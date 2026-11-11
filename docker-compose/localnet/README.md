@@ -37,6 +37,13 @@ list); only the addresses of services are replaced.
 - **Emulated nodes** send heartbeats and dAuth requests only. They run no jobs.
 - **State is synthetic.** The chain store of every oracle starts with 3,657 made-up records (about
   5.5 MB, the size on mainnet) and 30 old-style job pointers whose documents exist nowhere.
+- **Seeds start with the complete list of allowed senders**, as a long-running mainnet seed does. A seed
+  fills that list from the on-chain oracle list once at start-up and then every 15 minutes, and can only
+  name oracles whose heartbeats it has already registered. Seeds that start together for the first time
+  therefore keep a partial list (one to four seeds, itself always) for 15 minutes: writes are replicated
+  only to that partial list, and a seed that listed only itself gets no write confirmed. `init` writes the
+  eleven oracles into each seed's `authorized_addrs`; `init --empty-whitelist` keeps the first-start
+  behaviour, for work on that start-up path.
 - **No tunnels, no MinIO, no update server.** The update check fails harmlessly.
 
 Read results as comparisons between code versions under the same conditions, not as predictions of

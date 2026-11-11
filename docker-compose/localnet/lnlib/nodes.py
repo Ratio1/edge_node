@@ -160,6 +160,28 @@ def seed_chain_store(home, nodes, keys=3657, value_bytes=1400, legacy_jobs=30, l
   return json.loads(line[-1][7:])
 
 
+def seed_whitelists(home, nodes):
+  """
+  Write the complete oracle list into the allowed-senders file of every seed (nodes must be stopped).
+  See ctl/seed_whitelist.py for why a first start without it is not the state of a mainnet seed.
+  """
+  seeds = [node for node in nodes if node['role'] == 'seed']
+  oracles = [[node['address'], node['name']] for node in nodes if node['role'] in ('seed', 'oracle')]
+  if not seeds:
+    return None
+  mounts = [(HERE, '/opt/localnet', 'ro')] + [
+    (node['volume'], '/nodes/{}/_local_cache'.format(node['name']), 'rw') for node in seeds]
+  out = tool_run(
+    "{} -I /opt/localnet/ctl/seed_whitelist.py /nodes '{}' {}".format(
+      PYTHON, json.dumps(oracles), ' '.join(node['name'] for node in seeds)),
+    mounts=mounts, timeout=300,
+  )
+  line = [item for item in out.stdout.splitlines() if item.startswith('WHITELISTED ')]
+  if not line:
+    raise LocalnetError('whitelist seeding failed:\n' + out.stdout[-2000:])
+  return json.loads(line[-1][12:])
+
+
 def wallet(index):
   """A made-up licence owner wallet."""
   return '0x' + '{:040x}'.format(0xA11CE00000 + index)

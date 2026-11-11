@@ -139,6 +139,12 @@ def cmd_init(args):
   if seeded:
     log('chain store of every oracle seeded: {} records, {:.1f} MB, {} old-style job pointers'.format(
       seeded['keys'], seeded['bytes'] / 1e6, len(seeded['legacy_jobs'])))
+  if args.empty_whitelist:
+    log('seeds start with an empty list of allowed senders (first start of a new network)')
+  else:
+    listed = nodelib.seed_whitelists(home, plan)
+    if listed:
+      log('allowed senders of every seed set to the {} oracles, as on a long-running seed'.format(listed['senders']))
   log('creating {} emulated node identities ({} of them revoked)'.format(args.fleet + args.revoked, args.revoked))
   fleet = nodelib.create_fleet_identities(home, args.arm, args.evm_net, licensed=args.fleet, revoked=args.revoked)
   manifest = {
@@ -322,6 +328,9 @@ def main():
                    help='records of the synthetic chain-store replica given to every oracle (mainnet: 3,657; 0: empty)')
   one.add_argument('--legacy-jobs', type=int, default=30,
                    help='old-style deployed-job pointers in the seeded replica (their documents are not in R1FS)')
+  one.add_argument('--empty-whitelist', action='store_true',
+                   help='leave the seeds\' list of allowed senders empty, as on the first start of a new network '
+                        '(default: the complete oracle list, as on a long-running mainnet seed)')
   one.add_argument('--infra-cpus', help='CPU list for brokers, relays, chain and load generators, for example "0,6"')
   one.add_argument('--node-cpus', help='CPU list shared by the real nodes, for example "1-5,7-11"')
   one.add_argument('--arm', default='new', help='source tree every node runs unless --arm-of says otherwise')

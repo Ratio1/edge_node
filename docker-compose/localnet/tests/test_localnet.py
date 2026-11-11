@@ -120,6 +120,42 @@ class TestSeeding(unittest.TestCase):
       self.assertEqual(len(record['value']), 46)
     self.assertIn(seed_cstore.storage_key('DEEPLOY_DEPLOYED_JOBS', '101'), records)
 
+  def test_seed_whitelist_names_every_oracle_in_the_format_the_node_reads(self):
+    import seed_whitelist
+    oracles = [['0xai_A2MGGXwcngd-dVcVh9DVPlP4vzm-q64i03D7tbGsx1kG', 'r1s-01'],
+               ['0xai_AjUjU4FbphwuCULJfWNs-BUsss8M6KuXW7BxNKfaJkD5', 'r1o-09']]
+    content = seed_whitelist.lines(oracles)
+    rows = [line.split() for line in content.splitlines()]
+    # ratio1 bc/base.py reads "<address> <alias>" and appends the EVM address itself when a line has two parts.
+    self.assertEqual(rows, oracles)
+    self.assertTrue(content.endswith('\n'))
+
+  def test_only_seeds_get_the_whitelist_and_it_lists_seeds_and_oracles(self):
+    from lnlib import nodes as nodelib
+    plan = [{'name': 'r1s-01', 'role': 'seed', 'address': '0xai_s1', 'volume': 'v1'},
+            {'name': 'r1o-09', 'role': 'oracle', 'address': '0xai_o9', 'volume': 'v2'},
+            {'name': 'r1w-01', 'role': 'worker', 'address': '0xai_w1', 'volume': 'v3'}]
+    seen = {}
+
+    def fake_tool_run(script, mounts=(), **kwargs):
+      seen['script'], seen['mounts'] = script, list(mounts)
+
+      class Out:
+        stdout = 'WHITELISTED {"nodes": 1, "senders": 2}\n'
+      return Out()
+
+    real = nodelib.tool_run
+    nodelib.tool_run = fake_tool_run
+    try:
+      result = nodelib.seed_whitelists(None, plan)
+    finally:
+      nodelib.tool_run = real
+    self.assertEqual(result, {'nodes': 1, 'senders': 2})
+    self.assertIn('[["0xai_s1", "r1s-01"], ["0xai_o9", "r1o-09"]]', seen['script'])
+    self.assertNotIn('0xai_w1', seen['script'])
+    self.assertTrue(seen['script'].rstrip().endswith(' r1s-01'))
+    self.assertEqual([dst for _src, dst, _mode in seen['mounts'][1:]], ['/nodes/r1s-01/_local_cache'])
+
 
 class TestScenarios(unittest.TestCase):
 
