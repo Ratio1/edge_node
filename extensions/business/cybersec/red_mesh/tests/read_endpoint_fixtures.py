@@ -181,3 +181,21 @@ def allow_pentester(fixture, enabled=True):
   fixture.tenant_store.put("tenant", fixture.tenant_id,
                            record={**tenant, "allow_pentester": bool(enabled)})
   return fixture.tenant_id
+
+
+def designate_reviewer(fixture, account="reader", *, enabled=True, full_name="Rita Reader"):
+  """RM-155: designate `account` a report reviewer, with a profile naming them, through the
+  account-profile row the policy reads. `reports:review` needs this beside the role and the
+  Allow Pentester switch; `full_name=""` gives a designated account with an incomplete profile."""
+  from extensions.business.cybersec.red_mesh.tenancy import account_profile
+  created_at = fixture.store.data[("auth", account)]["createdAt"]
+  row = {**account_profile.new_row(created_at), "full_name": full_name, "report_reviewer": enabled,
+         "updated_by": "creator", "updated_at": "2026-11-03T00:00:00+00:00"}
+  fixture.tenant_store.put(account_profile.KIND, account, record=row)
+
+
+def as_reviewer(fixture, role, **kwargs):
+  """`as_role` for a caller that is also a designated report reviewer (RM-155): the tenant to name."""
+  tenant_id = as_role(fixture, role, **kwargs)
+  designate_reviewer(fixture)
+  return tenant_id

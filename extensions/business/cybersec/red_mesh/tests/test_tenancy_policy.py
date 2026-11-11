@@ -244,7 +244,7 @@ class TestNoAccountRole(unittest.TestCase):
   def test_the_resolved_identity_carries_no_account_role(self):
     from dataclasses import fields
     self.assertEqual({field.name for field in fields(AccountView)},
-                     {"account_id", "active", "state", "tenant_memberships", "account_generation"})
+                     {"account_id", "active", "state", "tenant_memberships", "account_generation", "created_at"})
 
   def test_record_role_vocabulary_is_the_matrix(self):
     from extensions.business.cybersec.red_mesh.tenancy.account_record import MEMBERSHIP_ROLES
