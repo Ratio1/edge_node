@@ -37,6 +37,8 @@ class Coordinator(_DeploymentOperationsMixin):
     self._deployment_plans = {}
     self._deployment_plan_cache_lock = threading.Lock()
     self._deployment_preparations = {}
+    self._operations_confirmed = {}
+    self._operations_sent_at = {}
     self.cfg_deployment_readiness_timeout = 60
     self._get_response = lambda result: result
     self.P = lambda *args, **kw: None
@@ -141,6 +143,10 @@ class DeploymentStatusTests(unittest.TestCase):
     result = plugin._deployment_status({"operation_id": operation["operation_id"]})
     self.assertEqual(result["ready_nodes"], 2)
     self.assertEqual({node["node_id"]: node["stale"] for node in result["nodes"]}, {"A": False, "B": True, "C": False})
+    # An old snapshot is stale only while its coordinator is away.
+    self.assertFalse(result["observation_stale"])
+    plugin.offline.add("oracle")
+    self.assertTrue(plugin._deployment_status({"operation_id": operation["operation_id"]})["observation_stale"])
 
   def test_preparation_failure_does_not_project_a_restoration(self):
     plugin = self.prepare()
@@ -307,7 +313,8 @@ class DeploymentOperationTests(unittest.TestCase):
     plugin = Coordinator()
     operation = plugin.operation()
     for index in range(30):
-      plugin._save_operation(operation)
+      # Each save carries new state; an unchanged save writes nothing.
+      plugin._save_operation(operation, message="step {}".format(index))
     self.assertEqual(len(plugin.chainstore_hgetall(OPERATIONS_HKEY)), 8)
     self.assertEqual(plugin._operation_records()[operation["operation_id"]]["sequence"], 30)
 
@@ -352,6 +359,25 @@ class RuntimeCompletionTests(unittest.TestCase):
     plugin._assert_no_active_deployment(job_id=1, app_id="app")
     self.assertIsNone(plugin._find_request_operation(
       {"job_id": 1, "request_id": "retry-update"}, "owner", "update"))
+
+  def test_completed_snapshot_is_resent_as_repair_for_ten_minutes(self):
+    # One confirmation is enough for a write, so an oracle can miss the final snapshot; nothing else sends it again.
+    plugin = Coordinator()
+    operation = plugin.operation("update")
+    operation.update(phase="completed", outcome="failed", recovery="completed")
+    plugin._save_operation(operation)
+    stored, sent = dict(plugin.storage), []
+    store = plugin.chainstore_hset
+    plugin.chainstore_hset = lambda namespace, key, value, **kw: sent.append((namespace, key)) or store(namespace, key, value, **kw)
+    plugin._reconcile_coordinator_operations()  # just confirmed: nothing to send
+    self.assertEqual(sent, [])
+    plugin.now += 31
+    plugin._reconcile_coordinator_operations()  # 30 s later: the same record once more
+    self.assertEqual(sent, [(OPERATIONS_HKEY, "{}|{}".format(operation["operation_id"], operation["sequence"] % 8))])
+    plugin.now += 600
+    plugin._reconcile_coordinator_operations()  # past the window: left alone
+    self.assertEqual(len(sent), 1)
+    self.assertEqual(plugin.storage, stored)
 
 
 if __name__ == "__main__":
