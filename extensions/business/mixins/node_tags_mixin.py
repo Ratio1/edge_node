@@ -43,7 +43,43 @@ class _NodeTagsMixin(object):
   def get_ee_nt_is_kyb(self, node_address_eth):
     """
     Get the EE_NT_IS_KYB tag for node_address.
-    Returns tag_value.
+
+    Returns tag_value. Looks up the owner of the node's license on chain and asks
+    the dApp API (``<EE_DAPP_API_URL>/accounts/is-kyb``) whether that wallet passed
+    KYB. A node whose license owner is the zero address is not KYB. The request
+    runs on the single dAuth request thread for licensed nodes, so it is bounded:
+    3 s to connect and 15 s to read. Without a bound, a dApp API that accepts and
+    never answers held every queued dAuth request behind it; a time-out raises,
+    and ``fetch_node_tags`` catches it and leaves the tag out, as on any other
+    dApp API error.
+
+    Parameters
+    ----------
+    node_address_eth : str
+      The node's EVM address, used to look up its license owner.
+
+    Returns
+    -------
+    bool
+      The ``data`` field of the dApp API answer (True when the owner passed
+      KYB); False for the zero-address owner, a non-200 status or an answer
+      that is not valid JSON.
+
+    Raises
+    ------
+    requests.exceptions.RequestException
+      When the dApp API cannot be reached or does not answer within the timeout;
+      ``fetch_node_tags`` catches it and leaves the tag out.
+
+    Notes
+    -----
+    The read timeout is 15 s rather than 5 s because a time-out drops the tag
+    until the node next starts, so a slow answer is still accepted.
+
+    Examples
+    --------
+    >>> self.get_ee_nt_is_kyb("0x1234567890abcdef1234567890abcdef12345678")
+    True
     """
     base_url = self.bc.get_network_data().get(self.const.BASE_CT.dAuth.EvmNetData.EE_DAPP_API_URL_KEY)
     node_info = self.bc.get_node_license_info(node_address_eth=node_address_eth)
@@ -60,7 +96,8 @@ class _NodeTagsMixin(object):
 
     self.P(f"Fetching is_kyb for wallet {node_owner}", color='y')
 
-    # A time-out drops the tag until the node next starts, so allow a slow answer; still bounded.
+    # Bounded (3 s connect, 15 s read) so a dApp API that never answers cannot hold the single
+    # dAuth request thread; a time-out drops the tag until the node next starts, so allow a slow answer.
     response = self.requests.get(url, params=params, timeout=(3, 15))
     is_kyb = False
     if response.status_code == 200:

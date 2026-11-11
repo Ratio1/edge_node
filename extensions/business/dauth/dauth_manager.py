@@ -133,6 +133,34 @@ class DauthManagerPlugin(
   CONFIG = _CONFIG
 
   def __init__(self, **kwargs):
+    """
+    Create the dAuth manager plugin and its per-instance dAuth state.
+
+    Passes every argument to the base web-app plugin, then creates the fields the
+    dAuth mixins use: the dAuth server enablement and its message, the dAuth
+    registry oracles and internal peers with their refresh time and failure flag,
+    the time of the last job-secrets sync, the web-app and pause-teardown flags, and
+    the memo of old-style pipeline documents read by ``_load_legacy_pipeline``.
+    That memo is created here, with the other fields, so a missing field fails at
+    once instead of being recreated on first use.
+
+    Parameters
+    ----------
+    **kwargs : dict
+        Plugin construction arguments supplied by the plugin runtime; passed
+        unchanged to the base plugin constructor.
+
+    Returns
+    -------
+    None
+        The instance is initialized in place.
+
+    Examples
+    --------
+    >>> plugin = DauthManagerPlugin(**plugin_kwargs)  # built by the plugin runtime
+    >>> plugin._dauth_legacy_pipelines
+    {}
+    """
     super(DauthManagerPlugin, self).__init__(**kwargs)
     self._dauth_server_enabled = None
     self._dauth_server_enabled_message = None
@@ -143,7 +171,9 @@ class DauthManagerPlugin(
     self._last_dauth_job_secrets_hsync = None
     self._dauth_web_app_initialized = False
     self._dauth_pause_teardown_succeeded = True
-    self._dauth_legacy_pipelines = {}  # cid -> (retry_at, document); retry_at None while reading
+    # Memo of old-style pipeline documents, cid -> (retry_at, document); retry_at is None while
+    # a helper read runs. It lets each immutable document be read once, off the request thread.
+    self._dauth_legacy_pipelines = {}
     return
   
   

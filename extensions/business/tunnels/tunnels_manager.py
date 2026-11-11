@@ -330,6 +330,50 @@ class TunnelsManagerPlugin(BasePlugin):
   def get_secrets(self, payload: dict):
     """
     Get Cloudflare secrets for the sender address.
+
+    Checks that the request nonce is a recent client time and that the payload
+    is signed by a wallet (the tunnels UI prefix ``MESSAGE_PREFIX`` is tried
+    first, then the Deeploy prefix ``MESSAGE_PREFIX_DEEPLOY``), then reads that
+    wallet's record from the ``tunnels_manager_secrets`` chain-store hash. The
+    record's ``cs_rev`` field, the signed client time that ``add_secrets`` stores
+    as the record's revision, is chain-store bookkeeping and is left out of the
+    answer, so the client reads back exactly the Cloudflare fields it saved.
+
+    Parameters
+    ----------
+    payload : dict
+        Signed request. Must hold ``nonce`` (hex string of the client time in
+        milliseconds, at most 12 hours old and not in the future) and the
+        ``EE_ETH_SENDER`` / ``EE_ETH_SIGN`` signature fields.
+
+    Returns
+    -------
+    dict
+        The stored record without ``cs_rev``: ``cloudflare_api_key``,
+        ``cloudflare_account_id``, ``cloudflare_zone_id`` and
+        ``cloudflare_domain``. A record written before ``cs_rev`` existed is
+        returned as stored, and a stored value that is not a dict is returned
+        unchanged.
+
+    Raises
+    ------
+    KeyError
+        When ``payload`` has no ``nonce``.
+    ValueError
+        When the nonce is malformed, in the future or older than 12 hours.
+    Exception
+        When the signature matches neither prefix, or when no secrets are
+        stored for the signing wallet.
+
+    Notes
+    -----
+    Unlike ``add_secrets``, this endpoint raises on failure; the web-app base
+    then answers with the error text and status 500.
+
+    Examples
+    --------
+    >>> plugin.get_secrets(payload={"nonce": "0x1a1c9d5e280", "EE_ETH_SENDER": "0x...", "EE_ETH_SIGN": "0x..."})
+    {'cloudflare_api_key': '...', 'cloudflare_account_id': 'acc', 'cloudflare_zone_id': 'zone', 'cloudflare_domain': 'example.org'}
     """
     self._verify_nonce(payload['nonce'])
     sender = None
@@ -354,6 +398,8 @@ class TunnelsManagerPlugin(BasePlugin):
     # TODO we should add a CSP password to be used as token in cstore
     if secrets is None:
       raise Exception("No secrets found for sender: " + sender)
+    # Drop the "cs_rev" revision that add_secrets now stores in the record: it is chain-store bookkeeping,
+    # so the client reads back only the Cloudflare fields it saved. A non-dict value passes through unchanged.
     return {k: v for k, v in secrets.items() if k != "cs_rev"} if isinstance(secrets, dict) else secrets
 
   @BasePlugin.endpoint(method="post")
@@ -361,11 +407,61 @@ class TunnelsManagerPlugin(BasePlugin):
     """
     Endpoint for CSP addresses to add their own Cloudflare secrets.
 
-    Failures are returned, not raised: the web-app base logs the arguments of an endpoint that
-    raises, and the argument here is the credential.
+    The request is checked first: the nonce must be a client time from the last
+    12 hours, so a captured signed update cannot be replayed after that, and the
+    payload signature must name a wallet. The four Cloudflare fields are then
+    written under that wallet in the ``tunnels_manager_secrets`` chain-store
+    hash, together with the signed client time as the record's revision
+    ``cs_rev``. Success is reported only when other oracles confirmed the write,
+    so an update that did not replicate is reported as a failure the client can
+    retry instead of looking saved.
+
+    Failures are returned, not raised: the web-app base logs the arguments of an
+    endpoint that raises, and the argument here is the credential.
+
+    Parameters
+    ----------
+    payload : dict
+        Signed request with ``nonce`` (hex string of the client time in
+        milliseconds), ``cloudflare_api_key``, ``cloudflare_account_id``,
+        ``cloudflare_zone_id``, ``cloudflare_domain`` and the
+        ``EE_ETH_SENDER`` / ``EE_ETH_SIGN`` signature fields. The signed
+        message carries no prefix.
+
+    Returns
+    -------
+    dict
+        ``{"success": True}`` when the record was stored and confirmed by other
+        oracles. Otherwise ``{"success": False, "error": str}``, where the error
+        starts with "Secrets were not saved" and gives the reason: a missing,
+        malformed, future or expired (older than 12 hours) nonce, a failed
+        signature check, a missing Cloudflare field, or a write that other
+        oracles did not confirm.
+
+    Notes
+    -----
+    Each update that passes the checks leaves one log line: the wallet and
+    whether other oracles confirmed it, never the secret values. ``cs_rev`` is
+    only recorded; nothing orders replicas by it yet, so a restart sync can
+    still replace this copy with an older one.
+
+    Examples
+    --------
+    >>> plugin.add_secrets(payload={
+    ...   "nonce": "0x1a1c9d5e280", "cloudflare_api_key": "...", "cloudflare_account_id": "acc",
+    ...   "cloudflare_zone_id": "zone", "cloudflare_domain": "example.org",
+    ...   "EE_ETH_SENDER": "0x...", "EE_ETH_SIGN": "0x...",
+    ... })
+    {'success': True}
+    >>> plugin.add_secrets(payload=same_update_signed_13_hours_ago)
+    {'success': False, 'error': 'Secrets were not saved: Nonce is expired!'}
     """
     try:
-      self._verify_nonce(payload.get('nonce') or '')  # a captured signed update cannot be replayed later
+      # Reject a future nonce or one older than 12 hours, so a captured signed update cannot be replayed
+      # after that. A missing nonce is checked as an empty one and returned as "Nonce is invalid!".
+      self._verify_nonce(payload.get('nonce') or '')
+      # Recover the signing wallet inside the try: a signature check that raises becomes a returned
+      # failure, so the request, which holds the token, is not written to the log.
       sender = self.bc.eth_verify_payload_signature(
         payload=payload,
         no_hash=True,
@@ -373,7 +469,11 @@ class TunnelsManagerPlugin(BasePlugin):
         verify_safe=True,
       )
       if not sender:
+        # An invalid signature comes back as None, not as an exception: stop before anything is stored
+        # under an unverified sender, and report it through the except below.
         raise ValueError("Signature verification failed.")
+      # Build the record inside the try, so a missing Cloudflare field is returned as an error instead of
+      # raised with the credential-carrying payload in the log.
       secrets = {
         "cloudflare_api_key": payload['cloudflare_api_key'],
         "cloudflare_account_id": payload['cloudflare_account_id'],
@@ -384,12 +484,18 @@ class TunnelsManagerPlugin(BasePlugin):
         "cs_rev": int(payload['nonce'].replace("0x", ""), 16),
       }
     except Exception as exc:
+      # Return every check failure instead of raising: the web-app base logs the arguments of an endpoint
+      # that raises, and here the argument holds the Cloudflare token.
       return {"success": False, "error": "Secrets were not saved: {}".format(exc)}
+    # Keep the write's result: it is True only when other oracles confirmed the update. Ignoring it
+    # answered success for a save that never replicated, so the other oracles could keep an older token.
     stored = self.chainstore_hset(hkey="tunnels_manager_secrets", key=sender, value=secrets)
     # The only trace of a secrets update: who, and whether other oracles confirmed it. Never the values.
     self.P(f"Tunnel secrets update by {sender}: {'confirmed' if stored else 'NOT confirmed'} by other oracles",
            color=None if stored else 'r')
     if not stored:
+      # Report an unconfirmed write as a failure the client can retry. It is returned, not raised, so the
+      # request that holds the token is not written to the log.
       return {"success": False, "error": "Secrets were not saved: other oracles did not confirm the update. Please try again."}
     return {
       "success": True

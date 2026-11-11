@@ -97,10 +97,50 @@ class _DeploymentOperationsMixin:
   """Persist, execute, recover, and present asynchronous deployment operations."""
 
   def _init_deployment_operations(self):
-    """Start the independent execution worker and initialize bounded caches."""
+    """Start the independent execution worker and initialize bounded caches.
+
+    Creates every field the operation mixin needs before the worker thread
+    starts: the admission handoff markers, the bounded plan cache (at most 32
+    plans) with its lock, the wake-up and stop events, and two in-process
+    bookkeeping maps. `_operations_sent_at` holds the command resend times
+    that used to be written into the signed operation snapshot, so a command
+    retry no longer produces a new CStore write; `_operations_confirmed`
+    holds the last confirmed send of each snapshot, so an unchanged snapshot
+    is no longer re-sent on every 2 s pass. They are created here, next to
+    their sibling fields, so that a plugin missing one fails at once instead
+    of creating it on first use. Finally starts the daemon thread that runs
+    `_deployment_operation_worker`.
+
+    Returns
+    -------
+    None
+      The fields and the started thread are attached to the plugin instance.
+
+    Notes
+    -----
+    Called once from the plugin's `on_init`; `on_close` sets the stop event
+    and joins the thread. The two bookkeeping maps live only in process
+    memory and are not pruned: they hold one small entry per operation and
+    per command target. After a restart they start empty, so the current
+    snapshot of each own operation the worker still handles (unfinished, or
+    completed less than 600 s ago) is sent once more and pending commands are
+    sent again; nodes de-duplicate commands by operation id and attempt.
+
+    Examples
+    --------
+    >>> plugin._init_deployment_operations()
+    >>> plugin._deployment_operations_thread.name
+    'deeploy-operations'
+    >>> plugin._operations_confirmed, plugin._operations_sent_at
+    ({}, {})
+    """
     self._deployment_preparations = {}
-    self._operations_confirmed = {}  # operation id -> (sequence, signature, time of the last confirmed send)
-    self._operations_sent_at = {}  # operation id|attempt|action|node -> time of the last command
+    # Last confirmed send per operation id, as (sequence, signature, time): it lets _replicate_operation
+    # skip an unchanged snapshot for 30 s instead of re-sending it to every oracle on each 2 s pass.
+    self._operations_confirmed = {}
+    # Last command time per "operation id|attempt|action|node": the 10 s resend throttle lives in process
+    # memory, so a command retry no longer writes a new signed snapshot that every oracle re-stores.
+    self._operations_sent_at = {}
     self._deployment_plan_cache_lock = threading.Lock()
     self._deployment_operations_event = threading.Event()
     self._deployment_operations_stop = threading.Event()
@@ -156,13 +196,76 @@ class _DeploymentOperationsMixin:
     return latest
 
   def _save_operation(self, operation, phase=None, message=None):
-    """Replicate a signed snapshot in a bounded sequence slot before side effects."""
+    """Replicate a signed snapshot in a bounded sequence slot before side effects.
+
+    The coordinator saves the operation on every phase change and again
+    before each node command, so that the durable record leads the action it
+    describes. A new snapshot copies the operation, drops its old signature,
+    increments `sequence`, stamps `updated_at`, applies the optional phase,
+    appends the optional event (keeping the last 128), signs it, and writes it
+    to the slot `operation_id|sequence % 8` on the oracle peers.
+
+    A write happens only when durable state changed. When the phase is
+    unchanged, no new event message is given (or it equals the last event's
+    message) and the operation equals the snapshot stored in its current slot
+    in the local replica, the call returns without signing or writing.
+    Before this check, a stuck operation wrote a new signed snapshot for every
+    command retry and for every pass past its deadline, so every oracle
+    re-stored and re-pickled CStore for retry bookkeeping only.
+
+    Parameters
+    ----------
+    operation : dict
+      The coordinator's current operation snapshot. It is replaced in place
+      by the new signed snapshot after a confirmed write, and left untouched
+      when nothing changed. Fields the caller set on it (for example `error`
+      or `recovery`) count as changed content.
+    phase : str or None, optional
+      The phase to record, such as "waiting_for_readiness" or "completed".
+      None (the default) keeps the current phase.
+    message : str or None, optional
+      Text of an event to append, stamped with the new sequence, the time and
+      the phase. None (the default) or an empty string appends no event.
+
+    Returns
+    -------
+    dict
+      The same `operation` object: the new signed snapshot after a write, or
+      the unchanged operation when nothing durable changed.
+
+    Raises
+    ------
+    ValueError
+      If this oracle is not the operation's coordinator.
+    RuntimeError
+      If the replicated write is not confirmed; `operation` is then left
+      unchanged so the caller retries on a later pass.
+
+    Notes
+    -----
+    Eight slots bound the record count per operation: older sequences are
+    overwritten. A confirmed write also records `(sequence, signature, time)`
+    in `_operations_confirmed`, so `_replicate_operation` does not send the
+    same snapshot again for 30 s.
+
+    Examples
+    --------
+    >>> operation = plugin._save_operation(operation, "waiting_for_readiness", "Preparing target nodes.")
+    >>> operation["sequence"], operation["events"][-1]["message"]
+    (1, 'Preparing target nodes.')
+    >>> plugin._save_operation(operation)["sequence"]  # nothing changed: no write
+    1
+    """
     if operation["coordinator"] != self.bc.address:
       raise ValueError("Only the accepting oracle can advance this operation.")
     # Same phase, no new event, same content as the stored snapshot: nothing durable changed.
     if phase in (None, operation["phase"]) and (not message or message == (operation.get("events") or [{}])[-1].get("message")):
+      # Read the snapshot held in this operation's current sequence slot from the local replica (no network
+      # round trip), to compare it with the in-memory operation before deciding to write.
       stored = self.chainstore_hget(OPERATIONS_HKEY, "{}|{}".format(operation["operation_id"], operation.get("sequence", 0) % 8))
       if json.dumps(stored, sort_keys=True) == json.dumps(operation, sort_keys=True):
+        # Skip signing and writing: an operation with nothing new used to get a new signed snapshot on every
+        # command retry and every pass past a deadline, and every oracle re-stored and re-pickled CStore for it.
         return operation
     snapshot = copy.deepcopy(operation)
     for key in SIGNATURE_KEYS:
@@ -183,6 +286,8 @@ class _DeploymentOperationsMixin:
       raise RuntimeError("Deployment state replication is pending.")
     operation.clear()
     operation.update(snapshot)
+    # Remember that this exact snapshot (sequence and signature) was confirmed now, so _replicate_operation
+    # waits 30 s before sending it again instead of re-sending the unchanged record on every 2 s pass.
     self._operations_confirmed[snapshot["operation_id"]] = (snapshot["sequence"], snapshot.get("EE_SIGN"), self.time())
     return operation
 
@@ -191,8 +296,51 @@ class _DeploymentOperationsMixin:
 
     A confirmation needs only part of the peers, and nothing else brings an oracle that missed the write
     up to date. The re-sent snapshot is the same record: peers that hold it store nothing.
+
+    The snapshot is identified by its `sequence` and its signature. Until
+    that exact snapshot has been confirmed once, every call writes it again
+    and raises while the write stays unconfirmed, so the caller does not act
+    on state the peers may lack. Once confirmed, a call within 30 s of the
+    last send returns without writing; after that the same record is sent
+    again as peer repair, and a failed repair send is not an error. Before
+    this throttle the unchanged snapshot was re-sent to every oracle peer on
+    every 2 s pass of the worker.
+
+    Parameters
+    ----------
+    operation : dict
+      A signed operation snapshot exactly as stored, with `operation_id`,
+      `sequence` and `EE_SIGN`. It is written as is and never modified.
+
+    Returns
+    -------
+    None
+      After a send (confirmed, or a failed repair of an already confirmed
+      snapshot) its time is recorded in `_operations_confirmed`; a call inside
+      the 30 s window returns without sending or recording anything.
+
+    Raises
+    ------
+    RuntimeError
+      If the write is not confirmed and this exact snapshot was never
+      confirmed before.
+
+    Notes
+    -----
+    The 30 s timer is measured with `self.time()`; a negative age (a clock
+    step backwards) counts as expired, so the record is sent rather than
+    held back. A failed repair send also restarts the 30 s timer.
+
+    Examples
+    --------
+    >>> plugin._replicate_operation(operation)  # not confirmed yet: writes and records the send
+    >>> plugin._replicate_operation(operation)  # within 30 s: returns without writing
+    >>> plugin.now += 31
+    >>> plugin._replicate_operation(operation)  # repair: the same record is sent once more
     """
+    # Read the confirmations kept in process memory since init; the signed snapshot carries no send bookkeeping.
     confirmed = self._operations_confirmed
+    # Identify the snapshot by sequence and signature, and look up when it was last sent with confirmation.
     marker, last = (operation["sequence"], operation.get("EE_SIGN")), confirmed.get(operation["operation_id"])
     if last and last[:2] == marker and 0 <= self.time() - last[2] < 30:
       return
@@ -200,7 +348,10 @@ class _DeploymentOperationsMixin:
     if not self.chainstore_hset(OPERATIONS_HKEY, key, operation, readonly=True,
                                **self._operation_write_kwargs()):
       if not last or last[:2] != marker:
+        # Only a snapshot that was never confirmed blocks the caller; a failed repair of an already
+        # confirmed one no longer stops the node commands that follow it.
         raise RuntimeError("Deployment state replication is pending.")
+    # Record this send (or failed repair) so the next repair of the same snapshot waits another 30 s.
     confirmed[operation["operation_id"]] = marker + (self.time(),)
 
   def _assert_no_active_deployment(self, job_id=None, app_id=None):
@@ -511,7 +662,74 @@ class _DeploymentOperationsMixin:
     )
 
   def _send_operation_commands(self, operation, configs, attempt, action, reports):
-    """Retry scoped commands while recording intent before transport dispatch."""
+    """Retry scoped commands while recording intent before transport dispatch.
+
+    For every planned node that has not yet reported the wanted outcome
+    (stopped for "stop" and "retire", ready for "start"), sends a pipeline
+    command at most once per 10 s. Before each command the operation is saved
+    so the durable record leads the side effect; a restore or owner-transfer
+    start also binds each container instance to the runtime artifacts the
+    retired revision reported. Each command carries the operation metadata
+    (`DEEPLOY_OPERATION`) that nodes use to de-duplicate it.
+
+    The 10 s resend throttle is kept in process memory
+    (`_operations_sent_at`), not in the signed snapshot. Before, every
+    command retry changed the snapshot's `sent_at` field, so the save before
+    it wrote a new signed snapshot that every oracle re-stored and
+    re-pickled; now that save writes only when the caller changed durable
+    state.
+
+    Parameters
+    ----------
+    operation : dict
+      The coordinator's operation snapshot. It may be saved, and on a missing
+      runtime image binding it is marked `recovery="blocked"` and saved with
+      an event.
+    configs : dict
+      Node address -> pipeline config planned for that node. For "start" the
+      config is sent as the payload; for "stop" and "retire" only its `TYPE`
+      is used, with the job's `app_id` as the pipeline name.
+    attempt : str
+      The attempt the command belongs to: "deploy", "retire" or "restore".
+    action : str
+      The command: "start", "stop" or "retire".
+    reports : dict
+      Node address -> the newest signed node report for this attempt, as
+      returned by `_node_operation_reports`. Nodes without a report get the
+      command.
+
+    Returns
+    -------
+    None
+      Also returns early, without sending the remaining commands, when the
+      worker is stopping.
+
+    Raises
+    ------
+    RuntimeError
+      If a restore or owner-transfer start lacks the previous runtime image
+      binding for a container instance, or if a save is not confirmed.
+    ValueError
+      If this oracle is not the operation's coordinator (from
+      `_save_operation`).
+
+    Notes
+    -----
+    The throttle key is "operation id|attempt|action|node", so it is unique
+    across operations in the shared map. A negative age (a clock step
+    backwards) counts as expired, so the command is sent rather than held
+    back. Entries are lost on restart, so pending commands are sent once
+    more; nodes de-duplicate by operation id and attempt.
+
+    Examples
+    --------
+    >>> plugin._send_operation_commands(operation, configs, "deploy", "start", reports={})
+    >>> len(plugin._operations_sent_at)  # one command per planned node
+    3
+    >>> plugin._send_operation_commands(operation, configs, "deploy", "start", reports={})  # within 10 s
+    >>> len(plugin.commands)  # nothing was sent again
+    3
+    """
     for node, config in configs.items():
       report = reports.get(node, {})
       if action in ("stop", "retire") and report.get("status") == "stopped":
@@ -520,9 +738,13 @@ class _DeploymentOperationsMixin:
         continue
       # Resend throttle in process memory, not in the signed snapshot; nodes de-duplicate by operation_id|attempt.
       sent_at = self._operations_sent_at
+      # The map is shared by all operations, so the key starts with the operation id; the old in-snapshot
+      # key needed only attempt|action|node.
       key = "{}|{}|{}|{}".format(operation["operation_id"], attempt, action, node)
       if 0 <= self.time() - sent_at.get(key, 0) < 10:
         continue
+      # Record the send time in memory only: the save below then finds nothing changed and writes no new
+      # snapshot for a mere retry.
       sent_at[key] = self.time()
       self._save_operation(operation)
       payload = copy.deepcopy(config) if action == "start" else {
@@ -687,7 +909,43 @@ class _DeploymentOperationsMixin:
     self._deployment_secret_request("revoke", operation, active_attempt=active_attempt)
 
   def _reconcile_coordinator_operations(self):
-    """Advance runtime execution and recovery for this receiving oracle."""
+    """Advance runtime execution and recovery for this receiving oracle.
+
+    One pass of the operations worker. It clears admission handoffs that
+    have finished, reads the newest verified snapshot of every operation this
+    oracle coordinates from the local replica, and handles each one that no
+    admission still holds: an unfinished operation is advanced, and
+    a completed one whose last update is less than 600 s old is handed to
+    `_replicate_operation`, which re-sends the final snapshot at most every
+    30 s as peer repair.
+
+    The repair of completed operations exists because a write needs only one
+    confirmation, so an oracle can miss the final snapshot and nothing else
+    sent it again. That oracle kept showing the operation as running and
+    refused new changes to the job. Peers that already hold the record store
+    nothing when it arrives again.
+
+    Returns
+    -------
+    None
+      A failure on one operation is logged and the pass continues with the
+      next one.
+
+    Notes
+    -----
+    Runs on the `deeploy-operations` thread every 2 s, or sooner when the
+    wake-up event is set. Each operation is deep-copied before it is
+    advanced, so the replica's records are not mutated in place.
+
+    Examples
+    --------
+    >>> operation = plugin._save_operation(operation, "completed", "Deployment completed.")
+    >>> plugin._reconcile_coordinator_operations()  # just confirmed: nothing is sent
+    >>> plugin.now += 31
+    >>> plugin._reconcile_coordinator_operations()  # the same final record is sent once more
+    >>> plugin.now += 600
+    >>> plugin._reconcile_coordinator_operations()  # past the 600 s window: left alone
+    """
     # Clear completed handoffs BEFORE reading snapshots. Admissions that finish
     # during that read keep their marker until the next pass, avoiding a stale
     # `preparing` snapshot racing the request's final `accepted` write.
@@ -701,8 +959,13 @@ class _DeploymentOperationsMixin:
         continue
       try:
         if operation["phase"] != "completed":
+          # Unfinished operations are advanced as before; completed ones are no longer skipped outright but
+          # get the repair re-send below.
           self._advance_deployment_operation(operation)
-        elif self.time() - operation["updated_at"] < 600:  # oracles that missed the final snapshot get it too
+        # For 600 s after completion, oracles that missed the final snapshot get it too.
+        elif self.time() - operation["updated_at"] < 600:
+          # Re-send the final snapshot as repair, throttled to once per 30 s; peers that hold it store nothing,
+          # and an oracle that missed it stops showing the operation as running and refusing job changes.
           self._replicate_operation(operation)
       except Exception:
         self.P("Deployment operation waiting for storage or transport recovery.", color="y")
@@ -718,7 +981,68 @@ class _DeploymentOperationsMixin:
       self._deployment_operations_event.clear()
 
   def _deployment_status(self, request):
-    """Authorize a lookup and return a bounded, redacted progress projection."""
+    """Authorize a lookup and return a bounded, redacted progress projection.
+
+    Verifies the wallet's nonce-signed read envelope, then selects the
+    newest operation of the authenticated escrow owner that matches the
+    request's selectors, using only this oracle's local replica. The result
+    holds the operation's public fields, a per-node view (observed revision,
+    workload state, instances, staleness), readiness counts, a page of
+    events, and the revision that is in effect. Any oracle can answer; only
+    the coordinator advances the operation.
+
+    `observation_stale` tells the caller that the snapshot may be outdated.
+    Snapshots now change only when durable state changes and no longer on
+    every retry, so their age alone does not mean that: an unfinished
+    operation's snapshot is stale only when it is older than 30 s and its
+    coordinator is not online for control.
+
+    Parameters
+    ----------
+    request : dict
+      The endpoint's request body:
+      - "nonce", "EE_ETH_SIGN", "EE_ETH_SENDER": the reusable read
+        authorization; nothing else in the request is part of it.
+      - "operation_id" or "request_id" (str): selects one operation; at most
+        one of the two may be given.
+      - "job_id" (int or str, optional): limits the lookup to one job; it is
+        required when neither selector above is given.
+      - "kind" (str, optional): limits the lookup to "create", "update" or
+        "delete" operations.
+      - "events_limit" (int, optional): page size for events, 1 to 128,
+        default 64.
+      - "after_event_cursor" (int, optional): return only events with a
+        higher sequence, default 0.
+
+    Returns
+    -------
+    dict
+      The progress projection: the operation fields ("operation_id",
+      "request_id", "job_id", "app_id", "kind", "mutation", "sequence",
+      "target_revision", "previous_revision", "phase", "outcome",
+      "recovery", "coordinator", "created_at", "updated_at", "error") plus
+      "status", "nodes", "target_nodes", "ready_nodes",
+      "observation_stale", "poll_after_ms", "events", "next_event_cursor"
+      and "revision". When nothing matches, a short answer with "status"
+      set to "synchronizing" (replicas may not have the record yet), or to
+      "not_found" for a job lookup of the owner's job that has no tracked
+      operation yet.
+
+    Raises
+    ------
+    DeploymentAuthenticationError
+      If the read authorization is invalid or expired.
+    ValueError
+      If both selectors are given, no selector or job_id is given, or
+      events_limit or after_event_cursor is out of range.
+
+    Examples
+    --------
+    >>> result = plugin._deployment_status({"operation_id": operation_id, "nonce": nonce,
+    ...                                     "EE_ETH_SIGN": signature, "EE_ETH_SENDER": wallet})
+    >>> result["status"], result["ready_nodes"], result["observation_stale"]
+    ('waiting_for_readiness', 2, False)
+    """
     # Reuse the existing nonce-only wallet read envelope. Selectors cannot
     # widen access: every result is filtered by the authenticated escrow owner.
     envelope = {key: request.get(key) for key in ("nonce", "EE_ETH_SIGN", "EE_ETH_SENDER")}
@@ -809,6 +1133,8 @@ class _DeploymentOperationsMixin:
       ready_nodes=sum(self._node_is_ready(node, reports.get(node), config) for node, config in configs.items()),
       # Snapshots now change only with state: an old one is stale only while its coordinator is away.
       observation_stale=operation["phase"] != "completed" and now - operation["updated_at"] > 30
+        # With the coordinator online, an old snapshot only means nothing durable changed during a long
+        # wait (snapshots are no longer rewritten per retry), so it is not reported as an outdated view.
         and not self._netmon_node_is_online_for_control(operation["coordinator"]),
       poll_after_ms=2000, events=events[:limit],
       next_event_cursor=events[limit - 1]["sequence"] if len(events) > limit else None,

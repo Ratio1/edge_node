@@ -16,7 +16,51 @@ class _DauthDeploymentSecretsMixin:
   """Prepare immutable secrets and publish only at lifecycle finalization."""
 
   def _deployment_secret_context(self, body, requester):
-    """Authenticate an operation and its immutable, entirely redacted plan."""
+    """
+    Authenticate an operation and its immutable, entirely redacted plan.
+
+    Checks that the deployment operation is signed by the requesting coordinator for
+    this network, that its identity (job, operation ID prefix, kind, revisions) is
+    well formed, and that the requested action fits the operation's phase and kind.
+    It then reads the operation's plan from R1FS and checks that every planned
+    configuration matches the operation's placement and identity and carries no
+    plaintext secret. Every lifecycle custody action starts here, on the single
+    dAuth request thread, so the plan read is bounded: ``pin=False`` keeps
+    ``ipfs pin add`` out and makes the 10 s ``timeout`` the real bound.
+
+    Parameters
+    ----------
+    body : dict
+      The verified ``reconcile_job_secrets`` request body. Uses ``operation`` (the
+      coordinator-signed operation snapshot), ``job_id`` and ``action`` (one of
+      "prepare", "status", "commit", "revoke" or "delete").
+    requester : str
+      The verified node address that signed the request; it must be the
+      operation's coordinator and sender.
+
+    Returns
+    -------
+    tuple
+      ``(job_id, operation, plan)``: the normalized job ID (str), the operation
+      dict and the plan dict read from ``operation["plan_cid"]``.
+
+    Raises
+    ------
+    ValueError
+      When the operation is missing, unsigned, not from ``requester`` or for another
+      network, its identity is malformed, the action does not match its phase or
+      kind, or the plan's placement, identity, redaction or secret references are
+      invalid.
+    RuntimeError
+      When the plan cannot be read from R1FS, or a newer signed snapshot of the
+      same operation is already held on this node (both retryable).
+
+    Examples
+    --------
+    >>> job_id, operation, plan = self._deployment_secret_context(body, requester)
+    >>> job_id, operation["phase"], sorted(plan)  # an update in its prepare phase
+    ('42', 'preparing', ['configs', 'previous_configs'])
+    """
     operation = body.get("operation")
     if not isinstance(operation, dict):
       raise ValueError("A signed deployment operation is required.")
@@ -46,6 +90,8 @@ class _DauthDeploymentSecretsMixin:
       raise ValueError("Secret action does not match the deployment phase.")
     if (operation.get("kind") == "delete") != (action == "delete" or (action == "revoke" and phase == "retiring_previous")):
       raise ValueError("Secret action does not match the deployment kind.")
+    # Read the plan without pinning so the 10 s timeout bounds it: a pinning read waits on a
+    # fixed 90 s `ipfs pin add`, so one missing document held the single dAuth thread 182-212 s.
     plan = self.r1fs.get_json(operation["plan_cid"], timeout=10, pin=False, show_logs=False)
     if not isinstance(plan, dict):
       raise RuntimeError("Deployment plan is unavailable.")
@@ -182,7 +228,60 @@ class _DauthDeploymentSecretsMixin:
     return True
 
   def _publish_deployment_secrets(self, job_id, operation, plan, pointer, deleted=False):
-    """Bind custodied secrets to a verified coordinator-signed final pointer."""
+    """
+    Bind custodied secrets to a verified coordinator-signed final pointer.
+
+    Verifies that ``pointer`` is the coordinator's signed publication for exactly this
+    operation and that it has not been superseded. For a deployment it reads the
+    published configuration from R1FS, checks it against the plan, and turns the
+    prepared secret revision of the active attempt into the job's current, signed
+    secret bundle; for a delete it revokes the job's previous secret revision and
+    publishes an empty bundle. It then writes the bundle, writes the pointer and removes the
+    previous pipeline CID from R1FS. The published-configuration read runs on the
+    single dAuth request thread, so it is bounded: ``pin=False`` keeps
+    ``ipfs pin add`` out and makes the 10 s ``timeout`` the real bound.
+
+    Parameters
+    ----------
+    job_id : str
+      The normalized Deeploy job ID.
+    operation : dict
+      The authenticated operation from ``_deployment_secret_context``; its phase is
+      "finalizing", "finalizing_recovery" or (for a delete) "retiring_previous".
+    plan : dict
+      The operation's verified plan (``configs`` and ``previous_configs``). With
+      phase "finalizing_recovery" the restored ``previous_configs`` are published,
+      otherwise ``configs``.
+    pointer : dict or None
+      The coordinator-signed final deployment pointer from the request body
+      (``job_id``, ``revision``, ``operation_id``, ``coordinator``, ``deleted``,
+      ``pipeline_cid`` and, unless deleted, ``plan_cid``). None is rejected.
+    deleted : bool, optional
+      True for a delete: the pointer must carry ``pipeline_cid`` None, the job's
+      previous secret revision is revoked and an empty bundle is published in place
+      of the prepared one. Default False.
+
+    Returns
+    -------
+    None
+      The bundle and the pointer are written to the chain store.
+
+    Raises
+    ------
+    ValueError
+      When the pointer is missing, unsigned or does not match the operation, the
+      publication was superseded, the published configuration differs from the
+      plan, or the prepared secret revision is revoked or invalid.
+    RuntimeError
+      When the published configuration or the prepared secrets are not available, or
+      a chain-store write was not confirmed (all retryable).
+
+    Examples
+    --------
+    >>> self._publish_deployment_secrets("42", operation, plan, body["pointer"])
+    >>> self._load_dauth_pipeline_cid("42") == body["pointer"]["pipeline_cid"]
+    True
+    """
     if not isinstance(pointer, dict):
       raise ValueError("A signed deployment publication pointer is required.")
     expected = dict(job_id=job_id, revision=operation["target_revision"],
@@ -210,6 +309,8 @@ class _DauthDeploymentSecretsMixin:
       representative = copy.deepcopy(next(iter(configs.values())))
       representative.pop("DEEPLOY_OPERATION", None)
       canonical = self._recursively_sort_pipeline_data(self.extract_invariable_data_from_pipeline(representative))
+      # Read the published configuration without pinning so the 10 s timeout bounds it: a
+      # pinning read waits on a fixed 90 s `ipfs pin add` that ignores the timeout.
       published = self.r1fs.get_json(pointer["pipeline_cid"], timeout=10, pin=False, show_logs=False)
       if published is None:
         raise RuntimeError("Published deployment configuration is unavailable.")
@@ -233,7 +334,55 @@ class _DauthDeploymentSecretsMixin:
       self._delete_pipeline_cid_from_r1fs(previous_cid)
 
   def _revoke_deployment_secret_revisions(self, job_id, operation, plan, active_attempt):
-    """Erase only operation-derived unused references after lifecycle barriers."""
+    """
+    Erase only operation-derived unused references after lifecycle barriers.
+
+    First checks that cleanup is allowed in the operation's phase: ``active_attempt``
+    must match the phase, preparation cleanup waits for the preparation deadline, and
+    a failed rollout that can still restore previous nodes is not cleaned up. When an
+    attempt is active, the published pointer must belong to this operation and the
+    published configuration, read from R1FS, must match the plan. Then each unused
+    secret revision gets a "revoked" marker and its record is overwritten with a
+    revoked copy that keeps no secrets. The published-configuration read runs on the
+    single dAuth request thread, so it is bounded: ``pin=False`` keeps
+    ``ipfs pin add`` out and makes the 10 s ``timeout`` the real bound.
+
+    Parameters
+    ----------
+    job_id : str
+      The normalized Deeploy job ID.
+    operation : dict
+      The authenticated operation from ``_deployment_secret_context``.
+    plan : dict
+      The operation's verified plan; its ``configs`` and ``previous_configs`` say
+      which of the operation's revisions were prepared.
+    active_attempt : str or None
+      "deploy" when the target configuration is active (phase "finalizing"),
+      "restore" when the previous configuration was restored (phase
+      "finalizing_recovery"), or None when no attempt of this operation is active
+      (preparation cleanup, a failed rollout, or a delete).
+
+    Returns
+    -------
+    None
+      The markers and revoked records are written to the chain store.
+
+    Raises
+    ------
+    ValueError
+      When cleanup does not match the lifecycle phase, the published configuration
+      differs from the plan, or the operation's revision is already published and
+      would be cleaned up as incomplete.
+    RuntimeError
+      When the publication is still pending, the published configuration cannot be
+      read, or a chain-store write was not confirmed (all retryable).
+
+    Examples
+    --------
+    >>> self._revoke_deployment_secret_revisions("42", operation, plan, "deploy")
+    >>> self.chainstore_hget(hkey="DAUTH_JOB_SECRET_REVISIONS", key="42|" + operation["operation_id"] + ":restore")
+    {'job_id': '42', 'revision': '<operation_id>:restore', 'revoked': True}
+    """
     phase = operation["phase"]
     expected_active = {"finalizing": "deploy", "finalizing_recovery": "restore"}.get(phase)
     if active_attempt != expected_active or (
@@ -252,6 +401,8 @@ class _DauthDeploymentSecretsMixin:
           or pointer.get("revision") != operation["target_revision"]
           or not pointer.get("pipeline_cid")):
         raise RuntimeError("Active deployment publication is pending.")
+      # Read the published configuration without pinning so the 10 s timeout bounds it: a
+      # pinning read waits on a fixed 90 s `ipfs pin add` that ignores the timeout.
       published = self.r1fs.get_json(pointer["pipeline_cid"], timeout=10, pin=False, show_logs=False)
       if published is None:
         raise RuntimeError("Published deployment configuration is unavailable.")

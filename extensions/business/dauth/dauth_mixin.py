@@ -14,6 +14,8 @@ plugin to provide a complete decentralized authentication solution.
 
 """
 
+# Old-style pipeline documents are read on a helper thread (see _load_legacy_pipeline), so a
+# slow or missing R1FS document no longer holds the single dAuth request thread.
 import threading
 
 from .dauth_registry import (
@@ -269,9 +271,47 @@ class _DauthMixin(object):
     return record.get("pipeline_cid") if isinstance(record, dict) else record
 
   def _load_dauth_job_pipeline_record(self, job_id):
+    """
+    Load a job's active pipeline CID and the pipeline document it names.
+
+    Resolves the active CID from the job's deployment pointer and reads that
+    document from R1FS. It serves the wallet reveal, the old-style secret
+    reconciliation and the lifecycle preparation requests, all of which run on the
+    single dAuth request thread, so the read is bounded: ``pin=False`` keeps
+    ``ipfs pin add`` out of the request, which makes the 10 s ``timeout`` the
+    real bound.
+
+    Parameters
+    ----------
+    job_id : str
+      The normalized Deeploy job ID (see ``_normalize_dauth_job_id``).
+
+    Returns
+    -------
+    tuple
+      ``(cid, pipeline)``: ``cid`` is the active pipeline CID (str) and
+      ``pipeline`` is the deserialized document, or None when the R1FS read
+      failed or timed out. ``(None, None)`` when the job has no active CID.
+
+    Notes
+    -----
+    A pinning read runs ``ipfs pin add`` under a fixed 90 s timeout that ignores
+    the caller's ``timeout``, so one missing document held the single dAuth thread
+    for 182-212 s (two pin timeouts). This node does not
+    need its own pin: the writer and the relays keep theirs.
+
+    Examples
+    --------
+    >>> self._load_dauth_job_pipeline_record("7")
+    ('cid-active', {'NAME': 'app', 'DEEPLOY_SPECS': {'job_id': 7}, ...})
+    >>> self._load_dauth_job_pipeline_record("unknown-job")
+    (None, None)
+    """
     cid = self._load_dauth_pipeline_cid(job_id)
     if not cid:
       return None, None
+    # Read without pinning so the 10 s timeout bounds the request: a pinning read waited on
+    # a fixed 90 s `ipfs pin add` and held the single dAuth thread for 182-212 s per miss.
     return cid, self.r1fs.get_json(cid, timeout=10, pin=False, show_logs=False)
 
   def _load_dauth_job_pipeline(self, job_id):
@@ -279,33 +319,119 @@ class _DauthMixin(object):
     return pipeline
 
   def _load_legacy_pipeline(self, cid):
-    """Return the R1FS document `cid`, read once per CID and never on the request thread.
+    """
+    Return the R1FS document `cid`, read once per CID and never on the request thread.
 
     The CID comes from this node's own pointer and names immutable content; callers only
     read the document. The read runs on a helper thread; the request waits at most 0.25 s,
     otherwise fails as retryable, and the retry is answered from memory. A document that
     could not be read is read again 30 s after that read ended.
+
+    Before this memo every refused old-style ``get_secrets`` request fetched and pinned
+    the same immutable document on the single dAuth thread (0.25-0.9 s when the document
+    was present, 90-212 s when it was missing), queueing every other dAuth request
+    behind it until they ended in 503 responses.
+
+    Parameters
+    ----------
+    cid : str
+      The pipeline CID taken from the job's raw-CID deployment pointer
+      (``DEEPLOY_DEPLOYED_JOBS``).
+
+    Returns
+    -------
+    dict
+      The deserialized pipeline document. Every caller for this CID gets the same
+      cached dict object, so callers must only read it.
+
+    Raises
+    ------
+    RuntimeError
+      "Existing pipeline configuration is unavailable." when the helper read is still
+      running after 0.25 s, when the last read failed or did not return a dict and its
+      30 s retry delay has not passed yet, or when this request's read failed. The
+      ``RuntimeError`` from ``Thread.start`` is re-raised when the helper thread cannot
+      start; the cache entry is removed first so a later request tries again.
+
+    Notes
+    -----
+    The memo is ``self._dauth_legacy_pipelines`` (created in the plugin's ``__init__``),
+    mapping ``cid -> (retry_at, document)``. ``retry_at`` is None while a read is running,
+    so a retried request never starts a second read of the same CID. A document that was
+    read is kept for the life of the plugin. The helper read is bounded like the other
+    dAuth reads (``timeout=10``, ``pin=False``): with the SDK defaults a missing document
+    held a thread and an ``ipfs pin add`` for minutes, once per missing CID.
+
+    Examples
+    --------
+    >>> self._load_legacy_pipeline("QmLegacyPipeline")  # read finished within 0.25 s
+    {'NAME': 'app', 'DEEPLOY_SPECS': {'job_id': 7}, ...}
+    >>> self._load_legacy_pipeline("QmSlowPipeline")  # read still running
+    Traceback (most recent call last):
+      ...
+    RuntimeError: Existing pipeline configuration is unavailable.
     """
+    # Per-CID memo created with the plugin: cid -> (retry_at, document). It lets a retried
+    # request be answered from memory instead of fetching the same document again.
     cache = self._dauth_legacy_pipelines
+    # An unknown CID reads as "no document, retry time already passed", so the first
+    # request starts the read.
     retry_at, document = cache.get(cid, (0, None))
     if document is None and retry_at is not None and self.time() >= retry_at:
       def read():
+        """
+        Read the pipeline document on the helper thread and record the result in the memo.
+
+        Runs off the request thread so a slow or missing R1FS document cannot queue the
+        other dAuth requests behind it. Any read error, or a result that is not a dict, is
+        recorded as unavailable; either way the next read is allowed 30 s after this one
+        ended.
+
+        Returns
+        -------
+        None
+          The result is stored in ``cache[cid]`` as ``(retry_at, document)``, where
+          ``document`` is the dict that was read or None.
+
+        Examples
+        --------
+        >>> read()  # runs as the target of the "dauth-r1fs-read" thread
+        >>> cache[cid]
+        (1731320430.0, {'NAME': 'app', 'DEEPLOY_SPECS': {'job_id': 7}, ...})
+        """
         try:
+          # Bounded like the other dAuth reads: pin=False keeps the fixed 90 s `ipfs pin add`
+          # out, so a missing document no longer holds this thread for minutes.
           doc = self.r1fs.get_json(cid, timeout=10, pin=False, show_logs=False)
         except Exception:
+          # Any read error means "not available"; it is retried after the delay below.
           doc = None
+        # Store the result and allow the next read 30 s after this one ended (was 300 s, so
+        # one transient failure blocked the job's secrets for five minutes).
         cache[cid] = (self.time() + 30, doc if isinstance(doc, dict) else None)
+      # The R1FS read runs on a daemon helper thread, off the single dAuth request thread.
       reader = threading.Thread(target=read, name="dauth-r1fs-read", daemon=True)
+      # Mark the read as running before it starts, so a retried request does not start a
+      # second read of the same CID while this one is still going.
       cache[cid] = (None, None)
       try:
+        # Start the helper read; the request thread only waits for it below.
         reader.start()
       except RuntimeError:
+        # The thread could not start: free the entry, otherwise the CID would stay marked as
+        # "reading" forever and never be read.
         cache.pop(cid, None)
+        # Fail this request with the thread error; a later request starts a fresh read.
         raise
+      # Wait at most 0.25 s on the request thread; a slower read finishes in the background
+      # and the retried request is answered from the memo.
       reader.join(0.25)
+      # Take what the helper recorded so far; (None, None) means the read is still running.
       retry_at, document = cache[cid]
     if document is None:
+      # The same retryable error as before the memo, so callers simply ask again later.
       raise RuntimeError("Existing pipeline configuration is unavailable.")
+    # Return the memoized document; the CID names immutable content, so it never goes stale.
     return document
 
   def _load_current_dauth_secret_bundle(self, job_id, pipeline_cid, pipeline, require_unversioned=False):
@@ -569,15 +695,55 @@ class _DauthMixin(object):
     }
 
   def _load_unversioned_runner_secret_bundle(self, job_id, requester):
-    """Authorize a pre-lifecycle pipeline against its current CID and placement.
+    """
+    Authorize a pre-lifecycle pipeline against its current CID and placement.
 
     Only the original raw-CID metadata format qualifies. Read local metadata and
     protected bundles, reject versioned/tombstoned records, and
     retain the existing exact-CID binding and generation-change checks.
+
+    The pipeline document is read through ``_load_legacy_pipeline``: once per CID,
+    on a helper thread, with the request waiting at most 0.25 s. Before that, every
+    refused old-style request fetched and pinned the same immutable document on the
+    single dAuth thread and queued every other dAuth request behind it.
+
+    Parameters
+    ----------
+    job_id : str
+      The normalized Deeploy job ID of a ``get_secrets`` request that carries no
+      ``revision``.
+    requester : str
+      The verified node address that signed the request; it must be one of the
+      nodes that run the existing pipeline.
+
+    Returns
+    -------
+    dict
+      The job's current dAuth secret bundle (``job_id``, ``job_secrets`` and the
+      ``pipeline_cid`` it is bound to).
+
+    Raises
+    ------
+    ValueError
+      When the job has no raw-CID pointer, the pipeline is versioned or belongs to
+      another job, the requester does not run it, the stored bundle is missing,
+      versioned, deleted or revoked, or does not match the job or the CID, a
+      pre-CID bundle cannot be bound to the current placeholders or stored, or the
+      pointer changed while the bundle was being bound.
+    RuntimeError
+      When the pipeline document is not available yet (retryable), the helper read
+      thread cannot start, or the job's pointer changed after the bundle was loaded.
+
+    Examples
+    --------
+    >>> self._load_unversioned_runner_secret_bundle("7", "0xai_RunnerNodeAddress")
+    {'job_id': '7', 'job_secrets': {'ENV': {'TOKEN': '...'}}, 'pipeline_cid': 'QmLegacyPipeline'}
     """
     pipeline_cid = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=job_id)
     if not isinstance(pipeline_cid, str) or not pipeline_cid:
       raise ValueError("Secret revision is required or the existing pipeline is unavailable.")
+    # Read the immutable document once per CID, off the request thread: refused old-style
+    # requests used to fetch and pin it on the single dAuth thread every time.
     pipeline = self._load_legacy_pipeline(pipeline_cid)
     specs = pipeline.get("DEEPLOY_SPECS", {})
     if (not isinstance(specs, dict) or str(specs.get("job_id")) != job_id
