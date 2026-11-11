@@ -5767,15 +5767,17 @@ class EdgeguardApiPlugin(BasePlugin):
         retry_index=1,
         retry_limit=DEFAULT_SCHEMA_RETRY_LIMIT,
       )
-      profile_artifact = PATTERN_SCHEMA_ARTIFACTS.get(profile["name"])
-      is_v0_11 = profile_artifact is not None
+      # The schema each profile actually validates against (v0.11/v0.13
+      # artifacts, the decision-JSON prompt schema, or the v0.10 default).
+      validation_profile = self._cypher_validation_profile(key)
+      single_attempt = profile["name"] == PROMPT_PROFILE_DECISION_JSON_2026_11_08
       profiles.append({
         "prompt_profile_id": profile["prompt_profile_id"],
         "prompt_profile": profile["name"],
         "model_key": key,
         "template_version": profile["template_version"],
         "system_prompt_sha256": _sha256_text(system_prompt),
-        "correction_prompt_sha256": _sha256_text(correction_prompt),
+        "correction_prompt_sha256": None if single_attempt else _sha256_text(correction_prompt),
         "expected_output": profile["prompt_contract"],
         # Contract §1/§3.2 (review finding 7, S8): the v0.11 profile reports
         # the v0.11 artifact's own schema_version/schema_surface here (the
@@ -5784,10 +5786,8 @@ class EdgeguardApiPlugin(BasePlugin):
         # `literal_classes.py` module sha, since the literal-grounding guard
         # reads it regardless of profile (contract §3.2: "both pin its sha
         # in their reports").
-        "cypher_schema_version": profile_artifact["schema_version"] if is_v0_11 else SCHEMA_VERSION,
-        "schema_surface": (
-          canonical_schema_surface(profile_artifact) if is_v0_11 else canonical_schema_surface()
-        ),
+        "cypher_schema_version": validation_profile["schema_version"],
+        "schema_surface": validation_profile["schema_surface"],
         "literal_classes_sha256": LITERAL_CLASSES_SHA256,
       })
     return {

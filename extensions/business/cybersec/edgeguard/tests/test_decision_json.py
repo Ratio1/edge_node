@@ -127,6 +127,17 @@ class DecisionPromptTests(unittest.TestCase):
     self.assertEqual(body["temperature"], 0.0)
     self.assertEqual(body["max_tokens"], 512)
 
+  def test_prompt_contract_reports_this_profiles_prompt_and_schema(self):
+    plugin = _make_api(edgeguard_generation_workers=DECISION_WORKERS)
+
+    entry = {p["model_key"]: p for p in plugin.prompt_contract()["profiles"]}[DECISION_KEY]
+
+    self.assertEqual(entry["system_prompt_sha256"], self.BUNDLE_PROMPT_SHA256)
+    self.assertEqual(entry["cypher_schema_version"], "edgeguard-v2026.11.6-prompt-5e12777d5a")
+    self.assertIn("USES_TOOL", entry["schema_surface"]["relationship_types"])
+    self.assertIn("CVSSv40", entry["schema_surface"]["labels"])
+    self.assertIsNone(entry["correction_prompt_sha256"])  # one attempt, no correction turn
+
   def test_a_modified_prompt_file_is_refused(self):
     with tempfile.TemporaryDirectory() as tmp:
       path = Path(tmp) / "prompt.txt"
