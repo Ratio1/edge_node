@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 from .conftest import mock_plugin_modules
 
 TEST_CHANNEL_TOKEN = "test-model-token-material-at-least-32-bytes"
-EXPECTED_ENDPOINTS = 139  # +7 account profile, reviewer designation and certificates (RM-155 phase 1); +1 super-tenant provider read for every account's reports; +2 STA deployment integrations, -3 tenant integrations (RM-139); +2 Demo attestation bridge (RM-141); +2 public branding for the sign-in page; +3 super-tenant branding (RM-134); +1 list_deployment_nodes (RM-126); +5 data maintenance (RM-108, temporary); +3 tenant contract (RM-095 phase 1); +6 engagements (RM-095 phase 2); +1 delete_tenant, -4 tenant assets (RM-107); +7 tenant drafts (RM-109 phase 2); +3 draft release/close and tenant document download (RM-109 phase 3); +8 engagement drafts (RM-109 phase 4); +3 super-tenant profile and generated pack (RM-110 phase 1); +6 tenant assets (RM-125)
+EXPECTED_ENDPOINTS = 148  # +3 framework assessment list, create, archive (RM-120 phase 10b); +6 framework assessment (RM-120 phases 3 and 5); +7 account profile, reviewer designation and certificates (RM-155 phase 1); +1 super-tenant provider read for every account's reports; +2 STA deployment integrations, -3 tenant integrations (RM-139); +2 Demo attestation bridge (RM-141); +2 public branding for the sign-in page; +3 super-tenant branding (RM-134); +1 list_deployment_nodes (RM-126); +5 data maintenance (RM-108, temporary); +3 tenant contract (RM-095 phase 1); +6 engagements (RM-095 phase 2); +1 delete_tenant, -4 tenant assets (RM-107); +7 tenant drafts (RM-109 phase 2); +3 draft release/close and tenant document download (RM-109 phase 3); +8 engagement drafts (RM-109 phase 4); +3 super-tenant profile and generated pack (RM-110 phase 1); +6 tenant assets (RM-125)
 TOKEN_ENDPOINTS = {"launch_model_test", "preflight_model_test_provider"}
 LAUNCH_ENDPOINTS = ("launch_network_scan", "launch_webapp_scan", "launch_test", "launch_model_test")
 # Pre-RM-075 public positional contract; account actor fields are appended to launches.
@@ -29,6 +29,16 @@ ENDPOINT_FIRST_ARGS = {
   'download_tenant_contract': 'actor',
   # RM-107: removes a tenant with no members and no jobs.
   'delete_tenant': 'actor',
+  # RM-120 phase 3: framework maturity self-assessment, tenant-scoped.
+  'get_framework_assessment': 'actor',
+  'save_framework_assessment_draft': 'actor',
+  'submit_framework_assessment': 'actor',
+  'reopen_framework_assessment': 'actor',
+  'get_framework_assessment_artifact': 'actor',
+  'suggest_framework_assessment_evidence': 'actor',  # phase 5
+  'list_framework_assessments': 'actor',  # phase 10b
+  'create_framework_assessment': 'actor',
+  'archive_framework_assessment': 'actor',
   # RM-109 phase 2: tenant drafts, Super-Tenant Admin only.
   'create_tenant_draft': 'actor',
   'update_tenant_draft': 'actor',

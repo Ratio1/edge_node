@@ -74,7 +74,7 @@ class _DraftCase(unittest.TestCase):
     self.plugin = object.__new__(self.Plugin)
     self.plugin.cfg_tenancy_namespace = "deployment"
     self.plugin.P = lambda *args, **kwargs: None
-    for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
+    for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hkeys", "chainstore_hset"):
       setattr(self.plugin, name, getattr(self.store, name))
     self.plugin._document_store = lambda: self.documents
     self.events = []
