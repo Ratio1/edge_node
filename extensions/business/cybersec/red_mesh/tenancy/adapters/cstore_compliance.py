@@ -120,18 +120,27 @@ class CstoreComplianceStore:
     except Exception as exc:
       raise TenantStoreError("Compliance storage cannot be enumerated") from exc
     keys = [] if keys is None else keys
-    if not isinstance(keys, (list, tuple, set)) or len(keys) > MAX_ENUMERATED_RECORDS:
+    if not isinstance(keys, (list, tuple, set)):
       raise TenantStoreError("Compliance storage enumeration is unavailable")
-    found = []
+    # Other tenants' and other kinds' keys do not count against the bound, and are not parsed: the
+    # canonical dump of `[kind, namespace, tenant_id` is the prefix every key of this tenant starts with.
+    prefix = json.dumps([kind, self._namespace, tenant_id], separators=(",", ":"))[:-1] + ","
+    candidates = []
     for key in keys:
+      if not isinstance(key, str) or not key.startswith(prefix):
+        continue
       try:
         field = json.loads(key) if isinstance(key, str) else None
         valid = (isinstance(field, list) and len(field) in (4, 5) and field[:3] == [kind, self._namespace, tenant_id]
                  and key == self._location(kind, field[2:])[1])
       except (ValueError, RecursionError, TenantStoreError):
         continue
-      if not valid:
-        continue
+      if valid:
+        candidates.append((key, field))
+    if len(candidates) > MAX_ENUMERATED_RECORDS:
+      raise TenantStoreError("Compliance storage enumeration is unavailable")
+    found = []
+    for key, field in candidates:
       try:
         value = self._owner.chainstore_hget(hkey=self.hkey, key=key)
       except Exception as exc:

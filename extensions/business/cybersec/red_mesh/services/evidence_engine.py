@@ -6,6 +6,9 @@ signals, so the classification lives here, neutral to either profile. Pure funct
 pass's findings and the live triage map: no redaction, no storage, no text that names a target.
 The rulebook keeps its redacted evidence refs; the self-assessment only names jobs and passes.
 """
+import re
+from functools import lru_cache
+
 from ..models import normalize_triage_status as _normalize_triage_status
 
 SIGNAL_KINDS = ("vulnerability_management", "auth_access_findings", "crypto_transport_findings",
@@ -25,9 +28,16 @@ _ACCESS_KEYWORDS = {
 }
 _CRYPTO_KEYWORDS = {
   "certificate", "cipher", "cleartext", "crypto", "cryptographic", "encryption",
-  "https", "ssl", "tls", "transport", "x509",
+  "https", "openssl", "ssl", "tls", "transport", "x509",
 }
-_SOC_COMPLETED_TOKENS = ("sent", "completed", "success", "ok")
+# Whole status values the real writers produce: `sent` (log_export), `completed` (suricata
+# correlation); `success`/`ok` are the generic outcome words. Exact match, never a substring.
+_SOC_COMPLETED_STATUSES = frozenset({"sent", "completed", "success", "ok"})
+
+
+@lru_cache(maxsize=None)
+def _word_start_pattern(keywords):
+  return re.compile(r"(?<![a-z0-9])(?:un)?(?:" + "|".join(re.escape(keyword) for keyword in sorted(keywords)) + ")")
 
 
 def _finding_id(finding):
@@ -80,8 +90,11 @@ def _search_text(finding):
 
 
 def _matches_keywords(finding, keywords):
-  text = _search_text(finding)
-  return any(keyword in text for keyword in keywords)
+  """Keywords match at a word start (`_` and any non-alphanumeric separate words), optionally after
+  `un`: `auth` finds `authentication` and `unauthenticated`; `ssl` no longer finds `classloader`."""
+  if not keywords:
+    return False
+  return _word_start_pattern(frozenset(keywords)).search(_search_text(finding)) is not None
 
 
 def actionable_findings(findings, triage_map):
@@ -104,15 +117,15 @@ def soc_outcome(soc_event_status, detection_correlation):
   """`completed`, `present` (metadata without a completed outcome) or `absent`."""
   soc = soc_event_status if isinstance(soc_event_status, dict) else None
   detection = detection_correlation if isinstance(detection_correlation, dict) else None
-  status_text = " ".join(
-    str(item).lower()
+  statuses = [
+    str(item).strip().lower()
     for item in [
       (soc or {}).get("last_status"), (soc or {}).get("status"), (soc or {}).get("outcome"),
       (detection or {}).get("status"),
     ]
     if item
-  )
-  if any(token in status_text for token in _SOC_COMPLETED_TOKENS):
+  ]
+  if any(status in _SOC_COMPLETED_STATUSES for status in statuses):
     return "completed"
   if soc is not None or detection is not None:
     return "present"
