@@ -979,6 +979,8 @@ class DauthServerRegistryGateTests(unittest.TestCase):
         self.assertNotIn("credential-in-dependency-error", str(response) + str(plugin._messages))
         if enabled:
           self.assertIn(f"failed for request from {SOURCE_IP}", plugin._messages[-1])
+          # The log names the type of the error and the function that raised it, never its text.
+          self.assertIn("ValueError in reconcile_job_secrets > reconcile", plugin._messages[-1])
 
   def test_secret_endpoint_errors_echo_request_nonce(self):
     plugin = self._make_manager(dauth_oracle=True)

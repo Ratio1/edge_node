@@ -164,6 +164,50 @@ class DeploymentStatusTests(unittest.TestCase):
 
 
 class DeploymentOperationTests(unittest.TestCase):
+  def test_an_operation_that_cannot_advance_is_logged_with_what_failed_and_not_with_the_error_text(self):
+    plugin = Coordinator()
+    lines = []
+    plugin.P = lambda message, color=None, **kw: lines.append((message, color))
+    stuck, fine = plugin.operation(), plugin.operation()
+    fine["operation_id"], fine["job_id"], fine["app_id"] = stuck["operation_id"].replace("-test", "-fine"), 2, "app2"
+    for operation in (stuck, fine):
+      plugin._save_operation(operation)
+    advanced = []
+
+    def custody_call(operation):
+      raise RuntimeError("secret-value-in-error")
+
+    def advance(operation):
+      if operation["operation_id"] == stuck["operation_id"]:
+        custody_call(operation)
+      advanced.append(operation["operation_id"])
+
+    plugin._advance_deployment_operation = advance
+    plugin._reconcile_coordinator_operations()
+    self.assertEqual(advanced, [fine["operation_id"]])  # the pass goes on with the next operation
+    red = [message for message, color in lines if color == "r"]
+    self.assertEqual(len(red), 1)
+    for part in (stuck["operation_id"], "job {}".format(stuck["job_id"]), "phase {}".format(stuck["phase"]),
+                 "RuntimeError in _reconcile_coordinator_operations > advance > custody_call"):
+      self.assertIn(part, red[0])
+    self.assertNotIn("secret-value-in-error", str(lines))
+
+  def test_a_pass_that_fails_as_a_whole_is_logged_with_what_failed(self):
+    plugin = Coordinator()
+    lines = []
+    plugin.P = lambda message, color=None, **kw: lines.append((message, color))
+
+    def failing_pass():
+      plugin._deployment_operations_stop.set()
+      raise KeyError("secret-value-in-error")
+
+    plugin._reconcile_coordinator_operations = failing_pass
+    plugin._deployment_operations_event.set()
+    plugin._deployment_operation_worker()
+    self.assertEqual([color for _, color in lines], ["r"])
+    self.assertIn("KeyError in _deployment_operation_worker > failing_pass", lines[0][0])
+    self.assertNotIn("secret-value-in-error", lines[0][0])
+
   def test_worker_reconciles_local_operations_without_peer_repair(self):
     plugin = Coordinator()
     plugin._reconcile_coordinator_operations = Mock(side_effect=plugin._deployment_operations_stop.set)

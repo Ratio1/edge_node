@@ -9,6 +9,8 @@ import copy
 import hashlib
 import json
 import threading
+# The call path of an error that stops an operation is logged (function names only).
+import traceback
 import uuid
 
 from ratio1.const.base import BCct, dAuth
@@ -1011,8 +1013,10 @@ class _DeploymentOperationsMixin:
     Returns
     -------
     None
-      A failure on one operation is logged and the pass continues with the
-      next one.
+      A failure on one operation is logged in red and the pass continues with
+      the next one. The line names the operation, its job and phase, the type
+      of the error and the functions it passed through; the error text is not
+      logged because it can carry request values.
 
     Notes
     -----
@@ -1050,16 +1054,44 @@ class _DeploymentOperationsMixin:
           # Re-send the final snapshot as repair, throttled to once per 30 s; peers that hold it store nothing,
           # and an oracle that missed it stops showing the operation as running and refusing job changes.
           self._replicate_operation(operation)
-      except Exception:
-        self.P("Deployment operation waiting for storage or transport recovery.", color="y")
+      except Exception as exc:
+        # The functions the error passed through, outermost first. Before, one fixed line ("waiting for storage
+        # or transport recovery") was logged for every error, so the log could not tell an unconfirmed
+        # chain-store write from a dAuth custody call that failed, a plan that could not be read or a command
+        # that could not be sent. Only names are logged, never the error text: it can carry request values.
+        path = " > ".join(frame.name for frame in traceback.extract_tb(exc.__traceback__))[:300]
+        self.P("Deployment operation {} (job {}, phase {}) was not advanced and is tried again: {} in {}".format(
+          operation["operation_id"], operation["job_id"], operation["phase"], type(exc).__name__, path), color="r")
 
   def _deployment_operation_worker(self):
-    """Resume coordinator-owned work independently of HTTP and UI polling."""
+    """
+    Advance this coordinator's operations in the background, independently of HTTP requests and UI polling.
+
+    Runs on the `deeploy-operations` thread until the stop event is set: one pass of
+    `_reconcile_coordinator_operations`, then a wait of 2 s or until the wake-up event is set.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    An error that escapes a whole pass (the per-operation errors are caught inside the pass) is logged in
+    red with its type and call path, and the next pass runs as usual.
+
+    Examples
+    --------
+    >>> threading.Thread(target=plugin._deployment_operation_worker, name="deeploy-operations").start()
+    """
     while not self._deployment_operations_stop.is_set():
       try:
         self._reconcile_coordinator_operations()
-      except Exception:
-        self.P("Deployment operation synchronization is temporarily unavailable.", color="y")
+      except Exception as exc:
+        # As in the pass itself: the type of the error and the functions it passed through, not its text.
+        # Before, one fixed line hid what failed.
+        path = " > ".join(frame.name for frame in traceback.extract_tb(exc.__traceback__))[:300]
+        self.P("Deployment operation pass failed and runs again in 2 s: {} in {}".format(
+          type(exc).__name__, path), color="r")
       self._deployment_operations_event.wait(2)
       self._deployment_operations_event.clear()
 

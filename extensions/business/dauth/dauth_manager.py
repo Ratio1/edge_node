@@ -20,6 +20,9 @@ WHITELIST (oracles)
 
 
 """
+# The call path of a failed secret reconciliation is logged (function names only).
+import traceback
+
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 from extensions.business.mixins.request_tracking_mixin import _RequestTrackingMixin
@@ -539,16 +542,48 @@ class DauthManagerPlugin(
   @BasePlugin.endpoint(method="post")
   # /reconcile_job_secrets
   def reconcile_job_secrets(self, body: dict):
-    """Reconcile hidden secrets for a signed protocol-oracle pipeline update."""
+    """
+    Reconcile hidden secrets for a signed protocol-oracle pipeline update.
+
+    The coordinator of a deployment operation calls this to prepare, check or revoke the secret revision
+    of the operation. Only a registered dAuth oracle serves it.
+
+    Parameters
+    ----------
+    body : dict
+      The signed request: `nonce`, the sender fields and the operation reference; it can carry new
+      secret values.
+
+    Returns
+    -------
+    dict
+      The signed response with the request's `nonce` and either the reconciliation result or `error`.
+      The caller is told only that the reconciliation failed, never why.
+
+    Notes
+    -----
+    A failure is logged in red with the type of the error and the functions it passed through, so the
+    failing step (for example the read of the operation's plan) can be told from the log. The error text
+    is not logged: new secret values can be present in the request or in a dependency's error.
+
+    Examples
+    --------
+    >>> plugin.reconcile_job_secrets({"nonce": "n1", "EE_SENDER": "0xai_...", "action": "prepare"})
+    {'nonce': 'n1', 'error': 'dAuth secret reconciliation failed'}
+    """
     nonce = body.get("nonce") if isinstance(body, dict) else None
     if not self._is_dauth_server_enabled():
       data = {'error': 'dAuth server is not registered as a dAuth oracle'}
     else:
       try:
         data = self.process_dauth_reconcile_secrets_request(body)
-      except Exception:
-        # New values can be present in the request or dependency exceptions.
-        self.P(f"dAuth secret reconciliation failed for request from {self.get_request_client_ip()}.", color='r')
+      except Exception as exc:
+        # New values can be present in the request or dependency exceptions, so the error text stays out of
+        # the log. Its type and the functions it passed through are logged: before, the line said only that
+        # the reconciliation failed, and a plan that could not be read looked like any other failure.
+        path = " > ".join(frame.name for frame in traceback.extract_tb(exc.__traceback__))[:300]
+        self.P("dAuth secret reconciliation failed for request from {}: {} in {}.".format(
+          self.get_request_client_ip(), type(exc).__name__, path), color='r')
         data = {'error': 'dAuth secret reconciliation failed'}
     return self.__get_response({'nonce': nonce, **data})
 
