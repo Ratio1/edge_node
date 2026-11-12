@@ -21,7 +21,8 @@ class _ImagePullBackoffMixin:
     Calculate exponential backoff delay with random jitter for image pull retries.
 
     Formula: base * 2^(failures-1) + uniform(0, base * 2^(failures-1))
-    No max cap -- exponential growth naturally spaces out retries.
+    No max cap here -- exponential growth naturally spaces out retries; a caller that never gives
+    up passes its own ceiling to `_record_image_pull_failure`. The doubling itself stops at 2^20.
     The jitter component ensures multiple plugins on the same node
     don't retry simultaneously after a shared failure (e.g. DockerHub rate limit).
 
@@ -39,26 +40,48 @@ class _ImagePullBackoffMixin:
     -------
     float
         Seconds to wait before next pull attempt
+
+    Examples
+    --------
+    >>> self._image_pull_failures = 3
+    >>> 80 <= self._calculate_image_pull_backoff() <= 160
+    True
     """
     if self._image_pull_failures == 0:
       return 0
-    base_backoff = self.cfg_image_pull_backoff_base * (
-      2 ** (self._image_pull_failures - 1)
-    )
+    # The doubling stops at 2^20 (about 240 days with the default base). A caller that never gives up
+    # lets the failure count rise without end, and from failure 1021 the number no longer fitted a
+    # float: the pause could not be computed and the pacing of the registry attempts was lost.
+    base_backoff = self.cfg_image_pull_backoff_base * (2 ** min(self._image_pull_failures - 1, 20))
     jitter = self.np.random.uniform(0, base_backoff)
     return base_backoff + jitter
 
 
-  def _record_image_pull_failure(self):
+  def _record_image_pull_failure(self, max_backoff=None):
     """
     Record an image pull failure and schedule next attempt with backoff + jitter.
+
+    Parameters
+    ----------
+    max_backoff : float, optional
+        Longest pause in seconds before the next attempt. None (the default) leaves the pause
+        uncapped, for callers that stop after `IMAGE_PULL_MAX_RETRIES`. A caller that retries
+        forever sets it, so that the next attempt is never days away.
 
     Returns
     -------
     None
+
+    Examples
+    --------
+    >>> self._record_image_pull_failure()                  # 20-40 s, 40-80 s, 80-160 s, ...
+    >>> self._record_image_pull_failure(max_backoff=3600)  # the same, but at most one hour
     """
     self._image_pull_failures += 1
     backoff = self._calculate_image_pull_backoff()
+    if max_backoff is not None:
+      # The caller's ceiling, applied before the pause is scheduled and logged below.
+      backoff = min(backoff, max_backoff)
     self._next_image_pull_time = self.time() + backoff
     self.P(
       f"Image pull failure #{self._image_pull_failures}. "

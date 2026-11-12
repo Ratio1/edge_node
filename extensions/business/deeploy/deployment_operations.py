@@ -15,7 +15,8 @@ from ratio1.const.base import BCct, dAuth
 from .selected_secrets import inherit_selections
 
 from extensions.business.dauth.dauth_registry import get_dauth_registry_internal_peers
-from .deeploy_const import DEEPLOY_KEYS, CONTAINERIZED_APPS_SIGNATURES
+# The worker signature tells the restoration gate which runtime binding an instance needs.
+from .deeploy_const import DEEPLOY_KEYS, CONTAINERIZED_APPS_SIGNATURES, WORKER_APP_RUNNER_SIGNATURE
 
 
 OPERATIONS_HKEY = "DEEPLOY_OPERATIONS"
@@ -821,9 +822,16 @@ class _DeploymentOperationsMixin:
           for instance in plugin.get("INSTANCES", []):
             identity = plugin["SIGNATURE"] + "|" + instance["INSTANCE_ID"]
             artifacts = bindings.get(identity)
-            if not artifacts or not artifacts.get("image_id"):
+            # What the instance cannot be restored without: a worker is rebuilt from its Git commit on a
+            # base image the node pulls again, a container app is its image. Asking a worker for an image
+            # id blocked its restoration over a value it does not need.
+            needed = "git_commit" if plugin["SIGNATURE"].upper() == WORKER_APP_RUNNER_SIGNATURE else "image_id"
+            if not artifacts or not artifacts.get(needed):
               operation["recovery"] = "blocked"
-              self._save_operation(operation, message="Previous runtime image binding is unavailable; restoration is blocked.")
+              # Name what is really missing: for a worker that is its Git commit, not an image.
+              missing = "Git commit" if needed == "git_commit" else "image binding"
+              # The blocked state and its reason are saved before the error stops the command.
+              self._save_operation(operation, message="Previous runtime {} is unavailable; restoration is blocked.".format(missing))
               raise RuntimeError("Previous runtime artifacts are unavailable.")
             instance["DEEPLOY_RUNTIME_ARTIFACTS"] = copy.deepcopy(artifacts)
       payload["DEEPLOY_OPERATION"] = self._operation_metadata(operation, attempt, action)

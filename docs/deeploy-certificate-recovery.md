@@ -76,16 +76,24 @@ runner/coordinator. A timeout cannot be upgraded to readiness by a generic healt
 ## Verification and limits
 
 Restoration also pins runtime content. A mutable image tag such as `:stable` is not an
-immutable revision. The runner records the resolved Docker image ID in its existing local
-persistent state before launching a tracked attempt and starts that exact ID thereafter.
+immutable revision. A container app runner records the resolved Docker image ID in its existing
+local persistent state before launching a tracked attempt and starts that exact ID thereafter.
+With the ID it records the registry reference of that image (`repository@sha256:...`) when the
+image came from the repository the app is configured with: if the local image is lost it is
+pulled again and accepted only when its ID equals the recorded one.
+A worker's base image is not pinned; it follows `IMAGE_PULL_POLICY` and only its Git commit is.
 Node-owned observations capture the actual running image ID; worker runners additionally
 capture and verify the actual Git HEAD before publishing readiness. Retirement preserves
 these safe identifiers in the node journal/report, and restoration supplies them through
 the server-owned `DEEPLOY_RUNTIME_ARTIFACTS` instance field. The report getter reads cached
 identifiers and performs no Docker, disk, or Git I/O on the reporter thread.
 
-A restored node requires its local image ID to still exist; it never substitutes a tag or
-registry result if the old image was removed. Worker restoration checks out the exact prior
+A container app runs only its recorded image ID. When that image is no longer in the node's
+Docker store (the node's own container was replaced, or the image was removed) it is pulled
+again: by the recorded registry reference, then by the configured reference. What comes back is
+used only if its ID equals the recorded one, so the configured tag is consulted to find that
+image and never to replace it. Until the registry serves it the app stays stopped and the pull
+is tried again, at most an hour apart. Worker restoration checks out the exact prior
 commit and does not consult the branch's current head. Tracked attempts disable autonomous
 image/Git updates; a change requires a new deployment operation. Database volume names,
 paths, and contents remain untouched. These content bindings do not make arbitrary build

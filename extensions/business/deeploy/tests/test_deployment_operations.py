@@ -361,6 +361,40 @@ class RuntimeCompletionTests(unittest.TestCase):
     self.assertIsNone(plugin._find_request_operation(
       {"job_id": 1, "request_id": "retry-update"}, "owner", "update"))
 
+  def test_restoration_needs_a_workers_commit_and_a_container_apps_image(self):
+    # A worker is rebuilt from its Git commit on a base image the node pulls again, so the id of an image
+    # that existed in one Docker store must not decide whether it can be restored.
+    def restore(signature, artifacts):
+      plugin = Coordinator()
+      operation = plugin._save_operation(plugin.operation("update"), "restoring_previous", "Restoring.")
+      operation["retired_runtime"] = {"A": {signature + "|worker": artifacts}}
+      config = {"NAME": "app", "TYPE": "Void", "PLUGINS": [{"SIGNATURE": signature, "INSTANCES": [{"INSTANCE_ID": "worker"}]}]}
+      plugin._send_operation_commands(operation, {"A": config}, "restore", "start", reports={})
+      return plugin.commands[-1][1]["PLUGINS"][0]["INSTANCES"][0]["DEEPLOY_RUNTIME_ARTIFACTS"]
+    commit, image = "b" * 40, "sha256:" + "a" * 64
+    self.assertEqual(restore("WORKER_APP_RUNNER", {"git_commit": commit}), {"git_commit": commit})
+    self.assertEqual(restore("CONTAINER_APP_RUNNER", {"image_id": image}), {"image_id": image})
+    for signature, artifacts in (("WORKER_APP_RUNNER", {"image_id": image}), ("CONTAINER_APP_RUNNER", {"git_commit": commit}),
+                                 ("CONTAINER_APP_RUNNER", {})):
+      with self.assertRaisesRegex(RuntimeError, "runtime artifacts are unavailable"):
+        restore(signature, artifacts)
+    # The registry reference of a container app travels with its image id, unchanged.
+    reference = "ghcr.io/acme/shop@sha256:" + "d" * 64
+    self.assertEqual(restore("CONTAINER_APP_RUNNER", {"image_id": image, "image_ref": reference}),
+                     {"image_id": image, "image_ref": reference})
+
+  def test_a_blocked_restoration_names_what_is_missing(self):
+    for signature, expected in (("WORKER_APP_RUNNER", "Git commit"), ("CONTAINER_APP_RUNNER", "image binding")):
+      plugin = Coordinator()
+      operation = plugin._save_operation(plugin.operation("update"), "restoring_previous", "Restoring.")
+      operation["retired_runtime"] = {"A": {}}
+      config = {"NAME": "app", "TYPE": "Void", "PLUGINS": [{"SIGNATURE": signature, "INSTANCES": [{"INSTANCE_ID": "worker"}]}]}
+      with self.assertRaises(RuntimeError):
+        plugin._send_operation_commands(operation, {"A": config}, "restore", "start", reports={})
+      saved = plugin._operation_records()[operation["operation_id"]]
+      self.assertEqual(saved["recovery"], "blocked")
+      self.assertEqual(saved["events"][-1]["message"], "Previous runtime {} is unavailable; restoration is blocked.".format(expected))
+
   def test_each_signed_record_is_checked_once_and_a_changed_one_again(self):
     # The worker reads every operation record every 2 s on every oracle, and every status poll reads them
     # again. Each read checked every signature: about 1 ms a record, a few hundred records, all the time.

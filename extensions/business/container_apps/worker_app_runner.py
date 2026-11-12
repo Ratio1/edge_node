@@ -215,6 +215,32 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     inner_block = " ".join(f"{part};" for part in checks) + " fi;"
     return f"if ! command -v git >/dev/null 2>&1; then {inner_block} fi"
 
+  def _deployment_pins_image(self):
+    """
+    A worker is never bound to the image it was started with.
+
+    Its image (for example `node:22`) is only the base on which the repository is cloned and built;
+    the application is the source code. What a tracked worker must restore exactly is its Git commit,
+    which stays pinned. The id of the base image exists only in the Docker store that pulled it: when
+    the node's own container is replaced that store can be empty, and a worker that insisted on the
+    old id would never start again. So the base image follows `IMAGE_PULL_POLICY` like that of an
+    untracked worker, and its id is recorded for information only.
+
+    Returns
+    -------
+    bool
+      Always False.
+
+    Examples
+    --------
+    >>> tracked_worker._deployment_pins_image()
+    False
+    >>> tracked_worker._get_full_image_ref()   # the configured base image, not a saved id
+    'node:22'
+    """
+    # The base image is pulled again when it is missing; the pinned Git commit is what is restored.
+    return False
+
   def _build_git_clone_command(self, repo_path):
     repo_url = shlex.quote(self.repo_url)
     repo_path = shlex.quote(repo_path)
