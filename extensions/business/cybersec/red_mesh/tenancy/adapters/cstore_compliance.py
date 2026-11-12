@@ -130,7 +130,7 @@ class CstoreComplianceStore:
       if not isinstance(key, str) or not key.startswith(prefix):
         continue
       try:
-        field = json.loads(key) if isinstance(key, str) else None
+        field = json.loads(key)
         valid = (isinstance(field, list) and len(field) in (4, 5) and field[:3] == [kind, self._namespace, tenant_id]
                  and key == self._location(kind, field[2:])[1])
       except (ValueError, RecursionError, TenantStoreError):
