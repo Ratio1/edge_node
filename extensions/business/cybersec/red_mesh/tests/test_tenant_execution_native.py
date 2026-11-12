@@ -204,6 +204,13 @@ def _render_native(default_route=None):
   return source, instance
 
 
+def native_call_kwargs(source):
+  """IPC kwargs the rendered template sends; naeural_core >= 7.7.354 (#246) adds the client IP."""
+  if "_http_request: Request" in source:
+    return {"profile": None, "client_ip": "fixture"}
+  return {"profile": None}
+
+
 @pytest.fixture
 def native_api():
   source, harness = _render_native()
@@ -420,7 +427,7 @@ def test_raw_json_preserves_positional_dispatch_and_rejects_malformed_selectors(
         "fixture-only-token" if key == "token" else payload.get(key, parameter.default)
         for key, parameter in parameters.items()
       )
-      assert module.eng.calls[-1] == (name, expected_args, {"profile": None})
+      assert module.eng.calls[-1] == (name, expected_args, native_call_kwargs(_render_native()[0]))
     for selector in SELECTORS:
       for value in (None, True, False, 0, 1, 1.5, [], ["tenant-A"], {}, {"id": "tenant-A"}):
         assert await _request(module, name, {selector: value}) == (422, 0)
