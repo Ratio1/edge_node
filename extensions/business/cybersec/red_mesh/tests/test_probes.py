@@ -5454,6 +5454,26 @@ class RedMeshCatchAllGatingTests(unittest.TestCase):
     )
     self.assertEqual(worker.state["catch_all_status"], {"http://example.com": 500})
 
+  def test_the_631_error_page_shape_withholds_every_java_deserialization_check(self):
+    """CUPS-like page: 500, echoed uri, and a per-request object address."""
+    import itertools
+    worker = self._build_worker()
+    counter = itertools.count(0x76cee5d69340, 0x1230)
+
+    def page(url, **_kwargs):
+      uri = "/" + url.split("/", 3)[3]
+      body = (
+        "<html><head><title>500 - Request did not return bytes</title></head><body>"
+        "<h1>Request did not return bytes</h1><p>Request: <pre>&lt;Request at "
+        f"{hex(next(counter))} method=GET uri={uri} clientproto=HTTP/1.1&gt;</pre><br />"
+        "Resource: <pre>&lt;core.protocol.Index object at 0x76cee5d6a000&gt;</pre></body></html>"
+      )
+      return self._response(500, body, {"Content-Type": "text/html"})
+
+    with patch(_DISCOVERY_GET, side_effect=page), patch(_INJECTION_GET, side_effect=page):
+      result = worker._web_test_java_deserialization("example.com", 80)
+    self.assertEqual(result["findings"], [])
+
   def test_a_500_catch_all_is_reported_and_named_like_the_200_one(self):
     worker = self._build_worker()
     with patch(_DISCOVERY_GET, side_effect=self._all(500)), \

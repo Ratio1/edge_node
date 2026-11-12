@@ -13,6 +13,20 @@ CATCH_ALL_TITLE = "Web server returns 200 for random paths"
 # makes status-only checks on that code as unreliable as a 200-for-all host.
 CATCH_ALL_ERROR_TITLE_PREFIX = "Web server returns HTTP "
 CATCH_ALL_ERROR_TITLE_SUFFIX = " for random paths"
+# Per-request noise in an error page (object addresses, ids, counters). Removed
+# before two error pages are compared, so "same page, different address" is equal.
+_VOLATILE_TOKEN_RE = _re.compile(
+  r"0x[0-9a-fA-F]+"
+  r"|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+  r"|\d{5,}"
+)
+
+
+def _error_page_shape(text, path):
+  """`text` with the requested `path` and volatile tokens replaced by placeholders."""
+  return _VOLATILE_TOKEN_RE.sub("{V}", str(text)[:4000].replace(path, "{P}"))
+
+
 # Statuses a healthy server answers for a path that does not exist.
 _NORMAL_MISSING_STATUSES = (404, 410)
 
@@ -74,7 +88,7 @@ class _WebDiscoveryMixin:
       status = canary_resp.status_code
       text = canary_resp.text
       if isinstance(text, str):
-        self.state.setdefault("catch_all_canary_body", {})[base_url] = text[:4000].replace(canary_path, "{P}")
+        self.state.setdefault("catch_all_canary_body", {})[base_url] = _error_page_shape(text, canary_path)
     except Exception:
       status = None
     statuses[base_url] = status
@@ -92,8 +106,10 @@ class _WebDiscoveryMixin:
 
     A status-only check (`status_only`) is judged on the status alone: equal to
     the random-path status means no information. A body-validated check is
-    affected only when the body is the canary's body with the path swapped, i.e.
-    an error page that echoes the requested path. Both record the path as withheld.
+    affected only when its body equals the canary's after the requested path and
+    volatile tokens (hex addresses, UUIDs, long digit runs) are normalised, i.e.
+    an error page that echoes the request. A genuine hit (a WSDL, a SOAP fault)
+    has different content and is kept. Both record the path as withheld.
     """
     status = self._catch_all_error_status(base_url)
     if status is None or resp.status_code != status:
@@ -103,7 +119,7 @@ class _WebDiscoveryMixin:
       text = resp.text
       if canary_body is None or not isinstance(text, str):
         return False
-      if text[:4000].replace(path, "{P}") != canary_body:
+      if _error_page_shape(text, path) != canary_body:
         return False
     self._withhold_on_catch_all(base_url, "_web_test_java_deserialization", path)
     return True
