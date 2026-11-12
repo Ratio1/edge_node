@@ -119,6 +119,10 @@ from extensions.business.cybersec.red_mesh.pentester_api_01 import (
 
 
 class _SchedulerHarness(NativeFastApiPlugin):
+  # Built with `__new__`, so no config is loaded; naeural_core reads these in `_reject_expired_request`.
+  cfg_request_timeout = None
+  cfg_max_queue_wait = None
+
   def P(self, *args, **_kwargs):
     if hasattr(self, "_test_messages") and args:
       self._test_messages.append(str(args[0]))
