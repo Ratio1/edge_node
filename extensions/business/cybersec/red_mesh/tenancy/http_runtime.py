@@ -445,6 +445,7 @@ def install_generated_read_api(app, model_namespace) -> None:
     from pydantic import BaseModel
     from pydantic.fields import FieldInfo
     from starlette.exceptions import HTTPException
+    from starlette.requests import Request
 
     if (not callable(app.add_middleware) or not callable(app.add_exception_handler)
         or not isinstance(app.exception_handlers, dict) or app.middleware_stack is not None):
@@ -463,8 +464,16 @@ def install_generated_read_api(app, model_namespace) -> None:
       route = routes[0]
       parameters = inspect.signature(route.endpoint).parameters
       body_params = route.dependant.body_params
+      # naeural_core >= 7.7.354 (#246) prepends `_http_request: Request` so the plugin sees the
+      # client IP. FastAPI injects it from the connection, never from the body, so it is the only
+      # extra parameter accepted; anything else still fails closed.
+      if tuple(parameters) == ("_http_request", "request_model"):
+        if parameters["_http_request"].annotation is not Request:
+          raise RuntimeError(_READ_ERROR)
+      elif tuple(parameters) != ("request_model",):
+        raise RuntimeError(_READ_ERROR)
       if (route.path != "/" + name or route.methods != {"POST"} or route.endpoint is not endpoint
-          or tuple(parameters) != ("request_model",) or parameters["request_model"].annotation is not model
+          or parameters["request_model"].annotation is not model
           or model is None or model.__name__ != name + "Model" or model.__module__ != endpoint.__module__
           or route.body_field is None or route.body_field.field_info.annotation is not model
           or len(body_params) != 1 or body_params[0].name != "request_model"
