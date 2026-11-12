@@ -46,6 +46,24 @@ class TestEvidenceEngine(unittest.TestCase):
     self.assertEqual(engine.soc_outcome(None, None), "absent")
     self.assertEqual(engine.classify("something_else", [_finding("a", "HIGH", "x")])["status"], "not_observable")
 
+  def test_keywords_match_at_a_word_start_not_inside_a_word(self):
+    plural = [_finding("a", "HIGH", "Weak passwords and exposed credentials")]
+    self.assertEqual(engine.classify("auth_access_findings", plural)["status"], "gap")
+    unauth = [_finding("b", "HIGH", "Unauthenticated remote code execution")]
+    self.assertEqual(engine.classify("auth_access_findings", unauth)["status"], "gap")
+    prelogin = [_finding("c", "HIGH", "MSSQL prelogin handshake succeeded")]
+    self.assertEqual(engine.classify("auth_access_findings", prelogin)["status"], "supported")
+    classloader = [_finding("d", "HIGH", "Spring MVC class.module.classloader binding")]
+    self.assertEqual(engine.classify("crypto_transport_findings", classloader)["status"], "supported")
+    self.assertEqual(engine.classify("crypto_transport_findings", [_finding("e", "HIGH", "SSLv3 enabled")])["status"], "gap")
+
+  def test_soc_status_values_match_whole_not_as_substrings(self):
+    for completed in ("sent", "completed", "Success", " OK "):
+      self.assertEqual(engine.soc_outcome({"last_status": completed}, None), "completed", completed)
+    self.assertEqual(engine.soc_outcome(None, {"status": "completed"}), "completed")
+    for other in ("unsuccessful", "token", "broken", "empty", "error", "not sent", "unsent"):
+      self.assertEqual(engine.soc_outcome({"last_status": other}, None), "present", other)
+
 
 if __name__ == "__main__":
   unittest.main()

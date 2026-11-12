@@ -42,6 +42,8 @@ STATES = ("draft", "submitted")
 VIEW = "compliance_assessments:view"
 MANAGE = "compliance_assessments:manage"
 PENDING_TTL_SECONDS = 15 * 60
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+MAX_SUBMISSIONS = 50  # revisions per assessment; checked when a submit starts, never on record or clear
 LEVEL_PROVENANCE_KINDS = ("risk_score", "declared")
 REMEDIATION_ITEM_MAX = 32
 TEXT_MAX = 200
@@ -369,7 +371,9 @@ def validate_framework_assessment(row, ids):
                               or not isinstance(pending.get("intent_digest"), str)
                               or not isinstance(pending.get("submitted_at"), str)
                               or type(pending.get("revision")) is not int
-                              or type(pending.get("started_at")) is not int):
+                              or type(pending.get("started_at")) is not int
+                              or ("claimant_digest" in pending
+                                  and not _SHA256_HEX.fullmatch(pending["claimant_digest"] if isinstance(pending["claimant_digest"], str) else ""))):
     raise ValueError("Invalid framework assessment pending marker")
   if row["state"] == "submitted" and pending is not None:
     raise ValueError("Invalid framework assessment state")
@@ -401,6 +405,12 @@ def claimant_for(tenant):
     return None
   return {"legal_name": legal.get("name"), "registration_id": legal.get("registration_id"),
           "signer_name": legal.get("signer_name"), "signer_role": legal.get("signer_role")}
+
+
+def claimant_digest(tenant):
+  """Digest of the claimant a snapshot would carry; `pending` holds it so a resume can tell the claimant changed."""
+  blob = json.dumps(claimant_for(tenant), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+  return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def _view_claimant(tenant):
@@ -655,6 +665,9 @@ def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revis
   if pending is not None and pending["request_id"] == request_id:
     if pending["actor"] != account.account_id or pending["intent_digest"] != digest:
       raise _denied(409, "conflict")
+    # A pending written before the key existed resumes as it always did.
+    if "claimant_digest" in pending and pending["claimant_digest"] != claimant_digest(tenant):
+      raise _denied(409, "conflict")
     level = row["assurance_level"]
     computed = score(pack, level, row["scores"])
     return {"outcome": "resume", "revision": pending["revision"],
@@ -665,6 +678,8 @@ def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revis
   _expected_revision(row, expected_assessment_revision)
   if pending is not None:
     raise _denied(409, "assessment_submit_pending", pending=_pending_view(pending, name_resolver(service)))
+  if len(row["submissions"]) >= MAX_SUBMISSIONS:
+    raise _denied(409, "submission_limit")
   level = row.get("assurance_level")
   if level is None:
     raise _denied(400, "assessment_invalid", errors=[{"code": "level_missing"}])
@@ -674,7 +689,8 @@ def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revis
   if list(row["pack_acts"]) != list(pack["acts"]):
     raise _denied(409, "assessment_pack_stale", current_pack_acts=list(pack["acts"]))
   pending = {"request_id": request_id, "actor": account.account_id, "intent_digest": digest,
-             "revision": latest_revision(row) + 1, "submitted_at": _now_iso(), "started_at": _epoch()}
+             "revision": latest_revision(row) + 1, "submitted_at": _now_iso(), "started_at": _epoch(),
+             "claimant_digest": claimant_digest(tenant)}
   updated = _stamp({**row, "pending": pending, "assessment_revision": row["assessment_revision"] + 1},
                    account.account_id)
   stored = _put(service, updated)

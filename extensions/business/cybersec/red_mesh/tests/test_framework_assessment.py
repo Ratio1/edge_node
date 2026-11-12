@@ -429,6 +429,92 @@ class TestFrameworkAssessment(FrameworkAssessmentFixture):
     self.assertEqual(stale["current_assessment_revision"], revision + 1)
     self.ok(self.submit(revision + 1, str(uuid4())))
 
+  def test_pending_carries_a_claimant_digest_and_a_resume_with_a_changed_claimant_is_a_conflict(self):
+    revision = self.complete_basic_draft()
+    request = str(uuid4())
+    self.documents.fail = True
+    self.refused(self.submit(revision, request), 503, "unavailable")
+    self.documents.fail = False
+    row = self.stored_row()
+    digest = row["pending"]["claimant_digest"]
+    self.assertRegex(digest, r"\A[0-9a-f]{64}\Z")
+    self.assertNotIn("Example Holdings SRL", json.dumps(row))  # the claimant itself stays off the row
+    with patch.object(compliance, "claimant_digest", return_value="0" * 64):
+      self.refused(self.submit(revision, request), 409, "conflict")
+    self.assertEqual(self.stored_row()["pending"]["claimant_digest"], digest)
+    data = self.ok(self.submit(revision, request))
+    self.assertEqual((data["revision"], data["replayed"]), (1, False))
+
+  def test_a_pending_written_before_the_claimant_digest_existed_resumes_as_before(self):
+    revision = self.complete_basic_draft()
+    request = str(uuid4())
+    self.documents.fail = True
+    self.refused(self.submit(revision, request), 503, "unavailable")
+    self.documents.fail = False
+    row = self.stored_row()
+    self.write_row({**row, "pending": {key: value for key, value in row["pending"].items() if key != "claimant_digest"}})
+    with patch.object(compliance, "claimant_digest", return_value="0" * 64):
+      data = self.ok(self.submit(revision, request))
+    self.assertEqual((data["revision"], data["replayed"]), (1, False))
+
+  def test_a_malformed_claimant_digest_in_pending_is_refused_by_the_validator(self):
+    revision = self.complete_basic_draft()
+    self.documents.fail = True
+    self.refused(self.submit(revision, str(uuid4())), 503, "unavailable")
+    row = self.stored_row()
+    for bad in (None, 7, "", "abc", "A" * 64, "g" * 64, "0" * 63):
+      broken = {**row, "pending": {**row["pending"], "claimant_digest": bad}}
+      with self.assertRaises(ValueError, msg=repr(bad)):
+        compliance.validate_framework_assessment(broken, [self.tenant, PACK])
+    compliance.validate_framework_assessment(row, [self.tenant, PACK])
+
+  def test_the_fifty_first_submission_is_refused_at_prepare_only(self):
+    revision = self.complete_basic_draft()
+    self.ok(self.submit(revision, str(uuid4())))
+    current = self.ok(self.get())["assessmentRevision"]
+    self.ok(self.reopen(current, str(uuid4())))
+    row = self.stored_row()
+    template = row["submissions"][0]
+    submissions = [{**template, "revision": index, "request_id": str(uuid4())} for index in range(1, compliance.MAX_SUBMISSIONS)]
+    self.write_row({**row, "submissions": submissions})
+    signed = self.ok(self.save({"completion_date": "2026-11-01",
+                                "management_signoff": {"name": "Ana Pop", "role": "Director", "date": "2026-11-01"}},
+                               row["assessment_revision"]))
+    last = self.ok(self.submit(signed["assessmentRevision"], str(uuid4())))  # the 50th still goes through
+    self.assertEqual(last["revision"], compliance.MAX_SUBMISSIONS)
+    # Reopen: the 51st submit is refused at prepare, with no pending written.
+    current = self.ok(self.get())["assessmentRevision"]
+    self.ok(self.reopen(current, str(uuid4())))
+    row = self.stored_row()
+    signed = self.ok(self.save({"completion_date": "2026-11-02",
+                                "management_signoff": {"name": "Ana Pop", "role": "Director", "date": "2026-11-02"}},
+                               row["assessment_revision"]))
+    refusal = self.submit(signed["assessmentRevision"], str(uuid4()))
+    self.refused(refusal, 409, "submission_limit")
+    self.assertEqual(self.events[-1][1]["error"], "submission_limit")
+    self.assertIsNone(self.stored_row()["pending"])
+    self.assertEqual(len(self.stored_row()["submissions"]), compliance.MAX_SUBMISSIONS)
+
+  def test_the_cap_never_blocks_record_or_clear_pending(self):
+    revision = self.complete_basic_draft()
+    request = str(uuid4())
+    self.documents.fail = True
+    self.refused(self.submit(revision, request), 503, "unavailable")
+    self.documents.fail = False
+    row = self.stored_row()
+    template = {"ref": {"store": self.documents.name, "ref": "doc-x"}, "fingerprint": "f" * 64, "actor": "initial",
+                "submitted_at": "2026-10-06T00:00:00Z", "pack_acts": list(row["pack_acts"]), "assurance_level": "basic",
+                "verdict": {"passed": True}}
+    full = [{**template, "revision": index, "request_id": str(uuid4())} for index in range(1, compliance.MAX_SUBMISSIONS + 1)]
+    pending = {**row["pending"], "revision": compliance.MAX_SUBMISSIONS + 1}
+    self.write_row({**row, "submissions": full, "pending": pending})
+    data = self.ok(self.submit(revision, request))  # resume reaches record with 50 rows already stored
+    self.assertEqual(data["revision"], compliance.MAX_SUBMISSIONS + 1)
+    # clear-pending is not capped either.
+    row = self.stored_row()
+    self.write_row({**row, "state": "draft", "pending": {**pending, "started_at": 1}})
+    self.assertTrue(self.ok(self.submit(None, None, self.creator, action="clear_pending"))["cleared"])
+
   def test_record_is_superseded_when_the_pending_was_replaced(self):
     revision = self.complete_basic_draft()
     request = str(uuid4())
@@ -500,7 +586,30 @@ class TestFrameworkAssessment(FrameworkAssessmentFixture):
     self.refused(self.artifact(2), 404, "assessment_not_found")
     self.refused(self.artifact("1"), 404, "assessment_not_found")
     self.documents.envelopes["doc-1"]["revision"] = 7
+    self.events.clear()
     self.refused(self.artifact(1), 409, "document_integrity")
+    event, details = self.events[-1]
+    self.assertEqual((event, details["operation"], details["step"], details["status_code"], details["error"]),
+                     ("framework_assessment_refused", "artifact", "verify", 409, "document_integrity"))
+    self.assertEqual((details["assessment_id"], details["revision"]), ("default", 1))
+    self.assertNotIn("doc-1", str(details))
+
+  def test_artifact_read_failure_and_store_mismatch_are_audited_without_the_reference(self):
+    revision = self.complete_basic_draft()
+    self.ok(self.submit(revision, str(uuid4())))
+    self.events.clear()
+    self.documents.fail = True
+    self.refused(self.artifact(1), 503, "unavailable")
+    self.assertEqual((self.events[-1][0], self.events[-1][1]["operation"], self.events[-1][1]["step"]),
+                     ("framework_assessment_refused", "artifact", "read"))
+    self.documents.fail = False
+    row = self.stored_row()
+    submissions = [{**row["submissions"][0], "ref": {"store": "other-store", "ref": "doc-1"}}]
+    self.write_row({**row, "submissions": submissions})
+    self.events.clear()
+    self.refused(self.artifact(1), 503, "unavailable")
+    self.assertEqual((self.events[-1][1]["step"], self.events[-1][1]["revision"]), ("store_mismatch", 1))
+    self.assertNotIn("other-store", str(self.events))
 
   # -- purge ------------------------------------------------------------------------------------
 
@@ -695,6 +804,35 @@ class TestSeveralAssessments(FrameworkAssessmentFixture):
     self.storage.data[(COMPLIANCE_HKEY, json.dumps([compliance.KIND, "deployment", self.tenant, PACK, "bad"]))] = {"x": 1}
     ids = sorted(self.store().tenant_record_ids(compliance.KIND, self.tenant))
     self.assertEqual(ids, sorted([[self.tenant, PACK], [self.tenant, PACK, FA]]))
+
+  def test_the_enumeration_bound_counts_only_this_tenants_keys(self):
+    from extensions.business.cybersec.red_mesh.tenancy.adapters import cstore_compliance
+    from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
+    self.put_fa(FA)
+    for index in range(5):  # other tenants' rows and tombstones must not eat the bound
+      other = json.dumps([compliance.KIND, "deployment", f"tn_other{index}", PACK], separators=(",", ":"))
+      self.storage.data[(COMPLIANCE_HKEY, other)] = None
+    with patch.object(cstore_compliance, "MAX_ENUMERATED_RECORDS", 1):
+      self.assertEqual(self.store().tenant_record_ids(compliance.KIND, self.tenant), [[self.tenant, PACK, FA]])
+    with patch.object(cstore_compliance, "MAX_ENUMERATED_RECORDS", 0):
+      with self.assertRaises(TenantStoreError):
+        self.store().tenant_record_ids(compliance.KIND, self.tenant)
+
+  def test_enumeration_parses_only_keys_with_this_tenants_prefix(self):
+    self.put_fa(FA)
+    foreign = [json.dumps([compliance.KIND, "deployment", "tn_other", PACK], separators=(",", ":")), "not json"]
+    for key in foreign:
+      self.storage.data[(COMPLIANCE_HKEY, key)] = None
+    parsed = []
+    real = json.loads
+    from extensions.business.cybersec.red_mesh.tenancy.adapters import cstore_compliance
+    def spy(text, *args, **kwargs):
+      parsed.append(text)
+      return real(text, *args, **kwargs)
+    with patch.object(cstore_compliance.json, "loads", spy):
+      self.store().tenant_record_ids(compliance.KIND, self.tenant)
+    self.assertFalse(set(parsed) & set(foreign))
+    self.assertTrue(parsed)
 
   def test_tenant_record_ids_does_not_hgetall(self):
     self.put_fa()
