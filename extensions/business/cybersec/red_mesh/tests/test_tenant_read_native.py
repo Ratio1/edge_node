@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from .test_tenant_execution_native import ACTOR_ONLY_READ_ROUTES, TENANT_EXPORT_STATUS_ROUTES, TENANT_JOBLESS_READ_ROUTES, TENANT_REQUIRED_READ_ROUTES, EFFECT_ROUTES, UNGUARDED_ROUTES, TENANT_JSON_EXPORT_ROUTES, LEGACY_READ_ROUTES, TENANT_REVIEW_READ_ROUTES, TENANT_ARTIFACT_READ_ROUTES, READ_ROUTES, REPO_ROOT, ROUTES, _Comms, _render_native
+from .test_tenant_execution_native import ACTOR_ONLY_READ_ROUTES, TENANT_EXPORT_STATUS_ROUTES, TENANT_JOBLESS_READ_ROUTES, TENANT_REQUIRED_READ_ROUTES, EFFECT_ROUTES, UNGUARDED_ROUTES, TENANT_JSON_EXPORT_ROUTES, LEGACY_READ_ROUTES, TENANT_REVIEW_READ_ROUTES, TENANT_ARTIFACT_READ_ROUTES, READ_ROUTES, REPO_ROOT, ROUTES, _Comms, _render_native, native_call_kwargs
 
 
 ERROR = "Incompatible generated read API"
@@ -121,7 +121,7 @@ def test_raw_body_preserves_actual_positional_dispatch_and_omitted_requester(rea
       assert result == ({} if name in LIST_ROUTES else {"success": True})
       assert calls == 1
       assert module.eng.calls[-1] == (name, tuple(supplied.get(key, param.default)
-        for key, param in parameters.items()), {"profile": None})
+        for key, param in parameters.items()), native_call_kwargs(_render_native()[0]))
   asyncio.run(checks())
 
 
@@ -200,6 +200,47 @@ def test_route_model_contract_corruption_fails_at_install(read_native, name, fau
     route.dependant.body_params[0].field_info.annotation = object
   elif fault == "dependency":
     route.dependant.dependencies = [object()]
+  with pytest.raises(RuntimeError, match=f"^{ERROR}$"):
+    install(module)
+  assert module.eng.calls == []
+
+
+def _set_signature(endpoint, parameters):
+  endpoint.__signature__ = inspect.signature(endpoint).replace(parameters=parameters)
+
+
+@pytest.mark.parametrize("shape", ("generated", "request_model_only", "client_ip"))
+def test_read_install_accepts_both_template_signatures(read_native, shape):
+  """naeural_core >= 7.7.354 (#246) prepends `_http_request: Request`; older templates do not."""
+  from starlette.requests import Request
+  module, _ = read_native
+  for name in READ_ROUTES:
+    endpoint = module.__dict__[name]
+    request_model = inspect.signature(endpoint).parameters["request_model"]
+    if shape == "request_model_only":
+      _set_signature(endpoint, [request_model])
+    elif shape == "client_ip":
+      _set_signature(endpoint, [inspect.Parameter(
+        "_http_request", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Request), request_model])
+  install(module)
+  assert module.eng.calls == []
+
+
+@pytest.mark.parametrize("name", READ_ROUTES)
+@pytest.mark.parametrize("fault", ("foreign_name", "foreign_annotation", "trailing", "reordered"))
+def test_read_install_rejects_any_other_extra_parameter(read_native, name, fault):
+  from starlette.requests import Request
+  module, _ = read_native
+  endpoint = module.__dict__[name]
+  request_model = inspect.signature(endpoint).parameters["request_model"]
+  kind = inspect.Parameter.POSITIONAL_OR_KEYWORD
+  params = {
+    "foreign_name": [inspect.Parameter("client", kind, annotation=Request), request_model],
+    "foreign_annotation": [inspect.Parameter("_http_request", kind, annotation=str), request_model],
+    "trailing": [request_model, inspect.Parameter("extra", kind, default=None)],
+    "reordered": [request_model, inspect.Parameter("_http_request", kind, annotation=Request)],
+  }[fault]
+  _set_signature(endpoint, params)
   with pytest.raises(RuntimeError, match=f"^{ERROR}$"):
     install(module)
   assert module.eng.calls == []

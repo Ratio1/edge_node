@@ -119,7 +119,8 @@ from extensions.business.cybersec.red_mesh.pentester_api_01 import (
 
 
 class _SchedulerHarness(NativeFastApiPlugin):
-  # Built with `__new__`, so no config is loaded; naeural_core reads these in `_reject_expired_request`.
+  # Built with __new__, so no plugin config is loaded. naeural_core >= 7.7.355 (#247) reads these
+  # while admitting a request; None means no timeout and no queue-wait limit.
   cfg_request_timeout = None
   cfg_max_queue_wait = None
 
