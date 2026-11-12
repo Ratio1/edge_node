@@ -2,9 +2,9 @@
 import copy
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
-from extensions.business.container_apps.tests.support import make_lifecycle_runner
+from extensions.business.container_apps.tests.support import make_lifecycle_runner, make_mock_container
 from extensions.business.container_apps.worker_app_runner import WorkerAppRunnerPlugin
 import docker
 
@@ -183,8 +183,65 @@ class RuntimeArtifactTests(unittest.TestCase):
       plugin.cfg_deeploy_runtime_artifacts = {"image_id": IMAGE_ID, "image_ref": tagged}
       with self.assertRaisesRegex(ValueError, "image binding"):
         plugin._get_pinned_deployment_artifacts()
+    # A plain reference is accepted only in the configured repository: back to the one REF is in.
+    plugin.cfg_image = "test/image:latest"
     plugin.cfg_deeploy_runtime_artifacts = {"image_id": IMAGE_ID, "image_ref": REF}
     self.assertEqual(plugin._get_pinned_deployment_artifacts(), {"image_id": IMAGE_ID, "image_ref": REF})
+
+  def test_a_restoration_may_name_only_the_configured_repository(self):
+    plugin, client, _, _ = self.runner()
+    client.images.get.side_effect = docker.errors.NotFound("nothing in this Docker store")
+    # Another registry with the same path, another repository, the same repository spelled another way:
+    # each is refused before anything is pulled, although each has the shape of a reference.
+    for elsewhere in ("other-registry:5000/test/image", "test/other", "docker.io/test/image"):
+      plugin.cfg_deeploy_runtime_artifacts = {"image_id": IMAGE_ID, "image_ref": elsewhere + "@sha256:" + "d" * 64}
+      with self.assertRaisesRegex(ValueError, "image binding"):
+        plugin._ensure_image_available()
+    client.images.pull.assert_not_called()
+    # What this node saves for its image always comes back accepted: registry port, Docker Hub names, a
+    # registry server from CR_DATA, a configured digest instead of a tag.
+    for configured, server, listed in (
+      ("test/image:latest", "docker.io", REF),
+      ("docker.io/library/nginx:1.27", None, "nginx@sha256:" + "d" * 64),
+      ("team/app:1", "registry:5000", "registry:5000/team/app@sha256:" + "d" * 64),
+      ("acme/shop@sha256:" + "e" * 64, "ghcr.io", "ghcr.io/acme/shop@sha256:" + "d" * 64),
+    ):
+      plugin.cfg_image, plugin.cfg_cr_data = configured, {"SERVER": server}
+      saved = plugin._get_image_registry_ref(image(IMAGE_ID, "elsewhere/copy@sha256:" + "1" * 64, listed))
+      self.assertEqual(saved, listed)
+      plugin.cfg_deeploy_runtime_artifacts = {"image_id": IMAGE_ID, "image_ref": saved}
+      self.assertEqual(plugin._get_pinned_deployment_artifacts(), {"image_id": IMAGE_ID, "image_ref": saved})
+
+  def test_an_image_lost_under_a_running_app_is_asked_for_beyond_the_restart_limit(self):
+    # The image is removed by force under the running app, which then stops: its restart finds no image.
+    plugin, client, container, _ = self.runner(bound(image_ref=REF))
+    clock = [1000.0]
+    plugin.time = lambda: clock[0]
+    container.image = image(IMAGE_ID, REF)
+    plugin._handle_initial_launch()
+    client.images.get.side_effect = docker.errors.NotFound("nothing in this Docker store")
+    client.images.pull.side_effect = RuntimeError("manifest unknown")
+    # Three crashes just before: the stop and the restart without an image bring the count to the limit.
+    plugin._consecutive_failures = 3
+    container.status, container.attrs = "exited", {"State": {"ExitCode": 1, "Running": False}}
+    with patch.object(docker, "from_env", return_value=client):  # a restart makes a new Docker client
+      for _ in range(12 * 60):  # twelve hours of laps, one a minute
+        plugin.process()
+        clock[0] += 60
+      # The stop and the restart without an image reach the restart limit; the launch path still asks after that.
+      self.assertEqual(plugin._consecutive_failures, plugin.cfg_restart_max_retries)
+      self.assertGreater(plugin._image_pull_failures, plugin.cfg_restart_max_retries)
+      self.assertFalse([line for line in plugin.logged_messages if "abandoned" in line])
+      # The registry serves the bound image again: the app runs it within the hour.
+      client.images.pull.side_effect = None
+      client.images.pull.return_value = image(IMAGE_ID, REF)
+      client.containers.run.return_value = make_mock_container()
+      client.containers.run.return_value.image = image(IMAGE_ID, REF)
+      for _ in range(61):
+        plugin.process()
+        clock[0] += 60
+    self.assertEqual(client.containers.run.call_count, 2)
+    self.assertIs(plugin.container, client.containers.run.return_value)
 
   def test_a_tracked_worker_whose_base_image_was_lost_pulls_it_again_and_keeps_its_commit(self):
     # A real worker instance on the harness state: the base image follows the pull policy, the commit stays.

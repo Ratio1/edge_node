@@ -840,13 +840,26 @@ class ContainerAppRunnerPlugin(
     Raises
     ------
     ValueError
-      When the restoration command carries a malformed binding, or no image id for a runner that is
-      bound to its image.
+      When the restoration command carries a malformed binding, a registry reference outside the
+      repository this app is configured with, or no image id for a runner that is bound to its image.
+    TypeError
+      When the restoration command's registry reference is not a string.
+
+    Notes
+    -----
+    The command's registry reference passes `_is_configured_registry_ref`, the same test by which
+    this node picks the reference it saves and reports, so a reference this node reported for the
+    same configuration always passes. It is checked before anything is pulled: every pull of the
+    bound image takes its references from this binding.
 
     Examples
     --------
     >>> plugin._get_pinned_deployment_artifacts()
     {'image_id': 'sha256:9f2c...'}
+    >>> plugin.cfg_deeploy_runtime_artifacts = {"image_id": "sha256:9f2c...", "image_ref": "other-registry:5000/acme/shop@sha256:4f1c..."}
+    >>> plugin._get_pinned_deployment_artifacts()   # the app is configured with ghcr.io/acme/shop
+    Traceback (most recent call last):
+    ValueError: Invalid immutable deployment image binding
     """
     explicit = getattr(self, "cfg_deeploy_runtime_artifacts", None)
     if explicit is not None:
@@ -860,11 +873,11 @@ class ContainerAppRunnerPlugin(
         # A missing or malformed image id where one is needed: nothing can be restored from it.
         raise ValueError("Invalid immutable deployment image binding")
       # The registry reference is optional, but what is pulled from it must be a repository (with an
-      # optional registry host and port) and a digest and nothing else: a ":" is accepted only as the
-      # registry port, so no tag, no credentials and no second "@" pass.
-      if "image_ref" in explicit and not re.fullmatch(
-          r"(?:[\w.\-]+(?::\d+)?/)?[\w.\-/]+@sha256:[0-9a-f]{64}", explicit["image_ref"], re.ASCII):
-        # Refuse the whole restoration command: a reference of any other shape is never pulled.
+      # optional registry host and port) and a digest and nothing else, in the repository this app is
+      # configured with: the node pulls only where its configuration says, never where a command
+      # says. It is the same test by which this node chose the reference it saved and reported.
+      if "image_ref" in explicit and not self._is_configured_registry_ref(explicit["image_ref"]):
+        # Refuse the whole restoration command: a reference of any other shape or repository is never pulled.
         raise ValueError("Invalid immutable deployment image binding")
       commit = explicit.get("git_commit")
       if commit is not None and not re.fullmatch(r"[0-9a-f]{40}", commit):
@@ -4161,6 +4174,55 @@ class ContainerAppRunnerPlugin(
     """
     # Every repository this image was pulled from, each with the digest that names it there.
     references = (image.attrs or {}).get("RepoDigests") or []
+    # Only the configured repository, and only a plain repository and digest; any other is not saved.
+    for reference in references:
+      if self._is_configured_registry_ref(reference):
+        # A reference any Docker store can pull, and that can only ever name this image.
+        return reference
+    # Built or loaded locally, or not from this repository: nothing to fetch it again by.
+    return None
+
+  def _is_configured_registry_ref(self, reference):
+    """
+    Whether a reference is a plain `repository@sha256:<digest>` in the configured repository.
+
+    This one test decides which reference this node saves for its image (`_get_image_registry_ref`)
+    and which reference a restoration command may bring (`_get_pinned_deployment_artifacts`). A
+    reference this node saved and reported therefore always passes when it comes back, and a
+    reference that names any other registry or repository is never pulled.
+
+    Parameters
+    ----------
+    reference : str
+      A registry reference, as Docker lists it in `RepoDigests` or as a restoration command sends it.
+
+    Returns
+    -------
+    bool
+      True when the reference is an optional registry host with port, a repository and a digest and
+      nothing else (no tag, no credentials, no second "@"), and its repository is the configured one.
+
+    Raises
+    ------
+    TypeError
+      When the reference is not a string; a malformed restoration command then fails loudly.
+
+    Notes
+    -----
+    The configured repository is the configured image reference (with the `CR_DATA` registry server
+    in front when it is not Docker Hub) without its tag or digest, and a Docker Hub image is written
+    without `index.docker.io/`, `docker.io/` and `library/`, as Docker lists it. The comparison is
+    exact text: another spelling of the same repository (a Docker Hub image written with
+    `docker.io/`, a host in other upper or lower case) does not pass and is never rewritten.
+
+    Examples
+    --------
+    >>> self.cfg_image = "ghcr.io/acme/shop:stable"
+    >>> self._is_configured_registry_ref("ghcr.io/acme/shop@sha256:4f1c...")
+    True
+    >>> self._is_configured_registry_ref("other-registry:5000/acme/shop@sha256:4f1c...")
+    False
+    """
     # The configured reference without its tag or digest: "ghcr.io/acme/shop:stable" -> "ghcr.io/acme/shop".
     configured = super()._get_full_image_ref().split("@")[0]
     # A ":" after the last "/" starts a tag; one before it belongs to a registry port.
@@ -4169,14 +4231,9 @@ class ContainerAppRunnerPlugin(
     for prefix in ("index.docker.io/", "docker.io/", "library/"):
       # Compare the configured repository in the form Docker lists it.
       repository = repository.removeprefix(prefix)
-    # Only the configured repository, and only a plain repository and digest; any other is not saved.
-    for reference in references:
-      if reference.split("@")[0] == repository and re.fullmatch(
-          r"(?:[\w.\-]+(?::\d+)?/)?[\w.\-/]+@sha256:[0-9a-f]{64}", reference, re.ASCII):
-        # A reference any Docker store can pull, and that can only ever name this image.
-        return reference
-    # Built or loaded locally, or not from this repository: nothing to fetch it again by.
-    return None
+    # The shape first: it raises for a non-string, so a malformed command fails loudly; then the repository, as written.
+    return bool(re.fullmatch(r"(?:[\w.\-]+(?::\d+)?/)?[\w.\-/]+@sha256:[0-9a-f]{64}", reference, re.ASCII)) \
+      and reference.split("@")[0] == repository
 
   def _recover_bound_image(self, artifacts):
     """
@@ -4272,6 +4329,9 @@ class ContainerAppRunnerPlugin(
     "failed" is reported only when every known reference was pulled and gave another image (a tag
     that moved). A pull that raises, a "not found" answer included, is reported as "pulling_image"
     and tried again: a failed report cannot be taken back for that attempt.
+    The attempts also go on when the image disappears under a running app: the restart that finds
+    it missing counts one failed restart and leaves no container, so the following laps take the
+    launch path. RESTART_MAX_RETRIES ends only the restarts of a container that exists and has stopped.
 
     Examples
     --------
