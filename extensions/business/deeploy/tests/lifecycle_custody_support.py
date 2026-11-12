@@ -62,6 +62,34 @@ class Engine:
   def web3_is_dauth_oracle(self, address, network=None):
     return address == '0xdauth'
 
+  def P(self, s, color=None, **kwargs):
+    """
+    Accept a log line, as the real engine's `P` does.
+
+    The SDK's custody call logs through its engine: a refusal is logged in red with the alias of the dAuth
+    server that refused. The real engine has `P`, so the test engine has one too. The line is dropped, as
+    the fixture nodes drop theirs; a test that checks a line replaces `P` on the engine.
+
+    Parameters
+    ----------
+    s : str
+      The line to log.
+    color : str or None, optional
+      The line's color, such as 'r'.
+    **kwargs
+      Other options the real `P` takes, such as `boxed` or `verbosity`.
+
+    Returns
+    -------
+    None
+      Nothing is logged.
+
+    Examples
+    --------
+    >>> Engine('oracle').P('dAuth server dauth refused secret reconciliation (revoke).', color='r')
+    """
+    pass
+
 
 class Blobs:
   def __init__(self):
@@ -97,6 +125,33 @@ class State:
 
 class Node:
   def configure(self, state, address, custodian=False):
+    """
+    Give a fixture node the fields and helpers the real plugin has.
+
+    Binds the node to the shared fixture state, gives it its own test engine and blockchain wrapper, and
+    creates the plugin fields the deeploy and dAuth mixins read, as the real plugin's init does, including
+    the operations worker's fields that `_init_deployment_operations` creates (`_custody_retry` among them).
+    The worker thread itself is not started.
+
+    Parameters
+    ----------
+    state : State
+      The shared fixture state: public and secret stores, blobs and the clock.
+    address : str
+      The node's address; also its alias.
+    custodian : bool, optional
+      True for the dAuth node, the only one allowed to read the secret stores. Default False.
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> coordinator = Coordinator(State())
+    >>> coordinator.address, coordinator.custodian, coordinator._custody_retry
+    ('oracle', False, {})
+    """
     self.state = state
     self.address = address
     self.custodian = custodian
@@ -120,6 +175,9 @@ class Node:
     self._operations_confirmed = {}
     self._operations_sent_at = {}
     self._verified_operation_records = set()  # as _init_deployment_operations creates it
+    # The operations worker's custody waits, as _init_deployment_operations creates them; without it a pass of
+    # _reconcile_coordinator_operations would fail on the missing field instead of pacing a failed custody call.
+    self._custody_retry = {}
     self._deployment_operations_event = threading.Event()
     self._deployment_operations_stop = threading.Event()
     self._get_response = lambda value: value
@@ -189,11 +247,69 @@ def pipeline(secret='fresh-token', revision=0):
 
 
 def connect(test, state, custodian):
+  """
+  Route a test's SDK custody calls to the fixture's dAuth node.
+
+  Patches the SDK's HTTP post so that each custody request is processed by `custodian` and answered as a
+  dAuth server answers it (see `post`), and patches the SDK's clock to the shared fixture time. Both
+  patches are removed when the test ends.
+
+  Parameters
+  ----------
+  test : unittest.TestCase
+    The running test; its cleanup removes the patches.
+  state : State
+    The shared fixture state; its `now` is the SDK's clock.
+  custodian : Custodian
+    The dAuth node that processes each request and signs each answer.
+
+  Returns
+  -------
+  unittest.mock.MagicMock
+    The patched HTTP post, for call assertions.
+
+  Examples
+  --------
+  >>> http = connect(self, self.state, self.dauth)
+  >>> http.call_count
+  0
+  """
   def post(url, json, timeout):
+    """
+    Answer one custody request as a dAuth server does.
+
+    The custodian processes the signed request body. A refusal (ValueError or RuntimeError) is answered
+    with the request's nonce and an error only. Every answer then gets the fields a dAuth server adds to
+    every answer (its alias, version, time, epoch and uptime) and is signed, as a dAuth server does for
+    every answer it sends; the SDK names the server that refused by that alias.
+
+    Parameters
+    ----------
+    url : str
+      The reconcile endpoint the SDK posts to; not checked here.
+    json : dict
+      The posted document; its `body` is the signed request.
+    timeout : tuple
+      The SDK's HTTP timeout; not used here.
+
+    Returns
+    -------
+    types.SimpleNamespace
+      A response with status code 200 whose `json()` returns `{'result': answer}`.
+
+    Examples
+    --------
+    >>> post('https://dauth/reconcile_job_secrets', {'body': request}, (10, 60)).json()['result']['server_alias']
+    'dauth'
+    """
     try:
       result = custodian.process_dauth_reconcile_secrets_request(json['body'])
     except (ValueError, RuntimeError):
       result = {'nonce': json['body']['nonce'], 'error': 'custody rejected'}
+    # A dAuth server adds these fields to every answer before it signs it (dauth_manager `__get_response`); the
+    # fixture node's address is its alias. The SDK reads the alias to name the server that refused.
+    result.update(server_alias=custodian.address, server_version='fixture', server_time='1970-01-01 00:00:00',
+                  server_current_epoch=0, server_uptime='0:00:00')
     custodian.bc.sign(result)
     return SimpleNamespace(status_code=200, json=lambda: {'result': result})
   http = patch('ratio1.bc.base.requests.post', side_effect=post)

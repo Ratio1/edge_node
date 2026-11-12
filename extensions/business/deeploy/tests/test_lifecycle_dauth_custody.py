@@ -114,8 +114,12 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     stale = dict(operation, phase='finalizing')
     self.coordinator.bc.sign(stale)
     writes = len(self.state.writes)
+    logs = []
+    self.coordinator.engine.P = lambda message, color=None, **kwargs: logs.append((message, color))
     with self.assertRaises(RuntimeError):
       self.coordinator._deployment_secret_request('revoke', stale, active_attempt='deploy')
+    # The SDK names the dAuth server that refused, by the alias its signed answer carries.
+    self.assertEqual(logs, [('dAuth server dauth refused secret reconciliation (revoke).', 'r')])
     self.assertEqual(len(self.state.writes), writes)
     restored_ref = '7|' + operation['operation_id'] + ':restore'
     self.assertNotIn('revoked', self.state.secrets['DAUTH_JOB_SECRET_REVISIONS', restored_ref])
@@ -193,6 +197,40 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.assertEqual(self.state.public['DEEPLOY_DEPLOYED_JOBS', '7'], cid)
     self.assertEqual(self.token(self.state.secrets['DAUTH_JOB_SECRETS', '7']), 'old-token')
     self.assertEqual(self.coordinator.commands, [])
+
+  def test_worker_waits_after_dauth_refuses_a_cleanup_and_the_sdk_names_the_server(self):
+    # Worker passes against a signed dAuth refusal: the refused cleanup waits 10 s instead of calling dAuth every 2 s.
+    previous, cid = self.legacy()
+    self.state.fail_write = lambda namespace, key: 'before' if namespace == 'DAUTH_JOB_SECRET_REVISIONS' and key.endswith(':deploy') else None
+    with self.assertRaises(RuntimeError):
+      self.admit(previous)
+    self.state.fail_write = None
+    self.coordinator = Coordinator(self.state)
+    # Wraps the test engine's own P, so the SDK's refusal line also goes through its real signature.
+    self.coordinator.engine.P = Mock(wraps=self.coordinator.engine.P)
+    lines = []
+    self.coordinator.P = lambda message, color=None, **kwargs: lines.append((message, color))
+    self.state.now = self.operation()['preparation_deadline']
+    serve = self.dauth.process_dauth_reconcile_secrets_request
+    self.dauth.process_dauth_reconcile_secrets_request = Mock(side_effect=RuntimeError('custody store unavailable'))
+    calls = self.http.call_count
+    for _ in range(2):
+      self.coordinator._reconcile_coordinator_operations()
+      self.state.now += 2
+    # Expired at its deadline, its cleanup was refused once; the pass 2 s later did not call dAuth again.
+    self.assertEqual(self.http.call_count, calls + 1)
+    self.coordinator.engine.P.assert_called_once_with('dAuth server dauth refused secret reconciliation (revoke).', color='r')
+    red = [message for message, color in lines if color == 'r']
+    self.assertEqual(len(red), 1)
+    self.assertTrue(red[0].endswith('(custody failure 1, next try in 10 s)'))
+    self.dauth.process_dauth_reconcile_secrets_request = serve
+    self.state.now += 6
+    self.coordinator._reconcile_coordinator_operations()
+    # 10 s after the refusal dAuth is called again, cleans up, and the wait ends.
+    self.assertEqual(self.http.call_count, calls + 2)
+    self.assertEqual((self.operation()['phase'], self.operation()['outcome']), ('completed', 'failed'))
+    self.assertEqual(self.coordinator._custody_retry, {})
+    self.assertEqual(self.state.public['DEEPLOY_DEPLOYED_JOBS', '7'], cid)
 
   def test_uncertain_complete_preparation_recovers_without_credentials_in_coordinator(self):
     self.state.fail_write = lambda namespace, key: 'after' if namespace == 'DAUTH_JOB_SECRET_REVISIONS' else None

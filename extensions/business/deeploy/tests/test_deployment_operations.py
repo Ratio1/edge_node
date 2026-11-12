@@ -10,7 +10,7 @@ from ratio1.const.base import BCct
 
 from extensions.business.deeploy.deployment_operations import (
   _DeploymentOperationsMixin, OPERATIONS_HKEY, NODE_OPERATIONS_HKEY,
-  SECRET_REVISIONS_HKEY, request_digest, report_is_ready,
+  SECRET_REVISIONS_HKEY, DeploymentCustodyError, request_digest, report_is_ready,
 )
 from extensions.business.deeploy.tests.support import LifecycleCustodyDouble
 
@@ -40,6 +40,7 @@ class Coordinator(_DeploymentOperationsMixin):
     self._operations_confirmed = {}
     self._operations_sent_at = {}
     self._verified_operation_records = set()  # as _init_deployment_operations creates it
+    self._custody_retry = {}  # as _init_deployment_operations creates it
     self.cfg_deployment_readiness_timeout = 60
     self._get_response = lambda result: result
     self.P = lambda *args, **kw: None
@@ -207,6 +208,160 @@ class DeploymentOperationTests(unittest.TestCase):
     self.assertEqual([color for _, color in lines], ["r"])
     self.assertIn("KeyError in _deployment_operation_worker > failing_pass", lines[0][0])
     self.assertNotIn("secret-value-in-error", lines[0][0])
+
+  def test_a_failed_custody_call_is_tried_again_after_10_20_40_s_and_at_most_every_300_s(self):
+    # Before, an operation whose dAuth custody call failed called the same dAuth server again on every 2 s pass.
+    plugin = Coordinator()
+    lines = []
+    plugin.P = lambda message, color=None, **kw: lines.append((message, color))
+    stuck, other = plugin.operation(), plugin.operation()
+    stuck.update(phase="cleaning_up_preparation", outcome="failed", recovery="in_progress")
+    other.update(operation_id=stuck["operation_id"].replace("-test", "-other"), job_id=2,
+                 phase="waiting_for_readiness", deadline=10_000)
+    for operation in (stuck, other):
+      plugin._save_operation(operation)
+    calls, handled = [], []
+
+    def unavailable(payload):
+      calls.append(plugin.now)
+      raise RuntimeError("dAuth reconciliation service is unavailable.")
+
+    plugin.bc.reconcile_dauth_job_secrets = unavailable
+    advance = plugin._advance_deployment_operation
+    plugin._advance_deployment_operation = lambda operation: handled.append(operation["operation_id"]) or advance(operation)
+    # One worker pass every 2 s for 17 minutes.
+    passes = 0
+    while plugin.now < 1120:
+      plugin._reconcile_coordinator_operations()
+      plugin.now, passes = plugin.now + 2, passes + 1
+    self.assertEqual([later - earlier for earlier, later in zip(calls, calls[1:])], [10, 20, 40, 80, 160, 300, 300])
+    # The waiting operation is not even advanced; the other one is handled on every pass.
+    self.assertEqual(handled.count(stuck["operation_id"]), len(calls))
+    self.assertEqual(handled.count(other["operation_id"]), passes)
+    red = [message for message, color in lines if color == "r"]
+    self.assertEqual(len(red), len(calls))
+    self.assertIn("DeploymentCustodyError in _reconcile_coordinator_operations > ", red[0])
+    self.assertTrue(red[0].endswith("_advance_deployment_operation > _deployment_secret_request "
+                                    "(custody failure 1, next try in 10 s)"))
+    self.assertTrue(red[3].endswith("(custody failure 4, next try in 80 s)"))
+    self.assertTrue(red[-1].endswith("(custody failure 8, next try in 300 s)"))
+    # An operation whose records are gone from the replica leaves no wait behind.
+    self.assertIn(stuck["operation_id"], plugin._custody_retry)
+    for key in [key for key in plugin.storage if key[0] == OPERATIONS_HKEY and key[1].startswith(stuck["operation_id"] + "|")]:
+      del plugin.storage[key]
+    plugin._reconcile_coordinator_operations()
+    self.assertNotIn(stuck["operation_id"], plugin._custody_retry)
+
+  def test_a_custody_call_that_succeeds_ends_the_wait(self):
+    plugin = Coordinator()
+    operation = plugin.operation()
+    operation.update(phase="cleaning_up_preparation", outcome="failed", recovery="in_progress")
+    plugin._save_operation(operation)
+    unavailable = RuntimeError("dAuth reconciliation service is unavailable.")
+    answers, calls = [unavailable, unavailable, {}, unavailable, {}], []
+
+    def custody(payload):
+      calls.append(plugin.now)
+      answer = answers.pop(0)
+      if isinstance(answer, Exception):
+        raise answer
+      return answer
+
+    plugin.bc.reconcile_dauth_job_secrets = custody
+    # One custody call per pass that leaves the operation unfinished when it is answered, so a later one can fail.
+    plugin._advance_deployment_operation = lambda operation: plugin._deployment_secret_request("revoke", operation)
+    while plugin.now <= 142:
+      plugin._reconcile_coordinator_operations()
+      plugin.now += 2
+    # Waits of 10 and 20 s; the answer at 130 s ends the wait, so the failure at 132 s waits 10 s again.
+    self.assertEqual(calls, [100, 110, 130, 132, 142])
+    self.assertEqual(plugin._custody_retry, {})
+
+  def test_a_preparing_operation_asks_dauth_on_every_pass_until_its_preparation_deadline(self):
+    # Preparation is polled until its deadline (created + 120 s), then cleaned up as failed. With custody waits the
+    # last poll came at 70 s, so a dAuth that recovered later was not seen and the deployment was cleaned up.
+    plugin = Coordinator()
+    recovering, down = plugin.operation(), plugin.operation()
+    down.update(operation_id=recovering["operation_id"].replace("-test", "-down"), job_id=2)
+    for operation in (recovering, down):
+      operation.update(phase="preparing", preparation_deadline=220)
+      plugin._save_operation(operation)
+    calls = {recovering["operation_id"]: [], down["operation_id"]: []}
+
+    def custody(payload):
+      calls[payload["operation"]["operation_id"]].append((plugin.now, payload["action"]))
+      # dAuth answers the first operation again 6 s before its deadline; for the other one it stays down.
+      if plugin.now < 214 or payload["operation"]["operation_id"] == down["operation_id"]:
+        raise RuntimeError("dAuth reconciliation service is unavailable.")
+      return {"prepared": True}
+
+    plugin.bc.reconcile_dauth_job_secrets = custody
+    while plugin.now <= 260:
+      plugin._reconcile_coordinator_operations()
+      plugin.now += 2
+    # Asked on every 2 s pass until dAuth answered, and the deployment was accepted, not cleaned up.
+    self.assertEqual(calls[recovering["operation_id"]], [(now, "status") for now in range(100, 216, 2)])
+    accepted = plugin._operation_records()[recovering["operation_id"]]
+    self.assertIsNone(accepted["outcome"])
+    self.assertIn("Deployment preparation recovered.", [event["message"] for event in accepted["events"]])
+    # Without an answer it is cleaned up at the deadline; the cleanup has no deadline and is paced (10 s, 20 s).
+    self.assertEqual(calls[down["operation_id"]],
+                     [(now, "status") for now in range(100, 220, 2)] + [(220, "revoke"), (230, "revoke"), (250, "revoke")])
+
+  def test_a_chain_store_write_that_fails_is_still_tried_on_every_pass(self):
+    # Only a failed custody call makes an operation wait, also right after such a wait has run out.
+    plugin = Coordinator()
+    lines = []
+    plugin.P = lambda message, color=None, **kw: lines.append((message, color))
+    operation = plugin.operation()
+    operation.update(phase="cleaning_up_preparation", outcome="failed", recovery="in_progress")
+    plugin._save_operation(operation)
+    calls, writes = [], []
+
+    def custody(payload):
+      calls.append(plugin.now)
+      if len(calls) == 1:
+        raise RuntimeError("dAuth reconciliation service is unavailable.")
+      return {}
+
+    plugin.bc.reconcile_dauth_job_secrets = custody
+    store = plugin.chainstore_hset
+    plugin.chainstore_hset = lambda namespace, key, value, **kw: writes.append(plugin.now) or store(namespace, key, value, **kw)
+    plugin._reconcile_coordinator_operations()  # custody failure 1, next try in 10 s
+    # At 110 s the custody call succeeds, but no chain-store write is confirmed from then on.
+    plugin.now, plugin.replicate = 110, False
+    for _ in range(4):
+      plugin._reconcile_coordinator_operations()
+      plugin.now += 2
+    self.assertEqual(calls, [100, 110])
+    self.assertEqual(writes, [110, 112, 114, 116])
+    red = [message for message, color in lines if color == "r"]
+    self.assertEqual(len(red), 5)
+    self.assertTrue(red[0].endswith("(custody failure 1, next try in 10 s)"))
+    self.assertFalse(any("custody failure" in message for message in red[1:]))
+
+  def test_admission_answers_as_before_when_the_custody_call_fails(self):
+    # The admission endpoints answer 409 for DeploymentConflictError, 400 for any other ValueError and 503 for
+    # every other error (deeploy_manager_api.py). A custody call dAuth could not do stays a RuntimeError (503)
+    # with its text; an invalid answer stays the same ValueError (400).
+    plugin = Coordinator()
+    plugin._prepare_deployment_secret_configs = lambda configs, *args: (copy.deepcopy(configs), {})
+    plugin.r1fs.add_json = lambda plan, **kw: "plan"
+    plugin._get_pipeline_from_cstore = lambda job_id: None
+    admit = lambda request_id: plugin._admit_prepared_deployment(
+      request={"request_id": request_id, "job_id": 1}, auth_result={"escrow_owner": "owner"}, app_id="app",
+      configs={"A": copy.deepcopy(CONFIG)}, prior_pipeline=None, is_create=True)
+    plugin.bc.reconcile_dauth_job_secrets = Mock(side_effect=RuntimeError("dAuth reconciliation service is unavailable."))
+    with self.assertRaisesRegex(DeploymentCustodyError, "^dAuth reconciliation service is unavailable.$") as raised:
+      admit("unavailable")
+    self.assertNotIsInstance(raised.exception, ValueError)  # 503, as before
+    invalid = ValueError("Invalid dAuth reconciliation response.")
+    plugin.bc.reconcile_dauth_job_secrets = Mock(side_effect=invalid)
+    with self.assertRaises(ValueError) as raised:
+      admit("invalid")
+    self.assertIs(raised.exception, invalid)  # 400, as before
+    # Admission handed both operations to the worker, as before.
+    self.assertTrue(all(finished.is_set() for finished in plugin._deployment_preparations.values()))
 
   def test_worker_reconciles_local_operations_without_peer_repair(self):
     plugin = Coordinator()
