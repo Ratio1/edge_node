@@ -75,6 +75,12 @@ class _ContractSetCase(_SetupCase):
                                          COMPLETE["display_name"], COMPLETE["valid_from"], COMPLETE["valid_until"],
                                          COMPLETE["context"], [pick(asset)], **extra)
 
+  def admission_service(self):
+    """The launch gate's service with its clock pinned inside the `COMPLETE` engagement window."""
+    service = self.plugin._execution_service()
+    service.clock = lambda: datetime(2026, 10, 15, tzinfo=timezone.utc)
+    return service
+
   def second_contract_tenant(self, nodes=(SHARED_A,)):
     """An active, contract-fixed tenant with `c_2` activated for `nodes`: (tenant_id, c_2)."""
     _, tenant_id = self.tenant("acme", nodes=[SHARED_A], fixed=True)
@@ -421,7 +427,7 @@ class TestEngagementsPickAContract(_ContractSetCase):
     # `c_1` spelled out is the default.
     self.assertEqual(ok(self, self.engagement(tenant_id, contract_id="c_1"))["contractSha256"], tenant["contract"]["sha256"])
     # The launch gate accepts both contracts of the set.
-    service = self.plugin._execution_service()
+    service = self.admission_service()
     self.store.grant("acme.admin", tenant_id)
     for engagement in (first, second):
       with self.subTest(engagement["engagementId"]):
@@ -507,7 +513,7 @@ class TestRevisions(_ContractSetCase):
                      [("c_1", None, revision["contract_id"]), (second, None, None), (revision["contract_id"], "c_1", None)])
     self.assertEqual(ok(self, self.plugin.get_tenant_contract(self.actor, tenant_id))["superseded_by"], revision["contract_id"])
     # The old engagements still launch under the replaced contract; a new one on it is refused.
-    service = self.plugin._execution_service()
+    service = self.admission_service()
     for engagement in (old, picked):
       service.resolve_execution_admission(self.actor, tenant_id, engagement["engagementId"], "ea_1")
     refused(self, self.engagement(tenant_id), 409, "contract_superseded")

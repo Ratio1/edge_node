@@ -47,3 +47,16 @@ PYTHONPATH=/home/vitalii/remote-dev/repos/edge_node pytest -q extensions/busines
 PYTHONPATH=/home/vitalii/remote-dev/repos/edge_node pytest -q extensions/business/cybersec/red_mesh/tests/test_worker.py extensions/business/cybersec/red_mesh/tests/test_auth.py extensions/business/cybersec/red_mesh/tests/test_discovery.py extensions/business/cybersec/red_mesh/tests/test_safety.py
 PYTHONPATH=/home/vitalii/remote-dev/repos/edge_node pytest -q extensions/business/cybersec/red_mesh/tests/test_normalization.py extensions/business/cybersec/red_mesh/tests/test_graybox_finding.py extensions/business/cybersec/red_mesh/tests/test_contracts.py
 ```
+
+## Running the Suite
+
+The native FastAPI tests need `naeural_core` importable from the repo root (a checkout or a symlink
+named `naeural_core` next to `extensions/`) and `aiofiles` and `uvicorn`; without them those tests
+skip or error and the failure count is misleading. From the edge_node repo root:
+
+```bash
+uv run --no-project --with pytest --with pymisp --with requests --with numpy --with paramiko \
+  --with cryptography --with pyyaml --with scapy --with beautifulsoup4 --with jinja2 --with pydantic \
+  --with fastapi --with httpx --with aiofiles --with uvicorn \
+  python -m pytest extensions/business/cybersec/red_mesh/tests -q -p no:cacheprovider
+```

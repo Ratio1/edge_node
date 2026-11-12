@@ -165,6 +165,7 @@ def _compute(owner, pack_id, pack, level, selected, now):
   kinds = sorted(set(mapped.values()))
   suggestions = {ref_id: [] for ref_id in mapped}
   overriding = []
+  decided = {}  # (control, target) -> (finish time, raised): the newest pass of a target decides what it raised
   considered = skipped = 0
   for job_id, record in selected:
     ctx, err = _resolve_scan_context(owner, job_id, checked_job=record)
@@ -186,22 +187,41 @@ def _compute(owner, pack_id, pack, level, selected, now):
     results = {kind: classify(kind, findings, metadata) for kind in kinds}
     completed_at = _iso(record.get("date_completed"))
     ref = f"job:{job_id}:{pass_nr}"
+    target = _target_key(ctx, job_id)
+    finished = _number(record.get("date_completed") or record.get("date_created"))
     for ref_id, kind in mapped.items():
       result = results[kind]
-      if result["status"] == "not_observable" or len(suggestions[ref_id]) >= PER_CONTROL:
+      if result["status"] == "not_observable":
+        continue
+      raised = bool(result["severities"])
+      seen = decided.get((ref_id, target))
+      # Newest pass per target decides; on equal finish times a pass with findings wins over a clean one.
+      if seen is None or (seen == (finished, False) and raised):
+        decided[(ref_id, target)] = (finished, raised)
+        if raised and not any(item["control_id"] == ref_id for item in overriding):
+          overriding.append({"control_id": ref_id, "ref": ref, "job_id": job_id, "pass_nr": pass_nr,
+                             "severities": dict(result["severities"])})
+      if len(suggestions[ref_id]) >= PER_CONTROL:
         continue
       suggestions[ref_id].append({
         "ref": ref, "signal_kind": kind, "status": result["status"], "summary": _summary(kind, result, pass_nr),
         "job_id": job_id, "pass_nr": pass_nr, "completed_at": completed_at,
         "counts": {"gap": result["gap"], "review": result["review"]},
       })
-      if result["severities"] and not any(item["control_id"] == ref_id for item in overriding):
-        overriding.append({"control_id": ref_id, "ref": ref, "job_id": job_id, "pass_nr": pass_nr,
-                           "severities": dict(result["severities"])})
   return {"packId": pack_id, "assuranceLevel": level, "jobsAvailable": len(selected), "jobsConsidered": considered,
           "jobsSkipped": skipped, "generatedAt": _iso(now), "reason": None,
           "suggestions": {ref_id: items for ref_id, items in suggestions.items() if items},
           "overriding": overriding}
+
+
+def _target_key(ctx, job_id):
+  """The scanned target, lower-cased; a job without one stands alone so it never hides another's."""
+  for payload in (ctx.get("job_config"), ctx.get("job_specs")):
+    for key in ("target", "target_url"):
+      value = payload.get(key) if isinstance(payload, dict) else None
+      if value and str(value).strip():
+        return str(value).strip().lower()
+  return f"job:{job_id}"
 
 
 def _summary(kind, result, pass_nr):

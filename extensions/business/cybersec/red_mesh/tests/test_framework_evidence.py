@@ -65,15 +65,16 @@ class TestFrameworkEvidenceSuggestions(FrameworkAssessmentFixture):
 
   # -- fixtures ---------------------------------------------------------------------------------
 
-  def job(self, job_id, *, tenant=None, finalized=True, findings=None, completed=1770000300.0, soc=None):
+  def job(self, job_id, *, tenant=None, finalized=True, findings=None, completed=1770000300.0, soc=None,
+          target="https://app.example.test"):
     binding = {**binding_payload(), "tenant_id": tenant or self.tenant}
     record = {"job_id": job_id, "launcher": "operator", "workers": {}, "scan_type": "webapp",
-              "job_status": "FINALIZED" if finalized else "RUNNING", "target": "https://app.example.test",
+              "job_status": "FINALIZED" if finalized else "RUNNING", "target": target,
               "date_created": completed - 300, "date_completed": completed if finalized else None,
               "execution_binding": binding}
     if finalized:
       record["job_cid"] = f"archive-{job_id}"
-      archive = {"job_id": job_id, "job_config": {"target": "https://app.example.test", "execution_binding": deepcopy(binding)},
+      archive = {"job_id": job_id, "job_config": {"target": target, "execution_binding": deepcopy(binding)},
                  "passes": [{"pass_nr": 2, "date_completed": completed, "findings": findings or []}]}
       if soc is not None:
         archive["soc_event_status"] = soc
@@ -120,6 +121,48 @@ class TestFrameworkEvidenceSuggestions(FrameworkAssessmentFixture):
       self.assertNotIn(secret, text)
     self.assertEqual((self.stored_row(), len(self.storage.writes)), (before, writes))
     self.assertEqual(self.events, [])
+
+  def test_a_newer_clean_pass_of_the_same_target_clears_what_an_older_pass_raised(self):
+    self.job("job-old", findings=[self.HIGH_AUTH], completed=1770000000.0)
+    self.job("job-new", findings=[], completed=1770000600.0)
+    data = self.ok(self.suggest())
+    self.assertEqual(data["overriding"], [])
+    self.assertEqual(data["suggestions"]["PR.AA-01.1"][0]["job_id"], "job-new")
+
+  def test_an_open_finding_on_another_target_keeps_the_overriding_warning(self):
+    self.job("job-a-old", findings=[self.HIGH_AUTH], completed=1770000000.0, target="https://a.example.test")
+    self.job("job-a-new", findings=[], completed=1770000600.0, target="https://a.example.test")
+    self.job("job-b", findings=[self.HIGH_AUTH], completed=1770000300.0, target="https://b.example.test")
+    data = self.ok(self.suggest())
+    warned = [item for item in data["overriding"] if item["control_id"] == "PR.AA-01.1"]
+    self.assertEqual([item["job_id"] for item in warned], ["job-b"])
+
+  def test_the_warning_is_decided_before_the_per_control_suggestion_cap(self):
+    for index in range(3):
+      self.job(f"job-clean-{index}", findings=[], completed=1770000600.0 + index, target="https://a.example.test")
+    self.job("job-b", findings=[self.HIGH_AUTH], completed=1770000000.0, target="https://b.example.test")
+    data = self.ok(self.suggest())
+    self.assertEqual(len(data["suggestions"]["PR.AA-01.1"]), 3)  # job-b is the fourth: not a suggestion
+    self.assertEqual([item["job_id"] for item in data["overriding"] if item["control_id"] == "PR.AA-01.1"], ["job-b"])
+
+  def test_the_newest_pass_of_a_target_decides_even_when_it_is_the_one_that_raises(self):
+    self.job("job-old", findings=[], completed=1770000000.0)
+    self.job("job-new", findings=[self.HIGH_AUTH], completed=1770000600.0)
+    data = self.ok(self.suggest())
+    self.assertEqual([item["job_id"] for item in data["overriding"] if item["control_id"] == "PR.AA-01.1"], ["job-new"])
+
+  def _tied(self, first, second):
+    findings = {"job-a": [], "job-b": [self.HIGH_AUTH]}
+    for job_id in (first, second):
+      self.job(job_id, findings=findings[job_id], completed=1770000300.0)
+    data = self.ok(self.suggest())
+    self.assertEqual([item["job_id"] for item in data["overriding"] if item["control_id"] == "PR.AA-01.1"], ["job-b"])
+
+  def test_on_equal_finish_times_the_pass_with_findings_wins_over_a_clean_one(self):
+    self._tied("job-a", "job-b")
+
+  def test_the_tie_rule_does_not_depend_on_job_id_order(self):
+    self._tied("job-b", "job-a")
 
   def test_triage_closed_findings_and_unfinalized_jobs_do_not_count(self):
     self.job("job-1", findings=[self.HIGH_AUTH])
