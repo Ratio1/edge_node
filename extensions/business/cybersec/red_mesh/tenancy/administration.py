@@ -191,9 +191,13 @@ def _same_contract(stored, requested):
 
 class TenantAdministrationService:
   def __init__(self, accounts, store, configured_peers_reader=None, tenant_node_jobs_reader=None,
-               node_directory_reader=None, super_tenant_permissions_reader=None, integration_config_reader=None):
+               node_directory_reader=None, super_tenant_permissions_reader=None,
+               integration_config_reader=None, compliance=None):
     self.accounts = accounts
     self.store = store
+    # RM-120: the compliance key space (framework maturity self-assessments), injected like the
+    # tenancy store; None in callers that never touch it, and every assessment call then answers 503.
+    self.compliance = compliance
     self.configured_peers_reader = configured_peers_reader
     # RM-132: `() -> {key: bool}`, the deployment's `SUPER_TENANT_PERMISSIONS` (read-only here, set
     # by Ratio1). Injected like `configured_peers_reader`; without one, every key is `True`.
@@ -1504,6 +1508,8 @@ class TenantAdministrationService:
       row = self.store.raw_record("engagement", *ids) or {}
       documents = row.get("documents") if isinstance(row.get("documents"), list) else []
       refs.extend(documents)
+    # RM-120: revision snapshots of the tenant's framework assessments, from the compliance rows.
+    refs.extend(compliance.document_refs(self, tenant["tenant_id"]))
     done = set(tenant.get("deleting", {}).get("deleted_refs", []))
     unique = {}
     for ref in refs:
@@ -1560,6 +1566,8 @@ class TenantAdministrationService:
     asset_ids = self.store.child_record_ids("tenant_asset", {"tenant_id": tenant_id})
     for record_ids in asset_ids:
       self.store.delete("tenant_asset", *record_ids)
+    # RM-120: the assessment rows live in the compliance key space, deleted through its adapter.
+    counts["assessment"] = compliance.delete_rows(self, tenant_id)
     self.store.delete("receipt", tenant["actor_id"], tenant["request_id"])
     self.store.delete("tenant", tenant_id)
     # RM-139: `integrations` is always 0 now (the kind is retired). It stays only for the
@@ -1567,7 +1575,70 @@ class TenantAdministrationService:
     return {"tenantId": tenant_id, "deleted": True, "engagements": counts["engagement"],
             "integrations": 0, "assets": len(asset_ids),
             "nodeAssignments": counts["tenant_node"], "contractDrafts": counts["tenant_contract_draft"],
+            "assessments": counts["assessment"],
             "documents": len(tenant["deleting"]["deleted_refs"])}
+
+  # RM-120: framework maturity self-assessment per tenant. The operations live in `compliance.py`;
+  # these wrappers give them the lock and the response shape. The plugin's submit endpoint does the
+  # one document write between `prepare` and `record`, and reads a revision's snapshot after
+  # `framework_assessment_artifact_ref` resolved it under the lock.
+
+  @_endpoint
+  def get_framework_assessment(self, actor, tenant_id, pack_id, include_pack=True, assessment_id="default"):
+    return compliance.get_assessment(self, actor, tenant_id, pack_id, include_pack=include_pack,
+                                     assessment_id=assessment_id)
+
+  @_endpoint
+  def list_framework_assessments(self, actor, tenant_id, pack_id="", include_archived=False):
+    return compliance_catalogue.list_assessments(self, actor, tenant_id, pack_id, include_archived)
+
+  @_endpoint
+  def create_framework_assessment(self, actor, tenant_id, pack_id, request_id, name, assurance_level=None,
+                                  level_provenance=None):
+    return compliance_catalogue.create_assessment(self, actor, tenant_id, pack_id, request_id, name,
+                                                  assurance_level, level_provenance)
+
+  @_endpoint
+  def archive_framework_assessment(self, actor, tenant_id, pack_id, assessment_id, archived,
+                                   expected_assessment_revision):
+    return compliance_catalogue.archive_assessment(self, actor, tenant_id, pack_id, assessment_id, archived,
+                                                   expected_assessment_revision)
+
+  @_endpoint
+  def authorize_framework_assessment_manage(self, actor, tenant_id, pack_id):
+    return compliance.authorize_manage(self, actor, tenant_id, pack_id)
+
+  @_endpoint
+  def save_framework_assessment_draft(self, actor, tenant_id, pack_id, patch, expected_assessment_revision,
+                                      assessment_id="default"):
+    return compliance.save_draft(self, actor, tenant_id, pack_id, patch, expected_assessment_revision,
+                                 assessment_id=assessment_id)
+
+  @_endpoint
+  def prepare_framework_assessment_submit(self, actor, tenant_id, pack_id, expected_assessment_revision, request_id,
+                                          assessment_id="default"):
+    return compliance.prepare_submit(self, actor, tenant_id, pack_id, expected_assessment_revision, request_id,
+                                     assessment_id=assessment_id)
+
+  @_endpoint
+  def record_framework_assessment_submit(self, actor, tenant_id, pack_id, request_id, ref, expected_assessment_revision,
+                                         assessment_id="default"):
+    return compliance.record_submit(self, actor, tenant_id, pack_id, request_id, ref, expected_assessment_revision,
+                                    assessment_id=assessment_id)
+
+  @_endpoint
+  def clear_framework_assessment_pending(self, actor, tenant_id, pack_id, assessment_id="default"):
+    return compliance.clear_pending(self, actor, tenant_id, pack_id, assessment_id=assessment_id)
+
+  @_endpoint
+  def reopen_framework_assessment(self, actor, tenant_id, pack_id, expected_assessment_revision, request_id,
+                                  assessment_id="default"):
+    return compliance.reopen(self, actor, tenant_id, pack_id, expected_assessment_revision, request_id,
+                             assessment_id=assessment_id)
+
+  @_endpoint
+  def framework_assessment_artifact_ref(self, actor, tenant_id, pack_id, revision, assessment_id="default"):
+    return compliance.artifact_ref(self, actor, tenant_id, pack_id, revision, assessment_id=assessment_id)
 
   @_endpoint
   def authorize_platform(self, actor):
@@ -3022,3 +3093,8 @@ class TenantAdministrationService:
       return
     if not self._active_tenant_admins(tenant_id) - {account_id}:
       raise AdministrationDenied(409, "last_tenant_admin")
+
+
+# RM-120: imported last on purpose. `compliance` pulls in `services/`, whose package init imports
+# this module for `AdministrationDenied`; by here that name exists, so the cycle resolves.
+from . import compliance, compliance_catalogue  # noqa: E402

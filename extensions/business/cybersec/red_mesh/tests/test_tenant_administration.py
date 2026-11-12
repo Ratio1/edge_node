@@ -66,6 +66,10 @@ class FakeAdministrationStore:
   def chainstore_hgetall(self, *, hkey):
     return {key: copy.deepcopy(value) for (bucket, key), value in self.data.items() if bucket == hkey}
 
+  def chainstore_hkeys(self, *, hkey):
+    # naeural_core lists every field of the hkey from local memory, tombstones (None) included.
+    return [key for (bucket, key) in self.data if bucket == hkey]
+
   def chainstore_hset(self, *, hkey, key, value, **kwargs):
     self.writes.append((hkey, key))
     failed = len(self.writes) == self.fail_write

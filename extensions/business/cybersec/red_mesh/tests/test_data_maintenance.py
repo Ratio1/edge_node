@@ -13,6 +13,7 @@ from .test_execution_binding_models import binding_payload
 from .test_tenant_administration import FakeAdministrationStore
 
 TENANCY = '["redmesh","tenancy",1,"deployment"]'
+COMPLIANCE = '["redmesh","tenancy-compliance",1,"deployment"]'
 JOBS = "jobs"
 
 
@@ -77,7 +78,7 @@ class TestDataMaintenance(unittest.TestCase):
     self.plugin.cfg_tenancy_namespace = "deployment"
     self.plugin.cfg_instance_id = JOBS
     self.plugin.P = lambda *args, **kwargs: None
-    for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
+    for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hkeys", "chainstore_hset"):
       setattr(self.plugin, name, getattr(self.storage, name))
     self.events = []
     self.plugin._log_audit_event = lambda event, details: self.events.append((event, details))
@@ -126,6 +127,46 @@ class TestDataMaintenance(unittest.TestCase):
     done = self.plugin.cleanup_redmesh_old_data(self.actor, True, [self.target(row) for row in rows])
     self.assertTrue(done["success"], done)
     return done["data"]["outcomes"]
+
+  # -- RM-120: framework assessment rows in their own hkey ---------------------------------------
+
+  def assessment_row(self, tenant_id):
+    return {"schemaVersion": 1, "namespace": "deployment", "kind": "framework_assessment", "ids": [tenant_id, "ro.dnsc.o1-2026"],
+            "tenant_id": tenant_id, "pack_id": "ro.dnsc.o1-2026", "pack_acts": [], "assurance_level": None,
+            "level_provenance": None, "sectoral_requirements": "", "completion_date": "", "management_signoff": None,
+            "remediation": [], "state": "draft", "assessment_revision": 1, "reopened_from": None, "pending": None,
+            "scores": {}, "submissions": [], "created_by": "initial", "created_at": "t", "updated_by": "initial", "updated_at": "t"}
+
+  def test_assessment_rows_are_registered_and_classified_by_their_tenant(self):
+    field = lambda tenant_id: json.dumps(["framework_assessment", "deployment", tenant_id, "ro.dnsc.o1-2026"], separators=(",", ":"))
+    self.put(COMPLIANCE, field(self.tenant), self.assessment_row(self.tenant))
+    self.put(COMPLIANCE, field("tn_gone"), self.assessment_row("tn_gone"))
+    self.put(COMPLIANCE, field("tn_bad"), {**self.assessment_row("tn_bad"), "state": "lost"})
+    rows = self.scan()
+    self.assertEqual(rows[(COMPLIANCE, field(self.tenant))]["class"], "current")
+    self.assertEqual((rows[(COMPLIANCE, field("tn_gone"))]["class"], rows[(COMPLIANCE, field("tn_gone"))]["reason"]), ("orphan", "tenant_gone"))
+    self.assertEqual((rows[(COMPLIANCE, field("tn_bad"))]["class"], rows[(COMPLIANCE, field("tn_bad"))]["reason"]), ("old", "unrecognized"))
+    # The tenancy rows stay what they were: the compliance hkey is read on its own.
+    tenancy = [row for (hkey, _), row in rows.items() if hkey == TENANCY]
+    self.assertEqual({row["class"] for row in tenancy}, {"current"})
+
+  def test_five_element_assessment_rows_are_classified_like_the_four_element_row(self):
+    fa = "fa_11111111-1111-4111-8111-111111111111"
+    field = lambda tenant_id, *tail: json.dumps(["framework_assessment", "deployment", tenant_id, "ro.dnsc.o1-2026", *tail],
+                                               separators=(",", ":"))
+    row = lambda tenant_id, **extra: {**self.assessment_row(tenant_id), "assessment_id": fa, **extra,
+                                      "ids": [tenant_id, "ro.dnsc.o1-2026", fa]}
+    self.put(COMPLIANCE, field(self.tenant, fa), row(self.tenant))
+    self.put(COMPLIANCE, field("tn_gone", fa), row("tn_gone"))
+    self.put(COMPLIANCE, field("tn_bad", fa), row("tn_bad", state="lost"))
+    self.put(COMPLIANCE, field(self.tenant, "fa_bad"), row(self.tenant))
+    self.put(COMPLIANCE, field(self.tenant, fa, "x"), row(self.tenant))  # six elements
+    rows = self.scan()
+    self.assertEqual(rows[(COMPLIANCE, field(self.tenant, fa))]["class"], "current")
+    gone = rows[(COMPLIANCE, field("tn_gone", fa))]
+    self.assertEqual((gone["class"], gone["reason"]), ("orphan", "tenant_gone"))
+    for key in (field("tn_bad", fa), field(self.tenant, "fa_bad"), field(self.tenant, fa, "x")):
+      self.assertEqual((rows[(COMPLIANCE, key)]["class"], rows[(COMPLIANCE, key)]["reason"]), ("old", "unrecognized"), key)
 
   # -- authorization ----------------------------------------------------------------------------
 
@@ -177,7 +218,7 @@ class TestDataMaintenance(unittest.TestCase):
     hkeys = self.plugin.export_redmesh_records(self.actor, 0, 0, 1)["data"]["hkeys"]
     names = {item["hkey"] for item in hkeys}
     self.assertEqual({JOBS + suffix for suffix in built} - names, set())
-    self.assertLessEqual({JOBS, TENANCY, "auth", f"{JOBS}:integrations:{self.tenant}"}, names)
+    self.assertLessEqual({JOBS, TENANCY, COMPLIANCE, "auth", f"{JOBS}:integrations:{self.tenant}"}, names)
     self.assertEqual([item["hkey"] for item in hkeys if item["account"]], ["auth"])
 
   def test_a_job_lists_the_files_its_record_config_and_archive_name(self):
