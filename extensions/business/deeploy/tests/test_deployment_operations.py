@@ -428,11 +428,15 @@ class RuntimeCompletionTests(unittest.TestCase):
     plugin.bc.sign(record)
     self.assertTrue(plugin._verify_operation_record(record, "coordinator"))
     self.assertFalse(plugin._verify_operation_record(record, "node_addr"))
-    # The memory is bounded: at 10,000 fingerprints it starts again.
+    # The memory is bounded: at 10,000 fingerprints it starts again, and says so in red, because with more
+    # valid records than that alive it happens on every pass and nothing is saved any more.
     plugin._verified_operation_records = set(range(10000))
+    logs = []
+    plugin.P = lambda message, color=None, **kwargs: logs.append((message.split(":")[0], color))
     record["sequence"] = 9
     self.assertTrue(plugin._verify_operation_record(record, "coordinator"))
     self.assertEqual(len(plugin._verified_operation_records), 1)
+    self.assertEqual(logs, [("Emptying the 10,000 remembered Deeploy record fingerprints", "r")])
 
   def test_completed_snapshot_is_resent_as_repair_for_ten_minutes(self):
     # One confirmation is enough for a write, so an oracle can miss the final snapshot; nothing else sends it again.

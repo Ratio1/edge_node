@@ -9,12 +9,20 @@ class _RequestTrackingMixin(object):
   A client call reaches one node. When that node does not finish it, the client cannot say
   which node it was, and the other nodes cannot know either. A plugin that uses this mixin
   records the requests it receives in the chain store, under its own node id, so every node
-  holds the record and the node that holds an unanswered request can be named.
+  holds the record of what the other nodes received.
 
-  Only the endpoints listed in ``REQUESTS_TRACKED_ENDPOINTS`` are recorded: the ones that start
-  something (a deployment, an update, a delete). A read is never recorded. A chain-store write
-  goes to every oracle and each one stores it and saves its replica again, so recording a read
-  that a client repeats every two seconds made the whole network pay for every poll.
+  What the record can show is limited by where it is written. The write runs in ``process()``,
+  on the plugin thread, after the web-app lap has run the queued requests. So a request is
+  published as not answered only when a lap ends while it still waits in the queue (or when it
+  was refused with a 503 before it ran, see ``_track_request``). A request whose endpoint hangs
+  holds the plugin thread, so the record is not written while it hangs; a request that returns
+  is usually written already answered. This was so before the record was limited to the
+  tracked endpoints too.
+
+  Only the endpoints listed in ``REQUESTS_TRACKED_ENDPOINTS`` are recorded. The list is meant for
+  the endpoints that change state; reads are left out. A chain-store write goes to every oracle
+  and each one stores it and saves its replica again, so recording a read that a client repeats
+  every two seconds made the whole network pay for every poll.
 
   Opt-in: set REQUESTS_CSTORE_HKEY in plugin config to enable.
   When not set (None), all methods are no-ops.
@@ -65,11 +73,13 @@ class _RequestTrackingMixin(object):
     self.__rt_recent_requests = None
     self.__rt_last_log_time = 0
     self.__rt_dirty = False
-    # Time of the last write of the record. 0 lets the first tracked request be written at once.
+    # Time of the last write of the record. 0 lets the first change be written by the next
+    # process() call, without waiting for an interval.
     self.__rt_last_save_time = 0
     if self.__rt_cstore_hkey:
-      # A plain list, not a deque(maxlen): a full deque drops its oldest entry, which pushed a
-      # request that was never answered out of the record as soon as two newer ones arrived.
+      # A plain list, not a deque(maxlen): _track_request replaces it with a changed copy, so the
+      # plugin thread, which iterates the record while the monitor thread adds to it, never
+      # iterates a list that changes under it.
       self.__rt_recent_requests = []
     return
 
@@ -84,9 +94,12 @@ class _RequestTrackingMixin(object):
     A request to an endpoint that is not in ``REQUESTS_TRACKED_ENDPOINTS`` is ignored. That is
     what keeps reads (a status poll every two seconds, a list of apps) out of the chain store.
 
-    When the record is full, room is made by dropping the oldest request that was answered. A
-    request that was never answered is dropped only when every request in the record is
-    unanswered, so the entry that names the node holding a request stays visible.
+    When the record is full, the oldest request leaves it, answered or not (first in, first out).
+
+    A request refused with a 503 before it runs (refused when it arrived, or expired in the queue)
+    is recorded here, because the web-app base calls ``on_request`` before it refuses, but it is
+    never stamped, because the refusal does not call ``on_response``. It stays in the record as
+    not answered until newer requests push it out.
 
     Parameters
     ----------
@@ -115,8 +128,8 @@ class _RequestTrackingMixin(object):
       request_id = request.get('id')
       endpoint = value[0] if isinstance(value, (list, tuple)) and len(value) > 0 else 'unknown'
       if endpoint not in self.cfg_requests_tracked_endpoints:
-        # Not an endpoint that starts something: no record and no write. A read repeated by a
-        # client must cost the network nothing.
+        # Not one of the tracked endpoints, which are the ones that change state: no record and no
+        # write. A read repeated by a client must cost the network nothing.
         return
       record = {
         'id': request_id,
@@ -127,11 +140,8 @@ class _RequestTrackingMixin(object):
       # Work on a copy and swap it in below, so the plugin thread never sees a half-changed list.
       records = list(self.__rt_recent_requests)
       if len(records) >= self.__rt_max_records:
-        # Requests that were answered, oldest first: they are the ones that may leave the record.
-        answered = [item for item in records if item['date_complete'] is not None]
-        # Make room with the oldest answered request. Only when none was answered does the oldest
-        # unanswered one go, so a request a node never finished is not pushed out by later calls.
-        records.remove(answered[0] if answered else records[0])
+        # The record is full: the oldest request leaves, answered or not (first in, first out).
+        records.pop(0)
       # The new request joins the record as "received, not answered yet".
       records.append(record)
       # One assignment: readers on the plugin thread get the old list or the new one.
@@ -180,19 +190,23 @@ class _RequestTrackingMixin(object):
     """
     Write the record to the chain store (plugin thread only).
 
-    One replicated write: the record goes to every oracle under this node's id.
+    One replicated write: the record goes to every oracle under this node's id. The changed flag
+    is cleared before the record is copied, so a request that the monitor thread records while
+    the write waits for the other oracles sets it again and is written by the next save.
 
     Returns
     -------
     None
     """
+    # Clear the flag before the copy below: clearing it after the write forgot a request recorded
+    # during the write, which then stayed unwritten until another tracked change.
+    self.__rt_dirty = False
     self.chainstore_hset(
       hkey=self.__rt_cstore_hkey,
       key=self.ee_id,
       value=list(self.__rt_recent_requests),
       debug=True
     )
-    self.__rt_dirty = False
     # Start of the quiet period that REQUESTS_SAVE_INTERVAL enforces before the next write.
     self.__rt_last_save_time = self.time()
     return
@@ -203,10 +217,15 @@ class _RequestTrackingMixin(object):
 
     Call from ``process()`` (plugin thread). The record is written only when a tracked request
     arrived or was answered since the last write, and never more often than once every
-    ``REQUESTS_SAVE_INTERVAL`` seconds. The first change after a quiet period is written at
-    once, so a request that hangs is known to the other nodes right away; a change inside the
-    interval waits for its end. Every ``REQUESTS_LOG_INTERVAL`` seconds the records of all nodes
-    are read from the local replica and logged.
+    ``REQUESTS_SAVE_INTERVAL`` seconds. The first change after a quiet period is written by the
+    first call that sees it; a change inside the interval waits for its end. Every
+    ``REQUESTS_LOG_INTERVAL`` seconds the records of all nodes are read from the local replica
+    and logged.
+
+    The web-app lap runs the queued requests before it calls ``process()``. So a write made here
+    shows a request as answered, or as not answered in two cases: a lap ended while it still
+    waited in the queue, or it was refused with a 503 before it ran. A request whose endpoint
+    hangs holds the plugin thread, so nothing is written while it hangs.
 
     Returns
     -------
@@ -227,7 +246,7 @@ class _RequestTrackingMixin(object):
     if self.__rt_recent_requests is None:
       return
     # Write only a record that changed, and only once the interval since the last write has passed:
-    # the first change after a quiet period goes out at once, a burst of calls costs one write.
+    # the first change after a quiet period goes out on this call, a burst of calls costs one write.
     if self.__rt_dirty and self.time() - self.__rt_last_save_time >= self.cfg_requests_save_interval:
       self.__rt_save()
     if (self.time() - self.__rt_last_log_time) > self.__rt_log_interval:

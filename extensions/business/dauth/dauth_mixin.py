@@ -297,10 +297,8 @@ class _DauthMixin(object):
 
     Notes
     -----
-    A pinning read runs ``ipfs pin add`` under a fixed 90 s timeout that ignores
-    the caller's ``timeout``, so one missing document held the single dAuth thread
-    for 182-212 s (two pin timeouts). This node does not
-    need its own pin: the writer and the relays keep theirs.
+    The read does not pin because this node does not need its own pin of the
+    document: the writer and the relays keep theirs.
 
     Examples
     --------
@@ -312,8 +310,8 @@ class _DauthMixin(object):
     cid = self._load_dauth_pipeline_cid(job_id)
     if not cid:
       return None, None
-    # Read without pinning so the 10 s timeout bounds the request: a pinning read waited on
-    # a fixed 90 s `ipfs pin add` and held the single dAuth thread for 182-212 s per miss.
+    # Read within the 10 s timeout and without pinning: this node does not need its own pin of
+    # the document, because the writer and the relays keep theirs.
     return cid, self.r1fs.get_json(cid, timeout=10, pin=False, show_logs=False)
 
   def _load_dauth_job_pipeline(self, job_id):
@@ -423,8 +421,8 @@ class _DauthMixin(object):
           # request thread, a reveal or reconcile of the same job could read the same CID at the same
           # time, and in the shared per-CID folder each read deletes the other's files.
           with tempfile.TemporaryDirectory() as folder:
-            # Bounded like the other dAuth reads: pin=False keeps the fixed 90 s `ipfs pin add`
-            # out, so a missing document no longer holds this thread for minutes.
+            # Bounded like the other dAuth reads by the 10 s timeout, and without pinning: this node
+            # does not need its own pin of the document, because the writer and the relays keep theirs.
             doc = self.r1fs.get_json(cid, local_folder=folder, timeout=10, pin=False, show_logs=False)
         except Exception:
           # Any read error means "not available"; it is retried after the delay below.

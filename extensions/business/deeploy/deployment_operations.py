@@ -107,7 +107,9 @@ class _DeploymentOperationsMixin:
     that used to be written into the signed operation snapshot, so a command
     retry no longer produces a new CStore write; `_operations_confirmed`
     holds the last confirmed send of each snapshot, so an unchanged snapshot
-    is no longer re-sent on every 2 s pass. They are created here, next to
+    is no longer re-sent on every 2 s pass. `_verified_operation_records`, a set,
+    holds the fingerprints of the records whose signature was already checked
+    and found valid (see `_verify_operation_record`). They are created here, next to
     their sibling fields, so that a plugin missing one fails at once instead
     of creating it on first use. Finally starts the daemon thread that runs
     `_deployment_operation_worker`.
@@ -143,7 +145,8 @@ class _DeploymentOperationsMixin:
     # memory, so a command retry no longer writes a new signed snapshot that every oracle re-stores.
     self._operations_sent_at = {}
     # Fingerprints of the signed records already checked and found valid. A signed record never changes,
-    # so its signature is checked once and not on every 2 s worker pass and every status poll again.
+    # so while the set has room for every valid record, its signature is not checked again on every 2 s
+    # worker pass and every status poll (see _verify_operation_record for when it has no room).
     self._verified_operation_records = set()
     self._deployment_plan_cache_lock = threading.Lock()
     self._deployment_operations_event = threading.Event()
@@ -170,7 +173,7 @@ class _DeploymentOperationsMixin:
 
   def _verify_operation_record(self, record, signer_key):
     """
-    Accept only signed records whose claimed writer matches their signer, checking each record once.
+    Accept only signed records whose claimed writer matches their signer, remembering the valid ones.
 
     Operation snapshots and node reports are read from the local replica and their signatures are
     checked before use. The readers go over every record on every call: the `deeploy-operations`
@@ -201,9 +204,14 @@ class _DeploymentOperationsMixin:
     Notes
     -----
     The remembered set lives in process memory, so after a restart every record is checked once more.
-    It is emptied when it reaches 10,000 fingerprints (about 1 MB): records that were replaced leave
-    their fingerprints behind, and emptying it costs one full pass of checks, once. It is read and
-    written from the worker thread and the plugin thread; each operation on it is a single set call.
+    It is emptied when it reaches 10,000 fingerprints (about 1 MB), because records that were replaced
+    leave their fingerprints behind. While far fewer than 10,000 valid records (operation snapshots and
+    node reports together) are read in one pass, emptying it costs one more full pass of checks. With
+    more than 10,000 valid records alive, the set fills up and is emptied within every pass, almost
+    every record is checked again on every pass, and the saving is gone. Records are never removed, so
+    that point comes closer with every operation created. A red log line marks each emptying, so the
+    operator sees when it starts to repeat. It is read and written from the worker thread and the
+    plugin thread; each operation on it is a single set call.
 
     Examples
     --------
@@ -227,9 +235,13 @@ class _DeploymentOperationsMixin:
       # The full check, as before: a valid signature made by the address the record names as its writer.
       valid = bool(verification.valid and record.get("EE_SENDER") == record[signer_key])
       if valid:
+        # Bound the memory: fingerprints of replaced records are never looked up again. Emptying the set
+        # means the current records are checked once more; with more than 10,000 valid records alive it
+        # happens on every pass and the saving is gone.
         if len(self._verified_operation_records) >= 10000:
-          # Bound the memory: fingerprints of replaced records are never looked up again. Emptying the
-          # set only means that the current records are checked once more.
+          self.P("Emptying the 10,000 remembered Deeploy record fingerprints: every record is checked again. "
+                 "If this repeats on every pass, more than 10,000 valid records are alive.", color='r')
+          # Start again with an empty set; the records read from here on are remembered anew.
           self._verified_operation_records.clear()
         # Remember only records that passed, so a bad record is never accepted from memory.
         self._verified_operation_records.add(fingerprint)

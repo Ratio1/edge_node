@@ -7,14 +7,12 @@ from unittest import mock
 from constants import ADMIN_PIPELINE
 from extensions.business.cstore.cstore_manager_api import CstoreManagerApiPlugin
 from extensions.business.r1fs.r1fs_manager_api import R1fsManagerApiPlugin
-from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin
 
 
 API_PLUGINS = {
   "CSTORE_MANAGER_API": CstoreManagerApiPlugin,
   "R1FS_MANAGER_API": R1fsManagerApiPlugin,
 }
-CORE_HAS_IDLE_WAIT = hasattr(FastApiWebAppPlugin, "_idle_loop_wait")
 
 
 def _make_probe(plugin_class):
@@ -50,7 +48,6 @@ class ManagerApisIdleWaitTests(unittest.TestCase):
         self.assertNotIn("IDLE_LOOP_WAIT", ADMIN_PIPELINE[signature])
 
 
-@unittest.skipUnless(CORE_HAS_IDLE_WAIT, "naeural_core without IDLE_LOOP_WAIT")
 class ManagerApisWakeUpTests(unittest.TestCase):
 
   def test_waits_only_while_started_and_nothing_is_queued(self):
