@@ -31,6 +31,7 @@ from extensions.business.dauth.dauth_revoked_nodes import (
   DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL,
   DAUTH_REVOKED_UNLICENSED_WRITE_TIMEOUT,
   NODE_KEY_ROTATIONS_CSTORE_HKEY,
+  node_key_rotation_successor,
 )
 from extensions.business.dauth import test_dauth_registry_gating as gating
 from extensions.business.dauth.test_dauth_registry_gating import (
@@ -588,9 +589,15 @@ class NodeKeyRotationTests(unittest.TestCase):
     self.plugin = _harness(self.messages)
     self.plugin._load_dauth_revoked_nodes()
     self.plugin._queue_dauth_revoked_try = Mock()
+    # The SDK proof check, run against this harness's fake signatures and addresses.
+    self.plugin.bc.evm_network = "mainnet"
+    self.plugin.bc.verify_node_key_rotation = (
+      lambda proof: BaseBlockEngine.verify_node_key_rotation(self.plugin.bc, proof)
+    )
 
   def _stored(self):
-    return self.plugin._chainstore.get((NODE_KEY_ROTATIONS_CSTORE_HKEY, ETH[REVOKED].lower()))
+    proof = self.plugin._chainstore.get((NODE_KEY_ROTATIONS_CSTORE_HKEY, ETH[REVOKED].lower()))
+    return node_key_rotation_successor(proof)
 
   def test_revoked_node_is_named_in_the_auth_response(self):
     revoked = self.plugin.process_dauth_request(_auth_body(REVOKED))[dAuth.DAUTH_SUBKEY]
@@ -608,11 +615,13 @@ class NodeKeyRotationTests(unittest.TestCase):
   def test_repeated_announcement_rewrites_the_same_key(self):
     writes = []
     self.plugin.chainstore_hset = lambda hkey, key, value, **kwargs: writes.append((value, kwargs)) or False
-    self.assertFalse(self.plugin._announce_node_key(_announce_body(NEW))["confirmed"])
-    self.plugin._chainstore[(NODE_KEY_ROTATIONS_CSTORE_HKEY, ETH[REVOKED].lower())] = NEW
+    first = _announce_body(NEW)
+    self.assertFalse(self.plugin._announce_node_key(first)["confirmed"])
+    self.plugin._chainstore[(NODE_KEY_ROTATIONS_CSTORE_HKEY, ETH[REVOKED].lower())] = first
     self.plugin.chainstore_hset = lambda hkey, key, value, **kwargs: writes.append((value, kwargs)) or True
-    self.assertTrue(self.plugin._announce_node_key(_announce_body(NEW))["confirmed"])
-    self.assertEqual([value for value, _ in writes], [NEW, NEW])
+    self.assertTrue(self.plugin._announce_node_key(dict(_announce_body(NEW), nonce="c3d4"))["confirmed"])
+    # The retry republishes the stored proof, so every replica converges on one value.
+    self.assertEqual([value for value, _ in writes], [first, first])
     self.assertTrue(all(kwargs["readonly"] for _, kwargs in writes))
 
   def test_invalid_announcements_are_refused(self):

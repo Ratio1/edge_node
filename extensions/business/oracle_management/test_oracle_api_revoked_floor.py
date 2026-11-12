@@ -1,6 +1,12 @@
-"""The oracle API signs full availability for eligible revoked node keys."""
+"""The oracle API signs full availability for eligible revoked node keys and serves their new keys."""
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from ratio1.const.base import dAuth
+
+from extensions.business.dauth.dauth_revoked_nodes import NODE_KEY_ROTATIONS_CSTORE_HKEY
+from extensions.business.oracle_management import oracle_api
 from extensions.business.oracle_management.oracle_api import OracleApiPlugin
 
 
@@ -39,6 +45,43 @@ class RevokedFloorTests(unittest.TestCase):
 
   def test_no_list_raises_nothing(self):
     self.assertEqual(_floor(REVOKED_ETH, self.vals, revoked=()), {e: self.vals[e] for e in EPOCHS})
+
+
+class _LookupPlugin(OracleApiPlugin):
+  bc = None  # a plain attribute instead of the plugin's blockchain property
+
+
+class NodeKeyRotationLookupTests(unittest.TestCase):
+
+  def setUp(self):
+    self.plugin = _LookupPlugin.__new__(_LookupPlugin)
+    self.plugin._OracleApiPlugin__revoked_nodes = {REVOKED_ETH.lower(): "internal", OTHER_ETH: "internal-2"}
+    self.plugin._OracleApiPlugin__last_node_key_rotations_sync = 0
+    self.plugin._OracleApiPlugin__get_response = lambda data: data
+    self.plugin.bc = SimpleNamespace(address="self", node_address_to_eth_address=lambda node: "eth-" + node)
+    self.plugin.P = lambda *args, **kwargs: None
+    self.stored = {REVOKED_ETH.lower(): {dAuth.DAUTH_KEY_ROTATION: {"new_node": "new"}}}
+    self.plugin.chainstore_hget = lambda hkey, key: self.stored.get(key) if hkey == NODE_KEY_ROTATIONS_CSTORE_HKEY else None
+
+  def test_revoked_keys_are_answered_with_their_new_key_or_none(self):
+    result = self.plugin.node_key_rotations([REVOKED_ETH, OTHER_ETH, "0x" + "c" * 40])
+    self.assertEqual(result, {"rotations": {
+      REVOKED_ETH: {"node": "new", "node_eth_address": "eth-new"},
+      OTHER_ETH: None,
+    }})
+
+  def test_rotations_are_synced_from_every_other_dauth_server(self):
+    calls = []
+    def hsync(**kwargs):
+      calls.append(kwargs["extra_peers"])
+      if kwargs["extra_peers"] == ["down"]:
+        raise ValueError("timeout")
+    self.plugin.chainstore_hsync = hsync
+    self.plugin.time = lambda: 1000
+    with patch.object(oracle_api, "get_dauth_registry_internal_peers", return_value=["self", "down", "up"]):
+      self.plugin._OracleApiPlugin__maybe_sync_node_key_rotations()
+      self.plugin._OracleApiPlugin__maybe_sync_node_key_rotations()
+    self.assertEqual(calls, [["down"], ["up"]])
 
 
 if __name__ == "__main__":

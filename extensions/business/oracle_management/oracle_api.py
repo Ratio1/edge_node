@@ -38,13 +38,15 @@ TODO LEDGER :
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 from ratio1.const.base import dAuth
 
+from extensions.business.dauth.dauth_registry import get_dauth_registry_internal_peers
 from extensions.business.dauth.dauth_revoked_nodes import (
   DAUTH_REVOKED_NODES_ENV_KEY,
   NODE_KEY_ROTATIONS_CSTORE_HKEY,
+  node_key_rotation_successor,
   parse_revoked_node_addresses,
 )
 
-__VER__ = '0.3.4'
+__VER__ = '0.3.5'
 
 # Mainnet nodes whose key is in `EE_REVOKED_NODE_ADDRESSES` and that had any availability
 # in the eligibility epochs are signed full availability in the floor epochs.
@@ -55,6 +57,10 @@ REVOKED_FLOOR_LAST_EPOCH = 557
 REVOKED_FLOOR_VALUE = 255
 # Most addresses `node_key_rotations` answers per request.
 NODE_KEY_ROTATIONS_MAX_ADDRESSES = 1000
+# Every this many seconds the oracle copies the `NODE_KEY_ROTATIONS` hash from each dAuth
+# server, which write it, so an oracle that missed a write catches up.
+NODE_KEY_ROTATIONS_SYNC_INTERVAL = 600
+NODE_KEY_ROTATIONS_SYNC_TIMEOUT = 5
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -83,6 +89,7 @@ class OracleApiPlugin(BasePlugin):
     # Mainnet signs no availability without the revoked-node list: a revoked node's
     # claim signed without the floor cannot be redone.
     self.__revoked_nodes = {}
+    self.__last_node_key_rotations_sync = 0
     if self.evm_network == dAuth.EvmNetData.MAINNET:
       self.__revoked_nodes = parse_revoked_node_addresses(
         self.bc, self.os_environ.get(DAUTH_REVOKED_NODES_ENV_KEY)
@@ -120,6 +127,39 @@ class OracleApiPlugin(BasePlugin):
       self.__class__.__name__, current_epoch, self.json_dumps(my_node_info, indent=2))
     )
     # TODO: Bleo lock it until we `can_serve` it
+    return
+
+
+  def process(self):
+    super(OracleApiPlugin, self).process()
+    self.__maybe_sync_node_key_rotations()
+    return
+
+
+  def __maybe_sync_node_key_rotations(self):
+    """Merge the `NODE_KEY_ROTATIONS` hash from every dAuth server (mainnet only)."""
+    if not self.__revoked_nodes:
+      return
+    now = self.time()
+    if now - self.__last_node_key_rotations_sync < NODE_KEY_ROTATIONS_SYNC_INTERVAL:
+      return
+    self.__last_node_key_rotations_sync = now
+    try:
+      peers = get_dauth_registry_internal_peers(self)
+    except Exception as exc:
+      self.P(f"Could not list dAuth servers to sync node key rotations: {exc}", color='y')
+      return
+    for peer in peers:
+      if peer == self.bc.address:
+        continue
+      try:
+        self.chainstore_hsync(
+          hkey=NODE_KEY_ROTATIONS_CSTORE_HKEY, extra_peers=[peer],
+          include_default_peers=False, include_configured_peers=False,
+          timeout=NODE_KEY_ROTATIONS_SYNC_TIMEOUT,
+        )
+      except Exception as exc:
+        self.P(f"Could not sync node key rotations from {peer}: {exc}", color='y')
     return
 
 
@@ -804,7 +844,7 @@ class OracleApiPlugin(BasePlugin):
   # /node_key_rotations
   def node_key_rotations(self, eth_node_addresses: list):
     """
-    Returns the new node key announced for each given revoked node key.
+    Returns, for each given revoked node key, the new node key it announced.
 
     Parameters
     ----------
@@ -814,8 +854,9 @@ class OracleApiPlugin(BasePlugin):
     Returns
     -------
     dict
-        `rotations`: {given ETH address: {node, node_eth_address}} for each address
-        that has an announced new key; addresses without one are left out.
+        `rotations`: {given ETH address: {node, node_eth_address}} for each revoked
+        address, or None when it has not announced a new key yet; addresses that are
+        not revoked are left out.
     """
     if not isinstance(eth_node_addresses, list) or len(eth_node_addresses) > NODE_KEY_ROTATIONS_MAX_ADDRESSES:
       raise ValueError(f"Please provide a list of at most {NODE_KEY_ROTATIONS_MAX_ADDRESSES} ETH node addresses.")
@@ -823,12 +864,16 @@ class OracleApiPlugin(BasePlugin):
     for eth_node_addr in eth_node_addresses:
       if not isinstance(eth_node_addr, str):
         continue
-      new_node = self.chainstore_hget(hkey=NODE_KEY_ROTATIONS_CSTORE_HKEY, key=eth_node_addr.lower())
+      new_node = node_key_rotation_successor(
+        self.chainstore_hget(hkey=NODE_KEY_ROTATIONS_CSTORE_HKEY, key=eth_node_addr.lower())
+      )
       if isinstance(new_node, str):
         rotations[eth_node_addr] = {
           'node': new_node,
           'node_eth_address': self.bc.node_address_to_eth_address(new_node),
         }
+      elif eth_node_addr.lower() in self.__revoked_nodes:
+        rotations[eth_node_addr] = None
     return self.__get_response({'rotations': rotations})
 
 

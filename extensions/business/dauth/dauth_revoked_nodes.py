@@ -21,9 +21,11 @@ also reads it.
 Key rotation: dAuth's refusal of a revoked node carries `dAuth.DAUTH_REVOKED`, and the
 node then creates a new key and announces it on `/announce_node_key`, signed by both
 keys. dAuth keeps only the first new key announced for each revoked key, in the
-`NODE_KEY_ROTATIONS` ChainStore hash (field = revoked key's ETH address, value = new node
-address), written read-only so other writers cannot replace it. The oracle API serves
-that hash to the dApp, where the license owner links the new key.
+`NODE_KEY_ROTATIONS` ChainStore hash (field = revoked key's ETH address, value = the
+signed announcement request, which any peer can verify). ChainStore accepts that hash
+only from dAuth servers and only with a valid proof, and never replaces or deletes a
+stored new key. The oracle API syncs the hash and serves it to the dApp, where the
+license owner links the new key.
 """
 import hashlib
 import json
@@ -51,7 +53,7 @@ DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL = 600
 # The plugin loop never waits longer than this for peer confirmations of one write, and
 # makes at most one such write per `process` call.
 DAUTH_REVOKED_UNLICENSED_WRITE_TIMEOUT = 3
-# Field = revoked key's lowercase ETH address, value = first new node address announced.
+# Field = revoked key's lowercase ETH address, value = first announcement request (the proof).
 NODE_KEY_ROTATIONS_CSTORE_HKEY = "NODE_KEY_ROTATIONS"
 # The announcement request waits at most this long for peer confirmations (seconds).
 NODE_KEY_ROTATION_WRITE_TIMEOUT = 3
@@ -107,6 +109,13 @@ def parse_revoked_node_addresses(bc, value):
   return revoked
 
 
+def node_key_rotation_successor(proof):
+  """New node address named by a stored rotation proof (already verified by ChainStore)."""
+  if not isinstance(proof, dict):
+    return None
+  return (proof.get(dAuth.DAUTH_KEY_ROTATION) or {}).get("new_node")
+
+
 class _DauthRevokedNodesMixin(object):
   """Denylist of revoked node addresses."""
 
@@ -156,9 +165,9 @@ class _DauthRevokedNodesMixin(object):
 
     The request is signed by the new key and carries the announcement
     (`dAuth.DAUTH_KEY_ROTATION`) signed by the revoked key, naming the new key. The
-    first new key stored for a revoked key is final; later announcements only read it.
-    A matching announcement rewrites the same value so a write lost the first time is
-    replicated on retry.
+    request itself is stored as the proof. The first new key stored for a revoked key is
+    final; later announcements only read it. A matching announcement rewrites the stored
+    proof so a write lost the first time is replicated on retry.
 
     Returns
     -------
@@ -167,29 +176,24 @@ class _DauthRevokedNodesMixin(object):
       (True when the stored address is this request's and peers confirmed it).
     """
     new_node, new_eth = self._verify_signed_dauth_body(body, endpoint="announce_node_key")
-    announcement = body.get(dAuth.DAUTH_KEY_ROTATION)
-    if not isinstance(announcement, dict) or not self.bc.verify(announcement, return_full_info=True).valid:
-      raise ValueError("Invalid node key announcement signature.")
-    if (
-      announcement.get("purpose") != dAuth.DAUTH_KEY_ROTATION_PURPOSE
-      or announcement.get("network") != self.evm_network
-      or not isinstance(announcement.get("new_node"), str)
-      or self.bc.node_address_to_eth_address(announcement["new_node"]).lower() != new_eth.lower()
-    ):
+    old_node, announced_node = self.bc.verify_node_key_rotation(body)
+    if announced_node != new_node:
       raise ValueError("Invalid node key announcement.")
-    old_node = announcement.get(self.const.BASE_CT.BCctbase.SENDER)
     old_eth = self.bc.node_address_to_eth_address(old_node).lower()
     if old_eth not in self._dauth_revoked_nodes:
       raise ValueError("Only a revoked node key can announce a new key.")
 
-    stored = self.chainstore_hget(hkey=NODE_KEY_ROTATIONS_CSTORE_HKEY, key=old_eth)
+    current = self.chainstore_hget(hkey=NODE_KEY_ROTATIONS_CSTORE_HKEY, key=old_eth)
+    stored = node_key_rotation_successor(current)
     confirmed = False
     if stored in (None, new_node):
       confirmed = bool(self.chainstore_hset(
-        hkey=NODE_KEY_ROTATIONS_CSTORE_HKEY, key=old_eth, value=new_node,
+        hkey=NODE_KEY_ROTATIONS_CSTORE_HKEY, key=old_eth, value=current or body,
         readonly=True, timeout=NODE_KEY_ROTATION_WRITE_TIMEOUT, max_retries=0,
       ))
-      stored = self.chainstore_hget(hkey=NODE_KEY_ROTATIONS_CSTORE_HKEY, key=old_eth)
+      stored = node_key_rotation_successor(
+        self.chainstore_hget(hkey=NODE_KEY_ROTATIONS_CSTORE_HKEY, key=old_eth)
+      )
     self.P("Node key announcement for revoked {} -> {}: stored {}, confirmed {}".format(
       old_eth, new_eth, stored, confirmed and stored == new_node,
     ), color='y')
