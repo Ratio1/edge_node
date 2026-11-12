@@ -504,12 +504,13 @@ class DauthManagerPlugin(
       return self.__get_response({
         'error': 'dAuth server is not registered as a dAuth oracle'
       })
+    nonce = body.get("nonce") if isinstance(body, dict) else None
     try:
       data = self._announce_node_key(body)
     except Exception as e:
       self.P("Node key announcement from {} refused: {}".format(self.get_request_client_ip(), e), color='r')
       data = {'error': str(e)}
-    return self.__get_response(data)
+    return self.__get_response({'nonce': nonce, **data})
 
   @BasePlugin.endpoint(method="post")
   # /add_secrets
