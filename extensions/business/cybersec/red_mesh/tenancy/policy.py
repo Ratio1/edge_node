@@ -31,6 +31,9 @@ _ROLE_OPERATIONS = {
     "engagements:create", "engagements:revoke", "engagements:documents",
     # RM-107. Removes a tenant with no members and no jobs (owner, 2026-09-28).
     "tenants:delete",
+    # RM-120. Framework maturity self-assessment: governance data, read by the tenant roles that
+    # hold reports:view except the pentesters (owner, 2026-10-06), written by the admins.
+    "compliance_assessments:view", "compliance_assessments:manage",
     # RM-125. Registers, edits, archives and deletes the tenant's assets (owner, 2026-10-09).
     "assets:manage",
   }),
@@ -45,6 +48,7 @@ _ROLE_OPERATIONS = {
     "node_failure_policy:update",
     "tenant_users:manage", "attestation_keys:manage",
     "reports:view", "reports:export", "audit:view",
+    "compliance_assessments:view", "compliance_assessments:manage",
     # RM-155 (owner, 2026-11-03): a Tenant Admin may review under the same conditions as the others:
     # the Super-Tenant Admin's designation and the tenant's Allow Pentester switch.
     "reports:review",
@@ -52,7 +56,7 @@ _ROLE_OPERATIONS = {
   "tenant_pentester": frozenset({"tasks:launch", "tasks:update", "reports:view", "reports:export",
                                  "analysis:run", "authorization:upload", "tasks:stop",
                                  "reports:review"}),
-  "tenant_user": frozenset({"reports:view"}),
+  "tenant_user": frozenset({"reports:view", "compliance_assessments:view"}),
 }
 _PLATFORM_ROLES = frozenset({"super_tenant_admin", "super_pentester"})
 # Operations Allow Pentester binds the way it binds launch: the tenant roles need the switch on, the
