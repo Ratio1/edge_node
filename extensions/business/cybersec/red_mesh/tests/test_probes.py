@@ -5436,6 +5436,60 @@ class RedMeshCatchAllGatingTests(unittest.TestCase):
       [f["title"] for f in result["findings"]],
     )
 
+  def test_a_500_for_every_path_withholds_the_java_deserialization_findings(self):
+    """Port 631 (CUPS) answers 500 to every path and echoes the path in the
+    body. CVE-2017-12149, CVE-2019-2725 and JMXInvokerServlet rested on that."""
+    worker = self._build_worker()
+
+    def cups(url, **_kwargs):
+      return self._response(500, f"<html>Bad request /{url.split('/', 3)[3]}</html>")
+
+    with patch(_DISCOVERY_GET, side_effect=cups), patch(_INJECTION_GET, side_effect=cups):
+      result = worker._web_test_java_deserialization("example.com", 80)
+    self.assertEqual(result["findings"], [])
+    paths = {e["path"] for e in worker.state["catch_all_withheld"]["http://example.com"]}
+    self.assertEqual(
+      paths,
+      {"/invoker/readonly", "/invoker/JMXInvokerServlet", "/_async/AsyncResponseService"},
+    )
+    self.assertEqual(worker.state["catch_all_status"], {"http://example.com": 500})
+
+  def test_a_500_catch_all_is_reported_and_named_like_the_200_one(self):
+    worker = self._build_worker()
+    with patch(_DISCOVERY_GET, side_effect=self._all(500)), \
+         patch(_INJECTION_GET, side_effect=self._all(500)):
+      common = worker._web_test_common("example.com", 80)
+      worker._web_test_java_deserialization("example.com", 80)
+    [canary] = [f for f in common["findings"] if f["title"] == "Web server returns HTTP 500 for random paths"]
+    self.assertEqual(canary["severity"], "INFO")
+    self.assertIn("HTTP 500", canary["evidence"])
+    self.assertEqual(worker.state["catch_all_hosts"], {"http://example.com": False})
+    withheld = {e["path"] for e in worker.state["catch_all_withheld"]["http://example.com"]}
+    self.assertIn("/invoker/readonly", withheld)
+
+  def test_a_404_host_still_reports_a_500_on_the_invoker_path(self):
+    worker = self._build_worker()
+
+    def fake(url, **_kwargs):
+      return self._response(500 if url.endswith("/invoker/readonly") else 404)
+
+    with patch(_DISCOVERY_GET, side_effect=fake), patch(_INJECTION_GET, side_effect=fake):
+      result = worker._web_test_java_deserialization("example.com", 80)
+    self.assertIn("CVE-2017-12149", " ".join(f["title"] for f in result["findings"]))
+    self.assertNotIn("catch_all_withheld", worker.state)
+
+  def test_a_body_validated_hit_survives_a_500_catch_all(self):
+    worker = self._build_worker()
+
+    def fake(url, **_kwargs):
+      if url.endswith("/_async/AsyncResponseService"):
+        return self._response(500, "<soap>AsyncResponseService fault</soap>", {"Content-Type": "text/xml"})
+      return self._response(500, "error")
+
+    with patch(_DISCOVERY_GET, side_effect=fake), patch(_INJECTION_GET, side_effect=fake):
+      result = worker._web_test_java_deserialization("example.com", 80)
+    self.assertEqual([f["title"] for f in result["findings"] if "CVE-2019-2725" in f["title"]].__len__(), 1)
+
   def test_actuator_needs_an_actuator_shaped_body_on_a_catch_all_host(self):
     worker = self._build_worker()
 

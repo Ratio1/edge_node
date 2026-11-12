@@ -9,6 +9,20 @@ from ..probe_registry import register_probe, CATEGORY_WEB_TEST
 
 
 CATCH_ALL_TITLE = "Web server returns 200 for random paths"
+# A host that answers one error code to every path (CUPS on 631 answers 500)
+# makes status-only checks on that code as unreliable as a 200-for-all host.
+CATCH_ALL_ERROR_TITLE_PREFIX = "Web server returns HTTP "
+CATCH_ALL_ERROR_TITLE_SUFFIX = " for random paths"
+# Statuses a healthy server answers for a path that does not exist.
+_NORMAL_MISSING_STATUSES = (404, 410)
+
+
+def is_catch_all_title(title):
+  """True for the 200 canary title and the non-200 (error) canary titles."""
+  title = str(title or "")
+  return title == CATCH_ALL_TITLE or (
+    title.startswith(CATCH_ALL_ERROR_TITLE_PREFIX) and title.endswith(CATCH_ALL_ERROR_TITLE_SUFFIX)
+  )
 
 
 def web_base_url(target, port):
@@ -36,18 +50,63 @@ class _WebDiscoveryMixin:
     aiohttp host that 200s everything (RM-086 item 1). Body-validated probes
     never consult it.
     """
+    status = self._random_path_status(base_url)
     memo = self.state.setdefault("catch_all_hosts", {})
-    if base_url in memo:
-      return memo[base_url]
-    result = False
+    memo[base_url] = status == 200
+    return memo[base_url]
+
+  def _random_path_status(self, base_url):
+    """HTTP status `base_url` answers for a random, non-existent path, or None.
+
+    The canary runs once per base_url; the status (whatever the code) is kept in
+    `state["catch_all_status"]`, and the canary body, with the canary path
+    replaced by `{P}`, in `state["catch_all_canary_body"]` so a check can tell a
+    real endpoint from an error page that echoes the requested path. None when
+    the request failed.
+    """
+    statuses = self.state.setdefault("catch_all_status", {})
+    if base_url in statuses:
+      return statuses[base_url]
+    status = None
     try:
       canary_path = f"/{_uuid.uuid4().hex}"
       canary_resp = requests.get(base_url + canary_path, timeout=self._target_timeout(2), verify=False)
-      result = canary_resp.status_code == 200
+      status = canary_resp.status_code
+      text = canary_resp.text
+      if isinstance(text, str):
+        self.state.setdefault("catch_all_canary_body", {})[base_url] = text[:4000].replace(canary_path, "{P}")
     except Exception:
-      result = False
-    memo[base_url] = result
-    return result
+      status = None
+    statuses[base_url] = status
+    return status
+
+  def _catch_all_error_status(self, base_url):
+    """The 4xx/5xx status (other than 404/410) `base_url` answers to a random path, else None."""
+    status = self._random_path_status(base_url)
+    if isinstance(status, int) and status >= 400 and status not in _NORMAL_MISSING_STATUSES:
+      return status
+    return None
+
+  def _matches_catch_all_error(self, base_url, path, resp, status_only):
+    """True when `resp` is the host's answer-to-everything error, not a real hit.
+
+    A status-only check (`status_only`) is judged on the status alone: equal to
+    the random-path status means no information. A body-validated check is
+    affected only when the body is the canary's body with the path swapped, i.e.
+    an error page that echoes the requested path. Both record the path as withheld.
+    """
+    status = self._catch_all_error_status(base_url)
+    if status is None or resp.status_code != status:
+      return False
+    if not status_only:
+      canary_body = self.state.get("catch_all_canary_body", {}).get(base_url)
+      text = resp.text
+      if canary_body is None or not isinstance(text, str):
+        return False
+      if text[:4000].replace(path, "{P}") != canary_body:
+        return False
+    self._withhold_on_catch_all(base_url, "_web_test_java_deserialization", path)
+    return True
 
   def _withhold_on_catch_all(self, base_url, probe, path):
     """Record a status-only check withheld because `base_url` is a catch-all host.
@@ -97,6 +156,21 @@ class _WebDiscoveryMixin:
 
     # --- Catch-all detection: 200-for-all ---
     catch_all = self._host_is_catch_all(base_url)
+    error_status = self._catch_all_error_status(base_url)
+    if error_status is not None:
+      findings_list.append(Finding(
+        severity=Severity.INFO,
+        title=f"{CATCH_ALL_ERROR_TITLE_PREFIX}{error_status}{CATCH_ALL_ERROR_TITLE_SUFFIX}",
+        description=f"A request to a non-existent random UUID path returned HTTP {error_status}, "
+                    "the same status the host gives every path. It lowers confidence in any "
+                    "status-only check on that code; those checks are withheld "
+                    "and listed under coverage limitations.",
+        evidence=f"A request to {base_url} for a randomly generated, "
+                 f"non-existent path returned HTTP {error_status}.",
+        remediation="Investigate the catch-all behavior; ensure proper 404 responses for unknown paths.",
+        cwe_id="CWE-345",
+        confidence="firm",
+      ))
     if catch_all:
       findings_list.append(Finding(
         # INFO, not a weakness: the catch-all is a property of the host that
