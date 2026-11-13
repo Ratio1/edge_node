@@ -90,8 +90,8 @@ class _DauthDeploymentSecretsMixin:
       raise ValueError("Secret action does not match the deployment phase.")
     if (operation.get("kind") == "delete") != (action == "delete" or (action == "revoke" and phase == "retiring_previous")):
       raise ValueError("Secret action does not match the deployment kind.")
-    # Read the plan without pinning so the 10 s timeout bounds it: a pinning read waits on a
-    # fixed 90 s `ipfs pin add`, so one missing document held the single dAuth thread 182-212 s.
+    # Read the plan within the 10 s timeout and without pinning: this node does not need its own
+    # pin of the plan, because the writer and the relays keep theirs.
     plan = self.r1fs.get_json(operation["plan_cid"], timeout=10, pin=False, show_logs=False)
     if not isinstance(plan, dict):
       raise RuntimeError("Deployment plan is unavailable.")
@@ -309,8 +309,8 @@ class _DauthDeploymentSecretsMixin:
       representative = copy.deepcopy(next(iter(configs.values())))
       representative.pop("DEEPLOY_OPERATION", None)
       canonical = self._recursively_sort_pipeline_data(self.extract_invariable_data_from_pipeline(representative))
-      # Read the published configuration without pinning so the 10 s timeout bounds it: a
-      # pinning read waits on a fixed 90 s `ipfs pin add` that ignores the timeout.
+      # Read the published configuration within the 10 s timeout and without pinning: this node
+      # does not need its own pin of it, because the writer and the relays keep theirs.
       published = self.r1fs.get_json(pointer["pipeline_cid"], timeout=10, pin=False, show_logs=False)
       if published is None:
         raise RuntimeError("Published deployment configuration is unavailable.")
@@ -401,8 +401,8 @@ class _DauthDeploymentSecretsMixin:
           or pointer.get("revision") != operation["target_revision"]
           or not pointer.get("pipeline_cid")):
         raise RuntimeError("Active deployment publication is pending.")
-      # Read the published configuration without pinning so the 10 s timeout bounds it: a
-      # pinning read waits on a fixed 90 s `ipfs pin add` that ignores the timeout.
+      # Read the published configuration within the 10 s timeout and without pinning: this node
+      # does not need its own pin of it, because the writer and the relays keep theirs.
       published = self.r1fs.get_json(pointer["pipeline_cid"], timeout=10, pin=False, show_logs=False)
       if published is None:
         raise RuntimeError("Published deployment configuration is unavailable.")

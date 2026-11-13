@@ -50,6 +50,16 @@ _CONFIG = {
   'MIN_ETH_BALANCE' : 0.0003,
 
   'REQUESTS_CSTORE_HKEY': 'DEEPLOY_REQUESTS',
+  # The endpoints that change state are recorded under this oracle's id, so that the other oracles can see the
+  # requests it received (the request-tracking mixin says when a write happens): deploy, update, scale up,
+  # delete, the commands to a running app, the CSP escrow reconciliation and the preferred-node save. Reads are
+  # not recorded: the status poll that a client repeats every 2 s used to be one chain-store write per poll,
+  # stored and saved again by every oracle.
+  'REQUESTS_TRACKED_ENDPOINTS': ['create_pipeline', 'update_pipeline', 'scale_up_job_workers', 'delete_pipeline', 'send_instance_command', 'send_app_command', 'reconcile_csp_escrow_jobs', 'save_preferred_nodes'],
+  # At most one write of the record every 30 s (two a minute), however often the endpoints above are called.
+  # A change after a quiet period is written by the next process() call that runs past WARMUP_DELAY; process()
+  # runs at the end of the plugin lap, after the queued requests.
+  'REQUESTS_SAVE_INTERVAL': 30,
   'REQUESTS_LOG_INTERVAL' : 5 * 60,
   'REQUESTS_MAX_RECORDS' : 2,
 
