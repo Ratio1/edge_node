@@ -3,6 +3,7 @@ import copy
 import hashlib
 import threading
 import unittest
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -39,7 +40,8 @@ class Coordinator(_DeploymentOperationsMixin):
     self._deployment_preparations = {}
     self._operations_confirmed = {}
     self._operations_sent_at = {}
-    self._verified_operation_records = set()  # as _init_deployment_operations creates it
+    self._verified_operation_records = OrderedDict()  # as _init_deployment_operations creates it
+    self._verified_operation_records_lock = threading.Lock()
     self._custody_retry = {}  # as _init_deployment_operations creates it
     self.cfg_deployment_readiness_timeout = 60
     self._get_response = lambda result: result
@@ -627,15 +629,108 @@ class RuntimeCompletionTests(unittest.TestCase):
     plugin.bc.sign(record)
     self.assertTrue(plugin._verify_operation_record(record, "coordinator"))
     self.assertFalse(plugin._verify_operation_record(record, "node_addr"))
-    # The memory is bounded: at 10,000 fingerprints it starts again, and says so in red, because with more
-    # valid records than that alive it happens on every pass and nothing is saved any more.
-    plugin._verified_operation_records = set(range(10000))
-    logs = []
-    plugin.P = lambda message, color=None, **kwargs: logs.append((message.split(":")[0], color))
-    record["sequence"] = 9
-    self.assertTrue(plugin._verify_operation_record(record, "coordinator"))
-    self.assertEqual(len(plugin._verified_operation_records), 1)
-    self.assertEqual(logs, [("Emptying the 10,000 remembered Deeploy record fingerprints", "r")])
+
+  def test_verified_fingerprints_evict_only_the_oldest_insertion(self):
+    plugin = Coordinator()
+    record = dict(coordinator="oracle", EE_SENDER="oracle", EE_SIGN="valid")
+    plugin.bc.verify = Mock(wraps=plugin.bc.verify)
+    plugin.P = Mock()
+    for index in range(10000):
+      self.assertTrue(plugin._verify_operation_record(dict(record, sequence=index), "coordinator"))
+    self.assertEqual(len(plugin._verified_operation_records), 10000)
+    plugin.bc.verify.reset_mock()
+    # A cache hit does not refresh insertion order.
+    self.assertTrue(plugin._verify_operation_record(dict(record, sequence=0), "coordinator"))
+    plugin.bc.verify.assert_not_called()
+    # Neither invalid signatures nor a mismatched writer may evict a valid entry.
+    for invalid in (dict(record, EE_SIGN="forged"), dict(record, EE_SENDER="other")):
+      for _ in range(2):
+        self.assertFalse(plugin._verify_operation_record(invalid, "coordinator"))
+    self.assertEqual(plugin.bc.verify.call_count, 4)
+    self.assertTrue(plugin._verify_operation_record(dict(record, sequence=0), "coordinator"))
+    self.assertEqual(plugin.bc.verify.call_count, 4)
+    self.assertTrue(plugin._verify_operation_record(dict(record, sequence=10000), "coordinator"))
+    self.assertEqual(len(plugin._verified_operation_records), 10000)
+    plugin.bc.verify.reset_mock()
+    for index in (1, 9999, 10000):
+      self.assertTrue(plugin._verify_operation_record(dict(record, sequence=index), "coordinator"))
+    plugin.bc.verify.assert_not_called()
+    # The evicted record is verified again; its reinsertion evicts the next oldest.
+    for index in (0, 1):
+      self.assertTrue(plugin._verify_operation_record(dict(record, sequence=index), "coordinator"))
+    self.assertEqual(plugin.bc.verify.call_count, 2)
+    self.assertEqual(len(plugin._verified_operation_records), 10000)
+    plugin.P.assert_not_called()
+
+  def test_concurrent_verified_fingerprints_remain_bounded_without_extra_evictions(self):
+    # A barrier alone can miss unprotected cache races under the GIL. Assert lock ownership too.
+    test = self
+
+    class CacheLock:
+      def __init__(self):
+        self.lock = threading.Lock()
+        self.owner = None
+
+      def __enter__(self):
+        self.lock.acquire()
+        self.owner = threading.get_ident()
+
+      def __exit__(self, *args):
+        self.owner = None
+        self.lock.release()
+
+    class LockedCache(OrderedDict):
+      def __contains__(self, key):
+        test.assertEqual(self.guard.owner, threading.get_ident())
+        return super().__contains__(key)
+
+      def __len__(self):
+        test.assertEqual(self.guard.owner, threading.get_ident())
+        return super().__len__()
+
+      def __setitem__(self, key, value):
+        test.assertEqual(self.guard.owner, threading.get_ident())
+        super().__setitem__(key, value)
+        test.assertLessEqual(OrderedDict.__len__(self), 10000)
+
+      def popitem(self, *args, **kwargs):
+        test.assertEqual(self.guard.owner, threading.get_ident())
+        return super().popitem(*args, **kwargs)
+
+    for duplicates in (False, True):
+      with self.subTest(duplicates=duplicates):
+        plugin = Coordinator()
+        cache = LockedCache()
+        cache.guard = plugin._verified_operation_records_lock = CacheLock()
+        plugin._verified_operation_records = cache
+        record = dict(coordinator="oracle", EE_SENDER="oracle", EE_SIGN="valid")
+        for index in range(10000):
+          self.assertTrue(plugin._verify_operation_record(dict(record, sequence=index), "coordinator"))
+        verify = plugin.bc.verify
+        barrier = threading.Barrier(4, timeout=5)
+
+        def concurrent_verify(value, **kwargs):
+          # All misses must reach verification concurrently: the cache lock cannot cover crypto.
+          barrier.wait()
+          return verify(value, **kwargs)
+
+        plugin.bc.verify = concurrent_verify
+        indices = [10000] * 4 if duplicates else list(range(10000, 10004))
+        with ThreadPoolExecutor(max_workers=4) as executor:
+          futures = [executor.submit(plugin._verify_operation_record, dict(record, sequence=index), "coordinator")
+                     for index in indices]
+          self.assertEqual([future.result(timeout=10) for future in futures], [True] * 4)
+        with cache.guard:
+          self.assertEqual(len(cache), 10000)
+        plugin.bc.verify = Mock(wraps=verify)
+        # Duplicate misses insert once; distinct misses evict exactly their number of old entries.
+        for index in [len(set(indices)), 9999] + indices:
+          self.assertTrue(plugin._verify_operation_record(dict(record, sequence=index), "coordinator"))
+        plugin.bc.verify.assert_not_called()
+        self.assertTrue(plugin._verify_operation_record(dict(record, sequence=0), "coordinator"))
+        plugin.bc.verify.assert_called_once()
+        with cache.guard:
+          self.assertEqual(len(cache), 10000)
 
   def test_completed_snapshot_is_resent_as_repair_for_ten_minutes(self):
     # One confirmation is enough for a write, so an oracle can miss the final snapshot; nothing else sends it again.

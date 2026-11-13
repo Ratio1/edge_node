@@ -4,7 +4,7 @@ import hashlib
 import importlib.util
 import json
 import threading
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -174,7 +174,8 @@ class Node:
     self._deployment_preparations = {}
     self._operations_confirmed = {}
     self._operations_sent_at = {}
-    self._verified_operation_records = set()  # as _init_deployment_operations creates it
+    self._verified_operation_records = OrderedDict()  # as _init_deployment_operations creates it
+    self._verified_operation_records_lock = threading.Lock()
     # The operations worker's custody waits, as _init_deployment_operations creates them; without it a pass of
     # _reconcile_coordinator_operations would fail on the missing field instead of pacing a failed custody call.
     self._custody_retry = {}

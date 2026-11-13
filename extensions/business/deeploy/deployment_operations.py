@@ -12,6 +12,7 @@ import threading
 # The call path of an error that stops an operation is logged (function names only).
 import traceback
 import uuid
+from collections import OrderedDict
 
 from ratio1.const.base import BCct, dAuth
 from .selected_secrets import inherit_selections
@@ -118,7 +119,7 @@ class _DeploymentOperationsMixin:
     that used to be written into the signed operation snapshot, so a command
     retry no longer produces a new CStore write; `_operations_confirmed`
     holds the last confirmed send of each snapshot, so an unchanged snapshot
-    is no longer re-sent on every 2 s pass. `_verified_operation_records`, a set,
+    is no longer re-sent on every 2 s pass. `_verified_operation_records`, a FIFO cache,
     holds the fingerprints of the records whose signature was already checked
     and found valid (see `_verify_operation_record`). `_custody_retry` holds,
     per operation out of the "preparing" phase with a failed dAuth custody
@@ -161,10 +162,9 @@ class _DeploymentOperationsMixin:
     # Last command time per "operation id|attempt|action|node": the 10 s resend throttle lives in process
     # memory, so a command retry no longer writes a new signed snapshot that every oracle re-stores.
     self._operations_sent_at = {}
-    # Fingerprints of the signed records already checked and found valid. A signed record never changes,
-    # so while the set has room for every valid record, its signature is not checked again on every 2 s
-    # worker pass and every status poll (see _verify_operation_record for when it has no room).
-    self._verified_operation_records = set()
+    # Keep the last 10,000 verified fingerprints in insertion order; hits do not refresh their position.
+    self._verified_operation_records = OrderedDict()
+    self._verified_operation_records_lock = threading.Lock()
     # Operation id -> (failures in a row, time of the last one, seconds to wait) after a failed dAuth custody
     # call: the worker waits that long before it calls the same dAuth server again, instead of every 2 s.
     self._custody_retry = {}
@@ -223,15 +223,13 @@ class _DeploymentOperationsMixin:
 
     Notes
     -----
-    The remembered set lives in process memory, so after a restart every record is checked once more.
-    It is emptied when it reaches 10,000 fingerprints (about 1 MB), because records that were replaced
-    leave their fingerprints behind. While far fewer than 10,000 valid records (operation snapshots and
-    node reports together) are read in one pass, emptying it costs one more full pass of checks. With
-    more than 10,000 valid records alive, the set fills up and is emptied within every pass, almost
-    every record is checked again on every pass, and the saving is gone. Records are never removed, so
-    that point comes closer with every operation created. A red log line marks each emptying, so the
-    operator sees when it starts to repeat. It is read and written from the worker thread and the
-    plugin thread; each operation on it is a single set call.
+    The cache lives in process memory, so after a restart every record is checked once more.
+    It holds at most 10,000 fingerprints. Inserting a new one at capacity evicts only the oldest
+    insertion; hits do not refresh that order. Evicted records are checked again when next read.
+    Sequential scans of more than 10,000 distinct valid records can still miss on every lookup.
+    A lock protects lookups and insertion/eviction shared by the worker and plugin threads.
+    Signature verification runs outside the lock, so concurrent misses can check the same record
+    more than once; membership is checked again before insertion to avoid unnecessary eviction.
 
     Examples
     --------
@@ -248,23 +246,21 @@ class _DeploymentOperationsMixin:
       # Fingerprint of everything the result depends on: the writer field's name and the whole record,
       # signature fields included. About 30 times cheaper than the signature check it replaces.
       fingerprint = hashlib.sha256((signer_key + json.dumps(record, sort_keys=True)).encode()).digest()
-      if fingerprint in self._verified_operation_records:
-        # These exact bytes were checked before and were valid: no second signature check.
-        return True
+      with self._verified_operation_records_lock:
+        if fingerprint in self._verified_operation_records:
+          # These exact bytes were checked before and were valid: no second signature check.
+          return True
       verification = self.bc.verify(record, return_full_info=True)
       # The full check, as before: a valid signature made by the address the record names as its writer.
       valid = bool(verification.valid and record.get("EE_SENDER") == record[signer_key])
       if valid:
-        # Bound the memory: fingerprints of replaced records are never looked up again. Emptying the set
-        # means the current records are checked once more; with more than 10,000 valid records alive it
-        # happens on every pass and the saving is gone.
-        if len(self._verified_operation_records) >= 10000:
-          self.P("Emptying the 10,000 remembered Deeploy record fingerprints: every record is checked again. "
-                 "If this repeats on every pass, more than 10,000 valid records are alive.", color='r')
-          # Start again with an empty set; the records read from here on are remembered anew.
-          self._verified_operation_records.clear()
-        # Remember only records that passed, so a bad record is never accepted from memory.
-        self._verified_operation_records.add(fingerprint)
+        with self._verified_operation_records_lock:
+          # Another thread may have verified and inserted this fingerprint while the lock was released.
+          if fingerprint not in self._verified_operation_records:
+            if len(self._verified_operation_records) >= 10000:
+              self._verified_operation_records.popitem(last=False)
+            # Remember only records that passed; retain the other cached verifications at capacity.
+            self._verified_operation_records[fingerprint] = True
       # The outcome of the full check; a record that failed it was not remembered above.
       return valid
     except Exception:
