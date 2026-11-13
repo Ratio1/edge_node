@@ -12,6 +12,7 @@ import threading
 # The call path of an error that stops an operation is logged (function names only).
 import traceback
 import uuid
+# The verified-fingerprint cache keeps insertion order, so its oldest entry can be dropped first.
 from collections import OrderedDict
 
 from ratio1.const.base import BCct, dAuth
@@ -164,6 +165,7 @@ class _DeploymentOperationsMixin:
     self._operations_sent_at = {}
     # Keep the last 10,000 verified fingerprints in insertion order; hits do not refresh their position.
     self._verified_operation_records = OrderedDict()
+    # The worker thread and the plugin thread both look up and insert: one lock for the cache.
     self._verified_operation_records_lock = threading.Lock()
     # Operation id -> (failures in a row, time of the last one, seconds to wait) after a failed dAuth custody
     # call: the worker waits that long before it calls the same dAuth server again, instead of every 2 s.
@@ -246,6 +248,7 @@ class _DeploymentOperationsMixin:
       # Fingerprint of everything the result depends on: the writer field's name and the whole record,
       # signature fields included. About 30 times cheaper than the signature check it replaces.
       fingerprint = hashlib.sha256((signer_key + json.dumps(record, sort_keys=True)).encode()).digest()
+      # Look the fingerprint up under the cache lock; the signature check below runs outside it.
       with self._verified_operation_records_lock:
         if fingerprint in self._verified_operation_records:
           # These exact bytes were checked before and were valid: no second signature check.
@@ -254,10 +257,12 @@ class _DeploymentOperationsMixin:
       # The full check, as before: a valid signature made by the address the record names as its writer.
       valid = bool(verification.valid and record.get("EE_SENDER") == record[signer_key])
       if valid:
+        # Insert under the cache lock, so the size check, the drop and the insert are one step.
         with self._verified_operation_records_lock:
           # Another thread may have verified and inserted this fingerprint while the lock was released.
           if fingerprint not in self._verified_operation_records:
             if len(self._verified_operation_records) >= 10000:
+              # At capacity drop only the oldest insertion, so the other cached checks are kept.
               self._verified_operation_records.popitem(last=False)
             # Remember only records that passed; retain the other cached verifications at capacity.
             self._verified_operation_records[fingerprint] = True
