@@ -4,6 +4,51 @@ from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebApp
 
 __VER__ = '0.2.3'
 
+# Namespaces the node's own plugins keep in the chain store; they reach them through the plugin API, not over this
+# HTTP API. Every data endpoint refuses a name that starts with one of these entries (each an exact name or a prefix).
+SYSTEM_NAMESPACES = (
+  # The composed key of a hash record, "hs:<hash of the hash key>:<field>" (built by chainstore_hset): refused so
+  # the plain get and set cannot address a hash record by its raw key. A hash key with this prefix is refused too.
+  "hs:",
+  # dAuth: DAUTH_JOB_SECRETS, DAUTH_JOB_SECRET_REVISIONS, DAUTH_REVOKED_UNLICENSED_NODES and DAUTH_REQUESTS.
+  "DAUTH_",
+  # Deeploy: the job hashes DEEPLOY_DEPLOYED_JOBS, DEEPLOY_OPERATIONS and DEEPLOY_NODE_OPERATIONS, and DEEPLOY_REQUESTS.
+  "DEEPLOY_",
+  # Node key rotations, each one a signed proof written by dAuth servers.
+  "NODE_KEY_ROTATIONS",
+  # Tunnels Manager: tunnels_manager_secrets and tunnels_manager_tcp_routes.
+  "tunnels_manager_",
+  # Container-app file sync records, published by the node's container-app plugin.
+  "CHAINSTORE_SYNC",
+  # Deeploy Plus+ preferred-node lists, one per CSP owner.
+  "plus_preferred_nodes",
+  # Liveness marks of the chain-distribution monitor.
+  "chain_dist_monitor",
+  # Edge inference API: the capacity records and the delegated request and result mailboxes of a balancing group.
+  "inference_api:",
+)
+# The exact hash keys the node's own plugins use, which the prefixes above stand for. A hash endpoint also refuses a
+# hash key whose index (the hash part of its records' raw keys, as chainstore_hset composes it) equals the index of
+# one of these, since its records are stored under the same raw keys.
+SYSTEM_HASH_KEYS = (
+  # dAuth: job secrets, their revisions, revoked unlicensed nodes, and the request log of the dAuth manager.
+  "DAUTH_JOB_SECRETS", "DAUTH_JOB_SECRET_REVISIONS", "DAUTH_REVOKED_UNLICENSED_NODES", "DAUTH_REQUESTS",
+  # Deeploy: the jobs hash, the operation and node-operation hashes, and the request log of the Deeploy manager.
+  "DEEPLOY_DEPLOYED_JOBS", "DEEPLOY_OPERATIONS", "DEEPLOY_NODE_OPERATIONS", "DEEPLOY_REQUESTS",
+  # Node key rotations.
+  "NODE_KEY_ROTATIONS",
+  # Tunnels Manager: tunnel credentials and TCP routes (the plugin's default TCP_ROUTES_HKEY).
+  "tunnels_manager_secrets", "tunnels_manager_tcp_routes",
+  # Container-app file sync records.
+  "CHAINSTORE_SYNC",
+  # Deeploy Plus+ preferred-node lists.
+  "plus_preferred_nodes",
+  # Liveness marks of the chain-distribution monitor.
+  "chain_dist_monitor",
+  # Edge inference API of the default balancing group; a named group's hash keys depend on the node's configuration.
+  "inference_api:capacity:default", "inference_api:req:default", "inference_api:res:default",
+)
+
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -11,6 +56,10 @@ _CONFIG = {
   'PORT': 31234,
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
+  # Request-driven API with no process() of its own, running on every node: instead of lapping ~30 times a
+  # second while idle, a lap with nothing queued blocks up to 0.25 s on the core wake-up event, which a
+  # request, an input, an instance command or a stop ends at once. A core without this key ignores it.
+  'IDLE_LOOP_WAIT' : 0.25,
   
   'CSTORE_VERBOSE' : 11,
 
@@ -285,6 +334,16 @@ class CstoreManagerApiPlugin(BasePlugin):
     """
     Execute one API operation with shared timing and summary accounting.
 
+    Every data endpoint runs through here, so this is also where a request for
+    a system namespace is refused: the namespace the request addresses (``hkey``
+    on the hash endpoints, the raw ``key`` on the plain get and set) is checked
+    against ``SYSTEM_NAMESPACES`` before ``operation`` runs, and on the hash
+    endpoints the index of ``hkey`` (``get_hash(hkey, algorithm='sha256',
+    length=10)``, as ``chainstore_hset`` composes it) is compared with the
+    indexes of ``SYSTEM_HASH_KEYS``. A refused request leaves one red log line
+    naming the endpoint and the first 64 characters of the namespace, never
+    the value, and is not counted in the forced-summary window.
+
     Parameters
     ----------
     endpoint_name : str
@@ -292,21 +351,46 @@ class CstoreManagerApiPlugin(BasePlugin):
     operation : callable
       Zero-argument callable that performs the actual CStore operation.
     key : str, optional
-      Flat key associated with the request for usage grouping.
+      Flat key of ``get`` and ``set``, or the field of ``hget`` and ``hset``;
+      also used for usage grouping.
     hkey : str, optional
-      Hash namespace associated with the request for usage grouping.
+      Hash namespace of the hash endpoints; also used for usage grouping.
 
     Returns
     -------
     Any
-      Result returned by ``operation``.
+      Result returned by ``operation``. For a system namespace, the error
+      answer ``{"error": str, "status_code": 403, "logged": True}`` instead,
+      and ``operation`` does not run.
 
     Raises
     ------
     Exception
       Re-raises any exception from ``operation`` after the failed call is
       recorded in the forced-summary window.
+
+    Examples
+    --------
+    >>> plugin._run_api_call("hget", lambda: 1, key="node-1", hkey="ratio1:backend:offline_nodes_notifier:v1")
+    1
+    >>> plugin._run_api_call("hget", lambda: 1, key="7", hkey="DEEPLOY_DEPLOYED_JOBS")["status_code"]
+    403
     """
+    # The namespace the request addresses: the hash key on the hash endpoints, the raw key on plain get and set.
+    namespace = key if hkey is None else hkey
+    # Refuse a namespace kept by the node's own plugins before the store is touched: a name with a system prefix,
+    # or a hash key whose index, composed as chainstore_hset composes it, equals the index of a system hash key.
+    if namespace.startswith(SYSTEM_NAMESPACES) or (
+      hkey is not None
+      and self.get_hash(hkey, algorithm='sha256', length=10)
+      in [self.get_hash(name, algorithm='sha256', length=10) for name in SYSTEM_HASH_KEYS]
+    ):
+      # Log the namespace cut to 64 characters, so a caller cannot write arbitrarily long log lines.
+      self.P(f"CStore {endpoint_name} refused for system namespace '{namespace[:64]}'", color='r')
+      # The error answer the web-app base gives for a failed request, with 403: this API does not serve it.
+      return {
+        "error": f"Namespace '{namespace}' is reserved for the node's plugins.", "status_code": 403, "logged": True,
+      }
     start_timer = self.time()
     try:
       result = operation()
@@ -370,13 +454,32 @@ class CstoreManagerApiPlugin(BasePlugin):
     """
     Set a key-value pair in the chainstore with any value type.
 
-    Args:
-        key (str): The key to store the value under
-        value: The value to store (any type supported by chainstore)
-        chainstore_peers (list): Extra chainstore peers
+    ``key`` is a raw key. A key in a system namespace (``SYSTEM_NAMESPACES``)
+    is refused, and so is a raw key in the composed form of a hash record
+    (``hs:<hash of the hash key>:<field>``, as ``chainstore_hset`` builds it):
+    hash records are written only through ``hset``.
 
-    Returns:
-        boolean: The result of the write operation
+    Parameters
+    ----------
+    key : str
+      The key to store the value under.
+    value : Any
+      The value to store (any type supported by chainstore).
+    chainstore_peers : list, optional
+      Extra chainstore peers.
+
+    Returns
+    -------
+    bool or dict
+      The result of the write operation, or for a refused key the error answer
+      ``{"error": str, "status_code": 403, "logged": True}``.
+
+    Examples
+    --------
+    >>> plugin.set(key="app:counter", value=3)
+    True
+    >>> plugin.set(key="hs:0123456789:ZmllbGQ=", value=3)["status_code"]
+    403
     """
     if chainstore_peers is None:
       chainstore_peers = []
@@ -397,11 +500,29 @@ class CstoreManagerApiPlugin(BasePlugin):
     """
     Retrieve a value from the chainstore by key.
 
-    Args:
-        key (str): The key to retrieve the value for
+    ``key`` is a raw key. A key in a system namespace (``SYSTEM_NAMESPACES``)
+    is refused, and so is a raw key in the composed form of a hash record
+    (``hs:<hash of the hash key>:<field>``, as ``chainstore_hset`` builds it):
+    hash records are read only through ``hget`` and ``hgetall``.
 
-    Returns:
-        Any: The value associated with the given key, or None if not found
+    Parameters
+    ----------
+    key : str
+      The key to retrieve the value for.
+
+    Returns
+    -------
+    Any
+      The value associated with the given key, or None if not found. For a
+      refused key, the error answer ``{"error": str, "status_code": 403,
+      "logged": True}``.
+
+    Examples
+    --------
+    >>> plugin.get(key="app:counter")
+    3
+    >>> plugin.get(key="hs:0123456789:ZmllbGQ=")["status_code"]
+    403
     """
     return self._run_api_call(
       "get",
@@ -415,14 +536,31 @@ class CstoreManagerApiPlugin(BasePlugin):
     """
     Set a field-value pair within a hash in the chainstore.
 
-    Args:
-        hkey (str): The hash key (outer key)
-        key (str): The field key within the hash
-        value (Any): The value to store for the field (any type supported by chainstore)
-        chainstore_peers (list): Extra chainstore peers
+    A hash key in a system namespace (``SYSTEM_NAMESPACES``) is refused, and
+    so is one whose index equals the index of a system hash key
+    (``SYSTEM_HASH_KEYS``).
 
-    Returns:
-        boolean: The result of the write operation
+    Parameters
+    ----------
+    hkey : str
+      The hash key (outer key).
+    key : str
+      The field key within the hash.
+    value : Any
+      The value to store for the field (any type supported by chainstore).
+    chainstore_peers : list, optional
+      Extra chainstore peers.
+
+    Returns
+    -------
+    bool or dict
+      The result of the write operation, or for a refused hash key the error
+      answer ``{"error": str, "status_code": 403, "logged": True}``.
+
+    Examples
+    --------
+    >>> plugin.hset(hkey="ratio1:backend:offline_nodes_notifier:v1", key="node-1", value={"seen": 1})
+    True
     """
     # Log request
     if chainstore_peers is None:
@@ -447,12 +585,28 @@ class CstoreManagerApiPlugin(BasePlugin):
     """
     Retrieve a field value from a hset in the chainstore.
 
-    Args:
-        hkey (str): The hash key (outer key)
-        key (str): The field key within the hset
+    A hash key in a system namespace (``SYSTEM_NAMESPACES``) is refused, and
+    so is one whose index equals the index of a system hash key
+    (``SYSTEM_HASH_KEYS``).
 
-    Returns:
-        Any: The value associated with the given field in the hset, or None if not found
+    Parameters
+    ----------
+    hkey : str
+      The hash key (outer key).
+    key : str
+      The field key within the hset.
+
+    Returns
+    -------
+    Any
+      The value associated with the given field in the hset, or None if not
+      found. For a refused hash key, the error answer ``{"error": str,
+      "status_code": 403, "logged": True}``.
+
+    Examples
+    --------
+    >>> plugin.hget(hkey="ratio1:backend:offline_nodes_notifier:v1", key="node-1")
+    {'seen': 1}
     """
     return self._run_api_call(
       "hget",
@@ -467,11 +621,26 @@ class CstoreManagerApiPlugin(BasePlugin):
     """
     Retrieve all field-value pairs from a hset in the chainstore.
 
-    Args:
-        hkey (str): The hash key to retrieve all fields for
+    A hash key in a system namespace (``SYSTEM_NAMESPACES``) is refused, and
+    so is one whose index equals the index of a system hash key
+    (``SYSTEM_HASH_KEYS``).
 
-    Returns:
-        dict: A dictionary containing all field-value pairs in the hset, with Any type values
+    Parameters
+    ----------
+    hkey : str
+      The hash key to retrieve all fields for.
+
+    Returns
+    -------
+    dict
+      A dictionary containing all field-value pairs in the hset, with Any type
+      values. For a refused hash key, the error answer ``{"error": str,
+      "status_code": 403, "logged": True}``.
+
+    Examples
+    --------
+    >>> plugin.hgetall(hkey="ratio1:backend:offline_nodes_notifier:v1")
+    {'node-1': {'seen': 1}}
     """
     return self._run_api_call(
       "hgetall",
@@ -499,12 +668,20 @@ class CstoreManagerApiPlugin(BasePlugin):
     dict
       Result envelope returned by ``chainstore_hsync``. On success it includes
       the refreshed ``hkey``, the accepted ``source_peer``, and
-      ``merged_fields``.
+      ``merged_fields``. For a hash key in a system namespace
+      (``SYSTEM_NAMESPACES``) or with the index of a system hash key
+      (``SYSTEM_HASH_KEYS``), the error answer ``{"error": str,
+      "status_code": 403, "logged": True}`` instead, and nothing is synced.
 
     Notes
     -----
     This wrapper is intentionally thin. The merge-only semantics, allowed-peer
     filtering, and timeout behavior all live in `naeural_core`.
+
+    Examples
+    --------
+    >>> plugin.hsync(hkey="ratio1:backend:offline_nodes_notifier:v1")["hkey"]
+    'ratio1:backend:offline_nodes_notifier:v1'
     """
     return self._run_api_call(
       "hsync",

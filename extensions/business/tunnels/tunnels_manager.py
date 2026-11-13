@@ -8,6 +8,10 @@ __VER__ = '0.4.0'
 
 MESSAGE_PREFIX = "Please sign this message to manage your tunnels: "
 MESSAGE_PREFIX_DEEPLOY = "Please sign this message for Deeploy: "
+# Longest value add_secrets accepts for each of the four Cloudflare fields, since every oracle keeps a copy of the
+# record. The longest field is the domain, at most 253 characters in DNS; the account and zone IDs are 32 hex
+# characters and an API token a few dozen.
+SECRET_FIELD_MAX_LEN = 256
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -41,9 +45,33 @@ class TunnelsManagerPlugin(BasePlugin):
     return
 
   def on_init(self):
+    """
+    Start the plugin and warm up its chain-store namespaces.
+
+    Syncs the ``tunnels_manager_secrets`` hash from a peer, then the TCP
+    routes hash through ``_sync_tcp_routes``. A secrets sync that gets no
+    accepted answer (no peer answered in time, or the answering peer could not
+    be checked against the oracle registry) logs one line of its own, after the
+    error line of the sync call, and the plugin starts with its local copy, as
+    the TCP routes sync already does.
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> plugin.on_init()   # no accepted answer to the secrets sync: logged, and the plugin starts
+    """
     super(TunnelsManagerPlugin, self).on_init()
     self._last_tcp_routes_sync = None
-    self.chainstore_hsync(hkey="tunnels_manager_secrets")  # warm up the cache
+    # Warm up the cache of tunnel secrets. A sync that raises is logged and start-up goes on with the local copy,
+    # the same handling _sync_tcp_routes gives the TCP routes, instead of ending the plugin.
+    try:
+      # Sync the tunnel secrets from a peer.
+      self.chainstore_hsync(hkey="tunnels_manager_secrets")
+    except Exception as exc:
+      self.P(f"Could not sync tunnel secrets: {exc}", color="y")
     self._sync_tcp_routes()
     return
 
@@ -408,8 +436,11 @@ class TunnelsManagerPlugin(BasePlugin):
     Endpoint for CSP addresses to add their own Cloudflare secrets.
 
     The request is checked first: the nonce must be a client time from the last
-    12 hours, so a captured signed update cannot be replayed after that, and the
-    payload signature must name a wallet. The four Cloudflare fields are then
+    12 hours, so a captured signed update cannot be replayed after that, the
+    payload signature must name a wallet, and that wallet must have an active
+    escrow, the condition Deeploy applies to the wallet of its requests. Each
+    of the four Cloudflare fields must be a string of at most
+    ``SECRET_FIELD_MAX_LEN`` characters. The four Cloudflare fields are then
     written under that wallet in the ``tunnels_manager_secrets`` chain-store
     hash, together with the signed client time as the record's revision
     ``cs_rev``. Success is reported only when other oracles confirmed the write,
@@ -435,7 +466,9 @@ class TunnelsManagerPlugin(BasePlugin):
         oracles. Otherwise ``{"success": False, "error": str}``, where the error
         starts with "Secrets were not saved" and gives the reason: a missing,
         malformed, future or expired (older than 12 hours) nonce, a failed
-        signature check, a missing Cloudflare field, or a write that other
+        signature check, a wallet without an active escrow, an escrow lookup
+        that failed, a missing Cloudflare field, a field that is not a string
+        or is longer than ``SECRET_FIELD_MAX_LEN``, or a write that other
         oracles did not confirm.
 
     Notes
@@ -443,7 +476,10 @@ class TunnelsManagerPlugin(BasePlugin):
     Each update that passes the checks leaves one log line: the wallet and
     whether other oracles confirmed it, never the secret values. ``cs_rev`` is
     only recorded; nothing orders replicas by it yet, so a restart sync can
-    still replace this copy with an older one.
+    still replace this copy with an older one. The escrow lookup is a chain
+    read on every request that passes the signature check; its result is not
+    cached. The same signed request sent again is written again, so the client
+    can retry an update other oracles did not confirm.
 
     Examples
     --------
@@ -455,6 +491,8 @@ class TunnelsManagerPlugin(BasePlugin):
     {'success': True}
     >>> plugin.add_secrets(payload=same_update_signed_13_hours_ago)
     {'success': False, 'error': 'Secrets were not saved: Nonce is expired!'}
+    >>> plugin.add_secrets(payload=update_signed_by_a_wallet_without_an_active_escrow)
+    {'success': False, 'error': 'Secrets were not saved: Wallet has no active escrow.'}
     """
     try:
       # Reject a future nonce or one older than 12 hours, so a captured signed update cannot be replayed
@@ -472,6 +510,12 @@ class TunnelsManagerPlugin(BasePlugin):
         # An invalid signature comes back as None, not as an exception: stop before anything is stored
         # under an unverified sender, and report it through the except below.
         raise ValueError("Signature verification failed.")
+      # Accept only a wallet with an active escrow: the condition Deeploy's wallet check (__check_allowed_wallet in
+      # deeploy_mixin.py) applies to its requests. The lookup takes the checksummed address the signature check
+      # returned and reads the chain on each call; a read that fails raises and is refused through the except below.
+      if not self.bc.get_user_escrow_details(sender)['isActive']:
+        # Refused through the except below, with the endpoint's usual error answer.
+        raise ValueError("Wallet has no active escrow.")
       # Build the record inside the try, so a missing Cloudflare field is returned as an error instead of
       # raised with the credential-carrying payload in the log.
       secrets = {
@@ -483,6 +527,11 @@ class TunnelsManagerPlugin(BasePlugin):
         # until the chain store does, a restart sync can still replace this copy with an older one.
         "cs_rev": int(payload['nonce'].replace("0x", ""), 16),
       }
+      # Accept only Cloudflare fields that are strings of at most SECRET_FIELD_MAX_LEN characters, so the record
+      # every oracle keeps stays within the real sizes of these fields.
+      if any(not isinstance(v, str) or len(v) > SECRET_FIELD_MAX_LEN for k, v in secrets.items() if k != "cs_rev"):
+        # Refused through the except below; the message names no value.
+        raise ValueError(f"Cloudflare fields must be strings of at most {SECRET_FIELD_MAX_LEN} characters.")
     except Exception as exc:
       # Return every check failure instead of raising: the web-app base logs the arguments of an endpoint
       # that raises, and here the argument holds the Cloudflare token.

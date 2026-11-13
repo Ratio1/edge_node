@@ -9,13 +9,18 @@ import copy
 import hashlib
 import json
 import threading
+# The call path of an error that stops an operation is logged (function names only).
+import traceback
 import uuid
+# The verified-fingerprint cache keeps insertion order, so its oldest entry can be dropped first.
+from collections import OrderedDict
 
 from ratio1.const.base import BCct, dAuth
 from .selected_secrets import inherit_selections
 
 from extensions.business.dauth.dauth_registry import get_dauth_registry_internal_peers
-from .deeploy_const import DEEPLOY_KEYS, CONTAINERIZED_APPS_SIGNATURES
+# The worker signature tells the restoration gate which runtime binding an instance needs.
+from .deeploy_const import DEEPLOY_KEYS, CONTAINERIZED_APPS_SIGNATURES, WORKER_APP_RUNNER_SIGNATURE
 
 
 OPERATIONS_HKEY = "DEEPLOY_OPERATIONS"
@@ -27,6 +32,15 @@ class DeploymentAuthenticationError(ValueError):
 
 class DeploymentConflictError(ValueError):
   """A request conflicts with observed operation identity or revision."""
+
+
+class DeploymentCustodyError(RuntimeError):
+  """dAuth could not do a custody call now; past preparation the operations worker waits before it tries again.
+
+  Raised by `_deployment_secret_request` in place of the RuntimeError of the SDK call (request not signed, a
+  call that failed or timed out, an HTTP error, a refusal, or a preparation not finished yet). It stays a
+  RuntimeError, so the admission endpoints still answer 503 for it, as before.
+  """
 
 
 SIGNATURE_KEYS = {"EE_SIGN", "EE_SENDER", "EE_HASH", BCct.SIGN_CANON_V}
@@ -106,7 +120,13 @@ class _DeploymentOperationsMixin:
     that used to be written into the signed operation snapshot, so a command
     retry no longer produces a new CStore write; `_operations_confirmed`
     holds the last confirmed send of each snapshot, so an unchanged snapshot
-    is no longer re-sent on every 2 s pass. They are created here, next to
+    is no longer re-sent on every 2 s pass. `_verified_operation_records`, a FIFO cache,
+    holds the fingerprints of the records whose signature was already checked
+    and found valid (see `_verify_operation_record`). `_custody_retry` holds,
+    per operation out of the "preparing" phase with a failed dAuth custody
+    call since its last pass without an error, how long the worker waits
+    before calling dAuth again (see `_reconcile_coordinator_operations`).
+    They are created here, next to
     their sibling fields, so that a plugin missing one fails at once instead
     of creating it on first use. Finally starts the daemon thread that runs
     `_deployment_operation_worker`.
@@ -125,14 +145,16 @@ class _DeploymentOperationsMixin:
     snapshot of each own operation the worker still handles (unfinished, or
     completed less than 600 s ago) is sent once more and pending commands are
     sent again; nodes de-duplicate commands by operation id and attempt.
+    `_custody_retry` is pruned on every worker pass and also starts empty, so
+    after a restart each waiting operation calls dAuth on the first pass.
 
     Examples
     --------
     >>> plugin._init_deployment_operations()
     >>> plugin._deployment_operations_thread.name
     'deeploy-operations'
-    >>> plugin._operations_confirmed, plugin._operations_sent_at
-    ({}, {})
+    >>> plugin._operations_confirmed, plugin._operations_sent_at, plugin._custody_retry
+    ({}, {}, {})
     """
     self._deployment_preparations = {}
     # Last confirmed send per operation id, as (sequence, signature, time): it lets _replicate_operation
@@ -141,6 +163,13 @@ class _DeploymentOperationsMixin:
     # Last command time per "operation id|attempt|action|node": the 10 s resend throttle lives in process
     # memory, so a command retry no longer writes a new signed snapshot that every oracle re-stores.
     self._operations_sent_at = {}
+    # Keep the last 10,000 verified fingerprints in insertion order; hits do not refresh their position.
+    self._verified_operation_records = OrderedDict()
+    # The worker thread and the plugin thread both look up and insert: one lock for the cache.
+    self._verified_operation_records_lock = threading.Lock()
+    # Operation id -> (failures in a row, time of the last one, seconds to wait) after a failed dAuth custody
+    # call: the worker waits that long before it calls the same dAuth server again, instead of every 2 s.
+    self._custody_retry = {}
     self._deployment_plan_cache_lock = threading.Lock()
     self._deployment_operations_event = threading.Event()
     self._deployment_operations_stop = threading.Event()
@@ -165,12 +194,80 @@ class _DeploymentOperationsMixin:
                 include_configured_peers=False, timeout=5, max_retries=1)
 
   def _verify_operation_record(self, record, signer_key):
-    """Accept only signed records whose claimed writer matches their signer."""
+    """
+    Accept only signed records whose claimed writer matches their signer, remembering the valid ones.
+
+    Operation snapshots and node reports are read from the local replica and their signatures are
+    checked before use. The readers go over every record on every call: the `deeploy-operations`
+    worker every 2 s on every oracle, and every `get_deployment_status` request. One signature check
+    costs about 1 ms, so with a few hundred records each pass cost a few hundred milliseconds of CPU,
+    all the time, and more with every operation ever created (records are never removed).
+
+    A signed record never changes, and the result of the check depends only on the record's bytes and
+    on which field names its writer. So a record that was found valid is remembered by a fingerprint of
+    exactly those bytes, and the signature of a remembered record is not checked again. A record that
+    differs in any byte has another fingerprint and is checked in full. Records that fail are not
+    remembered: they are checked again each time.
+
+    Parameters
+    ----------
+    record : dict
+      A signed operation snapshot or node report as read from the chain store.
+    signer_key : str
+      Name of the field that holds the address of the record's writer ("coordinator" for an operation
+      snapshot, "node_addr" for a node report). The record is accepted only if its signer is that address.
+
+    Returns
+    -------
+    bool
+      True when the signature is valid and the signer is the claimed writer; False otherwise, also when
+      the record is not a dict, the writer field is missing or the check raises.
+
+    Notes
+    -----
+    The cache lives in process memory, so after a restart every record is checked once more.
+    It holds at most 10,000 fingerprints. Inserting a new one at capacity evicts only the oldest
+    insertion; hits do not refresh that order. Evicted records are checked again when next read.
+    Sequential scans of more than 10,000 distinct valid records can still miss on every lookup.
+    A lock protects lookups and insertion/eviction shared by the worker and plugin threads.
+    Signature verification runs outside the lock, so concurrent misses can check the same record
+    more than once; membership is checked again before insertion to avoid unnecessary eviction.
+
+    Examples
+    --------
+    >>> plugin._verify_operation_record(snapshot, "coordinator")   # first time: the signature is checked
+    True
+    >>> plugin._verify_operation_record(snapshot, "coordinator")   # same bytes: answered from memory
+    True
+    >>> plugin._verify_operation_record({**snapshot, "phase": "completed"}, "coordinator")   # changed: checked, fails
+    False
+    """
     if not isinstance(record, dict) or not record.get(signer_key):
       return False
     try:
+      # Fingerprint of everything the result depends on: the writer field's name and the whole record,
+      # signature fields included. About 30 times cheaper than the signature check it replaces.
+      fingerprint = hashlib.sha256((signer_key + json.dumps(record, sort_keys=True)).encode()).digest()
+      # Look the fingerprint up under the cache lock; the signature check below runs outside it.
+      with self._verified_operation_records_lock:
+        if fingerprint in self._verified_operation_records:
+          # These exact bytes were checked before and were valid: no second signature check.
+          return True
       verification = self.bc.verify(record, return_full_info=True)
-      return bool(verification.valid and record.get("EE_SENDER") == record[signer_key])
+      # The full check, as before: a valid signature made by the address the record names as its writer.
+      valid = bool(verification.valid and record.get("EE_SENDER") == record[signer_key])
+      if valid:
+        # Insert under the cache lock, so the size check, the drop and the insert are one step.
+        with self._verified_operation_records_lock:
+          # Another thread may have verified and inserted this fingerprint while the lock was released.
+          if fingerprint not in self._verified_operation_records:
+            if len(self._verified_operation_records) >= 10000:
+              # At capacity drop only the oldest insertion, so the other cached checks are kept.
+              self._verified_operation_records.popitem(last=False)
+            # Remember only records that passed; retain the other cached verifications at capacity.
+            self._verified_operation_records[fingerprint] = True
+      # The outcome of the full check; a record that failed it was not remembered above.
+      return valid
     except Exception:
       return False
 
@@ -393,11 +490,64 @@ class _DeploymentOperationsMixin:
     ))
 
   def _deployment_secret_request(self, action, operation, **payload):
-    """Request custody work through the SDK without fetching protected bundles."""
-    return self.bc.reconcile_dauth_job_secrets(dict(
-      job_id=str(operation["job_id"]), operation=copy.deepcopy(operation),
-      action=action, **payload,
-    ))
+    """Request custody work through the SDK without fetching protected bundles.
+
+    Sends one custody step of an operation to dAuth through the SDK's signed secret reconciliation call
+    and returns its checked answer. The SDK raises RuntimeError when the request could not be signed, when
+    the call failed or timed out (dAuth may still have received it), when dAuth answered with an HTTP error
+    or refused, and when a preparation is not finished; that error is raised again as
+    `DeploymentCustodyError`, so the operations worker can wait before it calls the same dAuth server again.
+    A ValueError (invalid payload, answer, signature or signer) is raised unchanged and is tried again on the
+    next pass, as before.
+
+    Parameters
+    ----------
+    action : str
+      The custody step: "prepare", "status", "commit", "revoke" or "delete".
+    operation : dict
+      The coordinator's operation snapshot. A copy is sent; the snapshot itself is not changed.
+    **payload
+      The step's other fields, such as `new_secrets`, `active_attempt` or `pointer`.
+
+    Returns
+    -------
+    dict
+      The authenticated dAuth result. For "prepare" and "status" it holds the boolean `prepared`.
+
+    Raises
+    ------
+    DeploymentCustodyError
+      When the SDK call raised RuntimeError. The original error is its `__cause__` and its text is kept.
+      It is a RuntimeError, so admission still answers 503 (`ADMISSION_UNAVAILABLE`) for it.
+    ValueError
+      When the payload or dAuth's answer is invalid, unchanged; admission still answers 400 for it.
+
+    Notes
+    -----
+    Called by admission ("prepare") on the request thread, and by the operations worker for every
+    other step. Only the worker waits after a `DeploymentCustodyError`, and only for an operation out of the
+    "preparing" phase (see `_reconcile_coordinator_operations`).
+
+    Examples
+    --------
+    >>> plugin._deployment_secret_request("status", operation)["prepared"]
+    True
+    >>> plugin._deployment_secret_request("revoke", operation, active_attempt=None)  # dAuth down
+    Traceback (most recent call last):
+    DeploymentCustodyError: dAuth reconciliation transport could not be confirmed.
+    """
+    try:
+      # The signed custody call, unchanged; only its RuntimeError is given a type of its own below.
+      return self.bc.reconcile_dauth_job_secrets(dict(
+        job_id=str(operation["job_id"]), operation=copy.deepcopy(operation),
+        action=action, **payload,
+      ))
+    except RuntimeError as exc:
+      # The SDK raises RuntimeError when the request could not be signed, when the call failed or timed out
+      # (dAuth may still have received it), when dAuth answered with an HTTP error or refused it (for any
+      # reason), and when a preparation is not finished; a type of its own lets the worker wait before the
+      # next call, and it stays a RuntimeError for admission.
+      raise DeploymentCustodyError(str(exc)) from exc
 
   def _prepare_deployment_secret_configs(self, configs, prior_pipeline=None, identity_aliases=None):
     """Extract only fresh input values; reconciliation remains on dAuth."""
@@ -682,9 +832,10 @@ class _DeploymentOperationsMixin:
     Parameters
     ----------
     operation : dict
-      The coordinator's operation snapshot. It may be saved, and on a missing
-      runtime image binding it is marked `recovery="blocked"` and saved with
-      an event.
+      The coordinator's operation snapshot. It may be saved, and when an
+      instance's needed runtime binding (Git commit for a worker app, image
+      id for a container app) is missing it is marked `recovery="blocked"`
+      and saved with an event naming what is missing.
     configs : dict
       Node address -> pipeline config planned for that node. For "start" the
       config is sent as the payload; for "stop" and "retire" only its `TYPE`
@@ -707,8 +858,9 @@ class _DeploymentOperationsMixin:
     Raises
     ------
     RuntimeError
-      If a restore or owner-transfer start lacks the previous runtime image
-      binding for a container instance, or if a save is not confirmed.
+      If a restore or owner-transfer start lacks the previous runtime binding
+      an instance needs (the Git commit for a worker app, the image id for a
+      container app), or if a save is not confirmed.
     ValueError
       If this oracle is not the operation's coordinator (from
       `_save_operation`).
@@ -758,9 +910,16 @@ class _DeploymentOperationsMixin:
           for instance in plugin.get("INSTANCES", []):
             identity = plugin["SIGNATURE"] + "|" + instance["INSTANCE_ID"]
             artifacts = bindings.get(identity)
-            if not artifacts or not artifacts.get("image_id"):
+            # What the instance cannot be restored without: a worker is rebuilt from its Git commit on a
+            # base image the node pulls again, a container app is its image. Asking a worker for an image
+            # id blocked its restoration over a value it does not need.
+            needed = "git_commit" if plugin["SIGNATURE"].upper() == WORKER_APP_RUNNER_SIGNATURE else "image_id"
+            if not artifacts or not artifacts.get(needed):
               operation["recovery"] = "blocked"
-              self._save_operation(operation, message="Previous runtime image binding is unavailable; restoration is blocked.")
+              # Name what is really missing: for a worker that is its Git commit, not an image.
+              missing = "Git commit" if needed == "git_commit" else "image binding"
+              # The blocked state and its reason are saved before the error stops the command.
+              self._save_operation(operation, message="Previous runtime {} is unavailable; restoration is blocked.".format(missing))
               raise RuntimeError("Previous runtime artifacts are unavailable.")
             instance["DEEPLOY_RUNTIME_ARTIFACTS"] = copy.deepcopy(artifacts)
       payload["DEEPLOY_OPERATION"] = self._operation_metadata(operation, attempt, action)
@@ -925,17 +1084,40 @@ class _DeploymentOperationsMixin:
     refused new changes to the job. Peers that already hold the record store
     nothing when it arrives again.
 
+    After a failed dAuth custody call (`DeploymentCustodyError`) the operation
+    is skipped for 10 s, then 20, 40 and so on, up to 300 s, counted from the
+    failure. Before, it called the same dAuth server again on every 2 s pass,
+    for ever, and kept that server's request thread busy. An operation still
+    in the "preparing" phase is not paced: it asks dAuth on every pass until
+    its preparation deadline (created + 120 s), as before, so a dAuth that
+    recovers in the last seconds before the deadline still gets the
+    deployment accepted. At the deadline it moves to cleanup, whose failed
+    custody calls are paced. Any other failure, for example a chain-store
+    write that was not confirmed, is tried again on the next pass, as before.
+    A pass of the operation without an error drops its wait.
+
     Returns
     -------
     None
-      A failure on one operation is logged and the pass continues with the
-      next one.
+      A failure on one operation is logged in red and the pass continues with
+      the next one. The line names the operation, its job and phase, the type
+      of the error and the functions it passed through (outermost first, cut
+      to 300 characters); the error text is not logged because it can carry
+      request values. After a failed custody call outside the "preparing"
+      phase the line ends with "(custody failure N, next try in D s)".
 
     Notes
     -----
     Runs on the `deeploy-operations` thread every 2 s, or sooner when the
     wake-up event is set. Each operation is deep-copied before it is
     advanced, so the replica's records are not mutated in place.
+
+    The waits live in `_custody_retry`, which only this thread reads and
+    writes. A waiting operation is skipped without any call, so the others are
+    handled in the same pass. An entry is dropped when its operation has a
+    pass without an error (it advanced, or it completed with either outcome)
+    and, at the start of every pass, when its operation is no longer read
+    from the replica.
 
     Examples
     --------
@@ -945,6 +1127,20 @@ class _DeploymentOperationsMixin:
     >>> plugin._reconcile_coordinator_operations()  # the same final record is sent once more
     >>> plugin.now += 600
     >>> plugin._reconcile_coordinator_operations()  # past the 600 s window: left alone
+
+    With dAuth down, a cleanup operation calls it again only after the wait:
+
+    >>> plugin._reconcile_coordinator_operations()  # custody failure 1, next try in 10 s
+    >>> plugin.now += 2
+    >>> plugin._reconcile_coordinator_operations()  # waiting: no dAuth call
+    >>> plugin.now += 8
+    >>> plugin._reconcile_coordinator_operations()  # custody failure 2, next try in 20 s
+
+    A preparing operation asks dAuth again on the next pass:
+
+    >>> plugin._reconcile_coordinator_operations()  # status failed, no wait
+    >>> plugin.now += 2
+    >>> plugin._reconcile_coordinator_operations()  # status answered "prepared": accepted
     """
     # Clear completed handoffs BEFORE reading snapshots. Admissions that finish
     # during that read keep their marker until the next pass, avoiding a stale
@@ -954,8 +1150,18 @@ class _DeploymentOperationsMixin:
         self._deployment_preparations.pop(operation_id)
     own = [copy.deepcopy(operation) for operation in self._operation_records().values()
            if operation["coordinator"] == self.bc.address]
+    # Keep a custody wait only for an operation still read here, so one whose records are gone leaves no
+    # entry behind and the map never holds more than this oracle's own operations.
+    self._custody_retry = {operation["operation_id"]: self._custody_retry[operation["operation_id"]]
+                           for operation in own if operation["operation_id"] in self._custody_retry}
     for operation in own:
       if operation["operation_id"] in self._deployment_preparations:
+        continue
+      # (failures in a row, time of the last one, seconds to wait) after a failed dAuth custody call, else None.
+      pause = self._custody_retry.get(operation["operation_id"])
+      if pause and 0 <= self.time() - pause[1] < pause[2]:
+        # Do not call the same dAuth server again yet; only this operation waits, the pass goes on with the
+        # next one. A clock step backwards ends the wait, as for the other throttles in this file.
         continue
       try:
         if operation["phase"] != "completed":
@@ -967,16 +1173,63 @@ class _DeploymentOperationsMixin:
           # Re-send the final snapshot as repair, throttled to once per 30 s; peers that hold it store nothing,
           # and an oracle that missed it stops showing the operation as running and refusing job changes.
           self._replicate_operation(operation)
-      except Exception:
-        self.P("Deployment operation waiting for storage or transport recovery.", color="y")
+        # A pass without an error ends the custody wait, so a later failed custody call waits 10 s again.
+        self._custody_retry.pop(operation["operation_id"], None)
+      except Exception as exc:
+        # The functions the error passed through, outermost first, cut to 300 characters to bound the log line: on a
+        # very deep path the innermost names (where the error was raised) are the ones cut. Before, one fixed line
+        # ("waiting for storage or transport recovery") was logged for every error, so the log could not tell an
+        # unconfirmed chain-store write from a dAuth custody call that failed, a plan that could not be read or a
+        # command that could not be sent. Only names are logged, never the error text: it can carry request values.
+        path = " > ".join(frame.name for frame in traceback.extract_tb(exc.__traceback__))[:300]
+        # Any other error (a chain-store write, a plan read, a command) is tried again on the next pass, as before.
+        retry = ""
+        # A preparing operation is not paced: it asks dAuth on every pass until its preparation deadline (created
+        # + 120 s), as before, so a dAuth that recovers in the last seconds still gets the deployment accepted.
+        # At the deadline it moves to cleanup, which has no deadline; the phase is read after the failed step.
+        if isinstance(exc, DeploymentCustodyError) and operation["phase"] != "preparing":
+          # Custody calls that failed in a row; a pass without an error resets the count (see above).
+          failures = pause[0] + 1 if pause else 1
+          # Wait 10 s after the first failure and double the wait after each further one, up to 300 s. Before,
+          # the same dAuth server was called again on every 2 s pass and its request thread was kept busy.
+          delay = min(10 * 2 ** (failures - 1), 300)
+          # Kept in process memory only: after a restart the operation calls dAuth on the first pass.
+          self._custody_retry[operation["operation_id"]] = (failures, self.time(), delay)
+          # The red line says how many custody calls failed in a row and when the next one is made.
+          retry = " (custody failure {}, next try in {} s)".format(failures, delay)
+        self.P("Deployment operation {} (job {}, phase {}) was not advanced and is tried again: {} in {}{}".format(
+          operation["operation_id"], operation["job_id"], operation["phase"], type(exc).__name__, path, retry), color="r")
 
   def _deployment_operation_worker(self):
-    """Resume coordinator-owned work independently of HTTP and UI polling."""
+    """
+    Advance this coordinator's operations in the background, independently of HTTP requests and UI polling.
+
+    Runs on the `deeploy-operations` thread until the stop event is set: one pass of
+    `_reconcile_coordinator_operations`, then a wait of 2 s or until the wake-up event is set.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    An error that escapes a whole pass (the per-operation errors are caught inside the pass) is logged in
+    red with its type and call path (cut to 300 characters), and the next pass runs as usual.
+
+    Examples
+    --------
+    >>> threading.Thread(target=plugin._deployment_operation_worker, name="deeploy-operations").start()
+    """
     while not self._deployment_operations_stop.is_set():
       try:
         self._reconcile_coordinator_operations()
-      except Exception:
-        self.P("Deployment operation synchronization is temporarily unavailable.", color="y")
+      except Exception as exc:
+        # As in the pass itself: the type of the error and the functions it passed through, not its text.
+        # Before, one fixed line hid what failed. The path, outermost first, is cut to 300 characters to
+        # bound the log line, so on a very deep path the innermost names are the ones cut.
+        path = " > ".join(frame.name for frame in traceback.extract_tb(exc.__traceback__))[:300]
+        self.P("Deployment operation pass failed and runs again in 2 s: {} in {}".format(
+          type(exc).__name__, path), color="r")
       self._deployment_operations_event.wait(2)
       self._deployment_operations_event.clear()
 

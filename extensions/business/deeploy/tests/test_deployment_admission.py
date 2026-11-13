@@ -2,6 +2,7 @@
 import copy
 import threading
 import unittest
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -44,6 +45,9 @@ class Admission(_DeploymentOperationsMixin, _DeeployMixin):
     self._deployment_preparations = {}
     self._operations_confirmed = {}
     self._operations_sent_at = {}
+    self._verified_operation_records = OrderedDict()  # as _init_deployment_operations creates it
+    self._verified_operation_records_lock = threading.Lock()
+    self._custody_retry = {}  # as _init_deployment_operations creates it
     self.storage = {}
     self.deepcopy = copy.deepcopy
     self.previous_configs = None
