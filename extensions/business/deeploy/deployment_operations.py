@@ -35,9 +35,9 @@ class DeploymentConflictError(ValueError):
 class DeploymentCustodyError(RuntimeError):
   """dAuth could not do a custody call now; past preparation the operations worker waits before it tries again.
 
-  Raised by `_deployment_secret_request` in place of the RuntimeError of the SDK call (request not signed or
-  not sent, an HTTP error, a refusal, or a preparation not finished yet). It stays a RuntimeError, so the
-  admission endpoints still answer 503 for it, as before.
+  Raised by `_deployment_secret_request` in place of the RuntimeError of the SDK call (request not signed, a
+  call that failed or timed out, an HTTP error, a refusal, or a preparation not finished yet). It stays a
+  RuntimeError, so the admission endpoints still answer 503 for it, as before.
   """
 
 
@@ -492,11 +492,12 @@ class _DeploymentOperationsMixin:
     """Request custody work through the SDK without fetching protected bundles.
 
     Sends one custody step of an operation to dAuth through the SDK's signed secret reconciliation call
-    and returns its checked answer. The SDK raises RuntimeError when the request could not be signed or
-    sent, when dAuth answered with an HTTP error or refused, and when a preparation is not finished; that
-    error is raised again as `DeploymentCustodyError`, so the operations worker can wait before it calls
-    the same dAuth server again. A ValueError (invalid payload, answer, signature or signer) is raised
-    unchanged and is tried again on the next pass, as before.
+    and returns its checked answer. The SDK raises RuntimeError when the request could not be signed, when
+    the call failed or timed out (dAuth may still have received it), when dAuth answered with an HTTP error
+    or refused, and when a preparation is not finished; that error is raised again as
+    `DeploymentCustodyError`, so the operations worker can wait before it calls the same dAuth server again.
+    A ValueError (invalid payload, answer, signature or signer) is raised unchanged and is tried again on the
+    next pass, as before.
 
     Parameters
     ----------
@@ -541,8 +542,10 @@ class _DeploymentOperationsMixin:
         action=action, **payload,
       ))
     except RuntimeError as exc:
-      # The SDK raises RuntimeError only when dAuth could not do it now (or the request could not be signed);
-      # a type of its own lets the worker wait before the next call, and it stays a RuntimeError for admission.
+      # The SDK raises RuntimeError when the request could not be signed, when the call failed or timed out
+      # (dAuth may still have received it), when dAuth answered with an HTTP error or refused it (for any
+      # reason), and when a preparation is not finished; a type of its own lets the worker wait before the
+      # next call, and it stays a RuntimeError for admission.
       raise DeploymentCustodyError(str(exc)) from exc
 
   def _prepare_deployment_secret_configs(self, configs, prior_pipeline=None, identity_aliases=None):
@@ -828,9 +831,10 @@ class _DeploymentOperationsMixin:
     Parameters
     ----------
     operation : dict
-      The coordinator's operation snapshot. It may be saved, and on a missing
-      runtime image binding it is marked `recovery="blocked"` and saved with
-      an event.
+      The coordinator's operation snapshot. It may be saved, and when an
+      instance's needed runtime binding (Git commit for a worker app, image
+      id for a container app) is missing it is marked `recovery="blocked"`
+      and saved with an event naming what is missing.
     configs : dict
       Node address -> pipeline config planned for that node. For "start" the
       config is sent as the payload; for "stop" and "retire" only its `TYPE`
@@ -853,8 +857,9 @@ class _DeploymentOperationsMixin:
     Raises
     ------
     RuntimeError
-      If a restore or owner-transfer start lacks the previous runtime image
-      binding for a container instance, or if a save is not confirmed.
+      If a restore or owner-transfer start lacks the previous runtime binding
+      an instance needs (the Git commit for a worker app, the image id for a
+      container app), or if a save is not confirmed.
     ValueError
       If this oracle is not the operation's coordinator (from
       `_save_operation`).
@@ -1095,10 +1100,10 @@ class _DeploymentOperationsMixin:
     None
       A failure on one operation is logged in red and the pass continues with
       the next one. The line names the operation, its job and phase, the type
-      of the error and the functions it passed through; the error text is not
-      logged because it can carry request values. After a failed custody call
-      outside the "preparing" phase the line ends with
-      "(custody failure N, next try in D s)".
+      of the error and the functions it passed through (outermost first, cut
+      to 300 characters); the error text is not logged because it can carry
+      request values. After a failed custody call outside the "preparing"
+      phase the line ends with "(custody failure N, next try in D s)".
 
     Notes
     -----
@@ -1170,10 +1175,11 @@ class _DeploymentOperationsMixin:
         # A pass without an error ends the custody wait, so a later failed custody call waits 10 s again.
         self._custody_retry.pop(operation["operation_id"], None)
       except Exception as exc:
-        # The functions the error passed through, outermost first. Before, one fixed line ("waiting for storage
-        # or transport recovery") was logged for every error, so the log could not tell an unconfirmed
-        # chain-store write from a dAuth custody call that failed, a plan that could not be read or a command
-        # that could not be sent. Only names are logged, never the error text: it can carry request values.
+        # The functions the error passed through, outermost first, cut to 300 characters to bound the log line: on a
+        # very deep path the innermost names (where the error was raised) are the ones cut. Before, one fixed line
+        # ("waiting for storage or transport recovery") was logged for every error, so the log could not tell an
+        # unconfirmed chain-store write from a dAuth custody call that failed, a plan that could not be read or a
+        # command that could not be sent. Only names are logged, never the error text: it can carry request values.
         path = " > ".join(frame.name for frame in traceback.extract_tb(exc.__traceback__))[:300]
         # Any other error (a chain-store write, a plan read, a command) is tried again on the next pass, as before.
         retry = ""
@@ -1207,7 +1213,7 @@ class _DeploymentOperationsMixin:
     Notes
     -----
     An error that escapes a whole pass (the per-operation errors are caught inside the pass) is logged in
-    red with its type and call path, and the next pass runs as usual.
+    red with its type and call path (cut to 300 characters), and the next pass runs as usual.
 
     Examples
     --------
@@ -1218,7 +1224,8 @@ class _DeploymentOperationsMixin:
         self._reconcile_coordinator_operations()
       except Exception as exc:
         # As in the pass itself: the type of the error and the functions it passed through, not its text.
-        # Before, one fixed line hid what failed.
+        # Before, one fixed line hid what failed. The path, outermost first, is cut to 300 characters to
+        # bound the log line, so on a very deep path the innermost names are the ones cut.
         path = " > ".join(frame.name for frame in traceback.extract_tb(exc.__traceback__))[:300]
         self.P("Deployment operation pass failed and runs again in 2 s: {} in {}".format(
           type(exc).__name__, path), color="r")

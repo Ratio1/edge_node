@@ -564,31 +564,39 @@ class DauthManagerPlugin(
     """
     Reconcile hidden secrets for a signed protocol-oracle pipeline update.
 
-    The coordinator of a deployment operation calls this to prepare, check or revoke the secret revision
-    of the operation. Only a registered dAuth oracle serves it.
+    Two kinds of request are served, both signed by a protocol oracle. A lifecycle request carries `job_id`,
+    the coordinator's signed `operation` and an `action` ("prepare", "status", "commit", "revoke" or "delete").
+    An old-style job update carries `job_id`, `expected_pipeline_cid` and `pipeline_configs` (optionally
+    `identity_aliases`). Only a registered dAuth oracle serves either; any other node answers the error
+    'dAuth server is not registered as a dAuth oracle'.
 
     Parameters
     ----------
     body : dict
-      The signed request: `nonce`, the sender fields and the operation reference; it can carry new
-      secret values.
+      The signed request: `nonce`, the sender fields, `job_id`, and either `operation` with `action` (plus the
+      coordinator-signed `pointer` for "commit" and "delete") or the old-style `expected_pipeline_cid` and
+      `pipeline_configs`; it can carry new secret values.
 
     Returns
     -------
     dict
-      The signed response with the request's `nonce` and either the reconciliation result or `error`.
-      The caller is told only that the reconciliation failed, never why.
+      The signed response with the request's `nonce`, the server fields this node adds (alias, version,
+      time, epoch, uptime) and either the reconciliation result or `error`. When reconciliation fails, the
+      caller is told only that it failed, never why.
 
     Notes
     -----
-    A failure is logged in red with the type of the error and the functions it passed through, so the
-    failing step (for example the read of the operation's plan) can be told from the log. The error text
-    is not logged: new secret values can be present in the request or in a dependency's error.
+    A failure is logged in red with the type of the error and the functions it passed through, outermost
+    first and cut to 300 characters, so the failing step (for example the read of the operation's plan) can
+    be told from the log. The error text is not logged: new secret values can be present in the request or
+    in a dependency's error.
 
     Examples
     --------
-    >>> plugin.reconcile_job_secrets({"nonce": "n1", "EE_SENDER": "0xai_...", "action": "prepare"})
-    {'nonce': 'n1', 'error': 'dAuth secret reconciliation failed'}
+    >>> body = {"nonce": "n1", "EE_SENDER": "0xai_...", "action": "prepare"}  # unsigned: refused
+    >>> response = plugin.reconcile_job_secrets(body)  # on a registered dAuth oracle
+    >>> response["nonce"], response["error"]
+    ('n1', 'dAuth secret reconciliation failed')
     """
     nonce = body.get("nonce") if isinstance(body, dict) else None
     if not self._is_dauth_server_enabled():
@@ -599,7 +607,9 @@ class DauthManagerPlugin(
       except Exception as exc:
         # New values can be present in the request or dependency exceptions, so the error text stays out of
         # the log. Its type and the functions it passed through are logged: before, the line said only that
-        # the reconciliation failed, and a plan that could not be read looked like any other failure.
+        # the reconciliation failed, and a plan that could not be read looked like any other failure. The
+        # path, outermost first, is cut to 300 characters to bound the log line: on a very deep path the
+        # innermost names (where the error was raised) are the ones cut.
         path = " > ".join(frame.name for frame in traceback.extract_tb(exc.__traceback__))[:300]
         self.P("dAuth secret reconciliation failed for request from {}: {} in {}.".format(
           self.get_request_client_ip(), type(exc).__name__, path), color='r')

@@ -24,13 +24,15 @@ class _RequestTrackingMixin(object):
   and each one stores it and saves its replica again, so recording a read that a client repeats
   every two seconds made the whole network pay for every poll.
 
-  Opt-in: set REQUESTS_CSTORE_HKEY in plugin config to enable.
-  When not set (None), all methods are no-ops.
+  Opt-in: set REQUESTS_CSTORE_HKEY in plugin config to enable. With it set, REQUESTS_TRACKED_ENDPOINTS and
+  REQUESTS_SAVE_INTERVAL must be set too (they have no default); an empty REQUESTS_TRACKED_ENDPOINTS records
+  nothing.
+  When REQUESTS_CSTORE_HKEY is not set (None), all methods are no-ops.
 
   Config keys:
     REQUESTS_CSTORE_HKEY : str or None  -- chainstore hash key (None = disabled)
-    REQUESTS_TRACKED_ENDPOINTS : list   -- names of the endpoints that are recorded; no other is
-    REQUESTS_SAVE_INTERVAL : int        -- least seconds between two writes of the record
+    REQUESTS_TRACKED_ENDPOINTS : list   -- names of the endpoints that are recorded; no other is (no default)
+    REQUESTS_SAVE_INTERVAL : int        -- least seconds between two writes of the record (no default)
     REQUESTS_MAX_RECORDS : int          -- max requests kept in the record (default 2)
     REQUESTS_LOG_INTERVAL : int         -- seconds between cross-node log dumps (default 300)
   """

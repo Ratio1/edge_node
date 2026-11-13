@@ -843,7 +843,8 @@ class ContainerAppRunnerPlugin(
       When the restoration command carries a malformed binding, a registry reference outside the
       repository this app is configured with, or no image id for a runner that is bound to its image.
     TypeError
-      When the restoration command's registry reference is not a string.
+      When the restoration command's `image_ref`, `image_id` or `git_commit` holds a value that is not
+      a string (the format checks pass it to `re.fullmatch`); a null `git_commit` is ignored.
 
     Notes
     -----
@@ -885,9 +886,11 @@ class ContainerAppRunnerPlugin(
       # A copy of the command's binding, completed below; the configuration itself is not changed.
       artifacts = dict(explicit)
       if self._deployment_pins_image() and "image_ref" not in artifacts:
-        # A restoration made from a record older than the registry reference carries none. The command
-        # used to be returned as sent, so the reference this node adds itself was dropped at every
-        # start and never reported. Read back what this node saved.
+        # A restoration made from a record older than the registry reference carries none. Returned as
+        # sent, the binding read before each start would lack the exact reference this node saved earlier
+        # (`_capture_deployment_image` adds it again from the running image's RepoDigests only once the
+        # container runs, and for an image loaded by hand it would save the binding without it), so a lost
+        # image could be fetched again only through the configured tag. Read back what this node saved.
         saved = self._load_persistent_state().get("deployment_runtime_artifacts", {})
         # The saved reference, used only when it was saved for this operation and for this image.
         image_ref = saved.get("artifacts", {}).get("image_ref")
@@ -4223,7 +4226,8 @@ class ContainerAppRunnerPlugin(
     >>> self._is_configured_registry_ref("other-registry:5000/acme/shop@sha256:4f1c...")
     False
     """
-    # The configured reference without its tag or digest: "ghcr.io/acme/shop:stable" -> "ghcr.io/acme/shop".
+    # The configured reference without a digest: "ghcr.io/acme/shop:stable@sha256:..." -> "ghcr.io/acme/shop:stable";
+    # the tag is cut on the next line.
     configured = super()._get_full_image_ref().split("@")[0]
     # A ":" after the last "/" starts a tag; one before it belongs to a registry port.
     repository = configured.rsplit(":", 1)[0] if ":" in configured.rsplit("/", 1)[-1] else configured
@@ -4322,9 +4326,10 @@ class ContainerAppRunnerPlugin(
 
     Notes
     -----
-    Only the registry attempts are paced: 20 s after the first failure, doubling, at most one hour
-    apart, so that a registry that was down for a day is asked again within the hour and many apps
-    on one node stay under registry rate limits. The launch path calls this about every 5 s; between
+    Only the registry attempts are paced: after the first failure by IMAGE_PULL_BACKOFF_BASE plus up to
+    as much again of random jitter (20-40 s with the default base of 20 s), doubling, at most one hour
+    apart, so that a registry that was down for a day is asked again within the hour and many apps on
+    one node stay under registry rate limits. The launch path calls this about every 5 s; between
     attempts it only does the local lookup, so an image loaded onto the node by hand is used at once.
     "failed" is reported only when every known reference was pulled and gave another image (a tag
     that moved). A pull that raises, a "not found" answer included, is reported as "pulling_image"
@@ -4361,8 +4366,9 @@ class ContainerAppRunnerPlugin(
           )
           # Report the failure only now that it is known the registry cannot provide the image.
           self.report_deployment_status("failed", error_code="WORKLOAD_START_FAILED")
-        # Pause before the next registry attempt: 20 s, doubling, never more than an hour. These
-        # attempts never end, and an app must not wait days for an image that is back on the registry.
+        # Pause before the next registry attempt: 20-40 s with the default base (base plus jitter),
+        # doubling, never more than an hour. These attempts never end, and an app must not wait days
+        # for an image that is back on the registry.
         self._record_image_pull_failure(max_backoff=3600)
         # Nothing to start on this lap; the local lookup still runs on every lap.
         return False
