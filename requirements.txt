@@ -1,8 +1,8 @@
 kmonitor
-# ratio1 3.5.71 is the first SDK version with this change's SDK parts, among them R1FS reads that pin only
-# after the get, so the caller's timeout bounds the network fetch. A lower floor would let an image build
-# without them.
-ratio1>=3.5.71
+# ratio1 3.5.72 is the first SDK version whose R1FS start closes a connection the relay opened before the
+# node's own dial, retries a relay that is not reachable yet, and reconnects the relay after a failed read
+# of a file the relay holds. A lower floor would let an image build without them.
+ratio1>=3.5.72
 # naeural_core 7.7.357 is the first core version with this change's core parts, among them IDLE_LOOP_WAIT,
 # which the CStore and R1FS manager APIs set (an older core ignores the key). A lower floor would let an
 # image build without them.
