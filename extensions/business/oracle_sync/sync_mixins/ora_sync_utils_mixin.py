@@ -259,8 +259,14 @@ class _OraSyncUtilsMixin:
     def r1fs_get_pickle(self, cid: str, debug=True):
       """
       Get the data from the IPFS using the CID.
+
       The CID will be used for retrieving the file from the IPFS.
       That file should be a pickle file.
+
+      When the plugin is configured not to use R1FS (``USE_R1FS`` false), no
+      file is fetched or loaded: one log line is written and None is returned,
+      the answer of a failed retrieval, which every caller treats as a message
+      not accepted. An oracle with R1FS disabled never sends a CID itself.
 
       Parameters
       ----------
@@ -271,9 +277,21 @@ class _OraSyncUtilsMixin:
 
       Returns
       -------
-      dict
-          The data from the IPFS
+      dict or None
+          The data from the IPFS, or None when the retrieval failed or R1FS
+          use is disabled.
+
+      Examples
+      --------
+      >>> plugin.cfg_use_r1fs = False
+      >>> plugin.r1fs_get_pickle(cid="Qm...") is None
+      True
       """
+      # R1FS is disabled for this plugin: fetch and load nothing named by a received message.
+      if not self.cfg_use_r1fs:
+        self.P("R1FS use is disabled: data named by a CID in a received message is not retrieved.", color='r')
+        # The answer of a failed retrieval, which every caller treats as a message not accepted.
+        return None
       total_retries = 3
       retrieved_data = None
       sleep_time = 3
