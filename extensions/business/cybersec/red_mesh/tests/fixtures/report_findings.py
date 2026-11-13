@@ -94,10 +94,12 @@ def _ssh(port, banner, accept, outputs, *, cves=True):
       if not accept(username, password):
         raise paramiko.AuthenticationException("rejected")
       self.user = username
-    def exec_command(self, cmd, timeout=None):
-      stdout = MagicMock()
-      stdout.read.return_value = outputs.get(self.user, b"")
-      return MagicMock(), stdout, MagicMock()
+    def get_transport(self):
+      chan = MagicMock()
+      chan.recv.side_effect = [outputs.get(self.user, b""), b""]
+      transport = MagicMock()
+      transport.open_session.return_value = chan
+      return transport
     def close(self): pass
 
   worker = _worker([port])
