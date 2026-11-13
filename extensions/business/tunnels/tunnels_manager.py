@@ -51,12 +51,17 @@ class TunnelsManagerPlugin(BasePlugin):
     Syncs the ``tunnels_manager_secrets`` hash from a peer, then the TCP
     routes hash through ``_sync_tcp_routes``. A secrets sync that gets no
     accepted answer (no peer answered in time, or the answering peer could not
-    be checked against the oracle registry) leaves one log line and the plugin
-    starts with its local copy, as the TCP routes sync already does.
+    be checked against the oracle registry) logs one line of its own, after the
+    error line of the sync call, and the plugin starts with its local copy, as
+    the TCP routes sync already does.
 
     Returns
     -------
     None
+
+    Examples
+    --------
+    >>> plugin.on_init()   # no accepted answer to the secrets sync: logged, and the plugin starts
     """
     super(TunnelsManagerPlugin, self).on_init()
     self._last_tcp_routes_sync = None
@@ -508,7 +513,7 @@ class TunnelsManagerPlugin(BasePlugin):
       # Accept only a wallet with an active escrow: the condition Deeploy's wallet check (__check_allowed_wallet in
       # deeploy_mixin.py) applies to its requests. The lookup takes the checksummed address the signature check
       # returned and reads the chain on each call; a read that fails raises and is refused through the except below.
-      if not self.bc.get_user_escrow_details(sender).get('isActive', False):
+      if not self.bc.get_user_escrow_details(sender)['isActive']:
         # Refused through the except below, with the endpoint's usual error answer.
         raise ValueError("Wallet has no active escrow.")
       # Build the record inside the try, so a missing Cloudflare field is returned as an error instead of
