@@ -135,7 +135,7 @@ CVE_DATABASE: list = [
 
   # ── Exim ───────────────────────────────────────────────────────────
   CveEntry("exim", "<4.98",   "CVE-2024-39929", Severity.MEDIUM, "RFC 2231 header parsing bypass — malware delivery", "CWE-20"),
-  CveEntry("exim", "<4.97.1", "CVE-2023-42115", Severity.CRITICAL, "AUTH out-of-bounds write", "CWE-787"),
+  CveEntry("exim", "<4.96.1", "CVE-2023-42115", Severity.CRITICAL, "AUTH out-of-bounds write", "CWE-787"),
   CveEntry("exim", "<4.96.1", "CVE-2023-42116", Severity.CRITICAL, "NTLM challenge stack buffer overflow", "CWE-121"),
   CveEntry("exim", "<4.96.1", "CVE-2023-42114", Severity.MEDIUM, "NTLM challenge out-of-bounds read", "CWE-125"),
   CveEntry("exim", "<4.94.2", "CVE-2021-27216", Severity.MEDIUM, "Privilege escalation via symlink attack", "CWE-59"),
