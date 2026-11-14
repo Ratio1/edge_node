@@ -34,6 +34,12 @@ DAUTH_SECRET_REQUEST_MAX_AGE_SECONDS = 120
 DAUTH_SECRET_REVEAL_ACTION = "reveal_job_secrets"
 DAUTH_VIEW_SECRETS_PERMISSION = 1 << 4
 DEEPLOY_WALLET_MESSAGE_PREFIX = "Please sign this message for Deeploy: "
+# The oldest node release dAuth serves. The gate used to refuse every sender 10 or more build numbers
+# behind the answering server; releases are 10 or 20 build numbers apart, so a node one release behind
+# was refused whenever it started during a rolling update. A named release does not move when a server
+# is updated. Raise it on purpose, at a release, and keep it below that release: a minimum equal to
+# the release refuses the previous one again (test_dauth_version_gate.py checks the form and that bound).
+DAUTH_MIN_SENDER_APP_VERSION = "2.10.710"
 
 
 def version_to_int(version):
@@ -101,11 +107,44 @@ class _DauthMixin(object):
     sender_sdk_version : str
   ):
     """
-    Check the version of the node that is sending the request.
-    Returns `None` if all ok and a message if there is a problem.
-    
-    
-    """    
+    Check the versions a dAuth requester declares.
+
+    Types the requester from the versions it sends (a node sends app, core and SDK versions,
+    an SDK client only the SDK version) and refuses a node whose app version is below
+    `DAUTH_MIN_SENDER_APP_VERSION`. A node that is behind this server but at or above that
+    minimum is served, with a warning in the message.
+
+    Parameters
+    ----------
+    sender_app_version : str
+      The app (edge node) version the requester declares; None for an SDK client.
+    sender_core_version : str
+      The core version the requester declares; None for an SDK client.
+    sender_sdk_version : str
+      The SDK version the requester declares.
+
+    Returns
+    -------
+    VersionCheckData
+      `result` (False when the request must be refused), `message` (notes and warnings; for a
+      refusal it starts with the reason) and `requester_type`.
+
+    Notes
+    -----
+    The versions are declared by the requester and not proven, so this is an upgrade policy and
+    not a security control. The minimum is tested only for a sender older than this server: the
+    minimum is below this server's release, so a sender at or above the server is above it too.
+    Version texts are read by `version_to_int`, which keeps a partial sum for text it cannot
+    read; a sender whose text gives a sum below the minimum is refused as too old.
+
+    Examples
+    --------
+    >>> self.ee_ver, self.ee_core_ver, self.ee_sdk_ver = "2.10.730", "7.7.357", "3.5.71"
+    >>> self.version_check("2.10.720", "7.7.357", "3.5.71").result
+    True
+    >>> self.version_check("2.10.700", "7.7.357", "3.5.71").message
+    ' FAIL: Sender app version 2.10.700 is too old (minimum: 2.10.710).'
+    """
     #
     output = VersionCheckData(result=True, message="")
     dAuthCt = self.const.BASE_CT.dAuth
@@ -136,10 +175,12 @@ class _DauthMixin(object):
     
     if int_sender_app_version > 0 and int_sender_app_version < int_server_app_version:
       output.message += f" WARNING: Sender app version {sender_app_version} is lower than server app version {self.ee_ver}."
-      diff = int_server_app_version - int_sender_app_version
-      if diff >= 10:
+      # Refuse only below the named minimum release, not at a distance from this server: the
+      # previous release stays served while the servers and the nodes are updated one by one.
+      if int_sender_app_version < version_to_int(DAUTH_MIN_SENDER_APP_VERSION):
         output.result = False
-        output.message = f" FAIL: Sender app version {sender_app_version} is too old (diff: {diff})."
+        # The words "is too old" are kept; the text names the release to reach, not the distance.
+        output.message = f" FAIL: Sender app version {sender_app_version} is too old (minimum: {DAUTH_MIN_SENDER_APP_VERSION})."
     #end app version check
       
     if int_sender_core_version > 0 and int_sender_core_version < int_server_core_version:
