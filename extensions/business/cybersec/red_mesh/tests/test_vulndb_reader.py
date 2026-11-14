@@ -192,6 +192,48 @@ class VulndbReaderTests(unittest.TestCase):
         self.assertEqual(hit, _matches_constraint(version, constraint, product or "x"))
 
 
+  def _spans(self, product, version, rows, **kw):
+    self.build(rows=rows)
+    reader, _ = load_reader(self.db, self.pin)
+    return {m.cve_id: (m.confidence, m.reason) for m in reader.query(product, version, **kw)}
+
+  def test_truncated_banner_keeps_whole_prefix_rows_and_marks_the_rest(self):
+    rows = [
+      ("CVE-2022-0001", "apache", "<3.0", "nvd", "firm", "nvd_range", 0, 0),           # whole 2.4.x: unchanged
+      ("CVE-2022-0002", "apache", "<2.4.50", "nvd", "firm", "nvd_range", 0, 0),        # 2.4.0 yes, 2.4.999999 no
+      ("CVE-2022-0003", "apache", ">=2.4.49,<2.5", "nvd", "firm", "nvd_range", 0, 0),  # high end only
+      ("CVE-2022-0004", "apache", ">=2.4.49,<2.4.51", "nvd", "firm", "nvd_range", 0, 0),  # inside: neither end, dropped
+      ("CVE-2022-0005", "apache", "<2.4", "nvd", "firm", "nvd_range", 0, 0),           # below the prefix: dropped
+    ]
+    self.assertEqual(self._spans("apache", "2.4", rows), {
+      "CVE-2022-0001": ("firm", "nvd_range"),
+      "CVE-2022-0002": ("tentative", "inferred_version"),
+      "CVE-2022-0003": ("tentative", "inferred_version"),
+    })
+    self.assertEqual(sorted(self._spans("apache", "2.4.0", rows)), ["CVE-2022-0001", "CVE-2022-0002"])  # full precision
+    self.assertEqual(sorted(self._spans("apache", "2.4.60", rows)), ["CVE-2022-0001", "CVE-2022-0003"])
+
+  def test_two_part_products_are_not_truncated_at_two_parts(self):
+    rows = [("CVE-2022-0006", "openssh", "<9.0", "nvd", "firm", "nvd_range", 0, 0)]
+    self.assertEqual(self._spans("openssh", "8.9", rows), {"CVE-2022-0006": ("firm", "nvd_range")})
+
+  def test_inferred_span_keeps_rows_that_cover_the_whole_span(self):
+    rows = [
+      ("CVE-2022-0010", "openssl", ">=1.0.1,<1.0.1g", "nvd", "firm", "nvd_range", 0, 0),
+      ("CVE-2022-0011", "openssl", ">=1.0.1a,<1.0.1u", "nvd", "firm", "nvd_range", 0, 0),  # starts inside the span
+      ("CVE-2022-0012", "openssl", "<=1.0.1s", "nvd", "firm", "nvd_range", 0, 0),
+      ("CVE-2022-0013", "openssl", ">=1.0.1g,<1.0.1u", "nvd", "firm", "nvd_range", 0, 0),
+    ]
+    span = ("1.0.1", "1.0.1f")
+    self.assertEqual(self._spans("openssl", "1.0.1f", rows, inferred_span=span), {
+      "CVE-2022-0010": ("firm", "nvd_range"),
+      "CVE-2022-0011": ("tentative", "inferred_version"),
+      "CVE-2022-0012": ("firm", "nvd_range"),
+    })
+    self.assertEqual(sorted(self._spans("openssl", "1.0.1f", rows)),
+                     ["CVE-2022-0010", "CVE-2022-0011", "CVE-2022-0012"])  # no span: today's behaviour
+
+
 @unittest.skipUnless(os.environ.get("VULNDB_BENCH_DB"), "set VULNDB_BENCH_DB to a real database (pin built from it)")
 class VulndbBenchmark(unittest.TestCase):
   def test_vulhub_p95_and_rss(self):
