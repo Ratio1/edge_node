@@ -5362,45 +5362,26 @@ class TestPhase5Endpoints(unittest.TestCase):
     }
     plugin.time.return_value = 123.0
     plugin._log_audit_event = MagicMock()
-    triage_store = {}
-    triage_audit_store = {}
+    binding = binding_payload()
+    stub["execution_binding"] = binding
+    stub["launcher"] = plugin.ee_addr
+    plugin.r1fs.get_json.return_value["job_config"] = {"execution_binding": binding}
+    rows = {}
 
-    def _chainstore_hget(hkey, key):
-      if hkey.endswith(":triage"):
-        return triage_store.get(key)
-      if hkey.endswith(":triage:audit"):
-        return triage_audit_store.get(key)
-      return {"fin-job": stub}.get(key)
+    plugin.chainstore_hget.side_effect = lambda hkey, key: (
+      {"fin-job": stub}.get(key) if hkey == "test-instance" else rows.get((hkey, key)))
+    plugin.chainstore_hgetall.side_effect = lambda hkey: (
+      {"fin-job": stub} if hkey == "test-instance" else {k: v for (h, k), v in rows.items() if h == hkey})
+    plugin.chainstore_hset.side_effect = lambda hkey, key, value: rows.__setitem__((hkey, key), value)
 
-    def _chainstore_hgetall(hkey):
-      if hkey.endswith(":triage"):
-        return dict(triage_store)
-      if hkey.endswith(":triage:audit"):
-        return dict(triage_audit_store)
-      return {"fin-job": stub}
+    result = update_finding_triage(plugin, "fin-job", "f-1", "accepted_risk", note="Approved by analyst",
+                                   actor="alice", review_at=456.0)
 
-    def _chainstore_hset(hkey, key, value):
-      if hkey.endswith(":triage"):
-        triage_store[key] = value
-      elif hkey.endswith(":triage:audit"):
-        triage_audit_store[key] = value
-
-    plugin.chainstore_hget.side_effect = _chainstore_hget
-    plugin.chainstore_hgetall.side_effect = _chainstore_hgetall
-    plugin.chainstore_hset.side_effect = _chainstore_hset
-
-    result = update_finding_triage(plugin,
-      job_id="fin-job",
-      finding_id="f-1",
-      status="accepted_risk",
-      note="Approved by analyst",
-      actor="alice",
-      review_at=456.0,
-    )
-
-    self.assertEqual(result["triage"]["status"], "accepted_risk")
-    self.assertEqual(result["audit"][-1]["actor"], "alice")
-    self.assertEqual(triage_store["fin-job:f-1"]["review_at"], 456.0)
+    member = result["results"][0]
+    self.assertEqual(member["triage"]["status"], "accepted_risk")
+    self.assertEqual(member["audit"][-1]["actor"], "alice")
+    hkey = f"test-instance:triage:t:{binding['tenant_id']}"
+    self.assertEqual(rows[(hkey, "192.0.2.10\x1ff-1")]["review_at"], 456.0)
     plugin._log_audit_event.assert_called_once()
 
   def test_get_job_triage_not_found(self):
