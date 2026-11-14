@@ -144,9 +144,11 @@ class _DeploymentOperationsMixin:
     and joins the thread. The two bookkeeping maps live only in process
     memory and are not pruned: they hold one small entry per operation and
     per command target. After a restart they start empty, so the current
-    snapshot of each own operation the worker still handles (unfinished, or
-    completed less than 600 s ago) is sent once more and pending commands are
-    sent again; nodes de-duplicate commands by operation id and attempt.
+    snapshot of each own operation that is unfinished or completed less than
+    600 s ago is sent once more and pending commands are sent again; nodes
+    de-duplicate commands by operation id and attempt. An operation completed
+    600 s to 24 h ago is not sent at once: its repair back-off starts again
+    from the first pass (see `_reconcile_coordinator_operations`).
     `_custody_retry` is pruned on every worker pass and also starts empty, so
     after a restart each waiting operation calls dAuth on the first pass.
 
@@ -406,8 +408,8 @@ class _DeploymentOperationsMixin:
     self._operations_confirmed[snapshot["operation_id"]] = (snapshot["sequence"], snapshot.get("EE_SIGN"), self.time())
     return operation
 
-  def _replicate_operation(self, operation):
-    """Retry the exact snapshot until confirmed; once confirmed, re-send it every 30 s as repair.
+  def _replicate_operation(self, operation, every=30):
+    """Retry the exact snapshot until confirmed; once confirmed, re-send it every `every` seconds as repair.
 
     A confirmation needs only part of the peers, and nothing else brings an oracle that missed the write
     up to date. The re-sent snapshot is the same record: peers that hold it store nothing.
@@ -415,24 +417,28 @@ class _DeploymentOperationsMixin:
     The snapshot is identified by its `sequence` and its signature. Until
     that exact snapshot has been confirmed once, every call writes it again
     and raises while the write stays unconfirmed, so the caller does not act
-    on state the peers may lack. Once confirmed, a call within 30 s of the
-    last send returns without writing; after that the same record is sent
-    again as peer repair, and a failed repair send is not an error. Before
-    this throttle the unchanged snapshot was re-sent to every oracle peer on
-    every 2 s pass of the worker.
+    on state the peers may lack. Once confirmed, a call within `every` seconds
+    (30 by default) of the last send returns without writing; after that the
+    same record is sent again as peer repair, and a failed repair send is not
+    an error. Before this throttle the unchanged snapshot was re-sent to every
+    oracle peer on every 2 s pass of the worker.
 
     Parameters
     ----------
     operation : dict
       A signed operation snapshot exactly as stored, with `operation_id`,
       `sequence` and `EE_SIGN`. It is written as is and never modified.
+    every : float, optional
+      Seconds a repair waits after the last send of the same snapshot.
+      Default 30; `_reconcile_coordinator_operations` passes 600 to 3600 for
+      an operation completed more than 600 s ago.
 
     Returns
     -------
     None
       After a send (confirmed, or a failed repair of an already confirmed
       snapshot) its time is recorded in `_operations_confirmed`; a call inside
-      the 30 s window returns without sending or recording anything.
+      the `every` window returns without sending or recording anything.
 
     Raises
     ------
@@ -442,9 +448,9 @@ class _DeploymentOperationsMixin:
 
     Notes
     -----
-    The 30 s timer is measured with `self.time()`; a negative age (a clock
-    step backwards) counts as expired, so the record is sent rather than
-    held back. A failed repair send also restarts the 30 s timer.
+    The timer is measured with `self.time()`; a negative age (a clock step
+    backwards) counts as expired, so the record is sent rather than held
+    back. A failed repair send also restarts the timer.
 
     Examples
     --------
@@ -452,12 +458,16 @@ class _DeploymentOperationsMixin:
     >>> plugin._replicate_operation(operation)  # within 30 s: returns without writing
     >>> plugin.now += 31
     >>> plugin._replicate_operation(operation)  # repair: the same record is sent once more
+    >>> plugin.now += 31
+    >>> plugin._replicate_operation(operation, every=600)  # within 600 s: returns without writing
     """
     # Read the confirmations kept in process memory since init; the signed snapshot carries no send bookkeeping.
     confirmed = self._operations_confirmed
     # Identify the snapshot by sequence and signature, and look up when it was last sent with confirmation.
     marker, last = (operation["sequence"], operation.get("EE_SIGN")), confirmed.get(operation["operation_id"])
-    if last and last[:2] == marker and 0 <= self.time() - last[2] < 30:
+    # Hold the repair back while the last send of this snapshot is less than `every` seconds old (30 s unless the
+    # caller passes the back-off of a completed operation).
+    if last and last[:2] == marker and 0 <= self.time() - last[2] < every:
       return
     key = "{}|{}".format(operation["operation_id"], operation["sequence"] % 8)
     if not self.chainstore_hset(OPERATIONS_HKEY, key, operation, readonly=True,
@@ -466,7 +476,7 @@ class _DeploymentOperationsMixin:
         # Only a snapshot that was never confirmed blocks the caller; a failed repair of an already
         # confirmed one no longer stops the node commands that follow it.
         raise RuntimeError("Deployment state replication is pending.")
-    # Record this send (or failed repair) so the next repair of the same snapshot waits another 30 s.
+    # Record this send (or failed repair) so the next repair of the same snapshot waits `every` seconds again.
     confirmed[operation["operation_id"]] = marker + (self.time(),)
 
   def _assert_no_active_deployment(self, job_id=None, app_id=None):
@@ -1092,15 +1102,19 @@ class _DeploymentOperationsMixin:
     have finished, reads the newest verified snapshot of every operation this
     oracle coordinates from the local replica, and handles each one that no
     admission still holds: an unfinished operation is advanced, and
-    a completed one whose last update is less than 600 s old is handed to
-    `_replicate_operation`, which re-sends the final snapshot at most every
-    30 s as peer repair.
+    a completed one whose last update is less than 24 h old is handed to
+    `_replicate_operation`, which re-sends the final snapshot as peer repair:
+    at most every 30 s while the completion is less than 600 s old, then once
+    the time since the last send reaches half the time since completion,
+    bounded to 600 s to 1 h, so the gaps double from 600 s up to 1 h.
 
     The repair of completed operations exists because a write needs only one
     confirmation, so an oracle can miss the final snapshot and nothing else
     sent it again. That oracle kept showing the operation as running and
     refused new changes to the job. Peers that already hold the record store
-    nothing when it arrives again.
+    nothing when it arrives again. Before, the repair stopped 600 s after
+    completion, so an oracle away longer never got the final snapshot; now it
+    gets it at the first send after it is back, within 1 h, for 24 h.
 
     After a failed dAuth custody call (`DeploymentCustodyError`) the operation
     is skipped for 10 s, then 20, 40 and so on, up to 300 s, counted from the
@@ -1137,14 +1151,26 @@ class _DeploymentOperationsMixin:
     and, at the start of every pass, when its operation is no longer read
     from the replica.
 
+    With the 2 s pass, a completed operation is re-sent 19 times in its first
+    600 s, as before, then 25 more times: about 1,170, 2,340 and 4,680 s after
+    completion, then every 3,600 s up to 83,880 s. The time of the last send is
+    kept in process memory only (`_operations_confirmed`); after a restart an
+    operation completed more than 600 s ago counts its last send as made at
+    the first pass, so the restart sends nothing at once for it, and a failed
+    send of it is not an error.
+
     Examples
     --------
     >>> operation = plugin._save_operation(operation, "completed", "Deployment completed.")
     >>> plugin._reconcile_coordinator_operations()  # just confirmed: nothing is sent
     >>> plugin.now += 31
     >>> plugin._reconcile_coordinator_operations()  # the same final record is sent once more
+    >>> plugin.now += 300
+    >>> plugin._reconcile_coordinator_operations()  # 331 s: the last send is over 30 s old, sent again
     >>> plugin.now += 600
-    >>> plugin._reconcile_coordinator_operations()  # past the 600 s window: left alone
+    >>> plugin._reconcile_coordinator_operations()  # 931 s: the last send is 600 s old, sent again
+    >>> plugin.now += 86400
+    >>> plugin._reconcile_coordinator_operations()  # past 24 h: left alone
 
     With dAuth down, a cleanup operation calls it again only after the wait:
 
@@ -1182,15 +1208,24 @@ class _DeploymentOperationsMixin:
         # next one. A clock step backwards ends the wait, as for the other throttles in this file.
         continue
       try:
+        # Seconds since the operation's last snapshot; for a completed operation, since its completion.
+        age = self.time() - operation["updated_at"]
         if operation["phase"] != "completed":
           # Unfinished operations are advanced as before; completed ones are no longer skipped outright but
           # get the repair re-send below.
           self._advance_deployment_operation(operation)
-        # For 600 s after completion, oracles that missed the final snapshot get it too.
-        elif self.time() - operation["updated_at"] < 600:
-          # Re-send the final snapshot as repair, throttled to once per 30 s; peers that hold it store nothing,
-          # and an oracle that missed it stops showing the operation as running and refusing job changes.
-          self._replicate_operation(operation)
+        # For 24 h after completion, oracles that missed the final snapshot get it too; before, only for 600 s, so an
+        # oracle away longer never got it and kept showing the operation as running and refusing job changes.
+        elif age < 86400:
+          if age >= 600:
+            # The last send is kept in process memory only: after a restart, count it as made now, so the back-off
+            # resumes from here instead of every operation completed in the last 24 h being sent at once.
+            self._operations_confirmed.setdefault(
+              operation["operation_id"], (operation["sequence"], operation.get("EE_SIGN"), self.time()))
+          # Re-send the final snapshot as repair; peers that hold it store nothing. Every 30 s for the first 600 s, as
+          # before; then once the time since the last send reaches half the time since completion, bounded to 600 s
+          # to 1 h, so the gaps double from 600 s up to 1 h: 25 more sends per completed operation over the 24 h.
+          self._replicate_operation(operation, every=30 if age < 600 else min(max(age / 2, 600), 3600))
         # A pass without an error ends the custody wait, so a later failed custody call waits 10 s again.
         self._custody_retry.pop(operation["operation_id"], None)
       except Exception as exc:

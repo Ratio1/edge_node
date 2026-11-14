@@ -1035,24 +1035,83 @@ class RuntimeCompletionTests(unittest.TestCase):
     # Still one line; the cache stays at its bound.
     self.assertEqual((len(lines), len(plugin._verified_operation_records)), (1, 10000))
 
-  def test_completed_snapshot_is_resent_as_repair_for_ten_minutes(self):
+  def test_completed_snapshot_is_resent_every_30_s_then_on_a_back_off_for_a_day(self):
+    """The final snapshot of a completed operation is re-sent every 30 s for 600 s, as before, then at gaps that
+    double from 600 s up to 1 h, and no more from 24 h after completion; always the same record."""
     # One confirmation is enough for a write, so an oracle can miss the final snapshot; nothing else sends it again.
     plugin = Coordinator()
+    # A completed update operation.
     operation = plugin.operation("update")
+    # Completed, with a failed outcome and a completed recovery.
     operation.update(phase="completed", outcome="failed", recovery="completed")
+    # The final snapshot, written and confirmed now: its update time is the completion.
     plugin._save_operation(operation)
+    # The store after the final write, and the (seconds after completion, namespace, key) of each re-send.
     stored, sent = dict(plugin.storage), []
+    # The fake store's own write.
     store = plugin.chainstore_hset
-    plugin.chainstore_hset = lambda namespace, key, value, **kw: sent.append((namespace, key)) or store(namespace, key, value, **kw)
-    plugin._reconcile_coordinator_operations()  # just confirmed: nothing to send
-    self.assertEqual(sent, [])
-    plugin.now += 31
-    plugin._reconcile_coordinator_operations()  # 30 s later: the same record once more
-    self.assertEqual(sent, [(OPERATIONS_HKEY, "{}|{}".format(operation["operation_id"], operation["sequence"] % 8))])
-    plugin.now += 600
-    plugin._reconcile_coordinator_operations()  # past the window: left alone
-    self.assertEqual(len(sent), 1)
+    # Record each write with its time after completion, keeping the fake store's behaviour.
+    plugin.chainstore_hset = lambda namespace, key, value, **kw: sent.append(
+      (plugin.now - operation["updated_at"], namespace, key)) or store(namespace, key, value, **kw)
+    # One worker pass every 2 s, from completion to 25 h: past 87,480 s, where the 1 h gap would put the next send.
+    for _ in range(90000 // 2 + 1):
+      # One pass.
+      plugin._reconcile_coordinator_operations()
+      # The worker's 2 s wait.
+      plugin.now += 2
+    # 19 re-sends 30 s apart in the first 600 s, then 1,170, 2,340 and 4,680 s, then every hour up to 83,880 s.
+    self.assertEqual([age for age, _, _ in sent],
+                     list(range(30, 600, 30)) + [1170, 2340, 4680] + list(range(8280, 86400, 3600)))
+    # 25 of them after the first 600 s.
+    self.assertEqual(len([age for age, _, _ in sent if age >= 600]), 25)
+    # Every re-send wrote the final snapshot's own slot.
+    self.assertEqual({(namespace, key) for _, namespace, key in sent},
+                     {(OPERATIONS_HKEY, "{}|{}".format(operation["operation_id"], operation["sequence"] % 8))})
+    # And always the same record: the store is as the final write left it.
     self.assertEqual(plugin.storage, stored)
+
+  def test_after_a_restart_an_older_completion_resumes_its_back_off_without_a_send_at_once(self):
+    """After a restart, an operation completed more than 600 s ago is not sent at once: its back-off starts again
+    from the first pass, and a later send that is not confirmed is not an error."""
+    # A coordinator with a completed operation.
+    plugin = Coordinator()
+    # A completed update operation.
+    operation = plugin.operation("update")
+    # Completed, with a failed outcome and a completed recovery.
+    operation.update(phase="completed", outcome="failed", recovery="completed")
+    # The final snapshot, written and confirmed now.
+    plugin._save_operation(operation)
+    # 5,000 s after completion the oracle restarts: the send times kept in memory are gone.
+    plugin.now += 5000
+    # As _init_deployment_operations leaves them after a restart.
+    plugin._operations_confirmed = {}
+    # The times of the writes, and the log lines with their colors.
+    sent, lines = [], []
+    # The fake store's own write.
+    store = plugin.chainstore_hset
+    # Record each write's time, keeping the fake store's behaviour.
+    plugin.chainstore_hset = lambda namespace, key, value, **kw: sent.append(plugin.now) or store(
+      namespace, key, value, **kw)
+    # Every log call lands in the list.
+    plugin.P = lambda message, color=None, **kw: lines.append((message, color))
+    # The first pass after the restart.
+    plugin._reconcile_coordinator_operations()
+    # Nothing is sent at once.
+    self.assertEqual(sent, [])
+    # 3,599 s later: half the age is above 1 h, so the gap is 1 h and it is not over yet.
+    plugin.now += 3599
+    # A pass inside the gap.
+    plugin._reconcile_coordinator_operations()
+    # Still nothing sent.
+    self.assertEqual(sent, [])
+    # Other oracles do not confirm from now on.
+    plugin.replicate = False
+    # The hour since the restart is over.
+    plugin.now += 1
+    # The pass that sends.
+    plugin._reconcile_coordinator_operations()
+    # Sent once, and the unconfirmed send is not logged as an error.
+    self.assertEqual((sent, lines), ([plugin.now], []))
 
 
 if __name__ == "__main__":
