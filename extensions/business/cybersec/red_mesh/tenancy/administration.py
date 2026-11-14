@@ -1947,7 +1947,13 @@ class TenantAdministrationService:
   # the plugin's download.
   @_endpoint
   def public_super_tenant_branding(self):
-    return super_tenant_branding.branding_dto(self._branding_row())
+    """The branding DTO plus `branded`: a logo is set or the profile's legal name is not blank. Only
+    that boolean leaves the profile, never the name or another field (RM-192)."""
+    dto = super_tenant_branding.branding_dto(self._branding_row())
+    profile = self.store.get("super_tenant_profile", super_tenant_profile.RECORD_ID)
+    legal_name = (profile or {}).get("legal_name")
+    named = isinstance(legal_name, str) and bool(legal_name.strip())
+    return {**dto, "branded": dto["logo"] is not None or named}
 
   @_endpoint
   def public_super_tenant_branding_logo(self):
