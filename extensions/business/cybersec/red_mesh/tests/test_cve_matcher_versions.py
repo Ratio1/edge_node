@@ -41,6 +41,10 @@ UNIT = [
   ('', '1.2.3-devel', '<1.2.3', False, 'tail "devel" is not a dev pre-release'),
   ('', '1.2.3-precise', '==1.2.3', True, 'a non-tag tail reads as the release'),
   ('', '11.0.0-M3', '<11.0.0', True, 'tomcat milestone with a dash'),
+  ('', '1.2.3-preview', '<1.2.3', True, 'preview stays a pre-release'),
+  ('', '1.2.3-prerelease', '<1.2.3', True, 'prerelease stays a pre-release'),
+  ('', '1.2.3-preview2', '<1.2.3', True, 'numbered preview'),
+  ('', '1.2.3-previews', '<1.2.3', False, 'a longer word is not a tag'),
 ]
 
 
