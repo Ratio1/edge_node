@@ -135,7 +135,7 @@ CVE_DATABASE: list = [
 
   # ── Exim ───────────────────────────────────────────────────────────
   CveEntry("exim", "<4.98",   "CVE-2024-39929", Severity.MEDIUM, "RFC 2231 header parsing bypass — malware delivery", "CWE-20"),
-  CveEntry("exim", "<4.97.1", "CVE-2023-42115", Severity.CRITICAL, "AUTH out-of-bounds write", "CWE-787"),
+  CveEntry("exim", "<4.96.1", "CVE-2023-42115", Severity.CRITICAL, "AUTH out-of-bounds write", "CWE-787"),
   CveEntry("exim", "<4.96.1", "CVE-2023-42116", Severity.CRITICAL, "NTLM challenge stack buffer overflow", "CWE-121"),
   CveEntry("exim", "<4.96.1", "CVE-2023-42114", Severity.MEDIUM, "NTLM challenge out-of-bounds read", "CWE-125"),
   CveEntry("exim", "<4.94.2", "CVE-2021-27216", Severity.MEDIUM, "Privilege escalation via symlink attack", "CWE-59"),
@@ -555,6 +555,7 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
   cvss_score_env = None
   cvss_vector_env = ""
   cvss_version = "3.1"
+  cvss_source = ""
   cvss_freshness = ""
   kev = False
   epss_score = None
@@ -572,6 +573,7 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
       cvss_score = cvss_rec.score
       cvss_vector = cvss_rec.vector
       cvss_version = cvss_rec.version or cvss_version
+      cvss_source = "nvd" if cvss_rec.vector else ""
       cvss_freshness = cvss_rec.fetched_at
       if cvss_rec.source_url:
         references_list.append(cvss_rec.source_url)
@@ -598,6 +600,7 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
       cvss_vector = static_vector
       cvss_score = cvss31_base_score(static_vector)
       cvss_version = static_vector.split("/", 1)[0].removeprefix("CVSS:")
+      cvss_source = "nvd"
       cvss_freshness = ""  # static, not fetched at scan time
 
   # What the distribution package says about this match, stated rather than
@@ -640,6 +643,7 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
     cvss_score=cvss_score,
     cvss_vector=cvss_vector,
     cvss_version=cvss_version,
+    cvss_source=cvss_source,
     cvss_score_env=cvss_score_env,
     cvss_vector_env=cvss_vector_env,
     cvss_data_freshness=cvss_freshness,

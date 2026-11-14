@@ -912,6 +912,7 @@ class _WebInjectionMixin(_InjectionTestBase):
         "product": "JBoss",
         "cve": "CVE-2017-12149",
         "check": lambda resp: resp.status_code == 500,
+        "status_only": True,
         "desc": "JBoss /invoker/readonly returns 500, indicating the "
                 "deserialization endpoint exists (CVE-2017-12149).",
       },
@@ -920,6 +921,7 @@ class _WebInjectionMixin(_InjectionTestBase):
         "product": "JBoss",
         "cve": None,
         "check": lambda resp: resp.status_code in (200, 500),
+        "status_only": True,
         # The only check here a bare 200 satisfies; the others read the body
         # or need a 500. On a catch-all host the 200 branch is withheld
         # (RM-086 item 1); a 500 still counts.
@@ -936,7 +938,13 @@ class _WebInjectionMixin(_InjectionTestBase):
         if catch_all and ep.get("status_only_on_200") and resp.status_code == 200:
           self._withhold_on_catch_all(base_url, "_web_test_java_deserialization", ep["path"])
           continue
+        # A host that answers one error code to every path (CUPS: 500) makes
+        # that code meaningless: status-only checks are withheld on equality
+        # with the random-path status; body-validated ones only when the body
+        # is the canary's error page echoing the path.
         if ep["check"](resp):
+          if self._matches_catch_all_error(base_url, ep["path"], resp, bool(ep.get("status_only"))):
+            continue
           title = f"Java deserialization endpoint: {ep['path']}"
           if ep["cve"]:
             title = f"{ep['cve']}: {ep['product']} deserialization endpoint {ep['path']}"
