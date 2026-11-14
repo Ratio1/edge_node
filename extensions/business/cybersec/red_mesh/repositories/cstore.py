@@ -10,6 +10,7 @@ from ..models import (
   RulebookSubmissionRegistry,
   WorkerProgress,
 )
+from ..tenancy.execution import triage_scope
 
 
 RUNNING_JOB_REQUIRED_FIELDS = {
@@ -349,9 +350,9 @@ class JobStateRepository:
     return audit_log
 
   def get_host_triage(self, tenant_id, host, finding_id):
-    payload = self.owner.chainstore_hget(
+    """The stored value as is (None when absent); a caller that trusts it validates its shape."""
+    return self.owner.chainstore_hget(
       hkey=self.host_triage_hkey(tenant_id), key=self.host_triage_key(host, finding_id))
-    return payload if isinstance(payload, dict) else None
 
   def list_host_triage(self, tenant_id, host):
     """`finding_id -> record` of one tenant's host. Another tenant's hkey is never read."""
@@ -362,6 +363,15 @@ class JobStateRepository:
       for key, value in payload.items()
       if isinstance(key, str) and key.startswith(prefix) and isinstance(value, dict)
     }
+
+  def list_triage_for_record(self, record):
+    """The host triage map of the tenant and host a job record is bound to, never a caller's.
+
+    `{}` for a record with no binding, a malformed one, or a target without triage (a model job).
+    """
+    binding = record.get("execution_binding") if isinstance(record, dict) else None
+    scope = triage_scope(binding) if binding is not None else None
+    return self.list_host_triage(*scope) if scope else {}
 
   def put_host_triage(self, triage):
     """Store a state that names its tenant and host; returns the stored payload."""

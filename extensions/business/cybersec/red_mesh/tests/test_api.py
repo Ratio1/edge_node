@@ -4229,8 +4229,9 @@ class TestPhase5Endpoints(unittest.TestCase):
     }
     plugin.r1fs.get_json.return_value = archive_data
     plugin.chainstore_hget.side_effect = lambda hkey, key: (
-      {"job_id": "fin-job", "finding_id": "f-1", "status": "accepted_risk", "note": "documented"}
-      if hkey == "test-instance:triage" and key == "fin-job:f-1" else None)
+      {"job_id": "fin-job", "finding_id": "f-1", "status": "accepted_risk", "note": "documented",
+       "tenant_id": self._tenant_id, "host": "192.0.2.10"}
+      if hkey == f"test-instance:triage:t:{self._tenant_id}" and key == "192.0.2.10\x1ff-1" else None)
 
     result = Plugin.get_job_archive(plugin, job_id="fin-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
     self.assertEqual(result["job_id"], "fin-job")
