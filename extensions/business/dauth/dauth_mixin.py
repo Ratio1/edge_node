@@ -24,7 +24,8 @@ from .dauth_registry import (
   DAUTH_SECRET_PIPELINE_CID_KEY,
   dauth_registry_write_kwargs,
 )
-from ratio1.const.base import dAuth
+# BCctbase names the sender fields of a signed request, which a refusal line reports.
+from ratio1.const.base import BCctbase, dAuth
 
 
 DAUTH_JOB_SECRETS_CSTORE_HKEY = "DAUTH_JOB_SECRETS"
@@ -55,6 +56,48 @@ def version_to_int(version):
     except:
       pass
   return val
+
+def dauth_request_label(body):
+  """
+  Say who a dAuth request names as its sender and which job it is about, for a log line.
+
+  A refusal line of a secrets endpoint carries this label, so the log shows which node asked
+  for which job. Before, the line had only the source address and the reason, and a refused
+  node behind a shared address could not be told from another.
+
+  Parameters
+  ----------
+  body : dict
+    The request body. Anything else, and a body without the fields, gives ``None`` values.
+
+  Returns
+  -------
+  str
+    ``sender <node address> ETH <ETH address> job <job id>``, each value as its ``repr`` cut
+    to 60, 50 and 40 characters.
+
+  Notes
+  -----
+  The values are what the request says, read before or after its signature is checked: for a
+  request refused over its signature they are a claim, not a verified identity. They are
+  written as ``repr``, so a line break in a value cannot start a log line of its own, and
+  cut, so a value cannot grow the line. Only these three fields are read: never a secret
+  value, a configuration or an error text.
+
+  Examples
+  --------
+  >>> dauth_request_label({"EE_SENDER": "0xai_Node", "EE_ETH_SENDER": "0xE7h", "job_id": 49})
+  "sender '0xai_Node' ETH '0xE7h' job 49"
+  >>> dauth_request_label(None)
+  'sender None ETH None job None'
+  """
+  # A body that is not a dictionary names nothing: the label then says None three times.
+  fields = body if isinstance(body, dict) else {}
+  # repr() escapes line breaks and the precision cuts each value: the request controls this text.
+  return "sender {!r:.60} ETH {!r:.50} job {!r:.40}".format(
+    fields.get(BCctbase.SENDER), fields.get(BCctbase.ETH_SENDER), fields.get("job_id"),
+  )
+
 
 class DauthRefused(ValueError):
   """

@@ -36,8 +36,9 @@ from extensions.business.dauth.dauth_registry import (
   load_dauth_registry_snapshot,
 )
 # The type of a refusal that is dAuth's verdict on the requester; get_secrets logs it in yellow.
-# Imported on a line of its own, apart from the block above.
-from extensions.business.dauth.dauth_mixin import DauthRefused
+# The label says which sender and job a refused request names. Imported on a line of its own,
+# apart from the block above.
+from extensions.business.dauth.dauth_mixin import DauthRefused, dauth_request_label
 from extensions.business.dauth.dauth_revoked_nodes import _DauthRevokedNodesMixin
 
 from extensions.business.dauth.deployment_secrets import _DauthDeploymentSecretsMixin
@@ -593,10 +594,11 @@ class DauthManagerPlugin(
 
     Notes
     -----
-    A failure is logged in red with the type of the error and the functions it passed through, outermost
-    first and cut to 300 characters, so the failing step (for example the read of the operation's plan) can
-    be told from the log. The error text is not logged: new secret values can be present in the request or
-    in a dependency's error.
+    A failure is logged in red with the sender and the job the request names (see `dauth_request_label`),
+    the type of the error, the functions it passed through, outermost first and cut to 300 characters, and
+    the line of the innermost function, where it was raised. The failing check can so be told from the log:
+    one function holds several checks that raise the same type. The error text is not logged: new secret
+    values can be present in the request or in a dependency's error.
 
     Examples
     --------
@@ -617,9 +619,15 @@ class DauthManagerPlugin(
         # the reconciliation failed, and a plan that could not be read looked like any other failure. The
         # path, outermost first, is cut to 300 characters to bound the log line: on a very deep path the
         # innermost names (where the error was raised) are the ones cut.
-        path = " > ".join(frame.name for frame in traceback.extract_tb(exc.__traceback__))[:300]
-        self.P("dAuth secret reconciliation failed for request from {}: {} in {}.".format(
-          self.get_request_client_ip(), type(exc).__name__, path), color='r')
+        frames = traceback.extract_tb(exc.__traceback__)
+        # The same path as before, built from the frames kept above.
+        path = " > ".join(frame.name for frame in frames)[:300]
+        # The line also names who asked for which job and the line that raised, by the innermost
+        # function's name and line number: a location in the code, never the error text. Before,
+        # several checks of one function could not be told apart and the requester was not named.
+        self.P("dAuth secret reconciliation failed for request from {} ({}): {} in {} (line {} of {}).".format(
+          self.get_request_client_ip(), dauth_request_label(body), type(exc).__name__, path,
+          frames[-1].lineno, frames[-1].name), color='r')
         data = {'error': 'dAuth secret reconciliation failed'}
     return self.__get_response({'nonce': nonce, **data})
 
@@ -647,7 +655,8 @@ class DauthManagerPlugin(
 
     Notes
     -----
-    A failed request writes one line with the source address and the error text. The line is
+    A failed request writes one line with the source address, the sender and the job the
+    request names (see `dauth_request_label`) and the error text. The line is
     yellow when the error is a ``DauthRefused``, dAuth's verdict on the requester (a revoked
     key or revision, a node outside the job's placement or the revision's plan), and red for
     everything else. Red lines are also copied to the error log.
@@ -669,8 +678,8 @@ class DauthManagerPlugin(
     try:
       data = self.process_dauth_get_secret_request(body)
     except Exception as e:
-      self.P("Error processing get_secrets request from {}: {}".format(
-        self.get_request_client_ip(), e), color='y' if isinstance(e, DauthRefused) else 'r'
+      self.P("Error processing get_secrets request from {} ({}): {}".format(
+        self.get_request_client_ip(), dauth_request_label(body), e), color='y' if isinstance(e, DauthRefused) else 'r'
       )
       data = {
         'error': str(e),

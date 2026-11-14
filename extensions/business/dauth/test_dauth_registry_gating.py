@@ -983,8 +983,10 @@ class DauthServerRegistryGateTests(unittest.TestCase):
           self.assertIn("ValueError in reconcile_job_secrets > reconcile", plugin._messages[-1])
 
   def test_secret_endpoint_errors_echo_request_nonce(self):
+    """A failing secrets endpoint answers with the request's nonce and the error text, and logs one line per failure."""
     plugin = self._make_manager(dauth_oracle=True)
     plugin._dauth_server_enabled = True
+    # Each of the three request handlers fails with a text of its own.
     plugin.process_dauth_add_secrets_request = lambda body: (_ for _ in ()).throw(
       ValueError("add failed")
     )
@@ -994,6 +996,7 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin.process_dauth_reveal_secret_request = lambda body: (_ for _ in ()).throw(
       ValueError("reveal failed")
     )
+    # A body with a nonce and nothing else: it names no sender and no job.
     body = {"nonce": REQUEST_NONCE}
 
     add_response = plugin.add_secrets(body)
@@ -1006,9 +1009,10 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     self.assertEqual(get_response["error"], "get failed")
     self.assertEqual(reveal_response["nonce"], REQUEST_NONCE)
     self.assertEqual(reveal_response["error"], "reveal failed")
+    # The get_secrets line also says which sender and job the request names: none here.
     self.assertEqual(plugin._messages[-3:], [
       f"Error processing add_secrets request from {SOURCE_IP}: add failed",
-      f"Error processing get_secrets request from {SOURCE_IP}: get failed",
+      f"Error processing get_secrets request from {SOURCE_IP} (sender None ETH None job None): get failed",
       f"Error processing reveal_job_secrets request from {SOURCE_IP}: reveal failed",
     ])
 

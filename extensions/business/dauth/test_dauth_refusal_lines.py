@@ -1,4 +1,4 @@
-"""dAuth logs its verdict on a requester in yellow and keeps a fault, and the version-gate refusal, red."""
+"""dAuth refusal lines: a verdict on a requester is yellow, a fault red, and the line says who asked for which job."""
 import unittest
 from unittest.mock import Mock
 
@@ -7,6 +7,7 @@ from extensions.business.dauth.dauth_mixin import (
   DAUTH_JOB_SECRETS_CSTORE_HKEY,
   DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY,
   DauthRefused,
+  dauth_request_label,
 )
 from extensions.business.dauth.test_dauth_revoked_nodes import ALLOWED, ETH, REVOKED, _auth_body, _harness
 from extensions.business.dauth.test_unversioned_secret_resolution import existing_job, request
@@ -70,6 +71,30 @@ def _revision_request(**overrides):
     "EE_SENDER": "node-runner", "EE_ETH_SENDER": "0xRUNNER", "nonce": gating.REQUEST_NONCE,
     "job_id": "7", "revision": "op:deploy", **overrides,
   }
+
+
+def _manager(process_name, process):
+  """
+  Build a registered dAuth manager whose request handling for one endpoint is replaced.
+
+  Parameters
+  ----------
+  process_name : str
+    The name of the handler the endpoint calls, for example ``process_dauth_get_secret_request``.
+  process : callable
+    Called with the request body in its place.
+
+  Returns
+  -------
+  tuple
+    `(manager, lines)`: the manager stand-in and the `(text, color)` lines it logs.
+  """
+  manager = gating.DauthManagerPlugin.__new__(gating.DauthManagerPlugin)
+  # A registered dAuth server whose answer is returned as the endpoint builds it, unsigned.
+  manager._dauth_server_enabled = True
+  manager._DauthManagerPlugin__get_response = lambda data: data
+  setattr(manager, process_name, process)
+  return manager, _record_lines(manager)
 
 
 class AuthDataRefusalColorTests(unittest.TestCase):
@@ -199,12 +224,7 @@ class SecretRefusalColorTests(unittest.TestCase):
     tuple
       `(response, lines)`: the endpoint's answer and the `(text, color)` lines it logged.
     """
-    manager = gating.DauthManagerPlugin.__new__(gating.DauthManagerPlugin)
-    # A registered dAuth server whose answer is returned as the endpoint builds it, unsigned.
-    manager._dauth_server_enabled = True
-    manager._DauthManagerPlugin__get_response = lambda data: data
-    manager.process_dauth_get_secret_request = plugin.process_dauth_get_secret_request
-    lines = _record_lines(manager)
+    manager, lines = _manager("process_dauth_get_secret_request", plugin.process_dauth_get_secret_request)
     return manager.get_secrets(body), lines
 
   def test_verdict_is_logged_yellow_and_answered_as_final(self):
@@ -225,6 +245,55 @@ class SecretRefusalColorTests(unittest.TestCase):
     response, lines = self._get_secrets(_revision_job(), _revision_request(revision="op:other"))
     self.assertIs(response["retryable"], True)
     self.assertEqual([color for _, color in lines], ["r"])
+
+
+class RefusalLineNamesTests(unittest.TestCase):
+
+  def test_get_secrets_refusal_line_names_sender_job_and_reason(self):
+    """A refused `get_secrets` request is logged with the sender's address, its ETH address, the job and the reason."""
+    body = request(EE_SENDER="node-other", EE_ETH_SENDER="0xOTHER")
+    manager, lines = _manager("process_dauth_get_secret_request", existing_job().process_dauth_get_secret_request)
+    response = manager.get_secrets(body)
+    self.assertEqual(lines, [(
+      f"Error processing get_secrets request from {gating.SOURCE_IP} "
+      "(sender 'node-other' ETH '0xOTHER' job '7'): Sender is not running the existing job.", "y",
+    )])
+    # The answer to the requester is the text it got before: only the server's log line changed.
+    self.assertEqual(response["error"], "Sender is not running the existing job.")
+    # The job's stored secret value is in no line.
+    self.assertNotIn("existing-secret", str(lines))
+
+  def test_reconcile_failure_line_names_sender_job_and_the_failing_line_but_no_error_text(self):
+    """A failed reconciliation is logged with the sender, the job and the function and line that raised, never the error text."""
+    def failing_check(body):
+      raise ValueError("credential-in-dependency-error")
+    # The `raise` is the line after the `def`.
+    raised_at = failing_check.__code__.co_firstlineno + 1
+    manager, lines = _manager("process_dauth_reconcile_secrets_request", failing_check)
+    response = manager.reconcile_job_secrets({"nonce": "n1", "EE_SENDER": "node-oracle", "EE_ETH_SENDER": "0xORACLE", "job_id": 7})
+    self.assertEqual(lines, [(
+      f"dAuth secret reconciliation failed for request from {gating.SOURCE_IP} "
+      "(sender 'node-oracle' ETH '0xORACLE' job 7): ValueError in reconcile_job_secrets > failing_check "
+      f"(line {raised_at} of failing_check).", "r",
+    )])
+    # The caller is still told only that it failed.
+    self.assertEqual(response["error"], "dAuth secret reconciliation failed")
+    self.assertNotIn("credential-in-dependency-error", str(response) + str(lines))
+
+  def test_label_escapes_and_cuts_what_the_request_names(self):
+    """Text the requester controls cannot add a log line or grow one without bound."""
+    label = dauth_request_label({"EE_SENDER": "a\nfake line " * 50, "EE_ETH_SENDER": "0x" + "f" * 500, "job_id": "9" * 500})
+    # A line break is written as an escape, so the text stays on the line of the refusal.
+    self.assertNotIn("\n", label)
+    self.assertIn("a\\nfake line", label)
+    # 60, 50 and 40 characters of the three values, plus the three field names and separators.
+    self.assertEqual(len(label), len("sender  ETH  job ") + 60 + 50 + 40)
+
+  def test_label_of_a_request_without_the_fields(self):
+    """A body that names no sender or job, or is not a dictionary, gives a label that says so."""
+    for body in ({}, {"nonce": "n1"}, None, "text"):
+      with self.subTest(body=body):
+        self.assertEqual(dauth_request_label(body), "sender None ETH None job None")
 
 
 if __name__ == "__main__":
