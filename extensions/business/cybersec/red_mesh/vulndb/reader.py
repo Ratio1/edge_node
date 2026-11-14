@@ -12,7 +12,6 @@ import sqlite3
 import sys
 from collections import namedtuple
 from pathlib import Path
-from urllib.parse import quote
 
 from ..cve_db import _compare_versions, _parse_version
 from .models import SUPPORTED_MODELS
@@ -99,12 +98,12 @@ class VulndbReader:
     for clauses, row in self._ranges.get(product, ()):
       if all(_holds(op, _compare_versions(parsed, target)) for op, target in clauses):
         found.append(row)
-    seen, result = set(), []
+    best = {}  # one row per CVE: firm/certain over tentative, then platform-independent over dependent
     for row in found:
-      if row[0] not in seen:
-        seen.add(row[0])
-        result.append(self._match(row))
-    return result
+      rank = (row[4] == "tentative", row[6])
+      if row[0] not in best or rank < best[row[0]][0]:
+        best[row[0]] = (rank, row)
+    return [self._match(row) for _, row in best.values()]
 
 
 _VULNS = (
@@ -128,14 +127,20 @@ def load_reader(db_path=DB_PATH, pin_path=PIN_PATH):
   db_path = Path(db_path)
   if not db_path.is_file():
     raise VulndbError("file_missing")
-  digest = hashlib.sha256()
-  with open(db_path, "rb") as handle:
-    for chunk in iter(lambda: handle.read(1 << 20), b""):
-      digest.update(chunk)
-  if not isinstance(pin, dict) or digest.hexdigest() != pin.get("sha256_sqlite"):
+  try:
+    if isinstance(pin, dict) and pin.get("size") is not None and db_path.stat().st_size != pin["size"]:
+      raise VulndbError("hash_mismatch")
+    data = db_path.read_bytes()  # the one read: hashed and loaded from these bytes
+  except OSError:
+    raise VulndbError("file_unreadable")
+  if not isinstance(pin, dict) or hashlib.sha256(data).hexdigest() != pin.get("sha256_sqlite"):
     raise VulndbError("hash_mismatch")
   try:
-    conn = sqlite3.connect("file:%s?mode=ro" % quote(str(db_path)), uri=True)
+    conn = sqlite3.connect(":memory:")
+    conn.deserialize(data)
+    del data
+    conn.execute("PRAGMA trusted_schema = OFF")
+    conn.execute("PRAGMA query_only = ON")
     try:
       model = conn.execute("PRAGMA user_version").fetchone()[0]
       if model not in SUPPORTED_MODELS:
@@ -167,15 +172,20 @@ def load_reader(db_path=DB_PATH, pin_path=PIN_PATH):
 
 def load_vulndb(requested, db_path=DB_PATH, pin_path=PIN_PATH):
   """Resolve the flag. Returns `(reader or None, capability_keys)`; never raises (fall back to static)."""
-  requested = requested if requested in ("static", "generated") else "static"
   keys = {"vulndb_source": "static", "vulndb_build_id": None, "vulndb_built_at": None,
           "vulndb_origin": None, "vulndb_load_error": None}
   if requested == "static":
+    return None, keys
+  if requested != "generated":
+    keys["vulndb_load_error"] = "unknown_source"
     return None, keys
   try:
     reader, info = load_reader(db_path, pin_path)
   except VulndbError as exc:
     keys["vulndb_load_error"] = str(exc.args[0])
+    return None, keys
+  except Exception as exc:  # RecursionError in a hostile pin, MemoryError, ...
+    keys["vulndb_load_error"] = "load_failed:%s" % type(exc).__name__
     return None, keys
   keys.update(vulndb_source="generated", vulndb_build_id=info["build_id"],
               vulndb_built_at=info["built_at"], vulndb_origin=info["origin"])
