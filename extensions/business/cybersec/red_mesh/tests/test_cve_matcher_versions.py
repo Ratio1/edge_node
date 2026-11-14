@@ -37,6 +37,10 @@ UNIT = [
   ('bind', '9.10.3-P4', '<9.10.3-P5', True, 'BIND patch levels order'),
   ('openssl', '1.0.2a', '<1.0.2b', True, 'openssl: single letter is a release, not alpha'),
   ('openssl', '1.0.2a', '>=1.0.2', True, 'openssl: letter release after base'),
+  ('', '1.2.3-precise', '<1.2.3', False, 'distro tail "precise" is not a pre-release'),
+  ('', '1.2.3-devel', '<1.2.3', False, 'tail "devel" is not a dev pre-release'),
+  ('', '1.2.3-precise', '==1.2.3', True, 'a non-tag tail reads as the release'),
+  ('', '11.0.0-M3', '<11.0.0', True, 'tomcat milestone with a dash'),
 ]
 
 
