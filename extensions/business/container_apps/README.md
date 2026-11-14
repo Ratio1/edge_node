@@ -385,6 +385,10 @@ empty string) disables SYNC on that job with a red log line; there is no fallbac
   it is newer than the last applied one, and a valid record the consumer never applied, an older one included,
   is accepted once. Both values are the publisher's clock, so when a publisher's clock steps back, or differs
   from the previous publisher's, a stale answer can hold a consumer on older data until the next publish.
+  The last applied record is the one this consumer wrote last by its own clock, so the same holds when the
+  consumer's clock steps back between two applies by more than the time between them: an older record applied
+  after the step does not count as the last one, the current record is refused when it returns, and the
+  consumer stays on the older data until the next publish.
 - **After a secret is corrected.** A record refused under the wrong secret stays quarantined with the usual
   back-off: it can stay held for up to 1920 s (32 minutes), or until the next publish.
 

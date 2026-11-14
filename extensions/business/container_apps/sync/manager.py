@@ -1534,6 +1534,13 @@ class SyncManager:
     records (see ``_order_key``) refuses the re-seen record. When a publisher's clock steps back, or differs
     from the previous publisher's, two re-seen records can be misordered until the next publish.
 
+    "Written last" is read from the written-at marker of each history entry, which is this node's own wall
+    clock at the apply. When that clock steps back between two applies by more than the time between them,
+    the entry of the later apply carries the smaller marker and does not count as the last one. An older,
+    never-applied record applied after the step then leaves the earlier record as "last applied": the current
+    record is refused when it returns (its key equals the last one's), the consumer tick then stops on it,
+    and the volume keeps the older data until the next publish.
+
     Examples
     --------
     >>> manager.validate_record_for_apply({"cid": "", "version": "1", "manifest": {}})[:2]
