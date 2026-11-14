@@ -659,7 +659,10 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
 
   def test_dauth_secret_extraction_redacts_only_mandatory_paths(self):
     """Every mandatory secret path, a sync set's secret among them, is redacted; other values stay."""
+    # A Deeploy plugin stub that carries the extraction code under test.
     plugin = make_deeploy_plugin()
+    # One plugin instance with a value at every mandatory secret path, and values outside those paths (a
+    # branch, a registry user, a user's own ENV password, the response key).
     payload = {
       "PLUGINS": [{
         "INSTANCES": [{
@@ -692,10 +695,14 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       }],
     }
 
+    # The pipeline as it is stored, and the tree of the values taken out of it.
     redacted, secrets = plugin._extract_and_redact_deeploy_dauth_secrets(payload)
+    # The stored pipeline as text, to find a value wherever it sits.
     serialized_redacted = str(redacted)
+    # The secret tree as text, for the same reason.
     serialized_secrets = str(secrets)
 
+    # The value at each mandatory path.
     for value in (
       "cf-token",
       "ngrok-token",
@@ -715,7 +722,9 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       "root-crt",
       "root-key",
     ):
+      # Gone from the stored pipeline.
       self.assertNotIn(value, serialized_redacted)
+      # Kept in the secret tree.
       self.assertIn(value, serialized_secrets)
 
     # At its own path: the placeholder in the redacted pipeline, the value in the secret tree.
@@ -725,10 +734,15 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       (DEEPLOY_DAUTH_SECRET_PLACEHOLDER, "sync-set-secret"),
     )
 
+    # The stored pipeline holds the placeholder where values were taken out.
     self.assertIn(DEEPLOY_DAUTH_SECRET_PLACEHOLDER, serialized_redacted)
+    # An ENV value outside the mandatory paths stays in the stored pipeline.
     self.assertIn("user-env-password", serialized_redacted)
+    # So does the response key.
     self.assertIn("response-key", serialized_redacted)
+    # That ENV value is not copied into the secret tree.
     self.assertNotIn("user-env-password", serialized_secrets)
+    # Nor is the response key.
     self.assertNotIn("response-key", serialized_secrets)
 
   def test_cockroachdb_secure_config_generates_node_certs_and_redacts_them(self):
