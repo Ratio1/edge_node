@@ -1,6 +1,7 @@
 """Archive identity precedes serializers, finding-state reads and publication."""
 from copy import deepcopy
 import unittest
+from uuid import uuid4
 
 from extensions.business.cybersec.red_mesh.services import triage
 from extensions.business.cybersec.red_mesh.tenancy.administration import AdministrationDenied
@@ -16,13 +17,16 @@ class TestTenantTriageSnapshots(unittest.TestCase):
     self.job["job_cid"] = "archive"
     self.archive = archive_for(self.job)
     self.owner.artifacts["archive"] = self.archive
-    self.state = {"job_id": "job-1", "finding_id": "finding-1", "status": "open",
-                  "note": "reviewed", "actor": "reviewer", "updated_at": 1}
-    self.owner.points[("jobs:triage", "job-1:finding-1")] = self.state
+    self.tenant = self.job["execution_binding"]["tenant_id"]
+    self.hkey = f"jobs:triage:t:{self.tenant}"
+    self.point = (self.hkey, "192.0.2.10\x1ffinding-1")
+    self.state = {"job_id": "job-0", "finding_id": "finding-1", "status": "open", "note": "reviewed",
+                  "actor": "reviewer", "updated_at": 1, "tenant_id": self.tenant, "host": "192.0.2.10"}
+    self.owner.points[self.point] = self.state
 
   def test_archive_uses_point_state_and_preserves_detached_binding(self):
     result = triage.get_job_archive_with_triage(self.owner, "job-1", checked_job=self.job)
-    self.assertEqual(self.owner.reads, [("artifact", "archive"), ("jobs:triage", "job-1:finding-1")])
+    self.assertEqual(self.owner.reads, [("artifact", "archive"), self.point])
     self.assertEqual(result["archive"]["passes"][0]["findings"][0]["triage"], self.state)
     self.assertEqual(result["execution_binding"], self.job["execution_binding"])
     result["triage"]["finding-1"]["note"] = "changed"
@@ -33,7 +37,7 @@ class TestTenantTriageSnapshots(unittest.TestCase):
     self.assertTrue(result["found"])
     self.assertNotIn("audit", result)
     self.assertEqual(result["triage"], self.state)
-    self.assertEqual(self.owner.reads, [("artifact", "archive"), ("jobs:triage", "job-1:finding-1")])
+    self.assertEqual(self.owner.reads, [("artifact", "archive"), self.point])
 
   def test_unknown_finding_denies_before_state_read(self):
     with self.assertRaises(AdministrationDenied) as caught:
@@ -64,10 +68,11 @@ class TestTenantTriageSnapshots(unittest.TestCase):
     self.assertEqual(self.owner.reads, [])
 
   def test_state_identity_or_storage_failure_is_not_empty_success(self):
-    for value in ({**self.state, "job_id": "foreign"}, {**self.state, "finding_id": "foreign"},
-                  [], {}, RuntimeError("private payload")):
+    # `job_id` is the writer and may differ; the tenant, host and finding must be this job's.
+    for value in ({**self.state, "tenant_id": "tn_foreign"}, {**self.state, "host": "192.0.2.99"},
+                  {**self.state, "finding_id": "foreign"}, [], {}, RuntimeError("private payload")):
       with self.subTest(value=value):
-        self.owner.points[("jobs:triage", "job-1:finding-1")] = value
+        self.owner.points[self.point] = value
         with self.assertRaises(TenantStoreError) as caught:
           triage.get_job_triage(self.owner, "job-1", checked_job=self.job)
         self.assertNotIn("private", str(caught.exception))
@@ -75,6 +80,21 @@ class TestTenantTriageSnapshots(unittest.TestCase):
     result = triage.get_job_triage(self.owner, "job-1", "finding-1", checked_job=self.job)
     self.assertFalse(result["found"])
     self.assertIsNone(result["triage"])
+
+  def test_another_tenants_or_hosts_record_is_never_read(self):
+    other = "tn_" + str(uuid4())
+    self.owner.points.clear()
+    self.owner.points[(f"jobs:triage:t:{other}", "192.0.2.10\x1ffinding-1")] = {**self.state, "tenant_id": other}
+    self.owner.points[(self.hkey, "192.0.2.99\x1ffinding-1")] = {**self.state, "host": "192.0.2.99"}
+    result = triage.get_job_triage(self.owner, "job-1", checked_job=self.job)
+    self.assertEqual(result["triage"], {})
+    self.assertEqual([read for read in self.owner.reads if read[0] != "artifact"], [self.point])
+
+  def test_a_record_written_under_another_job_of_the_host_is_read(self):
+    # A rerun is a new job on the same tenant and host: the record outlives the job that wrote it.
+    result = triage.get_job_triage(self.owner, "job-1", "finding-1", checked_job=self.job)
+    self.assertEqual(result["triage"]["job_id"], "job-0")
+    self.assertEqual(result["triage"]["status"], "open")
 
   def test_finding_budget_rejects_before_point_reads(self):
     self.archive["passes"][0]["findings"] = [{"finding_id": str(n)} for n in range(10001)]
@@ -86,7 +106,7 @@ class TestTenantTriageSnapshots(unittest.TestCase):
     self.archive["passes"][0]["findings"] = [{"finding_id": "finding-1"} for _ in range(10000)]
     result = triage.get_job_triage(self.owner, "job-1", checked_job=self.job)
     self.assertEqual(result["triage"], {"finding-1": self.state})
-    self.assertEqual(self.owner.reads, [("artifact", "archive"), ("jobs:triage", "job-1:finding-1")])
+    self.assertEqual(self.owner.reads, [("artifact", "archive"), self.point])
 
   def test_missing_archive_and_broken_reference_are_distinct(self):
     self.job.pop("job_cid")

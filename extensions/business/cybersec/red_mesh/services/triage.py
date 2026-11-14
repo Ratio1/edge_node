@@ -9,6 +9,7 @@ from ..tenancy.administration import AdministrationDenied
 from ..tenancy.job_artifacts import (
   MAX_ARTIFACT_REFERENCES, TenantJobArtifacts, checked_job_snapshot, validate_snapshot_mode,
 )
+from ..tenancy.execution import triage_scope
 from ..tenancy.ports import TenantStoreError
 from .event_hooks import emit_finding_event
 
@@ -71,8 +72,12 @@ def _merge_triage_into_archive_dict(archive: dict, triage_map: dict) -> dict:
   return merged
 
 
-def _checked_triage_map(owner, job_id, archive, finding_id=""):
-  """Read state only for archive-owned findings; reports:view does not grant audit:view."""
+def _checked_triage_map(owner, job, archive, finding_id=""):
+  """Read state only for archive-owned findings; reports:view does not grant audit:view.
+
+  The map is the job's tenant and host, both from the job's own execution binding. A record that does
+  not name that tenant and host, or this finding, is a broken store, never a foreign row to skip.
+  """
   try:
     passes = archive.get("passes", [])
     if not isinstance(passes, list) or len(passes) > MAX_ARTIFACT_REFERENCES:
@@ -93,12 +98,19 @@ def _checked_triage_map(owner, job_id, archive, finding_id=""):
         finding_ids.add(identifier)
     if finding_id and finding_id not in finding_ids:
       raise AdministrationDenied(404, "not_found")
+    scope = triage_scope(job["execution_binding"])
+    if scope is None:
+      return {}
+    tenant_id, host = scope
+    repo = _job_repo(owner)
     result = {}
+    # Point reads of the archive's own findings, not an enumeration of the tenant's hkey.
     for identifier in ([finding_id] if finding_id else sorted(finding_ids)):
-      state = deepcopy(_job_repo(owner).get_finding_triage(job_id, identifier))
+      state = deepcopy(repo.get_host_triage(tenant_id, host, identifier))
       if state is None:
         continue
-      if not isinstance(state, dict) or state.get("job_id") != job_id or state.get("finding_id") != identifier:
+      if (not isinstance(state, dict) or state.get("finding_id") != identifier
+          or state.get("tenant_id") != tenant_id or state.get("host") != host):
         raise ValueError("Invalid finding state identity")
       result[identifier] = FindingTriageState.from_dict(state).to_dict()
     return result
@@ -120,7 +132,7 @@ def get_job_triage(owner, job_id: str, finding_id: str = "", *, checked_job=_UNS
         raise AdministrationDenied(404, "not_found")
       triage_map = {}
     else:
-      triage_map = _checked_triage_map(owner, job_id, archive, finding_id)
+      triage_map = _checked_triage_map(owner, job, archive, finding_id)
     result = {"job_id": job_id}
     if snapshot_mode == "tenant_bound":
       result["execution_binding"] = job["execution_binding"]
@@ -130,10 +142,12 @@ def get_job_triage(owner, job_id: str, finding_id: str = "", *, checked_job=_UNS
     else:
       result["triage"] = triage_map
     return result
-  triage_map = _job_repo(owner).list_job_triage(job_id)
+  record = owner._get_job_from_cstore(job_id)
+  triage_map = _job_repo(owner).list_triage_for_record(record)
   if finding_id:
     state = triage_map.get(finding_id)
-    audit = _job_repo(owner).get_finding_triage_audit(job_id, finding_id)
+    scope = triage_scope(record.get("execution_binding")) if isinstance(record, dict) and record.get("execution_binding") else None
+    audit = _job_repo(owner).get_host_triage_audit(*scope, finding_id) if scope else []
     if state is None:
       return {"job_id": job_id, "finding_id": finding_id, "found": False, "triage": None, "audit": audit}
     return {"job_id": job_id, "finding_id": finding_id, "found": True, "triage": state, "audit": audit}
@@ -245,7 +259,7 @@ def get_job_archive_with_triage(owner, job_id: str, *, checked_job=_UNSET, snaps
     try:
       model = ModelTestArchive if is_model_test_job(job) else JobArchive
       archive = model.from_dict(payload).to_dict()
-      triage_map = {} if is_model_test_job(job) else _checked_triage_map(owner, job_id, payload)
+      triage_map = {} if is_model_test_job(job) else _checked_triage_map(owner, job, payload)
       return {**result, "archive": _merge_triage_into_archive_dict(archive, triage_map), "triage": triage_map}
     except Exception:
       raise TenantStoreError("Tenant archive is unavailable") from None
@@ -300,6 +314,9 @@ def get_job_archive_with_triage(owner, job_id: str, *, checked_job=_UNSET, snaps
     )
     return {"error": "integrity_mismatch", "message": "Archive job_id does not match requested job_id."}
 
-  triage_map = _job_repo(owner).list_job_triage(job_id)
+  archived_ids = {finding.get("finding_id") for pass_report in archive.get("passes", []) or []
+                  for finding in pass_report.get("findings", []) or [] if isinstance(finding, dict)}
+  triage_map = {key: value for key, value in _job_repo(owner).list_triage_for_record(job_specs).items()
+                if key in archived_ids}
   merged_archive = _merge_triage_into_archive_dict(archive, triage_map)
   return {"job_id": job_id, "archive": merged_archive, "triage": triage_map}
