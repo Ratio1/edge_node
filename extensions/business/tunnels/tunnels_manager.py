@@ -470,8 +470,12 @@ class TunnelsManagerPlugin(BasePlugin):
         that failed, a missing Cloudflare field, a field that is not a string
         or is longer than ``SECRET_FIELD_MAX_LEN``, an update older than the
         credentials this oracle stores for the wallet ("the stored credentials
-        are newer than this update", no stored value named), or a write that
-        other oracles did not confirm.
+        are newer than this update", no stored value named), a write that
+        other oracles did not confirm or that found no oracle among its
+        targets (the only answers that ask for a retry), or a write the chain
+        store ended another way, answered with its word for that way out
+        (for example ``overwritten`` or ``refused_by_peers``), which names no
+        stored value.
 
     Notes
     -----
@@ -482,7 +486,10 @@ class TunnelsManagerPlugin(BasePlugin):
     without ``cs_rev`` does not either. An update older than the record this
     oracle stores is refused here at once, with the chain store's word
     ``refused_cs_rev`` in ``result_info``; an oracle that refuses it does not
-    confirm it. Oracles of the previous release do not order by ``cs_rev``.
+    confirm it. While the chain store's order switch is not 'on', such an
+    oracle sends no refusal answer, so an update older than what only other
+    oracles hold ends unconfirmed after the full wait and gets the retry
+    answer. Oracles of the previous release do not order by ``cs_rev``.
     The escrow lookup is a chain read on every request that passes the
     signature check; its result is not cached. The same signed request sent
     again is written again (an equal ``cs_rev`` is not older), so the client
@@ -502,6 +509,8 @@ class TunnelsManagerPlugin(BasePlugin):
     {'success': False, 'error': 'Secrets were not saved: Wallet has no active escrow.'}
     >>> plugin.add_secrets(payload=update_signed_before_the_stored_one)
     {'success': False, 'error': 'Secrets were not saved: the stored credentials are newer than this update.'}
+    >>> plugin.add_secrets(payload=update_replaced_by_another_write_during_its_wait)
+    {'success': False, 'error': "Secrets were not saved: the chain store ended the write with 'overwritten'."}
     """
     try:
       # Reject a future nonce or one older than 12 hours, so a captured signed update cannot be replayed
@@ -545,8 +554,8 @@ class TunnelsManagerPlugin(BasePlugin):
       # Return every check failure instead of raising: the web-app base logs the arguments of an endpoint
       # that raises, and here the argument holds the Cloudflare token.
       return {"success": False, "error": "Secrets were not saved: {}".format(exc)}
-    # Filled by the chain store with the word of how the write ended, which tells an update older than the stored
-    # record ("refused_cs_rev") from one other oracles did not confirm.
+    # Filled by the chain store with the word of how the write ended, which picks one of the three failure answers
+    # below.
     write_info = {}
     # Keep the write's result: it is True only when other oracles confirmed the update. Ignoring it
     # answered success for a save that never replicated, so the other oracles could keep an older token.
@@ -559,8 +568,17 @@ class TunnelsManagerPlugin(BasePlugin):
         # This oracle holds credentials of a newer update (a higher cs_rev), so sending this one again cannot
         # succeed: say so instead of asking for a retry, without naming any stored value.
         return {"success": False, "error": "Secrets were not saved: the stored credentials are newer than this update."}
-      # Report an unconfirmed write as a failure the client can retry. It is returned, not raised, so the
-      # request that holds the token is not written to the log.
+      if write_info["outcome"] not in ("unconfirmed", "refused_oracle_only"):
+        # Any other way out (another write replaced it, other oracles refused it, the store refused it or raised) is
+        # not one that sending the same update again is known to change: answer with the chain store's word, which
+        # names no value, instead of asking for a retry.
+        return {
+          "success": False,
+          "error": f"Secrets were not saved: the chain store ended the write with '{write_info['outcome']}'.",
+        }
+      # Report a write other oracles did not confirm, or one that found no oracle among its targets (none among the
+      # peers, or the registry could not be read), as a failure the client can retry. It is returned, not raised, so
+      # the request that holds the token is not written to the log.
       return {"success": False, "error": "Secrets were not saved: other oracles did not confirm the update. Please try again."}
     return {
       "success": True

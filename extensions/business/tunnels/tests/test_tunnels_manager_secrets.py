@@ -270,6 +270,33 @@ class TunnelSecretsTests(unittest.TestCase):
       [False, False],
     )
 
+  def test_only_a_write_a_retry_can_change_is_answered_with_the_retry_text(self):
+    """A write other oracles did not confirm, or one that found no oracle among its targets, gets the retry
+    answer; every other word the chain store ends a failed write with gets an answer that names that word, asks
+    for no retry and names no value."""
+    # The answer that asks for a retry.
+    retry = "Secrets were not saved: other oracles did not confirm the update. Please try again."
+    # Each failure word the chain store can end this write with, and the answer it must get.
+    cases = [("unconfirmed", retry), ("refused_oracle_only", retry)] + [
+      (word, f"Secrets were not saved: the chain store ended the write with '{word}'.")
+      for word in ("overwritten", "refused_by_peers", "refused_token", "refused_readonly", "error")
+    ]
+    # Each word in turn.
+    for word, error in cases:
+      # Name the case in a failure report.
+      with self.subTest(word=word):
+        # A fresh manager over an empty store.
+        manager = _Manager()
+        # A store that ends the write with this word and False, as the chain store does for a failed write.
+        manager.chainstore_hset = lambda hkey, key, value, result_info, word=word: (
+          result_info.update(outcome=word) or False)
+        # The signed request.
+        result = manager.add_secrets(_payload())
+        # The exact answer for this word.
+        self.assertEqual(result, {"success": False, "error": error})
+        # The token appears in neither the answer nor the log.
+        self.assertNotIn(TOKEN, result["error"] + " ".join(manager.logged))
+
   def test_a_wallet_with_an_active_escrow_is_stored_as_before(self):
     """A wallet with an active escrow is stored as before, and the escrow lookup is asked for the address the
     signature check returned."""
