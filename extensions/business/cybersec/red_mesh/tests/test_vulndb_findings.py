@@ -9,7 +9,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from extensions.business.cybersec.red_mesh import cve_db
+from extensions.business.cybersec.red_mesh.cve_view import build_cve_view
 from extensions.business.cybersec.red_mesh.findings import _finding_to_jsonable
+from extensions.business.cybersec.red_mesh.mixins.redmesh_llm_agent import _RedMeshLlmAgentMixin
 from extensions.business.cybersec.red_mesh.mixins.report import _dedup_finding_list
 from extensions.business.cybersec.red_mesh.vulndb.reader import load_vulndb
 
@@ -28,6 +30,11 @@ ROWS = [
   ("CVE-2030-0005", "redis", "<9", "nvd", "firm", "nvd_range", 0, 1),
   ("CVE-2030-0006", "redis", "<9", "nvd", "firm", "nvd_range", 0, 0),
   ("CVE-2030-0007", "redis", "<9", "cna", "tentative", "cna_range", 0, 0),
+  ("CVE-2030-0010", "oldprod", ">=2.1,<3", "nvd", "firm", "nvd_range", 0, 0),  # starts inside the supported line
+  ("CVE-2030-0011", "oldprod", "<1.9", "nvd", "firm", "nvd_range", 0, 0),
+  ("CVE-2030-0012", "oldprod", ">=1.0,<1.8", "nvd", "firm", "nvd_range", 0, 0),
+  ("CVE-2030-0013", "oldprod", ">=2.2,<2.5", "nvd", "firm", "nvd_range", 0, 0),
+  ("CVE-2030-0013", "oldprod", "<1.2", "cna", "tentative", "cna_range", 0, 0),  # a row with no supported-line start
 ]
 
 
@@ -38,7 +45,7 @@ def build(dirpath, build_id="vulndb-aaaaaaaaaaaa", origin=None):
   conn.executescript(
     "CREATE TABLE cvss(cve_id TEXT, version TEXT, vector TEXT, score REAL, source TEXT);"
     "CREATE TABLE eol(product TEXT PRIMARY KEY, oldest_supported TEXT);"
-    "INSERT INTO eol VALUES ('redis', '6.0');")
+    "INSERT INTO eol VALUES ('redis', '6.0'); INSERT INTO eol VALUES ('oldprod', '2.0');")
   conn.executemany("INSERT INTO cvss VALUES (?,?,?,?,?)", [
     (CVE, "4.0", V40, 9.3, "cna"), (CVE, "3.1", V31, 8.1, "nvd"), (CVE, "3.1", V31, 8.1, "cna")])
   conn.execute("UPDATE vuln SET kev = 0, display_cvss_version = '3.1', display_cvss_score = 8.1,"
@@ -70,7 +77,7 @@ class FindingFieldTests(unittest.TestCase):
     return reader
 
   def by_id(self, product, version, **kw):
-    return {f.cve[0]: f for f in cve_db.check_cves(product, version, **kw)}
+    return {f.cve[0]: f for f in cve_db.check_cves(product, version, **kw) if f.cve}
 
   def test_static_changes_only_kev_and_reason(self):
     finding = self.by_id("openssh", "4.0")[CVE]
@@ -133,6 +140,47 @@ class FindingFieldTests(unittest.TestCase):
     finding = self.by_id("openssh", "4.0")[CVE]
     finding.cvss[0]["score"] = 0.0
     self.assertEqual(reader.query("openssh", "4.0")[0].cvss[0]["score"], 8.1)
+
+  def test_eol_unassessed_and_the_unsupported_finding(self):
+    self.use()
+    found = cve_db.check_cves("oldprod", "1.5")
+    cves = {f.cve[0]: f for f in found if f.cve}
+    self.assertEqual(sorted(cves), ["CVE-2030-0010", "CVE-2030-0011", "CVE-2030-0012"])  # 0013 has a row with no supported-line start
+    self.assertEqual((cves["CVE-2030-0010"].confidence, cves["CVE-2030-0010"].confidence_reason), ("tentative", "eol_unassessed"))
+    self.assertEqual(cves["CVE-2030-0011"].confidence_reason, "nvd_range")  # matched by range, no lower bound
+    self.assertEqual(cves["CVE-2030-0012"].confidence, "firm")
+    unsupported = [f for f in found if not f.cve]
+    self.assertEqual([(f.severity.value, f.confidence, f.finding_id == unsupported[0].finding_id) for f in unsupported],
+                     [("HIGH", "firm", True)])
+    self.assertEqual(unsupported[0].tags, ("vulndb_eol", "oldprod"))
+    again = cve_db.check_cves("oldprod", "1.5")
+    self.assertEqual([f.finding_id for f in again if not f.cve], [unsupported[0].finding_id])
+
+  def test_the_view_names_the_unsupported_finding_outside_raw(self):
+    eol = {"finding_id": "eol1", "port": 80, "vulndb_build_id": "b", "tags": ["vulndb_eol", "apache"]}
+    cve = {"finding_id": "c1", "cve": ["CVE-2030-1"], "vulndb_build_id": "b", "port": 80, "confidence": "firm", "kev": True,
+           "description": "apache 1.5 is vulnerable to CVE-2030-1. x", "evidence": "Detected version: 1.5, affected: <2"}
+    view = build_cve_view([cve, eol])
+    self.assertEqual((view["services"][0]["unsupported"], view["counts"]["raw"]), ("eol1", 1))
+    self.assertIsNone(build_cve_view([eol]))
+
+  def test_llm_top_findings_send_listed_cves_only(self):
+    class Host(_RedMeshLlmAgentMixin):
+      def _extract_report_findings(self, report):
+        return report["findings"]
+    base = {"severity": "HIGH", "port": 80, "vulndb_build_id": "b", "confidence": "firm", "title": "t",
+            "description": "apache 1.5 is vulnerable to CVE-2030-1. x", "evidence": "e"}
+    findings = [dict(base, finding_id="a", cve=["CVE-2030-1"], kev=True, cvss=[], finding_signature="s1"),
+                dict(base, finding_id="b", cve=["CVE-2030-2"], kev=False, cvss=[], finding_signature="s2")]
+    compact, meta = Host()._build_llm_top_findings({"findings": findings}, "security_assessment")
+    self.assertEqual([c["cve"] for c in compact], [["CVE-2030-1"]])
+    self.assertEqual(meta["total_findings"], 2)
+
+  def test_supported_version_and_product_without_eol_row_have_no_eol_findings(self):
+    self.use()
+    self.assertEqual([f.cve[0] for f in cve_db.check_cves("oldprod", "2.2") if not f.cve], [])
+    self.assertEqual([f for f in cve_db.check_cves("oldprod", "2.2") if f.confidence_reason == "eol_unassessed"], [])
+    self.assertTrue(all(f.cve for f in cve_db.check_cves("openssh", "4.0")))
 
   def test_package_not_fixed_is_firm_distro_package(self):
     self.use()

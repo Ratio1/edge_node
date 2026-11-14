@@ -584,6 +584,9 @@ def check_cves(
         _record_not_applicable(match, product, version, package, NOT_APPLICABLE_BACKPORT_FIXED)
         continue
       findings.append(_build_finding(match, product, version, dynamic_cache, backport_status=status, reader=reader))
+    oldest = reader.unsupported(product, version) if applicability in ("", SERVER_APPLICABILITY) else None
+    if oldest:
+      findings.append(_unsupported_finding(product, version, oldest, reader))
     return findings
   for entry in CVE_DATABASE:
     if entry.product != product:
@@ -649,7 +652,7 @@ _BACKPORTED_PRODUCTS = frozenset({
   "proftpd", "redis", "memcached", "mongodb", "couchdb", "tomcat", "vsftpd", "dovecot", "postfix",
 })
 # Order in which one reason wins when several apply (report-findings.md, Per-finding fields).
-_TENTATIVE_REASON_ORDER = ("platform_dependent", "backport_unknown", "banner_only", "nvd_exact", "cna_range")
+_TENTATIVE_REASON_ORDER = ("eol_unassessed", "inferred_version", "platform_dependent", "backport_unknown", "banner_only", "nvd_exact", "cna_range")
 
 
 def _static_cwe_id(cve_id: str) -> str:
@@ -834,6 +837,30 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
     "probe_id": f"cve:{product}",
     "asset_canonical": f"{product}:{version}:{entry.cve_id}",
   }
+  return finding.with_identity(
+    finding_signature=finding.compute_signature(**identity),
+    finding_id=finding.compute_dedup_key(**identity),
+  )
+
+
+def _unsupported_finding(product: str, version: str, oldest: str, reader):
+  """HIGH finding: `version` is older than the oldest branch the vendor supports (`eol` table).
+
+  Not a CVE finding: no `cve`, so it is outside the CVE view's `raw`; the `vulndb_eol` tag lets the view name it.
+  """
+  finding = Finding(
+    severity=Severity.HIGH,
+    title=f"Unsupported version: {product} {version} (oldest supported {oldest})",
+    description=f"{product} {version} is older than the oldest supported branch ({oldest}); it no longer receives security fixes.",
+    evidence=f"Detected version: {version}, oldest supported: {oldest}",
+    remediation=f"Upgrade {product} to a supported release (>= {oldest}).",
+    confidence="firm",
+    confidence_reason="eol",
+    vulndb_build_id=reader.build_id,
+    tags=("vulndb_eol", product),
+    kev=False,
+  )
+  identity = {"probe_id": f"cve:{product}", "asset_canonical": f"{product}:{version}:eol"}
   return finding.with_identity(
     finding_signature=finding.compute_signature(**identity),
     finding_id=finding.compute_dedup_key(**identity),
