@@ -608,11 +608,12 @@ class SyncManager:
   def _record_digest(record: dict) -> str:
     """Digest that names a record's quarantine file.
 
-    SHA-256 over the canonical JSON of the record's ``cid`` and ``manifest``, and of its ``mac`` when the record
-    has one. A record without ``mac`` (a set that uses the shared key) keeps the digest it had before records
-    carried a MAC, so quarantine files written by older code still match. With ``mac`` in the digest, a forged
-    copy of a set's record (same ``cid`` and ``manifest``, another ``mac``) gets its own quarantine file and
-    does not hold back the genuine record.
+    A record without ``mac`` (a set that uses the shared key): SHA-256 over the canonical JSON of its ``cid``
+    and ``manifest``, the digest it had before records carried a MAC, so quarantine files written by older
+    code still match. A record with ``mac`` (a set with a secret): SHA-256 over the canonical JSON of the whole
+    record. A copy of a set's record with any field changed, whether it carries another ``mac`` or keeps the
+    genuine one beside another ``node_id``, ``metadata``, ``version`` or ``timestamp``, therefore gets its own
+    quarantine file and does not hold back the genuine record.
 
     Parameters
     ----------
@@ -624,21 +625,30 @@ class SyncManager:
     str
       64 lowercase hex characters; the quarantine file name uses the first 16.
 
+    Notes
+    -----
+    Two records with ``mac`` share a digest only when their canonical JSON is the same, and then the MAC check
+    reads the same bytes for both: a refused copy never shares a quarantine file with a record whose MAC matches.
+
     Examples
     --------
     >>> plain = {"cid": "QmA", "manifest": {"schema_version": 1}}
-    >>> SyncManager._record_digest(plain) == SyncManager._record_digest({**plain, "mac": "00" * 32})
-    False
     >>> SyncManager._record_digest(plain) == SyncManager._record_digest({**plain, "version": 7})
     True
+    >>> signed = {**plain, "version": 7, "mac": "00" * 32}
+    >>> SyncManager._record_digest(signed) == SyncManager._record_digest(plain)
+    False
+    >>> SyncManager._record_digest(signed) == SyncManager._record_digest({**signed, "version": 8})
+    False
     """
     payload = {
       "cid": record.get("cid"),
       "manifest": record.get("manifest") if isinstance(record, dict) else None,
     }
     if "mac" in record:
-      # Only when present: a record without a MAC keeps its earlier digest; a forged twin gets its own.
-      payload["mac"] = record["mac"]
+      # A set's record is named by all of its fields, so a copy that keeps the genuine MAC and changes any
+      # other field gets its own file; a record without a MAC keeps the cid-and-manifest digest it had.
+      payload = record
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 

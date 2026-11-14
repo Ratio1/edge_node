@@ -2571,6 +2571,30 @@ class TestSetSecret(unittest.TestCase):
     self.assertNotEqual(SyncManager._record_digest(twin), SyncManager._record_digest(genuine))
     # The genuine record is not held.
     self.assertIsNone(self.sm_c.quarantined_record(genuine))
+    # Twins that keep the genuine MAC, cid and manifest and change one other field, as any party that can
+    # read the public record can write them.
+    same_mac_twins = [
+      ("node_id", "ee_other"),
+      ("metadata", {"epoch": 2}),
+      ("version", genuine["version"] + 1),
+      ("timestamp", genuine["timestamp"] + 0.5),
+    ]
+    # Each of them, one at a time.
+    for field, value in same_mac_twins:
+      # A failure names the changed field.
+      with self.subTest(same_mac_twin=field):
+        # The copy with that one change.
+        twin = self._changed(genuine, field, value)
+        # It still carries the genuine MAC.
+        self.assertEqual(twin["mac"], genuine["mac"])
+        # Refused by the MAC, which covers the changed field, and quarantined.
+        self._assert_refused(twin, _REASON_MAC)
+        # Under a digest of its own.
+        self.assertNotEqual(SyncManager._record_digest(twin), SyncManager._record_digest(genuine))
+        # So the genuine record is still not held.
+        self.assertIsNone(self.sm_c.quarantined_record(genuine))
+    # One quarantine file per refused copy, none for the genuine record.
+    self.assertEqual(len(list(quarantine_dir(self.consumer).glob("*.json"))), 1 + len(same_mac_twins))
     # It applies next.
     self.assertTrue(self.sm_c.apply_snapshot(genuine))
     # The consumer holds its data.
