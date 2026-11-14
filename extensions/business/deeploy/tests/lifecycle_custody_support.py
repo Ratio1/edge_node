@@ -173,6 +173,8 @@ class Node:
     self._deployment_plan_cache_lock = threading.Lock()
     self._deployment_preparations = {}
     self._operations_confirmed = {}
+    # The served ages of each completed operation's repair schedule, as _init_deployment_operations creates them.
+    self._operations_repaired = {}
     self._operations_sent_at = {}
     self._verified_operation_records = OrderedDict()  # as _init_deployment_operations creates it
     self._verified_operation_records_lock = threading.Lock()
