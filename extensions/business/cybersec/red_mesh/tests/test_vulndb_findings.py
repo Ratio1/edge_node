@@ -115,6 +115,25 @@ class FindingFieldTests(unittest.TestCase):
     self.assertEqual(found["CVE-2030-0006"].severity, cve_db.Severity.MEDIUM)  # UNKNOWN is not hidden
     self.assertTrue(found["CVE-2030-0002"].kev is False and found["CVE-2030-0002"].epss_score == 0.5)
 
+  def test_unknown_tentative_reason_passes_through(self):
+    reader = self.use()
+    match = next(m for m in reader.query("redis", "5.0") if m.cve_id == "CVE-2030-0007")
+    self.assertEqual(cve_db._confidence_reason("", match._replace(reason="future_reason"), "nonbackported"),
+                     ("tentative", "future_reason"))
+
+  def test_non_backported_product_keeps_the_row_reason(self):
+    reader = self.use()
+    rows = {m.cve_id: m for m in reader.query("redis", "5.0")}
+    self.assertNotIn("nonbackported", cve_db._BACKPORTED_PRODUCTS)
+    self.assertEqual(cve_db._confidence_reason("", rows["CVE-2030-0002"], "nonbackported"), ("firm", "nvd_range"))
+    self.assertEqual(cve_db._confidence_reason("", rows["CVE-2030-0003"], "nonbackported"), ("tentative", "nvd_exact"))
+
+  def test_findings_own_their_cvss_dicts(self):
+    reader = self.use()
+    finding = self.by_id("openssh", "4.0")[CVE]
+    finding.cvss[0]["score"] = 0.0
+    self.assertEqual(reader.query("openssh", "4.0")[0].cvss[0]["score"], 8.1)
+
   def test_package_not_fixed_is_firm_distro_package(self):
     self.use()
     package = cve_db.parse_distro_package("OpenSSH_8.9p1 Ubuntu-3ubuntu0.1")
@@ -188,6 +207,7 @@ class PluginWiringTests(unittest.TestCase):
                      (1, "generated", "vulndb-aaaaaaaaaaaa", None))
 
   def test_load_failure_falls_back_to_static(self):
+    cve_db.set_vulndb_reader(object())  # a stale reader must be reset by init
     with tempfile.TemporaryDirectory() as tmp:
       Plugin, plugin = self.run_init("generated", Path(tmp) / "none.sqlite", Path(tmp) / "none.json")
       self.assertIsNone(cve_db._VULNDB_READER)
