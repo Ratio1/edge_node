@@ -398,9 +398,20 @@ because the disk API of plugin code refuses that folder (the core's `RESTRICTED_
 - **Rollback:** an image without `docker/daemon.json` does not see this store. It pulls every app image
   into the node container's own layer, as before, while the store stays on the host: for that time the host
   needs free space for the app images a second time.
-- **A store Docker refuses:** when dockerd cannot open the store at start, the base image entrypoint stops
-  the node container before the node starts, at every start, until `_bin/docker` is removed on the host.
-  Seen only with a store file damaged by hand; nothing in the image recovers from it yet.
+- **A daemon that does not start:** the node images start through `cmds/node_entrypoint`. It runs the base
+  image entrypoint and, when that fails, logs "The inner Docker daemon did not start: removing its kept
+  store.", removes the store directory and stops the container with exit code 1. The next start begins on an
+  empty store, as every start did before the store was kept: nothing has to be removed on the host, and
+  every app image is pulled again once (stopped containers and anonymous volumes in the store go with it).
+  The script cannot tell why the daemon did not start, so any failed start empties the store: a store file
+  dockerd refuses (seen only with a file damaged by hand), but also a node container started without
+  privileges, an iptables fault, a wrong `DOCKERD_READY_TIMEOUT` or a daemon that takes longer than that
+  time (120 s) to answer. A start with `EE_DD=0` starts no daemon and removes nothing. A container started
+  with another entrypoint (`--entrypoint`, `entrypoint:` in a compose file) does not get this recovery.
+- **One node per cache folder:** never start a second container of a node image on the `_local_cache` of a
+  running node (use `docker exec`, or start it with `EE_DD=0`). The second daemon cannot open a store that is
+  in use, its start fails, and the script then removes the store the running node's daemon is using; that
+  node needs a restart afterwards.
 - **Copying a node's `_local_cache`** to another host: leave `_bin/docker` out; it holds only what can be
   pulled again.
 
