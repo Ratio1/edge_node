@@ -1321,10 +1321,10 @@ class _DauthMixin(object):
     -----
     A refusal writes one line with the nonce, the shortened sender address, the alias, the
     shortened ETH address, the source address and the reason. The line is yellow when the
-    reason is the server's verdict on the node (no license, revoked key) and red otherwise: a
-    request that could not be judged (wrong ETH address, bad signature, a check that failed
-    on this server) and a version refusal, which depends on this server's own minimum
-    release. Red lines are also copied to the error log.
+    reason is the server's verdict on the requester (declared versions the gate refuses, no
+    license, revoked key) and red when the request could not be judged (wrong ETH address,
+    bad signature, a check that failed on this server). Red lines are also copied to the
+    error log.
 
     Examples
     --------
@@ -1389,6 +1389,9 @@ class _DauthMixin(object):
       if not version_check_data.result:
         # not None means we have a error message
         error = 'Version check failed: {}'.format(version_check_data.message)
+        # Yellow: a verdict on the versions a correctly signed request declares. The gate refuses below
+        # a named minimum (or version data it cannot type), not at a distance from this server's release.
+        refusal_color = 'y'
       elif version_check_data.message not in [None, '']:
         _non_critical_error = version_check_data.message
 
@@ -1404,7 +1407,7 @@ class _DauthMixin(object):
         error = 'Node not allowed to request auth data. ' + message
         # No license or a revoked key is a correct verdict, logged in yellow so that the red
         # lines, which are copied to the error log, are left to faults. A check that failed
-        # (None) stays red, and so does the version-gate refusal above.
+        # (None) stays red.
         refusal_color = 'r' if allowed_to_dauth is None else 'y'
     
     if False and hasattr(self, "DEBUG_BYPASS") and self.DEBUG_BYPASS:

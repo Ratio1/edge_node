@@ -163,18 +163,35 @@ class AuthDataRefusalColorTests(unittest.TestCase):
     # The second is the refusal line of the request.
     self.assertTrue(self.lines[1][0].startswith("dAuth request 'a1b2' failed for <"))
 
-  def test_version_gate_refusal_stays_red(self):
-    """A sender below the minimum release is still refused in red: that refusal can be this server's own doing."""
-    # The harness sender is on 2.10.621; a much newer server refuses it as too old.
-    self.plugin.ee_ver = "99.0.0"
-    # The request of a licensed node that is not revoked.
-    self.plugin.process_dauth_request(_auth_body(ALLOWED))
-    # One line for the refusal.
-    self.assertEqual(len(self.lines), 1)
-    # The reason is the version check.
-    self.assertIn("Version check failed", self.lines[0][0])
-    # The line is red.
-    self.assertEqual(self.lines[0][1], "r")
+  def test_version_gate_refusal_is_yellow(self):
+    """A correctly signed request whose declared versions the gate refuses is one yellow line, whatever the reason."""
+    # Per expected reason: the version fields that replace those of the harness sender, which is on 2.10.621.
+    cases = {
+      # Below the named minimum: the same request is refused by every server, whatever its own release.
+      "is too old (minimum: ": {},
+      # A core and an SDK version with no app version.
+      "core and sdk only not allowed": {"sender_app_ver": None},
+      # No version at all.
+      "Invalid sender version data: None None None": {"sender_app_ver": None, "sender_core_ver": None, "sender_sdk_ver": None},
+    }
+    # Every case in turn.
+    for text, versions in cases.items():
+      # Each case reports on its own.
+      with self.subTest(text):
+        # A fresh server and an empty line list for the case.
+        self.setUp()
+        # A server far ahead of the sender: the minimum is tested only for a sender behind the server.
+        self.plugin.ee_ver = "99.0.0"
+        # The request of a licensed node that is not revoked, with the versions of the case.
+        self.plugin.process_dauth_request(_auth_body(ALLOWED, **versions))
+        # One line for the refusal.
+        self.assertEqual(len(self.lines), 1)
+        # The reason is the version check.
+        self.assertIn("Version check failed", self.lines[0][0])
+        # The line carries the text of the case.
+        self.assertIn(text, self.lines[0][0])
+        # Yellow: a verdict on what the sender declares, kept out of the error log.
+        self.assertEqual(self.lines[0][1], "y")
 
   def test_request_that_could_not_be_judged_stays_red(self):
     """A bad signature, a wrong ETH address and a check that fails on this server are red, in one line each."""
