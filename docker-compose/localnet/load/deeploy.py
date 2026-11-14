@@ -328,6 +328,8 @@ def main():
   one.add_argument('--period', type=int, default=30, help='provider: seconds before each publish')
   # Provider: how many archives in all.
   one.add_argument('--publishes', type=int, default=1, help='provider: archives to publish in all')
+  # How long a "node is not online" refusal is retried (a worker that has just started).
+  one.add_argument('--online-wait', type=float, default=180, help='seconds to retry while the worker is not online yet')
   for name in ('create', 'delete', 'update', 'watch'):
     one = sub.add_parser(name)
     one.add_argument('--job', type=int, required=True)
@@ -360,13 +362,24 @@ def main():
     return 0
 
   if args.cmd == 'sync-app':
-    # The worker's node address from the manifest.
-    payload = sync_app_payload(args.job, worker_addresses(manifest, [args.node])[0], args.role, args.key, args.image,
-                               period=args.period, publishes=args.publishes)
-    # Signed by the job owner's wallet, sent through the public Deeploy name.
-    accepted = client.submit('create_pipeline', payload)
-    # The admission answer (an error body on a refusal).
-    body = accepted['body'] if isinstance(accepted['body'], dict) else {}
+    # A worker that started moments ago is not yet online for the oracles: retry that refusal, as a user would.
+    deadline = time.time() + args.online_wait
+    # One attempt per lap.
+    while True:
+      # The worker's node address from the manifest; a fresh request id for every attempt.
+      payload = sync_app_payload(args.job, worker_addresses(manifest, [args.node])[0], args.role, args.key, args.image,
+                                 period=args.period, publishes=args.publishes)
+      # Signed by the job owner's wallet, sent through the public Deeploy name.
+      accepted = client.submit('create_pipeline', payload)
+      # The admission answer (an error body on a refusal).
+      body = accepted['body'] if isinstance(accepted['body'], dict) else {}
+      # Any other answer, or the end of the wait, is final.
+      if body.get('status') == 'accepted' or 'is not online' not in json.dumps(body) or time.time() > deadline:
+        break
+      # Said once per retry, in the generator's log.
+      common.say(WHO, 'worker {} is not online for Deeploy yet; trying again in 10 s'.format(args.node))
+      # The oracles mark a node online after its first heartbeats.
+      time.sleep(10)
     # The same wait and record as "create": the operation must reach its completed phase.
     final = client.wait(body['operation_id']) if body.get('status') == 'accepted' else None
     # One JSON line with the admission, the phase timeline and the outcome.
