@@ -375,6 +375,7 @@
       "backport_status": "unknown",
       "category": "service",
       "confidence": "tentative",
+      "confidence_reason": "backport_unknown",
       "created_by": "",
       "cve": [
         "CVE-2021-41617"
@@ -407,7 +408,7 @@
       "finding_signature": "af2b47441340faf28f7644f79373942954a971768f20ea105324d5c7efc34f51",
       "first_seen": "",
       "impact": "",
-      "kev": false,
+      "kev": null,
       "last_seen": "",
       "owasp_id": "A03:2021",
       "owasp_top10": [

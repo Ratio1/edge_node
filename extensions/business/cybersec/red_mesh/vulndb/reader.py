@@ -1,6 +1,6 @@
 """Read-only reader for the generated vulnerability database (contract: vulndb.md, Node consumption).
 
-Not wired into `check_cves` yet: `VulndbReader.query(product, version)` returns the matched rows.
+`VulndbReader.query(product, version)` returns the matched rows; `cve_db.check_cves` reads it under `generated`.
 Constraints are pre-parsed once at load with the node matcher (`cve_db._parse_version`,
 `_compare_versions`), so the comparison semantics are the matcher's.
 """
@@ -24,7 +24,7 @@ _CLAUSE = re.compile(r"(>=|<=|>|<|==)(.+)")
 Match = namedtuple("Match", (
   "cve_id", "product", "constraint", "source", "confidence", "reason", "platform_dependent", "client_side",
   "title", "cwe", "published", "severity", "kev", "kev_date_added", "epss", "epss_percentile",
-  "cvss_version", "cvss_score", "cvss_source",
+  "cvss_version", "cvss_score", "cvss_source", "cvss",
 ))
 
 
@@ -62,10 +62,17 @@ def _holds(op, cmp):
 
 
 class VulndbReader:
-  def __init__(self, vulns, rows, build_id, schema):
-    """`vulns`: cve_id -> vuln fields (title .. cvss_source); `rows`: affected rows in `Match` order."""
+  def __init__(self, vulns, rows, build_id, schema, cvss=None, eol=None, built_at=None):
+    """`vulns`: cve_id -> vuln fields (title .. cvss_source); `rows`: affected rows in `Match` order.
+
+    `cvss`: cve_id -> tuple of `{version, vector, score, source}` sorted by `(version, source, vector)`;
+    `eol`: product -> oldest supported version; `built_at`: pin `built_at`, None for a local build.
+    """
     self.build_id = build_id
     self.schema = schema
+    self.built_at = built_at
+    self.eol = dict(eol or {})
+    self._cvss = cvss or {}
     self.dropped = 0
     self.row_count = 0
     self._vulns = vulns
@@ -87,7 +94,7 @@ class VulndbReader:
 
   def _match(self, row):
     vuln = self._vulns[row[0]]
-    return Match(*row, *vuln)
+    return Match(*row, *vuln, self._cvss.get(row[0], ()))
 
   def query(self, product, version):
     """Rows of `product` whose constraint holds for `version`, one per CVE."""
@@ -114,6 +121,16 @@ _AFFECTED = (
   'SELECT cve_id, product, "constraint", source, confidence, reason, platform_dependent, client_side '
   "FROM affected ORDER BY product, cve_id, \"constraint\""
 )
+_CVSS = "SELECT cve_id, version, vector, score, source FROM cvss ORDER BY cve_id, version, source, vector"
+_EOL = "SELECT product, oldest_supported FROM eol"
+
+
+def _optional(conn, sql):
+  """Rows of a table the file may not have: an older ADDITION lacks `eol`, a tiny test file lacks `cvss`."""
+  try:
+    return conn.execute(sql).fetchall()
+  except sqlite3.OperationalError:
+    return []
 
 
 def load_reader(db_path=DB_PATH, pin_path=PIN_PATH):
@@ -154,7 +171,14 @@ def load_reader(db_path=DB_PATH, pin_path=PIN_PATH):
         raise VulndbError("build_id_mismatch")
       vulns = {row[0]: row[1:] for row in conn.execute(_VULNS)}
       rows = (row for row in conn.execute(_AFFECTED) if row[0] in vulns)
-      reader = VulndbReader(vulns, rows, build_id, schema)
+      cvss = {}
+      for cve_id, version, vector, score, source in _optional(conn, _CVSS):
+        cvss.setdefault(cve_id, []).append(
+          {"version": version, "vector": vector, "score": score, "source": source})
+      cvss = {k: tuple(v) for k, v in cvss.items()}
+      eol = dict(_optional(conn, _EOL))
+      origin = pin.get("origin")
+      reader = VulndbReader(vulns, rows, build_id, schema, cvss, eol, None if origin == "local" else pin.get("built_at"))
     finally:
       conn.close()
   except VulndbError:

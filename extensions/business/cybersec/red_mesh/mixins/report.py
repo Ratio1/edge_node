@@ -40,6 +40,9 @@ _DEDUP_EXCLUDE_FIELDS = frozenset(
   {"_source_worker_id", "_source_node_addr"}
   | set(_worker_attribution_fields())
   | set(_volatile_non_content_fields())
+  # RM-169: per database build, so one finding seen by two workers on different pins still collapses;
+  # `_reconcile_volatile_fields` gives the survivor the build of the newer freshness.
+  | {"vulndb_build_id"}
 )
 
 
@@ -196,6 +199,8 @@ def _reconcile_volatile_fields(survivor, dropped):
     # comparison for the same reason `finding_rank` demotes one.
     if current is None or str(incoming) > str(current):
       survivor[field] = incoming
+      if field == "cvss_data_freshness" and dropped.get("vulndb_build_id"):
+        survivor["vulndb_build_id"] = dropped["vulndb_build_id"]
 
 
 def _dedup_findings_in_aggregated(aggregated):
