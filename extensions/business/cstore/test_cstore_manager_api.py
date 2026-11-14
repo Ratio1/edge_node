@@ -334,7 +334,8 @@ class CstoreManagerApiNamespaceTests(unittest.TestCase):
 
   def test_plain_get_and_set_refuse_a_raw_key_under_the_tombstone_prefix(self):
     """A raw key starting with "dl:", where the chain store keeps the tombstones of deleted keys, gets the 403
-    answer of a system namespace on get and set, with the store never called and one red log line."""
+    answer of a system namespace on get and set, with the store never called and one red log line; a key that
+    starts with "dl" without the colon, or holds "dl:" further on, still reaches the store."""
     # A tombstone key of an application key, of a hash record's raw key, and the bare prefix.
     for raw_key in ["dl:app:counter", "dl:" + _composed_key(APP_HKEYS[1], "7"), "dl:"]:
       # The raw key on each plain endpoint.
@@ -355,6 +356,13 @@ class CstoreManagerApiNamespaceTests(unittest.TestCase):
           [(line, color)] = plugin.logged
           # It is red, names the endpoint and the key, and never the value.
           self.assertEqual((color, endpoint in line, raw_key in line, SECRET_VALUE in line), ("r", True, True, False))
+    # A fresh plugin, for a key that starts with "dl" without the colon and holds "dl:" further on.
+    plugin = _make_store_plugin()
+    # Only the "dl:" prefix is refused: this key reaches the store on plain set and get, with no log line.
+    self.assertEqual(
+      (plugin.set(key="dlq:app:dl:counter", value=1), plugin.get(key="dlq:app:dl:counter"), plugin.logged),
+      (True, 1, []),
+    )
 
   def test_a_hash_key_starting_with_the_tombstone_prefix_is_served_as_before(self):
     """The "dl:" refusal concerns raw keys only: a hash key with that prefix still reaches the store on the four
