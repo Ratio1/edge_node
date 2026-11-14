@@ -35,6 +35,8 @@ custody   check that a job's stored copy holds the dAuth placeholder, not the se
           secret_len; writes custody_<job>.json and .txt, and a FAIL fails the scenario
 scan      search every node for a set's secret: secret (name), name; writes scan_<name>.json
           and .txt, and a finding fails the scenario
+seed_history  give a job's container app the received history of a long-lived consumer: node,
+          job, count (entries written into the app's history folder before the run)
 
 Every phase is measured with ``metrics.collect`` when it ends; the result goes
 to ``<results>/<run>/<phase>.json`` and a summary table to ``summary.txt``.
@@ -303,6 +305,11 @@ def _steps(home, spec, manifest, out, phase, note, close_phase):
       if not report['ok']:
         # The findings become the scenario's error message.
         raise LocalnetError('secret scan {} failed: {}'.format(label, '; '.join(report['failures'])))
+    elif do == 'seed_history':
+      # The app's folder and its file count afterwards; a failed seed raises and ends the scenario.
+      report = applib.seed_history(step['node'], step['job'], step['count'])
+      # What was written, in the run journal.
+      note('seed_history {} job {}: {} files in {}'.format(step['node'], step['job'], report['files'], report['folder']))
     else:
       raise LocalnetError('unknown scenario step {}'.format(do))
   return

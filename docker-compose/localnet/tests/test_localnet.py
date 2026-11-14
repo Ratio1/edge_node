@@ -164,7 +164,7 @@ class TestScenarios(unittest.TestCase):
 
   # Every step type lnlib/scenario.py runs, the container-app steps (custody and secret scan included).
   STEPS = {'load', 'run', 'unload', 'wait', 'phase', 'node', 'chain', 'profile', 'replicas', 'pin', 'note',
-           'image', 'isolation', 'sync', 'switch', 'custody', 'scan'}
+           'image', 'isolation', 'sync', 'switch', 'custody', 'scan', 'seed_history'}
 
   def test_shipped_scenarios_use_known_steps_and_generators(self):
     """Every shipped scenario names itself, has unique phases, and uses only step types and generators that exist."""
@@ -491,6 +491,41 @@ class TestContainerApps(unittest.TestCase):
     self.assertFalse(self._refusal_check(refusal, file_after='payload 2\n')['ok'])
     # A refusal of an older record only (the latest not refused) fails too.
     self.assertFalse(self._refusal_check(refusal.replace('Qm2', 'Qm1'))['ok'])
+
+  def test_history_seeder_writes_old_retired_entries_the_sync_reader_leaves_out(self):
+    """The history seeder writes the asked number of readable entries into the app's received folder, each older than any apply, already retired and of another set, so the sync reader of the real set sees none of them."""
+    import subprocess
+    import time
+    from lnlib import apps
+    # A throwaway cache folder, removed at the end.
+    with tempfile.TemporaryDirectory() as tmp:
+      # The app's instance folder as the runner lays it out (its fixed volumes folder marks it).
+      os.makedirs(os.path.join(tmp, '_data', 'pipelines_data', 'lnsync3002_ab12', 'CONTAINER_APP_1', 'fixed_volumes'))
+      # The seeder as it runs in a node, pointed at this folder.
+      code = apps.HISTORY_SEEDER.replace("'/edge_node/_local_cache/_data", repr(tmp + '/_data')[:-1])
+      # Fifty entries for job 3002.
+      out = subprocess.run([sys.executable, '-I', '-', '3002', '50'], input=code, capture_output=True, text=True, timeout=60).stdout
+      # The folder the runner reads that app's received history from.
+      folder = os.path.join(tmp, '_data', 'pipelines_data', 'lnsync3002_ab12', 'CONTAINER_APP_1', 'sync_history', 'received')
+      # It now holds 50 files, as the seeder reports.
+      self.assertEqual(apps._tagged(out, 'SEEDED'), {'folder': folder, 'files': 50})
+      # Every entry is readable JSON.
+      entries = [json.loads(Path(folder, name).read_text()) for name in os.listdir(folder)]
+      # Each is retired and of the set "seed".
+      self.assertTrue(all(item['deletion']['deleted_at'] and item['metadata'] == {'key': 'seed'} for item in entries))
+      # Each was written ten days ago or earlier: never the last applied entry.
+      self.assertLess(max(item['history_written_at_ns'] for item in entries), (time.time() - 9 * 86400) * 10 ** 9)
+      # The sync reader, run on the same folder for a real set.
+      reader = apps.SYNC_READER.replace("'/edge_node/_local_cache/_data'", repr(tmp + '/_data'))
+      # Its view of the set's history.
+      state = apps._tagged(subprocess.run([sys.executable, '-I', '-', 'lnet-sync-s0'], input=reader, capture_output=True,
+                                          text=True, timeout=60).stdout, 'SYNCSTATE')
+      # No received entry of the real set.
+      self.assertEqual(state['received'], [])
+      # A job without an app: the seeder finds no folder.
+      missing = subprocess.run([sys.executable, '-I', '-', '3999', '5'], input=code, capture_output=True, text=True, timeout=60).stdout
+      # So the host function raises on its report.
+      self.assertEqual(apps._tagged(missing, 'SEEDED'), {'folder': None, 'files': 0})
 
   def test_scan_reader_finds_every_form_outside_dauth_records_and_prints_none(self):
     """The node-side scan finds each form of the secret in files, reports dAuth's bundle records apart, skips loop images and prints no form."""

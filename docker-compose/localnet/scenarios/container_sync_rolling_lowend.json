@@ -1,0 +1,29 @@
+{
+ "name": "container_sync_rolling_lowend",
+ "about": "container_sync_rolling on a weak consumer host: r1w-02 is limited to 0.35 CPU (node, inner Docker daemon and app together; the limit is set again after each switch, because a switch recreates the node's container, so each start after a switch runs without it) and its consumer app is given 1,000 received-history entries before the first publish, as a long-lived consumer keeps them. Same pass values as container_sync_rolling (280 s rule, no refusal, the shared-key format, equal files). Stage \"old\" and \"next\", then init --arm old --docker-nodes r1w-01,r1w-02.",
+ "steps": [
+  {"do": "image", "image": "redis:7-alpine", "tag": "localnet/syncapp:1", "nodes": ["r1w-01", "r1w-02"]},
+  {"do": "isolation", "image": "localnet/syncapp:1", "nodes": ["r1w-01", "r1w-02"]},
+  {"do": "run", "generator": "deeploy", "args": ["setup", "--first-job", "3001", "--jobs", "2", "--job-type", "53"], "timeout": 120},
+  {"do": "node", "node": "r1w-02", "cpus": 0.35},
+  {"do": "phase", "name": "all_old"},
+  {"do": "run", "generator": "deeploy", "args": ["sync-app", "--job", "3002", "--node", "r1w-02", "--role", "consumer", "--key", "lnet-sync-roll"], "timeout": 960},
+  {"do": "seed_history", "node": "r1w-02", "job": 3002, "count": 1000},
+  {"do": "run", "generator": "deeploy", "args": ["sync-app", "--job", "3001", "--node", "r1w-01", "--role", "provider", "--key", "lnet-sync-roll", "--period", "90", "--publishes", "6"], "timeout": 960},
+  {"do": "wait", "seconds": 150},
+  {"do": "phase", "name": "consumer_next"},
+  {"do": "switch", "node": "r1w-02", "arm": "next"},
+  {"do": "node", "node": "r1w-02", "cpus": 0.35},
+  {"do": "wait", "seconds": 90},
+  {"do": "phase", "name": "both_next"},
+  {"do": "switch", "node": "r1w-01", "arm": "next"},
+  {"do": "wait", "seconds": 90},
+  {"do": "phase", "name": "consumer_back"},
+  {"do": "switch", "node": "r1w-02", "arm": "old"},
+  {"do": "node", "node": "r1w-02", "cpus": 0.35},
+  {"do": "wait", "seconds": 90},
+  {"do": "phase", "name": "both_back"},
+  {"do": "switch", "node": "r1w-01", "arm": "old"},
+  {"do": "sync", "name": "rolling", "key": "lnet-sync-roll", "provider": "r1w-01", "consumers": ["r1w-02"], "image": "localnet/syncapp:1", "publishes": 6, "within": 280, "timeout": 1200, "encryption": "r1fs-default"}
+ ]
+}

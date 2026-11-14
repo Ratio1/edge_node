@@ -1291,6 +1291,83 @@ def scan_text(report):
   return '\n'.join(lines)
 
 
+# On a node: COUNT received-history entries written into the history folder of the job's container app, as a
+# consumer that has applied many archives keeps them (one file per apply, never pruned). Each entry names a
+# CID no publish has, an old version, a written-at marker older than any real apply (so it is never the "last
+# applied" entry), a deletion already done (so no apply tries to retire it) and the set name "seed" in its
+# metadata (so the sync check, which reads one set's entries, leaves them out).
+HISTORY_SEEDER = r'''
+# Standard library only (-I).
+import glob, json, os, sys, time
+# The Deeploy job whose app gets the entries, and how many.
+job, count = sys.argv[1], int(sys.argv[2])
+# The app's instance folder: <pipelines data>/<job's pipeline>/<instance> (the pipeline is named after the job).
+folders = glob.glob('/edge_node/_local_cache/_data/pipelines_data/lnsync{}_*/*/fixed_volumes'.format(job))
+# One app per job in these scenarios; none means the app does not exist yet.
+received = os.path.join(os.path.dirname(folders[0]), 'sync_history', 'received') if len(folders) == 1 else None
+if received:
+  # The runner creates it at its first apply; created here before that.
+  os.makedirs(received, exist_ok=True)
+  # Ten days before now, in nanoseconds: older than any apply of this run.
+  base = time.time_ns() - 10 * 86400 * 10 ** 9
+  for n in range(count):
+    # An old version (a Unix time in 2001) and a CID no publish has.
+    version, cid = 1000000000 + n, 'QmSEED{:040d}'.format(n)
+    # The fields a received entry has: the record's CID, version and publish time, the apply time.
+    entry = {'cid': cid, 'version': version, 'source_timestamp': float(version), 'applied_timestamp': float(version),
+             # Another set's name, a manifest with no paths, nothing extracted.
+             'node_id': 'seed', 'metadata': {'key': 'seed'}, 'manifest': {}, 'extracted_paths': [],
+             # Written long ago, and already retired.
+             'history_written_at_ns': base + n, 'deletion': {'deleted_at': float(version), 'deletion_succeeded': True, 'deletion_error': None}}
+    # The runner's file name: 10-digit version (unique per entry), two underscores, the first 12 characters of the CID.
+    with open(os.path.join(received, '{:010d}__{}.json'.format(version, cid[:12])), 'w') as fh:
+      # One JSON document per file, as the runner writes it.
+      json.dump(entry, fh)
+# One tagged line for the host: the folder and how many entries it holds now.
+print('SEEDED ' + json.dumps({'folder': received, 'files': len(os.listdir(received)) if received else 0}))'''
+
+
+def seed_history(name, job, count):
+  """
+  Write ``count`` received-history entries into the history folder of a job's container app on a node.
+
+  A consumer keeps one received-history file per apply and never prunes them, and every tick reads all of
+  them while a record is refused. This gives an app the history of a long-lived consumer before a run.
+
+  Parameters
+  ----------
+  name : str
+    Node name.
+  job : int
+    Deeploy job id of the app (its pipeline is named after it).
+  count : int
+    Entries to write.
+
+  Returns
+  -------
+  dict
+    ``folder`` (the app's received-history folder, None when the app was not found) and ``files`` (entries in
+    it after the write).
+
+  Raises
+  ------
+  LocalnetError
+    The app was not found, or the folder does not hold the entries afterwards.
+
+  Examples
+  --------
+  >>> seed_history('r1w-02', 3002, 1000)['files']
+  1000
+  """
+  # The node's interpreter writes the files where the runner reads them.
+  report = _tagged(_exec_python(name, HISTORY_SEEDER, str(job), str(count)), 'SEEDED') or {'folder': None, 'files': 0}
+  if report['folder'] is None or report['files'] < count:
+    # Fail loudly: a run measured without the seeded history would measure something else.
+    raise LocalnetError('history of job {} on {} could not be seeded: {}'.format(job, name, report))
+  # The folder and its file count.
+  return report
+
+
 def wait_source(name, arm_rev, since, timeout=600):
   """
   Wait until a node restarted on another source tree is back on the network with that tree.

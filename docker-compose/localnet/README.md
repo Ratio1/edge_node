@@ -132,7 +132,10 @@ oracles that run it.
   publish's delay to each consumer, refused records, and the file the provider wrote as each consumer
   app reads it. PASS or FAIL. `--refusing NODE[=TEXT]` names a consumer that must refuse the set's
   records: it needs a refusal line for the latest record (holding TEXT), no R1FS fetch line and no
-  download folder for any of the set's CIDs, nothing applied, and its file unchanged.
+  download folder for any of the set's CIDs, nothing applied, and its file unchanged. `--encryption
+  r1fs-set-v1|r1fs-default` also requires the latest record on every holding oracle to carry that format
+  tag (the set tag with a 64-hex `mac`, the shared-key tag with none); the report names each publish's
+  tag and the record's form, never the `mac` itself.
 - `custody <job> --secret NAME [--node N --key K --secret-len N]` reads the job's stored copy and
   deployment plan from R1FS with the default key on an oracle (they must hold only the dAuth placeholder
   at `ENV.R1EN_SYNC_SECRET` and not the secret) and the app's `/data/secret_len`.
@@ -169,6 +172,10 @@ the isolated network), `down [--purge]`.
 | `scenarios/container_sync.json` | One container-sync set: a provider app and a consumer app on two workers, two publishes, then the sync check |
 | `scenarios/container_sync_rolling.json` | A set that keeps publishing while its workers move to tree `next` one at a time and back to `old` |
 | `scenarios/container_sync_custody.json` | A provider created with a set secret through `secret_paths`: the sync check, the custody check (placeholder in R1FS, the app's count), and the secret scan |
+| `scenarios/container_sync_secret.json` | A provider and a consumer both created with a set secret on code that supports it: the sync check with the set's format, custody of both jobs (count 0 in the apps), the secret scan |
+| `scenarios/container_sync_secret_fleet.json` | A shared-key set and a set with a secret on six workers, with consumers that must refuse (no, wrong or malformed secret), a kill and start of one consumer, then a rollback of three workers to `old` and their re-upgrade |
+| `scenarios/container_sync_secret_mixed.json` | A set with a secret created through a Deeploy oracle on `old`, with one consumer on `old` that refuses, then moves to `next` |
+| `scenarios/container_sync_rolling_lowend.json`, `container_sync_secret_lowend.json` | The rolling scenario and the all-`next` part of the fleet scenario with r1w-02 limited to 0.35 CPU and its consumer apps given 1,000 received-history entries each (step `seed_history`) |
 
 A scenario is a list of steps (start a load, wait, begin a measurement phase, stop or throttle a node,
 slow the chain, take a profile). See `lnlib/scenario.py` for the step types.
