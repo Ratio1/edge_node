@@ -3994,13 +3994,20 @@ class ContainerAppRunnerPlugin(
 
     Parameters
     ----------
-    latest_hash : str
-        Latest image hash from registry
+    latest_hash : str or None
+        Latest image hash from registry; None when the pull that reads it failed
 
     Returns
     -------
     bool
-        True if hash changed and update needed, False otherwise
+        True if hash changed and update needed, False otherwise (also when `latest_hash` is None)
+
+    Raises
+    ------
+    docker.errors.APIError, requests.exceptions.RequestException
+        On the first check of a run only: reading the image of the running container (`self.container.image`) is
+        a request to the Docker daemon, which can refuse it or not answer within the client timeout. The baseline
+        then stays unset and the next check reads it again.
 
     Notes
     -----
@@ -4801,20 +4808,25 @@ class ContainerAppRunnerPlugin(
     Raises
     ------
     docker.errors.APIError
-      When the Docker daemon refuses a request. It is raised into the plugin loop, and the sweep is not tried
-      again in this node run.
+      When the Docker daemon refuses a request.
+    requests.exceptions.RequestException
+      When the daemon does not answer a request within the client timeout (`ReadTimeout`, 60 s) or cannot be
+      reached. Either error is raised into the plugin loop, which logs it, and the sweep is not tried again in
+      this node run.
 
     Notes
     -----
-    All apps of a node share one store, so one sweep serves them all: the first app thread that comes here after
-    the delay does it, on its own Docker client, and leaves a marker in the memory the plugins of a node share.
+    `process` calls this first in every lap, in every state of the app, so a node whose apps cannot start still
+    sweeps. All apps of a node share one store, so one sweep serves them all: the first app thread that comes
+    here after the delay does it, on its own Docker client, and leaves a marker in the memory the plugins of a
+    node share.
     An app that has no container at that moment (stopped by hand, waiting for another app or for its image) loses
     its stored image and pulls it at its next start, as every app did at every node start before. Only containers
     created before this node run are removed: a container of this run that has exited stays for inspection.
     The start of the run is the current time less the node's running time; a node clock set forward by more than
     the age of a stopped container of this run would make that container count as left by an earlier run.
-    Each request waits for Docker at most the client timeout (60 s); a store too large for that ends the sweep
-    with the error above, with what was removed so far removed.
+    Each request waits for Docker at most the client timeout (60 s); a store too large or a host too slow for
+    that ends the sweep with the `ReadTimeout` above, with what was removed so far removed.
 
     Examples
     --------

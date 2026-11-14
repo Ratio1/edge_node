@@ -98,6 +98,7 @@ def make_running_runner(container_image):
 
 
 class TestUpdateCheckBaselineIsTheRunningImage(unittest.TestCase):
+  """The first AUTOUPDATE check of a run compares the registry's image with the image the container runs."""
 
   def test_an_app_started_from_an_older_stored_image_is_restarted_on_the_first_check(self):
     """The tag moved while the node was down: the first check finds another image than the container runs and restarts."""
@@ -168,6 +169,7 @@ class TestRemovedContainerTakesItsAnonymousVolumes(unittest.TestCase):
 
 
 class TestDockerStoreSweep(unittest.TestCase):
+  """What earlier runs left in the kept Docker store is removed once per node run, from the lap of any app."""
 
   def setUp(self):
     """

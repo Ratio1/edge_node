@@ -150,6 +150,7 @@ def disk_api_of_a_plugin():
 
 
 class TestNodeImageDockerStore(unittest.TestCase):
+  """The daemon file and the node Dockerfiles agree with each other, the entrypoint's flags and the disk API."""
 
   def test_the_store_is_a_directory_per_docker_major_in_the_bin_folder_of_the_mounted_cache(self):
     """The store sits under /edge_node/_local_cache, the only folder a host mounts, in `_bin`, in a directory named by a Docker major."""
