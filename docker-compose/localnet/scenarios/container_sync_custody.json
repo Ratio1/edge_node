@@ -1,0 +1,15 @@
+{
+ "name": "container_sync_custody",
+ "about": "Custody of a container-sync set's secret through Deeploy and dAuth. A consumer app on r1w-02 without a secret, then a provider app on r1w-01 created through the Deeploy API with the secret of set s1 as ENV.R1EN_SYNC_SECRET and the top-level secret_paths. The provider publishes once; the sync check runs; the custody check reads the job's stored copy and deployment plan from R1FS with the default key (they must hold the dAuth placeholder at that variable and the secret nowhere) and the provider app's count of the variable's bytes (65 on code that passes the secret into the container, 0 on code that hides it: set secret_len to what the code under test must give); last, every node's log, cache folder and chain-store replica (dAuth's bundle records apart) are searched for the secret in any form. Needs init --docker-nodes with r1w-01 and r1w-02 (the image goes into every node that runs Docker) and the image redis:7-alpine on this machine.",
+ "steps": [
+  {"do": "image", "image": "redis:7-alpine", "tag": "localnet/syncapp:1"},
+  {"do": "isolation", "image": "localnet/syncapp:1"},
+  {"do": "run", "generator": "deeploy", "args": ["setup", "--first-job", "3001", "--jobs", "2", "--job-type", "53"], "timeout": 120},
+  {"do": "phase", "name": "custody"},
+  {"do": "run", "generator": "deeploy", "args": ["sync-app", "--job", "3002", "--node", "r1w-02", "--role", "consumer", "--key", "lnet-sync-k1"], "timeout": 960},
+  {"do": "run", "generator": "deeploy", "args": ["sync-app", "--job", "3001", "--node", "r1w-01", "--role", "provider", "--key", "lnet-sync-k1", "--secret", "s1", "--period", "60", "--publishes", "1"], "timeout": 960},
+  {"do": "sync", "name": "k1", "key": "lnet-sync-k1", "provider": "r1w-01", "consumers": ["r1w-02"], "publishes": 1, "within": 150, "timeout": 600},
+  {"do": "custody", "job": 3001, "secret": "s1", "oracle": "r1s-01", "node": "r1w-01", "key": "lnet-sync-k1", "secret_len": 65},
+  {"do": "scan", "name": "s1", "secret": "s1"}
+ ]
+}

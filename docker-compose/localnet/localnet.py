@@ -18,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lnlib import apps as applib, compare as comparelib, infra, load as loadlib, metrics, nodes as nodelib, profile as profilelib, replicas as replicalib, scenario as scenariolib  # noqa: E402
 from lnlib.common import (  # noqa: E402
   HERE, LABEL, NODE_IMAGE, PROJECT, PYTHON, SUBNET, Home, LocalnetError,
-  compose, container, ctl_exec, die, ip, log, sh,
+  # sync_secret: a set's secret from its name, for the custody check and the scan.
+  compose, container, ctl_exec, die, ip, log, sh, sync_secret,
 )
 
 REPOS = {'core': 'naeural_core', 'edge': 'edge_node', 'sdk': 'ratio1_sdk'}
@@ -447,7 +448,8 @@ def cmd_sync(args):
   Parameters
   ----------
   args : argparse.Namespace
-    ``key``, ``provider``, ``consumers``, ``image``, ``publishes``, ``within``, ``timeout``, ``out``.
+    ``key``, ``provider``, ``consumers``, ``refusing`` (``NODE`` or ``NODE=TEXT`` items), ``image``,
+    ``publishes``, ``within``, ``timeout``, ``out``.
 
   Returns
   -------
@@ -456,20 +458,91 @@ def cmd_sync(args):
 
   Examples
   --------
-  >>> cmd_sync(parser.parse_args(['sync', 'lnet-sync-s0', 'r1w-01', 'r1w-02']))
+  >>> cmd_sync(parser.parse_args(['sync', 'lnet-sync-s0', 'r1w-01', 'r1w-02', '--refusing', 'r1w-04=unsupported encryption']))
   0
   """
   # The running localnet's manifest.
   manifest = Home(args.home).manifest()
+  # NODE or NODE=TEXT: the consumers that must refuse, with the text their refusal line must hold.
+  refusing = dict((item.split('=', 1) + [''])[:2] for item in args.refusing or [])
   # Waits for the set to converge, then measures it.
   report = applib.sync_check(manifest, args.provider, args.consumers, args.key, args.image, publishes=args.publishes,
-                             within=args.within, timeout=args.timeout)
+                             # The delay bound, the wait, and the consumers that must refuse.
+                             within=args.within, timeout=args.timeout, refusing=refusing)
   if args.out:
     # The full report next to the summary, when asked for.
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     # Sorted keys keep two reports comparable with diff.
     Path(args.out).write_text(json.dumps(report, indent=1, sort_keys=True))
   print(applib.sync_text(report))
+  # The exit code carries the verdict.
+  return 0 if report['ok'] else 1
+
+
+def cmd_custody(args):
+  """
+  Check the custody of a set's secret for one Deeploy job and print PASS or FAIL with what was found.
+
+  Parameters
+  ----------
+  args : argparse.Namespace
+    ``job``, ``secret`` (the set's name; the value is derived and never printed), ``oracle``, ``node``,
+    ``key``, ``image``, ``secret_len``, ``timeout``, ``out``.
+
+  Returns
+  -------
+  int
+    0 on PASS, 1 on FAIL.
+
+  Examples
+  --------
+  >>> cmd_custody(parser.parse_args(['custody', '3001', '--secret', 's1', '--node', 'r1w-01', '--key', 'k', '--secret-len', '65']))
+  0
+  """
+  # The localnet folder: its private settings give the set's secret.
+  home = Home(args.home)
+  # Stored redacted in R1FS (read on the oracle), and what the app's environment holds (read on the node).
+  report = applib.custody(args.job, sync_secret(home.secrets(), args.secret), args.oracle, node=args.node, key=args.key,
+                          image=args.image, secret_len=args.secret_len, timeout=args.timeout)
+  if args.out:
+    # The full report (kinds and counts only, no secret) next to the summary, when asked for.
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    # Sorted keys keep two reports comparable with diff.
+    Path(args.out).write_text(json.dumps(report, indent=1, sort_keys=True))
+  print(applib.custody_text(report))
+  # The exit code carries the verdict.
+  return 0 if report['ok'] else 1
+
+
+def cmd_scan(args):
+  """
+  Search every node for a set's secret in any of its forms and print PASS or FAIL with where it was found.
+
+  Parameters
+  ----------
+  args : argparse.Namespace
+    ``secret`` (the set's name; the value is derived and never printed), ``out``.
+
+  Returns
+  -------
+  int
+    0 when nothing was found, 1 otherwise.
+
+  Examples
+  --------
+  >>> cmd_scan(parser.parse_args(['scan', 's1']))
+  0
+  """
+  # The localnet folder: its manifest names the nodes, its private settings give the set's secret.
+  home = Home(args.home)
+  # Every node's log and cache folder.
+  report = applib.scan(home.manifest(), sync_secret(home.secrets(), args.secret))
+  if args.out:
+    # The full report (paths and kinds only, no secret), when asked for.
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    # Sorted keys keep two reports comparable with diff.
+    Path(args.out).write_text(json.dumps(report, indent=1, sort_keys=True))
+  print(applib.scan_text(report))
   # The exit code carries the verdict.
   return 0 if report['ok'] else 1
 
@@ -682,8 +755,11 @@ def main():
   one.add_argument('key', help='the sync key of the set')
   # The provider app's node.
   one.add_argument('provider', help='node of the provider app')
-  # Every consumer app's node.
-  one.add_argument('consumers', nargs='+', help='nodes of the consumer apps')
+  # Every consumer app's node that must apply; none when every consumer must refuse.
+  one.add_argument('consumers', nargs='*', help='nodes of the consumer apps that must apply every publish')
+  # Consumers that must refuse every record before any download, with the text their refusal must hold.
+  one.add_argument('--refusing', action='append', metavar='NODE[=TEXT]',
+                   help='a consumer node that must refuse the set\'s records (TEXT: part of its refusal reason)')
   # To find the app containers inside the nodes.
   one.add_argument('--image', default='localnet/syncapp:1', help='image of the apps')
   # The pass values: publishes expected and the delay bound.
@@ -696,6 +772,38 @@ def main():
   one.add_argument('--out', help='write the full report as JSON to this file')
   # Run by main().
   one.set_defaults(func=cmd_sync)
+
+  # Custody of a set's secret for one job: stored redacted in R1FS, delivered (or not) to the app.
+  one = sub.add_parser('custody', help='check that a job\'s stored copy holds the dAuth placeholder, not the secret')
+  # The Deeploy job.
+  one.add_argument('job', type=int, help='Deeploy job id')
+  # The set's name, as given to sync-app --secret.
+  one.add_argument('--secret', required=True, metavar='NAME', help='name of the set\'s secret (as sync-app --secret)')
+  # Where the pointer and the stored documents are read.
+  one.add_argument('--oracle', default='r1s-01', help='oracle whose replica and IPFS repository are read')
+  # The job's app, for its count of the variable's bytes.
+  one.add_argument('--node', help='node of the job\'s app (reads /data/secret_len)')
+  # To find that app among the node's apps.
+  one.add_argument('--key', help='sync key of the app\'s set')
+  # The apps' image.
+  one.add_argument('--image', default='localnet/syncapp:1', help='image of the apps')
+  # 65: the secret reached the container; 0: it did not (code that hides it).
+  one.add_argument('--secret-len', type=int, help='expected count in /data/secret_len')
+  # How long the pointer may take to reach the saved replica.
+  one.add_argument('--timeout', type=float, default=180, help='seconds to wait for the job\'s pointer')
+  # The full report as JSON.
+  one.add_argument('--out', help='write the full report as JSON to this file')
+  # Run by main().
+  one.set_defaults(func=cmd_custody)
+
+  # Scan every node for a set's secret.
+  one = sub.add_parser('scan', help='search node logs, plugin data and store files for a set\'s secret')
+  # The set's name, as given to sync-app --secret.
+  one.add_argument('secret', metavar='NAME', help='name of the set\'s secret (as sync-app --secret)')
+  # The full report as JSON.
+  one.add_argument('--out', help='write the full report as JSON to this file')
+  # Run by main().
+  one.set_defaults(func=cmd_scan)
 
   # One step of a rolling update or rollback.
   one = sub.add_parser('switch', help='recreate one node on another staged source tree (rolling update / rollback)')

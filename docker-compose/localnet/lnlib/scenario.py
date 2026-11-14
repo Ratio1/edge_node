@@ -25,9 +25,15 @@ image     load an image of this machine into the Docker daemon of nodes: image, 
 isolation prove that nodes running Docker and their inner containers reach nothing public:
           image, nodes; a node that does fails the scenario
 sync      check a container-sync set: key, provider, consumers, image, publishes, within,
-          timeout, name; writes sync_<name>.json and .txt, and a FAIL fails the scenario
+          timeout, name, refusing ({node: text} of consumers that must refuse); writes
+          sync_<name>.json and .txt, and a FAIL fails the scenario
 switch    recreate one node on another staged source tree (rolling update, rollback):
           node, arm, kill
+custody   check that a job's stored copy holds the dAuth placeholder, not the set's secret,
+          and what its app's environment holds: job, secret (name), oracle, node, key,
+          secret_len; writes custody_<job>.json and .txt, and a FAIL fails the scenario
+scan      search every node for a set's secret: secret (name), name; writes scan_<name>.json
+          and .txt, and a finding fails the scenario
 
 Every phase is measured with ``metrics.collect`` when it ends; the result goes
 to ``<results>/<run>/<phase>.json`` and a summary table to ``summary.txt``.
@@ -41,8 +47,8 @@ from pathlib import Path
 
 # apps: images, isolation probe and sync check of the container-app steps.
 from . import apps as applib, infra, load as loadlib, metrics, profile as profilelib, replicas as replicalib
-# HERE: where localnet.py lives, for the "switch" step.
-from .common import HERE, PYTHON, LocalnetError, container, ctl_exec, log, sh
+# HERE: where localnet.py lives, for the "switch" step; sync_secret: a set's secret from its name (custody, scan).
+from .common import HERE, PYTHON, LocalnetError, container, ctl_exec, log, sh, sync_secret
 
 
 def _chain_control(settings):
@@ -160,7 +166,8 @@ def _steps(home, spec, manifest, out, phase, note, close_phase):
   Raises
   ------
   LocalnetError
-    An unknown step, a node that is not isolated, or a container-sync check that failed.
+    An unknown step, a node that is not isolated, or a container-sync, custody or secret-scan check that
+    failed.
 
   Examples
   --------
@@ -233,9 +240,13 @@ def _steps(home, spec, manifest, out, phase, note, close_phase):
       # Names the report files, for scenarios with several checks.
       label = step.get('name') or 'sync'
       # Waits for the set to converge, then measures it.
+      # Consumers that must refuse, with the text of their refusal, are optional.
       report = applib.sync_check(manifest, step['provider'], step['consumers'], step['key'],
                                  step.get('image', 'localnet/syncapp:1'), publishes=step.get('publishes', 1),
-                                 within=step.get('within', 150), timeout=step.get('timeout', 900))
+                                 # The delay bound and the wait, as before.
+                                 within=step.get('within', 150), timeout=step.get('timeout', 900),
+                                 # None when the step names no refusing consumer.
+                                 refusing=step.get('refusing'))
       # The full report, kept with the run.
       (out / 'sync_{}.json'.format(label)).write_text(json.dumps(report, indent=1, sort_keys=True))
       # The short summary next to it.
@@ -255,6 +266,40 @@ def _steps(home, spec, manifest, out, phase, note, close_phase):
       proc = sh(*(cmd + (['--kill'] if step.get('kill') else [])), timeout=900)
       # The command's own last line: trees, stop kind and time away.
       note('switch {}'.format((proc.stdout or '').strip().splitlines()[-1]))
+    elif do == 'custody':
+      # Stored redacted in R1FS (read on the oracle), and what the job's app environment holds.
+      report = applib.custody(step['job'], sync_secret(home.secrets(), step['secret']), step.get('oracle', 'r1s-01'),
+                              node=step.get('node'), key=step.get('key'), image=step.get('image', 'localnet/syncapp:1'),
+                              secret_len=step.get('secret_len'), timeout=step.get('timeout', 180))
+      # The full report (kinds and counts only, no secret), kept with the run.
+      (out / 'custody_{}.json'.format(step['job'])).write_text(json.dumps(report, indent=1, sort_keys=True))
+      # The short summary next to it.
+      (out / 'custody_{}.txt'.format(step['job'])).write_text(applib.custody_text(report) + '\n')
+      # The summary also goes into the run journal, one line at a time.
+      for line in applib.custody_text(report).splitlines():
+        # Prefixed with the job.
+        note('custody {}: {}'.format(step['job'], line))
+      # A failed check fails the scenario (exit code 2), after its report is written.
+      if not report['ok']:
+        # The reasons become the scenario's error message.
+        raise LocalnetError('custody check of job {} failed: {}'.format(step['job'], '; '.join(report['failures'])))
+    elif do == 'scan':
+      # Names the report files, for scenarios with several scans.
+      label = step.get('name') or 'scan'
+      # Every node's log and cache folder.
+      report = applib.scan(manifest, sync_secret(home.secrets(), step['secret']))
+      # The full report (paths and kinds only, no secret), kept with the run.
+      (out / 'scan_{}.json'.format(label)).write_text(json.dumps(report, indent=1, sort_keys=True))
+      # The short summary next to it.
+      (out / 'scan_{}.txt'.format(label)).write_text(applib.scan_text(report) + '\n')
+      # The summary also goes into the run journal, one line at a time.
+      for line in applib.scan_text(report).splitlines():
+        # Prefixed with the scan's name.
+        note('scan {}: {}'.format(label, line))
+      # A finding fails the scenario (exit code 2), after its report is written.
+      if not report['ok']:
+        # The findings become the scenario's error message.
+        raise LocalnetError('secret scan {} failed: {}'.format(label, '; '.join(report['failures'])))
     else:
       raise LocalnetError('unknown scenario step {}'.format(do))
   return

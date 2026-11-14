@@ -122,9 +122,27 @@ oracles that run it.
 - `load run deeploy -- sync-app --job N --node r1w-01 --role provider --key K` creates one app of a
   container-sync set through the Deeploy API, in the shape the Deeploy web app sends
   (`setup --job-type 53` registers generic jobs first).
+- `sync-app ... --secret NAME` also sends the set's secret as `ENV.R1EN_SYNC_SECRET`, selected by the
+  top-level `secret_paths` as the web app does. The value is derived from the cluster's private
+  `secrets.json` and the name, so scenarios and reports carry only the name; another name gives a wrong
+  secret, `malformed` sends 32 x "a". The test app writes the byte count of that variable in its
+  environment to `/data/secret_len` at every start (65 or 0, never the value) and puts the set's key in
+  its publish metadata, so several sets can share a node.
 - `sync <key> <provider> <consumer...>` checks a set: the chain-store record on every oracle, each
   publish's delay to each consumer, refused records, and the file the provider wrote as each consumer
-  app reads it. PASS or FAIL.
+  app reads it. PASS or FAIL. `--refusing NODE[=TEXT]` names a consumer that must refuse the set's
+  records: it needs a refusal line for the latest record (holding TEXT), no R1FS fetch line and no
+  download folder for any of the set's CIDs, nothing applied, and its file unchanged.
+- `custody <job> --secret NAME [--node N --key K --secret-len N]` reads the job's stored copy and
+  deployment plan from R1FS with the default key on an oracle (they must hold only the dAuth placeholder
+  at `ENV.R1EN_SYNC_SECRET` and not the secret) and the app's `/data/secret_len`.
+- `scan NAME` searches every node's log and cache folder (logs, plugin data, the apps' mounted volumes,
+  downloads, store files) for the secret, its SHA-256 (the archive key), that key's first 16 bytes and
+  the record MAC subkey; dAuth's bundle records in the chain store are reported apart. It prints kinds
+  and paths only.
+- More app workers: `--workers 6 --docker-nodes r1w-01,...,r1w-06` (about 0.7 GB each). Deeploy on two
+  seeds: add `--web-of r1s-02=DAUTH_MANAGER,DEEPLOY_MANAGER_API`; `load run deeploy -- --api
+  http://172.31.90.52:31302 ...` sends a request to r1s-02 alone (seed n is `172.31.90.5n`).
 - `switch <node> <tree> [--kill]` recreates one node on another staged tree with the same identity,
   data and inner Docker data: one step of a rolling update or of a rollback. By default the node is
   stopped the way an update stops it (SIGTERM and the grace period).
@@ -148,6 +166,7 @@ the isolated network), `down [--purge]`.
 | `scenarios/secret_flood.json` | Secret requests for old-style jobs whose documents cannot be read, and what a starting node sees meanwhile |
 | `scenarios/container_sync.json` | One container-sync set: a provider app and a consumer app on two workers, two publishes, then the sync check |
 | `scenarios/container_sync_rolling.json` | A set that keeps publishing while its workers move to tree `next` one at a time and back to `old` |
+| `scenarios/container_sync_custody.json` | A provider created with a set secret through `secret_paths`: the sync check, the custody check (placeholder in R1FS, the app's count), and the secret scan |
 
 A scenario is a list of steps (start a load, wait, begin a measurement phase, stop or throttle a node,
 slow the chain, take a profile). See `lnlib/scenario.py` for the step types.

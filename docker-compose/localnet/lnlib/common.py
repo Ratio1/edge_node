@@ -1,5 +1,9 @@
 """Shared helpers of the localnet host tool: paths, shell, docker."""
 
+# SHA-256, the hash under the HMAC of sync_secret.
+import hashlib
+# The container-sync secret of a named set is an HMAC-SHA256 (sync_secret).
+import hmac
 import json
 import os
 import subprocess
@@ -129,3 +133,36 @@ def ctl_exec(*args, timeout=600, check=True, stdin=None):
 def die(msg):
   print('localnet: ' + str(msg), file=sys.stderr, flush=True)
   sys.exit(2)
+
+
+def sync_secret(secrets, name):
+  """
+  The container-sync secret of a named set on this localnet.
+
+  The host tool (scan, custody check) and the Deeploy load generator (``sync-app --secret NAME``) both
+  derive it from the cluster's private settings, so scenarios, journals and reports carry only the name
+  and no secret value is ever written down.
+
+  Parameters
+  ----------
+  secrets : dict
+    The localnet's ``secrets.json`` (throwaway keys made by ``init``, readable by the operator only).
+  name : str
+    Name of the set's secret; another name gives another, equally valid secret.
+
+  Returns
+  -------
+  str
+    64 lowercase hex characters, the format a node accepts as ``R1EN_SYNC_SECRET``.
+
+  Examples
+  --------
+  >>> len(sync_secret({'relay': {'k': 'v'}}, 's1'))
+  64
+  >>> sync_secret({'relay': {'k': 'v'}}, 's1') == sync_secret({'relay': {'k': 'v'}}, 's2')
+  False
+  """
+  # The canonical text of the cluster's settings keys the HMAC: the same file gives the same value on both sides.
+  material = json.dumps(secrets, sort_keys=True).encode()
+  # HMAC-SHA256 of the name, in hex: 32 bytes as 64 lowercase hex characters.
+  return hmac.new(material, b'container-sync-secret:' + name.encode(), hashlib.sha256).hexdigest()

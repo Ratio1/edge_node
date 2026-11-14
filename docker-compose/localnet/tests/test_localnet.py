@@ -11,6 +11,9 @@ missing.
 """
 
 import glob
+# The forms of a container-sync secret, computed independently of the tool in its scan test.
+import hashlib
+import hmac
 import importlib.util
 import json
 import os
@@ -159,9 +162,9 @@ class TestSeeding(unittest.TestCase):
 
 class TestScenarios(unittest.TestCase):
 
-  # Every step type lnlib/scenario.py runs, the container-app steps included.
+  # Every step type lnlib/scenario.py runs, the container-app steps (custody and secret scan included).
   STEPS = {'load', 'run', 'unload', 'wait', 'phase', 'node', 'chain', 'profile', 'replicas', 'pin', 'note',
-           'image', 'isolation', 'sync', 'switch'}
+           'image', 'isolation', 'sync', 'switch', 'custody', 'scan'}
 
   def test_shipped_scenarios_use_known_steps_and_generators(self):
     """Every shipped scenario names itself, has unique phases, and uses only step types and generators that exist."""
@@ -295,15 +298,16 @@ class TestContainerApps(unittest.TestCase):
     """The sync check passes a set whose consumer applied every publish in time with the same file, and fails it otherwise."""
     from lnlib import apps
     sent = [{'cid': 'Qm1', 'published_timestamp': 100.0}, {'cid': 'Qm2', 'published_timestamp': 200.0}]
-    state = {'r1w-01': {'sent': sent, 'received': [], 'quarantine': 0},
+    # Quarantine and download lists of the whole node, as the reader now returns them.
+    state = {'r1w-01': {'sent': sent, 'received': [], 'quarantine': [], 'downloads': []},
              # The consumer skipped Qm1 and applied Qm2 at 240: Qm1 counts as held at 240 (140 s), Qm2 after 40 s.
-             'r1w-02': {'sent': [], 'received': [{'cid': 'Qm2', 'applied_timestamp': 240.0}], 'quarantine': 0}}
+             'r1w-02': {'sent': [], 'received': [{'cid': 'Qm2', 'applied_timestamp': 240.0}], 'quarantine': [], 'downloads': ['Qm2']}}
     files = {'r1w-01': 'payload 2\n', 'r1w-02': 'payload 2\n'}
     saved = (apps.sync_state, apps.chain_record, apps.app_file, apps.node_log)
-    # Node reads replaced by the fixed state above.
-    apps.sync_state = lambda name: state[name]
+    # Node reads replaced by the fixed state above (the reads now name the set's key).
+    apps.sync_state = lambda name, key: state[name]
     apps.chain_record = lambda name, key: {'record': {'cid': 'Qm2'}, 'age_s': 1.0}
-    apps.app_file = lambda name, image, path: {'container': 'c', 'text': files[name], 'sha256': files[name]}
+    apps.app_file = lambda name, image, key, path: {'container': 'c', 'text': files[name], 'sha256': files[name]}
     apps.node_log = lambda name: ''
     manifest = {'nodes': [{'name': 'r1s-01', 'role': 'seed'}, {'name': 'r1w-01', 'role': 'worker'}]}
     try:
@@ -319,6 +323,197 @@ class TestContainerApps(unittest.TestCase):
       self.assertFalse(apps.sync_check(manifest, 'r1w-01', ['r1w-02'], 'k', 'img', publishes=2, within=100, timeout=0, poll=0)['ok'])
     finally:
       apps.sync_state, apps.chain_record, apps.app_file, apps.node_log = saved
+
+  def test_sync_app_sends_a_named_secret_through_secret_paths(self):
+    """--secret NAME sends the set's 64-hex secret as ENV.R1EN_SYNC_SECRET with the web app's top-level path, and host and generator derive the same value."""
+    sys.path.insert(0, str(HERE / 'load'))
+    try:
+      import deeploy
+    finally:
+      sys.path.remove(str(HERE / 'load'))
+    from lnlib import common
+    # Throwaway cluster settings, as init writes them.
+    secrets = {'relay': {'relay_api_key_b64': 'abc'}, 'mesh': {'client_password': 'x'}}
+    # The value of set s1.
+    value = common.sync_secret(secrets, 's1')
+    # The format a node accepts, the same after a JSON round trip of the settings, another value for another
+    # name or other settings.
+    self.assertRegex(value, r'^[0-9a-f]{64}$')
+    self.assertEqual(value, common.sync_secret(json.loads(json.dumps(secrets)), 's1'))
+    self.assertNotEqual(value, common.sync_secret(secrets, 'wrong'))
+    self.assertNotEqual(value, common.sync_secret({'relay': {}}, 's1'))
+    # The load generator calls the host tool's own derivation, so both sides always agree.
+    self.assertIs(deeploy.sync_secret, common.sync_secret)
+    # A provider request carrying the secret.
+    payload = deeploy.sync_app_payload(3001, '0xai_w1', 'provider', 'k1', 'localnet/syncapp:1', secret=value)
+    # One ENV entry and one top-level selector, as withSecretPaths of the web app emits them; no plugin SECRET_PATHS.
+    self.assertEqual(payload['plugins'][0]['ENV']['R1EN_SYNC_SECRET'], value)
+    self.assertEqual(payload['secret_paths'], [['plugins', 0, 'ENV', 'R1EN_SYNC_SECRET']])
+    self.assertNotIn('SECRET_PATHS', payload['plugins'][0])
+    # The malformed value is not of the accepted format, and the app writes a byte count, never the value.
+    self.assertNotRegex(deeploy.MALFORMED_SECRET, r'^[0-9a-f]{64}$')
+    self.assertIn('printenv R1EN_SYNC_SECRET | wc -c > "$D/secret_len"', deeploy.SYNC_APP_SCRIPT)
+
+  def _refusal_check(self, log, downloads=(), applied=(), file_after=None, expected=''):
+    """
+    Run the sync check on a set whose only consumer, r1w-04, must refuse, with fixed node reads.
+
+    Parameters
+    ----------
+    log : str
+      The refusing node's log.
+    downloads : tuple of str
+      CIDs in its R1FS download folder.
+    applied : tuple of str
+      CIDs it applied.
+    file_after : str or None
+      Its app's file at the end of the check (None: still missing, as at the start).
+    expected : str
+      Text one of its refusal reasons must hold ('' for any).
+
+    Returns
+    -------
+    dict
+      The sync check's report.
+
+    Examples
+    --------
+    >>> self._refusal_check('[sync] cannot prepare v2 (cid=Qm2): bad')['ok']
+    True
+    """
+    from lnlib import apps
+    # Two publishes; the refusing node quarantined the latest.
+    sent = [{'cid': 'Qm1', 'published_timestamp': 100.0}, {'cid': 'Qm2', 'published_timestamp': 200.0}]
+    state = {'r1w-01': {'sent': sent, 'received': [], 'quarantine': [], 'downloads': []},
+             'r1w-04': {'sent': [], 'received': [{'cid': cid, 'applied_timestamp': 250.0} for cid in applied],
+                        'quarantine': ['Qm2'], 'downloads': list(downloads)}}
+    # File reads in call order: the refusing app's file before the check, then the provider's and its own at the end.
+    reads = {'r1w-01': ['payload 2\n'], 'r1w-04': [None, file_after]}
+    saved = (apps.sync_state, apps.chain_record, apps.app_file, apps.node_log)
+    # Node reads replaced by the fixed state above.
+    apps.sync_state = lambda name, key: state[name]
+    apps.chain_record = lambda name, key: {'record': {'cid': 'Qm2'}, 'age_s': 1.0}
+    apps.app_file = lambda name, image, key, path: (lambda text: {'container': 'c', 'text': text, 'sha256': text})(reads[name].pop(0))
+    apps.node_log = lambda name: log
+    manifest = {'nodes': [{'name': 'r1s-01', 'role': 'seed'}, {'name': 'r1w-01', 'role': 'worker'}]}
+    try:
+      # No consumer that must apply; r1w-04 must refuse.
+      return apps.sync_check(manifest, 'r1w-01', [], 'k', 'img', publishes=2, timeout=0, poll=0, refusing={'r1w-04': expected})
+    finally:
+      apps.sync_state, apps.chain_record, apps.app_file, apps.node_log = saved
+
+  def test_sync_check_passes_a_refusal_before_download_and_fails_any_fetch(self):
+    """A consumer that must refuse passes only with a refusal of the latest record, its expected reason, no fetch line, no download, nothing applied and an unchanged file."""
+    # The refusal line a consumer with a set secret writes for a record whose MAC does not match.
+    refusal = "[EE] [sync] cannot prepare v2 (cid=Qm2): record mac does not match this node's sync secret\n"
+    # Refused before any download, for the expected reason: PASS, with the reason reported.
+    report = self._refusal_check(refusal, expected='record mac does not match')
+    self.assertTrue(report['ok'], report['failures'])
+    self.assertEqual(report['refusing']['r1w-04']['reasons'], ["record mac does not match this node's sync secret"])
+    # Another reason than the expected one fails.
+    self.assertFalse(self._refusal_check(refusal, expected='unsupported encryption')['ok'])
+    # A refusal after R1FS fetched the archive (its decryption-failure line names the download folder) fails.
+    fetched = refusal + 'Error decrypting file /edge_node/_local_cache/_output/ipfs_downloads/Qm2/f.tar.gz: tag\n'
+    self.assertFalse(self._refusal_check(fetched)['ok'])
+    # So do an archive left in the download folder, an applied record, and a file that took the provider's data.
+    self.assertFalse(self._refusal_check(refusal, downloads=('Qm2',))['ok'])
+    self.assertFalse(self._refusal_check(refusal, applied=('Qm2',))['ok'])
+    self.assertFalse(self._refusal_check(refusal, file_after='payload 2\n')['ok'])
+    # A refusal of an older record only (the latest not refused) fails too.
+    self.assertFalse(self._refusal_check(refusal.replace('Qm2', 'Qm1'))['ok'])
+
+  def test_scan_reader_finds_every_form_outside_dauth_records_and_prints_none(self):
+    """The node-side scan finds each form of the secret in files, reports dAuth's bundle records apart, skips loop images and prints no form."""
+    import pickle
+    import subprocess
+    from lnlib import apps
+    # A test secret and its four forms.
+    secret = 'ab' * 32
+    needles = apps.sync_needles(secret)
+    # Forms computed here independently: the archive key is SHA-256 of the text; the subkey an HMAC over the context.
+    self.assertEqual(needles['archive_key'], hashlib.sha256(secret.encode()).hexdigest())
+    self.assertEqual(needles['archive_key_16'], needles['archive_key'][:32])
+    self.assertEqual(needles['mac_subkey'], hmac.new(secret.encode(), b'r1en-volume-sync-record-v1', hashlib.sha256).hexdigest())
+    with tempfile.TemporaryDirectory() as tmp:
+      # A cache folder as a node keeps it: a log with the archive key, a clean data file, a loop image holding
+      # the secret (skipped), and a chain-store replica with a dAuth bundle record and another record.
+      for folder in ('_logs', '_data/app/fixed_volumes/images', '_data/cache'):
+        os.makedirs(os.path.join(tmp, folder))
+      Path(tmp, '_logs', 'node.txt').write_text('loaded key ' + needles['archive_key'] + '\n')
+      Path(tmp, '_data', 'clean.json').write_text('{"cid": "Qm1"}')
+      Path(tmp, '_data', 'app', 'fixed_volumes', 'images', 'data.img').write_text(secret)
+      # The replica's record names: "hs:" + 10 hex characters of the hash name's SHA-256 + ":" + the field.
+      dauth = 'hs:{}:MzAwMQ=='.format(hashlib.sha256(b'DAUTH_JOB_SECRETS').hexdigest()[:10])
+      store = {dauth: {'value': {'job_secrets': secret}}, 'hs:0123456789:eA==': {'value': {'m': needles['mac_subkey']}}}
+      Path(tmp, '_data', 'cache', 'object.pickle').write_bytes(pickle.dumps(store))
+      # The reader as it runs in a node, pointed at this folder, with its values in front.
+      code = apps._with_values(apps.SCAN_READER.replace("'/edge_node/_local_cache'", repr(tmp)), NEEDLES=needles,
+                               CSTORE_PICKLE=os.path.join(tmp, '_data', 'cache', 'object.pickle'))
+      out = subprocess.run([sys.executable, '-I', '-'], input=code, capture_output=True, text=True, timeout=60).stdout
+    found = apps._tagged(out, 'SCAN')
+    # The log (archive key and its 16-byte prefix) and the replica's non-dAuth record (subkey) are hits; the
+    # loop image is not read; the dAuth bundle record is reported apart.
+    self.assertEqual({os.path.basename(hit['path']): hit['kinds'] for hit in found['hits']},
+                     {'node.txt': ['archive_key', 'archive_key_16'], 'object.pickle': ['mac_subkey']})
+    self.assertEqual(found['dauth_bundle_kinds'], ['secret'])
+    self.assertEqual(found['files'], 3)
+    # The output names kinds and paths only.
+    self.assertFalse(any(needle in out for needle in needles.values()))
+
+  def test_custody_passes_only_the_placeholder_and_the_expected_count(self):
+    """The custody check passes stored documents holding only the placeholder and no secret with the expected app count, fails otherwise, and passes the secret through stdin only."""
+    from lnlib import apps
+    # What the reader on the oracle prints for a well-redacted job.
+    doc = {'cid': 'Qm1', 'readable': True, 'values': ['placeholder'], 'secret_paths': [[['ENV', 'R1EN_SYNC_SECRET']]],
+           'secret_in_doc': False}
+    answer = {'pointer': 'dict', 'docs': {'pipeline': dict(doc), 'plan': dict(doc, cid='Qm2')}}
+    # Command lines of the node programs, to prove the secret is not on them.
+    calls = []
+    saved = (apps._exec_python, apps.app_file)
+    # The oracle's answer, and the app's count of 65 bytes.
+    apps._exec_python = lambda name, code, *args: calls.append(args) or 'CUSTODY ' + json.dumps(answer)
+    apps.app_file = lambda name, image, key, path: {'container': 'c', 'text': '65\n', 'sha256': None}
+    secret = 'ab' * 32
+
+    def check(expected):
+      """
+      Run the custody check of job 3001 with the fixed reads above.
+
+      Parameters
+      ----------
+      expected : int
+        Expected count of secret bytes in the app's environment.
+
+      Returns
+      -------
+      bool
+        Whether the check passed.
+
+      Examples
+      --------
+      >>> check(65)
+      True
+      """
+      # One look only: no wait for the pointer.
+      return apps.custody(3001, secret, 'r1s-01', node='r1w-01', key='k', secret_len=expected, timeout=0, poll=0)['ok']
+
+    try:
+      self.assertTrue(check(65))
+      # The secret travelled in the program text (stdin), never as an argument.
+      self.assertFalse(any(secret in arg for args in calls for arg in args))
+      # A count other than the expected one (the secret reached, or did not reach, the container) fails.
+      self.assertFalse(check(0))
+      # A stored value other than the placeholder fails.
+      answer['docs']['plan']['values'] = ['other']
+      self.assertFalse(check(65))
+      # The secret inside a stored document fails.
+      answer['docs']['plan'] = dict(doc, secret_in_doc=True)
+      self.assertFalse(check(65))
+      # No pointer for the job fails.
+      answer['pointer'] = None
+      self.assertFalse(check(65))
+    finally:
+      apps._exec_python, apps.app_file = saved
 
 
 class TestMetrics(unittest.TestCase):

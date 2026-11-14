@@ -10,11 +10,16 @@ A node created with ``init --docker-nodes`` starts its own Docker daemon, as a p
     no app ever pulls from a registry;
   * prove from inside a node that an inner container reaches no public network;
   * check a container-sync set: what the provider published, the chain-store record on the oracles,
-    what each consumer applied and when, and whether the consumer's file equals the provider's.
+    what each consumer applied and when, and whether the consumer's file equals the provider's; and
+    that a consumer which must refuse the set's records refused them before any download;
+  * check the custody of a set's secret (stored redacted in R1FS, delivered to the node) and scan the
+    nodes for secret material.
 """
 
-# Digests of the files apps hold, to compare provider and consumer.
+# Digests of the files apps hold, to compare provider and consumer, and the forms of a secret a scan looks for.
 import hashlib
+# The MAC subkey a node derives from a set's secret (one of the forms the scan looks for).
+import hmac
 # Node inspection output and the sync reports.
 import json
 # The image stream from the host's Docker into a node's daemon.
@@ -32,10 +37,15 @@ from .infra import EDGE_IP
 from .nodes import docker_volume, node_log
 
 # Where the container app runner keeps the sync history of an app (sent by a provider, received by a
-# consumer), and the quarantine of records a consumer refused, inside a node's data folder.
+# consumer), and the quarantine of records a consumer refused, inside a node's data folder; and the
+# folders R1FS downloads archives into. Only the history of one set is kept: a provider's test app puts
+# the set's key into its publish metadata (load/deeploy.py), so two sets on one node stay apart.
 SYNC_READER = r'''
-import glob, json
+# Standard library only: the node's own modules are not imported (-I).
+import glob, json, os, sys
 root = '/edge_node/_local_cache/_data'
+# The set whose history is wanted.
+key = sys.argv[1]
 def entries(kind):
   rows = []
   for path in glob.glob(root + '/**/sync_history/' + kind + '/*.json', recursive=True):
@@ -43,12 +53,168 @@ def entries(kind):
       with open(path) as fh:
         item = json.load(fh)
     except Exception:
+      # An entry being rewritten at this moment is skipped; the next look reads it.
       continue
-    rows.append({key: item.get(key) for key in ('cid', 'version', 'published_timestamp', 'applied_timestamp', 'node_id')})
+    # A sent entry keeps the app's request (with its metadata); a received entry keeps the record's metadata.
+    meta = (item.get('request') or {}).get('metadata') if kind == 'sent' else item.get('metadata')
+    # Entries of other sets on the same node are left out.
+    if (meta or {}).get('key') != key:
+      # Another set's entry (or one written before apps named their set).
+      continue
+    # The fields the check needs.
+    rows.append({name: item.get(name) for name in ('cid', 'version', 'published_timestamp', 'applied_timestamp', 'node_id')})
   return sorted(rows, key=lambda row: (row.get('version') or 0, row.get('published_timestamp') or row.get('applied_timestamp') or 0))
-quarantine = glob.glob(root + '/**/sync_history/state/quarantine/*', recursive=True)
-print('SYNCSTATE ' + json.dumps({'sent': entries('sent'), 'received': entries('received'), 'quarantine': len(quarantine)}))
-'''
+# The CID of every quarantine file of the node (any set; the caller keeps the set's own).
+quarantine = []
+# One file per refused record, written by the sync code.
+for path in glob.glob(root + '/**/sync_history/state/quarantine/*.json', recursive=True):
+  # Each file names the refused record's CID.
+  with open(path) as fh:
+    # Kept for the host, which keeps the set's own.
+    quarantine.append(json.load(fh).get('cid'))
+# R1FS writes each fetched CID into a folder of that name here (the logger's output folder).
+downloads = '/edge_node/_local_cache/_output/ipfs_downloads'
+# One tagged line for the host.
+print('SYNCSTATE ' + json.dumps({'sent': entries('sent'), 'received': entries('received'), 'quarantine': quarantine,
+                                 # The folders present, none when R1FS never fetched anything.
+                                 'downloads': sorted(os.listdir(downloads)) if os.path.isdir(downloads) else []}))'''
+
+# The log line a consumer writes when it refuses a record before downloading it.
+REFUSAL_MARKER = '[sync] cannot prepare'
+# Log lines that name a CID only when R1FS fetched it, or tried to: the download folder in the success and
+# decryption-failure lines, the two download-failure lines, and the sync code's own get_file error lines.
+GET_FILE_MARKERS = ('ipfs_downloads', 'ipfs get failed', 'Failed to download CID', 'get_file(')
+# The chain-store replica a node last saved (owner, value and stamps per record, keyed "hs:<hash>:<field>").
+CSTORE_PICKLE = '/edge_node/_local_cache/_data/cache_plugins/admin_pipeline__chain_store_base__chain_store_base_inst/object.pickle'
+# The value Deeploy stores in place of each selected secret (ratio1 dAuth.DAUTH_SECRET_PLACEHOLDER).
+DAUTH_PLACEHOLDER = '__R1_DAUTH_SECRET__'
+# The context string under which a node derives a set's record MAC subkey from the set's secret.
+SYNC_MAC_CONTEXT = b'r1en-volume-sync-record-v1'
+# A node's IPFS repository: the SDK puts it in the logger's base folder (the cache folder) as ".ipfs".
+IPFS_HOME = '/edge_node/_local_cache/.ipfs'
+
+# On an oracle: the job's pointer in DEEPLOY_DEPLOYED_JOBS, then each document it names (the stored job and
+# the deployment plan) read from R1FS with the default key, as any node can read it. Prints, per document,
+# what the instances hold at ENV.R1EN_SYNC_SECRET ("placeholder" or "other", never a value), their
+# SECRET_PATHS, and whether the secret occurs anywhere in it. NEEDLE (the secret) is put in front by the
+# caller, through stdin. The node keeps its IPFS repository at IPFS_HOME.
+CUSTODY_READER = r'''
+# Standard library and the node image's cryptography package only (-I).
+import base64, hashlib, json, os, pickle, subprocess, sys, tempfile
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+# The Deeploy job id.
+job = sys.argv[1]
+# The record name of the job's pointer: "hs:" + 10 hex characters of the hash name's SHA-256 + ":" + base64url(job).
+field = 'hs:{}:{}'.format(hashlib.sha256(b'DEEPLOY_DEPLOYED_JOBS').hexdigest()[:10], base64.urlsafe_b64encode(job.encode()).decode())
+# The replica as the oracle last saved it.
+with open(CSTORE_PICKLE, 'rb') as fh:
+  record = pickle.load(fh).get(field)
+# The stored value: a signed dict naming the stored job and the plan, or a bare CID (older pointers).
+pointer = record.get('value') if isinstance(record, dict) else record
+# The documents to read.
+cids = {'pipeline': pointer.get('pipeline_cid'), 'plan': pointer.get('plan_cid')} if isinstance(pointer, dict) else {'pipeline': pointer}
+def read(cid):
+  # A throwaway folder, removed with what it holds.
+  with tempfile.TemporaryDirectory() as tmp:
+    # The node's own IPFS client fetches the object (a folder holding one encrypted file).
+    got = subprocess.run(['ipfs', 'get', cid, '-o', tmp + '/o'], env=dict(os.environ, IPFS_PATH=IPFS_HOME),
+                         capture_output=True, text=True, timeout=90)
+    if got.returncode != 0:
+      return None
+    # The one file in it.
+    with open(os.path.join(tmp, 'o', os.listdir(tmp + '/o')[0]), 'rb') as fh:
+      blob = fh.read()
+  # R1FS layout: 12-byte nonce, 4-byte metadata length, metadata, content, 16-byte GCM tag, one AES-GCM stream.
+  meta_len = int.from_bytes(blob[12:16], 'big')
+  # The default key: SHA-256 of the default secret "ratio1", as every node reads a stored job.
+  dec = Cipher(algorithms.AES(hashlib.sha256(b'ratio1').digest()), modes.GCM(blob[:12])).decryptor()
+  # The metadata (the file name) comes first in the stream.
+  dec.update(blob[16:16 + meta_len])
+  # The content, authenticated by the tag.
+  return (dec.update(blob[16 + meta_len:-16]) + dec.finalize_with_tag(blob[-16:])).decode()
+def walk(doc, values, paths):
+  if isinstance(doc, dict):
+    # An instance's variables.
+    env = doc.get('ENV')
+    if isinstance(env, dict) and 'R1EN_SYNC_SECRET' in env:
+      # Only whether it is the placeholder: the value itself is never printed.
+      values.append('placeholder' if env['R1EN_SYNC_SECRET'] == PLACEHOLDER else 'other')
+      # The instance's selections, as Deeploy keeps them.
+      paths.append(doc.get('SECRET_PATHS'))
+    for item in doc.values():
+      walk(item, values, paths)
+  elif isinstance(doc, list):
+    for item in doc:
+      walk(item, values, paths)
+# Per document: what was found.
+docs = {}
+# The stored job, then the plan.
+for kind, cid in cids.items():
+  # The plain text, None when the object could not be fetched.
+  text = read(cid) if cid else None
+  # What the instances hold at the variable, and their selections.
+  values, paths = [], []
+  if text is not None:
+    walk(json.loads(text), values, paths)
+  # Kinds and selections only; the secret is looked up, never echoed.
+  docs[kind] = {'cid': cid, 'readable': text is not None, 'values': values, 'secret_paths': paths,
+                'secret_in_doc': text is not None and NEEDLE in text}
+# One tagged line for the host.
+print('CUSTODY ' + json.dumps({'pointer': type(pointer).__name__ if pointer else None, 'docs': docs}))'''
+
+# On any node: every file under the node's cache folder (logs, plugin data, the apps' mounted system and data
+# volumes, R1FS downloads, store files), read as bytes and searched for each form of the secret (NEEDLES,
+# kind -> text, put in front by the caller through stdin). Loop-device image files are skipped: their
+# content is read through their mounts. A file removed while the scan runs (a temporary file) is skipped.
+# The chain-store replica is searched record by record, and the records of DAUTH_JOB_SECRETS, where dAuth
+# keeps the bundles it serves, are counted apart.
+SCAN_READER = r'''
+# Standard library only (-I).
+import hashlib, json, os, pickle
+# The node's whole cache folder.
+root = '/edge_node/_local_cache'
+# The record-name prefix of the DAUTH_JOB_SECRETS hash in the replica.
+dauth = 'hs:{}:'.format(hashlib.sha256(b'DAUTH_JOB_SECRETS').hexdigest()[:10])
+def kinds(blob):
+  # The kinds whose text occurs in the bytes.
+  return sorted(kind for kind, needle in NEEDLES.items() if needle.encode() in blob)
+# Findings, files and bytes read, and the kinds found in dAuth's bundle records.
+hits, files, size, dauth_kinds = [], 0, 0, []
+# Every folder, mounted app volumes included.
+for folder, dirs, names in os.walk(root):
+  # Loop-device images: read through their mounts instead.
+  if folder.endswith('/fixed_volumes/images'):
+    continue
+  for name in names:
+    # The file's full path.
+    path = os.path.join(folder, name)
+    # Regular files only: no links, sockets or pipes.
+    if os.path.islink(path) or not os.path.isfile(path):
+      continue
+    if path == CSTORE_PICKLE:
+      # The replica, read record by record.
+      with open(path, 'rb') as fh:
+        store = pickle.load(fh)
+      # dAuth's bundle records hold the secrets dAuth serves: reported apart.
+      dauth_kinds = kinds(repr({k: v for k, v in store.items() if k.startswith(dauth)}).encode())
+      # Every other record is searched like a file.
+      blob = repr({k: v for k, v in store.items() if not k.startswith(dauth)}).encode()
+    else:
+      try:
+        # The file's bytes.
+        with open(path, 'rb') as fh:
+          blob = fh.read()
+      except FileNotFoundError:
+        continue
+    # Counted as read.
+    files, size = files + 1, size + len(blob)
+    # The kinds it holds.
+    found = kinds(blob)
+    if found:
+      # Path and kinds only, never the text found.
+      hits.append({'path': path, 'kinds': found})
+# One tagged line for the host.
+print('SCAN ' + json.dumps({'files': files, 'bytes': size, 'hits': hits, 'dauth_bundle_kinds': dauth_kinds}))'''
 
 # The chain-store replica an oracle last saved, and the record of one sync key in it.
 RECORD_READER = r'''
@@ -417,8 +583,35 @@ def _exec_python(name, code, *args):
   >>> _exec_python('r1w-01', "print('x')")
   'x\\n'
   """
-  # Isolated mode: the program imports nothing from the node's working folder.
-  return sh('docker', 'exec', '-i', container(name), PYTHON, '-I', '-', *args, stdin=code, check=False, timeout=120).stdout or ''
+  # Isolated mode: the program imports nothing from the node's working folder. Up to 10 minutes: a secret
+  # scan reads every file of the node's cache folder.
+  return sh('docker', 'exec', '-i', container(name), PYTHON, '-I', '-', *args, stdin=code, check=False, timeout=600).stdout or ''
+
+
+def _with_values(code, **values):
+  """
+  A reader program with names defined in front of it, so values (a secret among them) reach the node
+  through stdin and never through a command line.
+
+  Parameters
+  ----------
+  code : str
+    Program text that uses the names.
+  **values
+    Name -> value (str, number, dict or list of them); each becomes one ``NAME = <literal>`` line.
+
+  Returns
+  -------
+  str
+    The program text with the definitions first.
+
+  Examples
+  --------
+  >>> _with_values('print(X)', X='a')
+  "X = 'a'\\nprint(X)"
+  """
+  # One literal per name (repr of a str, number, dict or list is valid Python), then the program.
+  return ''.join('{} = {!r}\n'.format(name, value) for name, value in values.items()) + code
 
 
 def _tagged(out, tag):
@@ -448,27 +641,31 @@ def _tagged(out, tag):
   return json.loads(lines[-1][len(tag) + 1:]) if lines else None
 
 
-def sync_state(name):
+def sync_state(name, key):
   """
-  Sync history of the container apps of one node: archives sent, archives applied, quarantined records.
+  Sync history of one set's container apps on one node: archives sent, archives applied, and what any app
+  of the node quarantined or downloaded.
 
   Parameters
   ----------
   name : str
     Node name.
+  key : str
+    The set's sync key; only history entries of that set are returned (several sets can share a node).
 
   Returns
   -------
   dict
-    ``sent`` and ``received`` (each a list of cid, version, timestamps), ``quarantine`` (count).
+    ``sent`` and ``received`` (each a list of cid, version, timestamps) of the set, ``quarantine`` (CIDs of
+    the node's quarantine files) and ``downloads`` (CIDs in the node's R1FS download folder).
 
   Examples
   --------
-  >>> sync_state('r1w-02')['received'][-1]['cid']
+  >>> sync_state('r1w-02', 'lnet-sync-s0')['received'][-1]['cid']
   'Qm...'
   """
   # An empty history when the node could not be read (for example while it restarts).
-  return _tagged(_exec_python(name, SYNC_READER), 'SYNCSTATE') or {'sent': [], 'received': [], 'quarantine': 0}
+  return _tagged(_exec_python(name, SYNC_READER, key), 'SYNCSTATE') or {'sent': [], 'received': [], 'quarantine': [], 'downloads': []}
 
 
 def chain_record(name, key):
@@ -496,9 +693,9 @@ def chain_record(name, key):
   return _tagged(_exec_python(name, RECORD_READER, key), 'RECORD') or {'record': None, 'age_s': None}
 
 
-def app_file(name, image, path):
+def app_file(name, image, key, path):
   """
-  Content of a file as the container app on a node sees it.
+  Content of a file as one set's container app on a node sees it.
 
   Parameters
   ----------
@@ -506,6 +703,8 @@ def app_file(name, image, path):
     Node name.
   image : str
     The app's image, to find its container in the node's inner daemon.
+  key : str
+    The set's sync key: the app is the one whose ``R1_SYNC_KEY`` is this key (several sets can share a node).
   path : str
     Absolute path inside the app container.
 
@@ -516,14 +715,17 @@ def app_file(name, image, path):
 
   Examples
   --------
-  >>> app_file('r1w-02', 'localnet/syncapp:1', '/data/payload.txt')['sha256'][:8]
+  >>> app_file('r1w-02', 'localnet/syncapp:1', 'lnet-sync-s0', '/data/payload.txt')['sha256'][:8]
   '3f1c...'
   """
-  # The running inner container of that image (an app being restarted for a sync has none for a moment).
-  names = sh('docker', 'exec', container(name), 'docker', 'ps', '--filter', 'ancestor=' + image, '--format', '{{.Names}}',
-             check=False).stdout.split()
+  # The running inner containers of that image (an app being restarted for a sync has none for a moment).
+  running = sh('docker', 'exec', container(name), 'docker', 'ps', '--filter', 'ancestor=' + image, '--format', '{{.Names}}',
+               check=False).stdout.split()
+  # The one of the set: the container app runner gives each app of an enabled set its key as R1_SYNC_KEY.
+  names = [item for item in running if sh('docker', 'exec', container(name), 'docker', 'exec', item, 'printenv', 'R1_SYNC_KEY',
+                                          check=False).stdout.strip() == key]
   if not names:
-    # No app running right now.
+    # No app of the set running right now.
     return {'container': None, 'text': None, 'sha256': None}
   # The file read inside the app container, as the app reads it.
   proc = sh('docker', 'exec', container(name), 'docker', 'exec', names[0], 'cat', path, check=False)
@@ -533,10 +735,38 @@ def app_file(name, image, path):
   return {'container': names[0], 'text': text, 'sha256': hashlib.sha256(text.encode()).hexdigest() if text else None}
 
 
-def sync_check(manifest, provider, consumers, key, image, publishes=1, path='/data/payload.txt', within=150,
-               timeout=900, poll=10):
+def _cid_lines(text, cids, markers):
   """
-  Wait until every consumer of a sync set applied the provider's latest archive, then measure the set.
+  Lines of a node log that name one of a set's CIDs and carry one of the given markers.
+
+  Parameters
+  ----------
+  text : str
+    The node's log.
+  cids : set of str
+    CIDs of the set's archives.
+  markers : tuple of str
+    Texts of which a line must hold at least one.
+
+  Returns
+  -------
+  list of str
+    The matching lines, in log order.
+
+  Examples
+  --------
+  >>> _cid_lines('[sync] cannot prepare v1 (cid=Qm1): bad\\nother Qm1\\n', {'Qm1'}, (REFUSAL_MARKER,))
+  ['[sync] cannot prepare v1 (cid=Qm1): bad']
+  """
+  # A line can name a CID of any set: keep the lines of this set that carry a wanted marker.
+  return [line for line in text.splitlines() if any(cid in line for cid in cids) and any(mark in line for mark in markers)]
+
+
+def sync_check(manifest, provider, consumers, key, image, publishes=1, path='/data/payload.txt', within=150,
+               timeout=900, poll=10, refusing=None):
+  """
+  Wait until every consumer of a sync set applied the provider's latest archive and every refusing
+  consumer refused it, then measure the set.
 
   Parameters
   ----------
@@ -545,7 +775,7 @@ def sync_check(manifest, provider, consumers, key, image, publishes=1, path='/da
   provider : str
     Node of the provider app.
   consumers : list of str
-    Nodes of the consumer apps.
+    Nodes of the consumer apps that must apply every publish (may be empty).
   key : str
     The set's sync key.
   image : str
@@ -561,33 +791,52 @@ def sync_check(manifest, provider, consumers, key, image, publishes=1, path='/da
     Seconds to wait for the set to converge before measuring anyway.
   poll : float
     Seconds between looks.
+  refusing : dict or None
+    Node -> text: consumer apps of the set that must refuse its records before any download. Each needs a
+    refusal line for the latest record (one of its refusal lines holding the text, when the text is not
+    empty), no R1FS fetch line and no download folder for any of the set's CIDs, nothing applied, and its
+    file unchanged and unlike the provider's.
 
   Returns
   -------
   dict
     Per publish: cid, the oracles whose replica holds the record, and each consumer's delay; per consumer:
-    archives applied, quarantined records and refusal log lines; the file on every node; ``failures`` (a
+    archives applied, quarantine files and refusal log lines of this set; per refusing consumer: the CIDs
+    and reasons it refused, its fetch lines, downloads and applies; the file on every node; ``failures`` (a
     list of reasons, empty when the set passed) and ``ok``.
 
   Examples
   --------
-  >>> report = sync_check(manifest, 'r1w-01', ['r1w-02'], 'lnet-sync-s0', 'localnet/syncapp:1')
+  >>> report = sync_check(manifest, 'r1w-01', ['r1w-02'], 'lnet-sync-s0', 'localnet/syncapp:1',
+  ...                     refusing={'r1w-04': 'unsupported encryption'})
   >>> report['ok'], report['publishes'][0]['delay_s']
   (True, {'r1w-02': 41.2})
   """
+  # Nodes that must refuse, with the text one of their refusal lines must hold ('' for any refusal).
+  refusing = dict(refusing or {})
   # Start of the wait, for the report and the timeout.
   started = time.time()
+  # A refusing app's file before the check: a refusal must leave it as it is.
+  before = {name: app_file(name, image, key, path)['sha256'] for name in refusing}
   # Look until the set converged or the time is up.
   while True:
     # What the provider published so far.
-    prov = sync_state(provider)
-    # What each consumer applied so far.
-    cons = {name: sync_state(name) for name in consumers}
+    prov = sync_state(provider, key)
+    # What each consumer, refusing ones included, applied, quarantined and downloaded so far.
+    cons = {name: sync_state(name, key) for name in list(consumers) + list(refusing)}
     # The provider's archives, oldest first.
     sent = prov['sent']
-    # Converged: the expected publishes exist and every consumer last applied the latest of them.
+    # The set's CIDs: refusal, fetch and download evidence is looked up by them.
+    cids = {item['cid'] for item in sent}
+    # The refusing nodes' logs, for their refusal and fetch lines.
+    logs = {name: node_log(name) for name in refusing}
+    # Converged: the expected publishes exist, every consumer last applied the latest of them, and every
+    # refusing consumer logged its refusal of the latest.
     done = len(sent) >= publishes and all(
-      cons[name]['received'] and cons[name]['received'][-1]['cid'] == sent[-1]['cid'] for name in consumers)
+      # Each consumer's last apply is the provider's latest archive.
+      cons[name]['received'] and cons[name]['received'][-1]['cid'] == sent[-1]['cid'] for name in consumers) and all(
+      # Each refusing consumer's log names the latest archive in a refusal line.
+      _cid_lines(logs[name], {sent[-1]['cid']}, (REFUSAL_MARKER,)) for name in refusing)
     if done or time.time() - started > timeout:
       break
     # Not yet: look again later.
@@ -616,8 +865,10 @@ def sync_check(manifest, provider, consumers, key, image, publishes=1, path='/da
   latest = sent[-1]['cid'] if sent else None
   # Each oracle whose saved replica points the set at the latest archive.
   holding = sorted(name for name, item in records.items() if (item.get('record') or {}).get('cid') == latest and latest)
-  # The file as the provider app and each consumer app read it.
-  files = {name: app_file(name, image, path) for name in [provider] + list(consumers)}
+  # The file as the provider app and each consumer app read it, refusing ones included.
+  files = {name: app_file(name, image, key, path) for name in [provider] + list(consumers) + list(refusing)}
+  # The provider's file digest.
+  digest = files[provider]['sha256']
   # Per consumer counts.
   per_consumer = {}
   # Each consumer of the set.
@@ -627,10 +878,12 @@ def sync_check(manifest, provider, consumers, key, image, publishes=1, path='/da
     # What the consumer applied, and what it refused.
     per_consumer[name] = {
       'applied': len(cons[name]['received']), 'latest_cid': (cons[name]['received'] or [{}])[-1].get('cid'),
-      'quarantine_files': cons[name]['quarantine'],
-      # The two log lines the sync code writes when it refuses or postpones a record.
-      'cannot_prepare_lines': text.count('[sync] cannot prepare'),
-      'quarantined_skips': text.count('[sync] skipping quarantined'),
+      # The node's quarantine files of this set's records (other sets can share the node).
+      'quarantine_files': len(cids & set(cons[name]['quarantine'])),
+      # The two log lines the sync code writes when it refuses or postpones a record of this set.
+      'cannot_prepare_lines': len(_cid_lines(text, cids, (REFUSAL_MARKER,))),
+      # Ticks that skipped one of this set's records while it was quarantined.
+      'quarantined_skips': len(_cid_lines(text, cids, ('[sync] skipping quarantined',))),
     }
   # Reasons the set failed; empty means PASS.
   failures = []
@@ -657,8 +910,46 @@ def sync_check(manifest, provider, consumers, key, image, publishes=1, path='/da
       # A refused record of a set whose records are all valid.
       failures.append('{} refused records: {} quarantined, {} "cannot prepare" lines'.format(
         name, item['quarantine_files'], item['cannot_prepare_lines']))
-  # The provider's file digest.
-  digest = files[provider]['sha256']
+  # Per refusing consumer: what it refused, and the evidence that it fetched and applied nothing.
+  per_refusing = {}
+  # Each refusing consumer, with the text its refusal must hold.
+  for name, expected in refusing.items():
+    # Its refusal lines for this set's records.
+    lines = _cid_lines(logs[name], cids, (REFUSAL_MARKER,))
+    # Its evidence.
+    per_refusing[name] = {
+      # The text its refusal must hold ('' for any).
+      'expected': expected,
+      # The records it refused (a refusal line names the CID).
+      'refused_cids': sorted(cid for cid in cids if any(cid in line for line in lines)),
+      # The reasons, as each line gives them after "(cid=...): " (fixed texts, never a value).
+      'reasons': sorted({line.split(REFUSAL_MARKER, 1)[1].split('): ', 1)[-1].strip() for line in lines}),
+      # An R1FS fetch of any of the set's archives leaves a log line (success, decryption or download failure).
+      'get_file_lines': len(_cid_lines(logs[name], cids, GET_FILE_MARKERS)),
+      # A fetch that succeeded leaves the archive's folder in the node's download folder.
+      'downloads': sorted(cids & set(cons[name]['downloads'])),
+      # Archives of the set it applied (none for a consumer that refuses them all).
+      'applied': len(cons[name]['received']),
+      # Its quarantine files of this set's records.
+      'quarantine_files': len(cids & set(cons[name]['quarantine'])),
+      # Its app's file before and after the check (None while missing).
+      'file_before': before[name], 'file_after': files[name]['sha256'],
+    }
+  # Each refusing consumer's end state.
+  for name, item in per_refusing.items():
+    if latest not in item['refused_cids']:
+      # It never refused the latest record (it may not have seen it, or it accepted it).
+      failures.append('{} logged no refusal of the latest record {}'.format(name, latest))
+    if item['expected'] and not any(item['expected'] in reason for reason in item['reasons']):
+      # It refused for another reason than the one the step expects.
+      failures.append('{} refused without "{}": {}'.format(name, item['expected'], item['reasons']))
+    if item['get_file_lines'] or item['downloads'] or item['applied']:
+      # The refusal came after a download, or the record was applied.
+      failures.append('{} fetched or applied records it must refuse: {} fetch lines, downloads {}, {} applied'.format(
+        name, item['get_file_lines'], item['downloads'], item['applied']))
+    if item['file_after'] != item['file_before'] or (item['file_after'] is not None and item['file_after'] == digest):
+      # The app's file changed, or holds the provider's data.
+      failures.append('{} file {} changed or equals the provider\'s'.format(name, path))
   # The file written on the provider must be readable, and the same, on every consumer.
   if not digest or any(files[name]['sha256'] != digest for name in consumers):
     # Unreadable on the provider, or different on a consumer.
@@ -667,7 +958,8 @@ def sync_check(manifest, provider, consumers, key, image, publishes=1, path='/da
   return {
     'key': key, 'provider': provider, 'consumers': list(consumers), 'waited_s': round(time.time() - started, 1),
     'publishes': rows, 'record_on_oracles': '{}/{}'.format(len(holding), len(oracles)), 'records': records,
-    'consumers_state': per_consumer, 'files': files, 'failures': failures, 'ok': not failures,
+    # The refusing consumers' evidence beside the consumers' counts.
+    'consumers_state': per_consumer, 'refusing': per_refusing, 'files': files, 'failures': failures, 'ok': not failures,
   }
 
 
@@ -704,10 +996,264 @@ def sync_text(report):
     # Applies and refusals.
     lines.append('  {} applied {} archive(s), quarantined {}, "cannot prepare" lines {}'.format(
       name, item['applied'], item['quarantine_files'], item['cannot_prepare_lines']))
+  # One line per refusing consumer.
+  for name, item in report['refusing'].items():
+    # What it refused and why, and the evidence that it fetched and applied nothing.
+    lines.append('  {} refused {} record(s) {}; fetch lines {}, downloads {}, applied {}'.format(
+      name, len(item['refused_cids']), item['reasons'], item['get_file_lines'], len(item['downloads']), item['applied']))
   # One line per node's file.
   for name, item in report['files'].items():
     # Its text and digest prefix.
     lines.append('  {} {}: {}'.format(name, (item['text'] or '').strip()[:80], (item['sha256'] or '-')[:16]))
+  # The verdict last.
+  lines.append('PASS' if report['ok'] else 'FAIL: ' + '; '.join(report['failures']))
+  # One text block.
+  return '\n'.join(lines)
+
+
+def sync_needles(secret):
+  """
+  The forms of a set's secret that must not appear in node logs, plugin data or store files.
+
+  Parameters
+  ----------
+  secret : str
+    The set's secret (64 lowercase hex characters).
+
+  Returns
+  -------
+  dict
+    Kind -> text: ``secret`` (the value), ``archive_key`` (SHA-256 of it in hex, the R1FS archive key),
+    ``archive_key_16`` (the first 16 bytes of that key in hex, as debug lines of older SDK versions print
+    keys) and ``mac_subkey`` (the record MAC subkey in hex: HMAC-SHA256 keyed by the secret over the fixed context).
+
+  Examples
+  --------
+  >>> sorted(sync_needles('ab' * 32))
+  ['archive_key', 'archive_key_16', 'mac_subkey', 'secret']
+  """
+  # The archive key R1FS derives from a secret: SHA-256 of its UTF-8 text.
+  archive_key = hashlib.sha256(secret.encode('utf-8')).digest()
+  # Each form as the hex text a log line or a file would hold.
+  return {
+    'secret': secret,
+    'archive_key': archive_key.hex(),
+    'archive_key_16': archive_key[:16].hex(),
+    # HMAC-SHA256 keyed by the secret's ASCII text over the fixed context.
+    'mac_subkey': hmac.new(secret.encode('ascii'), SYNC_MAC_CONTEXT, hashlib.sha256).hexdigest(),
+  }
+
+
+def custody(job, secret, oracle, node=None, key=None, image='localnet/syncapp:1', secret_len=None, timeout=180, poll=10):
+  """
+  Check the custody of a set's secret for one Deeploy job: stored redacted, and delivered to the node.
+
+  On ``oracle``, the job's pointer in DEEPLOY_DEPLOYED_JOBS names the stored job and its deployment plan in
+  R1FS; each is read with the default key, as any node can read it, and must hold only the dAuth
+  placeholder at ``ENV.R1EN_SYNC_SECRET`` and the secret nowhere. On ``node``, the set's app reports in
+  ``/data/secret_len`` how many bytes the variable has in its environment.
+
+  Parameters
+  ----------
+  job : int
+    The Deeploy job id.
+  secret : str
+    The set's secret (only searched for, never printed).
+  oracle : str
+    Oracle whose saved chain-store replica and IPFS repository are read.
+  node : str or None
+    Node of the job's app; None skips the app check.
+  key : str or None
+    The set's sync key, to find the app on ``node``.
+  image : str
+    The app's image.
+  secret_len : int or None
+    Expected count in ``/data/secret_len`` (65: the secret reached the container; 0: it did not); None only
+    reports it.
+  timeout : float
+    Seconds to wait for the pointer to appear in the oracle's saved replica.
+  poll : float
+    Seconds between looks.
+
+  Returns
+  -------
+  dict
+    ``pointer`` (its type, or None), ``docs`` (per stored document: cid, readable, what the instances hold at
+    the variable as "placeholder"/"other", their SECRET_PATHS, whether the secret occurs in it), the app's
+    ``secret_len``, ``failures`` and ``ok``.
+
+  Examples
+  --------
+  >>> custody(3001, secret, 'r1s-01', node='r1w-01', key='lnet-sync-k1', secret_len=65)['ok']
+  True
+  """
+  # Start of the wait for the pointer.
+  started = time.time()
+  # The reader with the secret and the node's paths in front of it: values travel through stdin only.
+  code = _with_values(CUSTODY_READER, NEEDLE=secret, CSTORE_PICKLE=CSTORE_PICKLE, IPFS_HOME=IPFS_HOME,
+                      PLACEHOLDER=DAUTH_PLACEHOLDER)
+  # The pointer reaches the saved replica some seconds after the operation completed.
+  while True:
+    # One read of the replica and of the documents the pointer names.
+    found = _tagged(_exec_python(oracle, code, str(job)), 'CUSTODY')
+    if (found and found['pointer']) or time.time() - started > timeout:
+      break
+    # Not saved yet: look again later.
+    time.sleep(poll)
+  # The documents read, none when there is no pointer.
+  docs = found['docs'] if found and found['pointer'] else {}
+  # The app's own count of the variable's bytes (written by the test app at every start).
+  text = app_file(node, image, key, '/data/secret_len')['text'] if node else None
+  # A count, or None when no app or file was found.
+  length = int(text) if text else None
+  # Reasons the custody check failed; empty means PASS.
+  failures = []
+  if not docs:
+    # Deeploy stored no pointer for the job, the replica was not saved in time, or the read failed.
+    failures.append('no DEEPLOY_DEPLOYED_JOBS pointer for job {} could be read on {} within {} s'.format(job, oracle, timeout))
+  # Each stored document.
+  for kind, doc in docs.items():
+    if not doc['readable']:
+      # Any node can read a stored job with the default key; this one could not be read so.
+      failures.append('stored {} {} is not readable with the default key'.format(kind, doc['cid']))
+    elif set(doc['values']) != {'placeholder'}:
+      # The variable is missing, or holds something other than the placeholder.
+      failures.append('stored {} holds {} at ENV.R1EN_SYNC_SECRET, not only the placeholder'.format(kind, doc['values']))
+    if doc['secret_in_doc']:
+      # The secret itself is in a document every node can read.
+      failures.append('stored {} holds the secret'.format(kind))
+  if secret_len is not None and length != secret_len:
+    # The node did not deliver the secret to the app as the code version should.
+    failures.append('{} app has {} bytes of R1EN_SYNC_SECRET in its environment, expected {}'.format(node, length, secret_len))
+  # The whole check.
+  return {
+    'job': job, 'oracle': oracle, 'pointer': found['pointer'] if found else None, 'docs': docs, 'node': node,
+    'secret_len': length, 'expected_secret_len': secret_len, 'waited_s': round(time.time() - started, 1),
+    'failures': failures, 'ok': not failures,
+  }
+
+
+def custody_text(report):
+  """
+  A short human summary of a ``custody`` report.
+
+  Parameters
+  ----------
+  report : dict
+    Result of ``custody``.
+
+  Returns
+  -------
+  str
+    A few lines ending with ``PASS`` or ``FAIL`` and the reasons.
+
+  Examples
+  --------
+  >>> print(custody_text(report).splitlines()[-1])
+  PASS
+  """
+  # The job, where it was read, and the pointer's kind.
+  lines = ['custody of job {}: pointer {} on {} (waited {} s)'.format(
+    report['job'], report['pointer'], report['oracle'], report['waited_s'])]
+  # One line per stored document.
+  for kind, doc in report['docs'].items():
+    # What it holds at the variable, its selections, and whether the secret is in it.
+    lines.append('  stored {} {}: readable {}, ENV.R1EN_SYNC_SECRET {}, SECRET_PATHS {}, secret in it {}'.format(
+      kind, doc['cid'], doc['readable'], doc['values'], doc['secret_paths'], doc['secret_in_doc']))
+  if report['node']:
+    # The app's count.
+    lines.append('  {} app: {} bytes of R1EN_SYNC_SECRET in its environment (expected {})'.format(
+      report['node'], report['secret_len'], report['expected_secret_len']))
+  # The verdict last.
+  lines.append('PASS' if report['ok'] else 'FAIL: ' + '; '.join(report['failures']))
+  # One text block.
+  return '\n'.join(lines)
+
+
+def scan(manifest, secret):
+  """
+  Search every node of the localnet for a set's secret in any of its forms.
+
+  Each node's log (``docker logs``) and every file of its cache folder (logs, plugin data, the apps'
+  mounted system and data volumes, R1FS downloads, store files) are searched for each form of
+  ``sync_needles``. In the chain-store replica, the records of DAUTH_JOB_SECRETS, where dAuth keeps the
+  bundles it serves, are reported apart and are no failure.
+
+  Parameters
+  ----------
+  manifest : dict
+    The localnet manifest.
+  secret : str
+    The set's secret (never printed; only the kinds of what was found are).
+
+  Returns
+  -------
+  dict
+    Per node: files and bytes read, ``hits`` (file path and kinds), ``log_kinds``, ``dauth_bundle_kinds``;
+    ``failures`` (one per hit, and per node that could not be read) and ``ok``.
+
+  Examples
+  --------
+  >>> scan(manifest, secret)['ok']
+  True
+  """
+  # The forms looked for.
+  needles = sync_needles(secret)
+  # The reader with the forms in front of it: they travel through stdin only.
+  code = _with_values(SCAN_READER, NEEDLES=needles, CSTORE_PICKLE=CSTORE_PICKLE)
+  # Per node results.
+  nodes = {}
+  # Reasons the scan failed; empty means PASS.
+  failures = []
+  # Every real node: seeds, oracles and workers.
+  for node in manifest['nodes']:
+    # The node's files.
+    found = _tagged(_exec_python(node['name'], code), 'SCAN')
+    # The node's log as Docker keeps it.
+    text = node_log(node['name'])
+    # The forms its log holds.
+    log_kinds = sorted(kind for kind, needle in needles.items() if needle in text)
+    if found is None:
+      # A node that could not be read is no proof of absence.
+      failures.append('{} could not be scanned'.format(node['name']))
+      # Nothing read on it.
+      found = {'files': 0, 'bytes': 0, 'hits': [], 'dauth_bundle_kinds': []}
+    # The node's result.
+    nodes[node['name']] = dict(found, log_kinds=log_kinds)
+    # One failure per file that holds a form of the secret.
+    for hit in found['hits']:
+      # The path and the kinds, never the text found.
+      failures.append('{}: {} in {}'.format(node['name'], ', '.join(hit['kinds']), hit['path']))
+    if log_kinds:
+      # The node's log holds a form of the secret.
+      failures.append('{}: {} in its log'.format(node['name'], ', '.join(log_kinds)))
+  # The whole scan.
+  return {'nodes': nodes, 'failures': failures, 'ok': not failures}
+
+
+def scan_text(report):
+  """
+  A short human summary of a ``scan`` report.
+
+  Parameters
+  ----------
+  report : dict
+    Result of ``scan``.
+
+  Returns
+  -------
+  str
+    One line per node, then ``PASS`` or ``FAIL`` and the reasons.
+
+  Examples
+  --------
+  >>> print(scan_text(report).splitlines()[-1])
+  PASS
+  """
+  # One line per node: what was read, what was found, and the dAuth bundle forms reported apart.
+  lines = ['  {}: {} files, {:.1f} MB, hits {}, log {}, dAuth bundle records {}'.format(
+    name, item['files'], item['bytes'] / 1e6, len(item['hits']), item['log_kinds'], item['dauth_bundle_kinds'])
+    for name, item in report['nodes'].items()]
   # The verdict last.
   lines.append('PASS' if report['ok'] else 'FAIL: ' + '; '.join(report['failures']))
   # One text block.

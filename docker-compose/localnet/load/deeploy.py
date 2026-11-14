@@ -17,7 +17,8 @@ delete    remove a job
 load      create several jobs one after another
 watch     print the state of a job's operation every few seconds
 sync-app  deploy one container app of a container-sync set (provider or consumer) on
-          one worker, as the Deeploy web app builds it; the worker must run Docker
+          one worker, as the Deeploy web app builds it; the worker must run Docker;
+          ``--secret NAME`` adds the set's secret as a dAuth secret (``secret_paths``)
 
 The incident: ``create`` a job on one worker, stop that worker's container,
 then ``delete`` the job. The operation cannot finish while the worker is
@@ -37,6 +38,11 @@ import urllib.request
 import uuid
 
 import common
+
+# The tool's folder (/opt/localnet in the container), for the secret derivation shared with the host tool.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Same derivation as the host's scan and custody check: a set's secret from its name, never written down.
+from lnlib.common import sync_secret  # noqa: E402
 
 WHO = 'deeploy'
 V2_PREFIX = 'Please sign this message for Deeploy: '
@@ -171,8 +177,13 @@ def create_payload(job_id, nodes, alias, delay=5, config_bytes=0):
 # SYNC_PERIOD seconds, then, while it has published fewer than SYNC_PUBLISHES archives, writes a counter
 # and a payload file into its fixed-size volume and asks for a publish through the request file. Every
 # offline publish restarts the app, which starts this script again. Every role prints what it holds.
+# At every start the app writes how many bytes R1EN_SYNC_SECRET has in its environment to secret_len (65 for
+# a 64-character secret and its newline, 0 when the variable is absent): a count, never the value. A
+# provider puts the set's key into the publish metadata, so a check can tell two sets on one node apart.
 SYNC_APP_SCRIPT = r'''
 D=/data; P=${SYNC_PERIOD:-30}; M=${SYNC_PUBLISHES:-1}
+# Bytes of the secret variable in this container's environment (with the newline), never the value.
+printenv R1EN_SYNC_SECRET | wc -c > "$D/secret_len"
 echo "syncapp start role=${R1_SYNC_TYPE:-none} key=${R1_SYNC_KEY:-none}"
 if [ "${R1_SYNC_TYPE:-}" = provider ]; then
   sleep "$P"
@@ -181,7 +192,8 @@ if [ "${R1_SYNC_TYPE:-}" = provider ]; then
     n=$((n + 1))
     echo "$n" > "$D/counter"
     echo "payload $n from $(hostname) at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$D/payload.txt"
-    printf '{"archive_paths": ["%s/"], "metadata": {"n": %s}}\n' "$D" "$n" > "$R1_VOLUME_SYNC_DIR/request.json.tmp"
+    # The publish request; its metadata names the set, so a check can tell sets on one node apart.
+    printf '{"archive_paths": ["%s/"], "metadata": {"n": %s, "key": "%s"}}\n' "$D" "$n" "$R1_SYNC_KEY" > "$R1_VOLUME_SYNC_DIR/request.json.tmp"
     mv "$R1_VOLUME_SYNC_DIR/request.json.tmp" "$R1_SYNC_REQUEST_FILE"
     echo "syncapp publish requested n=$n"
   fi
@@ -196,9 +208,13 @@ done
 MICRO_JOB_TYPE = 53
 # Its resources, as Deeploy checks them against the paid job type.
 MICRO = {'cpu': 0.25, 'memory': '512m', 'storage': '2g'}
+# The environment variable a node reads the set's secret from.
+SYNC_SECRET_ENV = 'R1EN_SYNC_SECRET'
+# "--secret malformed": 32 x "a" is not 64 lowercase hex, so a node must refuse it (and it is no secret).
+MALFORMED_SECRET = 'a' * 32
 
 
-def sync_app_payload(job_id, node, role, key, image, period=30, publishes=1):
+def sync_app_payload(job_id, node, role, key, image, period=30, publishes=1, secret=None):
   """
   Deeploy create request for one container app of a container-sync set, as the Deeploy web app builds it.
 
@@ -218,6 +234,9 @@ def sync_app_payload(job_id, node, role, key, image, period=30, publishes=1):
     Provider: seconds before each publish.
   publishes : int
     Provider: archives to publish in all.
+  secret : str or None
+    The set's secret, sent as ``ENV.R1EN_SYNC_SECRET`` and selected by the top-level ``secret_paths``, so
+    Deeploy keeps it out of the stored job and dAuth delivers it to the node; None sends no secret.
 
   Returns
   -------
@@ -229,7 +248,14 @@ def sync_app_payload(job_id, node, role, key, image, period=30, publishes=1):
   --------
   >>> sync_app_payload(3001, '0xai_A...', 'provider', 'lnet-sync-s0', 'localnet/syncapp:1')['plugins'][0]['SYNC']
   {'ENABLED': True, 'TYPE': 'provider', 'KEY': 'lnet-sync-s0'}
+  >>> sync_app_payload(3001, '0xai_A...', 'provider', 'k', 'img', secret='ab' * 32)['secret_paths']
+  [['plugins', 0, 'ENV', 'R1EN_SYNC_SECRET']]
   """
+  # The app's variables: the provider's pace.
+  env = {'SYNC_PERIOD': str(period), 'SYNC_PUBLISHES': str(publishes)}
+  if secret is not None:
+    # The secret is one more ENV entry, as the web app adds it; secret_paths below selects it.
+    env[SYNC_SECRET_ENV] = secret
   # Field for field what formatGenericJobPayload and withSecretPaths of the web app produce.
   return {
     'request_id': 'create-{}-{}'.format(job_id, uuid.uuid4().hex[:12]),
@@ -251,7 +277,8 @@ def sync_app_payload(job_id, node, role, key, image, period=30, publishes=1):
       'TUNNEL_ENGINE_ENABLED': False,
       'CLOUDFLARE_TOKEN': None,
       'EXPOSED_PORTS': {},
-      'ENV': {'SYNC_PERIOD': str(period), 'SYNC_PUBLISHES': str(publishes)},
+      # The app's variables, the secret among them when one is sent.
+      'ENV': env,
       'DYNAMIC_ENV': {},
       'VOLUMES': {},
       'FILE_VOLUMES': {},
@@ -271,7 +298,8 @@ def sync_app_payload(job_id, node, role, key, image, period=30, publishes=1):
     'pipeline_input_uri': None,
     'chainstore_response': True,
     # Secret paths travel at the top level (the web app's withSecretPaths); Deeploy refuses them in a plugin.
-    'secret_paths': [],
+    # The secret's path is the one the web app emits: plugin 0, its ENV, the variable.
+    'secret_paths': [['plugins', 0, 'ENV', SYNC_SECRET_ENV]] if secret is not None else [],
   }
 
 
@@ -330,6 +358,9 @@ def main():
   one.add_argument('--publishes', type=int, default=1, help='provider: archives to publish in all')
   # How long a "node is not online" refusal is retried (a worker that has just started).
   one.add_argument('--online-wait', type=float, default=180, help='seconds to retry while the worker is not online yet')
+  # The set's secret by name (derived from the cluster's private settings, never given on the command line).
+  one.add_argument('--secret', metavar='NAME',
+                   help='send the secret of set NAME as a dAuth secret (another name: a wrong secret; "malformed": 32 x "a")')
   for name in ('create', 'delete', 'update', 'watch'):
     one = sub.add_parser(name)
     one.add_argument('--job', type=int, required=True)
@@ -345,7 +376,8 @@ def main():
   one.add_argument('--config-bytes', type=int, default=0)
   args = parser.parse_args()
 
-  manifest, _secrets = common.start(WHO)
+  # The cluster's private settings also give each named set its secret (sync-app --secret).
+  manifest, cluster_secrets = common.start(WHO)
   out = common.Recorder('deeploy.jsonl')
   account = wallet()
   client = Client(args.api, account, out)
@@ -362,13 +394,16 @@ def main():
     return 0
 
   if args.cmd == 'sync-app':
+    # No secret, the fixed malformed value, or the named set's 64-hex secret.
+    secret = None if args.secret is None else MALFORMED_SECRET if args.secret == 'malformed' else sync_secret(cluster_secrets, args.secret)
     # A worker that started moments ago is not yet online for the oracles: retry that refusal, as a user would.
     deadline = time.time() + args.online_wait
     # One attempt per lap.
     while True:
       # The worker's node address from the manifest; a fresh request id for every attempt.
       payload = sync_app_payload(args.job, worker_addresses(manifest, [args.node])[0], args.role, args.key, args.image,
-                                 period=args.period, publishes=args.publishes)
+                                 # The provider's pace, and the set's secret (None: no secret is sent).
+                                 period=args.period, publishes=args.publishes, secret=secret)
       # Signed by the job owner's wallet, sent through the public Deeploy name.
       accepted = client.submit('create_pipeline', payload)
       # The admission answer (an error body on a refusal).
