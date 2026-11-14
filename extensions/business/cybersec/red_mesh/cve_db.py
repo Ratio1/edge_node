@@ -25,6 +25,7 @@ CVE_DB_LAST_UPDATED = "2026-11-14"
 _CURRENT_DYNAMIC_CACHE: ContextVar = ContextVar("redmesh_dynamic_reference_cache", default=None)
 # Scan-local `{"<port>/<cve_id>": entry}` of CVEs the matcher evaluated and
 # skipped as not applicable (RM-103 item 6). None outside a worker run.
+_VULNDB_READER = None  # `generated` source (RM-169); None means the frozen `CVE_DATABASE`
 _CURRENT_NOT_APPLICABLE: ContextVar = ContextVar("redmesh_cves_not_applicable", default=None)
 
 
@@ -570,6 +571,20 @@ def check_cves(
 
   findings = []
   seen_cves = set()
+  reader = _VULNDB_READER
+  if reader is not None:
+    # `generated`: the reader returns one row per CVE, strongest first, so no `seen_cves` here.
+    for match in reader.query(product, version):
+      if applicability and (CLIENT_APPLICABILITY if match.client_side else SERVER_APPLICABILITY) != applicability:
+        if match.client_side:
+          _record_not_applicable(match, product, version, package, NOT_APPLICABLE_CLIENT_SIDE)
+        continue
+      status = backport_status(product, match.cve_id, package)
+      if status == BACKPORT_FIXED:
+        _record_not_applicable(match, product, version, package, NOT_APPLICABLE_BACKPORT_FIXED)
+        continue
+      findings.append(_build_finding(match, product, version, dynamic_cache, backport_status=status, reader=reader))
+    return findings
   for entry in CVE_DATABASE:
     if entry.product != product:
       continue
@@ -592,6 +607,15 @@ def check_cves(
       continue
     findings.append(_build_finding(entry, product, version, dynamic_cache, backport_status=status))
   return findings
+
+
+def set_vulndb_reader(reader) -> None:
+  """Select the source for `check_cves`: a `VulndbReader` (`generated`) or None (`static`).
+
+  Deployment-wide, set once at plugin init: probes run on worker threads, so a ContextVar would not reach them.
+  """
+  global _VULNDB_READER
+  _VULNDB_READER = reader
 
 
 def set_dynamic_reference_cache(dynamic_cache):
@@ -619,12 +643,55 @@ def reset_not_applicable_collector(token) -> None:
   _CURRENT_NOT_APPLICABLE.reset(token)
 
 
-def _build_finding(entry, product: str, version: str, dynamic_cache, backport_status: str = ""):
+# Products distributions package and backport fixes for, so a plain banner cannot settle `generated` rows (RM-169).
+_BACKPORTED_PRODUCTS = frozenset({
+  "openssh", "openssl", "apache", "nginx", "mysql", "mariadb", "postgresql", "php", "bind", "samba", "exim",
+  "proftpd", "redis", "memcached", "mongodb", "couchdb", "tomcat", "vsftpd", "dovecot", "postfix",
+})
+# Order in which one reason wins when several apply (report-findings.md, Per-finding fields).
+_TENTATIVE_REASON_ORDER = ("platform_dependent", "backport_unknown", "banner_only", "nvd_exact", "cna_range")
+
+
+def _static_cwe_id(cve_id: str) -> str:
+  """The static catalog classification of a CVE: frozen into finding identity whichever source made the finding."""
+  global _STATIC_CWE
+  if _STATIC_CWE is None:
+    _STATIC_CWE = {}
+    for e in CVE_DATABASE:
+      if e.cwe_id and e.cve_id not in _STATIC_CWE:
+        _STATIC_CWE[e.cve_id] = e.cwe_id
+  return _STATIC_CWE.get(cve_id, "")
+
+
+_STATIC_CWE = None
+
+
+def _confidence_reason(backport_status: str, match, product: str) -> tuple:
+  """`(confidence, reason)` of a CVE finding. `match` is a reader `Match`, or None under `static`."""
+  if backport_status == BACKPORT_NOT_FIXED and not (match and match.platform_dependent):
+    return "firm", "distro_package"
+  if match is None:
+    return "tentative", "backport_unknown" if backport_status == BACKPORT_UNKNOWN else "banner_only"
+  reasons = set()
+  if match.platform_dependent:
+    reasons.add("platform_dependent")
+  if product in _BACKPORTED_PRODUCTS and backport_status != BACKPORT_NOT_FIXED:
+    reasons.add("backport_unknown" if backport_status == BACKPORT_UNKNOWN else "banner_only")
+  if match.confidence == "tentative":
+    reasons.add(match.reason if match.reason in ("nvd_exact", "cna_range") else "cna_range")
+  for reason in _TENTATIVE_REASON_ORDER:
+    if reason in reasons:
+      return "tentative", reason
+  return match.confidence, match.reason
+
+
+def _build_finding(entry, product: str, version: str, dynamic_cache, backport_status: str = "", reader=None):
   """Construct a Finding for a matched CveEntry, optionally enriched
-  via the dynamic reference cache."""
+  via the dynamic reference cache. With a `reader`, `entry` is a reader `Match` (`generated`)."""
+  generated = reader is not None
   # Parse the legacy "CWE-22" format into an int CWE id for the
   # list-form `cwe` field on Finding.
-  cwe_int = _parse_cwe_int(entry.cwe_id)
+  cwe_int = _parse_cwe_int(entry.cwe if generated else entry.cwe_id)
   cwe_list = (cwe_int,) if cwe_int else ()
 
   # Static OWASP mapping from the cwe_to_owasp reference table.
@@ -638,10 +705,26 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
   cvss_version = "3.1"
   cvss_source = ""
   cvss_freshness = ""
-  kev = False
+  # `None` is "not evaluated": nothing consulted a database or a live cache (report-findings.md, KEV).
+  kev = None
   epss_score = None
   references_list: list[str] = [f"https://nvd.nist.gov/vuln/detail/{entry.cve_id}"]
   severity = entry.severity
+  cvss_list = ()
+  if generated:
+    # The database is the only source: the dynamic cache is not consulted. UNKNOWN (no score, no overlay
+    # severity) lists as MEDIUM so an unscored CVE is not hidden.
+    dynamic_cache = None
+    severity = Severity(entry.severity) if entry.severity in Severity.__members__ else Severity.MEDIUM
+    kev = bool(entry.kev)
+    epss_score = entry.epss
+    cvss_list = tuple(entry.cvss)
+    cvss_freshness = reader.built_at or ""
+    # The label is v3.x only; a 4.0 or 2.0 display CVSS stays in `cvss[]` (report-findings.md).
+    if str(entry.cvss_version or "").startswith("3."):
+      cvss_score, cvss_version, cvss_source = entry.cvss_score, entry.cvss_version, entry.cvss_source or ""
+      cvss_vector = next((c["vector"] for c in cvss_list
+                          if c["version"] == cvss_version and c["source"] == cvss_source and c["score"] == cvss_score), "")
 
   if dynamic_cache is not None:
     try:
@@ -675,7 +758,7 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
   # Catalog labels are NVD's band (`test_cve_cvss_vectors.py`); the band check
   # still guards a refetched table that moved ahead of the catalog, withholding
   # the vector as a disagreeing probe template is (RM-064).
-  if not cvss_vector and cvss_score is None:
+  if not generated and not cvss_vector and cvss_score is None:
     static_vector = CVE_CVSS_VECTORS.get(entry.cve_id, "")
     if static_vector and _template_band_agrees(static_vector, severity):
       cvss_vector = static_vector
@@ -688,18 +771,17 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
   # left to the reader (RM-070). `not_fixed` is the one case the evidence
   # supports beyond the upstream version, so it is the one case that is not
   # `tentative`.
+  confidence, confidence_reason = _confidence_reason(backport_status, entry if generated else None, product)
   if backport_status == BACKPORT_NOT_FIXED:
     backport_note = (
       " The distribution package is below the revision that carries the fix, "
       "so the backport does not apply."
     )
-    confidence = "firm"
   elif backport_status == BACKPORT_UNKNOWN:
     backport_note = (
       " Backport status unknown: a distribution package was detected but no "
       "advisory data covers this CVE for it, so the fix may already be applied."
     )
-    confidence = "tentative"
   else:
     # BACKPORT_UNKNOWN_NO_PACKAGE, or "" from a caller that passed no status.
     backport_note = (
@@ -708,7 +790,6 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
       "security fixes without changing the upstream version number — this "
       "may be a false positive."
     )
-    confidence = "tentative"
     backport_status = backport_status or BACKPORT_UNKNOWN_NO_PACKAGE
 
   finding = Finding(
@@ -717,8 +798,11 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
     description=f"{product} {version} is vulnerable to {entry.cve_id}.{backport_note}",
     evidence=f"Detected version: {version}, affected: {entry.constraint}",
     remediation=f"Upgrade {product} to a patched version, or verify backport status with the OS vendor.",
-    cwe_id=entry.cwe_id,
+    cwe_id=_static_cwe_id(entry.cve_id) if generated else entry.cwe_id,
     confidence=confidence,
+    confidence_reason=confidence_reason,
+    vulndb_build_id=reader.build_id if generated else None,
+    cvss=cvss_list,
     backport_status=backport_status,
     # Phase 1 / Phase 2 enriched fields
     cvss_score=cvss_score,
