@@ -1,0 +1,13 @@
+{
+ "name": "container_sync",
+ "about": "One container-sync set on two workers that run their own Docker daemon: a consumer app on r1w-02 and a provider app on r1w-01, both created through the Deeploy API. The provider publishes two archives of its fixed-size volume 90 s apart (more than the consumer's 60 s chain-store refresh, so each archive is applied on its own); the check passes when the chain-store record on the oracles points at the latest archive, the consumer applied every archive (or a later one) within 150 s of its publish, no record was refused, and the file the provider wrote reads the same inside the consumer app. Needs init --docker-nodes r1w-01,r1w-02 and the image redis:7-alpine on this machine (any BusyBox image works: change image).",
+ "steps": [
+  {"do": "image", "image": "redis:7-alpine", "tag": "localnet/syncapp:1", "nodes": ["r1w-01", "r1w-02"]},
+  {"do": "isolation", "image": "localnet/syncapp:1", "nodes": ["r1w-01", "r1w-02"]},
+  {"do": "run", "generator": "deeploy", "args": ["setup", "--first-job", "3001", "--jobs", "2", "--job-type", "53"], "timeout": 120},
+  {"do": "phase", "name": "sync"},
+  {"do": "run", "generator": "deeploy", "args": ["sync-app", "--job", "3002", "--node", "r1w-02", "--role", "consumer", "--key", "lnet-sync-s0"], "timeout": 960},
+  {"do": "run", "generator": "deeploy", "args": ["sync-app", "--job", "3001", "--node", "r1w-01", "--role", "provider", "--key", "lnet-sync-s0", "--period", "90", "--publishes", "2"], "timeout": 960},
+  {"do": "sync", "name": "s0", "key": "lnet-sync-s0", "provider": "r1w-01", "consumers": ["r1w-02"], "image": "localnet/syncapp:1", "publishes": 2, "within": 150, "timeout": 900}
+ ]
+}

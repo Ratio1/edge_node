@@ -66,11 +66,83 @@ def volume(name):
   return '{}_{}_cache'.format(PROJECT, name)
 
 
-def plan(oracles=11, workers=2, arms=None, default_arm='new', evm_net='mainnet', full_oracles=None, full_workers=1):
+def docker_volume(name):
   """
-  Return the list of real nodes. ``arms`` maps node name to the source tree it runs. The first
-  ``full_oracles`` oracles (never fewer than the seeds) and the first ``full_workers`` workers run their
-  web plugins; the others are headless.
+  Name of the volume that holds the inner Docker daemon's data of one node.
+
+  Parameters
+  ----------
+  name : str
+    Node name, for example ``r1w-01``.
+
+  Returns
+  -------
+  str
+    Docker volume name, labelled as a localnet volume when created, so ``down --purge`` removes it.
+
+  Notes
+  -----
+  The volume keeps loaded images and container state across a recreation of the node container
+  (``switch``), and puts ``/var/lib/docker`` on the host's file system, so the inner daemon can use
+  overlay2 instead of an overlay on an overlay.
+
+  Examples
+  --------
+  >>> docker_volume('r1w-01')
+  'r1ln_r1w-01_docker'
+  """
+  # Same pattern as the node's data volume, so every localnet volume starts with the project name.
+  return '{}_{}_docker'.format(PROJECT, name)
+
+
+def plan(oracles=11, workers=2, arms=None, default_arm='new', evm_net='mainnet', full_oracles=None, full_workers=1,
+         docker_nodes=(), web=None, web_of=None):
+  """
+  Return the list of real nodes of a localnet.
+
+  The first ``full_oracles`` oracles (never fewer than the seeds) and the first ``full_workers`` workers
+  run their web plugins; the others are headless. A node named in ``docker_nodes`` runs its own Docker
+  daemon, as a production node does, so it can run container apps.
+
+  Parameters
+  ----------
+  oracles : int
+    Real oracle nodes; the first four are the seeds.
+  workers : int
+    Real nodes that are not oracles.
+  arms : dict or None
+    Node name -> source tree it runs; others run ``default_arm``.
+  default_arm : str
+    Source tree of every node not named in ``arms``.
+  evm_net : str
+    Network whose constants and code paths the nodes use.
+  full_oracles : int or None
+    Oracles that run their web plugins (None: all).
+  full_workers : int
+    Workers that run their web plugins.
+  docker_nodes : sequence of str
+    Nodes that start the inner Docker daemon (``EE_DD=1``, privileged, on the internal network only).
+  web : list of str or None
+    Web plugins every node with web plugins keeps (None: all of them).
+  web_of : dict or None
+    Node name -> list of web plugins that node keeps, overriding ``web``.
+
+  Returns
+  -------
+  list of dict
+    One dict per node: name, role, ip, arm, volume, and ``docker``, ``env``, ``web`` where they apply.
+
+  Raises
+  ------
+  LocalnetError
+    Too few or too many oracles, an unknown node or web plugin name, or a seed without dAuth.
+
+  Examples
+  --------
+  >>> nodes = plan(oracles=4, workers=2, full_workers=0, docker_nodes=('r1w-01', 'r1w-02'),
+  ...              web=['DAUTH_MANAGER'], web_of={'r1s-01': ['DAUTH_MANAGER', 'DEEPLOY_MANAGER_API']})
+  >>> [node['name'] for node in nodes if node.get('docker')]
+  ['r1w-01', 'r1w-02']
   """
   arms = arms or {}
   full_oracles = max(len(SEEDS), oracles if full_oracles is None else full_oracles)
@@ -78,6 +150,13 @@ def plan(oracles=11, workers=2, arms=None, default_arm='new', evm_net='mainnet',
     raise LocalnetError('a localnet needs at least the {} seed oracles'.format(len(SEEDS)))
   if oracles - len(SEEDS) > len(ORACLE_NAMES):
     raise LocalnetError('at most {} oracles are supported'.format(len(SEEDS) + len(ORACLE_NAMES)))
+  # Web plugin names are checked up front: a misspelt one would otherwise silently disable a plugin.
+  for chosen in [web or []] + list((web_of or {}).values()):
+    # Names that are not web plugins of the node.
+    unknown = sorted(set(chosen) - set(WEB_PLUGIN_SIGNATURES))
+    if unknown:
+      # Refused, with the list of valid names.
+      raise LocalnetError('unknown web plugin(s) {} (known: {})'.format(unknown, ', '.join(WEB_PLUGIN_SIGNATURES)))
   nodes = []
   for idx, (name, broker, relay) in enumerate(SEEDS):
     nodes.append({'name': name, 'role': 'seed', 'supervisor': True, 'broker': broker, 'relay': relay, 'ip': ip(51 + idx)})
@@ -87,10 +166,32 @@ def plan(oracles=11, workers=2, arms=None, default_arm='new', evm_net='mainnet',
   for idx in range(workers):
     nodes.append({'name': 'r1w-{:02d}'.format(idx + 1), 'role': 'worker', 'supervisor': False, 'ip': ip(81 + idx),
                   'headless': idx >= full_workers})
+  # The node names of this topology.
+  names = {node['name'] for node in nodes}
+  # A node name that is not in the topology would otherwise be ignored without a word.
+  unknown = sorted((set(docker_nodes) | set(web_of or {})) - names)
+  if unknown:
+    # Refused, with the names this topology has.
+    raise LocalnetError('unknown node name(s) {} (this topology has: {})'.format(unknown, ', '.join(sorted(names))))
   for node in nodes:
     node['arm'] = arms.get(node['name'], default_arm)
     node['evm_net'] = evm_net
     node['volume'] = volume(node['name'])
+    # The web plugins this node keeps when it is not headless (absent: every web plugin, as before).
+    kept = (web_of or {}).get(node['name'], web)
+    if kept is not None:
+      # Stored in the manifest, read by the start-up overrides and the front.
+      node['web'] = list(kept)
+    # A seed serves dAuth on mainnet, and "up" waits for the dAuth plugin of every seed.
+    if node['role'] == 'seed' and 'DAUTH_MANAGER' not in node.get('web', ['DAUTH_MANAGER']):
+      # Refused before anything is generated.
+      raise LocalnetError('seed {} must keep DAUTH_MANAGER among its web plugins'.format(node['name']))
+    if node['name'] in docker_nodes:
+      # Read by the compose service, the volumes and every container-app command.
+      node['docker'] = True
+      # EE_DD=1 makes the image entrypoint start the inner Docker daemon and the node report container
+      # support in its heartbeat ("did"), which Deeploy requires of a node it places a container app on.
+      node['env'] = dict(node.get('env') or {}, EE_DD='1')
   return nodes
 
 
@@ -213,14 +314,38 @@ def build_chain_state(nodes, fleet=None):
 
 
 def _startup_overrides(node):
+  """
+  Localnet settings merged into the production start-up configuration of one node.
+
+  Parameters
+  ----------
+  node : dict
+    A node of ``plan``; reads ``headless`` and ``web``.
+
+  Returns
+  -------
+  dict
+    ``ADMIN_PIPELINE`` overrides (fixed web plugin ports, no tunnels, disabled web plugins) and the
+    switched-off low-memory restart.
+
+  Examples
+  --------
+  >>> admin = _startup_overrides({'web': ['DAUTH_MANAGER']})['ADMIN_PIPELINE']
+  >>> admin['DAUTH_MANAGER'].get('DISABLED'), admin['ORACLE_API']['DISABLED']
+  (None, True)
+  """
   admin = {}
   for signature, port in WEB_PLUGINS.items():
     admin[signature] = {'PORT': port, 'TUNNEL_ENGINE_ENABLED': False}
   for signature in NO_TUNNEL_PLUGINS:
     admin[signature] = {'TUNNEL_ENGINE_ENABLED': False}
-  if node.get('headless'):
+  # A headless node runs no web plugin; a node with a "web" list runs only the plugins on that list.
+  kept = () if node.get('headless') else node.get('web')
+  if kept is not None:
     for signature in WEB_PLUGIN_SIGNATURES:
-      admin.setdefault(signature, {})['DISABLED'] = True
+      if signature not in kept:
+        # Disabled in the admin pipeline: the plugin and its two processes never start.
+        admin.setdefault(signature, {})['DISABLED'] = True
   return {
     'ADMIN_PIPELINE': admin,
     # A node restarts itself when the host runs low on memory. Here one host holds the whole network,
@@ -282,6 +407,29 @@ def write_node_files(home, manifest, secrets):
 
 
 def node_services(home, manifest):
+  """
+  Compose services of the real nodes.
+
+  Parameters
+  ----------
+  home : Home
+    Folder layout of the localnet.
+  manifest : dict
+    The localnet manifest; reads ``nodes``.
+
+  Returns
+  -------
+  dict
+    Service name -> compose service. A node with ``docker`` runs privileged with a private cgroup
+    namespace, starts through ``node/dind.sh`` and keeps its inner Docker data in its own volume; like
+    every node it is attached to the internal localnet network only and publishes no port.
+
+  Examples
+  --------
+  >>> services = node_services(home, manifest)
+  >>> services['r1w-01']['privileged']   # a node created with --docker-nodes r1w-01
+  True
+  """
   services = {}
   for node in manifest['nodes']:
     ndir = home.run / 'nodes' / node['name']
@@ -316,12 +464,46 @@ def node_services(home, manifest):
       service['cpuset'] = node['cpuset']
     if node.get('mem_limit'):
       service['mem_limit'] = node['mem_limit']
+    if node.get('docker'):
+      # Production runs the node privileged: the inner Docker daemon needs cgroups, mounts and iptables,
+      # and fixed-size app volumes need losetup and mount. The container stays on the internal network.
+      service['privileged'] = True
+      # A private cgroup namespace keeps the inner containers inside this node's own control group.
+      service['cgroup'] = 'private'
+      # The guard and the cgroup set-up run before the image's own entrypoint starts the daemon.
+      service['entrypoint'] = ['/bin/sh', '/opt/localnet/node/dind.sh']
+      # Inner images and containers survive a recreation of the node container (rolling update).
+      service['volumes'].append('{}:/var/lib/docker'.format(docker_volume(node['name'])))
     services[node['name']] = service
   return services
 
 
 def node_volumes(manifest):
-  return {node['volume']: {'external': True} for node in manifest['nodes']}
+  """
+  External volumes the compose file refers to: each node's data volume and, for a node that runs
+  Docker, its inner Docker data volume.
+
+  Parameters
+  ----------
+  manifest : dict
+    The localnet manifest; reads ``nodes``.
+
+  Returns
+  -------
+  dict
+    Volume name -> ``{'external': True}`` (``init`` creates every one with the localnet label).
+
+  Examples
+  --------
+  >>> sorted(node_volumes({'nodes': [{'name': 'r1w-01', 'volume': 'r1ln_r1w-01_cache', 'docker': True}]}))
+  ['r1ln_r1w-01_cache', 'r1ln_r1w-01_docker']
+  """
+  # The data volume of every node.
+  volumes = {node['volume']: {'external': True} for node in manifest['nodes']}
+  # The inner Docker data volume of each node that runs Docker.
+  volumes.update({docker_volume(node['name']): {'external': True} for node in manifest['nodes'] if node.get('docker')})
+  # All of them, created beforehand by init.
+  return volumes
 
 
 def describe(nodes):

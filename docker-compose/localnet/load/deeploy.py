@@ -16,6 +16,8 @@ update    change a running job
 delete    remove a job
 load      create several jobs one after another
 watch     print the state of a job's operation every few seconds
+sync-app  deploy one container app of a container-sync set (provider or consumer) on
+          one worker, as the Deeploy web app builds it; the worker must run Docker
 
 The incident: ``create`` a job on one worker, stop that worker's container,
 then ``delete`` the job. The operation cannot finish while the worker is
@@ -165,6 +167,114 @@ def create_payload(job_id, nodes, alias, delay=5, config_bytes=0):
   }
 
 
+# The test app of a container-sync set (POSIX sh, runs in any BusyBox image). A provider waits
+# SYNC_PERIOD seconds, then, while it has published fewer than SYNC_PUBLISHES archives, writes a counter
+# and a payload file into its fixed-size volume and asks for a publish through the request file. Every
+# offline publish restarts the app, which starts this script again. Every role prints what it holds.
+SYNC_APP_SCRIPT = r'''
+D=/data; P=${SYNC_PERIOD:-30}; M=${SYNC_PUBLISHES:-1}
+echo "syncapp start role=${R1_SYNC_TYPE:-none} key=${R1_SYNC_KEY:-none}"
+if [ "${R1_SYNC_TYPE:-}" = provider ]; then
+  sleep "$P"
+  n=$(cat "$D/counter" 2>/dev/null || echo 0)
+  if [ "$n" -lt "$M" ]; then
+    n=$((n + 1))
+    echo "$n" > "$D/counter"
+    echo "payload $n from $(hostname) at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$D/payload.txt"
+    printf '{"archive_paths": ["%s/"], "metadata": {"n": %s}}\n' "$D" "$n" > "$R1_VOLUME_SYNC_DIR/request.json.tmp"
+    mv "$R1_VOLUME_SYNC_DIR/request.json.tmp" "$R1_SYNC_REQUEST_FILE"
+    echo "syncapp publish requested n=$n"
+  fi
+fi
+while true; do
+  echo "syncapp holds n=$(cat $D/counter 2>/dev/null || echo -) payload=$(cat $D/payload.txt 2>/dev/null | sha256sum | cut -c1-16)"
+  sleep 60
+done
+'''
+
+# Smallest generic job type of Deeploy (micro): 0.25 CPU, 512 MB, 2 GB of storage.
+MICRO_JOB_TYPE = 53
+# Its resources, as Deeploy checks them against the paid job type.
+MICRO = {'cpu': 0.25, 'memory': '512m', 'storage': '2g'}
+
+
+def sync_app_payload(job_id, node, role, key, image, period=30, publishes=1):
+  """
+  Deeploy create request for one container app of a container-sync set, as the Deeploy web app builds it.
+
+  Parameters
+  ----------
+  job_id : int
+    Job registered on the local chain with ``setup --job-type 53``.
+  node : str
+    Address of the worker it runs on (the worker must run Docker).
+  role : str
+    ``provider`` or ``consumer``.
+  key : str
+    The set's sync key (the chain-store field the provider writes and the consumers read).
+  image : str
+    Image already loaded into the worker's Docker daemon; the app never pulls it (pull policy "manual").
+  period : int
+    Provider: seconds before each publish.
+  publishes : int
+    Provider: archives to publish in all.
+
+  Returns
+  -------
+  dict
+    The request: a generic job with one CONTAINER_APP_RUNNER instance, a 1 GB fixed-size volume at
+    ``/data`` and the ``SYNC`` block (enabled, role, key), as ``formatGenericJobPayload`` of the web app.
+
+  Examples
+  --------
+  >>> sync_app_payload(3001, '0xai_A...', 'provider', 'lnet-sync-s0', 'localnet/syncapp:1')['plugins'][0]['SYNC']
+  {'ENABLED': True, 'TYPE': 'provider', 'KEY': 'lnet-sync-s0'}
+  """
+  # Field for field what formatGenericJobPayload and withSecretPaths of the web app produce.
+  return {
+    'request_id': 'create-{}-{}'.format(job_id, uuid.uuid4().hex[:12]),
+    'app_alias': 'lnsync{}'.format(job_id),
+    'job_id': int(job_id),
+    'job_app_type': 'generic',
+    'target_nodes': [node],
+    'spare_nodes': [],
+    'allow_replication_in_the_wild': False,
+    'target_nodes_count': 1,
+    'job_tags': [],
+    'node_res_req': dict(MICRO),
+    'plugins': [{
+      'plugin_signature': 'CONTAINER_APP_RUNNER',
+      # The web app reserves the fixed volume inside the tier's storage: 2 GB tier - 1 GB volume.
+      'CONTAINER_RESOURCES': {'cpu': MICRO['cpu'], 'memory': MICRO['memory'], 'storage': '1g'},
+      'PORT': None,
+      'TUNNEL_ENGINE': 'cloudflare',
+      'TUNNEL_ENGINE_ENABLED': False,
+      'CLOUDFLARE_TOKEN': None,
+      'EXPOSED_PORTS': {},
+      'ENV': {'SYNC_PERIOD': str(period), 'SYNC_PUBLISHES': str(publishes)},
+      'DYNAMIC_ENV': {},
+      'VOLUMES': {},
+      'FILE_VOLUMES': {},
+      # A loop-mounted ext4 volume: the kind of volume a sync archive is taken from and applied to.
+      'FIXED_SIZE_VOLUMES': {'data': {'SIZE': '1G', 'MOUNTING_POINT': '/data'}},
+      'RESTART_POLICY': 'always',
+      # "manual" (the web app's other value): the image is used from the node's store, never pulled.
+      'IMAGE_PULL_POLICY': 'manual',
+      'SYNC': {'ENABLED': True, 'TYPE': role, 'KEY': key},
+      'IMAGE': image,
+      'CR_DATA': {'SERVER': 'docker.io'},
+      # The test app is a shell script; the image's own entrypoint is not used.
+      'CONTAINER_ENTRYPOINT': ['/bin/sh', '-c'],
+      'CONTAINER_START_COMMAND': [SYNC_APP_SCRIPT],
+    }],
+    'pipeline_input_type': 'void',
+    'pipeline_input_uri': None,
+    'chainstore_response': True,
+    # Secret paths travel at the top level (the web app's withSecretPaths); Deeploy refuses them in a plugin.
+    'secret_paths': [],
+  }
+
+
 def first_instance(status_body):
   for node in (status_body or {}).get('nodes') or []:
     for instance in node.get('instances') or []:
@@ -179,12 +289,45 @@ def worker_addresses(manifest, names):
 
 
 def main():
+  """
+  Command line of the Deeploy client (see the module docstring for the commands).
+
+  Returns
+  -------
+  int
+    0, except ``sync-app``: 1 when the request was refused or its operation did not complete (each
+    step's outcome is in its JSON line and in ``/out/deeploy.jsonl``).
+
+  Examples
+  --------
+  >>> sys.argv = ['deeploy.py', 'setup', '--first-job', '3001', '--jobs', '2', '--job-type', '53']
+  >>> main()
+  0
+  """
   parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
   parser.add_argument('--api', default=API, help='Deeploy address (default: the public name, any oracle answers)')
   sub = parser.add_subparsers(dest='cmd', required=True)
   one = sub.add_parser('setup')
   one.add_argument('--first-job', type=int, default=1001)
   one.add_argument('--jobs', type=int, default=20)
+  # 16 is the smallest native job; container apps need a generic type such as 53 (micro).
+  one.add_argument('--job-type', type=int, default=16, help='on-chain job type (16: native entry, 53: generic micro)')
+  # One app of a container-sync set.
+  one = sub.add_parser('sync-app')
+  # A job registered by "setup --job-type 53".
+  one.add_argument('--job', type=int, required=True)
+  # One worker per app, as the web app's target node.
+  one.add_argument('--node', required=True, help='worker name; it must run Docker')
+  # The app's side of the set.
+  one.add_argument('--role', required=True, choices=('provider', 'consumer'))
+  # The same key on every app of the set.
+  one.add_argument('--key', required=True, help='sync key of the set')
+  # Never pulled: loaded beforehand with "localnet.py image".
+  one.add_argument('--image', default='localnet/syncapp:1', help='image already loaded into the worker')
+  # Provider pace: wait before each publish.
+  one.add_argument('--period', type=int, default=30, help='provider: seconds before each publish')
+  # Provider: how many archives in all.
+  one.add_argument('--publishes', type=int, default=1, help='provider: archives to publish in all')
   for name in ('create', 'delete', 'update', 'watch'):
     one = sub.add_parser(name)
     one.add_argument('--job', type=int, required=True)
@@ -208,11 +351,28 @@ def main():
   if args.cmd == 'setup':
     chain_admin(op='add_escrow', escrow=ESCROW, owner=account.address, active=True, permissions=15)
     for job_id in range(args.first_job, args.first_job + args.jobs):
-      chain_admin(op='add_job', job_id=job_id, escrow=ESCROW, job_type=16, start_ts=0, price_per_epoch=1000000,
+      # Deeploy checks the requested resources against the paid job type, so the type follows the app kind.
+      chain_admin(op='add_job', job_id=job_id, escrow=ESCROW, job_type=args.job_type, start_ts=0, price_per_epoch=1000000,
                   balance=30000000, nodes_requested=1, active_nodes=[])
-    common.say(WHO, 'wallet {} with escrow and jobs {}..{} registered on the local chain'.format(
-      account.address, args.first_job, args.first_job + args.jobs - 1))
+    # The job type is now part of the line, as it decides which apps the jobs accept.
+    common.say(WHO, 'wallet {} with escrow and jobs {}..{} (type {}) registered on the local chain'.format(
+      account.address, args.first_job, args.first_job + args.jobs - 1, args.job_type))
     return 0
+
+  if args.cmd == 'sync-app':
+    # The worker's node address from the manifest.
+    payload = sync_app_payload(args.job, worker_addresses(manifest, [args.node])[0], args.role, args.key, args.image,
+                               period=args.period, publishes=args.publishes)
+    # Signed by the job owner's wallet, sent through the public Deeploy name.
+    accepted = client.submit('create_pipeline', payload)
+    # The admission answer (an error body on a refusal).
+    body = accepted['body'] if isinstance(accepted['body'], dict) else {}
+    # The same wait and record as "create": the operation must reach its completed phase.
+    final = client.wait(body['operation_id']) if body.get('status') == 'accepted' else None
+    # One JSON line with the admission, the phase timeline and the outcome.
+    row = client.record('sync-app-' + args.role, args.job, accepted, final)
+    # A refused request or an operation that did not complete stops the scenario at once (non-zero exit).
+    return 0 if row['phase'] == 'completed' and row['outcome'] == 'succeeded' else 1
 
   if args.cmd in ('create', 'load'):
     workers = worker_addresses(manifest, args.nodes)

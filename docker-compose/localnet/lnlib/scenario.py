@@ -21,17 +21,28 @@ replicas  compare the chain-store replicas of all oracles
 pin       send the dAuth requests of one load generator to one oracle: generator, node
           (mainnet keeps a client on one oracle's tunnel); node null clears it
 note      write a line into the run log
+image     load an image of this machine into the Docker daemon of nodes: image, tag, nodes
+isolation prove that nodes running Docker and their inner containers reach nothing public:
+          image, nodes; a node that does fails the scenario
+sync      check a container-sync set: key, provider, consumers, image, publishes, within,
+          timeout, name; writes sync_<name>.json and .txt, and a FAIL fails the scenario
+switch    recreate one node on another staged source tree (rolling update, rollback):
+          node, arm, kill
 
 Every phase is measured with ``metrics.collect`` when it ends; the result goes
 to ``<results>/<run>/<phase>.json`` and a summary table to ``summary.txt``.
 """
 
 import json
+# The interpreter that runs this tool, for the "switch" step's call of the tool itself.
+import sys
 import time
 from pathlib import Path
 
-from . import infra, load as loadlib, metrics, profile as profilelib, replicas as replicalib
-from .common import PYTHON, LocalnetError, container, ctl_exec, log, sh
+# apps: images, isolation probe and sync check of the container-app steps.
+from . import apps as applib, infra, load as loadlib, metrics, profile as profilelib, replicas as replicalib
+# HERE: where localnet.py lives, for the "switch" step.
+from .common import HERE, PYTHON, LocalnetError, container, ctl_exec, log, sh
 
 
 def _chain_control(settings):
@@ -122,6 +133,39 @@ def run(home, path, tag=None):
 
 
 def _steps(home, spec, manifest, out, phase, note, close_phase):
+  """
+  Run the steps of a scenario in order (see the module docstring for the step types).
+
+  Parameters
+  ----------
+  home : Home
+    Folder layout of the localnet.
+  spec : dict
+    The scenario: ``name`` and ``steps``.
+  manifest : dict
+    The localnet manifest when the scenario started.
+  out : Path
+    Result folder of this run.
+  phase : dict
+    The open measurement phase (``name``, ``start``), shared with ``run``.
+  note : callable
+    Writes a line to the log and the run journal.
+  close_phase : callable
+    Measures and closes the open phase.
+
+  Returns
+  -------
+  None
+
+  Raises
+  ------
+  LocalnetError
+    An unknown step, a node that is not isolated, or a container-sync check that failed.
+
+  Examples
+  --------
+  >>> _steps(home, {'name': 'x', 'steps': [{'do': 'note', 'text': 'hello'}]}, manifest, out, phase, note, close_phase)
+  """
   for step in spec['steps']:
     do = step['do']
     if do == 'load':
@@ -167,6 +211,50 @@ def _steps(home, spec, manifest, out, phase, note, close_phase):
       note('replicas {} compared: at most {} records missing or different on one oracle'.format(label, worst))
     elif do == 'note':
       note(step['text'])
+    elif do == 'image':
+      # From the host's image store into each node's inner daemon: no registry, no pull.
+      ids = applib.load_image(manifest, step['image'], step.get('nodes'), tag=step.get('tag'))
+      # Which image went where, in the run journal.
+      note('image {} loaded as {} into {}'.format(step['image'], step.get('tag') or step['image'], ', '.join(ids)))
+    elif do == 'isolation':
+      # Every named node, or every node that runs Docker.
+      for name in step.get('nodes') or applib.docker_nodes(manifest):
+        # Probe from a throwaway inner container of the given image.
+        report = applib.isolation(manifest, name, step['image'])
+        # Kept with the run as evidence.
+        (out / 'isolation_{}.json'.format(name)).write_text(json.dumps(report, indent=1, sort_keys=True))
+        # The verdict and its evidence in the run journal.
+        note('isolation {}: {}'.format(name, json.dumps(report, sort_keys=True)))
+        # A node or inner container that reaches anything public ends the scenario at once.
+        if not report['ok']:
+          # Stops here: nothing else runs on a cluster that reaches outside.
+          raise LocalnetError('node {} or its inner containers are not isolated: {}'.format(name, report))
+    elif do == 'sync':
+      # Names the report files, for scenarios with several checks.
+      label = step.get('name') or 'sync'
+      # Waits for the set to converge, then measures it.
+      report = applib.sync_check(manifest, step['provider'], step['consumers'], step['key'],
+                                 step.get('image', 'localnet/syncapp:1'), publishes=step.get('publishes', 1),
+                                 within=step.get('within', 150), timeout=step.get('timeout', 900))
+      # The full report, kept with the run.
+      (out / 'sync_{}.json'.format(label)).write_text(json.dumps(report, indent=1, sort_keys=True))
+      # The short summary next to it.
+      (out / 'sync_{}.txt'.format(label)).write_text(applib.sync_text(report) + '\n')
+      # The summary also goes into the run journal, one line at a time.
+      for line in applib.sync_text(report).splitlines():
+        # Prefixed with the check's name.
+        note('sync {}: {}'.format(label, line))
+      # A failed check fails the scenario (exit code 2), after its report is written.
+      if not report['ok']:
+        # The reasons become the scenario's error message.
+        raise LocalnetError('sync check {} failed: {}'.format(label, '; '.join(report['failures'])))
+    elif do == 'switch':
+      # The tool's own "switch" command: it rewrites the manifest and compose file and recreates the node.
+      cmd = [sys.executable, str(HERE / 'localnet.py'), '--home', str(home.root), 'switch', step['node'], step['arm']]
+      # Runs until the node is back on the new tree; a failure raises and ends the scenario.
+      proc = sh(*(cmd + (['--kill'] if step.get('kill') else [])), timeout=900)
+      # The command's own last line: trees, stop kind and time away.
+      note('switch {}'.format((proc.stdout or '').strip().splitlines()[-1]))
     else:
       raise LocalnetError('unknown scenario step {}'.format(do))
   return

@@ -309,6 +309,13 @@ EDGE_NAMES = {
   'deeploy-api.localnet': 31302,
   'oracle.localnet': 31303,
 }
+# The web plugin behind each public name: a node started with a shorter web plugin list (init --web-plugins,
+# --web-of) is left out of the names whose plugin it does not run.
+EDGE_PLUGINS = {
+  'dauth.localnet': 'DAUTH_MANAGER',
+  'deeploy-api.localnet': 'DEEPLOY_MANAGER_API',
+  'oracle.localnet': 'ORACLE_API',
+}
 
 EDGE_CONF_HEAD = '''
 worker_processes 2;
@@ -364,21 +371,53 @@ def pin_dauth(home, client_ip=None, node_name=None):
 
 
 def edge_service(home, nodes):
-  """nginx in the role Cloudflare plays on mainnet: one public name per web plugin, spread over the oracles."""
+  """
+  nginx in the role Cloudflare plays on mainnet: one public name per web plugin, spread over the oracles.
+
+  Parameters
+  ----------
+  home : Home
+    Folder layout of the localnet; the configuration is written under ``run/edge``.
+  nodes : list of dict
+    Nodes of the manifest; only oracles that run the web plugin behind a name serve that name.
+
+  Returns
+  -------
+  dict
+    The ``edge`` compose service, on the internal network only.
+
+  Notes
+  -----
+  A name that no oracle serves gets no upstream (nginx refuses an empty one) and answers 404 through
+  the default server.
+
+  Examples
+  --------
+  >>> service = edge_service(home, manifest['nodes'])
+  >>> service['edge']['networks'].keys()
+  dict_keys(['r1ln'])
+  """
   oracles = [node for node in nodes if node['role'] in ('seed', 'oracle') and not node.get('headless')]
   conf = [EDGE_CONF_HEAD]
   edir = home.run / 'edge'
   edir.mkdir(parents=True, exist_ok=True)
   for name, port in EDGE_NAMES.items():
     upstream = name.split('.')[0].replace('-', '_')
-    conf.append('  upstream {} {{\n    random;\n{}\n  }}'.format(
-      upstream, '\n'.join('    server {}:{} max_fails=0;'.format(node['ip'], port) for node in oracles)))
+    # Only the oracles that run this name's web plugin (a node without a "web" list runs them all).
+    serving = [node for node in oracles if EDGE_PLUGINS[name] in node.get('web', [EDGE_PLUGINS[name]])]
+    if not serving:
+      continue
+    # One server line per oracle that serves the name.
+    servers = '\n'.join('    server {}:{} max_fails=0;'.format(node['ip'], port) for node in serving)
+    # One upstream per name, spread at random over those oracles, as before.
+    conf.append('  upstream {} {{\n    random;\n{}\n  }}'.format(upstream, servers))
     if name != 'dauth.localnet':
       conf.append('  server {{ listen 80; server_name {}; location / {{ proxy_pass http://{}; }} }}'.format(name, upstream))
       continue
     # Mainnet observation (2026-11-10): Cloudflare kept every request of one client on the same oracle's
     # tunnel. "pins" reproduces that for chosen clients: client address -> one oracle. Others stay spread.
-    for node in oracles:
+    # A pin can name only an oracle that serves dAuth.
+    for node in serving:
       conf.append('  upstream {} {{ server {}:{} max_fails=0; }}'.format(pin_upstream(node['name']), node['ip'], port))
     if not (edir / 'pins_dauth.conf').exists():
       (edir / 'pins_dauth.conf').write_text('')

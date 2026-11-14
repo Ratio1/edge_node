@@ -1,0 +1,25 @@
+{
+ "name": "container_sync_rolling",
+ "about": "A container-sync set that keeps publishing while its two workers are moved, one at a time, to another code version and back. Stage the two trees as \"old\" and \"next\", then init --arm old --docker-nodes r1w-01,r1w-02. The provider on r1w-01 publishes six archives 90 s apart; the consumer on r1w-02 is moved to next, then the provider, then the consumer back to old, then the provider (each with the stop an update uses). The final check passes when every publish reached the consumer (that archive or a later one) within 150 s, no record was refused and the consumer's file equals the provider's.",
+ "steps": [
+  {"do": "image", "image": "redis:7-alpine", "tag": "localnet/syncapp:1", "nodes": ["r1w-01", "r1w-02"]},
+  {"do": "isolation", "image": "localnet/syncapp:1", "nodes": ["r1w-01", "r1w-02"]},
+  {"do": "run", "generator": "deeploy", "args": ["setup", "--first-job", "3001", "--jobs", "2", "--job-type", "53"], "timeout": 120},
+  {"do": "phase", "name": "all_old"},
+  {"do": "run", "generator": "deeploy", "args": ["sync-app", "--job", "3002", "--node", "r1w-02", "--role", "consumer", "--key", "lnet-sync-roll"], "timeout": 960},
+  {"do": "run", "generator": "deeploy", "args": ["sync-app", "--job", "3001", "--node", "r1w-01", "--role", "provider", "--key", "lnet-sync-roll", "--period", "90", "--publishes", "6"], "timeout": 960},
+  {"do": "wait", "seconds": 150},
+  {"do": "phase", "name": "consumer_next"},
+  {"do": "switch", "node": "r1w-02", "arm": "next"},
+  {"do": "wait", "seconds": 90},
+  {"do": "phase", "name": "both_next"},
+  {"do": "switch", "node": "r1w-01", "arm": "next"},
+  {"do": "wait", "seconds": 90},
+  {"do": "phase", "name": "consumer_back"},
+  {"do": "switch", "node": "r1w-02", "arm": "old"},
+  {"do": "wait", "seconds": 90},
+  {"do": "phase", "name": "both_back"},
+  {"do": "switch", "node": "r1w-01", "arm": "old"},
+  {"do": "sync", "name": "rolling", "key": "lnet-sync-roll", "provider": "r1w-01", "consumers": ["r1w-02"], "image": "localnet/syncapp:1", "publishes": 6, "within": 150, "timeout": 1200}
+ ]
+}

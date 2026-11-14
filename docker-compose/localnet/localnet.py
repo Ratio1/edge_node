@@ -14,7 +14,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from lnlib import compare as comparelib, infra, load as loadlib, metrics, nodes as nodelib, profile as profilelib, replicas as replicalib, scenario as scenariolib  # noqa: E402
+# apps: container apps on nodes that run their own Docker daemon (images, sync check, teardown).
+from lnlib import apps as applib, compare as comparelib, infra, load as loadlib, metrics, nodes as nodelib, profile as profilelib, replicas as replicalib, scenario as scenariolib  # noqa: E402
 from lnlib.common import (  # noqa: E402
   HERE, LABEL, NODE_IMAGE, PROJECT, PYTHON, SUBNET, Home, LocalnetError,
   compose, container, ctl_exec, die, ip, log, sh,
@@ -115,6 +116,29 @@ def cmd_stage(args):
 
 
 def cmd_init(args):
+  """
+  Generate keys, certificates, broker, relay and node configuration of a new localnet.
+
+  Parameters
+  ----------
+  args : argparse.Namespace
+    Options of ``init`` (see ``main``), among them ``docker_nodes``, ``web_plugins`` and ``web_of``.
+
+  Returns
+  -------
+  int
+    0.
+
+  Raises
+  ------
+  LocalnetError
+    A source tree is not staged, or the topology options are inconsistent.
+
+  Examples
+  --------
+  >>> cmd_init(parser.parse_args(['init', '--arm', 'rel', '--oracles', '4', '--docker-nodes', 'r1w-01,r1w-02']))
+  0
+  """
   home = Home(args.home)
   if home.compose_path.exists():
     cmd_down(args, quiet=True)
@@ -122,8 +146,18 @@ def cmd_init(args):
   for arm in set([args.arm] + list(arms.values())):
     if not (home.src / arm / 'core' / 'naeural_core').exists():
       raise LocalnetError('source tree "{}" is not staged under {} (run "stage" first)'.format(arm, home.src))
+  # Comma lists of the command line: nodes that run Docker, and web plugins kept (everywhere / per node).
+  docker_names = [name for name in (args.docker_nodes or '').split(',') if name]
+  # None keeps every web plugin, as without the option.
+  web = [name for name in args.web_plugins.split(',') if name] if args.web_plugins else None
+  # NODE=SIG,SIG per --web-of.
+  web_of = {item.split('=', 1)[0]: [name for name in item.split('=', 1)[1].split(',') if name] for item in (args.web_of or [])}
   home.run.mkdir(parents=True, exist_ok=True)
   (home.run / 'out').mkdir(exist_ok=True)
+  # The topology is checked before anything slow is generated.
+  plan = nodelib.plan(oracles=args.oracles, workers=args.workers, arms=arms, default_arm=args.arm, evm_net=args.evm_net,
+                      full_oracles=args.full_oracles, full_workers=args.full_workers, docker_nodes=docker_names,
+                      web=web, web_of=web_of)
   infra_repo = infra.find_infra_repo(args.infra_repo)
   log('rendering the mainnet broker mesh (infra repo: {})'.format(infra_repo))
   mesh = infra.render_brokers(home, infra_repo, nofile=args.broker_nofile)
@@ -131,9 +165,12 @@ def cmd_init(args):
   relays, relay_secrets = infra.init_relays(home)
   secrets = {'mesh': mesh.pop('secrets'), 'relay': relay_secrets}
   log('creating node identities')
-  plan = nodelib.plan(oracles=args.oracles, workers=args.workers, arms=arms, default_arm=args.arm, evm_net=args.evm_net,
-                      full_oracles=args.full_oracles, full_workers=args.full_workers)
   nodelib.create_identities(home, plan)
+  # Empty inner Docker data volumes for the nodes that run Docker.
+  made = applib.create_docker_volumes(plan)
+  if made:
+    # Said once, so that the privileged nodes are visible in every init log.
+    log('nodes that run their own Docker daemon (privileged, internal network only): {}'.format(', '.join(docker_names)))
   nodelib.describe(plan)
   seeded = nodelib.seed_chain_store(home, plan, keys=args.cstore_keys, legacy_jobs=args.legacy_jobs)
   if seeded:
@@ -164,6 +201,29 @@ def cmd_init(args):
 
 
 def cmd_up(args):
+  """
+  Start the localnet: infrastructure, then the seeds, then every other node.
+
+  Parameters
+  ----------
+  args : argparse.Namespace
+    Options of ``up`` (``infra_only``, ``nodes``).
+
+  Returns
+  -------
+  int
+    0 once the seeds serve dAuth, the oracles hold their role and the inner Docker daemons answer.
+
+  Raises
+  ------
+  LocalnetError
+    A part did not come up in time.
+
+  Examples
+  --------
+  >>> cmd_up(parser.parse_args(['up']))
+  0
+  """
   home = Home(args.home)
   manifest = home.manifest()
   nodelib.write_node_files(home, manifest, home.secrets())
@@ -188,11 +248,47 @@ def cmd_up(args):
     compose(home, 'up', '-d', '--no-color', *others)
     log('nodes started: {}'.format(', '.join(others)))
     nodelib.settle_oracles(home, manifest, [name for name in others])
+  # A scenario may exec into a node right away: wait until each inner Docker daemon answers.
+  waited = applib.wait_docker(manifest, names)
+  if applib.docker_nodes(manifest):
+    # How long the daemons took after the nodes started.
+    log('inner Docker daemons answer (waited {} s)'.format(waited))
   return 0
 
 
 def cmd_down(args, quiet=False):
+  """
+  Stop the localnet, and with ``--purge`` delete its volumes and generated state.
+
+  Parameters
+  ----------
+  args : argparse.Namespace
+    Options of ``down`` (``purge``, ``grace``); ``init`` passes its own.
+  quiet : bool
+    Do not log the final line.
+
+  Returns
+  -------
+  int
+    0.
+
+  Notes
+  -----
+  Nodes that run Docker are killed first and the loop devices of their apps' fixed-size volumes are
+  detached (``apps.release_docker``); a loop device still bound to a localnet image afterwards is
+  reported, because only a privileged process can detach it.
+
+  Examples
+  --------
+  >>> cmd_down(parser.parse_args(['down', '--purge']))
+  0
+  """
   home = Home(args.home)
+  if home.manifest_path.exists():
+    # Before the network goes: the release runs a throwaway container on it.
+    for name, line in applib.release_docker(home.manifest()).items():
+      # What was detached and what is left, per node.
+      log('{}: {}'.format(name, line))
   if home.compose_path.exists():
     compose(home, 'down', '--remove-orphans', '-t', str(getattr(args, 'grace', 5)), check=False)
   leftovers = sh('docker', 'ps', '-aq', '--filter', 'label=' + LABEL, check=False).stdout.split()
@@ -208,6 +304,11 @@ def cmd_down(args, quiet=False):
       # Broker data and node output are written by container users: remove them from inside a container.
       sh('docker', 'run', '--rm', '--network', 'none', '-v', '{}:/w'.format(home.run), '--entrypoint', '/bin/sh',
          NODE_IMAGE, '-c', 'rm -rf /w/* /w/.[!.]* 2>/dev/null; true', check=False)
+  # A loop device left bound to an app volume image holds host disk space until a privileged detach.
+  leaked = applib.leaked_loops()
+  if leaked:
+    # Named with the command that frees them; the tool itself has no host privileges.
+    log('loop devices left bound to container-app volume images (detach with "losetup -d" as root): {}'.format(leaked))
   if not quiet:
     log('localnet stopped{}'.format(' and purged' if getattr(args, 'purge', False) else ''))
   return 0
@@ -301,7 +402,165 @@ def cmd_ctl(args):
   return proc.returncode
 
 
+def cmd_image(args):
+  """
+  Load an image of this machine into the inner Docker daemon of nodes, then prove they stay isolated.
+
+  Parameters
+  ----------
+  args : argparse.Namespace
+    ``image`` (host image), ``tag`` (name inside the nodes), ``nodes`` (default: every node with Docker).
+
+  Returns
+  -------
+  int
+    0 when every node passed the isolation probe, 1 otherwise.
+
+  Examples
+  --------
+  >>> cmd_image(parser.parse_args(['image', 'redis:7-alpine', '--tag', 'localnet/syncapp:1']))
+  0
+  """
+  # The running localnet's manifest.
+  manifest = Home(args.home).manifest()
+  # Copied from the host's image store, never pulled.
+  ids = applib.load_image(manifest, args.image, args.nodes, tag=args.tag)
+  # Nodes that failed the isolation probe.
+  failed = 0
+  # Each node the image went into.
+  for name, image_id in ids.items():
+    # The probe runs in a throwaway container of the image just loaded.
+    report = applib.isolation(manifest, name, args.tag or args.image)
+    # The image id and the probe's evidence, per node.
+    log('{}: loaded {} as {} ({}); isolation {}'.format(name, args.image, args.tag or args.image, image_id[:19],
+                                                        json.dumps(report, sort_keys=True)))
+    # One node that reaches outside is a failure of the whole command.
+    failed += 0 if report['ok'] else 1
+  # Non-zero when any node reached something public.
+  return 1 if failed else 0
+
+
+def cmd_sync(args):
+  """
+  Check a container-sync set on the running localnet and print PASS or FAIL with its numbers.
+
+  Parameters
+  ----------
+  args : argparse.Namespace
+    ``key``, ``provider``, ``consumers``, ``image``, ``publishes``, ``within``, ``timeout``, ``out``.
+
+  Returns
+  -------
+  int
+    0 on PASS, 1 on FAIL.
+
+  Examples
+  --------
+  >>> cmd_sync(parser.parse_args(['sync', 'lnet-sync-s0', 'r1w-01', 'r1w-02']))
+  0
+  """
+  # The running localnet's manifest.
+  manifest = Home(args.home).manifest()
+  # Waits for the set to converge, then measures it.
+  report = applib.sync_check(manifest, args.provider, args.consumers, args.key, args.image, publishes=args.publishes,
+                             within=args.within, timeout=args.timeout)
+  if args.out:
+    # The full report next to the summary, when asked for.
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    # Sorted keys keep two reports comparable with diff.
+    Path(args.out).write_text(json.dumps(report, indent=1, sort_keys=True))
+  print(applib.sync_text(report))
+  # The exit code carries the verdict.
+  return 0 if report['ok'] else 1
+
+
+def cmd_switch(args):
+  """
+  Move one node to another staged source tree: one step of a rolling update or of a rollback.
+
+  The node's container is recreated on the other tree with the same identity, data volume and, for a
+  node that runs Docker, the same inner Docker data. By default it is stopped as an update stops it
+  (SIGTERM, then the grace period); ``--kill`` ends it at once.
+
+  Parameters
+  ----------
+  args : argparse.Namespace
+    ``node``, ``arm`` (staged tree name), ``kill``, ``timeout``.
+
+  Returns
+  -------
+  int
+    0 once the node reports the new tree and is connected.
+
+  Raises
+  ------
+  LocalnetError
+    Unknown node or tree, or the node did not come back in time.
+
+  Examples
+  --------
+  >>> cmd_switch(parser.parse_args(['switch', 'r1w-02', 'next']))
+  0
+  """
+  # The localnet folder and its manifest.
+  home = Home(args.home)
+  # Changed in place and saved below.
+  manifest = home.manifest()
+  # The node to move.
+  node = next((item for item in manifest['nodes'] if item['name'] == args.node), None)
+  if node is None:
+    # Refused: nothing changed yet.
+    raise LocalnetError('unknown node {}'.format(args.node))
+  # The tree's revision line, also what the node must report once back.
+  rev_file = home.src / args.arm / 'edge' / '.localnet_rev'
+  if not rev_file.exists():
+    # Refused: the tree must be staged first.
+    raise LocalnetError('source tree "{}" is not staged under {} (run "stage" first)'.format(args.arm, home.src))
+  # The old tree is kept for the log line.
+  previous, node['arm'] = node['arm'], args.arm
+  # The manifest, the node's files and the compose file all name the tree the node runs.
+  home.save(home.manifest_path, manifest)
+  # The node's environment and start-up file follow the manifest.
+  nodelib.write_node_files(home, manifest, home.secrets())
+  # The compose file mounts the new tree for this node.
+  write_compose(home, manifest)
+  # The node's time away is measured from here.
+  started = time.time()
+  if args.kill:
+    # The fast way out: no grace period, nothing closed by the node.
+    sh('docker', 'kill', container(args.node), check=False)
+  # Compose sees the changed source mount and recreates only this node (stop with its grace period, start).
+  compose(home, 'up', '-d', '--no-deps', '--no-color', args.node, timeout=600)
+  # Back when the node reports the new tree and its broker connection.
+  took = applib.wait_source(args.node, rev_file.read_text().strip(), started, timeout=args.timeout)
+  # Old and new tree, how the node was stopped, and its time away.
+  log('{} moved from {} to {} ({}), back on the network after {} s'.format(
+    args.node, previous, args.arm, 'killed' if args.kill else 'stopped', took))
+  # The node runs the new tree.
+  return 0
+
+
 def main():
+  """
+  Command line of the localnet tool.
+
+  Returns
+  -------
+  int
+    The exit code of the command run.
+
+  Raises
+  ------
+  SystemExit
+    Through ``die`` (exit code 2) when a command raises ``LocalnetError``, and through argparse on a
+    bad command line.
+
+  Examples
+  --------
+  >>> sys.argv = ['localnet.py', '--home', '/tmp/ln', 'status']
+  >>> main()
+  0
+  """
   parser = argparse.ArgumentParser(prog='localnet', description=__doc__.strip().splitlines()[0])
   parser.add_argument('--home', help='state folder (default: $R1_LOCALNET_HOME or ~/.cache/r1-localnet)')
   sub = parser.add_subparsers(dest='command', required=True)
@@ -337,6 +596,14 @@ def main():
   one.add_argument('--arm-of', action='append', metavar='NODE=TREE', help='source tree of one node (mixed fleets)')
   one.add_argument('--evm-net', default='mainnet', choices=('mainnet', 'testnet', 'devnet'),
                    help='network whose constants and code paths the nodes use (addresses always point at the localnet)')
+  # Container apps: nodes with their own Docker daemon, as production nodes have.
+  one.add_argument('--docker-nodes', metavar='NODE,NODE',
+                   help='nodes that run their own Docker daemon and can run container apps (privileged, internal network only)')
+  # A smaller cluster: full nodes that keep only some web plugins (each costs about 1.3 GB).
+  one.add_argument('--web-plugins', metavar='SIG,SIG',
+                   help='web plugins every non-headless node keeps (default: all); seeds must keep DAUTH_MANAGER')
+  # Per node, repeatable; overrides --web-plugins for that node.
+  one.add_argument('--web-of', action='append', metavar='NODE=SIG,SIG', help='web plugins one node keeps')
   one.set_defaults(func=cmd_init)
 
   one = sub.add_parser('up', help='start the localnet')
@@ -397,6 +664,51 @@ def main():
   one.add_argument('--timeout', type=float, default=600)
   one.add_argument('cmd', nargs=argparse.REMAINDER)
   one.set_defaults(func=cmd_ctl)
+
+  # Load an app image without any pull, then prove the nodes stay isolated.
+  one = sub.add_parser('image', help='load an image of this machine into the Docker daemon of nodes (no pull)')
+  # The source: an image the host's Docker already has.
+  one.add_argument('image', help='an image of the host Docker, for example redis:7-alpine')
+  # The name the apps use inside the nodes.
+  one.add_argument('--tag', help='name of the image inside the nodes, for example localnet/syncapp:1')
+  # Where it goes.
+  one.add_argument('nodes', nargs='*', help='nodes (default: every node that runs Docker)')
+  # Run by main().
+  one.set_defaults(func=cmd_image)
+
+  # Check a container-sync set.
+  one = sub.add_parser('sync', help='check a container-sync set: record, applies, delays, files')
+  # The set and its nodes.
+  one.add_argument('key', help='the sync key of the set')
+  # The provider app's node.
+  one.add_argument('provider', help='node of the provider app')
+  # Every consumer app's node.
+  one.add_argument('consumers', nargs='+', help='nodes of the consumer apps')
+  # To find the app containers inside the nodes.
+  one.add_argument('--image', default='localnet/syncapp:1', help='image of the apps')
+  # The pass values: publishes expected and the delay bound.
+  one.add_argument('--publishes', type=int, default=1, help='archives the provider should have published')
+  # Seconds per publish (default: poll 10 s + chain-store refresh 60 s + apply).
+  one.add_argument('--within', type=float, default=150, help='seconds a consumer may take per publish')
+  # How long to wait before measuring anyway.
+  one.add_argument('--timeout', type=float, default=900, help='seconds to wait for the set to converge')
+  # The full report as JSON.
+  one.add_argument('--out', help='write the full report as JSON to this file')
+  # Run by main().
+  one.set_defaults(func=cmd_sync)
+
+  # One step of a rolling update or rollback.
+  one = sub.add_parser('switch', help='recreate one node on another staged source tree (rolling update / rollback)')
+  # The node to move.
+  one.add_argument('node', help='node name')
+  # The staged tree it moves to.
+  one.add_argument('arm', help='staged source tree')
+  # Default: the stop an update uses (SIGTERM, then the grace period).
+  one.add_argument('--kill', action='store_true', help='kill the node instead of stopping it with its grace period')
+  # How long the node may take to come back.
+  one.add_argument('--timeout', type=float, default=600, help='seconds to wait for the node to come back')
+  # Run by main().
+  one.set_defaults(func=cmd_switch)
 
   args = parser.parse_args()
   try:

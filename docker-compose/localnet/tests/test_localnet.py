@@ -159,20 +159,166 @@ class TestSeeding(unittest.TestCase):
 
 class TestScenarios(unittest.TestCase):
 
-  STEPS = {'load', 'run', 'unload', 'wait', 'phase', 'node', 'chain', 'profile', 'replicas', 'pin', 'note'}
+  # Every step type lnlib/scenario.py runs, the container-app steps included.
+  STEPS = {'load', 'run', 'unload', 'wait', 'phase', 'node', 'chain', 'profile', 'replicas', 'pin', 'note',
+           'image', 'isolation', 'sync', 'switch'}
 
   def test_shipped_scenarios_use_known_steps_and_generators(self):
+    """Every shipped scenario names itself, has unique phases, and uses only step types and generators that exist."""
     files = glob.glob(str(HERE / 'scenarios' / '*.json'))
     self.assertTrue(files)
     for path in files:
       spec = json.loads(Path(path).read_text())
       self.assertTrue(spec['name'] and spec['about'], path)
+      # Phase names become result file names: two phases of one name would overwrite each other.
       phases = [step['name'] for step in spec['steps'] if step['do'] == 'phase']
       self.assertEqual(len(phases), len(set(phases)), path)
       for step in spec['steps']:
         self.assertIn(step['do'], self.STEPS, path)
         if step['do'] in ('load', 'run'):
+          # A load step must name a generator script that exists under load/.
           self.assertTrue((HERE / 'load' / (step['generator'] + '.py')).exists(), step)
+
+
+class TestContainerApps(unittest.TestCase):
+
+  def _plan(self, **kwargs):
+    """
+    A small topology with addresses filled in, as ``init`` leaves it.
+
+    Parameters
+    ----------
+    **kwargs
+      Extra arguments of ``nodes.plan``.
+
+    Returns
+    -------
+    list of dict
+      The nodes.
+
+    Examples
+    --------
+    >>> self._plan(docker_nodes=('r1w-01',))[-2]['docker']
+    True
+    """
+    from lnlib import nodes
+    plan = nodes.plan(oracles=4, workers=2, full_workers=0, default_arm='rel', **kwargs)
+    for node in plan:
+      node.update(address='0xai_' + node['name'], eth_address='0x0')
+    return plan
+
+  def test_docker_nodes_run_the_inner_daemon_on_the_internal_network_only(self):
+    """A node in --docker-nodes starts the inner daemon privileged, on the localnet network only; other nodes do not."""
+    from lnlib import nodes
+    from lnlib.common import Home, PROJECT
+    plan = self._plan(docker_nodes=('r1w-01', 'r1w-02'))
+    with tempfile.TemporaryDirectory() as tmp:
+      services = nodes.node_services(Home(tmp), {'nodes': plan})
+    worker, seed = services['r1w-01'], services['r1s-01']
+    # Started through the guard and cgroup set-up, privileged, in its own cgroup namespace.
+    self.assertEqual(worker['entrypoint'], ['/bin/sh', '/opt/localnet/node/dind.sh'])
+    self.assertTrue(worker['privileged'])
+    self.assertEqual(worker['cgroup'], 'private')
+    self.assertIn('r1ln_r1w-01_docker:/var/lib/docker', worker['volumes'])
+    # Attached to the internal localnet network only, and no port published.
+    self.assertEqual(list(worker['networks']), [PROJECT])
+    self.assertNotIn('ports', worker)
+    # Every other node is unchanged: not privileged, no inner daemon.
+    self.assertNotIn('privileged', seed)
+    self.assertNotIn('entrypoint', seed)
+    # EE_DD=1 starts the daemon and makes the node report container support; others keep EE_DD=0.
+    self.assertEqual(plan[-2]['env']['EE_DD'], '1')
+    self.assertNotIn('env', plan[0])
+    self.assertIn('r1ln_r1w-02_docker', nodes.node_volumes({'nodes': plan}))
+
+  def test_web_plugin_lists_disable_the_others_and_are_checked(self):
+    """--web-plugins and --web-of keep only the named web plugins, and bad names or a seed without dAuth are refused."""
+    from lnlib import nodes
+    from lnlib.common import LocalnetError
+    plan = self._plan(web=['DAUTH_MANAGER'], web_of={'r1s-01': ['DAUTH_MANAGER', 'DEEPLOY_MANAGER_API']})
+    first = nodes._startup_overrides(plan[0])['ADMIN_PIPELINE']
+    second = nodes._startup_overrides(plan[1])['ADMIN_PIPELINE']
+    # r1s-01 serves Deeploy and dAuth; r1s-02 only dAuth; neither runs the oracle API.
+    self.assertNotIn('DISABLED', first['DEEPLOY_MANAGER_API'])
+    self.assertTrue(second['DEEPLOY_MANAGER_API']['DISABLED'])
+    self.assertNotIn('DISABLED', second['DAUTH_MANAGER'])
+    self.assertTrue(first['ORACLE_API']['DISABLED'])
+    # A seed must serve dAuth; unknown plugin and node names are errors, not silently ignored.
+    with self.assertRaises(LocalnetError):
+      self._plan(web=['DEEPLOY_MANAGER_API'])
+    with self.assertRaises(LocalnetError):
+      self._plan(web=['DAUTH_MANAGERS'])
+    with self.assertRaises(LocalnetError):
+      self._plan(docker_nodes=('r1w-09',))
+
+  def test_front_routes_each_name_only_to_oracles_running_its_plugin(self):
+    """The front sends Deeploy only to the oracle that runs it and drops a name no oracle serves."""
+    from lnlib import infra
+    from lnlib.common import Home
+    plan = self._plan(web=['DAUTH_MANAGER'], web_of={'r1s-01': ['DAUTH_MANAGER', 'DEEPLOY_MANAGER_API']})
+    with tempfile.TemporaryDirectory() as tmp:
+      infra.edge_service(Home(tmp), plan)
+      conf = (Path(tmp) / 'run' / 'edge' / 'nginx.conf').read_text()
+    # The Deeploy upstream holds r1s-01 alone; dAuth holds the four seeds.
+    deeploy = conf.split('upstream deeploy_api {')[1].split('}')[0]
+    self.assertEqual(deeploy.count('server '), 1)
+    self.assertIn(plan[0]['ip'], deeploy)
+    self.assertEqual(conf.split('upstream dauth {')[1].split('}')[0].count('server '), 4)
+    # No oracle runs the oracle API: no empty upstream (nginx would refuse it) and no server for the name.
+    self.assertNotIn('upstream oracle ', conf)
+    self.assertNotIn('server_name oracle.localnet', conf)
+
+  def test_sync_app_request_matches_the_web_app_shape(self):
+    """The sync-app request is a generic container job with the web app's SYNC block, a fixed volume and no pull."""
+    sys.path.insert(0, str(HERE / 'load'))
+    try:
+      import deeploy
+    finally:
+      sys.path.remove(str(HERE / 'load'))
+    payload = deeploy.sync_app_payload(3001, '0xai_w1', 'provider', 'lnet-sync-s0', 'localnet/syncapp:1', period=5, publishes=2)
+    plugin = payload['plugins'][0]
+    self.assertEqual(payload['job_app_type'], 'generic')
+    self.assertEqual(plugin['plugin_signature'], 'CONTAINER_APP_RUNNER')
+    # The block the web app emits for an enabled set (ENABLED, TYPE, KEY), nothing more.
+    self.assertEqual(plugin['SYNC'], {'ENABLED': True, 'TYPE': 'provider', 'KEY': 'lnet-sync-s0'})
+    self.assertEqual(plugin['IMAGE_PULL_POLICY'], 'manual')
+    self.assertEqual(plugin['FIXED_SIZE_VOLUMES']['data']['MOUNTING_POINT'], '/data')
+    # Volume plus container storage equal the micro tier's 2 GB, as the web app reserves it.
+    self.assertEqual(int(plugin['FIXED_SIZE_VOLUMES']['data']['SIZE'][:-1]) + int(plugin['CONTAINER_RESOURCES']['storage'][:-1]),
+                     int(payload['node_res_req']['storage'][:-1]))
+    self.assertEqual(plugin['ENV'], {'SYNC_PERIOD': '5', 'SYNC_PUBLISHES': '2'})
+    # Deeploy refuses SECRET_PATHS inside a plugin; the web app sends secret_paths at the top level.
+    self.assertNotIn('SECRET_PATHS', plugin)
+    self.assertEqual(payload['secret_paths'], [])
+
+  def test_sync_check_measures_delays_and_fails_on_a_different_file(self):
+    """The sync check passes a set whose consumer applied every publish in time with the same file, and fails it otherwise."""
+    from lnlib import apps
+    sent = [{'cid': 'Qm1', 'published_timestamp': 100.0}, {'cid': 'Qm2', 'published_timestamp': 200.0}]
+    state = {'r1w-01': {'sent': sent, 'received': [], 'quarantine': 0},
+             # The consumer skipped Qm1 and applied Qm2 at 240: Qm1 counts as held at 240 (140 s), Qm2 after 40 s.
+             'r1w-02': {'sent': [], 'received': [{'cid': 'Qm2', 'applied_timestamp': 240.0}], 'quarantine': 0}}
+    files = {'r1w-01': 'payload 2\n', 'r1w-02': 'payload 2\n'}
+    saved = (apps.sync_state, apps.chain_record, apps.app_file, apps.node_log)
+    # Node reads replaced by the fixed state above.
+    apps.sync_state = lambda name: state[name]
+    apps.chain_record = lambda name, key: {'record': {'cid': 'Qm2'}, 'age_s': 1.0}
+    apps.app_file = lambda name, image, path: {'container': 'c', 'text': files[name], 'sha256': files[name]}
+    apps.node_log = lambda name: ''
+    manifest = {'nodes': [{'name': 'r1s-01', 'role': 'seed'}, {'name': 'r1w-01', 'role': 'worker'}]}
+    try:
+      report = apps.sync_check(manifest, 'r1w-01', ['r1w-02'], 'k', 'img', publishes=2, timeout=0, poll=0)
+      self.assertTrue(report['ok'], report['failures'])
+      self.assertEqual([row['delay_s']['r1w-02'] for row in report['publishes']], [140.0, 40.0])
+      self.assertEqual(report['record_on_oracles'], '1/1')
+      # A consumer file that differs from the provider's fails the set.
+      files['r1w-02'] = 'payload 1\n'
+      self.assertFalse(apps.sync_check(manifest, 'r1w-01', ['r1w-02'], 'k', 'img', publishes=2, timeout=0, poll=0)['ok'])
+      # So does a publish held later than the bound.
+      files['r1w-02'] = 'payload 2\n'
+      self.assertFalse(apps.sync_check(manifest, 'r1w-01', ['r1w-02'], 'k', 'img', publishes=2, within=100, timeout=0, poll=0)['ok'])
+    finally:
+      apps.sync_state, apps.chain_record, apps.app_file, apps.node_log = saved
 
 
 class TestMetrics(unittest.TestCase):
