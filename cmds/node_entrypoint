@@ -1,0 +1,28 @@
+#!/bin/sh
+###
+### node_entrypoint:
+###   The entrypoint of the node images (the ENTRYPOINT of the node Dockerfiles). It starts the inner Docker
+###   daemon with the unchanged base image entrypoint, then runs the node command as process 1.
+###
+###   The daemon keeps its store (images, containers, volumes) across node restarts. When the daemon does not
+###   start, this script removes that store and stops the container: the next start begins on an empty store, as
+###   every start did before the store was kept, and every app image is pulled once more.
+###
+###   Not an operator command: the container runtime runs it, once, when the node container starts.
+###
+
+# Start the daemon: the base image entrypoint launches dockerd in the background, waits until it answers and then
+# runs the command it is given. That command is `true`, so the entrypoint returns here and dockerd stays behind as
+# a child of process 1. With EE_DD=0 it starts no daemon, runs `true` and nothing is removed.
+# When that entrypoint fails, say so and remove the kept store: a store dockerd refuses would fail every later
+# start in the same way, until someone removed it on the host. The entrypoint does not report why it failed, so the
+# store goes after ANY failed start (a damaged store file, a container without privileges, iptables, a wrong
+# DOCKERD_READY_TIMEOUT, a daemon that did not answer in time). That includes a second container of this image
+# started on the cache folder of a running node: its daemon cannot open the store in use, and the store is removed
+# from under the running node. The directory is the "data-root" of docker/daemon.json; a test keeps the two equal.
+# Exit non-zero, as the base entrypoint did: the container stops, and whoever starts it again (the host's service)
+# starts on an empty store.
+/usr/local/bin/entrypoint.sh true || { echo "The inner Docker daemon did not start: removing its kept store." >&2; rm -rf /edge_node/_local_cache/_bin/docker/29; exit 1; }
+# Run the node command the way the base entrypoint ran it: it replaces this shell, so the node is process 1,
+# receives the stop signal itself and has dockerd as its child, as before.
+exec "$@"

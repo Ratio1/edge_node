@@ -5,9 +5,15 @@ A node container starts its own Docker daemon (the base image entrypoint, `EE_DD
 `docker/daemon.json` is installed as that daemon's `/etc/docker/daemon.json` by every node Dockerfile and names the
 directory of its store. These tests keep the file and the Dockerfiles consistent with each other, with what the
 entrypoint passes to dockerd and with what the disk API of plugin code refuses, without building an image.
+
+The images start through `cmds/node_entrypoint`, which runs that base image entrypoint and removes the kept store
+when the daemon does not start. The tests keep the script, the daemon file and the Dockerfiles consistent, and run
+a copy of the script against a stand-in for the base image entrypoint.
 """
 # The daemon settings file is JSON.
 import json
+# Whether the entrypoint script can be executed.
+import os
 # The repository root and the files in it.
 import pathlib
 # The Dockerfile lines and the shape of the store directory.
@@ -16,6 +22,8 @@ import re
 import subprocess
 # The interpreter this test runs on.
 import sys
+# A folder of its own for each run of the entrypoint script.
+import tempfile
 # The test framework.
 import unittest
 
@@ -42,6 +50,18 @@ VALIDATE_LINE = (
   "RUN dockerd --validate --host=unix:///var/run/docker.sock --storage-driver=vfs"
   " --tlscacert=/certs/server/ca.pem --tlscert=/certs/server/cert.pem --tlskey=/certs/server/key.pem"
 )
+
+# The entrypoint of the base image, which starts the inner daemon: the build steps inspect it, the script runs it.
+BASE_ENTRYPOINT = "/usr/local/bin/entrypoint.sh"
+
+# The script the node images start through. Every node Dockerfile copies `cmds/` to /usr/local/bin.
+ENTRYPOINT_SCRIPT = REPO_ROOT / "cmds" / "node_entrypoint"
+
+# The instruction that makes the script the entrypoint of a node image.
+ENTRYPOINT_LINE = 'ENTRYPOINT ["/usr/local/bin/{}"]'.format(ENTRYPOINT_SCRIPT.name)
+
+# Where each Dockerfile finds `cmds/` in its build context (see COPY_SOURCES for the two kinds of context).
+CMDS_SOURCES = {"Dockerfile_devnet_local": "./edge_node/cmds"}
 
 
 def node_dockerfiles():
@@ -171,6 +191,118 @@ def disk_api_accepts(paths):
   return json.loads(done.stdout.splitlines()[-1])
 
 
+def run_entrypoint_script(base_exit_code, command):
+  """
+  Run a copy of the entrypoint script in a folder of its own, with a stand-in for the base image entrypoint.
+
+  The copy differs from `cmds/node_entrypoint` in two absolute paths only, each of which the script names once:
+  the base image entrypoint becomes a stand-in that writes down its arguments and exits with `base_exit_code`, and
+  the store directory becomes the same place under a stand-in cache folder, between files that are not the
+  store's. Other tests pin the two real paths.
+
+  Parameters
+  ----------
+  base_exit_code : int
+    What the stand-in for the base image entrypoint exits with: 0 stands for a daemon that started.
+  command : list
+    The node command the script is started with, as a container starts it with the image's `CMD`.
+
+  Returns
+  -------
+  dict
+    `pid`: the process id the script was started with; `exit_code`, `stdout` and `stderr` of the run;
+    `base_arguments`: the arguments the stand-in got, None when it was not run; `before` and `after`: every path
+    under the stand-in cache folder, relative to it and sorted, before and after the run; `store`: the store
+    directory, relative in the same way.
+
+  Raises
+  ------
+  AssertionError
+    When the copy would still name a path outside its folder; it is not run then.
+
+  Examples
+  --------
+  >>> run_entrypoint_script(0, ["true"])["exit_code"]
+  0
+  >>> run_entrypoint_script(3, ["true"])["exit_code"]
+  1
+  """
+  # The store directory, as the daemon file has it.
+  data_root = daemon_config()["data-root"]
+  # A folder for this run alone, removed with everything in it when the run is over.
+  with tempfile.TemporaryDirectory() as folder:
+    # The same folder as a path object.
+    root = pathlib.Path(folder)
+    # The stand-in for the cache folder a host mounts.
+    cache = root / "cache"
+    # The stand-in store, at the place under the cache folder that the real one has.
+    store = cache / pathlib.PurePosixPath(data_root).relative_to(CACHE_ROOT)
+    # What is under the cache folder before the run.
+    files = [
+      # A file of the store.
+      store / "image" / "repositories.json",
+      # The store of another Docker major, next to it.
+      store.parent / "0" / "engine-id",
+      # A file next to the folder of the stores.
+      store.parent.parent / "other",
+      # Node data.
+      cache / "_data" / "e2.pem",
+    ]
+    # Each of them is created.
+    for path in files:
+      # Its folder first.
+      path.parent.mkdir(parents=True, exist_ok=True)
+      # Any content will do.
+      path.write_text("kept")
+    # The stand-in base entrypoint: it writes one line per argument it got, then exits as this run asks.
+    base = root / "base_entrypoint"
+    # A shell file, as the real one.
+    base.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$0.arguments"\nexit {}\n'.format(base_exit_code))
+    # The script runs it by its path.
+    base.chmod(0o755)
+    # The script with the two paths moved into the folder of this run.
+    text = ENTRYPOINT_SCRIPT.read_text().replace(BASE_ENTRYPOINT, str(base)).replace(data_root, str(store))
+    # The absolute paths its command lines (not its comments) still name.
+    named = re.findall(r"(?<![\w.])/[^\s;\"']+", "\n".join(line for line in text.splitlines() if not line.startswith("#")))
+    # A script that names its paths in another way would run or remove something real.
+    if not named or not all(path.startswith(folder) for path in named):
+      # Stop before the copy is run.
+      raise AssertionError("the copy of the entrypoint script names paths outside its folder: {}".format(named))
+    # The copy, under the script's own name.
+    copy = root / ENTRYPOINT_SCRIPT.name
+    # Its text is the changed one.
+    copy.write_text(text)
+    # A container runtime executes the entrypoint directly, so the copy is executed directly too.
+    copy.chmod(0o755)
+    # What is under the cache folder now.
+    before = sorted(str(path.relative_to(cache)) for path in cache.rglob("*"))
+    # Start the copy with the node command as its arguments.
+    process = subprocess.Popen([str(copy)] + list(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # Wait for its end; a script that hangs fails the test instead of the run.
+    stdout, stderr = process.communicate(timeout=60)
+    # The file the stand-in leaves when it was run.
+    arguments = root / "base_entrypoint.arguments"
+    # Everything a test asks about, read before the folder goes.
+    return {
+      # The process the script was started as.
+      "pid": process.pid,
+      # How the run ended.
+      "exit_code": process.returncode,
+      # What the run printed.
+      "stdout": stdout,
+      # What the run printed as errors.
+      "stderr": stderr,
+      # One argument per line.
+      "base_arguments": arguments.read_text().splitlines() if arguments.exists() else None,
+      # The cache folder before the run.
+      "before": before,
+      # The cache folder after the run.
+      "after": sorted(str(path.relative_to(cache)) for path in cache.rglob("*")),
+      # The store directory in those lists.
+      "store": str(store.relative_to(cache)),
+    }
+
+
 class TestNodeImageDockerStore(unittest.TestCase):
   """The daemon file and the node Dockerfiles agree with each other, the entrypoint's flags and the disk API."""
 
@@ -242,6 +374,107 @@ class TestNodeImageDockerStore(unittest.TestCase):
     keys = {"hosts" if flag == "host" else flag for flag in flags}
     # `tls` and `tlsverify` in the file fail the build without a flag: dockerd then wants certificates the image lacks.
     self.assertEqual(keys, ENTRYPOINT_FLAG_KEYS - {"tls", "tlsverify"})
+
+
+class TestNodeImageEntrypoint(unittest.TestCase):
+  """The node images start through `cmds/node_entrypoint`, which removes the kept store when the inner daemon does not start."""
+
+  def test_every_node_image_starts_through_the_script_right_after_the_store_steps(self):
+    """Each node image has one ENTRYPOINT, the script, after the daemon file steps; the script is copied before it, a command follows."""
+    # Every node Dockerfile, each reported under its own name.
+    for name, text in node_dockerfiles().items():
+      # One result per Dockerfile, so a failure names the file.
+      with self.subTest(dockerfile=name):
+        # The build instructions alone: comments and empty lines do not build anything.
+        instructions = [line for line in text.splitlines() if line and not line.startswith("#")]
+        # One entrypoint instruction in the file, and it names the script.
+        self.assertEqual([line for line in instructions if line.startswith("ENTRYPOINT")], [ENTRYPOINT_LINE])
+        # Where it is.
+        position = instructions.index(ENTRYPOINT_LINE)
+        # Directly after the last of the five store steps: the image is checked first, then told how to start.
+        self.assertEqual(instructions[position - 1], store_steps(name)[-1])
+        # The copy that brings the script into the image, from where this Dockerfile's build context has it.
+        copied = instructions.index("COPY {} /usr/local/bin/".format(CMDS_SOURCES.get(name, "./cmds")))
+        # Before the entrypoint instruction the script is copied and then made executable in the image.
+        self.assertLess(copied, instructions.index("RUN chmod +x /usr/local/bin/*", copied))
+        # That step too is before the entrypoint instruction.
+        self.assertLess(instructions.index("RUN chmod +x /usr/local/bin/*", copied), position)
+        # ENTRYPOINT drops the command of the base image, and the script ends with code 0 when it gets none: the
+        # image names its own node command after it, once.
+        self.assertEqual(len([line for line in instructions[position:] if line.startswith("CMD ")]), 1)
+
+  def test_the_script_removes_the_directory_the_daemon_file_names_and_nothing_else(self):
+    """The only `rm` of the script is on the data-root of `docker/daemon.json`, so the two cannot name different stores."""
+    # The directory the inner daemon keeps its store in.
+    data_root = daemon_config()["data-root"]
+    # The command lines of the script, without its comments.
+    code = "\n".join(line for line in ENTRYPOINT_SCRIPT.read_text().splitlines() if not line.startswith("#"))
+    # Every removal in them, up to the end of the command.
+    self.assertEqual(re.findall(r"\brm\b[^;\n]*", code), ["rm -rf " + data_root])
+    # No second mention of the directory that a change of the daemon file could leave behind.
+    self.assertEqual(ENTRYPOINT_SCRIPT.read_text().count(data_root), 1)
+
+  def test_the_script_runs_the_base_entrypoint_the_build_inspects(self):
+    """The script starts the daemon through the file the build checks for a store flag, and `cmds/` does not replace that file."""
+    # The command lines of the script, without its comments and empty lines.
+    code = [line for line in ENTRYPOINT_SCRIPT.read_text().splitlines() if line and not line.startswith("#")]
+    # The first of them runs the base image entrypoint with `true`, and handles its failure on the same line.
+    self.assertTrue(code[0].startswith(BASE_ENTRYPOINT + " true || "))
+    # The last of them puts the node command in the place of the script's own process.
+    self.assertEqual(code[-1], 'exec "$@"')
+    # Every node Dockerfile, each reported under its own name.
+    for name in node_dockerfiles():
+      # One result per Dockerfile, so a failure names the file.
+      with self.subTest(dockerfile=name):
+        # The build step that reads the entrypoint for a store flag reads that same file.
+        self.assertIn(" " + BASE_ENTRYPOINT + " ", store_steps(name)[3])
+    # `cmds/` is copied over /usr/local/bin: a file there with the base entrypoint's name would replace it, and the
+    # script would then run itself.
+    self.assertFalse((REPO_ROOT / "cmds" / pathlib.PurePosixPath(BASE_ENTRYPOINT).name).exists())
+
+  def test_the_script_is_an_executable_shell_file_with_unix_line_ends(self):
+    """A container runtime can execute the script: executable bit, a `/bin/sh` first line, no carriage return in any checkout."""
+    # The script, byte for byte.
+    data = ENTRYPOINT_SCRIPT.read_bytes()
+    # The image keeps the mode of the copied file, and the entrypoint is executed directly.
+    self.assertTrue(os.access(ENTRYPOINT_SCRIPT, os.X_OK))
+    # The interpreter of the base image entrypoint, so the start needs no other shell than before.
+    self.assertTrue(data.startswith(b"#!/bin/sh\n"))
+    # With a carriage return after the first line the kernel finds no interpreter and the container does not start.
+    self.assertNotIn(b"\r", data)
+    # A checkout that converts line ends leaves this file alone.
+    self.assertIn("cmds/{} text eol=lf".format(ENTRYPOINT_SCRIPT.name), (REPO_ROOT / ".gitattributes").read_text().splitlines())
+
+  def test_a_started_daemon_hands_the_node_command_on_as_the_same_process(self):
+    """After a good daemon start the script becomes the node command (process 1 in a container), arguments and exit code kept."""
+    # A node command that prints its own process id and its two arguments, then ends with a code of its own.
+    result = run_entrypoint_script(0, ["/bin/sh", "-c", 'echo "$$|$0|$1"; exit 7', "first argument", "second argument"])
+    # The base entrypoint is asked to start the daemon and run `true`, not the node command.
+    self.assertEqual(result["base_arguments"], ["true"])
+    # The command ran as the process the script was started as, so in a container it is process 1; its arguments
+    # arrive whole.
+    self.assertEqual(result["stdout"], "{}|first argument|second argument\n".format(result["pid"]))
+    # The node's exit code is the container's.
+    self.assertEqual(result["exit_code"], 7)
+    # The store and everything else are as they were.
+    self.assertEqual(result["after"], result["before"])
+
+  def test_a_daemon_that_does_not_start_costs_the_store_and_only_the_store(self):
+    """After a failed daemon start the script says so, removes the store and nothing else, and ends non-zero without the node command."""
+    # The base entrypoint fails with a code that is not the script's own; the node command would print a line.
+    result = run_entrypoint_script(3, ["/bin/sh", "-c", "echo the node command ran"])
+    # The daemon start was tried once, in the same way as in a good start.
+    self.assertEqual(result["base_arguments"], ["true"])
+    # The container stops with a failure code, so whoever started it sees a failed start.
+    self.assertEqual(result["exit_code"], 1)
+    # The node command was not run without a daemon.
+    self.assertEqual(result["stdout"], "")
+    # The log says what happened to the store.
+    self.assertIn("removing its kept store", result["stderr"])
+    # The store directory was there before the run.
+    self.assertIn(result["store"], result["before"])
+    # Afterwards the store directory and what was in it are gone, and every other path is still there.
+    self.assertEqual(result["after"], [path for path in result["before"] if not (path + "/").startswith(result["store"] + "/")])
 
 
 # Run this file directly as well as through the test runner.

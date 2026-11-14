@@ -64,6 +64,12 @@ RUN grep -cE -- '--(data-root|config-file)' /usr/local/bin/entrypoint.sh | grep 
 # directory name there and here, so that a node rolled back to an older image never reads a store written by
 # another Docker major.
 RUN dockerd --version | grep -q "^Docker version 29\."
+# Start through cmds/node_entrypoint (copied to /usr/local/bin above), not through the base image entrypoint alone.
+# The script runs that entrypoint unchanged to start dockerd, then the command of this image as process 1, as
+# before. When dockerd does not start, for whatever reason, it removes the store directory daemon.json names and
+# stops the container, so the next start begins on an empty store and pulls every app image once. Without it, a
+# store dockerd refuses stops the node at every start, until someone removes the directory on the host.
+ENTRYPOINT ["/usr/local/bin/node_entrypoint"]
 # set default Execution Engine id
 ENV EE_ID=E2dkr
 # Temporary fix:
