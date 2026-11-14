@@ -1009,9 +1009,9 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     self.assertEqual(get_response["error"], "get failed")
     self.assertEqual(reveal_response["nonce"], REQUEST_NONCE)
     self.assertEqual(reveal_response["error"], "reveal failed")
-    # The get_secrets line also says which sender and job the request names: none here.
     self.assertEqual(plugin._messages[-3:], [
       f"Error processing add_secrets request from {SOURCE_IP}: add failed",
+      # The get_secrets line also says which sender and job the request names: none here.
       f"Error processing get_secrets request from {SOURCE_IP} (sender None ETH None job None): get failed",
       f"Error processing reveal_job_secrets request from {SOURCE_IP}: reveal failed",
     ])
