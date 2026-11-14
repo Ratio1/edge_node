@@ -11,13 +11,16 @@ class _RequestTrackingMixin(object):
   records the requests it receives in the chain store, under its own node id, so every node
   holds the record of what the other nodes received.
 
-  What the record can show is limited by where it is written. The write runs in ``process()``,
-  on the plugin thread, after the web-app lap has run the queued requests. So a request is
-  published as not answered only when a lap ends while it still waits in the queue (or when it
-  was refused with a 503 before it ran, see ``_track_request``). A request whose endpoint hangs
-  holds the plugin thread, so the record is not written while it hangs; a request that returns
-  is usually written already answered. This was so before the record was limited to the
-  tracked endpoints too.
+  The record is written on the request monitor thread, from the web app's ``on_request_monitor_tick``
+  hook (see ``_maybe_publish_tracked_requests``), and the write does not wait for the other nodes.
+  The monitor thread is not held by an endpoint, so a request is published as not answered at the
+  monitor's next turn after it was queued, also when its endpoint then hangs and holds the plugin
+  thread. The answer is stamped by the plugin thread and published at the end of the interval, so the
+  other nodes can show a request as not answered for up to ``REQUESTS_SAVE_INTERVAL`` seconds after it
+  was answered. Before, the plugin thread wrote the record at the end of its lap and waited for the
+  other nodes: a request whose endpoint hung was never published while it hung. A plugin that does not
+  call the publish from the hook writes nothing; the hook exists from the core release that has the
+  chain store's ``wait=False`` write.
 
   Only the endpoints listed in ``REQUESTS_TRACKED_ENDPOINTS`` are recorded. The list is meant for
   the endpoints that change state; reads are left out. A chain-store write goes to every oracle
@@ -66,17 +69,24 @@ class _RequestTrackingMixin(object):
     -------
     None
 
+    Notes
+    -----
+    A plugin that publishes from ``on_request_monitor_tick`` calls this before the base ``on_init()``:
+    the web-app base starts the request monitor thread there, and that thread calls ``_track_request``
+    and the publish at once. It only reads the configuration and sets attributes, so it needs nothing
+    the base ``on_init()`` creates.
+
     Examples
     --------
     >>> def on_init(self):
-    ...   super().on_init()
     ...   self._init_request_tracking()
+    ...   super().on_init()
     """
     self.__rt_recent_requests = None
     self.__rt_last_log_time = 0
     self.__rt_dirty = False
-    # Time of the last write of the record. 0 lets the first change be written by the next
-    # process() call, without waiting for an interval.
+    # Time of the last write of the record. 0 lets the first change be written at the request
+    # monitor's next turn, without waiting for an interval.
     self.__rt_last_save_time = 0
     if self.__rt_cstore_hkey:
       # A plain list, not a deque(maxlen): _track_request replaces it with a changed copy, so the
@@ -90,8 +100,8 @@ class _RequestTrackingMixin(object):
     Record that a tracked endpoint received a request. Called from ``on_request``.
 
     Runs on the request monitor thread, before the endpoint and before any authentication.
-    It only changes memory: the chain-store write is left to
-    ``_maybe_log_and_save_tracked_requests`` on the plugin thread.
+    It only changes memory: the chain-store write is made by
+    ``_maybe_publish_tracked_requests`` at the monitor's next turn.
 
     A request to an endpoint that is not in ``REQUESTS_TRACKED_ENDPOINTS`` is ignored. That is
     what keeps reads (a status poll every two seconds, a list of apps) out of the chain store.
@@ -190,44 +200,62 @@ class _RequestTrackingMixin(object):
 
   def __rt_save(self):
     """
-    Write the record to the chain store (plugin thread only).
+    Write the record to the chain store without waiting for the other oracles (request monitor thread).
 
-    One replicated write: the record goes to every oracle under this node's id. The changed flag
-    is cleared before the record is copied, so a request that the monitor thread records while
-    the write waits for the other oracles sets it again and is written by the next save.
+    One replicated write with ``wait=False``: the record is stored in this node's replica and queued for
+    every oracle under this node's id, and the call returns; the chain store sends it again while no
+    oracle confirmed it. The changed flag is cleared before the record is copied, so an answer that the
+    plugin thread stamps while the write runs sets it again and is written by the next save. A write the
+    store does not take (it has not started, it has no peer, the call failed) leaves the record marked
+    as changed and is logged in red with the store's word for it; the save one interval later tries again.
 
     Returns
     -------
     None
+
+    Examples
+    --------
+    >>> self.__rt_save()   # the chain store has not started: red line, tried again one interval later
     """
-    # Clear the flag before the copy below: clearing it after the write forgot a request recorded
+    # Clear the flag before the copy below: clearing it after the write forgot a change made
     # during the write, which then stayed unwritten until another tracked change.
     self.__rt_dirty = False
-    self.chainstore_hset(
+    # The dict the chain store fills with its word for how the write ended; read for a write it did not take.
+    info = {}
+    # wait=False: stored here and queued for the other oracles, with no wait for their confirmations, so the
+    # monitor thread goes back to admitting requests. Before, the plugin thread waited here for up to 3 x 10 s
+    # and the result was not read.
+    if not self.chainstore_hset(
       hkey=self.__rt_cstore_hkey,
       key=self.ee_id,
       value=list(self.__rt_recent_requests),
+      wait=False,
+      result_info=info,
       debug=True
-    )
+    ):
+      # Not stored and not queued: the record stays marked as changed, so the save one interval later tries
+      # again. Before, a write that failed was forgotten until the next tracked change.
+      self.__rt_dirty = True
+      self.P(f"Request trace {self.__rt_cstore_hkey} was not published ({info['outcome']}); it is tried again in "
+             f"{self.cfg_requests_save_interval} s.", color='r')
     # Start of the quiet period that REQUESTS_SAVE_INTERVAL enforces before the next write.
     self.__rt_last_save_time = self.time()
     return
 
-  def _maybe_log_and_save_tracked_requests(self):
+  def _maybe_publish_tracked_requests(self):
     """
-    Write the record when it changed, and log every node's record now and then.
+    Write the record when it changed, at most once per interval.
 
-    Call from ``process()`` (plugin thread). The record is written only when a tracked request
-    arrived or was answered since the last write, and never more often than once every
-    ``REQUESTS_SAVE_INTERVAL`` seconds. The first change after a quiet period is written by the
-    first call that sees it; a change inside the interval waits for its end. Every
-    ``REQUESTS_LOG_INTERVAL`` seconds the records of all nodes are read from the local replica
-    and logged.
+    Call from ``on_request_monitor_tick()`` (request monitor thread): the web-app base calls that hook
+    before each read of its request queue, about every 0.25 s while no request comes and right after
+    each request was queued or refused. The record is written only when a tracked request arrived or
+    was answered since the last write, and never more often than once every ``REQUESTS_SAVE_INTERVAL``
+    seconds. The first change after a quiet period is written by the first call that sees it; a change
+    inside the interval waits for its end.
 
-    The web-app lap runs the queued requests before it calls ``process()``. So a write made here
-    shows a request as answered, or as not answered in two cases: a lap ended while it still
-    waited in the queue, or it was refused with a 503 before it ran. A request whose endpoint
-    hangs holds the plugin thread, so nothing is written while it hangs.
+    So a request is written as not answered right after it was queued, whatever its endpoint then does,
+    and a request that is answered is written a second time, with its answer, at the end of the
+    interval. A request refused with a 503 before it ran is written as not answered too.
 
     Returns
     -------
@@ -240,10 +268,13 @@ class _RequestTrackingMixin(object):
     could make every oracle store a record, and save its whole replica, once per call. With
     it a node writes its record at most ``60 / REQUESTS_SAVE_INTERVAL`` times a minute.
 
+    The monitor admits no request while this runs. The write does not wait for the other oracles, but
+    it takes the chain store's lock, which a save or a namespace-sync merge can hold.
+
     Examples
     --------
-    >>> def process(self):
-    ...   self._maybe_log_and_save_tracked_requests()
+    >>> def on_request_monitor_tick(self):
+    ...   self._maybe_publish_tracked_requests()
     """
     if self.__rt_recent_requests is None:
       return
@@ -251,6 +282,28 @@ class _RequestTrackingMixin(object):
     # the first change after a quiet period goes out on this call, a burst of calls costs one write.
     if self.__rt_dirty and self.time() - self.__rt_last_save_time >= self.cfg_requests_save_interval:
       self.__rt_save()
+    return
+
+  def _maybe_log_tracked_requests(self):
+    """
+    Log every node's record now and then.
+
+    Call from ``process()`` (plugin thread). Every ``REQUESTS_LOG_INTERVAL`` seconds the records of
+    all nodes are read from the local replica and logged. Nothing is written here: the record is
+    written by ``_maybe_publish_tracked_requests`` on the request monitor thread. Before, this function
+    also wrote it (it was named ``_maybe_log_and_save_tracked_requests``).
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> def process(self):
+    ...   self._maybe_log_tracked_requests()
+    """
+    if self.__rt_recent_requests is None:
+      return
     if (self.time() - self.__rt_last_log_time) > self.__rt_log_interval:
       try:
         hkey = self.__rt_cstore_hkey

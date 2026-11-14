@@ -379,12 +379,33 @@ class DauthManagerPlugin(
     return
 
   def process(self):
+    """
+    The end of each plugin lap: sync the job-secret namespaces when due and write pending unlicensed tries.
+
+    On a registered dAuth oracle each lap syncs the two job-secret namespaces from the dAuth registry peers
+    once per ``DAUTH_JOB_SECRETS_HSYNC_INTERVAL`` and writes at most one pending record of a revoked node that
+    asked without a license. On any other node nothing is done.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    The periodic log of every node's request trace is switched off here (the ``if False`` below). dAuth
+    tracks no endpoint, so it has no trace to write either.
+
+    Examples
+    --------
+    >>> plugin.process()   # called by the plugin loop after the lap's queued requests
+    """
     self._maybe_hsync_dauth_job_secrets()
     if self._is_dauth_server_enabled():
       self._maybe_publish_dauth_revoked_unlicensed_tries()
     # TODO: this will be re-enabled in the future.
     if False:
-      self._maybe_log_and_save_tracked_requests()
+      # The mixin's periodic log under its new name (it no longer writes the trace); still switched off.
+      self._maybe_log_tracked_requests()
     return
 
   def _maybe_hsync_dauth_job_secrets(self):
