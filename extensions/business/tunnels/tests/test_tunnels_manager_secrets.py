@@ -94,8 +94,48 @@ class _Manager(TunnelsManagerPlugin):
   def time_to_str(self, value):
     return str(value)
 
-  def chainstore_hset(self, hkey, key, value):
-    self.store[(hkey, key)] = value  # the store keeps the local copy also when peers do not confirm
+  def chainstore_hset(self, hkey, key, value, result_info):
+    """
+    Write one hash field as the chain store does, with its cs_rev rule and its outcome word.
+
+    A value whose ``cs_rev`` is lower than the stored one is refused on this oracle with the word
+    ``refused_cs_rev``; any other value is kept locally, also when other oracles do not confirm it, with the word
+    ``changed`` or ``unconfirmed``.
+
+    Parameters
+    ----------
+    hkey : str
+      Hash namespace.
+    key : str
+      Field within the hash.
+    value : dict
+      The record, with its ``cs_rev``.
+    result_info : dict
+      Receives the outcome word under ``"outcome"``; required, as the endpoint always passes it.
+
+    Returns
+    -------
+    bool
+      True only when the value was stored and other oracles confirmed it.
+
+    Examples
+    --------
+    >>> info = {}
+    >>> _Manager().chainstore_hset("tunnels_manager_secrets", WALLET, {"cs_rev": 1}, result_info=info), info
+    (True, {'outcome': 'changed'})
+    """
+    # The record this oracle holds for the field, if any.
+    held = self.store.get((hkey, key))
+    if held is not None and value["cs_rev"] < held["cs_rev"]:
+      # The chain store's cs_rev rule: an older update is refused here and not stored.
+      result_info["outcome"] = "refused_cs_rev"
+      # Refused at once, as the store does.
+      return False
+    # The store keeps the local copy also when peers do not confirm.
+    self.store[(hkey, key)] = value
+    # The word of a stored write: confirmed by other oracles, or not.
+    result_info["outcome"] = "changed" if self.confirmed else "unconfirmed"
+    # Whether other oracles confirmed it.
     return self.confirmed
 
   def chainstore_hget(self, hkey, key):
@@ -194,8 +234,9 @@ class TunnelSecretsTests(unittest.TestCase):
     manager = _Manager(confirmed=False)
     # The writes the endpoint makes, and the fake store's own write.
     writes, store_write = [], manager.chainstore_hset
-    # Count each write, keeping the fake store's behavior.
-    manager.chainstore_hset = lambda hkey, key, value: writes.append(key) or store_write(hkey, key, value)
+    # Count each write, keeping the fake store's behavior and its outcome word.
+    manager.chainstore_hset = lambda hkey, key, value, result_info: writes.append(key) or store_write(
+      hkey, key, value, result_info)
     # One signed request.
     payload = _payload()
     # First request: written, but other oracles did not confirm it; the local copy is kept.
@@ -204,6 +245,30 @@ class TunnelSecretsTests(unittest.TestCase):
     manager.confirmed = True
     # The same signed request again: written again, and reported as saved.
     self.assertEqual((manager.add_secrets(dict(payload)), len(writes)), ({"success": True}, 2))
+
+  def test_an_update_older_than_the_stored_credentials_gets_its_own_answer(self):
+    """An update whose signed time is older than the stored record's is refused by the store's cs_rev rule and
+    answered with its own error, which asks for no retry and names neither the stored nor the sent values."""
+    # A manager over an empty store.
+    manager = _Manager()
+    # An update signed a second ago with a new token, saved first.
+    newer = dict(_payload(age_s=1.0), cloudflare_api_key="new-" + TOKEN)
+    # Saved.
+    self.assertEqual(manager.add_secrets(newer), {"success": True})
+    # An update signed a minute ago with an old token, arriving after it.
+    older = dict(_payload(age_s=60.0), cloudflare_api_key="old-" + TOKEN)
+    # Refused with the answer of an older update.
+    result = manager.add_secrets(older)
+    # The exact answer: no retry asked, no value named.
+    self.assertEqual(
+      result, {"success": False, "error": "Secrets were not saved: the stored credentials are newer than this update."})
+    # The newer record is still the stored one.
+    self.assertEqual(manager.store[("tunnels_manager_secrets", WALLET)]["cloudflare_api_key"], "new-" + TOKEN)
+    # Neither token, nor the stored revision, appears in the answer or the log.
+    self.assertEqual(
+      [part in result["error"] + " ".join(manager.logged) for part in (TOKEN, str(int(newer["nonce"], 16)))],
+      [False, False],
+    )
 
   def test_a_wallet_with_an_active_escrow_is_stored_as_before(self):
     """A wallet with an active escrow is stored as before, and the escrow lookup is asked for the address the

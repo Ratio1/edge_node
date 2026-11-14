@@ -468,17 +468,24 @@ class TunnelsManagerPlugin(BasePlugin):
         malformed, future or expired (older than 12 hours) nonce, a failed
         signature check, a wallet without an active escrow, an escrow lookup
         that failed, a missing Cloudflare field, a field that is not a string
-        or is longer than ``SECRET_FIELD_MAX_LEN``, or a write that other
-        oracles did not confirm.
+        or is longer than ``SECRET_FIELD_MAX_LEN``, an update older than the
+        credentials this oracle stores for the wallet ("the stored credentials
+        are newer than this update", no stored value named), or a write that
+        other oracles did not confirm.
 
     Notes
     -----
     Each update that passes the checks leaves one log line: the wallet and
-    whether other oracles confirmed it, never the secret values. ``cs_rev`` is
-    only recorded; nothing orders replicas by it yet, so a restart sync can
-    still replace this copy with an older one. The escrow lookup is a chain
-    read on every request that passes the signature check; its result is not
-    cached. The same signed request sent again is written again, so the client
+    whether other oracles confirmed it, never the secret values. The chain
+    store orders this hash by ``cs_rev``: a value with a lower ``cs_rev`` never
+    replaces the stored record, by a live write or by a sync, and a sync copy
+    without ``cs_rev`` does not either. An update older than the record this
+    oracle stores is refused here at once, with the chain store's word
+    ``refused_cs_rev`` in ``result_info``; an oracle that refuses it does not
+    confirm it. Oracles of the previous release do not order by ``cs_rev``.
+    The escrow lookup is a chain read on every request that passes the
+    signature check; its result is not cached. The same signed request sent
+    again is written again (an equal ``cs_rev`` is not older), so the client
     can retry an update other oracles did not confirm.
 
     Examples
@@ -493,6 +500,8 @@ class TunnelsManagerPlugin(BasePlugin):
     {'success': False, 'error': 'Secrets were not saved: Nonce is expired!'}
     >>> plugin.add_secrets(payload=update_signed_by_a_wallet_without_an_active_escrow)
     {'success': False, 'error': 'Secrets were not saved: Wallet has no active escrow.'}
+    >>> plugin.add_secrets(payload=update_signed_before_the_stored_one)
+    {'success': False, 'error': 'Secrets were not saved: the stored credentials are newer than this update.'}
     """
     try:
       # Reject a future nonce or one older than 12 hours, so a captured signed update cannot be replayed
@@ -523,8 +532,8 @@ class TunnelsManagerPlugin(BasePlugin):
         "cloudflare_account_id": payload['cloudflare_account_id'],
         "cloudflare_zone_id": payload['cloudflare_zone_id'],
         "cloudflare_domain": payload['cloudflare_domain'],
-        # Signed client time, recorded as the record's revision ("cs_rev"). Nothing orders by it yet:
-        # until the chain store does, a restart sync can still replace this copy with an older one.
+        # Signed client time, the record's revision ("cs_rev"): the chain store never replaces a stored record with
+        # a value of a lower cs_rev, on a live write or on a sync, nor with a sync copy that has no cs_rev.
         "cs_rev": int(payload['nonce'].replace("0x", ""), 16),
       }
       # Accept only Cloudflare fields that are strings of at most SECRET_FIELD_MAX_LEN characters, so the record
@@ -536,13 +545,20 @@ class TunnelsManagerPlugin(BasePlugin):
       # Return every check failure instead of raising: the web-app base logs the arguments of an endpoint
       # that raises, and here the argument holds the Cloudflare token.
       return {"success": False, "error": "Secrets were not saved: {}".format(exc)}
+    # Filled by the chain store with the word of how the write ended, which tells an update older than the stored
+    # record ("refused_cs_rev") from one other oracles did not confirm.
+    write_info = {}
     # Keep the write's result: it is True only when other oracles confirmed the update. Ignoring it
     # answered success for a save that never replicated, so the other oracles could keep an older token.
-    stored = self.chainstore_hset(hkey="tunnels_manager_secrets", key=sender, value=secrets)
+    stored = self.chainstore_hset(hkey="tunnels_manager_secrets", key=sender, value=secrets, result_info=write_info)
     # The only trace of a secrets update: who, and whether other oracles confirmed it. Never the values.
     self.P(f"Tunnel secrets update by {sender}: {'confirmed' if stored else 'NOT confirmed'} by other oracles",
            color=None if stored else 'r')
     if not stored:
+      if write_info["outcome"] == "refused_cs_rev":
+        # This oracle holds credentials of a newer update (a higher cs_rev), so sending this one again cannot
+        # succeed: say so instead of asking for a retry, without naming any stored value.
+        return {"success": False, "error": "Secrets were not saved: the stored credentials are newer than this update."}
       # Report an unconfirmed write as a failure the client can retry. It is returned, not raised, so the
       # request that holds the token is not written to the log.
       return {"success": False, "error": "Secrets were not saved: other oracles did not confirm the update. Please try again."}
