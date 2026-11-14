@@ -57,6 +57,12 @@ def _parse_constraint(product, text, cache=None):
   return tuple(clauses)
 
 
+def _lower_at_or_above(clauses, oldest):
+  """True when the constraint has a lower bound (`>=`, `>`, `==`) at or above `oldest`."""
+  lowers = [target for op, target in clauses if op in (">=", ">", "==")]
+  return any(_compare_versions(t, oldest) >= 0 for t in lowers)
+
+
 def _holds(op, cmp):
   return {"<": cmp < 0, "<=": cmp <= 0, ">": cmp > 0, ">=": cmp >= 0, "==": cmp == 0}[op]
 
@@ -78,6 +84,7 @@ class VulndbReader:
     self._vulns = vulns
     self._exact = {}   # (product, normalised numbers, tail) -> [affected row]
     self._ranges = {}  # product -> [(clauses, affected row)]
+    self._rows = {}    # (product, cve_id) -> [(clauses, affected row)], for the end-of-life rules
     cache = {}
     for row in rows:
       row = tuple(sys.intern(v) if isinstance(v, str) and i != 2 else v for i, v in enumerate(row))
@@ -86,15 +93,30 @@ class VulndbReader:
         self.dropped += 1
         continue
       self.row_count += 1
+      if row[1] in self.eol:
+        self._rows.setdefault((row[1], row[0]), []).append((clauses, row))
       if len(clauses) == 1 and clauses[0][0] == "==":
         numbers, tail = clauses[0][1]
         self._exact.setdefault((row[1], _norm(numbers), tail), []).append(row)
       else:
         self._ranges.setdefault(row[1], []).append((clauses, row))
+    # product -> (oldest supported, [one row per CVE the vendor never assessed for the branch below it])
+    self._eol = {}
+    for product, text in self.eol.items():
+      oldest = _parse_version(text, product)
+      if oldest is not None:
+        self._eol[product] = (oldest, text, [rows[0][1] for (p, _), rows in self._rows.items()
+                                             if p == product and all(_lower_at_or_above(c, oldest) for c, _ in rows)])
 
   def _match(self, row):
     vuln = self._vulns[row[0]]
     return Match(*row, *vuln, self._cvss.get(row[0], ()))
+
+  def unsupported(self, product, version):
+    """The `oldest_supported` text when `version` is older than it, else None (no `eol` row: None)."""
+    entry = self._eol.get(product)
+    parsed = _parse_version(version, product) if entry else None
+    return entry[1] if parsed is not None and _compare_versions(parsed, entry[0]) < 0 else None
 
   def query(self, product, version):
     """Rows of `product` whose constraint holds for `version`, one per CVE."""
@@ -110,6 +132,11 @@ class VulndbReader:
       rank = (row[4] == "tentative", row[6])
       if row[0] not in best or rank < best[row[0]][0]:
         best[row[0]] = (rank, row)
+    if self.unsupported(product, version):
+      # `eol_unassessed`: the vendor's ranges for this CVE all start inside the supported line.
+      for row in self._eol[product][2]:
+        if row[0] not in best:
+          best[row[0]] = (None, row[:4] + ("tentative", "eol_unassessed") + row[6:])
     return [self._match(row) for _, row in best.values()]
 
 

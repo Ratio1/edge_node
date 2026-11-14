@@ -15,6 +15,7 @@ from typing import Optional
 
 from ..constants import RUN_MODE_SINGLEPASS
 from ..credential_redaction import redact_credential_text
+from ..cve_view import filter_listed
 from ..models.finding_schema import is_coverage_result as _is_coverage_result
 from ..services.config import get_llm_agent_config
 from ..services.resilience import run_bounded_retry
@@ -570,7 +571,8 @@ class _RedMeshLlmAgentMixin(object):
       if not _is_coverage_result(f)
     ]
     total_findings = len(findings)
-    deduped = self._deduplicate_findings(findings)
+    # Generated CVE findings: the listed ones only (rollup and possible rows are not sent one by one).
+    deduped = filter_listed(self._deduplicate_findings(findings))
     ranked = self._rank_findings(deduped)
     limits = self._get_llm_payload_limits(analysis_type)
     bucket_limits = _LLM_FINDING_BUCKETS.get(analysis_type, _LLM_FINDING_BUCKETS["security_assessment"])

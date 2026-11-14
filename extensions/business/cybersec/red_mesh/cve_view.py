@@ -144,6 +144,9 @@ def build_cve_view(findings, not_applicable=(), triage=None, now=None):
       closed += 1
     else:
       groups.setdefault((f.get("port"), _subject(f)[0]), []).append(f)
+  eol = {(f.get("port"), f["tags"][1]): f["finding_id"] for f in findings
+         if isinstance(f, dict) and f.get("vulndb_build_id") and f.get("finding_id")
+         and len(f.get("tags") or ()) > 1 and f["tags"][0] == "vulndb_eol"}
   services = []
   totals = {"listed": 0, "rolled_up": 0, "possible": 0}
   for (port, product), members in sorted(groups.items(), key=lambda kv: _service_order(*kv[0])):
@@ -161,7 +164,7 @@ def build_cve_view(findings, not_applicable=(), triage=None, now=None):
       "rollup": _rollup(product, sorted(rest, key=_rank)) if rest else None,
       "possible": _possible(tentative) if tentative else None,
       "possible_kev": [f["finding_id"] for f in kev_possible],
-      "unsupported": None,  # the end-of-life finding: a later step
+      "unsupported": eol.get((port, product)),  # the end-of-life finding, outside `raw`
     })
     totals["listed"] += len(listed)
     totals["rolled_up"] += len(rest)
