@@ -379,9 +379,10 @@ because the disk API of plugin code refuses that folder (the core's `RESTRICTED_
   the start) compares the registry's image with the one the container runs and restarts the app when the tag
   moved while the node was down, so such an app starts twice.
 - **Leftover container:** a container with the app's name that an earlier run left is removed before every
-  start. Every container the runner removes (at that point, at a stop, a restart or an update) goes with its
-  anonymous volumes: the volumes Docker creates for a `VOLUME` of the image that no app volume covers. Data
-  an app must keep belongs in a configured app volume.
+  start. A container removed at that point, at a stop, a restart or an update goes with its anonymous
+  volumes: the volumes Docker creates for a `VOLUME` of the image that no app volume covers. Data an app
+  must keep belongs in a configured app volume. (The clean-up of a deleted deployment removes the container
+  without them; they stay until the next sweep.)
 - **Sweep:** one hour into each node run, one app removes from the store the stopped containers of earlier
   runs, the anonymous volumes no container holds and every image no container uses. An app without a
   container at that moment (stopped by hand, waiting for another app) pulls its image at its next start. An
@@ -394,6 +395,12 @@ because the disk API of plugin code refuses that folder (the core's `RESTRICTED_
 - **Docker major:** the directory is named after the Docker major that writes it, and each image build stops
   when the base image has another major. The directory name in `docker/daemon.json` and that build check
   change together; the store of the earlier major is then left on the host until it is removed.
+- **Rollback:** an image without `docker/daemon.json` does not see this store. It pulls every app image
+  into the node container's own layer, as before, while the store stays on the host: for that time the host
+  needs free space for the app images a second time.
+- **A store Docker refuses:** when dockerd cannot open the store at start, the base image entrypoint stops
+  the node container before the node starts, at every start, until `_bin/docker` is removed on the host.
+  Seen only with a store file damaged by hand; nothing in the image recovers from it yet.
 - **Copying a node's `_local_cache`** to another host: leave `_bin/docker` out; it holds only what can be
   pulled again.
 
