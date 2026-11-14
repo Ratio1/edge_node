@@ -374,7 +374,7 @@
   }
  },
  "intent_digest": "4eced46e4d146431a11795020b13fe85965581dc3db06c9e1c688257f83678fc",
- "pack_view_sha256": "ac78f9ae3ceff2240ccefb63104d2347549ec0f4a60c3ba8e39b900311d08018",
+ "pack_view_sha256": "05300ce811ff9ece7160b94dfaeb21a905f50848765327052bf05665f9904c65",
  "snapshot_envelope": {
   "kind": "redmesh_framework_assessment",
   "pack_id": "ro.dnsc.o1-2026",

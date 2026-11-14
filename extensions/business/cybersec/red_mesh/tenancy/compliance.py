@@ -481,11 +481,23 @@ def pack_view(pack, text, level):
     "language": text.get("language") or pack["language"],
     "catalogue": pack["catalogue"],
     "title": manifest_pack(pack["pack_id"])["title"],  # the display name; `catalogue` names the source framework and is never shown
+    # RM-194: what the form needs to pick itself, as the pack list gives it (the rule block without `exports`, snake_case inside)
+    "scoring": manifest_pack(pack["pack_id"])["scoring"], "levels": list(pack_levels(pack)),
+    "rules": {key: value for key, value in pack_rules(pack).items() if key != "exports"},
   }
   if "hierarchy" in text:  # the generic hierarchy of any depth (contract §Pack and text schema)
     view["hierarchy"] = [dict(n) for n in text["hierarchy"]]
   view["extras"] = scorer_for(pack).pack_view_extras(pack, text)
   return view
+
+
+_ENTITY_VIEW_KEYS = {"dnsc_unique_id": "dnscUniqueId", "external_supplier": "externalSupplier"}
+
+
+def _entity_fields_view(row, pack):
+  """RM-194: an entity field is in the view only when the pack's rule block lists it (a console feature-detects on the key)."""
+  listed = pack_rules(pack).get("entity_fields") or []
+  return {view_key: row.get(field) or "" for field, view_key in _ENTITY_VIEW_KEYS.items() if field in listed}
 
 
 def assessment_view(row, pack, *, can_manage, text=None, names=_no_names, tenant=None):
@@ -502,7 +514,7 @@ def assessment_view(row, pack, *, can_manage, text=None, names=_no_names, tenant
     "assuranceLevel": level, "levelProvenance": row.get("level_provenance"),
     "sectoralRequirements": row.get("sectoral_requirements", ""),
     "completionDate": row.get("completion_date", ""), "managementSignoff": row.get("management_signoff"),
-    "dnscUniqueId": row.get("dnsc_unique_id") or "", "externalSupplier": row.get("external_supplier") or "",
+    **_entity_fields_view(row, pack),
     "claimant": _view_claimant(tenant),
     "remediation": list(row.get("remediation") or []),
     "state": row["state"], "assessmentRevision": row["assessment_revision"],

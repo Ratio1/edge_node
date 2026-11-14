@@ -193,6 +193,18 @@ class TestCyfunFamilyPack(GenericPackFixture):
     self.assertEqual(texts["TC.A-01.1"], ("Synthetic requirement text.", None))
     self.assertEqual(texts["TC.A-01.2"], (None, None))
 
+  def test_the_view_carries_scorer_levels_and_rules_and_entity_keys_only_where_listed(self):
+    """RM-194: the form picks itself from the read; the DNSC read keeps its entity keys, the CyFun-like read has none."""
+    aid = self.ok(self.create(CYFUN, level="base"))["assessmentId"]
+    data = self.ok(self.plugin.get_framework_assessment(self.admin, self.tenant, CYFUN, aid))
+    self.assertEqual((data["pack"]["scoring"], data["pack"]["levels"]), ("maturity_two_axis.v1", ["base", "extended"]))
+    self.assertEqual(data["pack"]["rules"]["entity_fields"], [])
+    self.assertNotIn("exports", data["pack"]["rules"])
+    self.assertFalse({"dnscUniqueId", "externalSupplier"} & set(data))
+    dnsc = self.ok(self.plugin.get_framework_assessment(self.admin, self.tenant, DNSC, "default"))
+    self.assertEqual(dnsc["pack"]["rules"]["entity_fields"], ["dnsc_unique_id", "external_supplier"])
+    self.assertEqual((dnsc["dnscUniqueId"], dnsc["externalSupplier"]), ("", ""))
+
 
 class TestRetiredPack(GenericPackFixture):
   def test_a_retired_pack_still_opens_and_is_neither_listed_nor_unknown(self):
