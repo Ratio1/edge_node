@@ -6,6 +6,7 @@ import statistics
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from extensions.business.cybersec.red_mesh.vulndb.reader import load_reader, load_vulndb
@@ -64,9 +65,8 @@ class VulndbReaderTests(unittest.TestCase):
     pin.update(pin_extra or {})
     self.pin.write_text(json.dumps(pin))
 
-  def error(self, flag="generated"):
-    reader, keys = load_vulndb(flag, self.db, self.pin)
-    return reader, keys
+  def load_generated(self):
+    return load_vulndb("generated", self.db, self.pin)
 
   def test_query_ranges_exact_and_dedup(self):
     self.build()
@@ -102,21 +102,22 @@ class VulndbReaderTests(unittest.TestCase):
 
   def test_generated_ok(self):
     self.build()
-    reader, keys = self.error()
+    reader, keys = self.load_generated()
     self.assertIsNotNone(reader)
     self.assertEqual((keys["vulndb_source"], keys["vulndb_build_id"], keys["vulndb_built_at"]),
                      ("generated", BUILD_ID, "2026-11-14T00:00:00Z"))
     self.assertIsNone(keys["vulndb_load_error"])
 
   def test_local_origin_reports_meta_build_id_no_built_at(self):
-    self.build(pin_extra={"origin": "local", "build_id": "ignored"})
-    self.pin.write_text(json.dumps({"origin": "local", "sha256_sqlite": json.loads(self.pin.read_text())["sha256_sqlite"]}))
-    _, keys = self.error()
+    self.build()
+    sha = json.loads(self.pin.read_text())["sha256_sqlite"]
+    self.pin.write_text(json.dumps({"origin": "local", "sha256_sqlite": sha}))
+    _, keys = self.load_generated()
     self.assertEqual((keys["vulndb_build_id"], keys["vulndb_built_at"], keys["vulndb_origin"]),
                      (BUILD_ID, None, "local"))
 
   def assert_fallback(self, cause):
-    reader, keys = self.error()
+    reader, keys = self.load_generated()
     self.assertIsNone(reader)
     self.assertEqual((keys["vulndb_source"], keys["vulndb_build_id"], keys["vulndb_load_error"]),
                      ("static", None, cause))
@@ -138,8 +139,57 @@ class VulndbReaderTests(unittest.TestCase):
     self.pin.write_text(json.dumps({"sha256_sqlite": hashlib.sha256(b"not sqlite").hexdigest()}))
     self.assert_fallback("load_failed:DatabaseError")
 
-  def test_unknown_flag_value_is_static(self):
-    self.assertEqual(load_vulndb("bogus", self.db, self.pin)[1]["vulndb_source"], "static")
+  def test_unknown_flag_value_falls_back_with_error(self):
+    reader, keys = load_vulndb("bogus", self.db, self.pin)
+    self.assertEqual((reader, keys["vulndb_source"], keys["vulndb_load_error"]), (None, "static", "unknown_source"))
+
+  def test_size_mismatch_and_unreadable_file(self):
+    self.build(pin_extra={"size": 1})
+    self.assert_fallback("hash_mismatch")
+    self.build()
+    os.chmod(self.db, 0)
+    self.addCleanup(os.chmod, self.db, 0o600)
+    if not os.access(self.db, os.R_OK):  # root ignores the mode
+      self.assert_fallback("file_unreadable")
+
+  def test_unreadable_read_simulated(self):
+    self.build()
+    with mock.patch.object(Path, "read_bytes", side_effect=PermissionError):
+      self.assert_fallback("file_unreadable")
+
+  def test_hostile_pin_never_raises(self):
+    self.build()
+    self.pin.write_text("[" * 100000)
+    reader, keys = self.load_generated()
+    self.assertIsNone(reader)
+    self.assertEqual(keys["vulndb_source"], "static")
+    self.assertTrue(keys["vulndb_load_error"])
+
+  def test_strongest_row_per_cve(self):
+    rows = [
+      ("CVE-2021-0010", "apache", "==2.4.1", "nvd", "tentative", "nvd_exact", 0, 0),
+      ("CVE-2021-0010", "apache", "<2.5", "nvd", "firm", "nvd_range", 1, 0),
+      ("CVE-2021-0010", "apache", "<2.6", "nvd", "firm", "nvd_range", 0, 0),
+    ]
+    self.build(rows=rows)
+    reader, _ = load_reader(self.db, self.pin)
+    (match,) = reader.query("apache", "2.4.1")
+    self.assertEqual((match.confidence, match.platform_dependent, match.constraint), ("firm", 0, "<2.6"))
+
+  def test_query_parity_with_matcher(self):
+    from extensions.business.cybersec.red_mesh.cve_db import _matches_constraint
+    from extensions.business.cybersec.red_mesh.tests.test_cve_matcher_versions import UNIT
+    extra = [("", "1.0", "==1.0rc1"), ("", "1.0rc1", "==1.0rc1"), ("openssl", "1.0.1f", "==1.0.1f"),
+             ("openssl", "1.0.1", "==1.0.1f"), ("bind", "9.18.24-S1", "==9.18.24-S1"),
+             ("bind", "9.18.24", "==9.18.24-S1"), ("bind", "9.10.3-P4", "==9.10.3-P4")]
+    cases = [(p, v, c) for p, v, c, _e, _w in UNIT] + extra
+    rows = [("CVE-2022-%04d" % i, p or "x", c, "nvd", "firm", "nvd_range", 0, 0) for i, (p, v, c) in enumerate(cases)]
+    self.build(rows=rows)
+    reader, _ = load_reader(self.db, self.pin)
+    for i, (product, version, constraint) in enumerate(cases):
+      with self.subTest(product=product, version=version, constraint=constraint):
+        hit = "CVE-2022-%04d" % i in [m.cve_id for m in reader.query(product or "x", version)]
+        self.assertEqual(hit, _matches_constraint(version, constraint, product or "x"))
 
 
 @unittest.skipUnless(os.environ.get("VULNDB_BENCH_DB"), "set VULNDB_BENCH_DB to a real database (pin built from it)")
