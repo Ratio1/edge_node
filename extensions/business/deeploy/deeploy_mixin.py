@@ -93,6 +93,8 @@ DEEPLOY_DAUTH_SECRET_PATH_SUFFIXES = (
   ("VCS_DATA", "TOKEN"),
   ("CR_DATA", "PASSWORD"),
   ("ENV", "R1EN_CSTORE_AUTH_SECRET"),
+  # A volume-sync set's secret: kept out of the stored pipeline even when a client sends no secret_paths for it.
+  ("ENV", "R1EN_SYNC_SECRET"),
   ("ENV", "R1EN_CSTORE_AUTH_BOOTSTRAP_ADMIN_PWD"),
   ("ENV", "CF_TUNNEL_TOKEN"),
   ("ENV", "CRDB_PASSWORD"),

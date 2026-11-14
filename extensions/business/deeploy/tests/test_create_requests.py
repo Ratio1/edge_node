@@ -658,6 +658,7 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     self.assertIn("'PER_NODE_CONFIG': '***'", serialized)
 
   def test_dauth_secret_extraction_redacts_only_mandatory_paths(self):
+    """Every mandatory secret path, a sync set's secret among them, is redacted; other values stay."""
     plugin = make_deeploy_plugin()
     payload = {
       "PLUGINS": [{
@@ -674,6 +675,8 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
           "CR_DATA": {"USERNAME": "user", "PASSWORD": "registry-password"},
           "ENV": {
             "R1EN_CSTORE_AUTH_SECRET": "cstore-secret",
+            # A volume-sync set's secret, sent like any ENV value with no secret_paths entry.
+            "R1EN_SYNC_SECRET": "sync-set-secret",
             "R1EN_CSTORE_AUTH_BOOTSTRAP_ADMIN_PWD": "admin-password",
             "CF_TUNNEL_TOKEN": "node-tunnel-token",
             "CRDB_PASSWORD": "crdb-password",
@@ -701,6 +704,8 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       "github-token",
       "registry-password",
       "cstore-secret",
+      # The sync secret: gone from the pipeline that is stored, present in the secret tree.
+      "sync-set-secret",
       "admin-password",
       "node-tunnel-token",
       "crdb-password",
@@ -712,6 +717,13 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     ):
       self.assertNotIn(value, serialized_redacted)
       self.assertIn(value, serialized_secrets)
+
+    # At its own path: the placeholder in the redacted pipeline, the value in the secret tree.
+    self.assertEqual(
+      (redacted["PLUGINS"][0]["INSTANCES"][0]["ENV"]["R1EN_SYNC_SECRET"],
+       secrets["PLUGINS"][0]["INSTANCES"][0]["ENV"]["R1EN_SYNC_SECRET"]),
+      (DEEPLOY_DAUTH_SECRET_PLACEHOLDER, "sync-set-secret"),
+    )
 
     self.assertIn(DEEPLOY_DAUTH_SECRET_PLACEHOLDER, serialized_redacted)
     self.assertIn("user-env-password", serialized_redacted)
