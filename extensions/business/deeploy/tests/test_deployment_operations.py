@@ -341,10 +341,10 @@ class DeploymentOperationTests(unittest.TestCase):
     self.assertEqual(calls[down["operation_id"]],
                      [(now, "status") for now in range(100, 220, 2)] + [(220, "revoke"), (230, "revoke"), (250, "revoke")])
 
-  def test_a_chain_store_write_that_fails_is_not_held_back_by_the_custody_wait(self):
+  def test_a_chain_store_write_that_fails_is_still_tried_on_every_pass(self):
     """Only a failed custody call makes an operation wait, also right after such a wait has run out: a final
-    write that fails after the custody call succeeded is tried again at its repair ages 30 and 60 s, where
-    custody waits of 20 and 40 s would have held the second try back, and its red lines name no custody failure."""
+    write that fails after the custody call succeeded is tried again on every 2 s pass, where a custody wait of
+    20 s would have held it back, and its red lines name no custody failure."""
     # A coordinator whose log lines are kept with their colors.
     plugin = Coordinator()
     # The log lines with their colors.
@@ -401,20 +401,20 @@ class DeploymentOperationTests(unittest.TestCase):
     plugin._reconcile_coordinator_operations()
     # At 110 s the custody call succeeds, but no chain-store write is confirmed from then on.
     plugin.now, plugin.replicate = 110, False
-    # One pass every 2 s up to 178 s.
-    for _ in range(35):
+    # One pass every 2 s up to 116 s.
+    for _ in range(4):
       # One pass.
       plugin._reconcile_coordinator_operations()
       # The worker's 2 s wait.
       plugin.now += 2
     # dAuth was called at 100 s and, after the 10 s wait, at 110 s.
     self.assertEqual(calls, [100, 110])
-    # The final write at 110 s, then its repair ages 30 and 60 s.
-    self.assertEqual(writes, [110, 140, 170])
+    # The final write at 110 s, then again on every pass.
+    self.assertEqual(writes, [110, 112, 114, 116])
     # The red lines.
     red = [message for message, color in lines if color == "r"]
-    # The custody failure and the three failed writes.
-    self.assertEqual(len(red), 4)
+    # The custody failure and the four failed writes.
+    self.assertEqual(len(red), 5)
     # Only the first names a custody failure.
     self.assertTrue(red[0].endswith("(custody failure 1, next try in 10 s)"))
     # The failed writes do not.
@@ -1121,9 +1121,10 @@ class RuntimeCompletionTests(unittest.TestCase):
     # And always the same record: the store is as the final write left it.
     self.assertEqual(plugin.storage, stored)
 
-  def test_a_late_send_does_not_hold_back_the_send_of_the_next_age(self):
-    """The sends of a completed operation fall on fixed ages after completion, not on the time since the last
-    send: a send made 1 s after the age 30 s is followed by the send of the age 60 s, 29 s later."""
+  def test_a_late_pass_does_not_hold_back_a_send(self):
+    """A late pass holds no send of a completed operation back: a first pass 35 s after completion sends at once,
+    as before, and from 600 s on the sends fall on fixed ages after completion, not on the time since the last send:
+    a send made late for the age 1,200 s, 20 s before the age 2,400 s, is followed by the send of that age."""
     # A coordinator with a completed operation.
     plugin = Coordinator()
     # A completed update operation.
@@ -1139,19 +1140,20 @@ class RuntimeCompletionTests(unittest.TestCase):
     # Record each write's time after completion, keeping the fake store's behaviour.
     plugin.chainstore_hset = lambda namespace, key, value, **kw: sent.append(
       plugin.now - operation["updated_at"]) or store(namespace, key, value, **kw)
-    # A pass at completion, a pass 1 s after the age 30 s, and a pass at the age 60 s.
-    for age in (0, 31, 60):
+    # A pass at completion, the next one 35 s later, one 20 s before the age 2,400 s, and one at that age.
+    for age in (0, 35, 2380, 2400):
       # The pass at this age.
       plugin.now = operation["updated_at"] + age
       # One pass.
       plugin._reconcile_coordinator_operations()
-    # Sent at 31 s and again at 60 s.
-    self.assertEqual(sent, [31, 60])
+    # Sent at 35 s, at 2,380 s for the ages 600 and 1,200 s, and again at 2,400 s.
+    self.assertEqual(sent, [35, 2380, 2400])
 
-  def test_restarts_send_nothing_at_once_and_keep_each_operation_on_its_own_ages(self):
-    """Restarts every 1,700 s, closer together than the later gaps, neither send at once nor move the sends:
-    two operations completed 1,000 s apart are each sent at their own ages after completion and at no other
-    time, and a restart more than 24 h after completion keeps no entry for them."""
+  def test_restarts_keep_each_operation_on_its_own_ages(self):
+    """A restart in an operation's first 600 s sends it at once and every 30 s from then, as before, and keeps its
+    age 600 s; restarts every 1,700 s after that, closer together than the later gaps, neither send at once nor
+    move the sends: two operations completed 1,000 s apart are each sent at their own ages after completion and
+    at no other time, and a restart more than 24 h after completion keeps no entry for them."""
     # A coordinator.
     plugin = Coordinator()
     # The completion time of each operation, by its id.
@@ -1179,11 +1181,14 @@ class RuntimeCompletionTests(unittest.TestCase):
     plugin.chainstore_hset = lambda namespace, key, value, **kw: sent.append(
       (value["operation_id"], plugin.now - completed[value["operation_id"]])) or store(namespace, key, value, **kw)
     # One pass every 10 s from the second completion (the first pass sees both, as after a restart) to 87,500 s
-    # after the first completion; a restart every 1,700 s from 850 s after the second completion, none on an age.
+    # after the first completion; a restart 310 s after the second completion, and one every 1,700 s from 850 s
+    # after it, none on an age.
     for now in range(completed[second], completed[first] + 87500, 10):
       # The pass at this time.
       plugin.now = now
-      if now >= completed[second] + 850 and (now - completed[second] - 850) % 1700 == 0:
+      # Seconds since the second completion.
+      since = now - completed[second]
+      if since == 310 or (since >= 850 and (since - 850) % 1700 == 0):
         # A restart: the maps kept in process memory start empty, as _init_deployment_operations leaves them.
         plugin._operations_confirmed, plugin._operations_repaired = {}, {}
       # One pass.
@@ -1191,8 +1196,10 @@ class RuntimeCompletionTests(unittest.TestCase):
     # The first operation, 1,000 s old at the first pass, is sent at each later age of its schedule and only then.
     self.assertEqual([age for operation_id, age in sent if operation_id == first],
                      [age for age in REPAIR_SCHEDULE if age > 1000])
-    # The second, seen at its completion, at every age of its schedule and only then.
-    self.assertEqual([age for operation_id, age in sent if operation_id == second], REPAIR_SCHEDULE)
+    # The second, seen at its completion: every 30 s up to 300 s, at the restart 310 s and every 30 s from there,
+    # then at every age of its schedule from 600 s, and only then.
+    self.assertEqual([age for operation_id, age in sent if operation_id == second],
+                     list(range(30, 330, 30)) + list(range(310, 600, 30)) + REPAIR_SCHEDULE[19:])
     # A restart more than 24 h after both completions.
     plugin._operations_confirmed, plugin._operations_repaired = {}, {}
     # One pass after it.
@@ -1200,9 +1207,10 @@ class RuntimeCompletionTests(unittest.TestCase):
     # Neither operation is kept in the schedule's map any more.
     self.assertEqual(plugin._operations_repaired, {})
 
-  def test_a_final_snapshot_never_confirmed_is_logged_at_each_age_before_and_after_a_restart(self):
-    """A final snapshot that other oracles never confirmed is sent again at each age of the schedule, not on
-    every pass, and each such send leaves one red line, the same before a restart and after it."""
+  def test_a_final_snapshot_never_confirmed_is_logged_the_same_before_and_after_a_restart(self):
+    """A final snapshot that other oracles never confirmed is sent again on every pass in its first 600 s, as
+    before, then at each age of the schedule only, and each such send leaves one red line, the same before a
+    restart and after it, in the first 600 s and later."""
     # A coordinator.
     plugin = Coordinator()
     # An update operation.
@@ -1228,17 +1236,18 @@ class RuntimeCompletionTests(unittest.TestCase):
       namespace, key, value, **kw)
     # Record the time after completion of each red log line.
     plugin.P = lambda message, color=None, **kw: red.append(plugin.now - completion) if color == "r" else None
-    # One pass every 2 s for 1,300 s after completion, with a restart 700 s after completion.
+    # One pass every 2 s for 1,300 s after completion, with restarts 300 and 700 s after completion.
     for now in range(completion, completion + 1300, 2):
       # The pass at this time.
       plugin.now = now
-      if now == completion + 700:
+      if now - completion in (300, 700):
         # A restart: the maps kept in process memory start empty, as _init_deployment_operations leaves them.
         plugin._operations_confirmed, plugin._operations_repaired = {}, {}
       # One pass.
       plugin._reconcile_coordinator_operations()
-    # Sent at each age up to 600 s before the restart and at 1,200 s after it, and each send is one red line.
-    self.assertEqual((sent, red), (REPAIR_SCHEDULE[:21], REPAIR_SCHEDULE[:21]))
+    # Sent on every pass up to 598 s, across the restart at 300 s, then at the age 600 s and, after the restart at
+    # 700 s, at the age 1,200 s; each send is one red line.
+    self.assertEqual((sent, red), (list(range(0, 600, 2)) + [600, 1200],) * 2)
 
 
 if __name__ == "__main__":
