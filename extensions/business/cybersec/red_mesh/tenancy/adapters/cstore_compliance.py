@@ -54,6 +54,10 @@ class CstoreComplianceStore:
       raise TenantStoreError("Invalid framework assessment storage record") from exc
     return raw
 
+  def validate_record(self, raw, kind, *ids):
+    """The stored record `raw` (as `raw_record` read it), validated as `get` would."""
+    return self._validate(raw, kind, ids)
+
   def get(self, kind, *ids):
     hkey, key = self._location(kind, ids)
     try:

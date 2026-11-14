@@ -373,8 +373,8 @@
    "total_min": 2.5
   }
  },
- "intent_digest": "444241df5171c3d91a6a488c7f75e5aa1d8dcf28be2ac98b5d44532661260382",
- "pack_view_sha256": "02c23c94ba8ca27c7a821304b0a0ee358196ec81fe8c883fd03abcb2d31ad6cb",
+ "intent_digest": "4eced46e4d146431a11795020b13fe85965581dc3db06c9e1c688257f83678fc",
+ "pack_view_sha256": "92f58ff922a8687aa64e6d52606073a94891fb48bfc6646b226ac9a024f04653",
  "snapshot_envelope": {
   "kind": "redmesh_framework_assessment",
   "pack_id": "ro.dnsc.o1-2026",
@@ -765,6 +765,7 @@
      "total_min": 2.5
     }
    },
+   "country": "RO",
    "dnsc_unique_id": "",
    "external_supplier": "",
    "level_provenance": {
@@ -777,10 +778,12 @@
     "name": "Ana Pop",
     "role": "Director"
    },
+   "manifest_version": 1,
    "pack_acts": [
     "MO 712 bis/2026-08-27",
     "MO 792/2026-09-18 (Ordin 2/2026)"
    ],
+   "pack_hash": "0b9e8c60011be5fbc447f5a89933586db750273f6752771df0fafb94d88e6a62",
    "pack_id": "ro.dnsc.o1-2026",
    "remediation": [
     {
@@ -1166,7 +1169,7 @@
    "sectoral_requirements": "",
    "submission": {
     "actor": "initial",
-    "fingerprint": "444241df5171c3d91a6a488c7f75e5aa1d8dcf28be2ac98b5d44532661260382",
+    "fingerprint": "4eced46e4d146431a11795020b13fe85965581dc3db06c9e1c688257f83678fc",
     "pack_acts": [
      "MO 712 bis/2026-08-27",
      "MO 792/2026-09-18 (Ordin 2/2026)"

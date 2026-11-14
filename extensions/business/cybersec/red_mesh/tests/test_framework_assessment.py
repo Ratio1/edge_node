@@ -625,8 +625,9 @@ class TestFrameworkAssessment(FrameworkAssessmentFixture):
     self.assertIn("doc-1", self.documents.deleted)
     self.assertEqual([v for v in self.compliance_rows().values() if v is not None], [])
 
-# The digest of a pre-RM-120-9b row (sign-off name/role/date only), computed before the entity fields existed.
-PRE_UPGRADE_DIGEST = "873bb5be735899fb4a7033292635fd70d30936793f5322f4e218edc3d7a4c7e7"
+# RM-182 phase 4 retired the pre-RM-120-9b digest (rows without the `row_format` marker are refused now).
+# This is the digest of the same minimal row with the marker: the intent digest binds the row format.
+ROW_FORMAT_2_DIGEST = "621350600fe65b2926a8709753f20b4dbd05ae57515dc36da4a4884dd47a9445"
 
 
 class TestEntityFieldsAndSignoffNames(FrameworkAssessmentFixture):
@@ -683,11 +684,11 @@ class TestEntityFieldsAndSignoffNames(FrameworkAssessmentFixture):
     self.refused(result, 400, "assessment_invalid")
 
   def test_digest_is_unchanged_for_a_pre_upgrade_row_and_changes_with_a_new_field(self):
-    row = self.fixture_row()
-    self.assertEqual(compliance.intent_digest(row), PRE_UPGRADE_DIGEST)
-    self.assertNotEqual(compliance.intent_digest({**row, "dnsc_unique_id": "ID-1"}), PRE_UPGRADE_DIGEST)
-    self.assertNotEqual(compliance.intent_digest({**row, "external_supplier": "S"}), PRE_UPGRADE_DIGEST)
-    self.assertEqual(compliance.intent_digest({**row, "dnsc_unique_id": "", "external_supplier": ""}), PRE_UPGRADE_DIGEST)
+    row = {**self.fixture_row(), "row_format": 2}
+    self.assertEqual(compliance.intent_digest(row), ROW_FORMAT_2_DIGEST)
+    self.assertNotEqual(compliance.intent_digest({**row, "dnsc_unique_id": "ID-1"}), ROW_FORMAT_2_DIGEST)
+    self.assertNotEqual(compliance.intent_digest({**row, "external_supplier": "S"}), ROW_FORMAT_2_DIGEST)
+    self.assertEqual(compliance.intent_digest({**row, "dnsc_unique_id": "", "external_supplier": ""}), ROW_FORMAT_2_DIGEST)
 
   def test_snapshot_and_reopen_carry_the_entity_fields(self):
     self.ok(self.save({"dnsc_unique_id": "ID-123", "external_supplier": "Furnizor SRL"}, 1))
@@ -857,11 +858,13 @@ class TestSeveralAssessments(FrameworkAssessmentFixture):
     row = {"tenant_id": "tn_x", "pack_id": "p", "pack_acts": ["a"], "assurance_level": "basic",
            "level_provenance": None, "sectoral_requirements": "s", "completion_date": "2026-10-06",
            "management_signoff": {"name": "Ana Pop", "role": "Director", "date": "2026-10-06"},
-           "remediation": [], "scores": {}}
-    self.assertEqual(compliance.intent_digest(row), PRE_UPGRADE_DIGEST)
-    self.assertEqual(compliance.intent_digest({**row, "name": "", "assessment_id": None}), PRE_UPGRADE_DIGEST)
-    self.assertNotEqual(compliance.intent_digest({**row, "name": "A"}), PRE_UPGRADE_DIGEST)
-    self.assertNotEqual(compliance.intent_digest({**row, "assessment_id": FA}), PRE_UPGRADE_DIGEST)
+           "remediation": [], "scores": {}, "row_format": 2}
+    self.assertEqual(compliance.intent_digest(row), ROW_FORMAT_2_DIGEST)
+    self.assertEqual(compliance.intent_digest({**row, "name": "", "assessment_id": None}), ROW_FORMAT_2_DIGEST)
+    self.assertNotEqual(compliance.intent_digest({**row, "name": "A"}), ROW_FORMAT_2_DIGEST)
+    self.assertNotEqual(compliance.intent_digest({**row, "country": "RO"}), ROW_FORMAT_2_DIGEST)
+    self.assertNotEqual(compliance.intent_digest({k: v for k, v in row.items() if k != "row_format"}), ROW_FORMAT_2_DIGEST)
+    self.assertNotEqual(compliance.intent_digest({**row, "assessment_id": FA}), ROW_FORMAT_2_DIGEST)
 
   # -- fa rows through every operation ----------------------------------------------------------
 

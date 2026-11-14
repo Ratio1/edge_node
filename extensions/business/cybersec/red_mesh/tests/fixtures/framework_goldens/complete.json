@@ -346,8 +346,8 @@
    "total_min": 2.5
   }
  },
- "intent_digest": "1b67776efcf17b3fe70159e7f977775de36ac35b1a55bc9edcee4cd6eb007b78",
- "pack_view_sha256": "02c23c94ba8ca27c7a821304b0a0ee358196ec81fe8c883fd03abcb2d31ad6cb",
+ "intent_digest": "982b29b06592d80c78e42b39df0a12e79d021bba82ecb08428ba5e3542cbc23b",
+ "pack_view_sha256": "92f58ff922a8687aa64e6d52606073a94891fb48bfc6646b226ac9a024f04653",
  "snapshot_envelope": {
   "assessment_id": "fa_golden",
   "kind": "redmesh_framework_assessment",
@@ -713,6 +713,7 @@
      "total_min": 2.5
     }
    },
+   "country": "RO",
    "dnsc_unique_id": "",
    "external_supplier": "Furnizor SRL",
    "level_provenance": {
@@ -725,11 +726,13 @@
     "name": "Ana Pop",
     "role": "Director"
    },
+   "manifest_version": 1,
    "name": "Evaluare",
    "pack_acts": [
     "MO 712 bis/2026-08-27",
     "MO 792/2026-09-18 (Ordin 2/2026)"
    ],
+   "pack_hash": "0b9e8c60011be5fbc447f5a89933586db750273f6752771df0fafb94d88e6a62",
    "pack_id": "ro.dnsc.o1-2026",
    "remediation": [],
    "schema": "redmesh.framework_assessment.v1",
@@ -1044,7 +1047,7 @@
    "sectoral_requirements": "",
    "submission": {
     "actor": "initial",
-    "fingerprint": "1b67776efcf17b3fe70159e7f977775de36ac35b1a55bc9edcee4cd6eb007b78",
+    "fingerprint": "982b29b06592d80c78e42b39df0a12e79d021bba82ecb08428ba5e3542cbc23b",
     "pack_acts": [
      "MO 712 bis/2026-08-27",
      "MO 792/2026-09-18 (Ordin 2/2026)"

@@ -46,7 +46,9 @@ class GenericPackFixture(FrameworkAssessmentFixture):
         self.seen_rules.append(rules) or [], {"scoring": "test_status.v1", "level": level, "verdict": {"passed": None}}),
       verdict_summary=lambda computed: {"passed": None}, normalise_patch=_status_normalise,
       entry_schema=lambda pack: {"fields": ["status", "rationale"], "values": list(STATUS_VALUES)},
-      validate_stored_entry=lambda pack, ref_id, entry: [] if entry.get("status") in STATUS_VALUES else [{"code": "bad"}])
+      validate_stored_entry=lambda pack, ref_id, entry: [] if entry.get("status") in STATUS_VALUES else [{"code": "bad"}],
+      pack_view_extras=lambda pack, text: {"status_values": list(STATUS_VALUES)},
+      capabilities=lambda: {"has_levels": False, "has_verdict": False, "has_remediation": False, "axes": []})
     patcher = patch.dict(SCORERS, {"test_status.v1": stub})
     patcher.start()
     self.addCleanup(patcher.stop)

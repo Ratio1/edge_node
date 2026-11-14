@@ -1593,10 +1593,14 @@ class TenantAdministrationService:
     return compliance_catalogue.list_assessments(self, actor, tenant_id, pack_id, include_archived)
 
   @_endpoint
+  def list_framework_packs(self, actor, tenant_id):
+    return compliance_catalogue.list_packs(self, actor, tenant_id)
+
+  @_endpoint
   def create_framework_assessment(self, actor, tenant_id, pack_id, request_id, name, assurance_level=None,
-                                  level_provenance=None):
+                                  level_provenance=None, country=None):
     return compliance_catalogue.create_assessment(self, actor, tenant_id, pack_id, request_id, name,
-                                                  assurance_level, level_provenance)
+                                                  assurance_level, level_provenance, country)
 
   @_endpoint
   def archive_framework_assessment(self, actor, tenant_id, pack_id, assessment_id, archived,

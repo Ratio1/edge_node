@@ -26,6 +26,8 @@ from ..references.framework_packs import (
   list_framework_pack_ids,
   load_framework_pack,
   load_framework_text,
+  manifest_pack,
+  EU_MEMBER_STATES,
   pack_levels,
   pack_rules,
 )
@@ -49,6 +51,8 @@ SNAPSHOT_SCHEMA = "redmesh.framework_assessment.v1"
 SNAPSHOT_ENVELOPE_KIND = "redmesh_framework_assessment"
 SNAPSHOT_ENVELOPE_VERSION = "1.0"
 STATES = ("draft", "submitted")
+ROW_FORMAT = 2  # `row_format` marker of every row RM-182 code writes; the validator refuses a row without it
+_COUNTRY = re.compile(r"[A-Z]{2}\Z")
 VIEW = "compliance_assessments:view"
 MANAGE = "compliance_assessments:manage"
 PENDING_TTL_SECONDS = 15 * 60
@@ -253,8 +257,29 @@ def apply_patch(row, patch, pack, *, actor, now):
 # -- the stored row ------------------------------------------------------------------------------
 
 
-def new_row(tenant_id, pack, *, actor, now):
+def require_active(pack):
+  """A retired pack opens its existing rows and starts no new one."""
+  if manifest_pack(pack["pack_id"])["status"] != "active":
+    raise _denied(404, "assessment_not_found")
+
+
+def resolve_country(pack_id, value):
+  """The assessment's country label: an ISO 3166-1 alpha-2 code the pack's entries name (an EU entry
+  covers the member states); None resolves to the country of a pack whose entries name exactly one."""
+  entries = manifest_pack(pack_id)["entries"]
+  named = {e["country"] for e in entries if e["country"]}
+  if value is None:
+    return next(iter(named)) if len(named) == 1 and not any(e["jurisdiction"] for e in entries) else None
+  if (not isinstance(value, str) or not _COUNTRY.match(value)
+      or not (value in named or (value in EU_MEMBER_STATES and any(e["jurisdiction"] == "EU" for e in entries)))):
+    raise AssessmentInvalid("invalid_request")
+  return value
+
+
+def new_row(tenant_id, pack, *, actor, now, country=None):
+  require_active(pack)
   return {
+    "row_format": ROW_FORMAT, "country": resolve_country(pack["pack_id"], country),
     "tenant_id": tenant_id, "pack_id": pack["pack_id"], "pack_acts": _acts(pack),
     "assurance_level": None, "level_provenance": None, "sectoral_requirements": "",
     "completion_date": "", "management_signoff": None, "remediation": [],
@@ -279,6 +304,8 @@ def validate_framework_assessment(row, ids):
       or row.get("assessment_id") != (ids[2] if len(ids) == 3 else None)
       or ("assessment_id" in row and len(ids) == 2)
       or row.get("pack_id") != ids[1] or not valid_pack_id(ids[1])
+      or type(row.get("row_format")) is not int or row["row_format"] != ROW_FORMAT
+      or not (row.get("country") is None or (isinstance(row["country"], str) and _COUNTRY.match(row["country"])))
       or not isinstance(row.get("pack_acts"), list)
       or (row.get("assurance_level") is not None and row["assurance_level"] not in _levels_of(ids[1]))
       or row.get("state") not in STATES
@@ -328,14 +355,16 @@ def _draft_fields(row):
   fields = {key: row.get(key) for key in ("tenant_id", "pack_id", "pack_acts", "assurance_level", "level_provenance",
                                           "sectoral_requirements", "completion_date", "management_signoff",
                                           "remediation", "scores")}
-  # Entity fields join the digest only when set, so a pre-upgrade row hashes as it always did.
-  fields.update({key: row[key] for key in ("dnsc_unique_id", "external_supplier", "name", "assessment_id") if row.get(key)})
+  # Entity fields, name, assessment id and country join the digest only when set.
+  fields.update({key: row[key] for key in ("dnsc_unique_id", "external_supplier", "name", "assessment_id", "country")
+                 if row.get(key)})
   return fields
 
 
 def intent_digest(row):
-  """Binds the stored draft, which is frozen while a submit is pending, plus the actor at prepare."""
-  blob = json.dumps(_draft_fields(row), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+  """Binds the stored draft, which is frozen while a submit is pending, plus the row format."""
+  blob = json.dumps({**_draft_fields(row), "row_format": row.get("row_format")}, sort_keys=True,
+                    separators=(",", ":"), ensure_ascii=False)
   return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
@@ -365,7 +394,9 @@ def build_snapshot(row, tenant, computed, pending):
   snapshot = {
     "schema": SNAPSHOT_SCHEMA, "artifact_kind": "self_assessment",
     **_draft_fields(row),
-    "dnsc_unique_id": row.get("dnsc_unique_id") or "", "external_supplier": row.get("external_supplier") or "",
+    **{key: row.get(key) or "" for key in manifest_pack(row["pack_id"])["rules"]["entity_fields"]},  # a pack emits only the fields it takes
+    "country": row.get("country"), "manifest_version": framework_packs.load_manifest()["manifest_version"],
+    "pack_hash": manifest_pack(row["pack_id"])["pack_sha256"],
     "claimant": claimant_for(tenant),
     "computed": computed,
     "submission": {"revision": pending["revision"], "submitted_at": pending["submitted_at"],
@@ -452,6 +483,7 @@ def pack_view(pack, text, level):
   }
   if "hierarchy" in text:  # the generic hierarchy of any depth (contract §Pack and text schema)
     view["hierarchy"] = [dict(n) for n in text["hierarchy"]]
+  view["extras"] = scorer_for(pack).pack_view_extras(pack, text)
   return view
 
 
@@ -501,9 +533,27 @@ def _ids(tenant_id, pack_id, assessment_id):
   return (tenant_id, pack_id, assessment_id)
 
 
+def read_row(store, ids):
+  """`(row, None)`; `(None, None)` when absent; `(None, reason)` for a row the validator refuses, with the
+  list's `unavailable_reason`: `pack_unknown`, `row_format_old` (no marker) or `row_invalid`. One read, then
+  the validator; a failed read raises: only a refused record is "unavailable"."""
+  raw = store.raw_record(KIND, *ids)
+  if raw is None:
+    return None, None
+  try:
+    return store.validate_record(raw, KIND, *ids), None
+  except TenantStoreError:
+    if not valid_pack_id(ids[1]):
+      return None, "pack_unknown"
+    return None, "row_format_old" if raw.get("row_format") != ROW_FORMAT else "row_invalid"
+
+
 def _row(service, tenant_id, pack_id, assessment_id=DEFAULT_ID):
-  """The stored row; None only for the default (lazy first save). A missing `fa_*` row is a 404."""
-  row = _store(service).get(KIND, *_ids(tenant_id, pack_id, assessment_id))
+  """The stored row; None only for the default (lazy first save). A missing `fa_*` row, and a row the
+  validator refuses (unavailable in the list), is a 404."""
+  row, reason = read_row(_store(service), _ids(tenant_id, pack_id, assessment_id))
+  if reason:
+    raise _denied(404, "assessment_not_found")
   if row is None and assessment_id != DEFAULT_ID:
     raise _denied(404, "assessment_not_found")
   return row

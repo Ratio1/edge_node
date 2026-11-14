@@ -443,6 +443,16 @@ def verdict_summary(computed: dict) -> dict:
           "total_failed": verdict["total_failed"]}
 
 
+def pack_view_extras(pack: dict, text: dict | None) -> dict:
+  """Hook: the scorer-specific part of the pack view (the per-level thresholds)."""
+  return {"thresholds": {level: dict(th) for level, th in (pack.get("thresholds") or {}).items()}}
+
+
+def capabilities() -> dict:
+  """Hook: the flags the Navigator reads for a pack on this scorer."""
+  return {"has_levels": True, "has_verdict": True, "has_remediation": True, "axes": list(AXES)}
+
+
 def check_pack(pack: dict, text: dict | None) -> None:
   """Scorer-owned schema check, called twice per pack: with `text` None when the pack file loads (levels,
   thresholds, control keys), and with the text dict when a text file loads (only the maturity scale)."""
@@ -465,7 +475,7 @@ def check_pack(pack: dict, text: dict | None) -> None:
 
 
 # Scorer registry (contract `redmesh.framework_scorer.v1`, §Generalisation): keyed by `pack["scoring"]`.
-# Hooks so far: `check_pack`, `entry_schema`, `normalise_patch`, `validate_stored_entry`, `compute`, `validate_for_submit` (with the manifest `rules`), `verdict_summary`.
+# Hooks: `check_pack`, `entry_schema`, `normalise_patch`, `validate_stored_entry`, `compute`, `validate_for_submit` (with the manifest `rules`), `verdict_summary`, `pack_view_extras`, `capabilities`.
 SCORERS: dict = {}
 
 
@@ -488,4 +498,6 @@ register_scorer(SCORING_ID, SimpleNamespace(
   compute=score,
   validate_for_submit=lambda pack, rules, level, draft: validate_for_submit(pack, level, draft, rules),
   verdict_summary=verdict_summary,
+  pack_view_extras=pack_view_extras,
+  capabilities=capabilities,
 ))

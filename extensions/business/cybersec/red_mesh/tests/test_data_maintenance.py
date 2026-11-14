@@ -10,6 +10,7 @@ from uuid import uuid4
 from extensions.business.cybersec.red_mesh.services import data_maintenance
 from .contract_fixture import install_contract
 from .test_execution_binding_models import binding_payload
+from .test_framework_manifest import static_dir
 from .test_tenant_administration import FakeAdministrationStore
 
 TENANCY = '["redmesh","tenancy",1,"deployment"]'
@@ -132,6 +133,7 @@ class TestDataMaintenance(unittest.TestCase):
 
   def assessment_row(self, tenant_id):
     return {"schemaVersion": 1, "namespace": "deployment", "kind": "framework_assessment", "ids": [tenant_id, "ro.dnsc.o1-2026"],
+            "row_format": 2,
             "tenant_id": tenant_id, "pack_id": "ro.dnsc.o1-2026", "pack_acts": [], "assurance_level": None,
             "level_provenance": None, "sectoral_requirements": "", "completion_date": "", "management_signoff": None,
             "remediation": [], "state": "draft", "assessment_revision": 1, "reopened_from": None, "pending": None,
@@ -167,6 +169,22 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertEqual((gone["class"], gone["reason"]), ("orphan", "tenant_gone"))
     for key in (field("tn_bad", fa), field(self.tenant, "fa_bad"), field(self.tenant, fa, "x")):
       self.assertEqual((rows[(COMPLIANCE, key)]["class"], rows[(COMPLIANCE, key)]["reason"]), ("old", "unrecognized"), key)
+
+  def test_row_format_marker_pack_and_retirement_decide_the_assessment_class(self):
+    """RM-182 phase 4: no marker or an unknown pack is `old` / `unrecognized`; a retired pack stays `current`."""
+    field = lambda pack: json.dumps(["framework_assessment", "deployment", self.tenant, pack], separators=(",", ":"))
+    unmarked = {key: value for key, value in self.assessment_row(self.tenant).items() if key != "row_format"}
+    unknown = {**self.assessment_row(self.tenant), "pack_id": "cyfun.2025", "ids": [self.tenant, "cyfun.2025"]}
+    self.put(COMPLIANCE, field("ro.dnsc.o1-2026"), unmarked)
+    self.put(COMPLIANCE, field("cyfun.2025"), unknown)
+    rows = self.scan()
+    for pack in ("ro.dnsc.o1-2026", "cyfun.2025"):
+      self.assertEqual((rows[(COMPLIANCE, field(pack))]["class"], rows[(COMPLIANCE, field(pack))]["reason"]),
+                       ("old", "unrecognized"), pack)
+    self.put(COMPLIANCE, field("ro.dnsc.o1-2026"), self.assessment_row(self.tenant))
+    static_dir(self, edit=lambda manifest: manifest["packs"][0].__setitem__("status", "retired"))
+    rows = self.scan()
+    self.assertEqual(rows[(COMPLIANCE, field("ro.dnsc.o1-2026"))]["class"], "current")
 
   # -- authorization ----------------------------------------------------------------------------
 
