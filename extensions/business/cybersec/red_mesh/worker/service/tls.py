@@ -93,7 +93,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       # OpenSSL package version is in [1.0.1, 1.0.1g). Walk the catalog at
       # the upper bound (1.0.1f) and emit every additional row that fires.
       # Skip the Heartbleed row itself — already emitted above.
-      for inferred in check_cves("openssl", "1.0.1f"):
+      for inferred in check_cves("openssl", "1.0.1f", inferred_span=("1.0.1", "1.0.1f")):
         if "CVE-2014-0160" in (inferred.cve or ()):
           continue
         findings.append(inferred)

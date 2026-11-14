@@ -552,6 +552,7 @@ def check_cves(
   applicability: str = SERVER_APPLICABILITY,
   dynamic_cache=None,
   package=None,
+  inferred_span=None,
 ) -> list:
   """Match version against CVE database. Returns list of Findings.
 
@@ -565,6 +566,10 @@ def check_cves(
   announced one. A CVE the distribution has fixed by backport at or below
   the package's revision is not reported; every other match on a
   distribution package states its backport status explicitly (RM-070).
+
+  ``inferred_span`` is a pair of versions a probe proved (Heartbleed: ``1.0.1`` to ``1.0.1f``). Under
+  ``generated`` only rows that hold across the span keep their confidence; the rest are tentative
+  ``inferred_version``. ``static`` ignores it.
   """
   if dynamic_cache is None:
     dynamic_cache = get_dynamic_reference_cache()
@@ -574,7 +579,7 @@ def check_cves(
   reader = _VULNDB_READER
   if reader is not None:
     # `generated`: the reader returns one row per CVE, strongest first, so no `seen_cves` here.
-    for match in reader.query(product, version):
+    for match in reader.query(product, version, inferred_span):
       if applicability and (CLIENT_APPLICABILITY if match.client_side else SERVER_APPLICABILITY) != applicability:
         if match.client_side:
           _record_not_applicable(match, product, version, package, NOT_APPLICABLE_CLIENT_SIDE)

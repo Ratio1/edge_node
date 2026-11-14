@@ -109,6 +109,13 @@ class FindingFieldTests(unittest.TestCase):
     self.assertEqual(finding.cwe, (79,))  # display classification from the database
     self.assertEqual(_finding_to_jsonable(finding)["vulndb_build_id"], "vulndb-aaaaaaaaaaaa")
 
+  def test_static_ignores_the_inferred_span(self):
+    plain = self.by_id("openssl", "1.0.1f")
+    spanned = self.by_id("openssl", "1.0.1f", inferred_span=("1.0.1", "1.0.1f"))
+    self.assertIn("CVE-2016-2183", plain)  # the one static row that starts inside the span
+    self.assertEqual({k: (f.confidence, f.confidence_reason) for k, f in plain.items()},
+                     {k: (f.confidence, f.confidence_reason) for k, f in spanned.items()})
+
   def test_local_origin_has_no_freshness(self):
     self.use(origin="local")
     self.assertEqual(self.by_id("openssh", "4.0")[CVE].cvss_data_freshness, "")

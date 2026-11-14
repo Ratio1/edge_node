@@ -20,6 +20,8 @@ DB_PATH = Path(__file__).resolve().parent / "vulndb.sqlite"
 PIN_PATH = Path(__file__).resolve().parent / "pin.json"
 
 _CLAUSE = re.compile(r"(>=|<=|>|<|==)(.+)")
+# Numeric parts of a full version, where a banner can be shorter than that: `Apache/2.4` is not 2.4.0. Default 3.
+_FULL_DEPTH = {"openssh": 2, "postgresql": 2, "exim": 2, "dropbear": 2, "libssh": 2}
 
 Match = namedtuple("Match", (
   "cve_id", "product", "constraint", "source", "confidence", "reason", "platform_dependent", "client_side",
@@ -126,17 +128,47 @@ class VulndbReader:
     parsed = _parse_version(version, product) if entry else None
     return entry[1] if parsed is not None and _compare_versions(parsed, entry[0]) < 0 else None
 
-  def query(self, product, version):
-    """Rows of `product` whose constraint holds for `version`, one per CVE."""
-    parsed = _parse_version(version, product)
-    if parsed is None:
-      return []
+  def _found(self, product, parsed):
+    """Rows of `product` whose constraint holds for one parsed version."""
     found = list(self._exact.get((product, _norm(parsed[0]), parsed[1]), ()))
     for clauses, row in self._ranges.get(product, ()):
       if all(_holds(op, _compare_versions(parsed, target)) for op, target in clauses):
         found.append(row)
+    return found
+
+  def _span(self, product, version, inferred_span):
+    """`(low, high)` parsed versions the evidence covers, or None when `version` is one exact version.
+
+    `inferred_span`: two versions a probe proved (Heartbleed: `1.0.1`, `1.0.1f`). A banner with fewer numeric parts than the
+    product's full precision (`Apache/2.4`) covers `2.4.0` up to `2.4.999999`.
+    """
+    if inferred_span:
+      low, high = (_parse_version(v, product) for v in inferred_span)
+      return (low, high) if low is not None and high is not None else None
+    parsed = _parse_version(version, product)
+    depth = _FULL_DEPTH.get(product, 3)
+    if parsed is None or parsed[1] != (0, 0, 0) or len(parsed[0]) >= depth:
+      return None
+    return parsed, (parsed[0] + [999999] * (depth - len(parsed[0])), parsed[1])
+
+  def query(self, product, version, inferred_span=None):
+    """Rows of `product` whose constraint holds for `version`, one per CVE.
+
+    Over a span (see `_span`) a row that holds at both ends keeps its confidence; a row that holds at one end only cannot be
+    told apart at this precision and is returned tentative with reason `inferred_version`; a row at neither end is dropped.
+    """
+    parsed = _parse_version(version, product)
+    if parsed is None:
+      return []
+    span = self._span(product, version, inferred_span)
+    if span is None:
+      found, partial = self._found(product, parsed), []
+    else:
+      low, high = (self._found(product, p) for p in span)
+      found = [row for row in low if row in high]
+      partial = [row[:4] + ("tentative", "inferred_version") + row[6:] for row in low + high if row not in found]
     best = {}  # one row per CVE: firm/certain over tentative, then platform-independent over dependent
-    for row in found:
+    for row in found + partial:
       rank = (row[4] == "tentative", row[6])
       if row[0] not in best or rank < best[row[0]][0]:
         best[row[0]] = (rank, row)
