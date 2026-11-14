@@ -14,6 +14,7 @@ from extensions.business.cybersec.red_mesh.references.framework_packs import con
 from extensions.business.cybersec.red_mesh.repositories import JobStateRepository
 from extensions.business.cybersec.red_mesh.services import evidence_engine, framework_evidence
 from extensions.business.cybersec.red_mesh.tenancy import compliance
+from extensions.business.cybersec.red_mesh.tenancy.execution import triage_scope
 
 from .test_execution_binding_models import binding_payload
 from .test_framework_assessment import PACK, FrameworkAssessmentFixture
@@ -85,8 +86,12 @@ class TestFrameworkEvidenceSuggestions(FrameworkAssessmentFixture):
     return record
 
   def triage(self, job_id, finding_id, status):
-    hkey = JobStateRepository(self.plugin)._triage_hkey
-    self.storage.data[(hkey, f"{job_id}:{finding_id}")] = {"status": status}
+    # Host-scoped: the job's own tenant and host, read from its binding (RM-169 step 4a).
+    binding = self.storage.data[(self.plugin.cfg_instance_id, job_id)]["execution_binding"]
+    tenant_id, host = triage_scope(binding)
+    hkey = JobStateRepository(self.plugin).host_triage_hkey(tenant_id)
+    self.storage.data[(hkey, f"{host}\x1f{finding_id}")] = {
+      "job_id": job_id, "finding_id": finding_id, "status": status, "tenant_id": tenant_id, "host": host}
 
   def suggest(self, actor=None):
     return self.plugin.suggest_framework_assessment_evidence(actor or self.admin, self.tenant, PACK)
@@ -172,6 +177,32 @@ class TestFrameworkEvidenceSuggestions(FrameworkAssessmentFixture):
     self.assertEqual((data["jobsAvailable"], data["jobsConsidered"]), (1, 1))
     self.assertEqual(data["suggestions"]["PR.AA-01.1"][0]["status"], "supported")
     self.assertEqual(data["overriding"], [])
+
+  @staticmethod
+  def _raised(data):
+    return [item["job_id"] for item in data["overriding"] if item["control_id"] == "PR.AA-01.1"]
+
+  def test_triage_shows_without_waiting_for_the_cache(self):
+    self.job("job-1", findings=[self.HIGH_AUTH])
+    self.assertEqual(self._raised(self.ok(self.suggest())), ["job-1"])
+    self.triage("job-1", "f-auth", "false_positive")  # nothing else changed: only the triage digest moves
+    self.assertEqual(self._raised(self.ok(self.suggest())), [])
+
+  def test_triage_follows_the_host_to_a_later_job(self):
+    self.job("job-1", findings=[self.HIGH_AUTH], completed=1770000300.0)
+    self.triage("job-1", "f-auth", "false_positive")
+    self.job("job-2", findings=[self.HIGH_AUTH], completed=1770000600.0)
+    data = self.ok(self.suggest())
+    self.assertEqual(self._raised(data), [])
+    self.assertEqual(data["jobsConsidered"], 2)
+
+  def test_another_tenants_triage_on_the_same_host_does_not_close_a_finding(self):
+    self.job("job-1", findings=[self.HIGH_AUTH])
+    other = "tn_" + str(uuid4())
+    self.job("job-x", tenant=other, findings=[self.HIGH_AUTH])
+    self.triage("job-x", "f-auth", "false_positive")
+    data = self.ok(self.suggest())
+    self.assertEqual(self._raised(data), ["job-1"])
 
   def test_bounded_to_the_twenty_most_recent_finalized_jobs_and_three_per_control(self):
     for index in range(25):
