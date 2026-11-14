@@ -316,7 +316,8 @@ _CONFIG = {
   "AUTOUPDATE_INTERVAL": 100,
 
   # Image pull retry configuration (exponential backoff with jitter)
-  "IMAGE_PULL_MAX_RETRIES": 100,      # Max pull attempts before giving up (0 = unlimited)
+  # Failed pulls after which an untracked app gives up (0 = unlimited); a tracked deployment never gives up.
+  "IMAGE_PULL_MAX_RETRIES": 100,
   "IMAGE_PULL_BACKOFF_BASE": 20,      # Base delay in seconds for exponential backoff
 
   # Restart retry configuration (exponential backoff)
@@ -607,6 +608,28 @@ class ContainerAppRunnerPlugin(
 
 
   def __reset_vars(self):
+    """
+    Reset the runtime state of the plugin to its initial values.
+
+    Called by `on_init` and by `_restart_container` before every start from scratch: it creates a new
+    Docker client, empties the container, port, volume, tunnel and log state, and resets the restart and
+    image pull counters. It ends with `_after_reset`, where a subclass resets its own state.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    RuntimeError
+      When the Docker daemon cannot be reached.
+
+    Examples
+    --------
+    >>> self.__reset_vars()
+    >>> self.container is None
+    True
+    """
     self.container = None
     self.container_id = None
     self.container_name = self._compute_container_name(
@@ -712,6 +735,10 @@ class ContainerAppRunnerPlugin(
     self._image_pull_failures = 0
     self._next_image_pull_time = 0
     self._fixed_volume_setup_pending = False
+    # The id this Docker store gives the bound image of a tracked container app, set by `_ensure_bound_image` before
+    # each launch and restart of the launch path, and kept by `_restart_container`; the inline restarts of volume
+    # sync and reset reuse it. Until one is set the container is started by the bound id (`_get_full_image_ref`).
+    self._bound_image_store_id = None
 
     # Command execution state
     self._commands_started = False
@@ -927,14 +954,17 @@ class ContainerAppRunnerPlugin(
     Record the id of the image the started container really runs.
 
     Called once on the plugin thread right after the container starts, so that publishing the node's
-    status needs no Docker call. For a runner bound to its image the id must equal the saved one. For
-    a worker the id is only information: after its base image was pulled again the id can be a new
-    one, and that must not fail the start.
+    status needs no Docker call. For a runner bound to its image the running image must be the bound
+    one (`_is_bound_image`): the saved id, or, when this Docker store gives the image another id, the
+    image listed under the saved registry reference; the saved id is kept either way. For a worker the
+    id is only information: after its base image was pulled again the id can be a new one, and that
+    must not fail the start.
 
     A runner bound to its image also gets its registry reference here when the binding has none (a
     binding made before the reference existed, or restored from such a record). It is added at the
     start and not while the plugin initializes: a failed save then fails this start, which is tried
-    again, and not the whole plugin.
+    again, and not the whole plugin. When the image has no reference in the configured repository
+    (built or loaded locally, or pulled from another repository), one red line says so at each start.
 
     Returns
     -------
@@ -961,11 +991,17 @@ class ContainerAppRunnerPlugin(
       if self._deployment_tracks_runtime():
         raise RuntimeError("Running container image identity is unavailable")
       return
-    # Only a runner bound to its image must run exactly the saved one. A worker's base image may be a
-    # newer pull of the same tag: its id is recorded below, replacing the one that was lost.
-    if self._deployment_pins_image() and artifacts.get("image_id") and artifacts["image_id"] != image_id:
-      raise RuntimeError("Running container does not match the immutable image binding")
-    artifacts["image_id"] = image_id
+    if self._deployment_pins_image() and artifacts.get("image_id"):
+      # Only a runner bound to its image must run exactly the saved one; under another image store than
+      # the one that made the binding, that image has another id and is known by its registry reference.
+      # The saved id is not rewritten: the binding the node reports and a restoration brings stays the same.
+      if not self._is_bound_image(image, artifacts):
+        # Any other image fails this start, as before: nothing but the bound image runs for this deployment.
+        raise RuntimeError("Running container does not match the immutable image binding")
+    else:
+      # A worker's base image may be a newer pull of the same tag: its id is recorded, replacing the one
+      # that was lost. A runner bound to its image records here the id of its first start, as before.
+      artifacts["image_id"] = image_id
     if self._deployment_tracks_runtime() and self._deployment_pins_image() and not artifacts.get("image_ref"):
       # A binding without a registry reference: add it now that the container is known to run the
       # bound image, so the next loss of the Docker store can be repaired by an exact pull.
@@ -973,6 +1009,13 @@ class ContainerAppRunnerPlugin(
       if image_ref:
         # Kept with the binding from now on, and reported with it.
         artifacts["image_ref"] = image_ref
+      else:
+        self.P(
+          "The bound image {} has no registry reference in the configured repository (built or loaded locally, "
+          "or pulled from another repository). If it is lost from the local Docker store, it can be found again "
+          "only through the configured tag '{}'.".format(image_id, super()._get_full_image_ref()),
+          color='r'
+        )
     self._save_deployment_artifacts(artifacts)
 
   def _get_full_image_ref(self):
@@ -980,14 +1023,16 @@ class ContainerAppRunnerPlugin(
     Return the image to look up, pull or run.
 
     A runner bound to its image uses the saved image id once it has one, so a restart never resolves
-    the configured tag again. Every other runner, a tracked worker included, uses the configured image
-    reference: an id saved earlier exists only in the Docker store that produced it and cannot be
-    pulled.
+    the configured tag again. When `_ensure_bound_image` found the bound image under another id (the
+    Docker store is of another type than the one that made the binding, and the image is listed under
+    the saved registry reference), it uses that id: the saved one names nothing in this store. Every
+    other runner, a tracked worker included, uses the configured image reference: an id saved earlier
+    exists only in the Docker store that produced it and cannot be pulled.
 
     Returns
     -------
     str
-      The saved `sha256:...` image id, or the configured image reference.
+      The `sha256:...` id of the bound image in this Docker store, or the configured image reference.
 
     Examples
     --------
@@ -1000,7 +1045,13 @@ class ContainerAppRunnerPlugin(
       # Not bound to an image: the configured reference is the only thing a registry can serve.
       return super()._get_full_image_ref()
     artifacts = self._get_pinned_deployment_artifacts()
-    return artifacts.get("image_id") or super()._get_full_image_ref()
+    if not artifacts.get("image_id"):
+      # Not bound yet: the configured reference, which the first start resolves once.
+      return super()._get_full_image_ref()
+    # The id under which the last image check that found the bound image (`_ensure_bound_image`, run before each
+    # launch and restart of the launch path; the inline restarts of volume sync and reset reuse its last value)
+    # found it in this Docker store, or the saved id until one did; both name the bound image.
+    return self._bound_image_store_id or artifacts["image_id"]
 
 
   def _load_manual_stop_state(self):
@@ -2980,6 +3031,14 @@ class ContainerAppRunnerPlugin(
     """
     Run a shell command inside the container and stream its output.
 
+    The command (BUILD_AND_RUN_COMMANDS, or a worker's clone and build) runs in a Docker exec whose
+    output a thread streams; that thread reports "failed" when the command exits with an error or its
+    exit code cannot be read. When the exec cannot be created or started, "failed" is reported and
+    `_commands_started` is cleared, so the next lap tries again. Once an exec has started, "starting"
+    is reported before the thread begins: that takes back the start failure an earlier try of this
+    exec reported, so a tracked app leaves "failed" once it is ready (the node's lifecycle keeps a
+    start failure while the plugin still holds its error code).
+
     Parameters
     ----------
     shell_cmd : str
@@ -2988,6 +3047,11 @@ class ContainerAppRunnerPlugin(
     Returns
     -------
     None
+
+    Examples
+    --------
+    >>> self._run_container_exec("npm install && npm start")   # lap 1: exec_create fails, "failed" is reported
+    >>> self._run_container_exec("npm install && npm start")   # lap 2: the exec starts, "starting" is reported
     """
     if not self.container or not shell_cmd:
       return
@@ -3019,6 +3083,10 @@ class ContainerAppRunnerPlugin(
       )
       execution_id = execution["Id"]
       output = self.docker_client.api.exec_start(execution_id, stream=True, detach=False)
+      # The command runs: "starting" takes back a start failure that an earlier try of this exec reported, so the
+      # app leaves "failed" once it is ready. Reported before the thread starts, so it never hides that the command
+      # itself failed; before, the failure of a retried exec stayed although the app ran.
+      self.report_deployment_status("starting")
       thread = threading.Thread(
         target=self._stream_deployment_exec,
         args=(execution_id, output, self._stop_event),
@@ -3715,17 +3783,31 @@ class ContainerAppRunnerPlugin(
     This prevents multiple plugins on the same edge node from hammering the
     registry simultaneously (thundering herd).
 
+    A tracked deployment (one that belongs to a Deeploy operation: a worker pulling its base image, or
+    a container app before its first start) is never abandoned. IMAGE_PULL_MAX_RETRIES does not apply
+    to it and its pause is at most one hour, as for a container app bound to its image
+    (`_ensure_bound_image`), so after a registry outage of any length it is pulled within the hour
+    after the registry is back. An untracked app keeps the retry limit and the uncapped pause.
+
     Returns
     -------
     Image or None
-        Image object or None if pull failed or in backoff
+        Image object, or None if the pull failed, a pause is running, or an untracked app gave up
+        after IMAGE_PULL_MAX_RETRIES failures
+
+    Examples
+    --------
+    >>> img = self._pull_image_from_registry()
+    >>> img is None   # True when the pull failed or the pause after a failure is not over yet
+    False
     """
     if not self.cfg_image:
       self.P("No Docker image configured", color='r')
       return None
 
-    # Check if we've exhausted all retries
-    if self._has_exceeded_image_pull_retries():
+    # An untracked app gives up after IMAGE_PULL_MAX_RETRIES failures, as before. A tracked one does not: a
+    # registry outage longer than those attempts must not leave it down for good.
+    if not self._deployment_tracks_runtime() and self._has_exceeded_image_pull_retries():
       self.report_deployment_status("failed", error_code="IMAGE_PULL_FAILED")
       self.P(
         f"Image pull abandoned after {self._image_pull_failures} consecutive failures "
@@ -3756,7 +3838,10 @@ class ContainerAppRunnerPlugin(
 
     except Exception as e:
       self.P(f"Image pull failed: {e}", color='r')
-      self._record_image_pull_failure()
+      # The pause before the next attempt. A tracked deployment asks without end, so at most one hour apart:
+      # uncapped, the doubling puts the attempts 3-6 h apart at failure 10 and 1-2 days apart at failure 13.
+      # An untracked app keeps the uncapped pause it has always had.
+      self._record_image_pull_failure(max_backoff=3600 if self._deployment_tracks_runtime() else None)
       return None
 
 
@@ -3997,6 +4082,12 @@ class ContainerAppRunnerPlugin(
     """
     Restart the container from scratch.
 
+    Stops the running container (unless the caller already did), resets the runtime state with
+    `__reset_vars`, configures volumes, ports and environment again, makes the image available and
+    starts a new container; a container that waits for semaphores is started later by the launch
+    path. The restart counters, the last image check, the current image hash and the id this Docker
+    store gives the bound image are kept across the reset.
+
     Parameters
     ----------
     stop_reason : StopReason, optional
@@ -4010,6 +4101,11 @@ class ContainerAppRunnerPlugin(
     bool
         True when restart setup succeeded or was deferred waiting for
         semaphores, False when cleanup or start failed.
+
+    Examples
+    --------
+    >>> self._restart_container(StopReason.CRASH)
+    True
     """
     if self._fixed_volume_setup_pending:
       self.P("Container initialization is waiting for its image; restart deferred.")
@@ -4022,6 +4118,9 @@ class ContainerAppRunnerPlugin(
     preserved_last_success = self._last_successful_start
     preserved_last_image_check = self._last_image_check
     preserved_current_hash = self.current_image_hash
+    # The id this Docker store gives the bound image: the fixed-size volume owner lookup below runs before the image
+    # check sets it again, and under another type of image store the bound id names nothing there.
+    preserved_bound_store_id = self._bound_image_store_id
 
     if cleanup_first:
       cleanup_ok = self._stop_container_and_save_logs_to_disk()
@@ -4043,6 +4142,8 @@ class ContainerAppRunnerPlugin(
     self._last_successful_start = preserved_last_success
     self._last_image_check = preserved_last_image_check
     self.current_image_hash = preserved_current_hash
+    # Kept across the reset, so that lookup inspects the image the stopped container ran; before, it used the bound id.
+    self._bound_image_store_id = preserved_bound_store_id
 
     # Set state after reset
     self._set_container_state(ContainerState.RESTARTING, stop_reason or StopReason.UNKNOWN)
@@ -4239,15 +4340,56 @@ class ContainerAppRunnerPlugin(
     return bool(re.fullmatch(r"(?:[\w.\-]+(?::\d+)?/)?[\w.\-/]+@sha256:[0-9a-f]{64}", reference, re.ASCII)) \
       and reference.split("@")[0] == repository
 
+  def _is_bound_image(self, image, artifacts):
+    """
+    Whether an image of the local Docker store is the image this deployment is bound to.
+
+    It is when its id is the saved one, or when the store lists it under the saved registry reference
+    (`RepoDigests`). The id is a content hash only within one type of image store: in Docker's classic
+    store it is the hash of the image's configuration, in the containerd store the manifest digest, so
+    the same image has another id when the node's nested Docker uses another store than the one that
+    made the binding. A `repository@sha256:...` reference names one content in every store.
+
+    Parameters
+    ----------
+    image : docker.models.images.Image
+      An image of the local Docker store.
+    artifacts : dict
+      The binding: `image_id`, and `image_ref` when it is known.
+
+    Returns
+    -------
+    bool
+      True for the saved id, or for an image listed under the saved registry reference. False for any
+      other image, and for an image with another id when the binding has no registry reference.
+
+    Notes
+    -----
+    A tag is never part of this test. What a pull of the configured tag returns is accepted, in that
+    attempt, only with the saved id (`_recover_bound_image`), because a tag can move to another image.
+    An image the store lists under the saved registry reference is the bound content however it came
+    into the store, a tag pull included, so a later local lookup by that reference accepts it.
+
+    Examples
+    --------
+    >>> self._is_bound_image(image, {"image_id": "sha256:9f2c...", "image_ref": "acme/shop@sha256:4f1c..."})
+    True
+    """
+    # The saved id, or the saved exact reference among those the store lists the image under; an id-only
+    # binding (no reference) is never matched through the second test.
+    return image.id == artifacts["image_id"] or \
+      artifacts.get("image_ref") in ((image.attrs or {}).get("RepoDigests") or [])
+
   def _recover_bound_image(self, artifacts):
     """
     Fetch from the registry the exact image this deployment is bound to.
 
     Tried in order: the saved registry reference (`repository@sha256:...`, which can only be that
-    image), then the configured image reference. A deployment bound before the registry reference
-    was saved has only the second; its tag may have moved, so whatever comes back is accepted only
-    if its id equals the bound image id. Image ids are content hashes: an equal id is the same image.
-    Nothing with another id is ever returned.
+    image), then the configured image reference. What the saved reference gives is accepted when it is
+    the bound image by `_is_bound_image`: the saved id, or listed under that reference, whatever id this
+    image store gives it. A deployment bound before the registry reference was saved has only the
+    configured reference; its tag may have moved, so whatever it gives is accepted only if its id
+    equals the bound image id. Nothing else is ever returned.
 
     Parameters
     ----------
@@ -4257,9 +4399,9 @@ class ContainerAppRunnerPlugin(
     Returns
     -------
     tuple of (docker.models.images.Image or None, bool)
-      The image when it was found with the bound id. Otherwise None and whether the answer is final
-      for now: True when every reference was pulled and each gave another image, False when a pull
-      or the registry login failed, a "not found" answer included, and a later try may succeed.
+      The bound image when it was found. Otherwise None and whether the answer is final for now: True
+      when every reference was pulled and each gave another image, False when a pull or the registry
+      login failed, a "not found" answer included, and a later try may succeed.
 
     Notes
     -----
@@ -4292,13 +4434,14 @@ class ContainerAppRunnerPlugin(
         # Remember that this reference was not looked at, so the outcome is not reported as final.
         failed = True
         continue
-      # The id is the hash of the image's configuration in Docker's classic image store, which the
-      # node's nested Docker uses. Under the containerd image store the id is the manifest digest and
-      # would not compare: a change of store type must come with a change of this check.
-      if image.id == artifacts["image_id"]:
-        # Same content hash: this is the image the deployment was started with.
+      # A pull by the saved exact reference is the bound image when the store lists it under that reference,
+      # whatever id this store gives it (`_is_bound_image`); what the configured tag gives must have the bound
+      # id, since a tag can move.
+      if (self._is_bound_image(image, artifacts) if reference == artifacts.get("image_ref")
+          else image.id == artifacts["image_id"]):
+        # The image the deployment was started with.
         return image, False
-      self.P("'{}' is now another image ({}); it is not run in place of the bound one.".format(reference, image.id), color='r')
+      self.P("'{}' gives an image with another id ({}); it is not run in place of the bound one.".format(reference, image.id), color='r')
     # Nothing matched. Final only if every reference could be pulled and looked at.
     return None, not failed
 
@@ -4306,12 +4449,15 @@ class ContainerAppRunnerPlugin(
     """
     Make the exact image a tracked container app is bound to available, or say that it is not.
 
-    The image is looked up in the local Docker store on every call, which is cheap. When it is not
-    there (the node's own container was replaced and its Docker store is empty, or the image was
-    removed), it is fetched again from the registry and accepted only with the bound id. So an app
-    whose image was lost comes back by itself when the registry serves that image under its saved
-    reference, or still under the configured one, and never runs anything else. The attempts do not
-    end: an app whose image is not there now is asked for again every hour.
+    The image is looked up in the local Docker store on every call, which is cheap: by the bound id,
+    then, when the binding has a registry reference, by that reference (another type of image store
+    gives the same image another id). When it is not there (the node's own container was replaced and
+    its Docker store is empty, or the image was removed), it is fetched again from the registry and
+    accepted only when it is the bound image (`_recover_bound_image`). So an app whose image was lost
+    comes back by itself when the registry serves that image under its saved reference, or still under
+    the configured one, and never runs anything else. The attempts do not end: an app whose image is
+    not there now is asked for again every hour. The id under which the image was found is the one
+    the following launch starts the container by (`_get_full_image_ref`).
 
     Parameters
     ----------
@@ -4330,10 +4476,12 @@ class ContainerAppRunnerPlugin(
     as much again of random jitter (20-40 s with the default base of 20 s), doubling, at most one hour
     apart, so that a registry that was down for a day is asked again within the hour and many apps on
     one node stay under registry rate limits. The launch path calls this about every 5 s; between
-    attempts it only does the local lookup, so an image loaded onto the node by hand is used at once.
-    "failed" is reported only when every known reference was pulled and gave another image (a tag
-    that moved). A pull that raises, a "not found" answer included, is reported as "pulling_image"
-    and tried again: a failed report cannot be taken back for that attempt.
+    attempts it only does the local lookups (two local Docker calls while the bound id is not found
+    and the binding has a reference, one otherwise), so an image loaded onto the node by hand is used
+    at once. "failed" is reported only when every known reference was pulled and gave another image
+    (a tag that moved). A pull that raises, a "not found" answer included, is reported as
+    "pulling_image" and tried again: a failed report that the coordinator reads ends the rollout of
+    that attempt.
     The attempts also go on when the image disappears under a running app: the restart that finds
     it missing counts one failed restart and leaves no container, so the following laps take the
     launch path. RESTART_MAX_RETRIES ends only the restarts of a container that exists and has stopped.
@@ -4347,8 +4495,17 @@ class ContainerAppRunnerPlugin(
       # The cheap check, on every lap: the exact image in the local store.
       image = self.docker_client.images.get(artifacts["image_id"])
     except Exception:
-      # Not in this Docker store.
+      # Not in this Docker store under the bound id.
       image = None
+    if image is None and artifacts.get("image_ref"):
+      try:
+        # Under another type of image store than the one that made the binding the same image has another id;
+        # it is found by its exact registry reference, which Docker resolves only to the image listed under it.
+        # One more local call, only while the bound id is not found.
+        image = self.docker_client.images.get(artifacts["image_ref"])
+      except Exception:
+        # Not in this Docker store under that reference either.
+        image = None
     if image is None:
       if self._is_image_pull_backoff_active():
         # A registry attempt failed a moment ago: wait for the next one without asking the registry
@@ -4374,6 +4531,9 @@ class ContainerAppRunnerPlugin(
         return False
       # Found again: clear the pause so a later loss starts with short waits.
       self._record_image_pull_success()
+    # The launch that follows starts the container by the id this Docker store gives the image found here
+    # (`_get_full_image_ref`): under another type of image store the bound id names nothing.
+    self._bound_image_store_id = image.id
     # The exact bound image is in the local store.
     return True
 
@@ -4388,7 +4548,8 @@ class ContainerAppRunnerPlugin(
 
     A runner bound to its image (a tracked container app) resolves its tag once, saves the image id
     and from then on accepts only that image. When that image is not in the local Docker store it is
-    fetched again from the registry and accepted only with the same id (see `_ensure_bound_image`).
+    fetched again from the registry and accepted only when it is that image: the same id, or listed
+    under the saved registry reference (see `_ensure_bound_image`).
     A tracked worker is not bound to its image and takes the strategies above, so a base image that
     was lost with the Docker store is simply pulled again.
 

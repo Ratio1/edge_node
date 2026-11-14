@@ -370,13 +370,33 @@ def make_mock_docker_client(container=None):
 
 
 def make_lifecycle_runner(docker_client=None, mock_container=None, **cfg_overrides):
-  """Create a plugin fully wired for lifecycle testing.
+  """
+  Create a plugin fully wired for lifecycle testing.
 
   Extends make_container_app_runner() with all attributes needed to call
   on_init(), process(), _handle_initial_launch(), _restart_container(),
-  stop_container(), on_close(), and _check_container_status().
+  stop_container(), on_close(), and _check_container_status(), set as
+  `__reset_vars` and the configuration would set them on a node.
 
-  Returns (plugin, docker_client, mock_container).
+  Parameters
+  ----------
+  docker_client : MagicMock, optional
+    The mocked Docker client; a new one from make_mock_docker_client() when omitted.
+  mock_container : MagicMock, optional
+    The container that client starts, used only when `docker_client` is omitted.
+  **cfg_overrides : dict
+    Attributes set on the plugin last, for example `cfg_health_check={...}`.
+
+  Returns
+  -------
+  tuple
+    `(plugin, docker_client, mock_container)`.
+
+  Examples
+  --------
+  >>> plugin, client, container = make_lifecycle_runner(cfg_restart_policy="no")
+  >>> plugin.container is None
+  True
   """
   from extensions.business.container_apps.container_app_runner import (
     ContainerState, StopReason,
@@ -424,6 +444,8 @@ def make_lifecycle_runner(docker_client=None, mock_container=None, **cfg_overrid
   plugin._image_pull_failures = 0
   plugin._next_image_pull_time = 0
   plugin._fixed_volume_setup_pending = False
+  # As `__reset_vars` leaves it: no image check has found a bound image yet, so a launch would use the bound id.
+  plugin._bound_image_store_id = None
   plugin.cfg_image_pull_max_retries = 100
   plugin.cfg_image_pull_backoff_base = 20
 

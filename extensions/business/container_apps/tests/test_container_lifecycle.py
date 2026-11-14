@@ -1647,6 +1647,28 @@ class TestImagePullBackoff(unittest.TestCase):
     self.assertIsNone(result)
     client.images.pull.assert_not_called()
 
+  def test_an_untracked_app_keeps_its_uncapped_pull_pause(self):
+    """
+    An app outside Deeploy keeps the pull pacing it had: its pause is not capped at one hour.
+
+    The one-hour ceiling is for tracked deployments, which never give up; an untracked app still stops after
+    IMAGE_PULL_MAX_RETRIES (`test_max_retries_gives_up`) and keeps the doubling pause on the way there.
+    """
+    # A clock.
+    clock = {"now": 100}
+    # An untracked app.
+    plugin, client, _ = make_lifecycle_runner()
+    # It reads that clock.
+    plugin.time = lambda: clock["now"]
+    # The registry does not answer.
+    client.images.pull.side_effect = Exception("registry unreachable")
+    # Nine failures in a row so far.
+    plugin._image_pull_failures = 9
+    # The tenth fails too.
+    self.assertIsNone(plugin._pull_image_from_registry())
+    # 3-6 hours to the next attempt, as before: more than the one hour a tracked deployment waits at most.
+    self.assertGreater(plugin._next_image_pull_time - clock["now"], 3600)
+
   def test_no_max_backoff_cap(self):
     """Backoff should grow without limit (no artificial cap)."""
     plugin, _, _ = make_lifecycle_runner()
