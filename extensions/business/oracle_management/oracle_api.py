@@ -331,6 +331,60 @@ class OracleApiPlugin(BasePlugin):
       for epoch, val in zip(epochs, selected)
     ]
 
+  def __check_served_epoch(self, node_eth_address, epoch, served, stored):
+    """
+    Check a single-epoch availability about to be served against the stored one.
+
+    `node_epoch` and `node_last_epoch` read the served value through `__get_node_epochs`, which
+    applies the revoked-key floor, and read the stored value again without it. The two must be
+    equal, with one exception the floor itself makes: a revoked node key is served
+    `REVOKED_FLOOR_VALUE` in the floor epochs. Without that exception such a request failed the
+    check whenever the stored value was lower, and was answered with an error.
+
+    Parameters
+    ----------
+    node_eth_address : str
+      The ETH address of the node, as `__get_node_epochs` returned it.
+    epoch : int
+      The epoch that was read.
+    served : int
+      The availability the endpoint is about to answer.
+    stored : int
+      The availability the epoch manager holds for that epoch.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    AssertionError
+      When the two values differ and the floor does not explain it; the text names the epoch
+      and both values.
+
+    Notes
+    -----
+    The floor's eligibility rule (availability in `REVOKED_FLOOR_ELIGIBLE_EPOCHS`) is not
+    checked again: it needs the node's whole history, which only `__get_node_epochs` reads. A
+    revoked key that is not eligible is served its stored value, so the equality covers it; the
+    check is weaker than the floor rule only for such a key served exactly the floor value.
+
+    Examples
+    --------
+    >>> self.__check_served_epoch("0xREVOKED", 530, 255, 0)   # the floor: passes
+    >>> self.__check_served_epoch("0xOTHER", 530, 255, 0)
+    Traceback (most recent call last):
+    AssertionError: Epoch 530: served 255, stored 0.
+    """
+    # The one difference the floor makes: the floor value, in a floor epoch, for a revoked key.
+    floored = (
+      served == REVOKED_FLOOR_VALUE and REVOKED_FLOOR_FIRST_EPOCH <= epoch <= REVOKED_FLOOR_LAST_EPOCH
+      and node_eth_address.lower() in self.__revoked_nodes
+    )
+    # Any other difference is still an error, and the text now says which values differ.
+    assert served == stored or floored, f"Epoch {epoch}: served {served}, stored {stored}."
+    return
+
   def __get_node_epochs(self, node_addr: str, start_epoch: int = 1, end_epoch: int = None, include_bc_info: bool = False):
     """
     Get the epochs availabilities for a given node.
@@ -948,6 +1002,23 @@ class OracleApiPlugin(BasePlugin):
 
         - epoch_prc: float
             The availability score of the node in the epoch as a percentage (between 0 and 1).
+
+        For a revoked node key that the floor covers, `epoch_val` in a floor epoch is
+        `REVOKED_FLOOR_VALUE`, the value the range endpoints serve and sign.
+
+    Raises
+    ------
+    ValueError
+        When neither `eth_node_addr` nor `node_addr` is given.
+    AssertionError
+        When the value to serve differs from the stored one and the revoked-key floor does
+        not explain it (see `__check_served_epoch`).
+
+    Examples
+    --------
+    >>> # a revoked key the floor covers, stored value 0 in epoch 530
+    >>> self.node_epoch(epoch=530, node_addr="0xai_node")["epoch_val"]
+    255
     """
     if eth_node_addr is not None:
       node_addr = self.__eth_to_internal(eth_node_addr)
@@ -958,7 +1029,8 @@ class OracleApiPlugin(BasePlugin):
     if isinstance(data.get('epochs_vals'), list) and len(data['epochs_vals']) > 0:
       epoch_val = data['epochs_vals'][0]
       epoch_val_direct = self.netmon.epoch_manager.get_node_epoch(node_addr, epoch)
-      assert epoch_val == epoch_val_direct
+      # The self-check accepts the revoked-key floor: a floored value no longer fails the request.
+      self.__check_served_epoch(data['node_eth_address'], epoch, epoch_val, epoch_val_direct)
       response = self.__get_response({
         'epoch_id': epoch,
         'epoch_val': epoch_val,
@@ -1006,6 +1078,22 @@ class OracleApiPlugin(BasePlugin):
         - last_epoch_prc: float
             The availability score of the node in the last epoch as a percentage (between 0 and 1).
 
+        For a revoked node key that the floor covers, `last_epoch_val` is `REVOKED_FLOOR_VALUE`
+        while the last synced epoch is a floor epoch, the value the range endpoints serve and sign.
+
+    Raises
+    ------
+    ValueError
+        When neither `eth_node_addr` nor `node_addr` is given.
+    AssertionError
+        When the value to serve differs from the stored one and the revoked-key floor does
+        not explain it (see `__check_served_epoch`).
+
+    Examples
+    --------
+    >>> # a revoked key the floor covers, stored value 0, last synced epoch 538
+    >>> self.node_last_epoch(node_addr="0xai_node")["last_epoch_val"]
+    255
     """
     if eth_node_addr is not None:
       node_addr = self.__eth_to_internal(eth_node_addr)
@@ -1017,7 +1105,8 @@ class OracleApiPlugin(BasePlugin):
     if isinstance(data.get('epochs_vals'), list) and len(data['epochs_vals']) > 0:
       epoch_val = data['epochs_vals'][0]
       epoch_val_direct = self.netmon.epoch_manager.get_node_epoch(node_addr, epoch)
-      assert epoch_val == epoch_val_direct
+      # The self-check accepts the revoked-key floor: a floored value no longer fails the request.
+      self.__check_served_epoch(data['node_eth_address'], epoch, epoch_val, epoch_val_direct)
       response = self.__get_response({
         'last_epoch_id': epoch,
         'last_epoch_val': epoch_val,
