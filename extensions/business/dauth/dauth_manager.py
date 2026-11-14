@@ -35,6 +35,9 @@ from extensions.business.dauth.dauth_registry import (
   dauth_registry_write_kwargs,
   load_dauth_registry_snapshot,
 )
+# The type of a refusal that is dAuth's verdict on the requester; get_secrets logs it in yellow.
+# Imported on a line of its own, apart from the block above.
+from extensions.business.dauth.dauth_mixin import DauthRefused
 from extensions.business.dauth.dauth_revoked_nodes import _DauthRevokedNodesMixin
 
 from extensions.business.dauth.deployment_secrets import _DauthDeploymentSecretsMixin
@@ -629,6 +632,31 @@ class DauthManagerPlugin(
     The signed request must include a hex-millisecond timestamp nonce no older
     than 120 seconds and the required secret revision. The signed response
     echoes both and the encrypted bundle is bound to the revision.
+
+    Parameters
+    ----------
+    body : dict
+      The signed request: the sender fields, `nonce`, `job_id` and, for a versioned job,
+      `revision`.
+
+    Returns
+    -------
+    dict
+      The signed response with the request's `nonce` and either the encrypted bundle or
+      `error` with `retryable` (False for a ``ValueError``, which is final for the requester).
+
+    Notes
+    -----
+    A failed request writes one line with the source address and the error text. The line is
+    yellow when the error is a ``DauthRefused``, dAuth's verdict on the requester (a revoked
+    key or revision, a node outside the job's placement or the revision's plan), and red for
+    everything else. Red lines are also copied to the error log.
+
+    Examples
+    --------
+    >>> response = plugin.get_secrets(body)   # signed by a node that does not run the job
+    >>> response["error"], response["retryable"]
+    ('Sender is not running the existing job.', False)
     """
     request_nonce = body.get("nonce") if isinstance(body, dict) else None
     if not self._is_dauth_server_enabled():
@@ -642,7 +670,7 @@ class DauthManagerPlugin(
       data = self.process_dauth_get_secret_request(body)
     except Exception as e:
       self.P("Error processing get_secrets request from {}: {}".format(
-        self.get_request_client_ip(), e), color='r'
+        self.get_request_client_ip(), e), color='y' if isinstance(e, DauthRefused) else 'r'
       )
       data = {
         'error': str(e),

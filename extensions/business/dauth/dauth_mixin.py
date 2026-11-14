@@ -56,6 +56,18 @@ def version_to_int(version):
       pass
   return val
 
+class DauthRefused(ValueError):
+  """
+  A request dAuth refuses as its verdict on the requester.
+
+  Raised where a correctly signed request is refused because of who asks: a revoked key, a node
+  that is not in the job's placement or in the revision's plan, a revoked secret revision. It
+  is a ``ValueError``, so every handler that treats a ``ValueError`` as a final answer still
+  does; the type only lets the endpoint log such a refusal in yellow and keep red for what it
+  could not judge (a bad signature, a missing or inconsistent record, a failed dependency).
+  """
+
+
 class _DotDict(dict):
   __getattr__ = dict.__getitem__
   __setattr__ = dict.__setitem__
@@ -222,18 +234,20 @@ class _DauthMixin(object):
     body : dict, optional
       The request body; a revoked requester's declared versions and alias are recorded from it.
     dauth_data : dict, optional
-      The `dauth` part of the answer; receives `dAuth.DAUTH_REVOKED` for a revoked requester.
+      The `auth` part of the answer; receives `dAuth.DAUTH_REVOKED` for a revoked requester.
 
     Returns
     -------
     tuple
-      `(allowed, message)`: `allowed` is a bool and `message` says why, as text for the
+      `(allowed, message)`: `allowed` is True, False for a verdict (version, revoked key, no
+      license) or None when the check itself failed; `message` says why, as text for the
       answer's error field.
 
     Notes
     -----
     An exception in the revocation check or in the license lookup refuses the request with
-    the exception text in `message`; it is never treated as "allowed".
+    the exception text in `message`; it is never treated as "allowed". None and False are
+    both falsy, so a caller that tests `not allowed` refuses in both cases.
 
     Examples
     --------
@@ -260,13 +274,50 @@ class _DauthMixin(object):
         str_allowed = "allowed" if result else "not allowed"
         msg = f"{version_check_data.requester_type} {node_address_eth} {str_allowed} on {self.evm_network}"
       except Exception as e:
-        result = False
+        # None, not False: the request is refused all the same, but this is a check that failed
+        # on this server and not a verdict on the node, so its refusal line stays red.
+        result = None
         msg = "Error checking if node is allowed ({} on {}): {} ".format(
           node_address_eth, self.evm_network, e
         )
     return result, msg
 
   def _verify_signed_dauth_body(self, body, endpoint, log_hash_sign_fails=True):
+    """
+    Check who signed a dAuth request and that the signer is not revoked.
+
+    The sender's ETH address in the body must be the one derived from its node address, the
+    signature must be valid, and the signing key must not be on the denylist of revoked keys.
+
+    Parameters
+    ----------
+    body : dict
+      The request body, with the sender's node address, its ETH address and the signature.
+    endpoint : str
+      The endpoint name, recorded with a revoked sender's try.
+    log_hash_sign_fails : bool
+      Passed to the signature check: whether it logs a hash or signature failure itself.
+
+    Returns
+    -------
+    tuple
+      `(requester, requester_eth)`: the verified node address and its ETH address.
+
+    Raises
+    ------
+    ValueError
+      When the body is not a dict, a sender field is missing, the ETH address does not match
+      the node address, or the signature is invalid.
+    DauthRefused
+      When the signer's key is revoked: a verdict on the requester, also a ``ValueError``.
+    RuntimeError
+      When the denylist of revoked keys is not loaded.
+
+    Examples
+    --------
+    >>> self._verify_signed_dauth_body(body, endpoint="get_secrets")
+    ('0xai_A...', '0x37379B80c7657620E5631832c4437B51D67A88cB')
+    """
     if not isinstance(body, dict):
       raise ValueError("Invalid request body.")
 
@@ -291,7 +342,8 @@ class _DauthMixin(object):
     if self._is_dauth_node_revoked(
       endpoint=endpoint, node_address=requester, body=body,
     ):
-      raise ValueError(f"Sender {requester_eth} not allowed on {self.evm_network}.")
+      # A verdict on the requester (its key is revoked): typed, so the endpoint logs it in yellow.
+      raise DauthRefused(f"Sender {requester_eth} not allowed on {self.evm_network}.")
     return requester, requester_eth
 
   def _is_protocol_oracle_eth(self, node_address_eth):
@@ -827,9 +879,12 @@ class _DauthMixin(object):
 
     Raises
     ------
+    DauthRefused
+      When the requester is not one of the nodes that run the pipeline: a verdict on the
+      requester, also a ``ValueError``.
     ValueError
       When the job has no raw-CID pointer, the pipeline is versioned or belongs to
-      another job, the requester does not run it, the stored bundle is missing,
+      another job, the stored bundle is missing,
       versioned, deleted or revoked, or does not match the job or the CID, a
       pre-CID bundle cannot be bound to the current placeholders or stored, or the
       pointer changed while the bundle was being bound.
@@ -855,7 +910,8 @@ class _DauthMixin(object):
       raise ValueError("Secret revision is required for this pipeline.")
     nodes = [self._normalize_node_address_for_compare(node) for node in self._pipeline_runner_nodes(pipeline)]
     if self._normalize_node_address_for_compare(requester) not in nodes:
-      raise ValueError("Sender is not running the existing job.")
+      # A verdict on the requester (not in the job's placement), not a fault of this server.
+      raise DauthRefused("Sender is not running the existing job.")
     bundle = self._load_current_dauth_secret_bundle(
       job_id, pipeline_cid, pipeline, require_unversioned=True,
     )
@@ -895,19 +951,57 @@ class _DauthMixin(object):
     return result
 
   def _load_revision_runner_secret_bundle(self, job_id, revision, requester):
-    """Authorize one exact immutable revision without a current-bundle fallback."""
+    """
+    Authorize one exact immutable revision without a current-bundle fallback.
+
+    Reads the stored record of the job's secret revision and returns it to a requester that
+    the revision's plan names. Nothing else is tried when the record is missing: the job's
+    current bundle is never served in its place.
+
+    Parameters
+    ----------
+    job_id : str
+      The normalized Deeploy job ID.
+    revision : str
+      The secret revision the request names.
+    requester : str
+      The verified node address that signed the request.
+
+    Returns
+    -------
+    dict
+      The revision record without its `pipelines` plan.
+
+    Raises
+    ------
+    DauthRefused
+      When the revision was revoked, or the requester is not in the revision's plan: verdicts
+      on the request, also ``ValueError``.
+    ValueError
+      When no revision is given, or the stored record is not a dict, names another job or
+      revision, or has no plan.
+    RuntimeError
+      When this server holds no record for the revision (the requester may retry).
+
+    Examples
+    --------
+    >>> self._load_revision_runner_secret_bundle("7", "op:deploy", "0xai_RunnerNodeAddress")
+    {'job_id': '7', 'revision': 'op:deploy', 'job_secrets': {...}, 'pipeline_cid': 'Qm...'}
+    """
     if not isinstance(revision, str) or not revision.strip():
       raise ValueError("Secret revision is required.")
     revision = revision.strip()
     key = "{}|{}".format(job_id, revision)
     revoked_key = key + "|revoked"
     if self.chainstore_hget(hkey=DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, key=revoked_key):
-      raise ValueError("dAuth secret revision has been revoked.")
+      # A verdict on the request (the revision was revoked on purpose), not a fault of this server.
+      raise DauthRefused("dAuth secret revision has been revoked.")
     secret_bundle = self.chainstore_hget(
       hkey=DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, key=key,
     )
     if isinstance(secret_bundle, dict) and secret_bundle.get("revoked"):
-      raise ValueError("dAuth secret revision has been revoked.")
+      # The same verdict, read from the revoked record itself.
+      raise DauthRefused("dAuth secret revision has been revoked.")
     if secret_bundle is None:
       raise RuntimeError("No dAuth secret bundle found for the requested revision.")
     if not isinstance(secret_bundle, dict):
@@ -921,7 +1015,8 @@ class _DauthMixin(object):
     if normalized_requester not in [
       self._normalize_node_address_for_compare(node) for node in pipelines
     ]:
-      raise ValueError("Sender is not authorized for the requested job revision.")
+      # A verdict on the requester (not in the revision's plan), not a fault of this server.
+      raise DauthRefused("Sender is not authorized for the requested job revision.")
     return {key: value for key, value in secret_bundle.items() if key != "pipelines"}
 
   def process_dauth_reveal_secret_request(self, body):
@@ -1161,9 +1256,41 @@ class _DauthMixin(object):
   
   def process_dauth_request(self, body):
     """
-    This is the main method that processes the request for authentication.
+    Process a request for authentication data (`get_auth_data`).
+
+    Checks, in this order and stopping at the first failure: the sender address and its ETH
+    address, the signature, the declared versions, then whether the node is allowed (not
+    revoked and licensed). An allowed requester gets the dAuth settings; any other gets an
+    answer with `error` and no settings. A served answer can carry a non-critical note in
+    `error` too, such as a version warning.
+
+    Parameters
+    ----------
+    body : dict
+      The signed request: sender address and ETH address, nonce, alias and declared versions.
+
+    Returns
+    -------
+    dict
+      The answer: the `auth` part (the settings, or `error`) and the server information.
+
+    Notes
+    -----
+    A refusal writes one line with the nonce, the shortened sender address, the alias, the
+    shortened ETH address, the source address and the reason. The line is yellow when the
+    reason is the server's verdict on the node (no license, revoked key) and red otherwise: a
+    request that could not be judged (wrong ETH address, bad signature, a check that failed
+    on this server) and a version refusal, which depends on this server's own minimum
+    release. Red lines are also copied to the error log.
+
+    Examples
+    --------
+    >>> self.process_dauth_request(body)["auth"]["error"]   # a node without a license
+    'Node not allowed to request auth data. node 0xUnlinked not allowed on mainnet'
     """
     error = None
+    # A refusal is logged in red unless it is the server's verdict on the node (set below).
+    refusal_color = 'r'
     _non_critical_error = None
     requester_eth = None
     version_check_data = VersionCheckData(result=False, message="", requester_type=None)
@@ -1232,6 +1359,10 @@ class _DauthMixin(object):
       )
       if not allowed_to_dauth:
         error = 'Node not allowed to request auth data. ' + message
+        # No license or a revoked key is a correct verdict, logged in yellow so that the red
+        # lines, which are copied to the error log, are left to faults. A check that failed
+        # (None) stays red, and so does the version-gate refusal above.
+        refusal_color = 'r' if allowed_to_dauth is None else 'y'
     
     if False and hasattr(self, "DEBUG_BYPASS") and self.DEBUG_BYPASS:
       # this is a debug flag that allows us to bypass the node check
@@ -1250,7 +1381,7 @@ class _DauthMixin(object):
     if error is not None:
       dct_dauth['error'] = error
       self.P("dAuth request '{}' failed for <{}>  '{}' (ETH: {}) from {}: {}".format(
-        sender_nonce, short_requester, requester_alias, short_eth, source_ip, error), color='r'
+        sender_nonce, short_requester, requester_alias, short_eth, source_ip, error), color=refusal_color
       )
     else:
       if _non_critical_error is not None:

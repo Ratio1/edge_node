@@ -234,9 +234,40 @@ class _DauthRevokedNodesMixin(object):
 
   def _is_dauth_node_revoked(self, endpoint, node_address, requester_type=None, body=None):
     """
-    True if the signed requester's key is revoked. Call only after the signature was
-    verified. The ETH address is derived here from `node_address` (the key that signed),
-    so every spelling of a revoked key matches. The refusal never depends on the license.
+    Say whether the signed requester's key is revoked, and record the try if it is.
+
+    Call only after the signature was verified. The ETH address is derived here from
+    `node_address` (the key that signed), so every spelling of a revoked key matches. The
+    refusal never depends on the license. A revoked requester's try is handed to the
+    recorder and logged in one yellow line with the node address, its ETH address, the
+    source address and the endpoint.
+
+    Parameters
+    ----------
+    endpoint : str
+      The endpoint the request came to, recorded with the try.
+    node_address : str
+      The node address whose key signed the request.
+    requester_type : str, optional
+      The requester type from the version check, recorded with the try.
+    body : dict, optional
+      The request body; the declared versions and alias are recorded from it, cut to 64
+      characters each.
+
+    Returns
+    -------
+    bool
+      True when the key is on the denylist.
+
+    Raises
+    ------
+    RuntimeError
+      When the denylist was not loaded.
+
+    Examples
+    --------
+    >>> self._is_dauth_node_revoked("get_auth_data", "0xai_RevokedNodeAddress")
+    True
     """
     revoked = getattr(self, "_dauth_revoked_nodes", None)
     if revoked is None:
@@ -267,7 +298,9 @@ class _DauthRevokedNodesMixin(object):
       "dAuth refused revoked {} {} ({}) from {} on /{}".format(
         requester_type or "requester", node_address, node_address_eth, source_ip, endpoint,
       ),
-      color='r',
+      # Yellow: refusing a revoked key is the denylist working, and each try is also kept in the
+      # registry file. Red lines are copied to the error log, where these hid the faults.
+      color='y',
     )
     return True
 
