@@ -26,6 +26,10 @@ signed announcement request, which any peer can verify). ChainStore accepts that
 only from dAuth servers and only with a valid proof, and never replaces or deletes a
 stored new key. The oracle API syncs the hash and serves it to the dApp, where the
 license owner links the new key.
+
+Requesters that are not revoked: the mixin also holds the short memo of their "not
+licensed" verdicts (`_is_dauth_requester_licensed`), so a node that keeps asking without a
+license costs one on-chain call per `DAUTH_UNLICENSED_MEMO_SECONDS` and not one per request.
 """
 import hashlib
 import json
@@ -68,6 +72,13 @@ DAUTH_REVOKED_PENDING_MAX = 10000
 DAUTH_REVOKED_RECORDER_INTERVAL = 2
 # `on_close` waits at most this long for the recorder's final pass (seconds).
 DAUTH_REVOKED_RECORDER_STOP_TIMEOUT = 10
+# A "not licensed" verdict of the chain is reused for this many seconds for requesters that are
+# not revoked. A refused node asks again every 16 to 29 s, and each of those requests made one
+# on-chain call; with the memo a steady asker costs one call per 300 s. A license linked in the
+# meantime is seen at most this much later.
+DAUTH_UNLICENSED_MEMO_SECONDS = 300
+# When the memo holds this many addresses its expired verdicts are dropped, which bounds its memory.
+DAUTH_UNLICENSED_MEMO_MAX = 10000
 
 _INTERNAL_ADDRESS_RE = re.compile(r"^[A-Za-z0-9_-]{44}$")
 _REPORTED_KEYS = (
@@ -121,12 +132,30 @@ class _DauthRevokedNodesMixin(object):
 
   def _load_dauth_revoked_nodes(self):
     """
-    Read the denylist once from `EE_REVOKED_NODE_ADDRESSES` (called from `on_init` on
+    Read the denylist and create the license bookkeeping of the mixin.
+
+    Reads the denylist once from `EE_REVOKED_NODE_ADDRESSES` (called from `on_init` on
     every node). A missing or malformed list is kept as an error for
     `_require_dauth_revoked_nodes`, since only dAuth servers need it. Only the count
-    and a hash are logged, never the addresses.
+    and a hash are logged, never the addresses. The two license memos start empty: the
+    one of revoked nodes (recorder thread) and the one of "not licensed" verdicts of
+    other requesters (request thread).
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> self.os_environ["EE_REVOKED_NODE_ADDRESSES"] = "0xai_A...,0xai_B..."
+    >>> self._load_dauth_revoked_nodes()
+    >>> len(self._dauth_revoked_nodes), self._dauth_unlicensed_until
+    (2, {})
     """
     self._dauth_revoked_license_checks = {}
+    # {requester ETH address: time until which its "not licensed" verdict is reused}. Created
+    # here, beside the other license memo, because every dAuth server and test harness runs this.
+    self._dauth_unlicensed_until = {}
     self._init_dauth_revoked_recorder()
     try:
       self._dauth_revoked_nodes = self._parse_dauth_revoked_nodes(
@@ -411,6 +440,65 @@ class _DauthRevokedNodesMixin(object):
     except Exception as exc:
       self.P(f"Could not write unlicensed revoked dAuth try: {exc}", color='r')
     return False
+
+  def _is_dauth_requester_licensed(self, node_address_eth):
+    """
+    Say whether a requester that is not revoked holds a license, reusing a recent "no".
+
+    Asks the chain through `bc.is_node_licensed` and remembers a "not licensed" answer for
+    `DAUTH_UNLICENSED_MEMO_SECONDS`. Within that time the same address is answered from the
+    memo, with no on-chain call. A "licensed" answer is never remembered, so a license that
+    ends is seen at the next request. Runs on the dAuth request thread only.
+
+    Parameters
+    ----------
+    node_address_eth : str
+      The requester's ETH address as the server derived it from the signing key, so one key
+      has one spelling.
+
+    Returns
+    -------
+    bool
+      True when the chain says the node is licensed; False when it says it is not, or said
+      so less than `DAUTH_UNLICENSED_MEMO_SECONDS` ago.
+
+    Raises
+    ------
+    Exception
+      Whatever the on-chain call raises. Nothing is remembered then, so the next request
+      asks the chain again.
+
+    Notes
+    -----
+    The memo is bounded: when it holds `DAUTH_UNLICENSED_MEMO_MAX` addresses, the expired
+    ones are dropped before the new one is added. Each new entry costs one on-chain call on
+    the single request thread, which limits how many can be valid at one time.
+
+    Examples
+    --------
+    >>> self._is_dauth_requester_licensed("0xUnlinked")   # one on-chain call
+    False
+    >>> self._is_dauth_requester_licensed("0xUnlinked")   # within 300 s: no call
+    False
+    """
+    # The plugin clock dates the verdicts, so a test can move it.
+    now = self.time()
+    # A "not licensed" verdict that is still valid answers without the on-chain call.
+    if self._dauth_unlicensed_until.get(node_address_eth, 0) > now:
+      # The answer the chain gave less than the memo time ago.
+      return False
+    # No valid verdict: ask the chain. An exception leaves the memo as it is.
+    licensed = self.bc.is_node_licensed(node_address_eth=node_address_eth)
+    if not licensed:
+      if len(self._dauth_unlicensed_until) >= DAUTH_UNLICENSED_MEMO_MAX:
+        # Full: keep only the verdicts that are still valid, one scan per filling of the memo.
+        self._dauth_unlicensed_until = {
+          address: until for address, until in self._dauth_unlicensed_until.items() if until > now
+        }
+      # Remember only "not licensed", until the memo time has passed.
+      self._dauth_unlicensed_until[node_address_eth] = now + DAUTH_UNLICENSED_MEMO_SECONDS
+    # The fresh answer of the chain, licensed or not.
+    return licensed
 
   def _is_dauth_revoked_node_licensed(self, internal, node_address_eth):
     """

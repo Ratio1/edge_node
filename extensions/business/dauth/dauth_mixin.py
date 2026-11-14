@@ -203,9 +203,42 @@ class _DauthMixin(object):
     dauth_data : dict = None,
   ):
     """
-    Check if the node address is allowed to request authentication data. A revoked
-    requester is also named in `dauth_data[dAuth.DAUTH_REVOKED]`, which tells the node
-    to replace its key.
+    Check if the node address is allowed to request authentication data.
+
+    A requester is allowed when its version check passed, its key is not revoked and the
+    chain says it holds a license. A revoked requester is also named in
+    `dauth_data[dAuth.DAUTH_REVOKED]`, which tells the node to replace its key. The license
+    answer comes through `_is_dauth_requester_licensed`, which reuses a recent "not
+    licensed" verdict instead of making one on-chain call per refused request.
+
+    Parameters
+    ----------
+    node_address : str
+      The requester's internal node address (the key that signed the request).
+    node_address_eth : str
+      The ETH address derived from that key.
+    version_check_data : VersionCheckData
+      The verdict of `version_check` for this request.
+    body : dict, optional
+      The request body; a revoked requester's declared versions and alias are recorded from it.
+    dauth_data : dict, optional
+      The `dauth` part of the answer; receives `dAuth.DAUTH_REVOKED` for a revoked requester.
+
+    Returns
+    -------
+    tuple
+      `(allowed, message)`: `allowed` is a bool and `message` says why, as text for the
+      answer's error field.
+
+    Notes
+    -----
+    An exception in the revocation check or in the license lookup refuses the request with
+    the exception text in `message`; it is never treated as "allowed".
+
+    Examples
+    --------
+    >>> self.check_if_node_allowed("0xai_A...", "0xUnlinked", version_check_data)
+    (False, 'node 0xUnlinked not allowed on mainnet')
     """
     self.Pd(f"Checking if node {node_address} (ETH: {node_address_eth}) is allowed")
     msg = ""
@@ -221,7 +254,9 @@ class _DauthMixin(object):
         )
         if revoked and dauth_data is not None:
           dauth_data[self.const.BASE_CT.dAuth.DAUTH_REVOKED] = node_address
-        result = not revoked and self.bc.is_node_licensed(node_address_eth=node_address_eth)
+        # The license answer of a requester that is not revoked comes through the short memo of
+        # "not licensed" verdicts: a node that keeps asking costs one on-chain call per 300 s.
+        result = not revoked and self._is_dauth_requester_licensed(node_address_eth)
         str_allowed = "allowed" if result else "not allowed"
         msg = f"{version_check_data.requester_type} {node_address_eth} {str_allowed} on {self.evm_network}"
       except Exception as e:
