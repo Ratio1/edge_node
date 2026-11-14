@@ -13,6 +13,7 @@ import struct as _struct
 from ..worker import PentestLocalWorker
 from .live_progress import _LiveProgressMixin
 from ..models import UiAggregate
+from ..cve_view import filter_listed
 from ..models.finding_identity import (
   worker_attribution_fields as _worker_attribution_fields,
   volatile_non_content_fields as _volatile_non_content_fields,
@@ -1094,7 +1095,9 @@ class _ReportMixin:
     # at 10. An `inconclusive` scenario keeps its *declared* severity, so
     # without the filter a scenario that concluded nothing was ranked into the
     # customer-facing top-findings list as a HIGH.
-    crit_high = [f for f in real_findings if f.get("severity") in ("CRITICAL", "HIGH")]
+    # Generated CVE findings: listed ones only (the rest are in a rollup or the possible section).
+    crit_high = [f for f in filter_listed(real_findings, (agg.get("cves_not_applicable") or {}).values())
+                 if f.get("severity") in ("CRITICAL", "HIGH")]
     crit_high.sort(key=lambda f: (
       self.SEVERITY_ORDER.get(f.get("severity"), 9),
       self.CONFIDENCE_ORDER.get(f.get("confidence"), 9),
