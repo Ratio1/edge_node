@@ -6,6 +6,9 @@ on:
       - "main"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: edge-node-build
   cancel-in-progress: false
@@ -17,6 +20,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Fetch pinned vulndb
+        uses: ./.github/actions/fetch-vulndb
 
       - name: Configure Git
         run: |
@@ -75,6 +81,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Fetch pinned vulndb
+        uses: ./.github/actions/fetch-vulndb
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
