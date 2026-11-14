@@ -62,7 +62,9 @@ def entries(kind):
       # Another set's entry (or one written before apps named their set).
       continue
     # The fields the check needs.
-    rows.append({name: item.get(name) for name in ('cid', 'version', 'published_timestamp', 'applied_timestamp', 'node_id')})
+    rows.append(dict({name: item.get(name) for name in ('cid', 'version', 'published_timestamp', 'applied_timestamp', 'node_id')},
+                     # The archive format tag the entry's manifest names (None when it has none).
+                     encryption=(item.get('manifest') or {}).get('encryption')))
   return sorted(rows, key=lambda row: (row.get('version') or 0, row.get('published_timestamp') or row.get('applied_timestamp') or 0))
 # The CID of every quarantine file of the node (any set; the caller keeps the set's own).
 quarantine = []
@@ -217,9 +219,12 @@ for folder, dirs, names in os.walk(root):
 # One tagged line for the host.
 print('SCAN ' + json.dumps({'files': files, 'bytes': size, 'hits': hits, 'dauth_bundle_kinds': dauth_kinds}))'''
 
-# The chain-store replica an oracle last saved, and the record of one sync key in it.
+# The chain-store replica an oracle last saved, and the record of one sync key in it: its archive, version and
+# publisher, the archive format tag of its manifest, and the form of its record MAC ("hex64", "other", or None
+# when the record has none), never the MAC itself.
 RECORD_READER = r'''
-import base64, hashlib, json, os, pickle, sys, time
+# re: the MAC's form is checked, its value is not printed.
+import base64, hashlib, json, os, pickle, re, sys, time
 path = '/edge_node/_local_cache/_data/cache_plugins/admin_pipeline__chain_store_base__chain_store_base_inst/object.pickle'
 key = 'hs:{}:{}'.format(hashlib.sha256(b'CHAINSTORE_SYNC').hexdigest()[:10], base64.urlsafe_b64encode(sys.argv[1].encode()).decode())
 value = None
@@ -227,7 +232,14 @@ if os.path.exists(path):
   with open(path, 'rb') as fh:
     record = pickle.load(fh).get(key)
   value = record.get('value') if isinstance(record, dict) else record
-out = {'cid': value.get('cid'), 'version': value.get('version'), 'node_id': value.get('node_id')} if isinstance(value, dict) else None
+# A set's record carries a top-level "mac"; a shared-key record has none.
+mac = value.get('mac') if isinstance(value, dict) else None
+# The MAC's form only: 64 lowercase hex characters, something else, or absent.
+form = None if mac is None else 'hex64' if isinstance(mac, str) and re.fullmatch('[0-9a-f]{64}', mac) else 'other'
+# The record's archive, version and publisher.
+out = {'cid': value.get('cid'), 'version': value.get('version'), 'node_id': value.get('node_id'),
+       # The manifest's format tag ("r1fs-default" or "r1fs-set-v1") and the MAC's form.
+       'encryption': (value.get('manifest') or {}).get('encryption'), 'mac': form} if isinstance(value, dict) else None
 print('RECORD ' + json.dumps({'record': out, 'age_s': round(time.time() - os.path.getmtime(path), 1) if os.path.exists(path) else None}))
 '''
 
@@ -764,7 +776,7 @@ def _cid_lines(text, cids, markers):
 
 
 def sync_check(manifest, provider, consumers, key, image, publishes=1, path='/data/payload.txt', within=150,
-               timeout=900, poll=10, refusing=None):
+               timeout=900, poll=10, refusing=None, encryption=None):
   """
   Wait until every consumer of a sync set applied the provider's latest archive and every refusing
   consumer refused it, then measure the set.
@@ -797,11 +809,16 @@ def sync_check(manifest, provider, consumers, key, image, publishes=1, path='/da
     refusal line for the latest record (one of its refusal lines holding the text, when the text is not
     empty), no R1FS fetch line and no download folder for any of the set's CIDs, nothing applied, and its
     file unchanged and unlike the provider's.
+  encryption : str or None
+    The archive format tag the latest record must carry on every oracle replica that holds it:
+    ``r1fs-set-v1`` (a set with a secret: the record must also carry a 64-hex ``mac``) or ``r1fs-default``
+    (a shared-key set: no ``mac``); None does not check the format.
 
   Returns
   -------
   dict
-    Per publish: cid, the oracles whose replica holds the record, and each consumer's delay; per consumer:
+    Per publish: cid, the format tag the provider published it with, and each consumer's delay; the oracles
+    whose replica holds the latest record and that record's (format tag, MAC form) per oracle; per consumer:
     archives applied, quarantine files and refusal log lines of this set; per refusing consumer: the CIDs
     and reasons it refused, its fetch lines, downloads and applies; the file on every node; ``failures`` (a
     list of reasons, empty when the set passed) and ``ok``.
@@ -860,8 +877,9 @@ def sync_check(manifest, provider, consumers, key, image, publishes=1, path='/da
       hits = [item['applied_timestamp'] for item in cons[name]['received'] if item['cid'] in later]
       # The first such apply, counted from the publish; None when it never happened.
       delays[name] = round(min(hits) - entry['published_timestamp'], 1) if hits else None
-    # The publish with its delays.
-    rows.append({'cid': entry['cid'], 'published': entry['published_timestamp'], 'delay_s': delays})
+    # The publish with its format tag (from the provider's sent history) and its delays.
+    rows.append({'cid': entry['cid'], 'published': entry['published_timestamp'], 'encryption': entry.get('encryption'),
+                 'delay_s': delays})
   # The archive every node should hold at the end.
   latest = sent[-1]['cid'] if sent else None
   # Each oracle whose saved replica points the set at the latest archive.
@@ -894,6 +912,13 @@ def sync_check(manifest, provider, consumers, key, image, publishes=1, path='/da
   if latest and not holding:
     # The record never reached a replica that was saved.
     failures.append('no oracle replica holds the latest record')
+  # The form each holding replica gives the latest record: its format tag and the form of its MAC.
+  forms = {name: (records[name]['record'].get('encryption'), records[name]['record'].get('mac')) for name in holding}
+  # A set with a secret publishes its tag with a 64-hex MAC; a shared-key set its tag with no MAC.
+  wanted = (encryption, 'hex64' if encryption == 'r1fs-set-v1' else None)
+  if encryption and any(form != wanted for form in forms.values()):
+    # The record is not in the format the code under test must publish.
+    failures.append('latest record (format, mac) on the oracles {} instead of {}'.format(forms, wanted))
   # Each publish.
   for row in rows:
     # Each consumer's delay for it.
@@ -959,6 +984,8 @@ def sync_check(manifest, provider, consumers, key, image, publishes=1, path='/da
   return {
     'key': key, 'provider': provider, 'consumers': list(consumers), 'waited_s': round(time.time() - started, 1),
     'publishes': rows, 'record_on_oracles': '{}/{}'.format(len(holding), len(oracles)), 'records': records,
+    # The latest record's (format tag, MAC form) per holding oracle, and the expected tag (None: not checked).
+    'record_forms': forms, 'encryption': encryption,
     # The refusing consumers' evidence beside the consumers' counts.
     'consumers_state': per_consumer, 'refusing': per_refusing, 'files': files, 'failures': failures, 'ok': not failures,
   }
@@ -988,10 +1015,13 @@ def sync_text(report):
     report['key'], report['provider'], ', '.join(report['consumers']), report['waited_s'])]
   # One line per publish.
   for row in report['publishes']:
-    # The archive and each consumer's delay.
-    lines.append('  publish {} delay to consumers {}'.format(row['cid'], row['delay_s']))
+    # The archive, its format tag and each consumer's delay.
+    lines.append('  publish {} ({}) delay to consumers {}'.format(row['cid'], row.get('encryption'), row['delay_s']))
   # How many oracle replicas point at the latest archive.
   lines.append('  chain-store record on oracles holding the latest archive: {}'.format(report['record_on_oracles']))
+  # Its format tag and MAC form, as each holding oracle keeps it (the MAC value is never read out).
+  lines.append('  latest record (format, mac) per oracle: {} (expected format {})'.format(
+    report['record_forms'], report['encryption']))
   # One line per consumer.
   for name, item in report['consumers_state'].items():
     # Applies and refusals.

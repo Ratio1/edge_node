@@ -25,8 +25,9 @@ image     load an image of this machine into the Docker daemon of nodes: image, 
 isolation prove that nodes running Docker and their inner containers reach nothing public:
           image, nodes; a node that does fails the scenario
 sync      check a container-sync set: key, provider, consumers, image, publishes, within,
-          timeout, name, refusing ({node: text} of consumers that must refuse); writes
-          sync_<name>.json and .txt, and a FAIL fails the scenario
+          timeout, name, refusing ({node: text} of consumers that must refuse), encryption
+          (format tag the latest record must carry); writes sync_<name>.json and .txt, and a
+          FAIL fails the scenario
 switch    recreate one node on another staged source tree (rolling update, rollback):
           node, arm, kill
 custody   check that a job's stored copy holds the dAuth placeholder, not the set's secret,
@@ -246,7 +247,9 @@ def _steps(home, spec, manifest, out, phase, note, close_phase):
                                  # The delay bound and the wait, as before.
                                  within=step.get('within', 150), timeout=step.get('timeout', 900),
                                  # None when the step names no refusing consumer.
-                                 refusing=step.get('refusing'))
+                                 refusing=step.get('refusing'),
+                                 # The latest record's expected format tag; None when the step names none.
+                                 encryption=step.get('encryption'))
       # The full report, kept with the run.
       (out / 'sync_{}.json'.format(label)).write_text(json.dumps(report, indent=1, sort_keys=True))
       # The short summary next to it.

@@ -324,6 +324,76 @@ class TestContainerApps(unittest.TestCase):
     finally:
       apps.sync_state, apps.chain_record, apps.app_file, apps.node_log = saved
 
+  def test_sync_check_fails_a_latest_record_in_another_format(self):
+    """With an expected format, the sync check passes only when every holding oracle keeps the latest record in it: the set tag with a 64-hex mac, or the shared-key tag with none."""
+    from lnlib import apps
+    # One publish of the set tag, as the provider's sent history gives it.
+    sent = [{'cid': 'Qm1', 'published_timestamp': 100.0, 'encryption': 'r1fs-set-v1'}]
+    # The consumer applied it 30 s later.
+    state = {'r1w-01': {'sent': sent, 'received': [], 'quarantine': [], 'downloads': []},
+             'r1w-02': {'sent': [], 'received': [{'cid': 'Qm1', 'applied_timestamp': 130.0}], 'quarantine': [], 'downloads': []}}
+    # The record as the oracle's replica gives it; each case below replaces its tag and mac form.
+    record = {'cid': 'Qm1', 'encryption': 'r1fs-set-v1', 'mac': 'hex64'}
+    # The real node reads, put back at the end.
+    saved = (apps.sync_state, apps.chain_record, apps.app_file, apps.node_log)
+    # Node reads replaced by the fixed state above.
+    apps.sync_state = lambda name, key: state[name]
+    # A copy of the record as it stands when the check reads it.
+    apps.chain_record = lambda name, key: {'record': dict(record), 'age_s': 1.0}
+    # Equal files on both nodes.
+    apps.app_file = lambda name, image, key, path: {'container': 'c', 'text': 'payload 1\n', 'sha256': 'd1'}
+    # No refusal lines anywhere.
+    apps.node_log = lambda name: ''
+    # One oracle and the provider's worker.
+    manifest = {'nodes': [{'name': 'r1s-01', 'role': 'seed'}, {'name': 'r1w-01', 'role': 'worker'}]}
+
+    def check(encryption):
+      """
+      Run the sync check on the fixed set with one expected format, on the record as it stands.
+
+      Parameters
+      ----------
+      encryption : str or None
+        The format tag the latest record must carry, or None for no format check.
+
+      Returns
+      -------
+      tuple
+        The verdict (bool) and the whole report (dict).
+
+      Examples
+      --------
+      >>> check('r1fs-set-v1')[0]
+      True
+      """
+      # The set's one publish, checked against the expected format.
+      report = apps.sync_check(manifest, 'r1w-01', ['r1w-02'], 'k', 'img', timeout=0, poll=0, encryption=encryption)
+      return report['ok'], report
+
+    try:
+      # The set tag with a 64-hex mac passes.
+      ok, report = check('r1fs-set-v1')
+      self.assertTrue(ok, report['failures'])
+      # The report names the record's form per oracle and the publish's tag.
+      self.assertEqual(report['record_forms'], {'r1s-01': ('r1fs-set-v1', 'hex64')})
+      self.assertEqual(report['publishes'][0]['encryption'], 'r1fs-set-v1')
+      # The set tag with a missing or malformed mac fails, and so does the shared-key tag.
+      for tag, mac in (('r1fs-set-v1', None), ('r1fs-set-v1', 'other'), ('r1fs-default', None)):
+        # This case's record on the oracle.
+        record.update(encryption=tag, mac=mac)
+        self.assertFalse(check('r1fs-set-v1')[0], (tag, mac))
+      # A shared-key record (no mac) passes the shared-key format.
+      record.update(encryption='r1fs-default', mac=None)
+      self.assertTrue(check('r1fs-default')[0])
+      # The shared-key tag with a mac fails it.
+      record.update(mac='hex64')
+      self.assertFalse(check('r1fs-default')[0])
+      # No expected format: the format is reported, not checked.
+      self.assertTrue(check(None)[0])
+    finally:
+      # The real node reads again.
+      apps.sync_state, apps.chain_record, apps.app_file, apps.node_log = saved
+
   def test_sync_app_sends_a_named_secret_through_secret_paths(self):
     """--secret NAME sends the set's 64-hex secret as ENV.R1EN_SYNC_SECRET with the web app's top-level path, and host and generator derive the same value."""
     sys.path.insert(0, str(HERE / 'load'))

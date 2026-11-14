@@ -449,7 +449,7 @@ def cmd_sync(args):
   ----------
   args : argparse.Namespace
     ``key``, ``provider``, ``consumers``, ``refusing`` (``NODE`` or ``NODE=TEXT`` items), ``image``,
-    ``publishes``, ``within``, ``timeout``, ``out``.
+    ``publishes``, ``within``, ``timeout``, ``encryption`` (the latest record's expected format tag), ``out``.
 
   Returns
   -------
@@ -468,7 +468,9 @@ def cmd_sync(args):
   # Waits for the set to converge, then measures it.
   report = applib.sync_check(manifest, args.provider, args.consumers, args.key, args.image, publishes=args.publishes,
                              # The delay bound, the wait, and the consumers that must refuse.
-                             within=args.within, timeout=args.timeout, refusing=refusing)
+                             within=args.within, timeout=args.timeout, refusing=refusing,
+                             # The format tag the latest record must carry (None: not checked).
+                             encryption=args.encryption)
   if args.out:
     # The full report next to the summary, when asked for.
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
@@ -775,6 +777,9 @@ def main():
   one.add_argument('--within', type=float, default=150, help='seconds a consumer may take per publish')
   # How long to wait before measuring anyway.
   one.add_argument('--timeout', type=float, default=900, help='seconds to wait for the set to converge')
+  # The record format the code under test must publish: r1fs-set-v1 (with a 64-hex mac) or r1fs-default (none).
+  one.add_argument('--encryption', choices=('r1fs-default', 'r1fs-set-v1'),
+                   help='format tag the latest record must carry on the oracles (r1fs-set-v1 also needs a 64-hex mac)')
   # The full report as JSON.
   one.add_argument('--out', help='write the full report as JSON to this file')
   # Run by main().
