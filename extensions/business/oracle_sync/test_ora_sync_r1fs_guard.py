@@ -73,6 +73,11 @@ class _Callable:
     -------
     tuple
       The function and its arguments.
+
+    Examples
+    --------
+    >>> _Callable().__reduce__()
+    (<function _record_call at 0x...>, ('called',))
     """
     # A file built from this names the function by module and name.
     return (_record_call, ("called",))
@@ -144,6 +149,13 @@ class _FakeR1fs:
     -------
     str
       Path of the written file.
+
+    Examples
+    --------
+    >>> folder = tempfile.mkdtemp()
+    >>> engine = _FakeR1fs(folder, {CID: pickle.dumps(DATA)})
+    >>> engine.get_file(CID) == os.path.join(folder, CID), engine.fetched
+    (True, ['QmPeerMessageCid'])
     """
     # Record the fetch, which must not happen while R1FS is disabled.
     self.fetched.append(cid)
@@ -309,7 +321,23 @@ class OraSyncR1fsGuardTests(unittest.TestCase):
   """With USE_R1FS off, no file named by a peer message is fetched; with it on, files load as plain data only."""
 
   def setUp(self):
-    """Give each test a folder of its own for the fetched files, removed after it."""
+    """
+    Give each test a folder of its own for the fetched files, removed after it.
+
+    The fake R1FS of each probe writes the files it fetches into this folder;
+    `addCleanup` removes it whatever the test's outcome.
+
+    Returns
+    -------
+    None
+      The folder's path is kept in ``self.folder``.
+
+    Examples
+    --------
+    >>> self.setUp()   # run by unittest before each test
+    >>> os.path.isdir(self.folder)
+    True
+    """
     # The folder, removed when the test ends.
     folder = tempfile.TemporaryDirectory()
     # Remove it whatever the test's outcome.

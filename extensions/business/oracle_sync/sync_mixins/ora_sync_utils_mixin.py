@@ -265,10 +265,14 @@ class _OraSyncUtilsMixin:
       by the SDK's ``get_pickle``, whose restricted loader builds plain data
       only (None, bool, int, float, str, bytes, and lists, tuples, dicts, sets
       and frozensets of these) and refuses a file that names any class or
-      function before anything of it is imported or called. The CID comes from
-      another oracle's message; the full pickle load used before ran whatever
-      the file named. Every file oracle sync writes holds plain data: local
-      and median tables, agreed tables and agreement signatures.
+      function before anything of it is imported or called. Before the load,
+      it also refuses a file that is too large, uses one container in two
+      places, nests too deep or re-uses its values too much, so a few hundred
+      bytes cannot take exponential time or memory when the data is hashed or
+      its signature is checked. The CID comes from another oracle's message;
+      the full pickle load used before ran whatever the file named. Every file
+      oracle sync writes holds plain data: local and median tables, agreed
+      tables and agreement signatures, each container in one place.
 
       When the plugin is configured not to use R1FS (``USE_R1FS`` false), no
       file is fetched or loaded: one log line is written and None is returned,
@@ -292,9 +296,10 @@ class _OraSyncUtilsMixin:
       -----
       Three tries; a try whose fetch, decryption or load fails (it raises) is
       followed by a 3 s pause, and with ``debug`` by a log line that gives the
-      error escaped (its ``repr``) and cut to 200 characters, for a refused
-      file the class or function it names. A file that holds None is tried
-      again at once.
+      error escaped (its ``repr``) and cut to 200 characters. The error names
+      the downloaded file's path before the reason (for a refused file, what
+      it names), so a long path, whose file name the sender chooses, can cut
+      the reason off. A file that holds None is tried again at once.
 
       Examples
       --------
