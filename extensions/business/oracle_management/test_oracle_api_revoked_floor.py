@@ -344,6 +344,11 @@ class EpochEndpointSelfCheckTests(unittest.TestCase):
       "revoked, not eligible": (
         _epoch_plugin(REVOKED_ETH, {**self.history, 527: 0}, stored=7), 530, "served 0, stored 7",
       ),
+      # The same key served a value above the stored one that is not the floor value: only the floor
+      # value itself is accepted, not any value higher than what is stored.
+      "revoked, not eligible, higher value": (
+        _epoch_plugin(REVOKED_ETH, {**self.history, 527: 0, 530: 100}, stored=7), 530, "served 100, stored 7",
+      ),
     }
     # Every case in turn.
     for name, (plugin, epoch, text) in cases.items():
