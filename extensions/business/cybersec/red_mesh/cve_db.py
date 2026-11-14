@@ -914,10 +914,10 @@ def _matches_constraint(version: str, constraint: str, product: str = "") -> boo
 
 
 # Pre-release tags sort BEFORE the release they precede. Ascending rank:
-# dev < alpha < beta < milestone < rc/pre; `a`/`b` are alpha/beta.
+# dev < alpha < beta < milestone < rc/pre/preview/prerelease; `a`/`b` are alpha/beta.
 _PRE_RANK = {
   "dev": 0, "alpha": 1, "a": 1, "beta": 2, "b": 2,
-  "milestone": 3, "m": 3, "rc": 4, "pre": 4,
+  "milestone": 3, "m": 3, "rc": 4, "pre": 4, "preview": 4, "prerelease": 4,
 }
 # Products whose single-letter suffix is a release (openssl 1.0.1f, proftpd
 # 1.3.5b), not a pre-release.
@@ -950,7 +950,7 @@ def _parse_version(version: str, product: str = ""):
   rest = m.group(2).lower()
   tail = (0, 0, 0)
   # `(?![a-z])`: the tag ends there, so `-precise` and `-devel` are not `pre` and `dev`.
-  pre = re.match(r"^[-_.~]?(alpha|beta|rc|pre|dev|milestone|m|a|b)(\d*)(?![a-z])", rest)
+  pre = re.match(r"^[-_.~]?(alpha|beta|rc|prerelease|preview|pre|dev|milestone|m|a|b)(\d*)(?![a-z])", rest)
   if pre:
     tag, num = pre.group(1), pre.group(2)
     # A bare single letter is a release letter, not a pre-release, unless a
