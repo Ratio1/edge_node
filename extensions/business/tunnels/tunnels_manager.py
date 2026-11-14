@@ -212,10 +212,47 @@ class TunnelsManagerPlugin(BasePlugin):
   def get_tcp_route(self, public_port: int):
     """
     Return only the Cloudflare origin hostname for a public TCP proxy port.
+
+    A port with no route, or with a disabled one, is a normal answer and not a fault: the
+    lookup returns a "not found" dictionary, which the web app sends as HTTP 404, and logs one
+    plain line with the port and the caller's address. Raising for it made the web app log a
+    red traceback and answer HTTP 500 for every such lookup.
+
+    Parameters
+    ----------
+    public_port : int
+      The public TCP proxy port to look up.
+
+    Returns
+    -------
+    str or dict
+      The origin hostname of the port's enabled route; or, when there is none,
+      ``{"error": "No TCP route found for port <port>", "status_code": 404}``.
+
+    Raises
+    ------
+    Exception
+      When `public_port` is not a port number (1 to 65535), or when the stored route has no
+      hostname, which is a broken record.
+
+    Notes
+    -----
+    The endpoint takes no token, so the caller's address is the only trace of who asks; it is
+    written to the node log for lookups that find nothing. A lookup that finds a route logs
+    nothing.
+
+    Examples
+    --------
+    >>> self.get_tcp_route(30010)   # a registered port
+    'app-1f0c.example.org'
+    >>> self.get_tcp_route(30007)   # no route
+    {'error': 'No TCP route found for port 30007', 'status_code': 404}
     """
     route = self._get_tcp_route_record(public_port)
     if not route or not route.get("enabled", True):
-      raise Exception(f"No TCP route found for port {public_port}")
+      self.P(f"No TCP route for port {public_port}, asked by {self.get_request_client_ip()}")
+      # Answered, not raised: the web app turns `status_code` into HTTP 404 and logs no traceback.
+      return {"error": f"No TCP route found for port {public_port}", "status_code": 404}
     hostname = route.get("hostname")
     if not hostname:
       raise Exception(f"TCP route for port {public_port} has no hostname")
