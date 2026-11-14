@@ -57,8 +57,16 @@ def _parse_constraint(product, text, cache=None):
   return tuple(clauses)
 
 
+def _merged(rows):
+  """One row for a CVE: the first, `platform_dependent` and `client_side` when any of its rows is."""
+  row = rows[0][1]
+  return row[:6] + (max(r[6] for _, r in rows), max(r[7] for _, r in rows))
+
+
 def _lower_at_or_above(clauses, oldest):
-  """True when the constraint has a lower bound (`>=`, `>`, `==`) at or above `oldest`."""
+  """True when the constraint has a lower bound (`>=`, `>`, `==`) at or above `oldest`; unparsed (None): no."""
+  if clauses is None:
+    return False
   lowers = [target for op, target in clauses if op in (">=", ">", "==")]
   return any(_compare_versions(t, oldest) >= 0 for t in lowers)
 
@@ -84,17 +92,17 @@ class VulndbReader:
     self._vulns = vulns
     self._exact = {}   # (product, normalised numbers, tail) -> [affected row]
     self._ranges = {}  # product -> [(clauses, affected row)]
-    self._rows = {}    # (product, cve_id) -> [(clauses, affected row)], for the end-of-life rules
+    rows_by_cve = {}   # (product, cve_id) -> [clauses or None (unparsed), affected row], for the end-of-life rules
     cache = {}
     for row in rows:
       row = tuple(sys.intern(v) if isinstance(v, str) and i != 2 else v for i, v in enumerate(row))
       clauses = _parse_constraint(row[1], row[2], cache)
+      if row[1] in self.eol:
+        rows_by_cve.setdefault((row[1], row[0]), []).append((clauses, row))
       if clauses is None:
         self.dropped += 1
         continue
       self.row_count += 1
-      if row[1] in self.eol:
-        self._rows.setdefault((row[1], row[0]), []).append((clauses, row))
       if len(clauses) == 1 and clauses[0][0] == "==":
         numbers, tail = clauses[0][1]
         self._exact.setdefault((row[1], _norm(numbers), tail), []).append(row)
@@ -105,7 +113,7 @@ class VulndbReader:
     for product, text in self.eol.items():
       oldest = _parse_version(text, product)
       if oldest is not None:
-        self._eol[product] = (oldest, text, [rows[0][1] for (p, _), rows in self._rows.items()
+        self._eol[product] = (oldest, text, [_merged(rows) for (p, _), rows in rows_by_cve.items()
                                              if p == product and all(_lower_at_or_above(c, oldest) for c, _ in rows)])
 
   def _match(self, row):

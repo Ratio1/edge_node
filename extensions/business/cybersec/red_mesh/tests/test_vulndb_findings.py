@@ -11,6 +11,7 @@ from unittest.mock import patch
 from extensions.business.cybersec.red_mesh import cve_db
 from extensions.business.cybersec.red_mesh.cve_view import build_cve_view
 from extensions.business.cybersec.red_mesh.findings import _finding_to_jsonable
+from extensions.business.cybersec.red_mesh.mixins.report import _dedup_finding_list
 from extensions.business.cybersec.red_mesh.mixins.redmesh_llm_agent import _RedMeshLlmAgentMixin
 from extensions.business.cybersec.red_mesh.mixins.report import _dedup_finding_list
 from extensions.business.cybersec.red_mesh.vulndb.reader import load_vulndb
@@ -35,6 +36,11 @@ ROWS = [
   ("CVE-2030-0012", "oldprod", ">=1.0,<1.8", "nvd", "firm", "nvd_range", 0, 0),
   ("CVE-2030-0013", "oldprod", ">=2.2,<2.5", "nvd", "firm", "nvd_range", 0, 0),
   ("CVE-2030-0013", "oldprod", "<1.2", "cna", "tentative", "cna_range", 0, 0),  # a row with no supported-line start
+  ("CVE-2030-0014", "oldprod", "==2.3", "nvd", "tentative", "nvd_exact", 0, 0),  # `==` is a lower bound
+  ("CVE-2030-0015", "oldprod", ">=2.5,<3", "nvd", "firm", "nvd_range", 0, 0),
+  ("CVE-2030-0015", "oldprod", "<bogus", "nvd", "firm", "nvd_range", 0, 0),  # unparsed: counts as no lower bound
+  ("CVE-2030-0016", "oldprod", ">=2.6,<3", "nvd", "firm", "nvd_range", 0, 0),
+  ("CVE-2030-0016", "oldprod", ">=2.7,<3", "nvd", "firm", "nvd_range", 1, 1),  # any row flags the merged one
 ]
 
 
@@ -145,8 +151,12 @@ class FindingFieldTests(unittest.TestCase):
     self.use()
     found = cve_db.check_cves("oldprod", "1.5")
     cves = {f.cve[0]: f for f in found if f.cve}
-    self.assertEqual(sorted(cves), ["CVE-2030-0010", "CVE-2030-0011", "CVE-2030-0012"])  # 0013 has a row with no supported-line start
+    self.assertEqual(sorted(cves), ["CVE-2030-0010", "CVE-2030-0011", "CVE-2030-0012", "CVE-2030-0014"])
+    # not 0013 (a row with no supported-line start), not 0015 (unparsed row); 0016 is client side (merged flag)
     self.assertEqual((cves["CVE-2030-0010"].confidence, cves["CVE-2030-0010"].confidence_reason), ("tentative", "eol_unassessed"))
+    self.assertEqual(cves["CVE-2030-0014"].confidence_reason, "eol_unassessed")
+    client = cve_db.check_cves("oldprod", "1.5", applicability=cve_db.CLIENT_APPLICABILITY)
+    self.assertEqual([f for f in client if not f.cve], [])  # no unsupported finding for the client component
     self.assertEqual(cves["CVE-2030-0011"].confidence_reason, "nvd_range")  # matched by range, no lower bound
     self.assertEqual(cves["CVE-2030-0012"].confidence, "firm")
     unsupported = [f for f in found if not f.cve]
@@ -155,6 +165,35 @@ class FindingFieldTests(unittest.TestCase):
     self.assertEqual(unsupported[0].tags, ("vulndb_eol", "oldprod"))
     again = cve_db.check_cves("oldprod", "1.5")
     self.assertEqual([f.finding_id for f in again if not f.cve], [unsupported[0].finding_id])
+
+  def test_the_merged_eol_row_is_flagged_when_any_row_is(self):
+    reader = self.use()
+    merged = next(m for m in reader.query("oldprod", "1.5") if m.cve_id == "CVE-2030-0016")
+    self.assertEqual((merged.platform_dependent, merged.client_side, merged.reason), (1, 1, "eol_unassessed"))
+
+  def test_two_unsupported_findings_on_one_port_collapse(self):
+    self.use()
+    eol = [_finding_to_jsonable(f) for f in cve_db.check_cves("oldprod", "1.5") if not f.cve][0]
+    self.assertEqual(len(_dedup_finding_list([dict(eol), dict(eol, vulndb_build_id="vulndb-other")])), 1)
+
+  def test_the_live_llm_payload_carries_the_view_under_generated_only(self):
+    class Host(_RedMeshLlmAgentMixin):
+      cfg_llm_agent = {"ENABLED": True, "TIMEOUT": 5, "AUTO_ANALYSIS_TYPE": "security_assessment"}
+    base = {"severity": "HIGH", "port": 80, "vulndb_build_id": "b", "confidence": "firm", "title": "t", "evidence": "e",
+            "description": "apache 1.5 is vulnerable to CVE-2030-1. x", "cvss": []}
+    findings = [dict(base, finding_id="a", cve=["CVE-2030-1"], kev=True, finding_signature="s1", title="CVE-2030-1: x"),
+                dict(base, finding_id="b", cve=["CVE-2030-2"], kev=False, finding_signature="s2", title="CVE-2030-2: y")]
+    def payload(items):
+      report = {"nr_open_ports": 1, "ports_scanned": 1, "open_ports": [80], "correlation_findings": items}
+      return Host()._build_llm_analysis_payload("j", report, {"scan_type": "network", "target": "t"}, "security_assessment")
+    generated = payload(findings)
+    self.assertEqual(generated["cve_view"]["counts"]["rolled_up"], 1)
+    self.assertEqual(generated["cve_view"]["rollups"][0]["cve_count"], 1)
+    self.assertEqual(generated["findings_summary"]["by_severity"], {"HIGH": 2})  # raw
+    self.assertEqual(generated["findings_summary"]["cve_view_counts"]["listed"], 1)
+    static = payload([dict(f, vulndb_build_id=None) for f in findings])
+    self.assertNotIn("cve_view", static)
+    self.assertNotIn("cve_view_counts", static["findings_summary"])
 
   def test_the_view_names_the_unsupported_finding_outside_raw(self):
     eol = {"finding_id": "eol1", "port": 80, "vulndb_build_id": "b", "tags": ["vulndb_eol", "apache"]}
