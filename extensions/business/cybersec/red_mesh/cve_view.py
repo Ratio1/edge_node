@@ -171,3 +171,26 @@ def build_cve_view(findings, not_applicable=(), triage=None, now=None):
     "services": services,
     "counts": {"raw": len(items) + dropped, **totals, "closed": closed, "dropped": dropped},
   }
+
+
+def view_members(view):
+  """`(listed ids, ids folded into a rollup or a possible row)` of a view."""
+  listed, folded = set(), set()
+  for service in view["services"]:
+    listed.update(service["listed"])
+    folded.update((service["rollup"] or {}).get("member_finding_ids", ()))
+    folded.update((service["possible"] or {}).get("member_finding_ids", ()))
+  return listed, folded
+
+
+def filter_listed(findings, not_applicable=()):
+  """`findings` without the generated CVE findings the view folds into a rollup or a possible row.
+
+  For the surfaces that show listed findings only (`top_findings`, the LLM input). Without a view, unchanged.
+  """
+  view = build_cve_view(findings, not_applicable)
+  if view is None:
+    return list(findings)
+  listed, folded = view_members(view)
+  hidden = folded - listed
+  return [f for f in findings if not (is_view_finding(f) and f.get("finding_id") in hidden)]

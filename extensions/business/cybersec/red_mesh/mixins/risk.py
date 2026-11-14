@@ -21,6 +21,7 @@ from ..models.finding_identity import (
   dedup_key as _dedup_key,
   parse_cwe_list as _parse_cwe_list,
 )
+from ..cve_view import build_cve_view, is_view_finding, view_members
 from ..constants import (
   RISK_SEVERITY_WEIGHTS,
   RISK_CONFIDENCE_MULTIPLIERS,
@@ -507,7 +508,23 @@ class _RiskScoringMixin:
     finding_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
     coverage_counts = {status: 0 for status in COVERAGE_STATUSES}
     cred_count = 0
-    for f in flat_findings:
+    # RM-169, generated CVE findings only (`static` has no view): findings folded into a rollup or a possible row
+    # leave the walk. A rollup scores once, as its highest-severity member (that member's confidence); possible
+    # findings add 0. Non-CVE tentative findings keep the 0.5 multiplier.
+    cve_view = build_cve_view(flat_findings, (aggregated_report.get("cves_not_applicable") or {}).values())
+    scored = flat_findings
+    if cve_view:
+      listed_ids, folded_ids = view_members(cve_view)
+      by_id = {f["finding_id"]: f for f in flat_findings if is_view_finding(f) and f.get("finding_id")}
+      rollup_tops = [
+        max((by_id[i] for i in service["rollup"]["member_finding_ids"]),
+            key=lambda m: (SEVERITY_RANK.get(str(m.get("severity")).upper(), 0),
+                           CONFIDENCE_RANK.get(str(m.get("confidence")).lower(), 0)))
+        for service in cve_view["services"] if service["rollup"]
+      ]
+      scored = [f for f in flat_findings
+                if not (is_view_finding(f) and f.get("finding_id") in folded_ids - listed_ids)] + rollup_tops
+    for f in scored:
       if _is_coverage_result(f):
         status = str(f.get("status") or "").lower()
         coverage_counts[status] = coverage_counts.get(status, 0) + 1
@@ -604,6 +621,9 @@ class _RiskScoringMixin:
         },
       },
     }
+    if cve_view:
+      risk_result["breakdown"]["possible_cves"] = cve_view["counts"]["possible"]
+      risk_result["breakdown"]["cve_view_counts"] = dict(cve_view["counts"])
     return risk_result, flat_findings
 
   def _count_services(self, service_info):

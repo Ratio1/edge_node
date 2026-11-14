@@ -5,7 +5,9 @@ import unittest
 
 from extensions.business.cybersec.red_mesh import cve_db
 from extensions.business.cybersec.red_mesh.findings import _finding_to_jsonable
-from extensions.business.cybersec.red_mesh.cve_view import build_cve_view
+from extensions.business.cybersec.red_mesh.cve_view import build_cve_view, filter_listed
+from extensions.business.cybersec.red_mesh.llm_input_builder import _sanitize_finding
+from extensions.business.cybersec.red_mesh.mixins.risk import _RiskScoringMixin
 from extensions.business.cybersec.red_mesh.vulndb.reader import load_vulndb
 
 from .test_vulndb_findings import CVE, build
@@ -170,6 +172,71 @@ class CveViewTests(unittest.TestCase):
     self.assertEqual((service["product"], service["version"]), ("openssh", "4.0"))
     self.assertEqual(service["rollup"]["fix_version"], "9.8")  # the matched `<9.8` row of the tiny database
     self.assertEqual(CVE, generated[0].cve[0])
+
+
+class _Host(_RiskScoringMixin):
+  pass
+
+
+def raw(n, severity="HIGH", **kw):
+  """`fnd` plus the fields a probe finding carries into the risk walk."""
+  f = fnd(n, **kw)
+  f.update(severity=severity, title="CVE-2030-%04d: t (apache 1.5)" % n, probe="p", category="x", finding_signature="s%d" % n)
+  return f
+
+
+def risk_of(findings, extra=None):
+  report = {"target": "t", "port_protocols": {"80": "http"},
+            "service_info": {"80": {"_service_info_http": {"findings": findings}}}, **(extra or {})}
+  return _Host()._compute_risk_and_findings(report)[0]["breakdown"]
+
+
+class RiskAndConsumerTests(unittest.TestCase):
+  def test_tentative_cve_adds_zero_under_generated_but_half_under_static(self):
+    tentative = dict(raw(1, "CRITICAL", confidence="tentative", reason="banner_only"))
+    generated = risk_of([tentative])
+    self.assertEqual((generated["findings_score"], generated["finding_counts"]["CRITICAL"], generated["possible_cves"]), (0.0, 0, 1))
+    static = risk_of([dict(tentative, vulndb_build_id=None)])
+    self.assertGreater(static["findings_score"], 0)
+    self.assertEqual(static["finding_counts"]["CRITICAL"], 1)
+    self.assertNotIn("possible_cves", static)
+
+  def test_non_cve_tentative_keeps_its_multiplier(self):
+    probe = {"severity": "HIGH", "title": "weak thing", "probe": "p", "category": "x", "confidence": "tentative",
+             "finding_signature": "z1"}
+    plain = risk_of([probe])["findings_score"]
+    mixed = risk_of([probe, dict(raw(1, confidence="tentative"))])
+    self.assertEqual(mixed["findings_score"], plain)
+    self.assertEqual(mixed["finding_counts"]["HIGH"], 1)
+
+  def test_a_rollup_scores_once_at_its_highest_member_severity(self):
+    one = risk_of([raw(1, "CRITICAL", score=5.0)])
+    many = risk_of([raw(1, "CRITICAL", score=5.0), raw(2, "LOW", score=5.0), raw(3, "MEDIUM", score=5.0)])
+    self.assertEqual(many["findings_score"], one["findings_score"])
+    self.assertEqual(many["finding_counts"], one["finding_counts"])
+    listed = risk_of([raw(1, "CRITICAL", score=5.0), raw(2, "LOW")])  # one listed, one rollup
+    self.assertEqual(listed["finding_counts"]["LOW"], 1)
+    self.assertEqual(listed["cve_view_counts"]["listed"], 1)
+
+  def test_dropped_records_reach_the_counts(self):
+    breakdown = risk_of([raw(1)], {"cves_not_applicable": {"80/CVE-2030-0099": {}}})
+    counts = breakdown["cve_view_counts"]
+    self.assertEqual((counts["dropped"], counts["raw"]), (1, 2))
+
+  def test_filter_listed_hides_folded_findings_only(self):
+    plain = {"finding_id": "n1", "title": "x"}
+    findings = [raw(1, kev=True), raw(2, score=5.0), raw(3, confidence="tentative"), plain, raw(4, build_id=None)]
+    kept = [f["finding_id"] for f in filter_listed(findings)]
+    self.assertEqual(kept, ["id0001", "n1", "id0004"])
+    self.assertEqual(filter_listed([plain, raw(4, build_id=None)]), [plain, raw(4, build_id=None)])
+
+  def test_llm_kev_follows_the_generated_tri_state(self):
+    out = lambda **kw: _sanitize_finding(dict(raw(1), cvss_data_freshness="", **kw))
+    self.assertEqual((out(kev=True)["kev"], out(kev=True)["kev_evaluated"]), (True, True))
+    self.assertEqual((out(kev=False)["kev"], out(kev=False)["kev_evaluated"]), (False, True))
+    self.assertEqual((out(kev=None)["kev"], out(kev=None)["kev_evaluated"]), (None, False))
+    static = _sanitize_finding(dict(raw(1, build_id=None), kev=False, cvss_data_freshness=""))
+    self.assertEqual((static["kev"], static["kev_evaluated"]), (None, False))
 
 
 if __name__ == "__main__":
