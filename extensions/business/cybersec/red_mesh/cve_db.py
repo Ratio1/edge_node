@@ -936,7 +936,8 @@ def _parse_version(version: str, product: str = ""):
   numbers = [int(x) for x in m.group(1).split(".")]
   rest = m.group(2).lower()
   tail = (0, 0, 0)
-  pre = re.match(r"^[-_.~]?(alpha|beta|rc|pre|dev|milestone|m|a|b)(\d*)", rest)
+  # `(?![a-z])`: the tag ends there, so `-precise` and `-devel` are not `pre` and `dev`.
+  pre = re.match(r"^[-_.~]?(alpha|beta|rc|pre|dev|milestone|m|a|b)(\d*)(?![a-z])", rest)
   if pre:
     tag, num = pre.group(1), pre.group(2)
     # A bare single letter is a release letter, not a pre-release, unless a
