@@ -138,11 +138,13 @@ oracles that run it.
   at `ENV.R1EN_SYNC_SECRET` and not the secret) and the app's `/data/secret_len`.
 - `scan NAME` searches every node's log and cache folder (logs, plugin data, the apps' mounted volumes,
   downloads, store files) for the secret, its SHA-256 (the archive key), that key's first 16 bytes and
-  the record MAC subkey; dAuth's bundle records in the chain store are reported apart. It prints kinds
+  the record MAC subkey; dAuth's bundle records in the chain store (`DAUTH_JOB_SECRETS`,
+  `DAUTH_JOB_SECRET_REVISIONS`) are reported apart. It prints kinds
   and paths only.
 - More app workers: `--workers 6 --docker-nodes r1w-01,...,r1w-06` (about 0.7 GB each). Deeploy on two
-  seeds: add `--web-of r1s-02=DAUTH_MANAGER,DEEPLOY_MANAGER_API`; `load run deeploy -- --api
-  http://172.31.90.52:31302 ...` sends a request to r1s-02 alone (seed n is `172.31.90.5n`).
+  seeds: add `--web-of r1s-02=DAUTH_MANAGER,DEEPLOY_MANAGER_API`; `load --tag run run deeploy --
+  --api http://172.31.90.52:31302 ...` sends a request to r1s-02 alone (seed n is `172.31.90.5n`), with
+  the wallet of the scenarios' `run` steps. `switch` of a seed returns once its dAuth answers.
 - `switch <node> <tree> [--kill]` recreates one node on another staged tree with the same identity,
   data and inner Docker data: one step of a rolling update or of a rollback. By default the node is
   stopped the way an update stops it (SIGTERM and the grace period).

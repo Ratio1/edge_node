@@ -436,7 +436,7 @@ class TestContainerApps(unittest.TestCase):
     self.assertEqual(needles['mac_subkey'], hmac.new(secret.encode(), b'r1en-volume-sync-record-v1', hashlib.sha256).hexdigest())
     with tempfile.TemporaryDirectory() as tmp:
       # A cache folder as a node keeps it: a log with the archive key, a clean data file, a loop image holding
-      # the secret (skipped), and a chain-store replica with a dAuth bundle record and another record.
+      # the secret (skipped), and a chain-store replica with dAuth bundle records and another record.
       for folder in ('_logs', '_data/app/fixed_volumes/images', '_data/cache'):
         os.makedirs(os.path.join(tmp, folder))
       Path(tmp, '_logs', 'node.txt').write_text('loaded key ' + needles['archive_key'] + '\n')
@@ -444,7 +444,10 @@ class TestContainerApps(unittest.TestCase):
       Path(tmp, '_data', 'app', 'fixed_volumes', 'images', 'data.img').write_text(secret)
       # The replica's record names: "hs:" + 10 hex characters of the hash name's SHA-256 + ":" + the field.
       dauth = 'hs:{}:MzAwMQ=='.format(hashlib.sha256(b'DAUTH_JOB_SECRETS').hexdigest()[:10])
-      store = {dauth: {'value': {'job_secrets': secret}}, 'hs:0123456789:eA==': {'value': {'m': needles['mac_subkey']}}}
+      # dAuth also keeps the bundle per revision, in a second hash.
+      revision = 'hs:{}:MzAwMXxvcDpkZXBsb3k='.format(hashlib.sha256(b'DAUTH_JOB_SECRET_REVISIONS').hexdigest()[:10])
+      store = {dauth: {'value': {'job_secrets': secret}}, revision: {'value': {'job_secrets': secret}},
+               'hs:0123456789:eA==': {'value': {'m': needles['mac_subkey']}}}
       Path(tmp, '_data', 'cache', 'object.pickle').write_bytes(pickle.dumps(store))
       # The reader as it runs in a node, pointed at this folder, with its values in front.
       code = apps._with_values(apps.SCAN_READER.replace("'/edge_node/_local_cache'", repr(tmp)), NEEDLES=needles,
@@ -452,7 +455,7 @@ class TestContainerApps(unittest.TestCase):
       out = subprocess.run([sys.executable, '-I', '-'], input=code, capture_output=True, text=True, timeout=60).stdout
     found = apps._tagged(out, 'SCAN')
     # The log (archive key and its 16-byte prefix) and the replica's non-dAuth record (subkey) are hits; the
-    # loop image is not read; the dAuth bundle record is reported apart.
+    # loop image is not read; the dAuth bundle records (both hashes) are reported apart.
     self.assertEqual({os.path.basename(hit['path']): hit['kinds'] for hit in found['hits']},
                      {'node.txt': ['archive_key', 'archive_key_16'], 'object.pickle': ['mac_subkey']})
     self.assertEqual(found['dauth_bundle_kinds'], ['secret'])

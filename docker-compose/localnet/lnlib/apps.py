@@ -166,15 +166,16 @@ print('CUSTODY ' + json.dumps({'pointer': type(pointer).__name__ if pointer else
 # volumes, R1FS downloads, store files), read as bytes and searched for each form of the secret (NEEDLES,
 # kind -> text, put in front by the caller through stdin). Loop-device image files are skipped: their
 # content is read through their mounts. A file removed while the scan runs (a temporary file) is skipped.
-# The chain-store replica is searched record by record, and the records of DAUTH_JOB_SECRETS, where dAuth
-# keeps the bundles it serves, are counted apart.
+# The chain-store replica is searched record by record, and the records of DAUTH_JOB_SECRETS and
+# DAUTH_JOB_SECRET_REVISIONS, where dAuth keeps the bundles it serves (current and per revision), are counted
+# apart.
 SCAN_READER = r'''
 # Standard library only (-I).
 import hashlib, json, os, pickle
 # The node's whole cache folder.
 root = '/edge_node/_local_cache'
-# The record-name prefix of the DAUTH_JOB_SECRETS hash in the replica.
-dauth = 'hs:{}:'.format(hashlib.sha256(b'DAUTH_JOB_SECRETS').hexdigest()[:10])
+# The record-name prefixes of dAuth's two bundle hashes in the replica (current bundle, bundle per revision).
+dauth = tuple('hs:{}:'.format(hashlib.sha256(name).hexdigest()[:10]) for name in (b'DAUTH_JOB_SECRETS', b'DAUTH_JOB_SECRET_REVISIONS'))
 def kinds(blob):
   # The kinds whose text occurs in the bytes.
   return sorted(kind for kind, needle in NEEDLES.items() if needle.encode() in blob)
@@ -1176,8 +1177,8 @@ def scan(manifest, secret):
 
   Each node's log (``docker logs``) and every file of its cache folder (logs, plugin data, the apps'
   mounted system and data volumes, R1FS downloads, store files) are searched for each form of
-  ``sync_needles``. In the chain-store replica, the records of DAUTH_JOB_SECRETS, where dAuth keeps the
-  bundles it serves, are reported apart and are no failure.
+  ``sync_needles``. In the chain-store replica, the records of DAUTH_JOB_SECRETS and
+  DAUTH_JOB_SECRET_REVISIONS, where dAuth keeps the bundles it serves, are reported apart and are no failure.
 
   Parameters
   ----------

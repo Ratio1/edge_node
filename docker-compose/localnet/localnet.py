@@ -553,7 +553,9 @@ def cmd_switch(args):
 
   The node's container is recreated on the other tree with the same identity, data volume and, for a
   node that runs Docker, the same inner Docker data. By default it is stopped as an update stops it
-  (SIGTERM, then the grace period); ``--kill`` ends it at once.
+  (SIGTERM, then the grace period); ``--kill`` ends it at once. A seed is back only once its dAuth
+  answers, as ``up`` waits for it: its web plugins start some seconds after its broker connection, and a
+  request sent to it in between is refused.
 
   Parameters
   ----------
@@ -563,12 +565,12 @@ def cmd_switch(args):
   Returns
   -------
   int
-    0 once the node reports the new tree and is connected.
+    0 once the node reports the new tree and is connected (a seed: and its dAuth answers).
 
   Raises
   ------
   LocalnetError
-    Unknown node or tree, or the node did not come back in time.
+    Unknown node or tree, or the node (a seed: its dAuth) did not come back in time.
 
   Examples
   --------
@@ -606,6 +608,11 @@ def cmd_switch(args):
   compose(home, 'up', '-d', '--no-deps', '--no-color', args.node, timeout=600)
   # Back when the node reports the new tree and its broker connection.
   took = applib.wait_source(args.node, rev_file.read_text().strip(), started, timeout=args.timeout)
+  if node['role'] == 'seed':
+    # A seed's web plugins (dAuth, Deeploy) answer some seconds after its broker connection; wait as "up" does.
+    nodelib.wait_dauth(manifest, [args.node])
+    # The time away now runs until dAuth answers.
+    took = round(time.time() - started, 1)
   # Old and new tree, how the node was stopped, and its time away.
   log('{} moved from {} to {} ({}), back on the network after {} s'.format(
     args.node, previous, args.arm, 'killed' if args.kill else 'stopped', took))
