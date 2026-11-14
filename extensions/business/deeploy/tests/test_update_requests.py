@@ -438,7 +438,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(
       prepared_plan["deeploy_specs"][DEEPLOY_KEYS.SERVICE_KIND],
       "cockroachdb",
-      "The first edit of a legacy CockroachDB deployment should persist its resolved service kind.",
+      "The first edit of a legacy R1DB deployment should persist its resolved service kind.",
     )
     self.assertEqual(set(prepared_plan["node_plugins_by_addr"]), set(nodes))
     for node_plugins in prepared_plan["node_plugins_by_addr"].values():
@@ -787,7 +787,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       "kind": "cockroachdb_certificate_regeneration",
       "operation_id": regeneration_id,
       "intent_hash": "intent-a",
-      "label": "CockroachDB certificate regeneration",
+      "label": "R1DB certificate regeneration",
     }
     claim = plugin._claim_managed_update_action("0xOwner", "cockroachdb_422ce92", action)
 

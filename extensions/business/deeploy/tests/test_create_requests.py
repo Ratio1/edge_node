@@ -4,8 +4,11 @@ from collections import defaultdict
 import ipaddress
 import sys
 import types
+from unittest.mock import patch
 
 from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.x509.oid import NameOID
 
 
 for _mod_name in ("torch", "torch.nn", "torch.nn.functional"):
@@ -226,13 +229,26 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       client_hostname="tcp.ratio1.link",
     )
 
+    ca = x509.load_pem_x509_certificate(bundle["0xai_node_a"]["CRDB_CA_CRT"].encode("ascii"))
+    self.assertEqual(ca.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value, "deeploy-r1db-ca")
+    self.assertEqual(ca.issuer, ca.subject)
+    self.assertTrue(ca.extensions.get_extension_for_class(x509.BasicConstraints).value.ca)
+
     for node in ("0xai_node_a", "0xai_node_b"):
       cert = x509.load_pem_x509_certificate(bundle[node]["CRDB_NODE_CRT"].encode("ascii"))
+      self.assertEqual(cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value, "node")
+      self.assertEqual(cert.issuer, ca.subject)
+      ca.public_key().verify(cert.signature, cert.tbs_certificate_bytes, padding.PKCS1v15(), cert.signature_hash_algorithm)
       san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
       self.assertIn("tcp.ratio1.link", san.get_values_for_type(x509.DNSName))
       self.assertIn("roach1", san.get_values_for_type(x509.DNSName))
       self.assertIn("roach2", san.get_values_for_type(x509.DNSName))
       self.assertIn("localhost", san.get_values_for_type(x509.DNSName))
+
+    root_cert = x509.load_pem_x509_certificate(bundle["0xai_node_a"]["CRDB_CLIENT_ROOT_CRT"].encode("ascii"))
+    self.assertEqual(root_cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value, "root")
+    self.assertEqual(root_cert.issuer, ca.subject)
+    ca.public_key().verify(root_cert.signature, root_cert.tbs_certificate_bytes, padding.PKCS1v15(), root_cert.signature_hash_algorithm)
 
     ip_bundle = plugin._generate_cockroachdb_cert_bundle(
       ["0xai_node_a", "0xai_node_b"],
@@ -241,6 +257,28 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     ip_cert = x509.load_pem_x509_certificate(ip_bundle["0xai_node_a"]["CRDB_NODE_CRT"].encode("ascii"))
     ip_san = ip_cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
     self.assertIn(ipaddress.ip_address("127.0.0.2"), ip_san.get_values_for_type(x509.IPAddress))
+
+  def test_r1db_ca_rename_reuses_existing_legacy_certificate_bundle(self):
+    plugin = make_deeploy_plugin()
+    inputs = self._make_cockroachdb_secure_inputs()
+    inputs[DEEPLOY_KEYS.PLUGINS][0]["IMAGE"] = "ghcr.io/ratio1/r1db:stable"
+    nodes = ["0xai_node_a", "0xai_node_b", "0xai_node_c"]
+    make_name = plugin._cockroachdb_name
+
+    # Reproduce an existing, valid chain with the previous CA display name.
+    with patch.object(plugin, "_cockroachdb_name", side_effect=lambda value: make_name(
+      "deeploy-cockroachdb-ca" if value == "deeploy-r1db-ca" else value,
+    )):
+      plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+    original = copy.deepcopy(inputs)
+    ca_pem = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"][nodes[0]]["ENV"]["CRDB_CA_CRT"]
+    ca = x509.load_pem_x509_certificate(ca_pem.encode("ascii"))
+    self.assertEqual(ca.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value, "deeploy-cockroachdb-ca")
+
+    with patch.object(plugin, "_generate_cockroachdb_cert_bundle", side_effect=AssertionError("Unexpected CA rotation")) as generate:
+      plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+    generate.assert_not_called()
+    self.assertEqual(inputs, original)
 
   def test_cockroachdb_secure_config_reuses_hostname_bound_bundle_and_forces_one_generation(self):
     plugin = make_deeploy_plugin()
