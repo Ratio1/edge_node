@@ -69,14 +69,16 @@ def _record_sends(plugin):
   return sends
 
 
-def _stuck_operation(kind="update"):
+def _stuck_operation(kind="update", phase="retiring_previous"):
   """
-  Build a coordinator with one open operation that waits for its previous nodes to stop.
+  Build a coordinator with one open operation whose snapshot does not change by itself.
 
   Parameters
   ----------
   kind : str
     The operation kind, "update" or "delete".
+  phase : str
+    The phase the operation is saved in. The default waits for the previous nodes to stop.
 
   Returns
   -------
@@ -88,8 +90,8 @@ def _stuck_operation(kind="update"):
   plugin = _Coordinator()
   # An update operation, which has previous nodes to stop.
   operation = plugin.operation("update")
-  # The wanted kind, in the phase that waits for the previous nodes, with a deadline that never comes.
-  operation.update(kind=kind, phase="retiring_previous", deadline=10 ** 9)
+  # The wanted kind and phase, with a deadline that never comes.
+  operation.update(kind=kind, phase=phase, deadline=10 ** 9)
   # The first snapshot: signed, written and confirmed at START.
   plugin._save_operation(operation)
   # The sends are recorded only from here, so the first write is not among them.
@@ -133,6 +135,24 @@ class OpenOperationRepairTests(unittest.TestCase):
     self.assertEqual([age for age, _ in sends], list(range(30, 600, 30)) + list(range(1170, 7201, 600)))
     # Every send is the same snapshot.
     self.assertEqual({sequence for _, sequence in sends}, {1})
+
+  def test_longer_wait_applies_in_every_open_phase(self):
+    """The wait depends on the age of the snapshot and not on the phase: every phase but "completed" gets the same send times."""
+    # Every phase the worker handles before "completed".
+    open_phases = (
+      "preparing", "cleaning_up_preparation", "accepted", "retiring_previous", "waiting_for_readiness",
+      "stopping_failed_rollout", "restoring_previous", "finalizing", "finalizing_recovery",
+    )
+    # Each phase in turn.
+    for phase in open_phases:
+      # Each phase reports on its own.
+      with self.subTest(phase=phase):
+        # One operation saved in that phase, whose snapshot never changes again.
+        plugin, operation, sends = _stuck_operation(phase=phase)
+        # Half an hour of worker passes, each one asking for the repair of the same snapshot.
+        _passes(plugin, 1800, lambda: plugin._replicate_operation(operation))
+        # Every 30 s while the snapshot is younger than 600 s, then 600 s after the send before.
+        self.assertEqual([age for age, _ in sends], list(range(30, 600, 30)) + [1170, 1770])
 
   def test_snapshot_just_under_600_s_old_keeps_the_30_s_repair(self):
     """The longer wait starts when the snapshot is 600 s old, not earlier."""
