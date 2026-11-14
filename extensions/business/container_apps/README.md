@@ -366,9 +366,13 @@ modifiable for non-root app images whose fixed-size data volume is app-owned.
 
 Container apps run in the node's own Docker daemon, which the base image entrypoint starts. The node images
 install `docker/daemon.json`, so that daemon keeps its store (images, containers, volumes) in
-`/edge_node/_local_cache/_docker/<Docker major>`, on the folder the host mounts into the node. The store
+`/edge_node/_local_cache/_bin/docker/<Docker major>`, on the folder the host mounts into the node. The store
 survives a node restart: an app starts from the stored image without a pull. On a node started without that
 mount the directory is on the node container's own layer and is lost with that container, as before.
+
+The store holds the environment every app was started with, its layers and its logs. It is under `_bin`
+because the disk API of plugin code refuses that folder (the core's `RESTRICTED_LOCATIONS`), as it refused
+`/var/lib/docker`, the place the store had before. Do not move it to a folder plugins can read or delete.
 
 - **First start on such an image:** the store is empty and every app image is pulled once.
 - **AUTOUPDATE:** an app starts from the stored image. The first update check (`AUTOUPDATE_INTERVAL` after
@@ -385,8 +389,8 @@ mount the directory is on the node container's own layer and is lost with that c
 - **Docker major:** the directory is named after the Docker major that writes it, and each image build stops
   when the base image has another major. The directory name in `docker/daemon.json` and that build check
   change together; the store of the earlier major is then left on the host until it is removed.
-- **Copying a node's `_local_cache`** to another host: leave `_docker` out; it holds only what can be pulled
-  again.
+- **Copying a node's `_local_cache`** to another host: leave `_bin/docker` out; it holds only what can be
+  pulled again.
 
 ---
 

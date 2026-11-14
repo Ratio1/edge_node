@@ -45,6 +45,8 @@ ENV EE_DD=1
 # Keep the store of the inner Docker daemon (images, containers, volumes) in the directory this file names, under
 # the mounted /edge_node/_local_cache, so app images survive a node restart. Before, the store was /var/lib/docker on
 # this container's own layer, deleted at every stop: every app image was pulled again at every start (9-54 s per app).
+# The directory is in the cache's `_bin` folder, which the disk API of plugin code refuses: the store holds every
+# app's environment, layers and logs, and a delete of it would remove every app's image.
 COPY ./docker/daemon.json /etc/docker/daemon.json
 # Fail the build, not a node: dockerd must accept that file, and the store directory is named after the Docker major
 # that writes it. A base image with another major needs a new directory name there and here, so that a node rolled
