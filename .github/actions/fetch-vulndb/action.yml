@@ -1,0 +1,61 @@
+name: Fetch vulndb
+description: >
+  Download the pinned redmesh-vulndb release, verify it, and place it at the fixed
+  path in the workspace. Skips cleanly when no pin.json is committed.
+runs:
+  using: composite
+  steps:
+    - name: Read pin
+      id: pin
+      shell: bash
+      run: |
+        set -euo pipefail
+        pin=extensions/business/cybersec/red_mesh/vulndb/pin.json
+        if [ ! -f "$pin" ]; then
+          echo "No pin.json: skipping vulndb fetch (image falls back to static catalog)"
+          echo "present=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "present=true" >> "$GITHUB_OUTPUT"
+        python3 "${GITHUB_ACTION_PATH}/verify_vulndb.py" pin "$pin" >> "$GITHUB_OUTPUT"
+
+    - name: Download and check sha256
+      if: steps.pin.outputs.present == 'true'
+      shell: bash
+      env:
+        BUILD_ID: ${{ steps.pin.outputs.build_id }}
+        ASSET: ${{ steps.pin.outputs.asset }}
+        SHA256: ${{ steps.pin.outputs.sha256 }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/vulndb"
+        curl --fail --silent --show-error --location --retry 3 \
+          -o "$RUNNER_TEMP/vulndb/$ASSET" \
+          "https://github.com/Ratio1/redmesh-vulndb/releases/download/${BUILD_ID}/${ASSET}"
+        echo "${SHA256}  $RUNNER_TEMP/vulndb/$ASSET" | sha256sum -c -
+
+    - name: Verify release attestation
+      if: steps.pin.outputs.present == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        BUILD_ID: ${{ steps.pin.outputs.build_id }}
+        ASSET: ${{ steps.pin.outputs.asset }}
+      run: |
+        set -euo pipefail
+        command -v gh >/dev/null || { echo "gh is missing" >&2; exit 1; }
+        gh --version
+        gh release verify "$BUILD_ID" --repo Ratio1/redmesh-vulndb
+        gh release verify-asset "$BUILD_ID" "$RUNNER_TEMP/vulndb/$ASSET" --repo Ratio1/redmesh-vulndb
+
+    - name: Decompress, verify, install
+      if: steps.pin.outputs.present == 'true'
+      shell: bash
+      env:
+        ASSET: ${{ steps.pin.outputs.asset }}
+      run: |
+        set -euo pipefail
+        zstd -d -f "$RUNNER_TEMP/vulndb/$ASSET" -o "$RUNNER_TEMP/vulndb/vulndb.sqlite"
+        pin=extensions/business/cybersec/red_mesh/vulndb/pin.json
+        python3 "${GITHUB_ACTION_PATH}/verify_vulndb.py" verify "$pin" "$RUNNER_TEMP/vulndb/vulndb.sqlite"
+        cp "$RUNNER_TEMP/vulndb/vulndb.sqlite" extensions/business/cybersec/red_mesh/vulndb/vulndb.sqlite

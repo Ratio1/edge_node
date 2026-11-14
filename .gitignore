@@ -205,3 +205,6 @@ extensions/business/cybersec/red_mesh/test_results/
 
 # Local SDK state created by the isolated per-node LLM testbed
 .per-node-llm-e2e-sdk-cache/
+
+# Generated vulnerability database (fetched by CI or VULNDB_PATH, never committed)
+extensions/business/cybersec/red_mesh/vulndb/vulndb.sqlite
