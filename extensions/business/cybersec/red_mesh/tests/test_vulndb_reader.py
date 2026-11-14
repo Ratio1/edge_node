@@ -202,16 +202,31 @@ class VulndbReaderTests(unittest.TestCase):
       ("CVE-2022-0001", "apache", "<3.0", "nvd", "firm", "nvd_range", 0, 0),           # whole 2.4.x: unchanged
       ("CVE-2022-0002", "apache", "<2.4.50", "nvd", "firm", "nvd_range", 0, 0),        # 2.4.0 yes, 2.4.999999 no
       ("CVE-2022-0003", "apache", ">=2.4.49,<2.5", "nvd", "firm", "nvd_range", 0, 0),  # high end only
-      ("CVE-2022-0004", "apache", ">=2.4.49,<2.4.51", "nvd", "firm", "nvd_range", 0, 0),  # inside: neither end, dropped
+      ("CVE-2022-0004", "apache", ">=2.4.49,<2.4.51", "nvd", "firm", "nvd_range", 0, 0),  # strictly inside: possible
       ("CVE-2022-0005", "apache", "<2.4", "nvd", "firm", "nvd_range", 0, 0),           # below the prefix: dropped
+      ("CVE-2022-0007", "apache", "==2.4.10", "nvd", "tentative", "nvd_exact", 0, 0),  # an exact version inside: possible
+      ("CVE-2022-0008", "apache", "==2.5.1", "nvd", "tentative", "nvd_exact", 0, 0),   # outside: dropped
+      ("CVE-2022-0009", "apache", ">=2.5,<2.6", "nvd", "firm", "nvd_range", 0, 0),     # outside: dropped
     ]
     self.assertEqual(self._spans("apache", "2.4", rows), {
       "CVE-2022-0001": ("firm", "nvd_range"),
       "CVE-2022-0002": ("tentative", "inferred_version"),
       "CVE-2022-0003": ("tentative", "inferred_version"),
+      "CVE-2022-0004": ("tentative", "inferred_version"),
+      "CVE-2022-0007": ("tentative", "inferred_version"),
     })
     self.assertEqual(sorted(self._spans("apache", "2.4.0", rows)), ["CVE-2022-0001", "CVE-2022-0002"])  # full precision
     self.assertEqual(sorted(self._spans("apache", "2.4.60", rows)), ["CVE-2022-0001", "CVE-2022-0003"])
+
+  def test_wordpress_two_part_banner_is_a_full_version(self):
+    rows = [("CVE-2022-0014", "wordpress", "<6.4.2", "nvd", "firm", "nvd_range", 0, 0)]
+    self.assertEqual(self._spans("wordpress", "6.4", rows), {"CVE-2022-0014": ("firm", "nvd_range")})  # x.y.0 ships as x.y
+    self.assertEqual(self._spans("wordpress", "6", rows), {"CVE-2022-0014": ("tentative", "inferred_version")})  # `6` is a prefix
+    self.assertEqual(self._spans("wordpress", "6.4.2", rows), {})
+
+  def test_libssh_three_part_banner_is_truncated_at_two_parts(self):
+    rows = [("CVE-2022-0015", "libssh", "<0.8.4", "nvd", "firm", "nvd_range", 0, 0)]
+    self.assertEqual(self._spans("libssh", "0.8", rows), {"CVE-2022-0015": ("tentative", "inferred_version")})
 
   def test_two_part_products_are_not_truncated_at_two_parts(self):
     rows = [("CVE-2022-0006", "openssh", "<9.0", "nvd", "firm", "nvd_range", 0, 0)]
@@ -223,12 +238,14 @@ class VulndbReaderTests(unittest.TestCase):
       ("CVE-2022-0011", "openssl", ">=1.0.1a,<1.0.1u", "nvd", "firm", "nvd_range", 0, 0),  # starts inside the span
       ("CVE-2022-0012", "openssl", "<=1.0.1s", "nvd", "firm", "nvd_range", 0, 0),
       ("CVE-2022-0013", "openssl", ">=1.0.1g,<1.0.1u", "nvd", "firm", "nvd_range", 0, 0),
+      ("CVE-2022-0016", "openssl", "==1.0.1c", "nvd", "tentative", "nvd_exact", 0, 0),
     ]
     span = ("1.0.1", "1.0.1f")
     self.assertEqual(self._spans("openssl", "1.0.1f", rows, inferred_span=span), {
       "CVE-2022-0010": ("firm", "nvd_range"),
       "CVE-2022-0011": ("tentative", "inferred_version"),
       "CVE-2022-0012": ("firm", "nvd_range"),
+      "CVE-2022-0016": ("tentative", "inferred_version"),  # exact 1.0.1c is a possible version
     })
     self.assertEqual(sorted(self._spans("openssl", "1.0.1f", rows)),
                      ["CVE-2022-0010", "CVE-2022-0011", "CVE-2022-0012"])  # no span: today's behaviour
