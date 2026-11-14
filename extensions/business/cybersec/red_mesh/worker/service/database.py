@@ -267,7 +267,8 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       ))
 
     # --- CVE-2012-2122 auth bypass test ---
-    # Affected: MySQL 5.1.x < 5.1.63, 5.5.x < 5.5.25, MariaDB < 5.5.23
+    # Affected (as the catalog rows): MySQL 5.1.x < 5.1.63, 5.5.x < 5.5.24, 5.6.x < 5.6.6. MariaDB is not probed:
+    # its 5.x banners are skipped below, and 10.x is not affected.
     # Bug: memcmp return value truncation means ~1/256 chance of auth bypass
     cve_bypass = self._mysql_test_cve_2012_2122(target, port)
     if cve_bypass:
@@ -293,7 +294,8 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
   # Affected version ranges for CVE-2012-2122
   _MYSQL_CVE_2012_2122_RANGES = [
     ((5, 1, 0), (5, 1, 63)),   # MySQL 5.1.x < 5.1.63
-    ((5, 5, 0), (5, 5, 25)),   # MySQL 5.5.x < 5.5.25
+    ((5, 5, 0), (5, 5, 24)),   # MySQL 5.5.x < 5.5.24
+    ((5, 6, 0), (5, 6, 6)),    # MySQL 5.6.x < 5.6.6
   ]
 
   def _mysql_test_cve_2012_2122(self, target, port):
