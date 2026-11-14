@@ -120,8 +120,10 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           except Exception:
             pass
 
-          # CVE check
-          findings += check_cves("mysql", version)
+          # CVE check — MariaDB speaks the MySQL protocol and its 10.x banner
+          # leads with `5.5.5-`; route it to its own product key.
+          cve_product, cve_version = self._mysql_cve_target(version)
+          findings += check_cves(cve_product, cve_version)
         else:
           raw["protocol_byte"] = pkt_payload[0] if pkt_payload else None
           findings.append(Finding(
@@ -274,6 +276,20 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
     return probe_result(raw_data=raw, findings=findings)
 
+  @staticmethod
+  def _mysql_cve_target(banner):
+    """Return ``(cve_db product, version)`` for a MySQL-protocol server banner.
+
+    MariaDB 10.x announces itself as ``5.5.5-10.11.6-MariaDB`` (the fake
+    ``5.5.5-`` prefix keeps old clients working); that prefix is not the server
+    version. ``*-MariaDB`` goes to the ``mariadb`` key, everything else to
+    ``mysql``.
+    """
+    stripped = _re.sub(r'^5\.5\.5-(?=\d)', '', banner or '')
+    if 'mariadb' in stripped.lower():
+      return "mariadb", stripped
+    return "mysql", stripped
+
   # Affected version ranges for CVE-2012-2122
   _MYSQL_CVE_2012_2122_RANGES = [
     ((5, 1, 0), (5, 1, 63)),   # MySQL 5.1.x < 5.1.63
@@ -312,6 +328,12 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       return None
 
     version_str = pkt_payload[1:].split(b'\x00')[0].decode('utf-8', errors='ignore')
+    # Gate on a real MySQL banner. MariaDB 10.x reports `5.5.5-10.x-MariaDB`,
+    # which read as MySQL 5.5.5 is in range and drew 300 auth attempts. The gate
+    # also skips MariaDB 5.x below 5.5.23, a true positive that is given up.
+    cve_product, version_str = self._mysql_cve_target(version_str)
+    if cve_product != "mysql":
+      return None
     version_tuple = tuple(int(x) for x in _re.findall(r'\d+', version_str)[:3])
     if len(version_tuple) < 3:
       return None

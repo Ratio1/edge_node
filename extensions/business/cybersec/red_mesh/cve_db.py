@@ -96,7 +96,7 @@ CVE_DATABASE: list = [
   #
   # Bounds are written WITHOUT the `p` suffix on purpose. `_SSH_LIBRARY_PATTERNS`
   # captures `(\d+\.\d+(?:\.\d+)?)`, so the matcher is handed "9.8", never
-  # "9.8p1" — and `_parse_version` encodes the suffix as extra tuple components,
+  # "9.8p1" — and `_parse_version` ranks the suffix in the key's tail,
   # making 9.8 sort *below* 9.8p1. Writing the published `p`-suffixed bounds
   # here shifted both boundaries by a release: a patched 9.8p1 server reported
   # CRITICAL, and vulnerable 8.5p1 servers were missed.
@@ -211,7 +211,17 @@ CVE_DATABASE: list = [
            "CWE-134"),
 
   # ── Erlang OTP SSH ──────────────────────────────────────────────
-  CveEntry("erlang_ssh", "<5.2.2", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
+  # The probe reports whichever number the banner carries: the ssh application
+  # version (`Erlang/5.2.9`, <= 5.x) or the OTP release (`Erlang/27.3.2`, >= 17).
+  # The two ranges do not overlap, so each branch gets its own rows. Fixed in
+  # ssh 5.2.10 / 5.1.4.8 / 4.15.3.12 and OTP 27.3.3 / 26.2.5.11 / 25.3.2.20
+  # (Erlang/OTP security advisory for CVE-2025-32433); every older release is affected.
+  CveEntry("erlang_ssh", "<4.15.3.12", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
+  CveEntry("erlang_ssh", ">=5.0,<5.1.4.8", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
+  CveEntry("erlang_ssh", ">=5.2,<5.2.10", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
+  CveEntry("erlang_ssh", ">=17,<25.3.2.20", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
+  CveEntry("erlang_ssh", ">=26,<26.2.5.11", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
+  CveEntry("erlang_ssh", ">=27,<27.3.3", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
 
   # ── CouchDB ──────────────────────────────────────────────────────
   CveEntry("couchdb", "<3.2.2",           "CVE-2022-24706", Severity.CRITICAL, "Default Erlang cookie RCE via cluster protocol", "CWE-1188"),
@@ -494,7 +504,7 @@ def check_cves(
       continue
     # Range first, so an entry skipped below is one the version did match and
     # the skip can be recorded as a judgement rather than a non-match.
-    if not _matches_constraint(version, entry.constraint):
+    if not _matches_constraint(version, entry.constraint, product):
       continue
     if applicability and entry_applicability(entry) != applicability:
       if entry_applicability(entry) == CLIENT_APPLICABILITY:
@@ -691,76 +701,111 @@ def _parse_cwe_int(cwe_str: str) -> int:
     return 0
 
 
-def _matches_constraint(version: str, constraint: str) -> bool:
+def _matches_constraint(version: str, constraint: str, product: str = "") -> bool:
   """Parse version constraint string and compare.
 
   Supports: ``<1.4.3``, ``>=2.4.49,<2.4.51``, ``<7.0``.
-  Comma-separated constraints are ANDed.
+  Comma-separated constraints are ANDed. ``product`` selects the product-specific
+  reading of single-letter release tags (see ``_parse_version``).
   """
   parts = [c.strip() for c in constraint.split(",")]
-  parsed = _parse_version(version)
+  parsed = _parse_version(version, product)
   if parsed is None:
     return False
   for part in parts:
-    if not _check_single(parsed, part):
+    if not _check_single(parsed, part, product):
       return False
   return True
 
 
-def _parse_version(version: str):
-  """Extract the first numeric version tuple from common banner strings.
+# Pre-release tags sort BEFORE the release they precede. Ascending rank:
+# dev < alpha < beta < milestone < rc/pre; `a`/`b` are alpha/beta.
+_PRE_RANK = {
+  "dev": 0, "alpha": 1, "a": 1, "beta": 2, "b": 2,
+  "milestone": 3, "m": 3, "rc": 4, "pre": 4,
+}
+# Products whose single-letter suffix is a release (openssl 1.0.1f, proftpd
+# 1.3.5b), not a pre-release.
+_LETTER_RELEASE_PRODUCTS = ("openssl", "proftpd", "samba")
+
+
+def _parse_version(version: str, product: str = ""):
+  """Reduce a banner or constraint version to a comparable key ``(numbers, tail)``.
 
   Handles values like ``Apache/2.4.57 (Ubuntu)``, ``OpenSSH_8.9p1``,
-  ``nginx/1.22.1``, and the older leading-version form
-  ``1.4.3-beta``.
+  ``nginx/1.22.1``, ``1:8.9p1-3ubuntu0.10`` and pre-releases such as
+  ``3.0.0rc1``, ``1.4.3-beta``, ``9.0.0.M1``, ``8.1.0-dev``.
+
+  ``tail`` orders what follows the numbers: a pre-release ``(-1, tag, n)`` sorts
+  before the release ``(0, 0, 0)``; a letter suffix ``9.8p1`` / ``1.0.1f`` or a
+  BIND edition or patch level (``-S1``, ``-P4``) sorts after it. Compare keys with ``_compare_versions``.
   """
   if not isinstance(version, str):
     return None
-  version = version.strip()
+  # Banners are untrusted: bound the work and the digit runs `int()` must parse.
+  version = version[:128].strip()
   # Strip a Debian/RPM epoch before searching. `1:8.9p1-3ubuntu0.10` otherwise
   # matches on the leading `1` and returns (1,), reading the epoch as the
   # upstream version — which makes an OpenSSH 8.9 host match every CVE for 1.x.
-  # Latent today because `_ssh_identify_library` reduces the banner to "8.9"
-  # before the matcher sees it, but live the moment the full package string is
-  # carried through, which RM-064 item 5 asks for.
   version = re.sub(r"^\s*\d+:", "", version)
-  m = re.search(r"(\d+(?:\.\d+)*)([a-z]+)?(\d*)", version, re.IGNORECASE)
+  m = re.search(r"(\d+(?:\.\d+)*)(.*)$", version, re.DOTALL)
   if not m:
     return None
-  parts = [int(x) for x in m.group(1).split(".")]
-  suffix = m.group(2) or ""
-  suffix_number = m.group(3) or ""
-  if suffix:
-    suffix_value = 0
-    for char in suffix.lower():
-      suffix_value = suffix_value * 26 + (ord(char) - ord("a") + 1)
-    parts.append(suffix_value)
-  if suffix_number:
-    parts.append(int(suffix_number))
-  return tuple(parts)
+  numbers = [int(x) for x in m.group(1).split(".")]
+  rest = m.group(2).lower()
+  tail = (0, 0, 0)
+  pre = re.match(r"^[-_.~]?(alpha|beta|rc|pre|dev|milestone|m|a|b)(\d*)", rest)
+  if pre:
+    tag, num = pre.group(1), pre.group(2)
+    # A bare single letter is a release letter, not a pre-release, unless a
+    # number follows (`1.0a1`, `9.0.0.M1`) and the product does not use letter
+    # releases.
+    single = len(tag) == 1
+    if (not single or num) and not (single and product in _LETTER_RELEASE_PRODUCTS):
+      tail = (-1, _PRE_RANK[tag], int(num or 0))
+  if tail == (0, 0, 0):
+    edition = re.match(r"^-([sp])(\d+)(?![a-z0-9])", rest)  # BIND `-S1` edition, `-P4` patch level
+    letter = re.match(r"^([a-z]{1,2})(\d*)(?=$|[-_.~+ ])", rest)  # 1.0.1f, 8.9p1, 1.3.5b
+    if edition:
+      tail = (1, ord(edition.group(1)) - 96, int(edition.group(2)))
+    elif letter:
+      value = 0
+      for char in letter.group(1):
+        value = value * 26 + ord(char) - 96
+      tail = (1, value, int(letter.group(2) or 0))
+  return numbers, tail
 
 
-def _check_single(parsed: tuple, expr: str) -> bool:
+def _compare_versions(a, b) -> int:
+  """Three-way compare of two ``_parse_version`` keys."""
+  na, ta = a
+  nb, tb = b
+  size = max(len(na), len(nb))
+  na = na + [0] * (size - len(na))
+  nb = nb + [0] * (size - len(nb))
+  if na != nb:
+    return -1 if na < nb else 1
+  return (ta > tb) - (ta < tb)
+
+
+def _check_single(parsed, expr: str, product: str = "") -> bool:
   """Evaluate one comparison like '<1.4.3' or '>=2.4.49'."""
   m = re.match(r"(>=|<=|>|<|==)(.+)", expr.strip())
   if not m:
     return False
   op, ver_str = m.group(1), m.group(2)
-  target = _parse_version(ver_str)
+  target = _parse_version(ver_str, product)
   if target is None:
     return False
-  # Normalize lengths for comparison
-  max_len = max(len(parsed), len(target))
-  a = parsed + (0,) * (max_len - len(parsed))
-  b = target + (0,) * (max_len - len(target))
+  c = _compare_versions(parsed, target)
   if op == "<":
-    return a < b
+    return c < 0
   elif op == "<=":
-    return a <= b
+    return c <= 0
   elif op == ">":
-    return a > b
+    return c > 0
   elif op == ">=":
-    return a >= b
+    return c >= 0
   elif op == "==":
-    return a == b
+    return c == 0
   return False

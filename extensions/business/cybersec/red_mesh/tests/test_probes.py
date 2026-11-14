@@ -3648,9 +3648,9 @@ class TestDetectionGapFixes(unittest.TestCase):
     self.assertTrue(any("CVE-2025-32433" in t for t in cve_ids))
 
   def test_erlang_ssh_cve_patched(self):
-    """CVE-2025-32433 should NOT match patched Erlang SSH >= 5.2.2."""
+    """CVE-2025-32433 should NOT match patched Erlang SSH >= 5.2.10 (5.2.2-5.2.9 are affected)."""
     from extensions.business.cybersec.red_mesh.cve_db import check_cves
-    findings = check_cves("erlang_ssh", "5.2.2")
+    findings = check_cves("erlang_ssh", "5.2.10")
     cve_ids = [f.title for f in findings]
     self.assertFalse(any("CVE-2025-32433" in t for t in cve_ids))
 
