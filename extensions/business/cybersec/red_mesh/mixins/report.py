@@ -1082,6 +1082,8 @@ class _ReportMixin:
     if scan_type == "webapp":
       graybox_stats = self._extract_graybox_ui_stats(agg, latest)
 
+    # `total_findings` and `findings_count` below stay raw record counts (every CVE finding the pass holds);
+    # `latest_risk_breakdown.finding_counts` is the scored view (RM-169: rollups once, possible and closed out).
     # Every counter in this object uses the same predicate, or the object
     # contradicts itself: `total_findings` excluding coverage while the severity
     # chart counted it produced a header saying one finding above a chart
@@ -1096,8 +1098,7 @@ class _ReportMixin:
     # without the filter a scenario that concluded nothing was ranked into the
     # customer-facing top-findings list as a HIGH.
     # Generated CVE findings: listed ones only (the rest are in a rollup or the possible section).
-    crit_high = [f for f in filter_listed(real_findings, (agg.get("cves_not_applicable") or {}).values())
-                 if f.get("severity") in ("CRITICAL", "HIGH")]
+    crit_high = [f for f in filter_listed(real_findings) if f.get("severity") in ("CRITICAL", "HIGH")]
     crit_high.sort(key=lambda f: (
       self.SEVERITY_ORDER.get(f.get("severity"), 9),
       self.CONFIDENCE_ORDER.get(f.get("confidence"), 9),

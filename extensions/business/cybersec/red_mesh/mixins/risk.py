@@ -85,7 +85,7 @@ def normalize_risk_score(raw_total):
 class _RiskScoringMixin:
   """Risk scoring and findings extraction methods for PentesterApi01Plugin."""
 
-  def _compute_risk_and_findings(self, aggregated_report):
+  def _compute_risk_and_findings(self, aggregated_report, triage=None):
     """
     Compute risk score AND extract flat findings in a single walk.
 
@@ -509,12 +509,12 @@ class _RiskScoringMixin:
     coverage_counts = {status: 0 for status in COVERAGE_STATUSES}
     cred_count = 0
     # RM-169, generated CVE findings only (`static` has no view): findings folded into a rollup or a possible row
-    # leave the walk. A rollup scores once, as its highest-severity member (that member's confidence); possible
+    # leave the walk, and so do closed ones (the triage map). A rollup scores once, as its highest-severity member (that member's confidence); possible
     # findings add 0. Non-CVE tentative findings keep the 0.5 multiplier.
-    cve_view = build_cve_view(flat_findings, (aggregated_report.get("cves_not_applicable") or {}).values())
+    cve_view = build_cve_view(flat_findings, (aggregated_report.get("cves_not_applicable") or {}).values(), triage)
     scored = flat_findings
     if cve_view:
-      listed_ids, folded_ids = view_members(cve_view)
+      listed_ids = view_members(cve_view)[0]
       by_id = {f["finding_id"]: f for f in flat_findings if is_view_finding(f) and f.get("finding_id")}
       rollup_tops = [
         max((by_id[i] for i in service["rollup"]["member_finding_ids"]),
@@ -522,8 +522,9 @@ class _RiskScoringMixin:
                            CONFIDENCE_RANK.get(str(m.get("confidence")).lower(), 0)))
         for service in cve_view["services"] if service["rollup"]
       ]
+      # A view finding scores only when listed; a closed one leaves with the folded ones.
       scored = [f for f in flat_findings
-                if not (is_view_finding(f) and f.get("finding_id") in folded_ids - listed_ids)] + rollup_tops
+                if not is_view_finding(f) or f["finding_id"] in listed_ids] + rollup_tops
     for f in scored:
       if _is_coverage_result(f):
         status = str(f.get("status") or "").lower()
