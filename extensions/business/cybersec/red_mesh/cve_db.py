@@ -23,9 +23,9 @@ from .references import cwe_to_owasp
 
 CVE_DB_LAST_UPDATED = "2026-11-14"
 _CURRENT_DYNAMIC_CACHE: ContextVar = ContextVar("redmesh_dynamic_reference_cache", default=None)
+_VULNDB_READER = None  # `generated` source (RM-169); None means the frozen `CVE_DATABASE`
 # Scan-local `{"<port>/<cve_id>": entry}` of CVEs the matcher evaluated and
 # skipped as not applicable (RM-103 item 6). None outside a worker run.
-_VULNDB_READER = None  # `generated` source (RM-169); None means the frozen `CVE_DATABASE`
 _CURRENT_NOT_APPLICABLE: ContextVar = ContextVar("redmesh_cves_not_applicable", default=None)
 
 
@@ -678,8 +678,8 @@ def _confidence_reason(backport_status: str, match, product: str) -> tuple:
   if product in _BACKPORTED_PRODUCTS and backport_status != BACKPORT_NOT_FIXED:
     reasons.add("backport_unknown" if backport_status == BACKPORT_UNKNOWN else "banner_only")
   if match.confidence == "tentative":
-    reasons.add(match.reason if match.reason in ("nvd_exact", "cna_range") else "cna_range")
-  for reason in _TENTATIVE_REASON_ORDER:
+    reasons.add(match.reason)  # a reason this node does not know passes through (readers ignore it)
+  for reason in _TENTATIVE_REASON_ORDER + tuple(sorted(reasons - set(_TENTATIVE_REASON_ORDER))):
     if reason in reasons:
       return "tentative", reason
   return match.confidence, match.reason
@@ -718,7 +718,7 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
     severity = Severity(entry.severity) if entry.severity in Severity.__members__ else Severity.MEDIUM
     kev = bool(entry.kev)
     epss_score = entry.epss
-    cvss_list = tuple(entry.cvss)
+    cvss_list = tuple(dict(c) for c in entry.cvss)
     cvss_freshness = reader.built_at or ""
     # The label is v3.x only; a 4.0 or 2.0 display CVSS stays in `cvss[]` (report-findings.md).
     if str(entry.cvss_version or "").startswith("3."):
