@@ -192,7 +192,11 @@ class _DauthMixin(object):
     not a security control. The minimum is tested only for a sender older than this server: the
     minimum is below this server's release, so a sender at or above the server is above it too.
     Version texts are read by `version_to_int`, which keeps a partial sum for text it cannot
-    read; a sender whose text gives a sum below the minimum is refused as too old.
+    read. A sender whose app version text gives a sum above 0 and below the minimum is refused
+    as too old. A text that reads as 0 is not measured against the minimum: the sender is
+    typed by the other versions it declares, so it is served as an SDK client when its core
+    version also reads as 0 and its SDK version does not, and refused for invalid version
+    data otherwise.
 
     Examples
     --------
