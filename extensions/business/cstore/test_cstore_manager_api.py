@@ -332,6 +332,47 @@ class CstoreManagerApiNamespaceTests(unittest.TestCase):
           # It is red and never names the value.
           self.assertEqual((color, SECRET_VALUE in line), ("r", False))
 
+  def test_plain_get_and_set_refuse_a_raw_key_under_the_tombstone_prefix(self):
+    """A raw key starting with "dl:", where the chain store keeps the tombstones of deleted keys, gets the 403
+    answer of a system namespace on get and set, with the store never called and one red log line."""
+    # A tombstone key of an application key, of a hash record's raw key, and the bare prefix.
+    for raw_key in ["dl:app:counter", "dl:" + _composed_key(APP_HKEYS[1], "7"), "dl:"]:
+      # The raw key on each plain endpoint.
+      for endpoint in ("get", "set"):
+        # Name the case in a failure report.
+        with self.subTest(raw_key=raw_key, endpoint=endpoint):
+          # A fresh plugin per request.
+          plugin = _make_store_plugin()
+          # The raw key on the plain endpoint, the write carrying a value that must not reach the log.
+          result = plugin.get(key=raw_key) if endpoint == "get" else plugin.set(key=raw_key, value=SECRET_VALUE)
+          # The error answer a system namespace gets, and the store never called.
+          self.assertEqual(
+            (result, plugin.calls),
+            ({"error": f"Namespace '{raw_key}' is reserved for the node's plugins.", "status_code": 403,
+              "logged": True}, []),
+          )
+          # Exactly one log line.
+          [(line, color)] = plugin.logged
+          # It is red, names the endpoint and the key, and never the value.
+          self.assertEqual((color, endpoint in line, raw_key in line, SECRET_VALUE in line), ("r", True, True, False))
+
+  def test_a_hash_key_starting_with_the_tombstone_prefix_is_served_as_before(self):
+    """The "dl:" refusal concerns raw keys only: a hash key with that prefix still reaches the store on the four
+    hash endpoints, since its records' raw keys start with "hs:"."""
+    # An application hash key that starts with the tombstone prefix.
+    hkey = "dl:my-app"
+    # A fresh plugin over an empty store.
+    plugin = _make_store_plugin()
+    # hset, hget and hgetall answer from the store as for any application hash key.
+    self.assertEqual(
+      (plugin.hset(hkey=hkey, key="node-1", value=1), plugin.hget(hkey=hkey, key="node-1"), plugin.hgetall(hkey=hkey)),
+      (True, 1, {"node-1": 1}),
+    )
+    # hsync reaches the store too.
+    self.assertEqual(plugin.hsync(hkey=hkey), {"hkey": hkey, "source_peer": "peer-1"})
+    # The store saw the four requests, and nothing was logged.
+    self.assertEqual(([op for op, _ in plugin.calls], plugin.logged), (["hset", "hget", "hgetall", "hsync"], []))
+
   def test_a_hash_key_with_the_index_of_a_system_hash_key_is_refused(self):
     """An application hash key whose index equals that of a system hash key is refused on the four hash
     endpoints, while the same name as a raw key on plain get and set still reaches the store."""
