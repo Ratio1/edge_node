@@ -137,6 +137,14 @@ class DauthVersionGateTests(unittest.TestCase):
     # A minimum equal to the release would refuse every node that has not updated yet.
     self.assertLess(version_to_int(DAUTH_MIN_SENDER_APP_VERSION), version_to_int(EDGE_VERSION))
 
+  def test_minimum_is_at_most_30_build_numbers_behind_this_release(self):
+    """A minimum that nobody raises fails this test once this tree's release is more than 30 build numbers ahead."""
+    # The distance in the weighted sum the gate compares: a build number counts 1, a minor version 1000.
+    lag = version_to_int(EDGE_VERSION) - version_to_int(DAUTH_MIN_SENDER_APP_VERSION)
+    # Three release steps of 10. Without this bound a minimum left alone serves older and older
+    # nodes with no signal; with it the release that passes the bound has a failing test.
+    self.assertLessEqual(lag, 30)
+
   def test_request_below_the_minimum_is_refused_before_the_license_lookup(self):
     """A request below the minimum gets the version refusal and costs no license lookup."""
     # A server one release step above the minimum.

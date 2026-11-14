@@ -40,6 +40,8 @@ DEEPLOY_WALLET_MESSAGE_PREFIX = "Please sign this message for Deeploy: "
 # was refused whenever it started during a rolling update. A named release does not move when a server
 # is updated. Raise it on purpose, at a release, and keep it below that release: a minimum equal to
 # the release refuses the previous one again (test_dauth_version_gate.py checks the form and that bound).
+# The same tests fail once the minimum is more than 30 build numbers behind the release in ver.py, so
+# that it is raised and does not serve older and older nodes unnoticed.
 DAUTH_MIN_SENDER_APP_VERSION = "2.10.710"
 
 
