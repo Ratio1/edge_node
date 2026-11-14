@@ -347,7 +347,7 @@
   }
  },
  "intent_digest": "982b29b06592d80c78e42b39df0a12e79d021bba82ecb08428ba5e3542cbc23b",
- "pack_view_sha256": "92f58ff922a8687aa64e6d52606073a94891fb48bfc6646b226ac9a024f04653",
+ "pack_view_sha256": "ac78f9ae3ceff2240ccefb63104d2347549ec0f4a60c3ba8e39b900311d08018",
  "snapshot_envelope": {
   "assessment_id": "fa_golden",
   "kind": "redmesh_framework_assessment",

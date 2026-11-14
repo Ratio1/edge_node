@@ -4,6 +4,7 @@
   "packs": [
     {
       "pack_id": "ro.dnsc.o1-2026",
+      "title": "DNSC Order 1/2026",
       "version": 1,
       "status": "active",
       "supersedes": null,

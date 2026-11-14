@@ -58,6 +58,7 @@ def _validate_manifest_pack(pack: dict) -> None:
   licence, rules = pack.get("licence"), pack.get("rules")
   licence, rules = licence if isinstance(licence, dict) else {}, rules if isinstance(rules, dict) else {}
   checks = {
+    "title": isinstance(pack.get("title"), str) and 0 < len(pack["title"]) <= 120,
     "version": type(pack.get("version")) is int,
     "status": pack.get("status") in ("active", "retired"),
     "supersedes": "supersedes" in pack, "derived_from": "derived_from" in pack,

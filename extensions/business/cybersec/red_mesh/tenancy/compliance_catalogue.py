@@ -106,7 +106,8 @@ def list_packs(service, actor, tenant_id):
     entry, pack = manifest_pack(pack_id), load_framework_pack(pack_id)
     rules = {key: value for key, value in entry["rules"].items() if key != "exports"}
     licence = entry["licence"]
-    packs.append({"packId": pack_id, "title": pack["catalogue"], "scoring": entry["scoring"],
+    packs.append({"packId": pack_id, "title": entry["title"], "scoring": entry["scoring"],
+                  "packSha256": entry["pack_sha256"],
                   "levels": list(pack_levels(pack)), "rules": rules, "exports": list(entry["rules"]["exports"]),
                   "licence": {"id": licence["id"], "attribution": licence["attribution"],
                               "shipText": licence["ship_text"]},

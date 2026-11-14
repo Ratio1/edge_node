@@ -4,6 +4,7 @@
  "packs": [
   {
    "pack_id": "test.status-ids.v1",
+   "title": "Synthetic ids-only pack (test)",
    "version": 1,
    "status": "active",
    "supersedes": null,
@@ -50,6 +51,7 @@
   },
   {
    "pack_id": "test.cyfun-like.v1",
+   "title": "Synthetic two-axis pack with levels (test)",
    "version": 1,
    "status": "active",
    "supersedes": null,

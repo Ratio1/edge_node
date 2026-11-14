@@ -480,6 +480,7 @@ def pack_view(pack, text, level):
     "maturityLevels": [dict(m) for m in text.get("maturity_levels") or []],
     "language": text.get("language") or pack["language"],
     "catalogue": pack["catalogue"],
+    "title": manifest_pack(pack["pack_id"])["title"],  # the display name; `catalogue` names the source framework and is never shown
   }
   if "hierarchy" in text:  # the generic hierarchy of any depth (contract §Pack and text schema)
     view["hierarchy"] = [dict(n) for n in text["hierarchy"]]

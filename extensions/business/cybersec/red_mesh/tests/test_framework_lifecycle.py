@@ -89,8 +89,13 @@ class TestPackList(LifecycleFixture):
     dnsc = by_id[DNSC]
     self.assertEqual((dnsc["scoring"], dnsc["levels"], dnsc["status"], dnsc["languages"]),
                      ("maturity_two_axis.v1", ["basic", "important", "essential"], "active", ["ro"]))
+    for pack_id, listed in by_id.items():  # the hash a draft export prints as its pack hash
+      self.assertEqual(listed["packSha256"], packs.manifest_pack(pack_id)["pack_sha256"])
     self.assertEqual((dnsc["exports"], dnsc["licence"]["shipText"], dnsc["title"]),
-                     (["json", "csv", "pdf", "eval_mms"], True, packs.load_framework_pack(DNSC)["catalogue"]))
+                     (["json", "csv", "pdf", "eval_mms"], True, "DNSC Order 1/2026"))
+    for listed in data["packs"]:  # the display name is the manifest title; the catalogue string names the source framework
+      self.assertEqual(listed["title"], packs.manifest_pack(listed["packId"])["title"])
+      self.assertNotRegex(listed["title"], r"CyFun|Anexa 1")
     self.assertEqual((dnsc["rules"]["entity_fields"], dnsc["rules"]["signoff_required"], "exports" in dnsc["rules"]),
                      (["dnsc_unique_id", "external_supplier"], True, False))
     self.assertEqual((dnsc["capabilities"]["has_levels"], dnsc["capabilities"]["axes"]), (True, ["documentation", "implementation"]))

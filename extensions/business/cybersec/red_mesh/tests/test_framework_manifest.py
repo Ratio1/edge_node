@@ -110,6 +110,9 @@ class TestManifestSchema(unittest.TestCase):
     self.refused(lambda m: m["packs"][0].update(status="draft"))
     self.refused(lambda m: m["packs"][0].update(version="1"))
     self.refused(lambda m: m["packs"][0].pop("supersedes"))
+    for bad_title in (None, "", 5, "x" * 121):  # a display title of 1..120 characters
+      self.refused(lambda m, t=bad_title: m["packs"][0].update(title=t))
+    self.refused(lambda m: m["packs"][0].pop("title"))
     self.refused(lambda m: m["packs"][0]["licence"].pop("ship_text"))
     self.refused(lambda m: m["packs"][0]["rules"].pop("entity_fields"))
     self.refused(lambda m: m["packs"][0]["rules"].update(signoff_required="yes"))
