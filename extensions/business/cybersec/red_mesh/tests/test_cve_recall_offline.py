@@ -7,6 +7,8 @@ Table source: RM-193 assessment 2026-11-13_vulndb, scripts/proto_eval2.py EXPECT
 """
 import unittest
 
+from extensions.business.cybersec.red_mesh.detection_inventory import PRODUCTS_WITHOUT_PROBE
+
 from extensions.business.cybersec.red_mesh.cve_db import (
   check_cves,
   parse_distro_package,
@@ -32,14 +34,16 @@ EXPECT = [
   ('spring_cloud_function', '3.2.2', 'CVE-2022-22963'), ('openssh', '8.9', 'CVE-2024-6387'),
 ]
 
-DEAD_KEYS = frozenset({
-  'struts2', 'spring_framework', 'spring_cloud_function', 'django', 'laravel_ignition',
-})
+# One source: the inventory's list of keys no probe passes (libvncserver has no EXPECT row).
+DEAD_KEYS = PRODUCTS_WITHOUT_PROBE
 
 # Measured at base 87b09e5 (before RM-168): 27 of 34 rows hit (20 of 27 live rows; all 7 dead-key rows hit).
-# The matcher change must not lower it.
-BASELINE_ALL = 27
-BASELINE_LIVE = 20
+# After the phase 1 matcher fixes and the phase 2 rows (MySQL CVE-2012-2122, JBoss CVE-2017-7504 added):
+# 31 of 34 (24 of 27 live). Remaining misses: PostgreSQL CVE-2019-9193 and OpenSSH CVE-2018-15473 (no
+# catalog row) and OpenSSH CVE-2024-6387 on 8.9p1 Ubuntu 3ubuntu0.10 (fixed by backport, so not reported).
+# The catalog must not lower it.
+BASELINE_ALL = 31
+BASELINE_LIVE = 24
 
 
 def _recall():

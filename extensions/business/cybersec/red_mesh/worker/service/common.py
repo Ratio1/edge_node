@@ -751,7 +751,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
 
     # FTP server version CVE check
     _ftp_m = _re.search(
-      r'(ProFTPD|vsftpd)[/ ]+(\d+(?:\.\d+)+)',
+      r'(ProFTPD|vsftpd)[/ ]+(\d+(?:\.\d+)+(?:[a-z](?![a-z]))?)',
       result["banner"], _re.IGNORECASE,
     )
     if _ftp_m:

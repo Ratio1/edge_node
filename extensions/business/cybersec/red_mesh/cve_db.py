@@ -21,7 +21,7 @@ from .cvss import cvss31_base_score
 from .findings import Finding, Remediation, Severity, _template_band_agrees, current_probe_port
 from .references import cwe_to_owasp
 
-CVE_DB_LAST_UPDATED = "2026-05-08"
+CVE_DB_LAST_UPDATED = "2026-11-14"
 _CURRENT_DYNAMIC_CACHE: ContextVar = ContextVar("redmesh_dynamic_reference_cache", default=None)
 # Scan-local `{"<port>/<cve_id>": entry}` of CVEs the matcher evaluated and
 # skipped as not applicable (RM-103 item 6). None outside a worker run.
@@ -84,7 +84,6 @@ CVE_DATABASE: list = [
   CveEntry("elasticsearch", "<1.2",   "CVE-2014-3120", Severity.HIGH, "MVEL scripting RCE", "CWE-94"),
   CveEntry("elasticsearch", "<1.4.3", "CVE-2015-1427", Severity.CRITICAL, "Groovy sandbox escape RCE", "CWE-94"),
   CveEntry("elasticsearch", "<1.4.5", "CVE-2015-3337", Severity.HIGH, "Directory traversal via site plugin", "CWE-22"),
-  CveEntry("elasticsearch", "<5.6.5", "CVE-2017-11480", Severity.HIGH, "XSS via URL access control bypass", "CWE-79"),
   CveEntry("elasticsearch", "<6.4.3", "CVE-2018-17244", Severity.MEDIUM, "Security bypass in token generation", "CWE-287"),
   CveEntry("elasticsearch", ">=7.0.0,<7.17.19", "CVE-2024-23450", Severity.HIGH, "Ingest pipeline DoS via deep nesting", "CWE-400"),
 
@@ -110,11 +109,22 @@ CVE_DATABASE: list = [
   CveEntry("openssh", "<7.0",  "CVE-2016-6210", Severity.MEDIUM, "User enumeration via timing", "CWE-200"),
 
   # ── Redis ──────────────────────────────────────────────────────────
-  CveEntry("redis", "<6.0.8",  "CVE-2021-32761", Severity.HIGH, "Integer overflow in BITFIELD", "CWE-190"),
+  # One row per branch: a single `<X` bound across branches fired on patched
+  # servers of the other branches. Ranges are the vendor's (CVE.org CNA) and
+  # NVD's; the lowest branch of each CVE keeps the CNA's open lower bound.
+  CveEntry("redis", ">=2.2,<5.0.13",  "CVE-2021-32761", Severity.HIGH, "BITFIELD integer overflow (32-bit builds only)", "CWE-190"),
+  CveEntry("redis", ">=6.0,<6.0.15",  "CVE-2021-32761", Severity.HIGH, "BITFIELD integer overflow (32-bit builds only)", "CWE-190"),
+  CveEntry("redis", ">=6.2,<6.2.5",   "CVE-2021-32761", Severity.HIGH, "BITFIELD integer overflow (32-bit builds only)", "CWE-190"),
   CveEntry("redis", "<6.2.7",  "CVE-2022-24735", Severity.HIGH, "Lua sandbox escape via EVAL", "CWE-94"),
-  CveEntry("redis", "<7.0.5",  "CVE-2022-35951", Severity.CRITICAL, "Integer overflow in XAUTOCLAIM", "CWE-190"),
-  CveEntry("redis", "<6.2.16", "CVE-2024-31449", Severity.HIGH, "Lua bit library stack buffer overflow RCE", "CWE-121"),
-  CveEntry("redis", "<7.2.7",  "CVE-2024-46981", Severity.CRITICAL, "Lua GC use-after-free RCE", "CWE-416"),
+  CveEntry("redis", ">=7.0.0,<7.0.5", "CVE-2022-35951", Severity.CRITICAL, "Integer overflow in XAUTOCLAIM", "CWE-190"),
+  CveEntry("redis", ">=2.6,<6.2.16",  "CVE-2024-31449", Severity.HIGH, "Lua bit library stack buffer overflow RCE", "CWE-121"),
+  CveEntry("redis", ">=7.0.0,<7.2.6", "CVE-2024-31449", Severity.HIGH, "Lua bit library stack buffer overflow RCE", "CWE-121"),
+  CveEntry("redis", ">=7.3.0,<7.4.1", "CVE-2024-31449", Severity.HIGH, "Lua bit library stack buffer overflow RCE", "CWE-121"),
+  # `<6.2.17` has no lower bound on purpose: 6.0 and earlier are end-of-life and
+  # unassessed by the vendor, and are reported (RM-169 labels them `eol_unassessed`).
+  CveEntry("redis", "<6.2.17",  "CVE-2024-46981", Severity.CRITICAL, "Lua GC use-after-free RCE", "CWE-416"),
+  CveEntry("redis", ">=7.2.0,<7.2.7", "CVE-2024-46981", Severity.CRITICAL, "Lua GC use-after-free RCE", "CWE-416"),
+  CveEntry("redis", ">=7.4.0,<7.4.2", "CVE-2024-46981", Severity.CRITICAL, "Lua GC use-after-free RCE", "CWE-416"),
 
   # ── MySQL ──────────────────────────────────────────────────────────
   CveEntry("mysql", ">=5.5,<5.5.52",  "CVE-2016-6662", Severity.CRITICAL, "Config file injection RCE", "CWE-94"),
@@ -122,16 +132,49 @@ CVE_DATABASE: list = [
   CveEntry("mysql", ">=5.7,<5.7.15",  "CVE-2016-6662", Severity.CRITICAL, "Config file injection RCE", "CWE-94"),
   CveEntry("mysql", ">=5.5,<5.5.52",  "CVE-2016-6664", Severity.HIGH, "Privilege escalation via mysqld_safe", "CWE-269"),
   CveEntry("mysql", ">=8.0,<8.0.23",  "CVE-2021-2022", Severity.MEDIUM, "InnoDB buffer pool corruption", "CWE-787"),
-  CveEntry("mysql", ">=5.7,<5.7.44",  "CVE-2024-20973", Severity.MEDIUM, "Optimizer DoS via low-privilege network attack", "CWE-404"),
+  CveEntry("mysql", ">=8.0.0,<=8.0.35", "CVE-2024-20973", Severity.MEDIUM, "Optimizer DoS via low-privilege network attack", "CWE-404"),
+  CveEntry("mysql", ">=8.1.0,<=8.2.0",  "CVE-2024-20973", Severity.MEDIUM, "Optimizer DoS via low-privilege network attack", "CWE-404"),
+  # Oracle MySQL 5.1.x before 5.1.63, 5.5.x before 5.5.24, 5.6.x before 5.6.6 (NVD
+  # description). NVD publishes a v2 vector only (MEDIUM).
+  CveEntry("mysql", ">=5.1,<5.1.63", "CVE-2012-2122", Severity.MEDIUM, "Authentication bypass via memcmp token comparison", "CWE-287"),
+  CveEntry("mysql", ">=5.5,<5.5.24", "CVE-2012-2122", Severity.MEDIUM, "Authentication bypass via memcmp token comparison", "CWE-287"),
+  CveEntry("mysql", ">=5.6,<5.6.6",  "CVE-2012-2122", Severity.MEDIUM, "Authentication bypass via memcmp token comparison", "CWE-287"),
+  CveEntry("mariadb", ">=5.1,<5.1.62",  "CVE-2012-2122", Severity.MEDIUM, "Authentication bypass via memcmp token comparison", "CWE-287"),
+  CveEntry("mariadb", ">=5.2,<5.2.12",  "CVE-2012-2122", Severity.MEDIUM, "Authentication bypass via memcmp token comparison", "CWE-287"),
+  CveEntry("mariadb", ">=5.3,<5.3.6",  "CVE-2012-2122", Severity.MEDIUM, "Authentication bypass via memcmp token comparison", "CWE-287"),
+  CveEntry("mariadb", ">=5.5,<5.5.23",  "CVE-2012-2122", Severity.MEDIUM, "Authentication bypass via memcmp token comparison", "CWE-287"),
 
   # ── PostgreSQL (new) ───────────────────────────────────────────────
-  CveEntry("postgresql", "<17.3",  "CVE-2025-1094", Severity.HIGH, "libpq quoting SQL injection leading to RCE", "CWE-89",
+  # One row per supported branch, each at its own fixed minor. The lowest branch
+  # has no lower bound: 11 and older are end-of-life and unassessed by the
+  # vendor, and are reported (RM-169 labels them `eol_unassessed`).
+  CveEntry("postgresql", "<13.19",  "CVE-2025-1094", Severity.HIGH, "libpq quoting SQL injection leading to RCE", "CWE-89",
            applicability=CLIENT_APPLICABILITY),
-  CveEntry("postgresql", "<17.1",  "CVE-2024-10979", Severity.HIGH, "PL/Perl env variable manipulation to RCE", "CWE-94"),
-  CveEntry("postgresql", "<17.1",  "CVE-2024-10976", Severity.MEDIUM, "Row security policy bypass via role confusion", "CWE-862"),
+  CveEntry("postgresql", ">=14.0,<14.16", "CVE-2025-1094", Severity.HIGH, "libpq quoting SQL injection leading to RCE", "CWE-89",
+           applicability=CLIENT_APPLICABILITY),
+  CveEntry("postgresql", ">=15.0,<15.11", "CVE-2025-1094", Severity.HIGH, "libpq quoting SQL injection leading to RCE", "CWE-89",
+           applicability=CLIENT_APPLICABILITY),
+  CveEntry("postgresql", ">=16.0,<16.7", "CVE-2025-1094", Severity.HIGH, "libpq quoting SQL injection leading to RCE", "CWE-89",
+           applicability=CLIENT_APPLICABILITY),
+  CveEntry("postgresql", ">=17.0,<17.3", "CVE-2025-1094", Severity.HIGH, "libpq quoting SQL injection leading to RCE", "CWE-89",
+           applicability=CLIENT_APPLICABILITY),
+  CveEntry("postgresql", "<12.21", "CVE-2024-10979", Severity.HIGH, "PL/Perl env variable manipulation to RCE", "CWE-94"),
+  CveEntry("postgresql", ">=13.0,<13.17", "CVE-2024-10979", Severity.HIGH, "PL/Perl env variable manipulation to RCE", "CWE-94"),
+  CveEntry("postgresql", ">=14.0,<14.14", "CVE-2024-10979", Severity.HIGH, "PL/Perl env variable manipulation to RCE", "CWE-94"),
+  CveEntry("postgresql", ">=15.0,<15.9", "CVE-2024-10979", Severity.HIGH, "PL/Perl env variable manipulation to RCE", "CWE-94"),
+  CveEntry("postgresql", ">=16.0,<16.5", "CVE-2024-10979", Severity.HIGH, "PL/Perl env variable manipulation to RCE", "CWE-94"),
+  CveEntry("postgresql", ">=17.0,<17.1", "CVE-2024-10979", Severity.HIGH, "PL/Perl env variable manipulation to RCE", "CWE-94"),
+  CveEntry("postgresql", "<12.21", "CVE-2024-10976", Severity.MEDIUM, "Row security policy bypass via role confusion", "CWE-862"),
+  CveEntry("postgresql", ">=13.0,<13.17", "CVE-2024-10976", Severity.MEDIUM, "Row security policy bypass via role confusion", "CWE-862"),
+  CveEntry("postgresql", ">=14.0,<14.14", "CVE-2024-10976", Severity.MEDIUM, "Row security policy bypass via role confusion", "CWE-862"),
+  CveEntry("postgresql", ">=15.0,<15.9", "CVE-2024-10976", Severity.MEDIUM, "Row security policy bypass via role confusion", "CWE-862"),
+  CveEntry("postgresql", ">=16.0,<16.5", "CVE-2024-10976", Severity.MEDIUM, "Row security policy bypass via role confusion", "CWE-862"),
+  CveEntry("postgresql", ">=17.0,<17.1", "CVE-2024-10976", Severity.MEDIUM, "Row security policy bypass via role confusion", "CWE-862"),
 
   # ── MongoDB (new) ──────────────────────────────────────────────────
-  CveEntry("mongodb", "<4.4.30", "CVE-2024-8207", Severity.MEDIUM, "Privilege escalation via untrusted library load", "CWE-284"),
+  CveEntry("mongodb", ">=5.0.0,<5.0.14", "CVE-2024-8207", Severity.MEDIUM, "Privilege escalation via untrusted library load", "CWE-284"),
+  CveEntry("mongodb", ">=6.0.0,<6.0.3",  "CVE-2024-8207", Severity.MEDIUM, "Privilege escalation via untrusted library load", "CWE-284"),
+  CveEntry("mongodb", ">=6.1.0,<6.1.1",  "CVE-2024-8207", Severity.MEDIUM, "Privilege escalation via untrusted library load", "CWE-284"),
 
   # ── Exim ───────────────────────────────────────────────────────────
   CveEntry("exim", "<4.98",   "CVE-2024-39929", Severity.MEDIUM, "RFC 2231 header parsing bypass — malware delivery", "CWE-20"),
@@ -159,10 +202,18 @@ CVE_DATABASE: list = [
   CveEntry("postfix", "<3.5.23", "CVE-2023-51764", Severity.MEDIUM, "SMTP smuggling via pipelining", "CWE-345"),
 
   # ── OpenSSL ────────────────────────────────────────────────────────
-  CveEntry("openssl", "<1.1.1",  "CVE-2020-1971", Severity.MEDIUM, "NULL dereference in GENERAL_NAME_cmp", "CWE-476"),
-  CveEntry("openssl", "<3.0.7",  "CVE-2022-3602", Severity.HIGH, "X.509 email address buffer overflow", "CWE-120"),
-  CveEntry("openssl", ">=3.2.0,<3.2.4",  "CVE-2024-12797", Severity.MEDIUM, "RPK verification bypass enabling MitM", "CWE-392"),
-  CveEntry("openssl", "<3.0.14", "CVE-2024-4741", Severity.HIGH, "SSL_free_buffers use-after-free", "CWE-416"),
+  # Branch ranges as published (NVD, CVE.org CNA). Where a row has no lower
+  # bound it is on purpose: 0.9.x to 1.1.0 are end-of-life branches the vendor
+  # never assessed, and they are reported (RM-169 labels them `eol_unassessed`).
+  CveEntry("openssl", "<1.0.2x",  "CVE-2020-1971", Severity.MEDIUM, "NULL dereference in GENERAL_NAME_cmp", "CWE-476"),
+  CveEntry("openssl", ">=1.1.0,<1.1.1i",  "CVE-2020-1971", Severity.MEDIUM, "NULL dereference in GENERAL_NAME_cmp", "CWE-476"),
+  CveEntry("openssl", ">=3.0.0,<3.0.7",  "CVE-2022-3602", Severity.HIGH, "X.509 email address buffer overflow", "CWE-120"),
+  CveEntry("openssl", ">=3.2.0,<3.2.4",  "CVE-2024-12797", Severity.HIGH, "RPK verification bypass enabling MitM", "CWE-392"),
+  CveEntry("openssl", "<1.1.1y", "CVE-2024-4741", Severity.CRITICAL, "SSL_free_buffers use-after-free", "CWE-416"),
+  CveEntry("openssl", ">=3.0.0,<3.0.14", "CVE-2024-4741", Severity.CRITICAL, "SSL_free_buffers use-after-free", "CWE-416"),
+  CveEntry("openssl", ">=3.1.0,<3.1.6", "CVE-2024-4741", Severity.CRITICAL, "SSL_free_buffers use-after-free", "CWE-416"),
+  CveEntry("openssl", ">=3.2.0,<3.2.2", "CVE-2024-4741", Severity.CRITICAL, "SSL_free_buffers use-after-free", "CWE-416"),
+  CveEntry("openssl", ">=3.3.0,<3.3.1", "CVE-2024-4741", Severity.CRITICAL, "SSL_free_buffers use-after-free", "CWE-416"),
 
   # ── ProFTPD ────────────────────────────────────────────────────────
   CveEntry("proftpd", "<1.3.6",  "CVE-2019-12815", Severity.CRITICAL, "Arbitrary file copy via mod_copy", "CWE-284"),
@@ -187,8 +238,12 @@ CVE_DATABASE: list = [
   CveEntry("samba", ">=3.5.0,<4.6.4", "CVE-2017-7494", Severity.CRITICAL, "SambaCry — writable share RCE via shared library upload", "CWE-94"),
 
   # ── Asterisk / FreePBX (new — for SIP probe) ──────────────────────
-  CveEntry("asterisk", "<20.11.0", "CVE-2024-42365", Severity.HIGH, "AMI manager injection via caller ID", "CWE-94"),
-  CveEntry("asterisk", "<18.24.0", "CVE-2023-49786", Severity.MEDIUM, "PJSIP request smuggling via multipart parser", "CWE-444"),
+  CveEntry("asterisk", "<18.24.2", "CVE-2024-42365", Severity.HIGH, "AMI manager injection via caller ID", "CWE-94"),
+  CveEntry("asterisk", ">=19.0.0,<20.9.2", "CVE-2024-42365", Severity.HIGH, "AMI manager injection via caller ID", "CWE-94"),
+  CveEntry("asterisk", ">=21.0.0,<21.4.2", "CVE-2024-42365", Severity.HIGH, "AMI manager injection via caller ID", "CWE-94"),
+  CveEntry("asterisk", "<18.20.1", "CVE-2023-49786", Severity.MEDIUM, "PJSIP request smuggling via multipart parser", "CWE-444"),
+  CveEntry("asterisk", ">=19.0.0,<20.5.1", "CVE-2023-49786", Severity.MEDIUM, "PJSIP request smuggling via multipart parser", "CWE-444"),
+  CveEntry("asterisk", ">=21.0.0,<21.0.1", "CVE-2023-49786", Severity.MEDIUM, "PJSIP request smuggling via multipart parser", "CWE-444"),
 
   # ── OpenSMTPD ────────────────────────────────────────────────────
   CveEntry("opensmtpd", "<6.6.2",  "CVE-2020-7247", Severity.CRITICAL, "RCE via crafted MAIL FROM command", "CWE-78"),
@@ -268,18 +323,25 @@ CVE_DATABASE: list = [
   CveEntry("weblogic", ">=12.1.3.0,<12.1.3.1", "CVE-2017-10271", Severity.HIGH, "XMLDecoder deserialization RCE via wls-wsat", "CWE-502"),
   CveEntry("weblogic", ">=10.3.6.0,<10.3.6.1", "CVE-2020-14882", Severity.CRITICAL, "Console unauthenticated takeover RCE", "CWE-306"),
   CveEntry("weblogic", ">=12.1.3.0,<12.2.1.5", "CVE-2020-14882", Severity.CRITICAL, "Console unauthenticated takeover RCE", "CWE-306"),
-  CveEntry("weblogic", ">=12.2.1.3,<12.2.1.4", "CVE-2023-21839", Severity.HIGH, "IIOP/T3 protocol deserialization RCE", "CWE-502"),
+  CveEntry("weblogic", ">=14.1.1.0,<14.1.1.1", "CVE-2020-14882", Severity.CRITICAL, "Console unauthenticated takeover RCE", "CWE-306"),
+  # Oracle lists 12.2.1.3.0, 12.2.1.4.0 and 14.1.1.0.0; 12.2.1.4 and 14.1.1 are the current KEV targets.
+  CveEntry("weblogic", ">=12.2.1.3,<12.2.1.5", "CVE-2023-21839", Severity.HIGH, "IIOP/T3 protocol deserialization RCE", "CWE-502"),
+  CveEntry("weblogic", ">=14.1.1.0,<14.1.2", "CVE-2023-21839", Severity.HIGH, "IIOP/T3 protocol deserialization RCE", "CWE-502"),
 
   # ── Apache Tomcat ────────────────────────────────────────────
   CveEntry("tomcat", ">=9.0.0,<9.0.31",   "CVE-2020-1938", Severity.CRITICAL, "Ghostcat: AJP connector file read/inclusion RCE", "CWE-20"),
   CveEntry("tomcat", ">=8.5.0,<8.5.51",   "CVE-2020-1938", Severity.CRITICAL, "Ghostcat: AJP connector file read/inclusion RCE", "CWE-20"),
   CveEntry("tomcat", ">=7.0.0,<7.0.100",  "CVE-2020-1938", Severity.CRITICAL, "Ghostcat: AJP connector file read/inclusion RCE", "CWE-20"),
   CveEntry("tomcat", ">=7.0.0,<7.0.81",   "CVE-2017-12615", Severity.HIGH, "PUT method JSP file upload RCE", "CWE-434"),
+  CveEntry("tomcat", ">=8.5.0,<=8.5.100", "CVE-2025-24813", Severity.CRITICAL, "Partial PUT deserialization RCE", "CWE-502"),
   CveEntry("tomcat", ">=9.0.0,<9.0.99",   "CVE-2025-24813", Severity.CRITICAL, "Partial PUT deserialization RCE", "CWE-502"),
   CveEntry("tomcat", ">=10.1.0,<10.1.35", "CVE-2025-24813", Severity.CRITICAL, "Partial PUT deserialization RCE", "CWE-502"),
+  CveEntry("tomcat", ">=11.0.0,<11.0.3",  "CVE-2025-24813", Severity.CRITICAL, "Partial PUT deserialization RCE", "CWE-502"),
 
   # ── JBoss Application Server ─────────────────────────────────
   CveEntry("jboss", ">=4.0,<7.0",   "CVE-2017-12149", Severity.CRITICAL, "Java deserialization RCE via /invoker/readonly", "CWE-502"),
+  # NVD: "Red Hat Jboss Application Server <= Jboss 4.X" (CPE up to 4.0, CNA "4.x").
+  CveEntry("jboss", "<5.0", "CVE-2017-7504", Severity.CRITICAL, "JbossMQ HTTP invocation layer deserialization RCE", "CWE-502"),
 
   # ── Spring Framework ─────────────────────────────────────────
   CveEntry("spring_framework", ">=5.3.0,<5.3.18", "CVE-2022-22965", Severity.CRITICAL, "Spring4Shell: ClassLoader manipulation RCE", "CWE-94"),
@@ -296,10 +358,19 @@ CVE_DATABASE: list = [
   CveEntry("jetty", ">=9.4.0,<9.4.51", "CVE-2023-40167", Severity.MEDIUM, "HTTP request smuggling via invalid Transfer-Encoding", "CWE-444"),
 
   # ── BIND (DNS) ──────────────────────────────────────────────────
-  CveEntry("bind", "<9.11.37",  "CVE-2022-2795", Severity.MEDIUM, "Flooding targeted resolver with queries DoS", "CWE-400"),
-  CveEntry("bind", "<9.16.33",  "CVE-2022-3080", Severity.HIGH, "TKEY assertion failure DoS on DNAME resolution", "CWE-617"),
-  CveEntry("bind", "<9.16.42",  "CVE-2023-2828", Severity.HIGH, "Cache exhaustion DoS via crafted queries", "CWE-770"),
-  CveEntry("bind", "<9.18.24",  "CVE-2023-4408", Severity.HIGH, "DNS message parsing CPU exhaustion DoS", "CWE-400"),
+  # One row per branch (NVD, ISC CNA). `-S` and `-P` editions sort after the plain release.
+  CveEntry("bind", ">=9.0.0,<9.16.33",  "CVE-2022-2795", Severity.MEDIUM, "Flooding targeted resolver with queries DoS", "CWE-400"),
+  CveEntry("bind", ">=9.18.0,<9.18.7",  "CVE-2022-2795", Severity.MEDIUM, "Flooding targeted resolver with queries DoS", "CWE-400"),
+  CveEntry("bind", ">=9.19.0,<9.19.5",  "CVE-2022-2795", Severity.MEDIUM, "Flooding targeted resolver with queries DoS", "CWE-400"),
+  CveEntry("bind", ">=9.16.14,<9.16.33",  "CVE-2022-3080", Severity.HIGH, "TKEY assertion failure DoS on DNAME resolution", "CWE-617"),
+  CveEntry("bind", ">=9.18.0,<9.18.7",  "CVE-2022-3080", Severity.HIGH, "TKEY assertion failure DoS on DNAME resolution", "CWE-617"),
+  CveEntry("bind", ">=9.19.0,<9.19.5",  "CVE-2022-3080", Severity.HIGH, "TKEY assertion failure DoS on DNAME resolution", "CWE-617"),
+  CveEntry("bind", ">=9.11.0,<9.16.42",  "CVE-2023-2828", Severity.HIGH, "Cache exhaustion DoS via crafted queries", "CWE-770"),
+  CveEntry("bind", ">=9.18.0,<9.18.16",  "CVE-2023-2828", Severity.HIGH, "Cache exhaustion DoS via crafted queries", "CWE-770"),
+  CveEntry("bind", ">=9.19.0,<9.19.14",  "CVE-2023-2828", Severity.HIGH, "Cache exhaustion DoS via crafted queries", "CWE-770"),
+  CveEntry("bind", ">=9.0.0,<9.16.46",  "CVE-2023-4408", Severity.HIGH, "DNS message parsing CPU exhaustion DoS", "CWE-400"),
+  CveEntry("bind", ">=9.18.0,<9.18.22",  "CVE-2023-4408", Severity.HIGH, "DNS message parsing CPU exhaustion DoS", "CWE-400"),
+  CveEntry("bind", ">=9.19.0,<9.19.20",  "CVE-2023-4408", Severity.HIGH, "DNS message parsing CPU exhaustion DoS", "CWE-400"),
   CveEntry("bind", "<9.11.31",  "CVE-2021-25216", Severity.CRITICAL, "GSSAPI SPNEGO buffer overflow RCE", "CWE-120"),
   CveEntry("bind", "<9.11.19",  "CVE-2020-8617", Severity.MEDIUM, "TSIG validity check assertion failure DoS", "CWE-617"),
   CveEntry("bind", "<9.10.4",   "CVE-2016-2776", Severity.HIGH, "Crafted query buffer.c assertion failure DoS", "CWE-617"),
