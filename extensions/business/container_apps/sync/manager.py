@@ -1852,6 +1852,12 @@ class SyncManager:
       The staged apply plan, or None when the record was refused, the download failed or the archive is
       unsafe; each of those is logged and quarantined.
 
+    Raises
+    ------
+    ValueError
+      Only inside this method: a tar member with a ``..`` part or outside the manifest's ``archive_paths``
+      raises it, and it is caught here, logged and quarantined. It does not reach the caller.
+
     Notes
     -----
     The key comes from this job's config, never from the record. With another secret R1FS cannot decrypt the
