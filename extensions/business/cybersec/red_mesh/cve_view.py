@@ -36,15 +36,52 @@ def _score(f):
   return value if isinstance(value, (int, float)) else -1.0
 
 
-def _is_closed(f, triage, now):
+def triage_record(f, triage):
+  """The host triage record of finding `f`: the map's, else the one embedded on the finding (an archive read
+  merges it there, a report build stamps it)."""
   record = (triage or {}).get(f.get("finding_id"))
+  return record if record is not None else f.get("triage")
+
+
+def effective_status(record, now):
+  """The status a record reads as: `accepted_risk` past `review_at` is `reopened` (the stored one is unchanged)."""
   status = record.get("status") if isinstance(record, dict) else record
+  if status == "accepted_risk":
+    review_at = record.get("review_at") if isinstance(record, dict) else None
+    if isinstance(review_at, (int, float)) and review_at <= now:
+      return "reopened"
+  return status
+
+
+def _is_closed(f, triage, now):
+  record = triage_record(f, triage)
+  status = effective_status(record, now)
   if status in CLOSED_STATUSES:
     return True
   if status != "accepted_risk":
     return False
   review_at = record.get("review_at") if isinstance(record, dict) else None
   return not isinstance(review_at, (int, float)) or review_at > now  # past `review_at` it reads `reopened`
+
+
+def apply_triage(findings, triage):
+  """`findings` with the host triage embedded as `triage`, and a confirmed tentative finding made certain.
+
+  A copy: the input is not touched. A record with `confirmed` on a tentative finding gives it
+  `confidence=certain`, `confidence_reason=triage_confirmed`, `verified_by=<actor>`; a stored archive is not
+  rewritten, so an archived pass keeps its score and the next rerun scores the finding certain.
+  """
+  result = []
+  for f in findings or ():
+    record = (triage or {}).get(f.get("finding_id")) if isinstance(f, dict) else None
+    if record is None:
+      result.append(f)
+      continue
+    f = {**f, "triage": record}
+    if isinstance(record, dict) and record.get("confirmed") is True and f.get("confidence") == "tentative":
+      f.update(confidence="certain", confidence_reason="triage_confirmed", verified_by=record.get("confirmed_by") or "")
+    result.append(f)
+  return result
 
 
 def _is_listed(f):

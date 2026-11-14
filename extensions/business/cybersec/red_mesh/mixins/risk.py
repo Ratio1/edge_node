@@ -21,7 +21,7 @@ from ..models.finding_identity import (
   dedup_key as _dedup_key,
   parse_cwe_list as _parse_cwe_list,
 )
-from ..cve_view import build_cve_view, is_view_finding, view_members
+from ..cve_view import apply_triage, build_cve_view, is_view_finding, view_members
 from ..constants import (
   RISK_SEVERITY_WEIGHTS,
   RISK_CONFIDENCE_MULTIPLIERS,
@@ -511,6 +511,8 @@ class _RiskScoringMixin:
     # RM-169, generated CVE findings only (`static` has no view): findings folded into a rollup or a possible row
     # leave the walk, and so do closed ones (the triage map). A rollup scores once, as its highest-severity member (that member's confidence); possible
     # findings add 0. Non-CVE tentative findings keep the 0.5 multiplier.
+    # The host triage map: a closed finding leaves the walk; a confirmed possible one is certain from here on.
+    flat_findings = apply_triage(flat_findings, triage)
     cve_view = build_cve_view(flat_findings, (aggregated_report.get("cves_not_applicable") or {}).values(), triage)
     scored = flat_findings
     if cve_view:

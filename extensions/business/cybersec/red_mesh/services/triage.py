@@ -1,6 +1,7 @@
 from copy import deepcopy
 from contextlib import ExitStack
 
+from ..cve_view import apply_triage
 from ..model_testing.artifacts import ModelTestArchive
 from ..model_testing.constants import is_model_test_job
 from ..models import FindingTriageAuditEntry, FindingTriageState, JobArchive, VALID_TRIAGE_STATUSES
@@ -52,6 +53,11 @@ def _find_archive_finding(archive: dict, finding_id: str):
   return None
 
 
+def _stamp(finding, triage):
+  # Embeds the record; a confirmed possible finding reads certain. The stored archive and its score are not rewritten.
+  finding.update(apply_triage([finding], {finding.get("finding_id"): triage})[0])
+
+
 def _merge_triage_into_archive_dict(archive: dict, triage_map: dict) -> dict:
   merged = deepcopy(archive)
   for pass_report in merged.get("passes", []) or []:
@@ -60,7 +66,7 @@ def _merge_triage_into_archive_dict(archive: dict, triage_map: dict) -> dict:
         continue
       triage = triage_map.get(finding.get("finding_id"))
       if triage:
-        finding["triage"] = triage
+        _stamp(finding, triage)
   ui = merged.get("ui_aggregate")
   if isinstance(ui, dict):
     for finding in ui.get("top_findings", []) or []:
@@ -68,7 +74,7 @@ def _merge_triage_into_archive_dict(archive: dict, triage_map: dict) -> dict:
         continue
       triage = triage_map.get(finding.get("finding_id"))
       if triage:
-        finding["triage"] = triage
+        _stamp(finding, triage)
   return merged
 
 
