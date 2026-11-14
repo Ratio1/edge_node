@@ -46,7 +46,11 @@ __VER__ = '0.3.5'
 _CONFIG = {
   **BasePlugin.CONFIG,
 
-  'PORT': None,
+  # A fixed port instead of a drawn one. With the generator seeded the same way on every node, this
+  # app drew 31731 everywhere; the value is kept, so whatever reaches the app on that local port (a
+  # tunnel ingress set to it) still does once the draws differ per node. A fixed port that is taken
+  # is retried every 5 s; it is not drawn again.
+  'PORT': 31731,
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   'REQUEST_TIMEOUT': 600,

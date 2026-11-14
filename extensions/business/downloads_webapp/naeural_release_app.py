@@ -23,6 +23,11 @@ RELEASES_CACHE_FILE = 'releases_history.pkl'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
+  # A fixed port instead of a drawn one. With the generator seeded the same way on every node, this
+  # app drew 30763 everywhere; the value is kept, so whatever reaches the app on that local port (a
+  # tunnel ingress set to it) still does once the draws differ per node. A fixed port that is taken
+  # is retried every 5 s; it is not drawn again.
+  'PORT': 30763,
   'ASSETS': 'plugins/business/fastapi/launcher_download',
   'JINJA_ARGS': {
     'html_files': [
