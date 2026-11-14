@@ -87,16 +87,23 @@ def _fix_version(product, members):
   return best[1] if best else None
 
 
+def _service_order(port, product):
+  """Numeric port order, a missing or non-numeric port last."""
+  return (0, port, product) if isinstance(port, int) else (1, 0, str(port), product)
+
+
 def _rollup(product, members):
   top = max(members, key=_score)
   score = _score(top)
   return {
     "fix_version": _fix_version(product, members),
     "cve_count": len(members),
-    "max_cvss": {"score": score if score >= 0 else None, "version": top.get("cvss_version") or None,
-                 "source": top.get("cvss_source") or None},
+    # Ranking and `max_cvss` stay on the v3 display label in v1; a 4.0 display ranking is RM-170.
+    "max_cvss": {"score": score if score >= 0 else None,
+                 "version": (top.get("cvss_version") or None) if score >= 0 else None,
+                 "source": (top.get("cvss_source") or None) if score >= 0 else None},
     "kev_count": sum(1 for f in members if f.get("kev") is True),
-    "member_finding_ids": [f["finding_id"] for f in members],
+    "member_finding_ids": sorted(f["finding_id"] for f in members),
   }
 
 
@@ -108,9 +115,9 @@ def _possible(members):
   top = sorted(members, key=_rank)[:MAX_POSSIBLE_TOP]
   return {
     "count": len(members),
-    "reasons": reasons,
+    "reasons": dict(sorted(reasons.items())),
     "top": [{"finding_id": f["finding_id"], "cve_id": f["cve"][0], "score": f.get("cvss_score")} for f in top],
-    "member_finding_ids": [f["finding_id"] for f in members],
+    "member_finding_ids": sorted(f["finding_id"] for f in members),
   }
 
 
@@ -120,6 +127,11 @@ def build_cve_view(findings, not_applicable=(), triage=None, now=None):
   `not_applicable`: the scan-local records of CVEs matched and skipped (client side, backport fixed), counted as
   `dropped`. `triage`: finding_id -> status or `{status, review_at}`; a closed member is counted in `closed` only.
   Conservation: `listed + rolled_up + possible + closed + dropped == raw` (`possible_kev` rows are inside `possible`).
+
+  Notes: with only `not_applicable` records and no generated finding the result is None (no view, no counts). In a
+  mixed job every collector record counts as `dropped`, whichever source made it. A finding whose description does
+  not parse forms the service `(port, "")`; one whose evidence has no constraint gives its rollup `fix_version` None.
+  The output does not depend on the input order.
   """
   now = time.time() if now is None else now
   items = [f for f in findings or () if is_view_finding(f) and f.get("finding_id")]
@@ -134,7 +146,7 @@ def build_cve_view(findings, not_applicable=(), triage=None, now=None):
       groups.setdefault((f.get("port"), _subject(f)[0]), []).append(f)
   services = []
   totals = {"listed": 0, "rolled_up": 0, "possible": 0}
-  for (port, product), members in sorted(groups.items(), key=lambda kv: (str(kv[0][0]), kv[0][1])):
+  for (port, product), members in sorted(groups.items(), key=lambda kv: _service_order(*kv[0])):
     firm = sorted((f for f in members if f.get("confidence") != "tentative"), key=_rank)
     tentative = [f for f in members if f.get("confidence") == "tentative"]
     candidates = [f for f in firm if _is_listed(f)]
@@ -144,7 +156,7 @@ def build_cve_view(findings, not_applicable=(), triage=None, now=None):
     services.append({
       "port": port,
       "product": product,
-      "version": _subject(members[0])[1],
+      "version": _subject(min(members, key=_rank))[1],
       "listed": [f["finding_id"] for f in listed],
       "rollup": _rollup(product, sorted(rest, key=_rank)) if rest else None,
       "possible": _possible(tentative) if tentative else None,

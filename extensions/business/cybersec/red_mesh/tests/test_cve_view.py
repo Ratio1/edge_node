@@ -59,6 +59,36 @@ class CveViewTests(unittest.TestCase):
     self.assertEqual(sorted(service["rollup"]["member_finding_ids"]), ["id0003", "id0004", "id0006"])
     self.assertEqual(view["counts"], {"raw": 6, "listed": 3, "rolled_up": 3, "possible": 0, "closed": 0, "dropped": 0})
 
+  def test_v2_entry_with_network_text_never_lists(self):
+    entry = [{"version": "2.0", "vector": "AV:N/PR:N/AV:N/PR:N", "score": 10.0, "source": "nvd"}]
+    view, service = self.one([fnd(1, cvss=entry, score=5.0)])
+    self.assertEqual(service["listed"], [])
+    self.assertEqual(service["rollup"]["max_cvss"]["version"], "3.1")
+
+  def test_order_epss_then_cve_id_and_missing_score_last(self):
+    findings = [fnd(3, epss=0.5), fnd(2, epss=0.5), fnd(1, epss=0.9), fnd(4, score=None, cvss=[
+      {"version": "3.1", "vector": NET, "score": 9.5, "source": "cna"}])]
+    _, service = self.one(findings)
+    self.assertEqual(service["listed"], ["id0001", "id0002", "id0003", "id0004"])
+
+  def test_no_score_gives_an_empty_max_cvss(self):
+    _, service = self.one([fnd(1, score=None, cvss=[], version="")])
+    self.assertEqual(service["rollup"]["max_cvss"], {"score": None, "version": None, "source": None})
+
+  def test_review_at_equal_to_now_is_reopened(self):
+    view, service = self.one([fnd(1)], triage={"id0001": {"status": "accepted_risk", "review_at": 1000}}, now=1000)
+    self.assertEqual((view["counts"]["closed"], service["listed"]), (0, ["id0001"]))
+
+  def test_possible_reasons_and_input_order(self):
+    findings = [fnd(1, confidence="tentative", reason="nvd_exact"), fnd(2, confidence="tentative", reason="banner_only"),
+                fnd(3, confidence="tentative", reason="banner_only", kev=True), fnd(4, score=5.0), fnd(5, score=4.0),
+                fnd(6, port=None), fnd(7, port=8080), fnd(8, port=443, product="nginx", ver="1.0")]
+    view, service = self.one(findings)
+    self.assertEqual(service["possible"]["reasons"], {"banner_only": 2, "nvd_exact": 1})
+    self.assertEqual([s["port"] for s in view["services"]], [80, 443, 8080, None])
+    self.assertEqual(view, build_cve_view(list(reversed(findings))))
+    self.assertEqual(build_cve_view(findings[:5])["services"][0]["version"], "1.5")
+
   def test_the_cut_reads_the_cvss_entry_not_the_label(self):
     other = [{"version": "3.1", "vector": NET, "score": 9.8, "source": "cna"}]
     _, service = self.one([fnd(1, score=7.5, cvss=other)])  # label 7.5, the CNA entry makes the cut
