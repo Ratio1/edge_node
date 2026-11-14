@@ -2289,8 +2289,8 @@ class TestSetSecret(unittest.TestCase):
     """With a secret the archive is added under it, the tag is the set tag and the record carries its MAC."""
     # Only the provider matters here.
     self._use_secret(provider=_SET_SECRET)
-    # A publish from a job with a secret.
-    record = self._publish(b"set-data", {"epoch": 1})
+    # A publish from a job with a secret; its metadata holds non-ASCII text, which the MAC must read escaped.
+    record = self._publish(b"set-data", {"epoch": 1, "name": "café"})
     # The archive key is the secret, and the tag says so.
     self.assertEqual(
       (self.r1fs.secrets[record["cid"]], record["manifest"]["encryption"]), (_SET_SECRET, "r1fs-set-v1"),
@@ -2308,6 +2308,8 @@ class TestSetSecret(unittest.TestCase):
       {"key": self.key, "record": {name: value for name, value in record.items() if name != "mac"}},
       sort_keys=True, separators=(",", ":"), ensure_ascii=True,
     )
+    # The non-ASCII letter is in the message as its \u escape, never as raw bytes.
+    self.assertIn("caf\\u00e9", message)
     # Its HMAC under the subkey, in hex.
     self.assertEqual(record["mac"], hmac.new(subkey, message.encode("ascii"), hashlib.sha256).hexdigest())
 
@@ -2657,8 +2659,9 @@ class TestSetSecret(unittest.TestCase):
     archive_key = hashlib.sha256(_SET_SECRET.encode("ascii")).hexdigest()
     # The MAC subkey.
     subkey = hmac.new(_SET_SECRET.encode("ascii"), b"r1en-volume-sync-record-v1", hashlib.sha256).hexdigest()
-    # The secret, the archive key in full and as its first 16 bytes, and the MAC subkey.
-    for needle in (_SET_SECRET, archive_key, archive_key[:32], subkey):
+    # The secret in full and as its first 8 characters, the archive key in full and as its first 16 bytes,
+    # and the MAC subkey.
+    for needle in (_SET_SECRET, _SET_SECRET[:8], archive_key, archive_key[:32], subkey):
       # In no file, no log line and no stored record.
       self.assertNotIn(needle, scanned)
 
@@ -2713,6 +2716,7 @@ class TestSetSecret(unittest.TestCase):
       ("NaN timestamp", newer, float("nan")),
       ("infinite timestamp", newer, float("inf")),
       ("400-digit int timestamp", newer, 10 ** 399),
+      ("400-digit negative int timestamp", newer, -(10 ** 399)),
     ]
     # Every case, one at a time.
     for label, version, timestamp in unusable:
@@ -2723,6 +2727,10 @@ class TestSetSecret(unittest.TestCase):
     # The control: the same CID with a newer, well-formed key passes the rule.
     self.assertEqual(
       self.sm_c.validate_record_for_apply(self._remac(rec_a, version=newer, timestamp=float(newer))), [],
+    )
+    # An int timestamp orders records too: the same control with the timestamp as an int.
+    self.assertEqual(
+      self.sm_c.validate_record_for_apply(self._remac(rec_a, version=newer, timestamp=newer)), [],
     )
     # The history entry written last and its file.
     path, entry, _ = max(

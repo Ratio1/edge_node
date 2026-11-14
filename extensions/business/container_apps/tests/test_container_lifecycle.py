@@ -1790,8 +1790,8 @@ class TestSyncSecretConfig(unittest.TestCase):
             (plugin.cfg_sync["ENABLED"], [text for _color, text in lines if "SYNC enabled" in text]), (False, []),
           )
           if secret != "":
-            # No line repeats the value (its first 32 characters stand for the whole).
-            self.assertEqual([text for _color, text in lines if str(secret)[:32] in text], [])
+            # No line repeats the value, not even its first 8 characters.
+            self.assertEqual([text for _color, text in lines if str(secret)[:8] in text], [])
           # The real env build.
           plugin._setup_env_and_ports()
           # The injection that follows every build.
@@ -1826,8 +1826,8 @@ class TestSyncSecretConfig(unittest.TestCase):
     self.assertEqual((plugin.cfg_sync["ENABLED"], len(greens)), (True, 1))
     # It names the set format.
     self.assertIn("encryption=r1fs-set-v1", greens[0])
-    # No line holds the secret or its first half.
-    self.assertEqual([text for _color, text in lines if self.VALID[:32] in text], [])
+    # No line holds the secret, not even its first 8 characters.
+    self.assertEqual([text for _color, text in lines if self.VALID[:8] in text], [])
     # The real env build copies the configured variable into the container env.
     plugin._setup_env_and_ports()
     # It is there before the injection.
