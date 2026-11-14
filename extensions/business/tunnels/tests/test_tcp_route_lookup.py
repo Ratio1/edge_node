@@ -1,7 +1,9 @@
 """The TCP route lookup answers "not found" for a port with no route and logs who asked."""
 import unittest
 
-from extensions.business.tunnels.tests.test_tunnels_manager_cloudflare_errors import make_plugin
+# The plugin class as the other tunnels tests load it: on their stand-in base class when these tests
+# run by themselves, on the real one when another test loaded it first. Both work here.
+from extensions.business.tunnels.tests.test_tunnels_manager_cloudflare_errors import TunnelsManagerPlugin
 
 
 CLIENT_IP = "203.0.113.7"
@@ -22,13 +24,19 @@ def _lookup_plugin(routes=None):
   tuple
     `(plugin, lines)`: the plugin stand-in and the list that receives `(text, color)` of every log call.
   """
-  plugin = make_plugin(requests=None)
+  # Only what a lookup reads is set, so the stand-in does not depend on which base class is loaded.
+  plugin = TunnelsManagerPlugin.__new__(TunnelsManagerPlugin)
+  # The name of the chain-store hash that holds the routes.
+  plugin.cfg_tcp_routes_hkey = ROUTES_HKEY
+  # A copy, so a test's dictionary is not shared with the stand-in.
+  stored = dict(routes or {})
+  # The local replica of the route registry: one record per port, keyed by the port as text.
+  plugin.chainstore_hget = lambda hkey, key: stored.get(str(key)) if hkey == ROUTES_HKEY else None
   lines = []
   # Every log call is kept with its colour: a red line is also copied to the error log.
   plugin.P = lambda text, *args, **kwargs: lines.append((text, kwargs.get("color")))
   # The address the web app holds for the request being handled.
   plugin.get_request_client_ip = lambda: CLIENT_IP
-  plugin._chainstore[ROUTES_HKEY] = dict(routes or {})
   return plugin, lines
 
 
