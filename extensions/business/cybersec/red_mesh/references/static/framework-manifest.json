@@ -1,0 +1,46 @@
+{
+  "schema": "redmesh.framework_manifest.v1",
+  "manifest_version": 1,
+  "packs": [
+    {
+      "pack_id": "ro.dnsc.o1-2026",
+      "version": 1,
+      "status": "active",
+      "supersedes": null,
+      "derived_from": null,
+      "scoring": "maturity_two_axis.v1",
+      "pack_schema": "redmesh.framework_pack.v1",
+      "text_schema": "redmesh.framework_text.v1",
+      "pack_sha256": "0b9e8c60011be5fbc447f5a89933586db750273f6752771df0fafb94d88e6a62",
+      "text_sha256": {"ro": "92fe6d9ed20ef5dfd63a32ad4dab375bcf3e991a749f4383d27bc74bbaeff8ec"},
+      "languages": ["ro"],
+      "licence": {
+        "id": "RO-OFFICIAL-ADMINISTRATIVE-TEXT",
+        "attribution": "DNSC Ordin 1/2026, Anexa 1 (MO 712 bis/2026-08-27, amended by MO 792/2026-09-18)",
+        "ship_text": true
+      },
+      "rules": {
+        "justification_required": true,
+        "exclusion_reason_required": true,
+        "remediation_on_fail": true,
+        "signoff_required": true,
+        "entity_fields": ["dnsc_unique_id", "external_supplier"],
+        "level_provenance_kinds": ["risk_score", "declared"],
+        "exports": ["json", "csv", "pdf", "eval_mms"]
+      },
+      "entries": [
+        {
+          "country": "RO",
+          "jurisdiction": null,
+          "sectors": [],
+          "legal_force": "mandatory",
+          "accepted_alternatives": [],
+          "source_url": "https://legislatie.just.ro/Public/DetaliiDocument/314360",
+          "legal_reference": "DNSC Ordin 1/2026, Anexa 1",
+          "verified_at": "2026-10-06",
+          "verified_by": "project-red-mesh:workbooks/redmesh-framework-pack (pinned official sources)"
+        }
+      ]
+    }
+  ]
+}

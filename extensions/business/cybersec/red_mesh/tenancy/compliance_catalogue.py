@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import unicodedata
 
+from ..references.framework_packs import pack_levels, pack_rules
 from . import compliance
 from .assets import canonical_uuid
 
@@ -92,11 +93,15 @@ def create_assessment(service, actor, tenant_id, pack_id, request_id, name, assu
   request_id = _request_id(request_id)
   try:
     name = compliance.normalize_name(name, required=True)
-    level = compliance.normalize_level(assurance_level)
-    if level is None:
+    level = compliance.normalize_level(assurance_level, pack)
+    if level is None and pack_levels(pack):  # a null level is accepted only for a pack with no levels
       raise compliance.AssessmentInvalid("invalid_level")
-    provenance = compliance.normalize_level_provenance(level_provenance if level_provenance is not None else {"kind": "declared"},
-                                                       actor=account.account_id)
+    if level is None and level_provenance is not None:  # no level, nothing to give a provenance for: refused
+      raise compliance.AssessmentInvalid("invalid_request")
+    if level_provenance is None and level is not None:
+      level_provenance = {"kind": "declared"}
+    provenance = compliance.normalize_level_provenance(level_provenance, actor=account.account_id,
+                                                       kinds=pack_rules(pack)["level_provenance_kinds"])
   except compliance.AssessmentInvalid as exc:
     raise compliance._denied(400, "assessment_invalid", errors=[exc.as_error()]) from None
   inputs = {"name": name, "assurance_level": level, "level_provenance": provenance}

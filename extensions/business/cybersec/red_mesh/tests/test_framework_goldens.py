@@ -60,7 +60,7 @@ def _record(name, row, pack, text):
     submission = {"revision": 1, "ref": {"store": "s", "ref": "r"}, "submitted_at": NOW, "actor": "initial",
                   "pack_acts": list(row["pack_acts"]), "assurance_level": "basic", "fingerprint": "f",
                   "request_id": PENDING["request_id"], "reopen_request_id": None,
-                  "verdict": compliance._verdict_summary(computed)}
+                  "verdict": scorer_for(pack).verdict_summary(computed)}
     row = {**row, "submissions": [submission]}
     view = compliance.assessment_view(row, pack, can_manage=True, tenant=TENANT)
   digest = compliance.intent_digest(row)

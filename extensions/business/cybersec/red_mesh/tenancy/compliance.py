@@ -21,14 +21,24 @@ import unicodedata
 from datetime import datetime, timezone
 
 from ..references.framework_packs import (
-  FRAMEWORK_LEVELS,
   FrameworkPackError,
   controls_for_level,
   list_framework_pack_ids,
   load_framework_pack,
   load_framework_text,
+  pack_levels,
+  pack_rules,
 )
-from ..services.framework_scoring import AXES, CAPS, NA, SCORE_VALUES, scorer_for, validate_scores
+from ..services.framework_scoring import (  # noqa: F401 - moved with the entry hooks; re-exported
+  CAPS,
+  JOB_REF,
+  AssessmentInvalid,
+  _EVIDENCE_REF,
+  bounded_text as _text,
+  scorer_for,
+  validate_scores,
+)
+from ..references import framework_packs
 from . import account_profile
 from .ports import TenantStoreError
 
@@ -44,10 +54,12 @@ MANAGE = "compliance_assessments:manage"
 PENDING_TTL_SECONDS = 15 * 60
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 MAX_SUBMISSIONS = 50  # revisions per assessment; checked when a submit starts, never on record or clear
-LEVEL_PROVENANCE_KINDS = ("risk_score", "declared")
 REMEDIATION_ITEM_MAX = 32
 TEXT_MAX = 200
 DNSC_ID_MAX = 64
+# Draft fields only some regimes accept (manifest `rules.entity_fields`), with their length caps.
+REGIME_FIELDS = {"dnsc_unique_id": DNSC_ID_MAX, "external_supplier": TEXT_MAX}
+assert tuple(REGIME_FIELDS) == framework_packs.REGIME_FIELDS  # the manifest loader checks `entity_fields` against these names
 NAME_MAX = 120
 
 
@@ -58,28 +70,6 @@ def normalize_name(value, *, required):
     raise AssessmentInvalid("invalid_request")
   return name
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
-# The `job:` grammar is one object: the evidence-ref validator and the ownership check in
-# `services/framework_evidence.py` share it, so a ref one accepts the other always sees.
-JOB_REF = re.compile(r"job:([A-Za-z0-9_-]{1,80}):[0-9]{1,6}\Z")
-_EVIDENCE_REF = re.compile(
-  r"(?:engagement:[A-Za-z0-9_-]{1,80}/document:ed_[0-9]{1,4}|contract"
-  r"|nis2:[A-Za-z0-9_-]{1,80}:[0-9]{1,6}|" + JOB_REF.pattern[:-2] + r")\Z")
-_REVIEW_STATES = ("linked",)
-
-
-class AssessmentInvalid(ValueError):
-  def __init__(self, code, ids=None, **extra):
-    super().__init__(code)
-    self.code = code
-    self.ids = sorted(ids) if ids else None
-    self.extra = extra
-
-  def as_error(self):
-    out = {"code": self.code}
-    if self.ids:
-      out["ids"] = self.ids
-    out.update(self.extra)
-    return out
 
 
 def _denied(status_code, error, **details):
@@ -94,17 +84,6 @@ def _now_iso():
 
 def _epoch():
   return int(datetime.now(timezone.utc).timestamp())
-
-
-def _text(value, limit, *, required=False):
-  if value is None:
-    value = ""
-  if not isinstance(value, str):
-    raise AssessmentInvalid("invalid_request")
-  value = value.strip()
-  if len(value) > limit or (required and not value):
-    raise AssessmentInvalid("invalid_request")
-  return value
 
 
 def _date(value, *, required=False):
@@ -122,7 +101,11 @@ def _date(value, *, required=False):
 
 
 def valid_pack_id(value):
-  return isinstance(value, str) and value in list_framework_pack_ids()
+  return isinstance(value, str) and value in list_framework_pack_ids(include_retired=True)
+
+
+def _acts(pack):
+  return list(pack.get("acts") or [])
 
 
 def pack_for(pack_id):
@@ -137,19 +120,20 @@ def pack_for(pack_id):
 # -- normalisation of caller input --------------------------------------------------------------
 
 
-def normalize_level(value):
+def normalize_level(value, pack):
+  """None is the unset level; a pack with no levels accepts no other value."""
   if value is None:
     return None
-  if value not in FRAMEWORK_LEVELS:
+  if value not in pack_levels(pack):
     raise AssessmentInvalid("invalid_level")
   return value
 
 
-def normalize_level_provenance(value, *, actor):
+def normalize_level_provenance(value, *, actor, kinds):
   """`declared_by` is the acting account (trusted boundary), never a client-supplied string."""
   if value is None:
     return None
-  if not isinstance(value, dict) or value.get("kind") not in LEVEL_PROVENANCE_KINDS:
+  if not isinstance(value, dict) or value.get("kind") not in kinds:
     raise AssessmentInvalid("invalid_request")
   out = {"kind": value["kind"]}
   score_value = value.get("score")
@@ -194,56 +178,6 @@ def normalize_remediation(value):
   return items
 
 
-def normalize_evidence_refs(value):
-  if value is None:
-    return []
-  if not isinstance(value, list) or len(value) > CAPS["evidence_refs"]:
-    raise AssessmentInvalid("evidence_ref_invalid")
-  refs = []
-  seen = set()
-  for entry in value:
-    ref = entry.get("ref") if isinstance(entry, dict) else entry
-    if not isinstance(ref, str) or not _EVIDENCE_REF.match(ref) or ref in seen:
-      raise AssessmentInvalid("evidence_ref_invalid")
-    state = entry.get("review_state", "linked") if isinstance(entry, dict) else "linked"
-    if state not in _REVIEW_STATES:
-      raise AssessmentInvalid("evidence_ref_invalid")
-    seen.add(ref)
-    refs.append({"ref": ref, "review_state": state})
-  return refs
-
-
-def _axis(value):
-  if value is None or value == NA:
-    return value
-  if type(value) is int and value in SCORE_VALUES:
-    return value
-  raise AssessmentInvalid("invalid_score_value")
-
-
-def normalize_score_entry(entry, *, actor, now):
-  """One control's entry as the caller sends it, with its justifications and references."""
-  if not isinstance(entry, dict):
-    raise AssessmentInvalid("invalid_score_value")
-  excluded = entry.get("excluded", False)
-  if type(excluded) is not bool:
-    raise AssessmentInvalid("invalid_score_value")
-  justification = entry.get("justification") or {}
-  if not isinstance(justification, dict):
-    raise AssessmentInvalid("invalid_request")
-  return {
-    "documentation": _axis(entry.get("documentation")),
-    "implementation": _axis(entry.get("implementation")),
-    "excluded": excluded,
-    "justification": {axis: _text(justification.get(axis), CAPS["justification"]) for axis in AXES},
-    "exclusion_justification": (_text(entry.get("exclusion_justification"), CAPS["exclusion_justification"])
-                                or None),
-    "evidence_refs": normalize_evidence_refs(entry.get("evidence_refs")),
-    "updated_by": actor,
-    "updated_at": now,
-  }
-
-
 # `control_not_in_level` is not a shape error: rule 1 says such a score does not count, and a level
 # change prunes the stored entries that fell outside the level (apply_patch).
 _SHAPE_ERRORS = frozenset({"unknown_level", "unknown_control", "invalid_score_value",
@@ -255,23 +189,29 @@ def apply_patch(row, patch, pack, *, actor, now):
   if not isinstance(patch, dict):
     raise AssessmentInvalid("invalid_request")
   allowed = {"assurance_level", "level_provenance", "sectoral_requirements", "completion_date",
-             "management_signoff", "remediation", "scores",
-             "dnsc_unique_id", "external_supplier", "name"}
+             "management_signoff", "remediation", "scores", "name", *REGIME_FIELDS}
   unknown = set(patch) - allowed
   if unknown:
     raise AssessmentInvalid("invalid_request", unknown_fields=sorted(unknown))
+  rules = pack_rules(pack)
+  foreign = [key for key in REGIME_FIELDS if key in patch and key not in rules["entity_fields"]]
+  if foreign:
+    raise AssessmentInvalid("field_not_in_regime", foreign)
   out = dict(row)
   if "assurance_level" in patch:
-    out["assurance_level"] = normalize_level(patch["assurance_level"])
+    out["assurance_level"] = normalize_level(patch["assurance_level"], pack)
   if "level_provenance" in patch:
-    out["level_provenance"] = normalize_level_provenance(patch["level_provenance"], actor=actor)
+    if patch["level_provenance"] is not None and not pack_levels(pack):
+      raise AssessmentInvalid("invalid_request")  # no levels, nothing to give a provenance for
+    out["level_provenance"] = normalize_level_provenance(patch["level_provenance"], actor=actor,
+                                                         kinds=rules["level_provenance_kinds"])
   if "sectoral_requirements" in patch:
     out["sectoral_requirements"] = _text(patch["sectoral_requirements"], CAPS["sectoral_requirements"])
   if "completion_date" in patch:
     out["completion_date"] = _date(patch["completion_date"])
   if "management_signoff" in patch:
     out["management_signoff"] = normalize_signoff(patch["management_signoff"])
-  for key, limit in (("dnsc_unique_id", DNSC_ID_MAX), ("external_supplier", TEXT_MAX)):
+  for key, limit in REGIME_FIELDS.items():
     if key in patch:
       value = _text(patch[key], limit)
       if value:
@@ -291,16 +231,11 @@ def apply_patch(row, patch, pack, *, actor, now):
     unknown_controls = [k for k in incoming if k not in known]
     if unknown_controls:
       raise AssessmentInvalid("unknown_control", unknown_controls)
-    for ref_id, entry in incoming.items():
+    for ref_id, entry in scorer_for(pack).normalise_patch(pack, rules, incoming, actor=actor, now=now).items():
       if entry is None:
         scores.pop(ref_id, None)
-        continue
-      try:
-        scores[ref_id] = normalize_score_entry(entry, actor=actor, now=now)
-      except AssessmentInvalid as exc:
-        if exc.ids is None:
-          raise AssessmentInvalid(exc.code, [ref_id], **exc.extra) from None
-        raise
+      else:
+        scores[ref_id] = entry
     out["scores"] = scores
   level = out.get("assurance_level")
   if level is not None:
@@ -311,7 +246,7 @@ def apply_patch(row, patch, pack, *, actor, now):
       first = shape[0]
       raise AssessmentInvalid(first["code"], first.get("ids"))
   # A draft follows the current acts of the pack; a submission records the acts it was scored under.
-  out["pack_acts"] = list(pack["acts"])
+  out["pack_acts"] = _acts(pack)
   return out
 
 
@@ -320,7 +255,7 @@ def apply_patch(row, patch, pack, *, actor, now):
 
 def new_row(tenant_id, pack, *, actor, now):
   return {
-    "tenant_id": tenant_id, "pack_id": pack["pack_id"], "pack_acts": list(pack["acts"]),
+    "tenant_id": tenant_id, "pack_id": pack["pack_id"], "pack_acts": _acts(pack),
     "assurance_level": None, "level_provenance": None, "sectoral_requirements": "",
     "completion_date": "", "management_signoff": None, "remediation": [],
     "state": "draft", "assessment_revision": 1, "reopened_from": None, "pending": None,
@@ -334,6 +269,10 @@ def _valid_ref(value):
           and isinstance(value.get("ref"), str) and value["ref"])
 
 
+def _levels_of(pack_id):
+  return pack_levels(load_framework_pack(pack_id))
+
+
 def validate_framework_assessment(row, ids):
   """Refuse a stored row the operations could not have written. Unknown fields are kept."""
   if (not isinstance(row, dict) or len(ids) not in (2, 3) or row.get("tenant_id") != ids[0]
@@ -341,7 +280,7 @@ def validate_framework_assessment(row, ids):
       or ("assessment_id" in row and len(ids) == 2)
       or row.get("pack_id") != ids[1] or not valid_pack_id(ids[1])
       or not isinstance(row.get("pack_acts"), list)
-      or (row.get("assurance_level") is not None and row["assurance_level"] not in FRAMEWORK_LEVELS)
+      or (row.get("assurance_level") is not None and row["assurance_level"] not in _levels_of(ids[1]))
       or row.get("state") not in STATES
       or type(row.get("assessment_revision")) is not int or row["assessment_revision"] < 1
       or not (row.get("reopened_from") is None or type(row["reopened_from"]) is int)
@@ -351,8 +290,9 @@ def validate_framework_assessment(row, ids):
       or not (row.get("pending") is None or isinstance(row["pending"], dict))
       or not all(isinstance(row.get(key), str) for key in ("created_by", "created_at", "updated_by", "updated_at"))):
     raise ValueError("Invalid framework assessment record")
-  for entry in row["scores"].values():
-    if not isinstance(entry, dict) or not isinstance(entry.get("justification"), dict):
+  pack = load_framework_pack(ids[1])
+  for ref_id, entry in row["scores"].items():
+    if scorer_for(pack).validate_stored_entry(pack, ref_id, entry):
       raise ValueError("Invalid framework assessment score")
   revisions = []
   for sub in row["submissions"]:
@@ -360,7 +300,7 @@ def validate_framework_assessment(row, ids):
         or not _valid_ref(sub.get("ref")) or not isinstance(sub.get("request_id"), str)
         or not isinstance(sub.get("fingerprint"), str) or not isinstance(sub.get("verdict"), dict)
         or not isinstance(sub.get("actor"), str) or not isinstance(sub.get("submitted_at"), str)
-        or not isinstance(sub.get("pack_acts"), list) or sub.get("assurance_level") not in FRAMEWORK_LEVELS):
+        or not isinstance(sub.get("pack_acts"), list) or sub.get("assurance_level") not in (_levels_of(ids[1]) or (None,))):
       raise ValueError("Invalid framework assessment submission")
     revisions.append(sub["revision"])
   if revisions != list(range(1, len(revisions) + 1)):
@@ -451,14 +391,6 @@ def verify_snapshot_envelope(envelope, *, tenant_id, pack_id, revision, assessme
   return envelope["snapshot"]
 
 
-def _verdict_summary(computed):
-  verdict = computed["verdict"]
-  return {"passed": verdict["passed"], "total": verdict["total"],
-          "failing_key_measures": list(verdict["failing_key_measures"]),
-          "failing_categories": list(verdict["failing_categories"]),
-          "total_failed": verdict["total_failed"]}
-
-
 def name_resolver(service):
   """Account id -> the person's full name, read at view time and never stored (a renamed person
   shows the new name). One lookup per distinct id. None when the account or its profile is missing,
@@ -502,33 +434,38 @@ def pack_view(pack, text, level):
   with the official text, plus the titles and the five maturity definitions. Only `get` carries it:
   a save or reopen answer leaves it out, the client keeps the copy it loaded."""
   controls = controls_for_level(pack, level) if level else pack["controls"]
-  return {
+  texts = text.get("controls") or {}  # a pack's text is optional, per control too
+  view = {
     "controls": [{
-      "refId": c["ref_id"], "order": c["order"], "category": c["category"], "subcategory": c["subcategory"],
-      "entryLevel": c["entry_level"], "keyMeasure": c["key_measure"], "managementAspect": c["management_aspect"],
-      "requirement": text["controls"][c["ref_id"]]["requirement"],
-      "guidance": text["controls"][c["ref_id"]]["guidance"],
+      "refId": c["ref_id"], "order": c["order"], "category": c.get("category"), "subcategory": c.get("subcategory"),
+      "entryLevel": c.get("entry_level"), "keyMeasure": c.get("key_measure"),
+      "managementAspect": c.get("management_aspect"),
+      "requirement": texts.get(c["ref_id"], {}).get("requirement"),
+      "guidance": texts.get(c["ref_id"], {}).get("guidance"),
     } for c in controls],
-    "functions": dict(text["functions"]),
-    "categories": {k: dict(v) for k, v in text["categories"].items()},
-    "subcategories": {k: dict(v) for k, v in text["subcategories"].items()},
-    "maturityLevels": [dict(m) for m in text["maturity_levels"]],
-    "language": text["language"],
+    "functions": dict(text.get("functions") or {}),
+    "categories": {k: dict(v) for k, v in (text.get("categories") or {}).items()},
+    "subcategories": {k: dict(v) for k, v in (text.get("subcategories") or {}).items()},
+    "maturityLevels": [dict(m) for m in text.get("maturity_levels") or []],
+    "language": text.get("language") or pack["language"],
     "catalogue": pack["catalogue"],
   }
+  if "hierarchy" in text:  # the generic hierarchy of any depth (contract §Pack and text schema)
+    view["hierarchy"] = [dict(n) for n in text["hierarchy"]]
+  return view
 
 
 def assessment_view(row, pack, *, can_manage, text=None, names=_no_names, tenant=None):
   """The DTO. Never a document reference. With `text`, the pack view rides along (reads only)."""
   level = row.get("assurance_level")
-  scorer = scorer_for(pack)
-  computed = scorer.compute(pack, level, row.get("scores") or {}) if level else None
-  submit_errors = scorer.validate_for_submit(pack, {}, level, row)[0] if level else [{"code": "level_missing"}]
+  scorer, ready = scorer_for(pack), bool(level) or not pack_levels(pack)  # no level is fine for a tier-less pack only
+  computed = scorer.compute(pack, level, row.get("scores") or {}) if ready else None
+  submit_errors = scorer.validate_for_submit(pack, pack_rules(pack), level, row)[0] if ready else [{"code": "level_missing"}]
   return {
     "pack": pack_view(pack, text, level) if text is not None else None,
     "tenantId": row["tenant_id"], "packId": row["pack_id"], "assessmentId": row.get("assessment_id") or DEFAULT_ID,
     "name": row.get("name") or "", "archived": bool(row.get("archived")), "packActs": list(row["pack_acts"]),
-    "currentPackActs": list(pack["acts"]), "stale": {"newerPackActs": list(row["pack_acts"]) != list(pack["acts"])},
+    "currentPackActs": _acts(pack), "stale": {"newerPackActs": list(row["pack_acts"]) != _acts(pack)},
     "assuranceLevel": level, "levelProvenance": row.get("level_provenance"),
     "sectoralRequirements": row.get("sectoral_requirements", ""),
     "completionDate": row.get("completion_date", ""), "managementSignoff": row.get("management_signoff"),
@@ -599,7 +536,7 @@ def get_assessment(service, actor, tenant_id, pack_id, include_pack=True, assess
   text = None
   if include_pack:
     try:
-      text = load_framework_text(pack_id)
+      text = load_framework_text(pack_id) or {}
     except FrameworkPackError as exc:
       raise TenantStoreError("Framework pack text unavailable") from exc
   row = _row(service, tenant_id, pack_id, assessment_id) or new_row(tenant_id, pack, actor=account.account_id, now=_now_iso())
@@ -669,8 +606,7 @@ def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revis
     # A pending written before the key existed resumes as it always did.
     if "claimant_digest" in pending and pending["claimant_digest"] != claimant_digest(tenant):
       raise _denied(409, "conflict")
-    level = row["assurance_level"]
-    computed = scorer_for(pack).compute(pack, level, row["scores"])
+    computed = scorer_for(pack).compute(pack, row["assurance_level"], row["scores"])
     return {"outcome": "resume", "revision": pending["revision"],
             "assessment_revision": row["assessment_revision"],
             "envelope": build_snapshot(row, tenant, computed, pending)}
@@ -682,13 +618,13 @@ def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revis
   if len(row["submissions"]) >= MAX_SUBMISSIONS:
     raise _denied(409, "submission_limit")
   level = row.get("assurance_level")
-  if level is None:
+  if level is None and pack_levels(pack):
     raise _denied(400, "assessment_invalid", errors=[{"code": "level_missing"}])
-  errors, computed = scorer_for(pack).validate_for_submit(pack, {}, level, row)
+  errors, computed = scorer_for(pack).validate_for_submit(pack, pack_rules(pack), level, row)
   if errors:
     raise _denied(400, "assessment_invalid", errors=errors)
-  if list(row["pack_acts"]) != list(pack["acts"]):
-    raise _denied(409, "assessment_pack_stale", current_pack_acts=list(pack["acts"]))
+  if list(row["pack_acts"]) != _acts(pack):
+    raise _denied(409, "assessment_pack_stale", current_pack_acts=_acts(pack))
   pending = {"request_id": request_id, "actor": account.account_id, "intent_digest": digest,
              "revision": latest_revision(row) + 1, "submitted_at": _now_iso(), "started_at": _epoch(),
              "claimant_digest": claimant_digest(tenant)}
@@ -737,7 +673,7 @@ def record_submit(service, actor, tenant_id, pack_id, request_id, ref, expected_
     "submitted_at": pending["submitted_at"], "actor": account.account_id,
     "pack_acts": list(row["pack_acts"]), "assurance_level": row["assurance_level"],
     "fingerprint": pending["intent_digest"], "request_id": request_id, "reopen_request_id": None,
-    "verdict": _verdict_summary(computed),
+    "verdict": scorer_for(pack).verdict_summary(computed),
   }
   updated = _stamp({**row, "state": "submitted", "pending": None,
                     "submissions": [*row["submissions"], submission]}, account.account_id)
