@@ -122,7 +122,9 @@ class _DeploymentOperationsMixin:
     holds the last confirmed send of each snapshot, so an unchanged snapshot
     is no longer re-sent on every 2 s pass. `_verified_operation_records`, a FIFO cache,
     holds the fingerprints of the records whose signature was already checked
-    and found valid (see `_verify_operation_record`). `_custody_retry` holds,
+    and found valid (see `_verify_operation_record`); its lock and
+    `_verified_operation_records_dropped`, the count of fingerprints dropped
+    from it since the start, sit next to it. `_custody_retry` holds,
     per operation out of the "preparing" phase with a failed dAuth custody
     call since its last pass without an error, how long the worker waits
     before calling dAuth again (see `_reconcile_coordinator_operations`).
@@ -167,6 +169,9 @@ class _DeploymentOperationsMixin:
     self._verified_operation_records = OrderedDict()
     # The worker thread and the plugin thread both look up and insert: one lock for the cache.
     self._verified_operation_records_lock = threading.Lock()
+    # Fingerprints dropped from the full cache since the start, changed under the lock above: every 10,000th drop
+    # makes one red line, the only sign that more valid records are alive than the cache holds.
+    self._verified_operation_records_dropped = 0
     # Operation id -> (failures in a row, time of the last one, seconds to wait) after a failed dAuth custody
     # call: the worker waits that long before it calls the same dAuth server again, instead of every 2 s.
     self._custody_retry = {}
@@ -232,6 +237,10 @@ class _DeploymentOperationsMixin:
     A lock protects lookups and insertion/eviction shared by the worker and plugin threads.
     Signature verification runs outside the lock, so concurrent misses can check the same record
     more than once; membership is checked again before insertion to avoid unnecessary eviction.
+    Evictions are counted under the same lock; every 10,000th eviction since the start makes one
+    red line, logged after the lock is released, so 10,000 evictions lie between two lines. If the
+    line repeats on every pass, more than 10,000 valid records are alive and every record is checked
+    again on every pass.
 
     Examples
     --------
@@ -257,6 +266,8 @@ class _DeploymentOperationsMixin:
       # The full check, as before: a valid signature made by the address the record names as its writer.
       valid = bool(verification.valid and record.get("EE_SENDER") == record[signer_key])
       if valid:
+        # Set under the lock below when this insertion makes the 10,000th drop since the last red line.
+        log_replaced = False
         # Insert under the cache lock, so the size check, the drop and the insert are one step.
         with self._verified_operation_records_lock:
           # Another thread may have verified and inserted this fingerprint while the lock was released.
@@ -264,8 +275,15 @@ class _DeploymentOperationsMixin:
             if len(self._verified_operation_records) >= 10000:
               # At capacity drop only the oldest insertion, so the other cached checks are kept.
               self._verified_operation_records.popitem(last=False)
+              # Count the drop with the cache, under its lock, so two threads never lose one.
+              self._verified_operation_records_dropped += 1
+              # One line per 10,000 drops: often enough to see a cache that is too small, never once per drop.
+              log_replaced = self._verified_operation_records_dropped % 10000 == 0
             # Remember only records that passed; retain the other cached verifications at capacity.
             self._verified_operation_records[fingerprint] = True
+        if log_replaced:
+          self.P("Replaced 10,000 remembered Deeploy record fingerprints. If this line repeats on every pass, more "
+                 "than 10,000 valid records are alive and every record is checked again.", color='r')
       # The outcome of the full check; a record that failed it was not remembered above.
       return valid
     except Exception:
