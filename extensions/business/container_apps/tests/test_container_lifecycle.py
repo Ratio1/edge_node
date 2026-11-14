@@ -767,24 +767,38 @@ class TestLifecycleStaleContainer(unittest.TestCase):
   """Test _ensure_no_stale_container()."""
 
   def test_removes_stale_running_container(self):
+    """A running container with the app's name is force-removed before a start, with its anonymous volumes."""
+    # An app with no container of its own yet.
     plugin, client, _ = make_lifecycle_runner()
+    # A container an earlier run left running under the app's name.
     stale = make_mock_container(status="running")
+    # Docker finds it by that name ...
     client.containers.get.side_effect = None
+    # ... and hands it over.
     client.containers.get.return_value = stale
 
+    # The guard that runs before every start.
     plugin._ensure_no_stale_container()
 
-    stale.remove.assert_called_once_with(force=True)
+    # Forced, because it runs; with its volumes (v), which no later container would ever get.
+    stale.remove.assert_called_once_with(force=True, v=True)
 
   def test_removes_stale_exited_container(self):
+    """A stopped container with the app's name is removed before a start, with its anonymous volumes."""
+    # An app with no container of its own yet.
     plugin, client, _ = make_lifecycle_runner()
+    # A container a killed node left, stopped, in the Docker store that is kept across node restarts.
     stale = make_mock_container(status="exited")
+    # Docker finds it by that name ...
     client.containers.get.side_effect = None
+    # ... and hands it over.
     client.containers.get.return_value = stale
 
+    # The guard that runs before every start.
     plugin._ensure_no_stale_container()
 
-    stale.remove.assert_called_once_with(force=True)
+    # With its volumes (v): without that, each node restart left one more volume per app in the kept store.
+    stale.remove.assert_called_once_with(force=True, v=True)
 
   def test_noop_when_no_stale_container(self):
     plugin, client, _ = make_lifecycle_runner()

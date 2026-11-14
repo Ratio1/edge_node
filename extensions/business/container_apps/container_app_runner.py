@@ -2741,6 +2741,22 @@ class ContainerAppRunnerPlugin(
     of its state (running, stopped, created). This is a guardrail for deterministic
     container naming -- it handles crash recovery, incomplete cleanup, and any state
     where self.container is None but a Docker container still exists.
+
+    Returns
+    -------
+    None
+      A failed removal is logged, not raised; the start that follows then fails on the name that is still taken.
+
+    Notes
+    -----
+    The node's Docker store is kept across node restarts, so the container a killed node left is still there at
+    the next start, with the anonymous volumes Docker created for it (one per `VOLUME` of the image that no
+    configured app volume covers). The container is removed together with those volumes: the runner never gives
+    them to a later container, and left behind they would add up, one set per node restart, until the store sweep.
+
+    Examples
+    --------
+    >>> self._ensure_no_stale_container()   # before every `containers.run`; does nothing when the name is free
     """
     try:
       stale = self.docker_client.containers.get(self.container_name)
@@ -2748,7 +2764,9 @@ class ContainerAppRunnerPlugin(
         f"Found stale container '{self.container_name}' "
         f"(id={stale.short_id}, status={stale.status}), removing..."
       )
-      stale.remove(force=True)
+      # Forced, whatever its state, and with its anonymous volumes (v): no later container gets them. Without v,
+      # every node restart left one more set of them in the kept store.
+      stale.remove(force=True, v=True)
       self.P("Stale container removed.")
     except docker.errors.NotFound:
       pass
@@ -2894,6 +2912,14 @@ class ContainerAppRunnerPlugin(
     -----
     If no container exists, logs a warning and returns.
     Clears container and container_id attributes after successful removal.
+    The container is removed with its anonymous volumes (one per `VOLUME` of the image that no configured app
+    volume covers). The next container gets new ones, so the old ones would only fill the node's Docker store,
+    which is kept across node restarts. App volumes are host folders and are not touched.
+
+    Examples
+    --------
+    >>> self.stop_container()   # a running app: stopped within 5 s, removed, `self.container` is None
+    True
     """
     if not self.container:
       self.P("No container to stop", color='r')
@@ -2913,7 +2939,9 @@ class ContainerAppRunnerPlugin(
 
     try:
       self.P(f"Removing container {self.container.short_id}...")
-      self.container.remove()
+      # With its anonymous volumes (v): a later container never gets them, and without v each restart or update of
+      # the app left one more set in the kept store until the next store sweep.
+      self.container.remove(v=True)
       self.P(f"Container {self.container.short_id} removed successfully")
     except Exception as e:
       removed_ok = False

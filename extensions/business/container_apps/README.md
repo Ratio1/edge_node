@@ -379,7 +379,9 @@ because the disk API of plugin code refuses that folder (the core's `RESTRICTED_
   the start) compares the registry's image with the one the container runs and restarts the app when the tag
   moved while the node was down, so such an app starts twice.
 - **Leftover container:** a container with the app's name that an earlier run left is removed before every
-  start.
+  start. Every container the runner removes (at that point, at a stop, a restart or an update) goes with its
+  anonymous volumes: the volumes Docker creates for a `VOLUME` of the image that no app volume covers. Data
+  an app must keep belongs in a configured app volume.
 - **Sweep:** one hour into each node run, one app removes from the store the stopped containers of earlier
   runs, the anonymous volumes no container holds and every image no container uses. An app without a
   container at that moment (stopped by hand, waiting for another app) pulls its image at its next start. An

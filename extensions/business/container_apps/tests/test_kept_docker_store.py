@@ -5,7 +5,8 @@ Before, the store of the node's inner Docker daemon was deleted with the node co
 started from a fresh pull and nothing was ever left behind. With the store kept (`docker/daemon.json`):
 - an app with AUTOUPDATE starts from the stored image, which its tag may have left, so the first update check must
   compare the registry's image with the image the container runs;
-- what earlier runs left in the store is removed once per node run (`_maybe_sweep_docker_store`).
+- what earlier runs left in the store is removed once per node run (`_maybe_sweep_docker_store`);
+- a container the runner removes takes its anonymous volumes with it, so they do not pile up between two sweeps.
 """
 
 # Loads the runner module a second time, as the node does for every plugin instance.
@@ -149,6 +150,21 @@ class TestUpdateCheckBaselineIsTheRunningImage(unittest.TestCase):
     self.assertFalse(plugin._has_image_hash_changed(None))
     # Still unset: the next check reads it from the running container.
     self.assertIsNone(plugin.current_image_hash)
+
+
+class TestRemovedContainerTakesItsAnonymousVolumes(unittest.TestCase):
+  """A container the runner removes at a stop or restart leaves no anonymous volume behind in the kept store."""
+
+  def test_a_stopped_app_container_is_removed_with_its_anonymous_volumes(self):
+    """Stop and restart remove the container with `v`: its anonymous volumes go with it and do not wait for a sweep."""
+    # A running app; its image may declare a volume that no configured app volume covers.
+    plugin, _client = make_running_runner(make_image("sha256:same"))
+    # The container that is about to be stopped: the runner forgets it once it is removed.
+    container = plugin.container
+    # Stop and remove, as every restart and every update of the app does.
+    self.assertTrue(plugin.stop_container())
+    # With its volumes: the next container gets new ones, so the old ones would only fill the kept store.
+    container.remove.assert_called_once_with(v=True)
 
 
 class TestDockerStoreSweep(unittest.TestCase):
