@@ -48,7 +48,43 @@ def find_infra_repo(explicit=None):
 # ---------------------------------------------------------------- brokers
 
 def render_brokers(home, infra_repo, overrides=None, nofile=1024):
-  """Render the mainnet bridge mesh for four local brokers. Returns {'brokers': {...}, 'secrets': {...}}."""
+  """
+  Render the mainnet bridge mesh for four local brokers.
+
+  The broker configuration is rendered by the infra repository's lab code; each broker's ``etc``
+  folder is copied out of a created (never started) broker container, then overlaid.
+
+  Parameters
+  ----------
+  home : Home
+    Folder layout of the localnet; output goes under ``run/brokers``.
+  infra_repo : Path or None
+    Checkout of the infra repository (``R1_INFRA_REPO``).
+  overrides : dict or None
+    Settings passed to the lab renderer.
+  nofile : int
+    Broker file-descriptor limit.
+
+  Returns
+  -------
+  dict
+    ``brokers`` (ip, node name, peers per broker), ``secrets`` and ``nofile``.
+
+  Raises
+  ------
+  LocalnetError
+    No infra repository.
+
+  Notes
+  -----
+  The broker image declares two volumes; the copy container is removed with ``-v`` so that they go
+  with it (without it every ``init`` left two anonymous volumes behind).
+
+  Examples
+  --------
+  >>> render_brokers(home, Path('/path/to/ratio1-cyber-infra'))['brokers']['emqx-a']['ip']
+  '172.31.90.11'
+  """
   if infra_repo is None:
     raise LocalnetError(
       'the ratio1-cyber-infra repository is needed to render the mainnet broker mesh '
@@ -65,7 +101,8 @@ def render_brokers(home, infra_repo, overrides=None, nofile=1024):
   for leftover in ('compose.yml', 'lab.json'):
     (out / leftover).unlink(missing_ok=True)
   seed = container('emqx-etc-seed')
-  sh('docker', 'rm', '-f', seed, check=False)
+  # With -v: the image's declared volumes (data, log) are removed with the container.
+  sh('docker', 'rm', '-f', '-v', seed, check=False)
   sh('docker', 'create', '--name', seed, '--label', LABEL + '=tool', EMQX_IMAGE)
   try:
     for broker in BROKERS:
@@ -80,7 +117,8 @@ def render_brokers(home, infra_repo, overrides=None, nofile=1024):
         (bdir / sub).mkdir(exist_ok=True)
         os.chmod(bdir / sub, 0o777)
   finally:
-    sh('docker', 'rm', '-f', seed, check=False)
+    # With -v, as above: nothing of the copy container stays behind.
+    sh('docker', 'rm', '-f', '-v', seed, check=False)
   # Nodes verify the broker certificate. On mainnet the SDK ships one self-signed certificate per broker
   # address; here the node gets the same kind of certificates as its trusted set (SSL_CERT_FILE).
   bundle = ''.join((out / broker / 'etc' / 'certs' / 'cert.pem').read_text() for broker in BROKERS)
