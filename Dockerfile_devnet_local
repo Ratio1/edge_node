@@ -60,16 +60,28 @@ WORKDIR /edge_node
 ENV AINODE_DOCKER=Yes
 ENV AINODE_DOCKER_SOURCE=develop
 ENV EE_DD=1
+# The base image must bring no settings file for its Docker daemon: the copy below would replace it without a word
+# and what it set would be lost on every node. Fail the build instead.
+RUN test ! -e /etc/docker/daemon.json
 # Keep the store of the inner Docker daemon (images, containers, volumes) in the directory this file names, under
 # the mounted /edge_node/_local_cache, so app images survive a node restart. Before, the store was /var/lib/docker on
 # this container's own layer, deleted at every stop: every app image was pulled again at every start (9-54 s per app).
 # The directory is in the cache's `_bin` folder, which the disk API of plugin code refuses: the store holds every
 # app's environment, layers and logs, and a delete of it would remove every app's image.
 COPY ./edge_node/docker/daemon.json /etc/docker/daemon.json
-# Fail the build, not a node: dockerd must accept that file, and the store directory is named after the Docker major
-# that writes it. A base image with another major needs a new directory name there and here, so that a node rolled
-# back to an older image never reads a store written by another Docker major.
-RUN dockerd --validate && dockerd --version | grep -q "^Docker version 29\."
+# Fail the build, not a node: dockerd must accept that file together with the flags the base image entrypoint
+# passes, because an option set both as a flag and in the file stops dockerd, and so the node, at every start.
+# --tlsverify is left out (its certificates exist only on a started node); `tls` or `tlsverify` in the file fail
+# this step for the same reason.
+RUN dockerd --validate --host=unix:///var/run/docker.sock --storage-driver=vfs --tlscacert=/certs/server/ca.pem --tlscert=/certs/server/cert.pem --tlskey=/certs/server/key.pem
+# The entrypoint itself must not set the store directory (dockerd would refuse the two) and must not name another
+# settings file (this one would not be read). The count of such lines must be exactly 0, so a base image without
+# this entrypoint file fails here too.
+RUN grep -cE -- '--(data-root|config-file)' /usr/local/bin/entrypoint.sh | grep -qx 0
+# The store directory is named after the Docker major that writes it. A base image with another major needs a new
+# directory name there and here, so that a node rolled back to an older image never reads a store written by
+# another Docker major.
+RUN dockerd --version | grep -q "^Docker version 29\."
 ENV EE_ID=E2dkr
 ENV AINODE_ENV=$AI_ENV
 ENV AINODE_ENV_VER=$AI_ENV_VER
