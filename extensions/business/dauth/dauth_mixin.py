@@ -1338,7 +1338,7 @@ class _DauthMixin(object):
     'Node not allowed to request auth data. node 0xUnlinked not allowed on mainnet'
     """
     error = None
-    # A refusal is logged in red unless it is the server's verdict on the node (set below).
+    # A refusal is logged in red unless it is the server's verdict on the requester (set below).
     refusal_color = 'r'
     _non_critical_error = None
     requester_eth = None
