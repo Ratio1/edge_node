@@ -324,6 +324,98 @@ class TestContainerApps(unittest.TestCase):
     finally:
       apps.sync_state, apps.chain_record, apps.app_file, apps.node_log = saved
 
+  def test_sync_check_waits_while_the_provider_wrote_its_next_file(self):
+    """A provider app that keeps publishing writes its next file before that publish is in its history: the check looks again instead of failing, and passes once the provider's history and file and the consumer's agree."""
+    from lnlib import apps
+    # Each look's provider history: first two publishes, then the third.
+    sent = [{'cid': 'Qm1', 'published_timestamp': 100.0}, {'cid': 'Qm2', 'published_timestamp': 200.0}]
+    third = {'cid': 'Qm3', 'published_timestamp': 300.0}
+    # The consumer applied Qm2 at 230; Qm3 at 320, once the provider published it.
+    applied = [{'cid': 'Qm2', 'applied_timestamp': 230.0}]
+    # The provider's file in each look: already "payload 3" while only Qm2 is in its history.
+    provider_files = ['payload 3\n', 'payload 3\n']
+    # The consumer's file in each look: "payload 2", then "payload 3" after the next apply.
+    consumer_files = ['payload 2\n', 'payload 3\n']
+    looks = []
+
+    def state(name, key):
+      """
+      The fixed node reads of one look: the second look of the provider sees the third publish.
+
+      Parameters
+      ----------
+      name : str
+        Node name.
+      key : str
+        Sync key (unused).
+
+      Returns
+      -------
+      dict
+        The node's sent and received history, quarantine and downloads.
+
+      Examples
+      --------
+      >>> state('r1w-01', 'k')['sent'][-1]['cid']
+      'Qm2'
+      """
+      if name == 'r1w-01':
+        # Counted per provider read: the first look and every later one.
+        looks.append(1)
+        if len(looks) == 2:
+          # Between the two looks the provider published Qm3 and the consumer applied it.
+          sent.append(third)
+          applied.append({'cid': 'Qm3', 'applied_timestamp': 320.0})
+        return {'sent': list(sent), 'received': [], 'quarantine': [], 'downloads': []}
+      # The consumer's history as it stands.
+      return {'sent': [], 'received': list(applied), 'quarantine': [], 'downloads': []}
+
+    def read_file(name, image, key, path):
+      """
+      The fixed file reads, in call order per node.
+
+      Parameters
+      ----------
+      name : str
+        Node name.
+      image, key, path : str
+        Unused.
+
+      Returns
+      -------
+      dict
+        The app's file text and its digest (the text itself).
+
+      Examples
+      --------
+      >>> read_file('r1w-01', 'img', 'k', '/data/payload.txt')['text']
+      'payload 3\\n'
+      """
+      # Provider and consumer files are taken from their own lists, one per read.
+      text = (provider_files if name == 'r1w-01' else consumer_files).pop(0)
+      return {'container': 'c', 'text': text, 'sha256': text}
+
+    # The real node reads, put back at the end.
+    saved = (apps.sync_state, apps.chain_record, apps.app_file, apps.node_log)
+    # Node reads replaced by the fixed ones above.
+    apps.sync_state, apps.app_file = state, read_file
+    # The latest record on the one oracle, and no refusal lines.
+    apps.chain_record = lambda name, key: {'record': {'cid': 'Qm3'}, 'age_s': 1.0}
+    apps.node_log = lambda name: ''
+    # One oracle and the provider's worker.
+    manifest = {'nodes': [{'name': 'r1s-01', 'role': 'seed'}, {'name': 'r1w-01', 'role': 'worker'}]}
+    try:
+      # Two publishes asked for; the first converged-looking look must not end the check.
+      report = apps.sync_check(manifest, 'r1w-01', ['r1w-02'], 'k', 'img', publishes=2, timeout=60, poll=0)
+      self.assertTrue(report['ok'], report['failures'])
+      # It passed on the second look, with the third publish measured and equal files.
+      self.assertEqual(len(looks), 2)
+      self.assertEqual([row['cid'] for row in report['publishes']], ['Qm1', 'Qm2', 'Qm3'])
+      self.assertEqual(report['files']['r1w-02']['text'], 'payload 3\n')
+    finally:
+      # The real node reads again.
+      apps.sync_state, apps.chain_record, apps.app_file, apps.node_log = saved
+
   def test_sync_check_fails_a_latest_record_in_another_format(self):
     """With an expected format, the sync check passes only when every holding oracle keeps the latest record in it: the set tag with a 64-hex mac, or the shared-key tag with none."""
     from lnlib import apps

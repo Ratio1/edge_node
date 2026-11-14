@@ -778,8 +778,8 @@ def _cid_lines(text, cids, markers):
 def sync_check(manifest, provider, consumers, key, image, publishes=1, path='/data/payload.txt', within=150,
                timeout=900, poll=10, refusing=None, encryption=None):
   """
-  Wait until every consumer of a sync set applied the provider's latest archive and every refusing
-  consumer refused it, then measure the set.
+  Wait until every consumer of a sync set applied the provider's latest archive, holds the provider's
+  file, and every refusing consumer refused that archive, then measure the set.
 
   Parameters
   ----------
@@ -836,6 +836,8 @@ def sync_check(manifest, provider, consumers, key, image, publishes=1, path='/da
   started = time.time()
   # A refusing app's file before the check: a refusal must leave it as it is.
   before = {name: app_file(name, image, key, path)['sha256'] for name in refusing}
+  # The provider's and consumers' files as the last converged look read them (none yet).
+  seen = {}
   # Look until the set converged or the time is up.
   while True:
     # What the provider published so far.
@@ -855,6 +857,12 @@ def sync_check(manifest, provider, consumers, key, image, publishes=1, path='/da
       cons[name]['received'] and cons[name]['received'][-1]['cid'] == sent[-1]['cid'] for name in consumers) and all(
       # Each refusing consumer's log names the latest archive in a refusal line.
       _cid_lines(logs[name], {sent[-1]['cid']}, (REFUSAL_MARKER,)) for name in refusing)
+    if done and consumers:
+      # A provider app that keeps publishing writes its next file before that publish reaches its history: the
+      # set has converged only when the provider's file is the one every consumer holds, read in this same look.
+      seen = {name: app_file(name, image, key, path) for name in [provider] + list(consumers)}
+      # Equal digests, or look again (a file that really differs still fails, at the timeout).
+      done = all(seen[name]['sha256'] == seen[provider]['sha256'] for name in consumers)
     if done or time.time() - started > timeout:
       break
     # Not yet: look again later.
@@ -884,8 +892,11 @@ def sync_check(manifest, provider, consumers, key, image, publishes=1, path='/da
   latest = sent[-1]['cid'] if sent else None
   # Each oracle whose saved replica points the set at the latest archive.
   holding = sorted(name for name, item in records.items() if (item.get('record') or {}).get('cid') == latest and latest)
-  # The file as the provider app and each consumer app read it, refusing ones included.
-  files = {name: app_file(name, image, key, path) for name in [provider] + list(consumers) + list(refusing)}
+  if not (done and seen):
+    # No converged look read the files (a timeout, or no consumer that must apply): read them now.
+    seen = {name: app_file(name, image, key, path) for name in [provider] + list(consumers)}
+  # The file as the provider app and each consumer app read it, then each refusing consumer's.
+  files = {**seen, **{name: app_file(name, image, key, path) for name in refusing}}
   # The provider's file digest.
   digest = files[provider]['sha256']
   # Per consumer counts.
