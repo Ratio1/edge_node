@@ -66,7 +66,7 @@ ENV EE_DD=1
 COPY ./edge_node/docker/daemon.json /etc/docker/daemon.json
 # Fail the build, not a node: dockerd must accept that file, and the store directory is named after the Docker major
 # that writes it. A base image with another major needs a new directory name there and here, so that a node rolled
-# back to an older image never reads a store written by a newer Docker.
+# back to an older image never reads a store written by another Docker major.
 RUN dockerd --validate && dockerd --version | grep -q "^Docker version 29\."
 ENV EE_ID=E2dkr
 ENV AINODE_ENV=$AI_ENV

@@ -12,6 +12,7 @@ Container application plugins for running Docker containers with Cloudflare tunn
   - [Local Env Overrides](#local-env-overrides)
   - [Reset](#reset)
   - [Volume Sync](#volume-sync)
+  - [The Node's Docker Store](#the-nodes-docker-store)
 - [Future Enhancements](#future-enhancements)
   - [Continuous Health Monitoring](#continuous-health-monitoring)
   - [Per-Port Health Checks](#per-port-health-checks)
@@ -360,6 +361,32 @@ downloaded files and does not remote-unpin provider content.
 Restored files and directories are owned by the target consumer volume root
 owner/group, with unsafe special mode bits stripped. This keeps replicated state
 modifiable for non-root app images whose fixed-size data volume is app-owned.
+
+### The Node's Docker Store
+
+Container apps run in the node's own Docker daemon, which the base image entrypoint starts. The node images
+install `docker/daemon.json`, so that daemon keeps its store (images, containers, volumes) in
+`/edge_node/_local_cache/_docker/<Docker major>`, on the folder the host mounts into the node. The store
+survives a node restart: an app starts from the stored image without a pull. On a node started without that
+mount the directory is on the node container's own layer and is lost with that container, as before.
+
+- **First start on such an image:** the store is empty and every app image is pulled once.
+- **AUTOUPDATE:** an app starts from the stored image. The first update check (`AUTOUPDATE_INTERVAL` after
+  the start) compares the registry's image with the one the container runs and restarts the app when the tag
+  moved while the node was down, so such an app starts twice.
+- **Leftover container:** a container with the app's name that an earlier run left is removed before every
+  start.
+- **Sweep:** one hour into each node run, one app removes from the store the stopped containers of earlier
+  runs, the anonymous volumes no container holds and every image no container uses. An app without a
+  container at that moment (stopped by hand, waiting for another app) pulls its image at its next start. An
+  image loaded by hand that no container uses at that moment is removed too.
+- **Disk:** the images of the apps that have a container, plus what a run adds after its sweep (the previous
+  image of each updated app, images and containers of apps removed since).
+- **Docker major:** the directory is named after the Docker major that writes it, and each image build stops
+  when the base image has another major. The directory name in `docker/daemon.json` and that build check
+  change together; the store of the earlier major is then left on the host until it is removed.
+- **Copying a node's `_local_cache`** to another host: leave `_docker` out; it holds only what can be pulled
+  again.
 
 ---
 
