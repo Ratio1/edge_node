@@ -12,8 +12,10 @@ import json
 import pathlib
 # The Dockerfile lines and the shape of the store directory.
 import re
-# A stand-in for the logger the disk API reads the cache folder from.
-import types
+# A separate interpreter for the core's disk API.
+import subprocess
+# The interpreter this test runs on.
+import sys
 # The test framework.
 import unittest
 
@@ -121,32 +123,52 @@ def store_steps(name):
   ]
 
 
-def disk_api_of_a_plugin():
+# What the separate interpreter runs: the core's real path check on a plugin whose cache folder is the first
+# argument, for each further argument; it prints the answers as one JSON list.
+DISK_API_PROGRAM = """
+import json, sys, types
+from naeural_core.business.mixins_base.diskapi import _DiskAPIMixin
+log = types.SimpleNamespace(get_base_folder=lambda: sys.argv[1])
+disk_api = type("DiskApiOfAPlugin", (_DiskAPIMixin,), {"log": log})()
+print(json.dumps([disk_api.is_path_safe(path) for path in sys.argv[2:]]))
+"""
+
+
+def disk_api_accepts(paths):
   """
-  The disk API that plugin code gets, with the cache folder of a node as its root.
+  Ask the disk API that plugin code gets whether it accepts each of some paths.
 
   Plugin code (customer code included) reads, copies, zips and deletes files only through this API, and every such
-  call first asks `is_path_safe`. The object is the core's real mixin; only the logger it reads the cache folder
-  from is a stand-in.
+  call first asks `is_path_safe`. The answers come from the core's real mixin on a node whose cache folder is
+  `CACHE_ROOT`; only the logger it reads that folder from is a stand-in. The core is loaded in an interpreter of its
+  own, because other test files of this repository leave stand-ins for core modules loaded in the test process.
+
+  Parameters
+  ----------
+  paths : list
+    Absolute paths, as plugin code would pass them.
 
   Returns
   -------
-  naeural_core.business.mixins_base.diskapi._DiskAPIMixin
-    An object whose `is_path_safe(path)` answers as on a node whose cache folder is `CACHE_ROOT`.
+  list
+    One bool per path: True when the disk API would work on it.
+
+  Raises
+  ------
+  subprocess.CalledProcessError
+    When the core cannot be loaded or the check itself fails.
 
   Examples
   --------
-  >>> disk_api_of_a_plugin().is_path_safe("/edge_node/_local_cache/_data/x.json")
-  True
-  >>> disk_api_of_a_plugin().is_path_safe("/var/lib/docker")
-  False
+  >>> disk_api_accepts(["/edge_node/_local_cache/_data/x.json", "/var/lib/docker"])
+  [True, False]
   """
-  # The core's own path check; imported here, so the tests of the image files alone need no core.
-  from naeural_core.business.mixins_base.diskapi import _DiskAPIMixin
-  # All the check reads from its plugin: the logger's cache folder.
-  log = types.SimpleNamespace(get_base_folder=lambda: CACHE_ROOT)
-  # A plugin made of the mixin and that logger.
-  return type("DiskApiOfAPlugin", (_DiskAPIMixin,), {"log": log})()
+  # The same interpreter and module path as this test, with nothing loaded yet.
+  command = [sys.executable, "-c", DISK_API_PROGRAM, CACHE_ROOT] + list(paths)
+  # A failure there fails the test with the interpreter's own error.
+  done = subprocess.run(command, check=True, capture_output=True, text=True)
+  # The answers are the last line; a library may print a warning before them.
+  return json.loads(done.stdout.splitlines()[-1])
 
 
 class TestNodeImageDockerStore(unittest.TestCase):
@@ -161,18 +183,21 @@ class TestNodeImageDockerStore(unittest.TestCase):
 
   def test_plugin_code_cannot_reach_the_store_through_the_disk_api(self):
     """The store holds every app's resolved environment, layers and logs: the plugins' disk API refuses every path into it."""
-    # The path check every disk API call of plugin code goes through.
-    disk_api = disk_api_of_a_plugin()
     # The directory the inner daemon keeps its store in.
     data_root = daemon_config()["data-root"]
-    # Control: the check does accept a place of the cache folder, here the one the store had at first, next to `_bin`.
-    self.assertTrue(disk_api.is_path_safe(CACHE_ROOT + "/_docker/29/containers/abc/config.v2.json"))
-    # The store itself: a delete of it would remove every app's image and container.
-    self.assertFalse(disk_api.is_path_safe(data_root))
-    # A container's settings file in it, which holds the environment the app was started with.
-    self.assertFalse(disk_api.is_path_safe(data_root + "/containers/abc/config.v2.json"))
-    # The same file named through a folder plugins may use and `..`.
-    self.assertFalse(disk_api.is_path_safe(CACHE_ROOT + "/_data/.." + data_root[len(CACHE_ROOT):] + "/containers/abc/config.v2.json"))
+    # One question per path, all in one interpreter start.
+    answers = disk_api_accepts([
+      # Control: a place of the cache folder the check does accept, here the one the store had at first, next to `_bin`.
+      CACHE_ROOT + "/_docker/29/containers/abc/config.v2.json",
+      # The store itself: a delete of it would remove every app's image and container.
+      data_root,
+      # A container's settings file in it, which holds the environment the app was started with.
+      data_root + "/containers/abc/config.v2.json",
+      # The same file named through a folder plugins may use and `..`.
+      CACHE_ROOT + "/_data/.." + data_root[len(CACHE_ROOT):] + "/containers/abc/config.v2.json",
+    ])
+    # Only the control is accepted.
+    self.assertEqual(answers, [True, False, False, False])
 
   def test_the_daemon_file_sets_nothing_the_entrypoint_passes_as_a_flag(self):
     """dockerd refuses to start when an option is both a flag and in daemon.json, so the file holds none of those."""
