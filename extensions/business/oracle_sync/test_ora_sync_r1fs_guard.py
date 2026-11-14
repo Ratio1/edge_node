@@ -348,6 +348,27 @@ class OraSyncR1fsGuardTests(unittest.TestCase):
     # One per try, each giving the loader's refusal of _record_call.
     self.assertEqual([("R1FS pickle refused" in line, "_record_call" in line) for line in tries], [(True, True)] * 3)
 
+  def test_a_refused_file_cannot_write_a_long_or_a_forged_log_line(self):
+    """The per-try line of a refused file gives the error text escaped and cut to 200 characters: a file naming a
+    module of over 5,000 characters that holds a newline leaves three lines of one line each, bounded in length."""
+    # A module name holding a newline and a forged log text, then 5,000 more characters, and a function name.
+    module, name = ("os\n[forged] oracle line" + "m" * 5000).encode(), b"system"
+    # Its pickle (protocol 4): the two names as strings, then STACK_GLOBAL, which asks the loader for that function.
+    crafted = (b"\x80\x04X" + len(module).to_bytes(4, "little") + module + b"X" + len(name).to_bytes(4, "little")
+               + name + b"\x93.")
+    # A plugin using R1FS whose file under CID is that pickle.
+    probe = _Probe(use_r1fs=True, folder=self.folder, files={CID: crafted})
+    # Refused: None after the three tries.
+    self.assertIsNone(probe.r1fs_get_pickle(cid=CID, debug=True))
+    # The fixed start of each per-try line, before the error text.
+    start = "Failed try {}/3 to retrieve data from IPFS using CID " + CID + ": "
+    # The error part of the three per-try lines.
+    errors = [line[len(start.format(i + 1)):] for i, line in enumerate(probe.logged) if line.startswith("Failed try")]
+    # Three, each escaped (it starts with the quote of a repr and holds no newline), at most 200 characters long
+    # and still naming the refusal.
+    self.assertEqual([(e[0], "\n" in e, len(e) <= 200, "R1FS pickle refused" in e) for e in errors],
+                     [("'", False, True, True)] * 3)
+
   def test_every_caller_treats_the_refusal_as_a_message_not_accepted(self):
     """With USE_R1FS off, a CID in a message makes each caller reject the message, still without fetching."""
     # A plugin configured not to use R1FS.

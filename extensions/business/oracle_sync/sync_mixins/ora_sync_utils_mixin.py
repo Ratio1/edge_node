@@ -292,8 +292,9 @@ class _OraSyncUtilsMixin:
       -----
       Three tries; a try whose fetch, decryption or load fails (it raises) is
       followed by a 3 s pause, and with ``debug`` by a log line that gives the
-      error, for a refused file the class or function it names. A file that
-      holds None is tried again at once.
+      error escaped (its ``repr``) and cut to 200 characters, for a refused
+      file the class or function it names. A file that holds None is tried
+      again at once.
 
       Examples
       --------
@@ -322,7 +323,9 @@ class _OraSyncUtilsMixin:
             break
         except Exception as e:
           if debug:
-            self.P(f"Failed try {i + 1}/{total_retries} to retrieve data from IPFS using CID {cid}: {e}")
+            # The error text escaped (repr) and cut to 200 characters: a refused file's text carries the names the
+            # file asked for, of any length and with any characters, so it could write a huge or a forged log line.
+            self.P(f"Failed try {i + 1}/{total_retries} to retrieve data from IPFS using CID {cid}: {str(e)!r:.200}")
           self.sleep(sleep_time)
         # endtry to retrieve data
       # endif retries
