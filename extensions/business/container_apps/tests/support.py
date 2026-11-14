@@ -346,7 +346,29 @@ def make_mock_container(status="running", exit_code=0):
 
 
 def make_mock_docker_client(container=None):
-  """Create a mock Docker client with all required methods."""
+  """
+  Create a mock Docker client with all required methods.
+
+  The client finds and pulls one image, starts one container from it, and has no container with the
+  runner's name yet.
+
+  Parameters
+  ----------
+  container : MagicMock, optional
+    The container `containers.run` returns; a new one from make_mock_container() when omitted.
+
+  Returns
+  -------
+  tuple
+    `(client, container)`. `container.image` is the image the client finds and pulls, as docker-py
+    gives it for a container that was started from that image.
+
+  Examples
+  --------
+  >>> client, container = make_mock_docker_client()
+  >>> container.image is client.images.pull.return_value
+  True
+  """
   import docker.errors
 
   client = MagicMock()
@@ -365,6 +387,9 @@ def make_mock_docker_client(container=None):
   mock_image.attrs = {"RepoDigests": ["test/image@sha256:abc123"]}
   client.images.get.return_value = mock_image
   client.images.pull.return_value = mock_image
+  # The container was started from that image: docker-py resolves `container.image` to it, and the first update
+  # check of a run reads the app's version from there.
+  container.image = mock_image
   client.login.return_value = {"Status": "Login Succeeded"}
   return client, container
 

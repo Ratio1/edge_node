@@ -3951,7 +3951,10 @@ class ContainerAppRunnerPlugin(
 
   def _has_image_hash_changed(self, latest_hash):
     """
-    Check if image hash has changed from current version.
+    Check if the image the registry serves is another one than the app runs.
+
+    The version the app is on (`current_image_hash`) is unknown after every start. The first check of a run takes
+    it from the image the running container was started from, then compares as every later check does.
 
     Parameters
     ----------
@@ -3962,16 +3965,32 @@ class ContainerAppRunnerPlugin(
     -------
     bool
         True if hash changed and update needed, False otherwise
+
+    Notes
+    -----
+    The node's Docker store is kept across node restarts, so an app starts from the stored image without a pull,
+    and its tag may have moved while the node was down. Before, the first check took the image it had just pulled
+    as the version the app is on and never compared it with the running one: such an app kept the old image until
+    the tag moved again. Only the caller runs with a container: `_check_image_updates`, from the monitoring of a
+    running app.
+
+    Examples
+    --------
+    >>> self.current_image_hash is None            # first check; the container runs sha256:aaa...
+    True
+    >>> self._has_image_hash_changed("sha256:bbb...")
+    True
     """
     if not latest_hash:
       # Pull failed, can't determine if update needed
       return False
 
     if not self.current_image_hash:
-      # First time - establish baseline
-      self.P(f"Establishing baseline image hash: {latest_hash}")
-      self.current_image_hash = latest_hash
-      return False
+      # First check of this run: the version the app is on is the image its running container was started from, read
+      # from the store by the same rule as the pulled one (registry digest, else image id). Before, it was the image
+      # just pulled, which is right only when every start pulls.
+      self.current_image_hash = self._get_image_digest(self.container.image)
+      self.P(f"Establishing baseline image hash: {self.current_image_hash}")
 
     # Compare hashes
     return latest_hash != self.current_image_hash
