@@ -361,6 +361,33 @@ Restored files and directories are owned by the target consumer volume root
 owner/group, with unsafe special mode bits stripped. This keeps replicated state
 modifiable for non-root app images whose fixed-size data volume is app-owned.
 
+#### Per-set sync secret
+
+A set can have its own secret: `ENV.R1EN_SYNC_SECRET`, exactly 64 lowercase hex characters (32 random
+bytes), the same value on every job of the set. Without the variable (or with a JSON null) the set uses the
+shared R1FS key and the record described above, unchanged. Any other value (a passphrase, uppercase hex, an
+empty string) disables SYNC on that job with a red log line; there is no fallback to the shared key.
+
+- **What it adds.** The provider encrypts the archive under the secret, tags the manifest
+  `encryption: "r1fs-set-v1"` and adds `mac` to the record: an HMAC-SHA256, keyed from the secret, over the
+  set's `KEY` and every other field of the record. A consumer checks the tag, then the `mac`, before any download.
+- **What stays readable in the network store.** `KEY`, `cid`, `version`, `timestamp`, `node_id`, the request
+  `metadata`, `runtime`, `archive_paths` and `archive_size_bytes`.
+- **Hidden from the app.** CAR removes `R1EN_SYNC_SECRET` from the container environment after every env
+  build, whether it came from `ENV` or `DYNAMIC_ENV`. `R1_SYNC_KEY` is still exported.
+- **The two formats do not mix.** A consumer with a secret refuses a record made without one, and a consumer
+  without a secret refuses a set's record: `unsupported encryption: 'r1fs-default' (expected: 'r1fs-set-v1')`
+  or the reverse. Another secret gives `record mac does not match this node's sync secret`. Refused records
+  are quarantined and never downloaded.
+- **Replay rule.** A record whose CID this consumer applied before is refused unless its
+  `(version, timestamp)` is newer than the last applied record's. The rule guarantees only that a consumer
+  ends on the current record once that record returns: a record applied before can be applied once more when
+  it is newer than the last applied one, and a valid record the consumer never applied, an older one included,
+  is accepted once. Both values are the publisher's clock, so when a publisher's clock steps back, or differs
+  from the previous publisher's, a stale answer can hold a consumer on older data until the next publish.
+- **After a secret is corrected.** A record refused under the wrong secret stays quarantined with the usual
+  back-off: it can stay held for up to 1920 s (32 minutes), or until the next publish.
+
 ---
 
 ## Future Enhancements
