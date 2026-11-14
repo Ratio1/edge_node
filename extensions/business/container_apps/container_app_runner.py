@@ -116,6 +116,14 @@ _CONTAINER_LOGS_FILE = "container_logs.pkl"
 # Kept here only so we can migrate content once; do not use for new writes.
 _LEGACY_CONTAINER_APPS_SUBFOLDER = "container_apps"
 
+# Seconds a node runs before the one sweep of its Docker store (`_maybe_sweep_docker_store`): one hour, by which
+# the apps of the run hold their images through their containers.
+_STORE_SWEEP_DELAY = 3600
+
+# Key, in the memory all plugins of a node share, under which the app thread that sweeps the store leaves its marker.
+# State of this module would not do: the node loads the module again for every plugin instance it creates.
+_STORE_SWEEP_KEY = "__docker_store_sweep"
+
 
 class ContainerState(Enum):
   """Container lifecycle states for proper state machine management."""
@@ -4746,18 +4754,86 @@ class ContainerAppRunnerPlugin(
     return
 
 
-  def _perform_periodic_monitoring(self):
+  def _maybe_sweep_docker_store(self):
     """
-    Perform periodic monitoring tasks.
+    Remove from the node's Docker store, once per node run, what no app of this run uses.
 
-    Executes image update checks, tunnel health checks,
-    and any subclass-defined additional checks.
+    The node image keeps the store of the node's inner Docker daemon across node restarts (`docker/daemon.json`),
+    so the app images are there at the next start. Before, the store was deleted with the node container at every
+    stop, which also removed everything left behind. This sweep takes over that part, one hour into the node run:
+    the stopped containers an earlier run left (a killed node removes none), the anonymous volumes no container
+    holds, and every image no container uses (the image a moved tag left behind, the image of an app that is no
+    longer on this node). After it the store holds the images of the apps that have a container, plus what this
+    run adds later, as a store did before within one run.
 
     Returns
     -------
     None
+
+    Raises
+    ------
+    docker.errors.APIError
+      When the Docker daemon refuses a request. It is raised into the plugin loop, and the sweep is not tried
+      again in this node run.
+
+    Notes
+    -----
+    All apps of a node share one store, so one sweep serves them all: the first app thread that comes here after
+    the delay does it, on its own Docker client, and leaves a marker in the memory the plugins of a node share.
+    An app that has no container at that moment (stopped by hand, waiting for another app or for its image) loses
+    its stored image and pulls it at its next start, as every app did at every node start before. Only containers
+    created before this node run are removed: a container of this run that has exited stays for inspection.
+    The start of the run is the current time less the node's running time; a node clock set forward by more than
+    the age of a stopped container of this run would make that container count as left by an earlier run.
+    Each request waits for Docker at most the client timeout (60 s); a store too large for that ends the sweep
+    with the error above, with what was removed so far removed.
+
+    Examples
+    --------
+    >>> self._maybe_sweep_docker_store()   # does nothing in the first hour of the node run, and nothing after the sweep
+    """
+    if self.get_node_running_time() < _STORE_SWEEP_DELAY:
+      # Too early in the node run: apps are still starting and do not hold their images yet.
+      return
+    # A marker of this call only. `setdefault` stores the first marker of the node run and hands back the stored one,
+    # in one step, so exactly one app thread gets its own back; no lap of any app ever waits.
+    marker = object()
+    if self.plugins_shmem.setdefault(_STORE_SWEEP_KEY, marker) is not marker:
+      # The store was already swept in this node run, by this app or by another.
+      return
+    # When this node run started, in whole seconds: every container an earlier run left is older, none of this run is.
+    run_started = int(self.time() - self.get_node_running_time())
+    # Stopped containers created before this node run: what a killed node left of apps that are gone or not started
+    # yet. They are removed first, because an image or a volume a container holds is in use for Docker.
+    containers = self.docker_client.containers.prune(filters={"until": run_started})
+    # Anonymous volumes no container holds: a container is removed without them, and no later container gets them.
+    volumes = self.docker_client.volumes.prune()
+    # Every image no container uses, tagged ones too ("dangling": False): superseded versions and removed apps.
+    images = self.docker_client.images.prune(filters={"dangling": False})
+    # Bytes the three requests freed, for the one log line of the sweep.
+    freed = containers["SpaceReclaimed"] + volumes["SpaceReclaimed"] + images["SpaceReclaimed"]
+    self.P(f"Docker store swept once for this node run: {freed} bytes freed")
+    return
+
+  def _perform_periodic_monitoring(self):
+    """
+    Perform periodic monitoring tasks.
+
+    Executes the one sweep of the node's Docker store when it is due, image update checks, tunnel health checks,
+    and any subclass-defined additional checks. It is called only while the app's container is running.
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> self._perform_periodic_monitoring()   # one lap: sweep when due, update check, tunnels, subclass checks
     """
     current_time = self.time()
+
+    # First, while this app's own container is known to run and so holds its image: the store sweep of this node run.
+    self._maybe_sweep_docker_store()
 
     if self.cfg_autoupdate:
       self._check_image_updates(current_time)
