@@ -7,10 +7,10 @@ A new endpoint is a new finding and inherits nothing.
 
 The order follows production: triage is refused until the job has a `job_cid`,
 and only finalization sets that, so every pass is already in the archive when
-triage is written. Nothing carries triage from one job to the next; that is not
-claimed here. The public `update_finding_triage` endpoint currently returns 503
-pending its scoped workspace contract, so the write goes through the service
-function; the read is the path `get_job_archive` uses.
+triage is written. Triage is stored by (tenant, host, finding), so a later job of the host reads it;
+that cross-job read is covered in `test_triage_readers.py` and `test_triage_write.py`.
+Here the records are seeded straight into the host map (the write is `test_triage_write.py`'s);
+the read is the path `get_job_archive` uses.
 
 The identity unit tests in `test_finding_identity_contract.py` prove the key
 itself. This file proves the chain around it: real producers, the archive write
