@@ -45,6 +45,8 @@ _TERMINAL = (JOB_STATUS_FINALIZED, JOB_STATUS_STOPPED, JOB_STATUS_FAILED)
 _CID = re.compile(r"(?:Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{58,})\Z")
 _FILENAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}\Z")
 _TENANT_STATUS_HKEY = re.compile(r":integrations:(tn_[0-9a-f-]{36})\Z")
+# RM-169 step 4a: host-scoped finding triage and its audit log, one hkey per tenant (not per job).
+_TENANT_TRIAGE_HKEY = re.compile(r":triage:(t|audit):(tn_[0-9a-f-]{36})\Z")
 # Keys that hold a file reference. `ref` is a tenant document; `cid` a rulebook submission.
 _REFERENCE_KEYS = frozenset({"cid", "ref", "secret_ref", "model_provider_secret_ref", "authorization_ref"})
 # Per-job hkeys: suffix, the stored value type, and whether the field is `<job_id>:<rest>`.
@@ -236,6 +238,8 @@ class Inventory:
     names = [self._instance] + [self._instance + suffix for suffix, _, _ in _PER_JOB]
     names.append(f"{self._instance}:integrations")
     names.extend(f"{self._instance}:integrations:{tenant}" for tenant in self.tenant_ids())
+    for tenant in self.tenant_ids():
+      names.extend([f"{self._instance}:triage:t:{tenant}", f"{self._instance}:triage:audit:{tenant}"])
     # RM-127: each node's self-published public IP, keyed by the node's address.
     names.append(f"{self._instance}:node_info")
     names.extend([self._tenancy_hkey, self._compliance_hkey, self._account_hkey])
@@ -247,7 +251,8 @@ class Inventory:
       return False
     prefix = f"{self._instance}:integrations:"
     return (hkey in self.hkeys()
-            or hkey.startswith(prefix) and _TENANT_STATUS_HKEY.match(hkey[len(self._instance):]) is not None)
+            or hkey.startswith(prefix) and _TENANT_STATUS_HKEY.match(hkey[len(self._instance):]) is not None
+            or self._triage_tenant(hkey) is not None)
 
   def is_account_hkey(self, hkey):
     return hkey == self._account_hkey
@@ -395,6 +400,24 @@ class Inventory:
       return OLD, "unrecognized"
     return CURRENT, ""
 
+  def _triage_tenant(self, hkey):
+    """`(kind, tenant_id)` of a host-triage hkey of this instance (`t` rows, `audit` rows), else None."""
+    if not isinstance(hkey, str) or not hkey.startswith(self._instance):
+      return None
+    match = _TENANT_TRIAGE_HKEY.fullmatch(hkey[len(self._instance):])
+    return (match.group(1), match.group(2)) if match else None
+
+  def _triage_class(self, kind, tenant_id, field, value):
+    """A row is current while its tenant is live, its field names a host and finding, and the value has the
+    shape the writer stores; with the tenant gone it is an orphan (or old when the tenant row is stored but
+    not current), as an integration status row is."""
+    if tenant_id not in self._live_tenants():
+      stored = any(k == "tenant" and ids == [tenant_id] and row is not None
+                   for _, k, ids, row in self._tenancy_fields())
+      return (OLD, "old_tenant") if stored else (ORPHAN, "tenant_gone")
+    shaped = isinstance(field, str) and field.count("\x1f") == 1 and all(field.split("\x1f"))
+    return (CURRENT, "") if shaped and isinstance(value, dict if kind == "t" else list) else (OLD, "unrecognized")
+
   def is_status_hkey(self, hkey):
     return isinstance(hkey, str) and hkey.startswith(f"{self._instance}:integrations")
 
@@ -419,6 +442,9 @@ class Inventory:
       return self._compliance_class(field, value)
     if self.is_status_hkey(hkey):
       return self._status_class(hkey, field, value)
+    triage = self._triage_tenant(hkey)
+    if triage:
+      return self._triage_class(*triage, field, value)
     if hkey == f"{self._instance}:node_info":
       return (CURRENT, "") if isinstance(value, dict) and set(value) == {"ip", "published_at"} else (OLD, "unrecognized")
     raise MaintenanceError(400, "invalid_request")

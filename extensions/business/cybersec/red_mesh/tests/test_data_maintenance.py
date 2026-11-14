@@ -215,11 +215,41 @@ class TestDataMaintenance(unittest.TestCase):
       text = path.read_text(encoding="utf-8")
       built.update(re.findall(r"""cfg_instance_id[^"'\n]*\}((?::[a-z_]+)+)[:"']""", text))
     self.assertTrue(built)
+    # `:triage:t:{tenant}` is a per-tenant family like `:integrations:{tenant}`: the tenant names are asserted below.
+    self.assertIn(":triage:t", built)
+    built.discard(":triage:t")
     hkeys = self.plugin.export_redmesh_records(self.actor, 0, 0, 1)["data"]["hkeys"]
     names = {item["hkey"] for item in hkeys}
     self.assertEqual({JOBS + suffix for suffix in built} - names, set())
-    self.assertLessEqual({JOBS, TENANCY, COMPLIANCE, "auth", f"{JOBS}:integrations:{self.tenant}"}, names)
+    self.assertLessEqual({JOBS, TENANCY, COMPLIANCE, "auth", f"{JOBS}:integrations:{self.tenant}",
+                          f"{JOBS}:triage:t:{self.tenant}", f"{JOBS}:triage:audit:{self.tenant}"}, names)
     self.assertEqual([item["hkey"] for item in hkeys if item["account"]], ["auth"])
+
+  def test_host_triage_rows_are_registered_classified_and_restorable(self):
+    # RM-169 step 4a: one hkey per tenant, field `host\x1ffinding_id`; no job owns a row.
+    gone = "tn_" + str(uuid4())
+    field = "192.0.2.10\x1ff1"
+    self.put(f"{JOBS}:triage:t:{self.tenant}", field, {"job_id": "new1", "finding_id": "f1", "status": "open"})
+    self.put(f"{JOBS}:triage:t:{self.tenant}", "no-separator", {"status": "open"})
+    self.put(f"{JOBS}:triage:audit:{self.tenant}", field, [{"status": "open"}])
+    self.put(f"{JOBS}:triage:audit:{self.tenant}", "192.0.2.10\x1ff2", {"not": "a list"})
+    rows = self.scan()
+    found = {key: (row["class"], row["reason"]) for key, row in rows.items()
+             if key[0].startswith(f"{JOBS}:triage:") and key[0] not in (f"{JOBS}:triage", f"{JOBS}:triage:audit")}
+    self.assertEqual(found, {
+      (f"{JOBS}:triage:t:{self.tenant}", field): ("current", ""),
+      (f"{JOBS}:triage:t:{self.tenant}", "no-separator"): ("old", "unrecognized"),
+      (f"{JOBS}:triage:audit:{self.tenant}", field): ("current", ""),
+      (f"{JOBS}:triage:audit:{self.tenant}", "192.0.2.10\x1ff2"): ("old", "unrecognized"),
+    })
+    # A backup row of a tenant that no longer exists is still accepted, as an integration status row is; the legacy
+    # audit hkey and a lookalike are not.
+    backup = [{"hkey": f"{JOBS}:triage:t:{gone}", "field": field, "value": {"status": "open"}},
+              {"hkey": f"{JOBS}:triage:audit:{gone}", "field": field, "value": [{"status": "open"}]},
+              {"hkey": f"{JOBS}:triage:t:audit", "field": field, "value": {"status": "open"}},
+              {"hkey": f"{JOBS}:triage:t:{gone}x", "field": field, "value": {"status": "open"}}]
+    done = self.plugin.restore_redmesh_records(self.actor, backup)
+    self.assertEqual([item["outcome"] for item in done["data"]["outcomes"]], ["written", "written", "refused", "refused"])
 
   def test_a_job_lists_the_files_its_record_config_and_archive_name(self):
     row = self.scan()[(JOBS, "old1")]

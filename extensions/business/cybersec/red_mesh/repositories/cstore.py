@@ -52,6 +52,24 @@ class JobStateRepository:
   def _triage_audit_hkey(self):
     return f"{self.owner.cfg_instance_id}:triage:audit"
 
+  # Host-scoped triage (report-findings.md §Triage). The `t:` prefix keeps these disjoint from the
+  # legacy `{cfg}:triage` and `{cfg}:triage:audit` hkeys and from the audit hkeys below.
+  def host_triage_hkey(self, tenant_id):
+    return f"{self.owner.cfg_instance_id}:triage:t:{self._scope_part(tenant_id)}"
+
+  def host_triage_audit_hkey(self, tenant_id):
+    return f"{self.owner.cfg_instance_id}:triage:audit:{self._scope_part(tenant_id)}"
+
+  @staticmethod
+  def _scope_part(value):
+    if not isinstance(value, str) or not value.strip() or "\x1f" in value:
+      raise ValueError("Invalid triage scope")
+    return value
+
+  @classmethod
+  def host_triage_key(cls, host, finding_id):
+    return f"{cls._scope_part(host)}\x1f{cls._scope_part(finding_id)}"
+
   @property
   def _model_test_raw_evidence_hkey(self):
     return f"{self.owner.cfg_instance_id}:model_test_raw_evidence"
@@ -328,6 +346,49 @@ class JobStateRepository:
     audit_log = list(self.get_finding_triage_audit(payload["job_id"], payload["finding_id"]))
     audit_log.append(payload)
     self.owner.chainstore_hset(hkey=self._triage_audit_hkey, key=key, value=audit_log)
+    return audit_log
+
+  def get_host_triage(self, tenant_id, host, finding_id):
+    payload = self.owner.chainstore_hget(
+      hkey=self.host_triage_hkey(tenant_id), key=self.host_triage_key(host, finding_id))
+    return payload if isinstance(payload, dict) else None
+
+  def list_host_triage(self, tenant_id, host):
+    """`finding_id -> record` of one tenant's host. Another tenant's hkey is never read."""
+    payload = self.owner.chainstore_hgetall(hkey=self.host_triage_hkey(tenant_id)) or {}
+    prefix = f"{self._scope_part(host)}\x1f"
+    return {
+      key[len(prefix):]: value
+      for key, value in payload.items()
+      if isinstance(key, str) and key.startswith(prefix) and isinstance(value, dict)
+    }
+
+  def put_host_triage(self, triage):
+    """Store a state that names its tenant and host; returns the stored payload."""
+    payload = (triage if isinstance(triage, FindingTriageState) else FindingTriageState.from_dict(triage)).to_dict()
+    self.owner.chainstore_hset(
+      hkey=self.host_triage_hkey(payload.get("tenant_id")),
+      key=self.host_triage_key(payload.get("host"), payload["finding_id"]),
+      value=payload,
+    )
+    return payload
+
+  def get_host_triage_audit(self, tenant_id, host, finding_id):
+    payload = self.owner.chainstore_hget(
+      hkey=self.host_triage_audit_hkey(tenant_id), key=self.host_triage_key(host, finding_id))
+    return payload if isinstance(payload, list) else []
+
+  def append_host_triage_audit(self, entry):
+    payload = (entry if isinstance(entry, FindingTriageAuditEntry)
+               else FindingTriageAuditEntry.from_dict(entry)).to_dict()
+    tenant_id, host = payload.get("tenant_id"), payload.get("host")
+    audit_log = self.get_host_triage_audit(tenant_id, host, payload["finding_id"])
+    audit_log.append(payload)
+    self.owner.chainstore_hset(
+      hkey=self.host_triage_audit_hkey(tenant_id),
+      key=self.host_triage_key(host, payload["finding_id"]),
+      value=audit_log,
+    )
     return audit_log
 
   def delete_job_triage(self, job_id):
