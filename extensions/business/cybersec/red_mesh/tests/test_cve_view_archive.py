@@ -35,6 +35,17 @@ class ArchiveCveViewTests(unittest.TestCase):
     self.assertNotIn("cve_view", passes[2])
     self.assertEqual(stored, before)  # the stored archive dict is untouched
 
+  def test_dropped_comes_from_the_stored_breakdown_and_counts_equal_it(self):
+    findings = [finding(1), finding(2, kev=False, cvss_score=5.0)]
+    counts = {"raw": 5, "listed": 1, "rolled_up": 1, "possible": 0, "closed": 0, "dropped": 3}
+    stored = archive(findings, findings)
+    stored["passes"][0]["risk_breakdown"] = {"cve_view_counts": counts}
+    passes = self.read(stored)["archive"]["passes"]
+    self.assertEqual(passes[0]["cve_view"]["counts"], counts)
+    c = passes[0]["cve_view"]["counts"]
+    self.assertEqual(c["listed"] + c["rolled_up"] + c["possible"] + c["closed"] + c["dropped"], c["raw"])
+    self.assertEqual(passes[1]["cve_view"]["counts"]["dropped"], 0)  # no stored counts
+
   def test_pagination_keeps_the_view_and_summary_does_not_need_it(self):
     stored = archive([finding(1)], [finding(2)])
     page = self.read(stored, pass_offset=1)["archive"]
