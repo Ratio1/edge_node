@@ -2716,6 +2716,7 @@ class TestSetSecret(unittest.TestCase):
       ("NaN timestamp", newer, float("nan")),
       ("infinite timestamp", newer, float("inf")),
       ("400-digit int timestamp", newer, 10 ** 399),
+      # The same size below zero: a bound from above alone would let it reach the float conversion.
       ("400-digit negative int timestamp", newer, -(10 ** 399)),
     ]
     # Every case, one at a time.
