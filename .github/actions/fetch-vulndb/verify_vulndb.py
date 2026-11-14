@@ -12,6 +12,7 @@ import re
 import sqlite3
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 REPO = "Ratio1/redmesh-vulndb"
 ASSET = "vulndb.sqlite.zst"
@@ -20,7 +21,7 @@ _BUILD_ID = re.compile(r"vulndb-[0-9a-f]{6,64}")
 
 
 def _supported_models():
-    path = Path(__file__).resolve().parents[3] / "extensions/business/cybersec/red_mesh/vulndb/__init__.py"
+    path = Path(__file__).resolve().parents[3] / "extensions/business/cybersec/red_mesh/vulndb/models.py"
     spec = importlib.util.spec_from_file_location("_vulndb_models", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -43,6 +44,10 @@ def load_pin(pin_path):
     for key in ("sha256", "sha256_sqlite"):
         if not _SHA.fullmatch(str(pin.get(key))):
             raise ValueError("bad %s" % key)
+    for key in ("size", "size_zst"):
+        value = pin.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("bad %s" % key)
     return pin
 
 
@@ -57,9 +62,11 @@ def sha256_file(path):
 def verify_sqlite(pin, sqlite_path, supported=None):
     """Raise ValueError unless the file matches the pin and a known MODEL."""
     supported = _supported_models() if supported is None else supported
+    if Path(sqlite_path).stat().st_size != pin["size"]:
+        raise ValueError("size mismatch")
     if sha256_file(sqlite_path) != pin["sha256_sqlite"]:
         raise ValueError("sha256_sqlite mismatch")
-    conn = sqlite3.connect("file:%s?mode=ro" % Path(sqlite_path).resolve(), uri=True)
+    conn = sqlite3.connect("file:%s?mode=ro" % quote(str(Path(sqlite_path).resolve())), uri=True)
     try:
         model = conn.execute("PRAGMA user_version").fetchone()[0]
         if model not in supported:
@@ -73,7 +80,7 @@ def verify_sqlite(pin, sqlite_path, supported=None):
 
 def write_local_pin(sqlite_path, out_path):
     """Write a pin for a local database: no release, so no built_at (verified like a pin)."""
-    conn = sqlite3.connect("file:%s?mode=ro" % Path(sqlite_path).resolve(), uri=True)
+    conn = sqlite3.connect("file:%s?mode=ro" % quote(str(Path(sqlite_path).resolve())), uri=True)
     try:
         row = conn.execute("SELECT v FROM meta WHERE k = 'build_id'").fetchone()
     finally:
@@ -89,7 +96,7 @@ def main(argv):
     try:
         if len(argv) == 3 and argv[1] == "pin":
             pin = load_pin(argv[2])
-            for key in ("build_id", "asset", "sha256"):
+            for key in ("build_id", "asset", "sha256", "size", "size_zst"):
                 print("%s=%s" % (key, pin[key]))
         elif len(argv) == 4 and argv[1] == "verify":
             verify_sqlite(load_pin(argv[2]), argv[3])
