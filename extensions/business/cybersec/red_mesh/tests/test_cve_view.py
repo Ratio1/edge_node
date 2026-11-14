@@ -6,10 +6,11 @@ import unittest
 from extensions.business.cybersec.red_mesh import cve_db
 from extensions.business.cybersec.red_mesh.findings import _finding_to_jsonable
 from extensions.business.cybersec.red_mesh.cve_view import build_cve_view, filter_listed
-from extensions.business.cybersec.red_mesh.llm_input_builder import _sanitize_finding
+from extensions.business.cybersec.red_mesh.llm_input_builder import _sanitize_finding, build_llm_input
 from extensions.business.cybersec.red_mesh.mixins.risk import _RiskScoringMixin
 from extensions.business.cybersec.red_mesh.vulndb.reader import load_vulndb
 
+from .test_finalization_aggregation import _AggHost
 from .test_vulndb_findings import CVE, build
 
 NET = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
@@ -230,8 +231,54 @@ class RiskAndConsumerTests(unittest.TestCase):
     self.assertEqual(kept, ["id0001", "n1", "id0004"])
     self.assertEqual(filter_listed([plain, raw(4, build_id=None)]), [plain, raw(4, build_id=None)])
 
+  def test_closed_members_leave_score_top_findings_and_llm_input(self):
+    findings = [raw(1, "CRITICAL", kev=True), raw(2, "HIGH"), raw(3, "LOW", score=5.0), raw(4, "MEDIUM", score=5.0)]
+    triage = {"id0002": "false_positive", "id0003": "remediated"}  # a listed and a rolled-up member
+    base = risk_of(findings)
+    closed = _Host()._compute_risk_and_findings(
+      {"target": "t", "port_protocols": {"80": "http"},
+       "service_info": {"80": {"_service_info_http": {"findings": findings}}}}, triage=triage)[0]["breakdown"]
+    self.assertEqual((base["finding_counts"]["HIGH"], base["finding_counts"]["MEDIUM"]), (1, 1))
+    self.assertEqual((closed["finding_counts"]["HIGH"], closed["finding_counts"]["MEDIUM"]), (0, 1))
+    self.assertEqual(closed["cve_view_counts"]["closed"], 2)
+    self.assertLess(closed["findings_score"], base["findings_score"])
+    kept = [f["finding_id"] for f in filter_listed(findings, triage=triage)]
+    self.assertEqual(kept, ["id0001"])
+
+  def test_rollup_tie_on_severity_is_broken_by_confidence(self):
+    firm = risk_of([raw(1, "HIGH", score=5.0), raw(2, "HIGH", score=5.0)])["findings_score"]
+    certain = risk_of([raw(1, "HIGH", score=5.0), raw(2, "HIGH", score=5.0, confidence="certain")])["findings_score"]
+    self.assertGreater(certain, firm)  # the rollup takes the certain member (multiplier 1.0, not 0.8)
+
+  def test_mixed_job_static_and_generated_collapse_and_keep_the_generated_view(self):
+    static = dict(raw(1, kev=True), vulndb_build_id=None)
+    generated = raw(1, kev=True)
+    breakdown = risk_of([static, generated, raw(2, confidence="tentative")])
+    self.assertEqual(breakdown["finding_counts"]["HIGH"], 1)  # one finding for the CVE, dedup picked one
+    self.assertEqual(breakdown["possible_cves"], 1)
+
+  def test_top_findings_through_ui_aggregate_list_only_listed_cves(self):
+    findings = [raw(1, "CRITICAL", kev=True), raw(2, "HIGH", score=5.0), raw(3, "CRITICAL", confidence="tentative"),
+                {"finding_id": "n1", "title": "plain", "severity": "HIGH", "confidence": "firm"}]
+    ui = _AggHost()._compute_ui_aggregate([{"pass_nr": 1, "findings": findings}], {"open_ports": [], "service_info": {}})
+    self.assertEqual([f["finding_id"] for f in ui.top_findings], ["id0001", "n1"])
+    self.assertEqual(ui.total_findings, 4)  # raw record count
+
+  def test_llm_input_carries_the_view_summary_under_generated_only(self):
+    findings = [raw(1, kev=True), raw(2, score=5.0), raw(3, confidence="tentative", reason="banner_only")]
+    out = build_llm_input(findings=findings, aggregated_report={})
+    summary = out.scan_summary["cve_view"]
+    self.assertEqual([f["cve"] for f in out.findings], [["CVE-2030-0001"]])
+    self.assertEqual((summary["rollups"][0]["cve_count"], summary["possible"][0]["count"]), (1, 1))
+    self.assertEqual(summary["possible"][0]["reasons"], {"banner_only": 1})
+    self.assertEqual(summary["counts"]["raw"], 3)
+    static = build_llm_input(findings=[dict(f, vulndb_build_id=None) for f in findings], aggregated_report={})
+    self.assertNotIn("cve_view", static.scan_summary)
+    self.assertEqual(len(static.findings), 3)
+
   def test_llm_kev_follows_the_generated_tri_state(self):
     out = lambda **kw: _sanitize_finding(dict(raw(1), cvss_data_freshness="", **kw))
+    self.assertIs(out(kev=1)["kev"], True)
     self.assertEqual((out(kev=True)["kev"], out(kev=True)["kev_evaluated"]), (True, True))
     self.assertEqual((out(kev=False)["kev"], out(kev=False)["kev_evaluated"]), (False, True))
     self.assertEqual((out(kev=None)["kev"], out(kev=None)["kev_evaluated"]), (None, False))

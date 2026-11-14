@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .credential_redaction import redact_credential_text
-from .cve_view import filter_listed
+from .cve_view import build_cve_view, filter_listed, summarize_view
 from .models.finding_schema import is_coverage_result as _is_coverage_result
 
 
@@ -221,22 +221,30 @@ def build_llm_input(
   # concluded nothing was competing for one of the `max_findings` slots against
   # real findings, on a declared severity it kept because only `not_vulnerable`
   # is downgraded to INFO.
-  real_findings = filter_listed([f for f in finding_dicts if not _is_coverage_result(f)])
+  real_findings = [f for f in finding_dicts if not _is_coverage_result(f)]
+  # RM-169, generated CVE findings: the listed ones go in `findings`; the view's counts, rollups and possible
+  # summary go in `scan_summary`. None under `static`.
+  not_applicable = ((aggregated_report or {}).get("cves_not_applicable") or {}).values()
+  cve_view = build_cve_view(real_findings, not_applicable)
+  real_findings = filter_listed(real_findings, view=cve_view)
   real_findings.sort(key=_key)
   truncated = real_findings[:max_findings]
 
   out_findings = [_sanitize_finding(f) for f in truncated]
 
+  scan_summary = _summarize_scan(
+    aggregated_report,
+    # All three from one list, so they cannot disagree. Fixing only
+    # `total_findings` told the model there was one finding and handed it ten.
+    total_findings=len(real_findings),
+    included_findings=len(out_findings),
+    truncated_findings=len(real_findings) - len(out_findings),
+  )
+  if cve_view:
+    scan_summary["cve_view"] = summarize_view(cve_view)
   return LlmInput(
     engagement_summary=_summarize_engagement(engagement),
-    scan_summary=_summarize_scan(
-      aggregated_report,
-      # All three from one list, so they cannot disagree. Fixing only
-      # `total_findings` told the model there was one finding and handed it ten.
-      total_findings=len(real_findings),
-      included_findings=len(out_findings),
-      truncated_findings=len(real_findings) - len(out_findings),
-    ),
+    scan_summary=scan_summary,
     findings=out_findings,
   )
 
@@ -364,7 +372,8 @@ def _sanitize_finding(f: dict) -> dict:
     # fetch timestamp is `cvss_data_freshness`. Otherwise it is unknown, not
     # "not listed" (RM-090: the cache is not wired in production yet).
     # A generated finding carries its own tri-state (a local build has no freshness but did evaluate KEV).
-    "kev": f.get("kev") if f.get("vulndb_build_id") else (bool(f.get("kev", False)) if f.get("cvss_data_freshness") else None),
+    "kev": (None if f.get("kev") is None else bool(f["kev"])) if f.get("vulndb_build_id")
+           else (bool(f.get("kev", False)) if f.get("cvss_data_freshness") else None),
     "kev_evaluated": f.get("kev") is not None if f.get("vulndb_build_id") else bool(f.get("cvss_data_freshness")),
     "epss_score": _safe_float(f.get("epss_score")),
     "cve": _sanitize_list(f.get("cve"), MAX_REFERENCES_PER_FINDING, 32),

@@ -23,7 +23,7 @@ _SUBJECT = re.compile(r"^(\S+) (.*?) is vulnerable to CVE-")
 
 def is_view_finding(f):
   """A CVE finding of the `generated` source."""
-  return isinstance(f, dict) and bool(f.get("cve")) and bool(f.get("vulndb_build_id"))
+  return isinstance(f, dict) and bool(f.get("cve")) and bool(f.get("vulndb_build_id")) and bool(f.get("finding_id"))
 
 
 def _subject(f):
@@ -134,7 +134,7 @@ def build_cve_view(findings, not_applicable=(), triage=None, now=None):
   The output does not depend on the input order.
   """
   now = time.time() if now is None else now
-  items = [f for f in findings or () if is_view_finding(f) and f.get("finding_id")]
+  items = [f for f in findings or () if is_view_finding(f)]
   if not items:
     return None
   groups = {}
@@ -183,14 +183,28 @@ def view_members(view):
   return listed, folded
 
 
-def filter_listed(findings, not_applicable=()):
-  """`findings` without the generated CVE findings the view folds into a rollup or a possible row.
+def filter_listed(findings, not_applicable=(), triage=None, view=None):
+  """`findings` keeping a generated CVE finding only when the view lists it.
 
-  For the surfaces that show listed findings only (`top_findings`, the LLM input). Without a view, unchanged.
+  Folded (rollup, possible) and closed findings leave. For the surfaces that show listed findings only
+  (`top_findings`, the LLM input, the score walk). Without a view, unchanged.
   """
-  view = build_cve_view(findings, not_applicable)
+  view = view or build_cve_view(findings, not_applicable, triage)
   if view is None:
     return list(findings)
-  listed, folded = view_members(view)
-  hidden = folded - listed
-  return [f for f in findings if not (is_view_finding(f) and f.get("finding_id") in hidden)]
+  listed = view_members(view)[0]
+  return [f for f in findings if not is_view_finding(f) or f["finding_id"] in listed]
+
+
+def summarize_view(view):
+  """The view as the LLM input carries it: counts, one line per rollup, the possible summary per service."""
+  rollups, possible = [], []
+  for service in view["services"]:
+    where = {"port": service["port"], "product": service["product"]}
+    if service["rollup"]:
+      r = service["rollup"]
+      rollups.append({**where, **{k: r[k] for k in ("fix_version", "cve_count", "kev_count", "max_cvss")}})
+    if service["possible"]:
+      p = service["possible"]
+      possible.append({**where, "count": p["count"], "reasons": p["reasons"], "top": p["top"]})
+  return {"counts": dict(view["counts"]), "rollups": rollups, "possible": possible}
