@@ -27,9 +27,11 @@ Arithmetic is exact (`Fraction`); the verdict is taken from the exact values; `c
 from __future__ import annotations
 
 from fractions import Fraction
+from types import SimpleNamespace
 
 from extensions.business.cybersec.red_mesh.references.framework_packs import (
   FRAMEWORK_LEVELS,
+  FrameworkPackError,
   controls_for_level,
   level_index,
 )
@@ -300,3 +302,26 @@ def validate_for_submit(pack: dict, level: str, draft: dict) -> tuple[list[dict]
     if missing:
       errors.append(_err("remediation_missing", missing))
   return errors, computed
+
+
+# Scorer registry (contract `redmesh.framework_scorer.v1`, §Generalisation): keyed by `pack["scoring"]`.
+# Hooks so far: `compute`, `validate_for_submit` (with the manifest `rules`, unused here), `remediation_items`.
+SCORERS: dict = {}
+
+
+def register_scorer(scoring_id: str, scorer) -> None:
+  SCORERS[scoring_id] = scorer
+
+
+def scorer_for(pack: dict):
+  try:
+    return SCORERS[pack.get("scoring")]
+  except KeyError:
+    raise FrameworkPackError(f"unknown scoring {pack.get('scoring')!r}") from None
+
+
+register_scorer(SCORING_ID, SimpleNamespace(
+  compute=score,
+  validate_for_submit=lambda pack, rules, level, draft: validate_for_submit(pack, level, draft),
+  remediation_items=required_remediation_items,
+))

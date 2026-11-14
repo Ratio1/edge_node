@@ -1,0 +1,1765 @@
+{
+ "computed": {
+  "categories": {
+   "DE.AE": {
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "maturity": 2.5
+   },
+   "DE.CM": {
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "maturity": 2.5
+   },
+   "GV.OC": {
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "maturity": 2.5
+   },
+   "GV.PO": {
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "maturity": 2.5
+   },
+   "GV.RM": {
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "maturity": 2.5
+   },
+   "GV.RR": {
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "maturity": 2.5
+   },
+   "ID.AM": {
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "maturity": 2.5
+   },
+   "ID.IM": {
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "maturity": 2.5
+   },
+   "ID.RA": {
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "maturity": 2.5
+   },
+   "PR.AA": {
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "maturity": 2.5
+   },
+   "PR.AT": {
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "maturity": 2.5
+   },
+   "PR.DS": {
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "maturity": 2.5
+   },
+   "PR.IR": {
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "maturity": 2.5
+   },
+   "PR.PS": {
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "maturity": 2.5
+   },
+   "RC.RP": {
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "maturity": 2.5
+   },
+   "RS.CO": {
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "maturity": 2.5
+   },
+   "RS.MA": {
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "maturity": 2.5
+   }
+  },
+  "complete": true,
+  "exclusions": {
+   "count": 0,
+   "excluded_value": 2.5,
+   "ids": [],
+   "max": 1
+  },
+  "key_measures": {
+   "DE.AE-03.1": {
+    "below_target_axes": [
+     "implementation"
+    ],
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "score": 2.5,
+    "target": 2.5
+   },
+   "DE.CM-01.2": {
+    "below_target_axes": [
+     "implementation"
+    ],
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "score": 2.5,
+    "target": 2.5
+   },
+   "ID.AM-08.2": {
+    "below_target_axes": [
+     "implementation"
+    ],
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "score": 2.5,
+    "target": 2.5
+   },
+   "PR.AA-01.1": {
+    "below_target_axes": [
+     "implementation"
+    ],
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "score": 2.5,
+    "target": 2.5
+   },
+   "PR.AA-03.2": {
+    "below_target_axes": [
+     "implementation"
+    ],
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "score": 2.5,
+    "target": 2.5
+   },
+   "PR.AA-05.1": {
+    "below_target_axes": [
+     "implementation"
+    ],
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "score": 2.5,
+    "target": 2.5
+   },
+   "PR.AA-05.2": {
+    "below_target_axes": [
+     "implementation"
+    ],
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "score": 2.5,
+    "target": 2.5
+   },
+   "PR.AA-05.3": {
+    "below_target_axes": [
+     "implementation"
+    ],
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "score": 2.5,
+    "target": 2.5
+   },
+   "PR.AA-05.4": {
+    "below_target_axes": [
+     "implementation"
+    ],
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "score": 2.5,
+    "target": 2.5
+   },
+   "PR.DS-11.1": {
+    "below_target_axes": [
+     "implementation"
+    ],
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "score": 2.5,
+    "target": 2.5
+   },
+   "PR.IR-01.1": {
+    "below_target_axes": [
+     "implementation"
+    ],
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "score": 2.5,
+    "target": 2.5
+   },
+   "PR.IR-01.2": {
+    "below_target_axes": [
+     "implementation"
+    ],
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "score": 2.5,
+    "target": 2.5
+   },
+   "PR.PS-04.1": {
+    "below_target_axes": [
+     "implementation"
+    ],
+    "documentation": 3.0,
+    "implementation": 2.0,
+    "score": 2.5,
+    "target": 2.5
+   }
+  },
+  "level": "basic",
+  "scoring": "maturity_two_axis.v1",
+  "subcategories": {
+   "DE.AE-03": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "DE.CM-01": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "DE.CM-03": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "GV.OC-03": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "GV.PO-01": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "GV.RM-03": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "GV.RR-04": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "ID.AM-01": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "ID.AM-02": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "ID.AM-05": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "ID.AM-07": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "ID.AM-08": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "ID.IM-03": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "ID.RA-01": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "ID.RA-05": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "PR.AA-01": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "PR.AA-03": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "PR.AA-05": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "PR.AA-06": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "PR.AT-01": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "PR.DS-01": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "PR.DS-11": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "PR.IR-01": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "PR.PS-04": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "PR.PS-05": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "RC.RP-01": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "RS.CO-02": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "RS.MA-01": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   }
+  },
+  "total": 2.5,
+  "totals_per_axis": {
+   "documentation": 3.0,
+   "implementation": 2.0
+  },
+  "unscored": [],
+  "verdict": {
+   "category_min": null,
+   "failing_categories": [],
+   "failing_key_measures": [],
+   "key_measure_min": 2.5,
+   "passed": true,
+   "total": 2.5,
+   "total_failed": false,
+   "total_min": 2.5
+  }
+ },
+ "intent_digest": "1b67776efcf17b3fe70159e7f977775de36ac35b1a55bc9edcee4cd6eb007b78",
+ "pack_view_sha256": "02c23c94ba8ca27c7a821304b0a0ee358196ec81fe8c883fd03abcb2d31ad6cb",
+ "snapshot_envelope": {
+  "assessment_id": "fa_golden",
+  "kind": "redmesh_framework_assessment",
+  "pack_id": "ro.dnsc.o1-2026",
+  "revision": 1,
+  "schema": "redmesh.framework_assessment.v1",
+  "schema_version": "1.0",
+  "snapshot": {
+   "artifact_kind": "self_assessment",
+   "assessment_id": "fa_golden",
+   "assurance_level": "basic",
+   "claimant": {
+    "legal_name": "Example SRL",
+    "registration_id": "RO123",
+    "signer_name": "Ana Pop",
+    "signer_role": "Director"
+   },
+   "completion_date": "2026-10-06",
+   "computed": {
+    "categories": {
+     "DE.AE": {
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "maturity": 2.5
+     },
+     "DE.CM": {
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "maturity": 2.5
+     },
+     "GV.OC": {
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "maturity": 2.5
+     },
+     "GV.PO": {
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "maturity": 2.5
+     },
+     "GV.RM": {
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "maturity": 2.5
+     },
+     "GV.RR": {
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "maturity": 2.5
+     },
+     "ID.AM": {
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "maturity": 2.5
+     },
+     "ID.IM": {
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "maturity": 2.5
+     },
+     "ID.RA": {
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "maturity": 2.5
+     },
+     "PR.AA": {
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "maturity": 2.5
+     },
+     "PR.AT": {
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "maturity": 2.5
+     },
+     "PR.DS": {
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "maturity": 2.5
+     },
+     "PR.IR": {
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "maturity": 2.5
+     },
+     "PR.PS": {
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "maturity": 2.5
+     },
+     "RC.RP": {
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "maturity": 2.5
+     },
+     "RS.CO": {
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "maturity": 2.5
+     },
+     "RS.MA": {
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "maturity": 2.5
+     }
+    },
+    "complete": true,
+    "exclusions": {
+     "count": 0,
+     "excluded_value": 2.5,
+     "ids": [],
+     "max": 1
+    },
+    "key_measures": {
+     "DE.AE-03.1": {
+      "below_target_axes": [
+       "implementation"
+      ],
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "score": 2.5,
+      "target": 2.5
+     },
+     "DE.CM-01.2": {
+      "below_target_axes": [
+       "implementation"
+      ],
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "score": 2.5,
+      "target": 2.5
+     },
+     "ID.AM-08.2": {
+      "below_target_axes": [
+       "implementation"
+      ],
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "score": 2.5,
+      "target": 2.5
+     },
+     "PR.AA-01.1": {
+      "below_target_axes": [
+       "implementation"
+      ],
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "score": 2.5,
+      "target": 2.5
+     },
+     "PR.AA-03.2": {
+      "below_target_axes": [
+       "implementation"
+      ],
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "score": 2.5,
+      "target": 2.5
+     },
+     "PR.AA-05.1": {
+      "below_target_axes": [
+       "implementation"
+      ],
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "score": 2.5,
+      "target": 2.5
+     },
+     "PR.AA-05.2": {
+      "below_target_axes": [
+       "implementation"
+      ],
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "score": 2.5,
+      "target": 2.5
+     },
+     "PR.AA-05.3": {
+      "below_target_axes": [
+       "implementation"
+      ],
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "score": 2.5,
+      "target": 2.5
+     },
+     "PR.AA-05.4": {
+      "below_target_axes": [
+       "implementation"
+      ],
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "score": 2.5,
+      "target": 2.5
+     },
+     "PR.DS-11.1": {
+      "below_target_axes": [
+       "implementation"
+      ],
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "score": 2.5,
+      "target": 2.5
+     },
+     "PR.IR-01.1": {
+      "below_target_axes": [
+       "implementation"
+      ],
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "score": 2.5,
+      "target": 2.5
+     },
+     "PR.IR-01.2": {
+      "below_target_axes": [
+       "implementation"
+      ],
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "score": 2.5,
+      "target": 2.5
+     },
+     "PR.PS-04.1": {
+      "below_target_axes": [
+       "implementation"
+      ],
+      "documentation": 3.0,
+      "implementation": 2.0,
+      "score": 2.5,
+      "target": 2.5
+     }
+    },
+    "level": "basic",
+    "scoring": "maturity_two_axis.v1",
+    "subcategories": {
+     "DE.AE-03": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "DE.CM-01": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "DE.CM-03": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "GV.OC-03": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "GV.PO-01": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "GV.RM-03": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "GV.RR-04": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "ID.AM-01": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "ID.AM-02": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "ID.AM-05": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "ID.AM-07": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "ID.AM-08": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "ID.IM-03": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "ID.RA-01": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "ID.RA-05": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "PR.AA-01": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "PR.AA-03": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "PR.AA-05": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "PR.AA-06": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "PR.AT-01": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "PR.DS-01": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "PR.DS-11": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "PR.IR-01": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "PR.PS-04": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "PR.PS-05": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "RC.RP-01": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "RS.CO-02": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     },
+     "RS.MA-01": {
+      "documentation": 3.0,
+      "implementation": 2.0
+     }
+    },
+    "total": 2.5,
+    "totals_per_axis": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "unscored": [],
+    "verdict": {
+     "category_min": null,
+     "failing_categories": [],
+     "failing_key_measures": [],
+     "key_measure_min": 2.5,
+     "passed": true,
+     "total": 2.5,
+     "total_failed": false,
+     "total_min": 2.5
+    }
+   },
+   "dnsc_unique_id": "",
+   "external_supplier": "Furnizor SRL",
+   "level_provenance": {
+    "declared_by": "initial",
+    "kind": "risk_score",
+    "score": 42
+   },
+   "management_signoff": {
+    "date": "2026-10-06",
+    "name": "Ana Pop",
+    "role": "Director"
+   },
+   "name": "Evaluare",
+   "pack_acts": [
+    "MO 712 bis/2026-08-27",
+    "MO 792/2026-09-18 (Ordin 2/2026)"
+   ],
+   "pack_id": "ro.dnsc.o1-2026",
+   "remediation": [],
+   "schema": "redmesh.framework_assessment.v1",
+   "scores": {
+    "DE.AE-03.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "DE.CM-01.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "DE.CM-01.2": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "DE.CM-03.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "GV.OC-03.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "GV.PO-01.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "GV.RM-03.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "GV.RR-04.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "ID.AM-01.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "ID.AM-02.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "ID.AM-05.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "ID.AM-07.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "ID.AM-08.2": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "ID.IM-03.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "ID.RA-01.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "ID.RA-05.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "PR.AA-01.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "PR.AA-03.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "PR.AA-03.2": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "PR.AA-05.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "PR.AA-05.2": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "PR.AA-05.3": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "PR.AA-05.4": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "PR.AA-06.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "PR.AT-01.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "PR.DS-01.9": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "PR.DS-11.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "PR.IR-01.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "PR.IR-01.2": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "PR.PS-04.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "PR.PS-05.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "RC.RP-01.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "RS.CO-02.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "RS.MA-01.1": {
+     "documentation": 3,
+     "excluded": false,
+     "implementation": 2,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    }
+   },
+   "sectoral_requirements": "",
+   "submission": {
+    "actor": "initial",
+    "fingerprint": "1b67776efcf17b3fe70159e7f977775de36ac35b1a55bc9edcee4cd6eb007b78",
+    "pack_acts": [
+     "MO 712 bis/2026-08-27",
+     "MO 792/2026-09-18 (Ordin 2/2026)"
+    ],
+    "request_id": "11111111-1111-4111-8111-111111111111",
+    "revision": 1,
+    "submitted_at": "2026-11-14T10:00:00Z"
+   },
+   "tenant_id": "tn_golden"
+  },
+  "tenant_id": "tn_golden"
+ },
+ "view": {
+  "archived": false,
+  "assessmentId": "fa_golden",
+  "assessmentRevision": 1,
+  "assuranceLevel": "basic",
+  "canManage": true,
+  "claimant": {
+   "legal_name": "Example SRL",
+   "registration_id": "RO123"
+  },
+  "completionDate": "2026-10-06",
+  "computed": {
+   "categories": {
+    "DE.AE": {
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "maturity": 2.5
+    },
+    "DE.CM": {
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "maturity": 2.5
+    },
+    "GV.OC": {
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "maturity": 2.5
+    },
+    "GV.PO": {
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "maturity": 2.5
+    },
+    "GV.RM": {
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "maturity": 2.5
+    },
+    "GV.RR": {
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "maturity": 2.5
+    },
+    "ID.AM": {
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "maturity": 2.5
+    },
+    "ID.IM": {
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "maturity": 2.5
+    },
+    "ID.RA": {
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "maturity": 2.5
+    },
+    "PR.AA": {
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "maturity": 2.5
+    },
+    "PR.AT": {
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "maturity": 2.5
+    },
+    "PR.DS": {
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "maturity": 2.5
+    },
+    "PR.IR": {
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "maturity": 2.5
+    },
+    "PR.PS": {
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "maturity": 2.5
+    },
+    "RC.RP": {
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "maturity": 2.5
+    },
+    "RS.CO": {
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "maturity": 2.5
+    },
+    "RS.MA": {
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "maturity": 2.5
+    }
+   },
+   "complete": true,
+   "exclusions": {
+    "count": 0,
+    "excluded_value": 2.5,
+    "ids": [],
+    "max": 1
+   },
+   "key_measures": {
+    "DE.AE-03.1": {
+     "below_target_axes": [
+      "implementation"
+     ],
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "score": 2.5,
+     "target": 2.5
+    },
+    "DE.CM-01.2": {
+     "below_target_axes": [
+      "implementation"
+     ],
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "score": 2.5,
+     "target": 2.5
+    },
+    "ID.AM-08.2": {
+     "below_target_axes": [
+      "implementation"
+     ],
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "score": 2.5,
+     "target": 2.5
+    },
+    "PR.AA-01.1": {
+     "below_target_axes": [
+      "implementation"
+     ],
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "score": 2.5,
+     "target": 2.5
+    },
+    "PR.AA-03.2": {
+     "below_target_axes": [
+      "implementation"
+     ],
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "score": 2.5,
+     "target": 2.5
+    },
+    "PR.AA-05.1": {
+     "below_target_axes": [
+      "implementation"
+     ],
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "score": 2.5,
+     "target": 2.5
+    },
+    "PR.AA-05.2": {
+     "below_target_axes": [
+      "implementation"
+     ],
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "score": 2.5,
+     "target": 2.5
+    },
+    "PR.AA-05.3": {
+     "below_target_axes": [
+      "implementation"
+     ],
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "score": 2.5,
+     "target": 2.5
+    },
+    "PR.AA-05.4": {
+     "below_target_axes": [
+      "implementation"
+     ],
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "score": 2.5,
+     "target": 2.5
+    },
+    "PR.DS-11.1": {
+     "below_target_axes": [
+      "implementation"
+     ],
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "score": 2.5,
+     "target": 2.5
+    },
+    "PR.IR-01.1": {
+     "below_target_axes": [
+      "implementation"
+     ],
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "score": 2.5,
+     "target": 2.5
+    },
+    "PR.IR-01.2": {
+     "below_target_axes": [
+      "implementation"
+     ],
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "score": 2.5,
+     "target": 2.5
+    },
+    "PR.PS-04.1": {
+     "below_target_axes": [
+      "implementation"
+     ],
+     "documentation": 3.0,
+     "implementation": 2.0,
+     "score": 2.5,
+     "target": 2.5
+    }
+   },
+   "level": "basic",
+   "scoring": "maturity_two_axis.v1",
+   "subcategories": {
+    "DE.AE-03": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "DE.CM-01": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "DE.CM-03": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "GV.OC-03": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "GV.PO-01": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "GV.RM-03": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "GV.RR-04": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "ID.AM-01": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "ID.AM-02": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "ID.AM-05": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "ID.AM-07": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "ID.AM-08": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "ID.IM-03": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "ID.RA-01": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "ID.RA-05": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "PR.AA-01": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "PR.AA-03": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "PR.AA-05": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "PR.AA-06": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "PR.AT-01": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "PR.DS-01": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "PR.DS-11": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "PR.IR-01": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "PR.PS-04": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "PR.PS-05": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "RC.RP-01": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "RS.CO-02": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    },
+    "RS.MA-01": {
+     "documentation": 3.0,
+     "implementation": 2.0
+    }
+   },
+   "total": 2.5,
+   "totals_per_axis": {
+    "documentation": 3.0,
+    "implementation": 2.0
+   },
+   "unscored": [],
+   "verdict": {
+    "category_min": null,
+    "failing_categories": [],
+    "failing_key_measures": [],
+    "key_measure_min": 2.5,
+    "passed": true,
+    "total": 2.5,
+    "total_failed": false,
+    "total_min": 2.5
+   }
+  },
+  "currentPackActs": [
+   "MO 712 bis/2026-08-27",
+   "MO 792/2026-09-18 (Ordin 2/2026)"
+  ],
+  "dnscUniqueId": "",
+  "externalSupplier": "Furnizor SRL",
+  "history": [],
+  "latestRevision": 0,
+  "levelProvenance": {
+   "declared_by": "initial",
+   "kind": "risk_score",
+   "score": 42
+  },
+  "managementSignoff": {
+   "date": "2026-10-06",
+   "name": "Ana Pop",
+   "role": "Director"
+  },
+  "name": "Evaluare",
+  "pack": null,
+  "packActs": [
+   "MO 712 bis/2026-08-27",
+   "MO 792/2026-09-18 (Ordin 2/2026)"
+  ],
+  "packId": "ro.dnsc.o1-2026",
+  "pending": null,
+  "remediation": [],
+  "reopenedFrom": null,
+  "scores": {
+   "DE.AE-03.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "DE.CM-01.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "DE.CM-01.2": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "DE.CM-03.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "GV.OC-03.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "GV.PO-01.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "GV.RM-03.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "GV.RR-04.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "ID.AM-01.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "ID.AM-02.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "ID.AM-05.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "ID.AM-07.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "ID.AM-08.2": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "ID.IM-03.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "ID.RA-01.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "ID.RA-05.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "PR.AA-01.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "PR.AA-03.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "PR.AA-03.2": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "PR.AA-05.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "PR.AA-05.2": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "PR.AA-05.3": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "PR.AA-05.4": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "PR.AA-06.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "PR.AT-01.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "PR.DS-01.9": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "PR.DS-11.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "PR.IR-01.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "PR.IR-01.2": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "PR.PS-04.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "PR.PS-05.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "RC.RP-01.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "RS.CO-02.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "RS.MA-01.1": {
+    "documentation": 3,
+    "excluded": false,
+    "implementation": 2,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   }
+  },
+  "sectoralRequirements": "",
+  "stale": {
+   "newerPackActs": false
+  },
+  "state": "draft",
+  "submitErrors": [],
+  "tenantId": "tn_golden",
+  "updatedAt": "2026-11-14T10:00:00Z",
+  "updatedBy": "initial",
+  "updatedByName": null
+ }
+}

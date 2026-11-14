@@ -1,0 +1,553 @@
+{
+ "computed": {
+  "categories": {
+   "GV.OC": {
+    "documentation": 4.0,
+    "implementation": 3.0,
+    "maturity": 3.5
+   },
+   "GV.PO": {
+    "documentation": 4.0,
+    "implementation": 3.0,
+    "maturity": 3.5
+   },
+   "GV.RM": {
+    "documentation": 4.0,
+    "implementation": 3.0,
+    "maturity": 3.5
+   },
+   "GV.RR": {
+    "documentation": 4.0,
+    "implementation": 3.0,
+    "maturity": 3.5
+   },
+   "ID.AM": {
+    "documentation": 4.0,
+    "implementation": 3.0,
+    "maturity": 3.5
+   }
+  },
+  "complete": false,
+  "exclusions": {
+   "count": 0,
+   "excluded_value": 2.5,
+   "ids": [],
+   "max": 1
+  },
+  "key_measures": {},
+  "level": "basic",
+  "scoring": "maturity_two_axis.v1",
+  "subcategories": {
+   "GV.OC-03": {
+    "documentation": 4.0,
+    "implementation": 3.0
+   },
+   "GV.PO-01": {
+    "documentation": 4.0,
+    "implementation": 3.0
+   },
+   "GV.RM-03": {
+    "documentation": 4.0,
+    "implementation": 3.0
+   },
+   "GV.RR-04": {
+    "documentation": 4.0,
+    "implementation": 3.0
+   },
+   "ID.AM-01": {
+    "documentation": 4.0,
+    "implementation": 3.0
+   }
+  },
+  "total": 3.5,
+  "totals_per_axis": {
+   "documentation": 4.0,
+   "implementation": 3.0
+  },
+  "unscored": [
+   "ID.AM-02.1",
+   "ID.AM-05.1",
+   "ID.AM-07.1",
+   "ID.AM-08.2",
+   "ID.IM-03.1",
+   "ID.RA-01.1",
+   "ID.RA-05.1",
+   "PR.AA-01.1",
+   "PR.AA-03.1",
+   "PR.AA-03.2",
+   "PR.AA-05.1",
+   "PR.AA-05.2",
+   "PR.AA-05.3",
+   "PR.AA-05.4",
+   "PR.AA-06.1",
+   "PR.AT-01.1",
+   "PR.DS-01.9",
+   "PR.DS-11.1",
+   "PR.IR-01.1",
+   "PR.IR-01.2",
+   "PR.PS-04.1",
+   "PR.PS-05.1",
+   "DE.AE-03.1",
+   "DE.CM-01.1",
+   "DE.CM-01.2",
+   "DE.CM-03.1",
+   "RS.CO-02.1",
+   "RS.MA-01.1",
+   "RC.RP-01.1"
+  ],
+  "verdict": {
+   "category_min": null,
+   "failing_categories": [],
+   "failing_key_measures": [],
+   "key_measure_min": 2.5,
+   "passed": false,
+   "total": 3.5,
+   "total_failed": false,
+   "total_min": 2.5
+  }
+ },
+ "intent_digest": "695f7d7b7bb59951312cf6929fbfda9451c435561f251176f7279f7cfbeeec9e",
+ "pack_view_sha256": "02c23c94ba8ca27c7a821304b0a0ee358196ec81fe8c883fd03abcb2d31ad6cb",
+ "snapshot_envelope": {
+  "kind": "redmesh_framework_assessment",
+  "pack_id": "ro.dnsc.o1-2026",
+  "revision": 1,
+  "schema": "redmesh.framework_assessment.v1",
+  "schema_version": "1.0",
+  "snapshot": {
+   "artifact_kind": "self_assessment",
+   "assurance_level": "basic",
+   "claimant": {
+    "legal_name": "Example SRL",
+    "registration_id": "RO123",
+    "signer_name": "Ana Pop",
+    "signer_role": "Director"
+   },
+   "completion_date": "",
+   "computed": {
+    "categories": {
+     "GV.OC": {
+      "documentation": 4.0,
+      "implementation": 3.0,
+      "maturity": 3.5
+     },
+     "GV.PO": {
+      "documentation": 4.0,
+      "implementation": 3.0,
+      "maturity": 3.5
+     },
+     "GV.RM": {
+      "documentation": 4.0,
+      "implementation": 3.0,
+      "maturity": 3.5
+     },
+     "GV.RR": {
+      "documentation": 4.0,
+      "implementation": 3.0,
+      "maturity": 3.5
+     },
+     "ID.AM": {
+      "documentation": 4.0,
+      "implementation": 3.0,
+      "maturity": 3.5
+     }
+    },
+    "complete": false,
+    "exclusions": {
+     "count": 0,
+     "excluded_value": 2.5,
+     "ids": [],
+     "max": 1
+    },
+    "key_measures": {},
+    "level": "basic",
+    "scoring": "maturity_two_axis.v1",
+    "subcategories": {
+     "GV.OC-03": {
+      "documentation": 4.0,
+      "implementation": 3.0
+     },
+     "GV.PO-01": {
+      "documentation": 4.0,
+      "implementation": 3.0
+     },
+     "GV.RM-03": {
+      "documentation": 4.0,
+      "implementation": 3.0
+     },
+     "GV.RR-04": {
+      "documentation": 4.0,
+      "implementation": 3.0
+     },
+     "ID.AM-01": {
+      "documentation": 4.0,
+      "implementation": 3.0
+     }
+    },
+    "total": 3.5,
+    "totals_per_axis": {
+     "documentation": 4.0,
+     "implementation": 3.0
+    },
+    "unscored": [
+     "ID.AM-02.1",
+     "ID.AM-05.1",
+     "ID.AM-07.1",
+     "ID.AM-08.2",
+     "ID.IM-03.1",
+     "ID.RA-01.1",
+     "ID.RA-05.1",
+     "PR.AA-01.1",
+     "PR.AA-03.1",
+     "PR.AA-03.2",
+     "PR.AA-05.1",
+     "PR.AA-05.2",
+     "PR.AA-05.3",
+     "PR.AA-05.4",
+     "PR.AA-06.1",
+     "PR.AT-01.1",
+     "PR.DS-01.9",
+     "PR.DS-11.1",
+     "PR.IR-01.1",
+     "PR.IR-01.2",
+     "PR.PS-04.1",
+     "PR.PS-05.1",
+     "DE.AE-03.1",
+     "DE.CM-01.1",
+     "DE.CM-01.2",
+     "DE.CM-03.1",
+     "RS.CO-02.1",
+     "RS.MA-01.1",
+     "RC.RP-01.1"
+    ],
+    "verdict": {
+     "category_min": null,
+     "failing_categories": [],
+     "failing_key_measures": [],
+     "key_measure_min": 2.5,
+     "passed": false,
+     "total": 3.5,
+     "total_failed": false,
+     "total_min": 2.5
+    }
+   },
+   "dnsc_unique_id": "DNSC-1",
+   "external_supplier": "",
+   "level_provenance": {
+    "declared_by": "initial",
+    "kind": "risk_score",
+    "score": 42
+   },
+   "management_signoff": null,
+   "pack_acts": [
+    "MO 712 bis/2026-08-27",
+    "MO 792/2026-09-18 (Ordin 2/2026)"
+   ],
+   "pack_id": "ro.dnsc.o1-2026",
+   "remediation": [],
+   "schema": "redmesh.framework_assessment.v1",
+   "scores": {
+    "GV.OC-03.1": {
+     "documentation": 4,
+     "excluded": false,
+     "implementation": 3,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "GV.PO-01.1": {
+     "documentation": 4,
+     "excluded": false,
+     "implementation": 3,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "GV.RM-03.1": {
+     "documentation": 4,
+     "excluded": false,
+     "implementation": 3,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "GV.RR-04.1": {
+     "documentation": 4,
+     "excluded": false,
+     "implementation": 3,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    },
+    "ID.AM-01.1": {
+     "documentation": 4,
+     "excluded": false,
+     "implementation": 3,
+     "justification": {
+      "documentation": "politica",
+      "implementation": "proces"
+     }
+    }
+   },
+   "sectoral_requirements": "",
+   "submission": {
+    "actor": "initial",
+    "fingerprint": "695f7d7b7bb59951312cf6929fbfda9451c435561f251176f7279f7cfbeeec9e",
+    "pack_acts": [
+     "MO 712 bis/2026-08-27",
+     "MO 792/2026-09-18 (Ordin 2/2026)"
+    ],
+    "request_id": "11111111-1111-4111-8111-111111111111",
+    "revision": 1,
+    "submitted_at": "2026-11-14T10:00:00Z"
+   },
+   "tenant_id": "tn_golden"
+  },
+  "tenant_id": "tn_golden"
+ },
+ "view": {
+  "archived": false,
+  "assessmentId": "default",
+  "assessmentRevision": 1,
+  "assuranceLevel": "basic",
+  "canManage": true,
+  "claimant": {
+   "legal_name": "Example SRL",
+   "registration_id": "RO123"
+  },
+  "completionDate": "",
+  "computed": {
+   "categories": {
+    "GV.OC": {
+     "documentation": 4.0,
+     "implementation": 3.0,
+     "maturity": 3.5
+    },
+    "GV.PO": {
+     "documentation": 4.0,
+     "implementation": 3.0,
+     "maturity": 3.5
+    },
+    "GV.RM": {
+     "documentation": 4.0,
+     "implementation": 3.0,
+     "maturity": 3.5
+    },
+    "GV.RR": {
+     "documentation": 4.0,
+     "implementation": 3.0,
+     "maturity": 3.5
+    },
+    "ID.AM": {
+     "documentation": 4.0,
+     "implementation": 3.0,
+     "maturity": 3.5
+    }
+   },
+   "complete": false,
+   "exclusions": {
+    "count": 0,
+    "excluded_value": 2.5,
+    "ids": [],
+    "max": 1
+   },
+   "key_measures": {},
+   "level": "basic",
+   "scoring": "maturity_two_axis.v1",
+   "subcategories": {
+    "GV.OC-03": {
+     "documentation": 4.0,
+     "implementation": 3.0
+    },
+    "GV.PO-01": {
+     "documentation": 4.0,
+     "implementation": 3.0
+    },
+    "GV.RM-03": {
+     "documentation": 4.0,
+     "implementation": 3.0
+    },
+    "GV.RR-04": {
+     "documentation": 4.0,
+     "implementation": 3.0
+    },
+    "ID.AM-01": {
+     "documentation": 4.0,
+     "implementation": 3.0
+    }
+   },
+   "total": 3.5,
+   "totals_per_axis": {
+    "documentation": 4.0,
+    "implementation": 3.0
+   },
+   "unscored": [
+    "ID.AM-02.1",
+    "ID.AM-05.1",
+    "ID.AM-07.1",
+    "ID.AM-08.2",
+    "ID.IM-03.1",
+    "ID.RA-01.1",
+    "ID.RA-05.1",
+    "PR.AA-01.1",
+    "PR.AA-03.1",
+    "PR.AA-03.2",
+    "PR.AA-05.1",
+    "PR.AA-05.2",
+    "PR.AA-05.3",
+    "PR.AA-05.4",
+    "PR.AA-06.1",
+    "PR.AT-01.1",
+    "PR.DS-01.9",
+    "PR.DS-11.1",
+    "PR.IR-01.1",
+    "PR.IR-01.2",
+    "PR.PS-04.1",
+    "PR.PS-05.1",
+    "DE.AE-03.1",
+    "DE.CM-01.1",
+    "DE.CM-01.2",
+    "DE.CM-03.1",
+    "RS.CO-02.1",
+    "RS.MA-01.1",
+    "RC.RP-01.1"
+   ],
+   "verdict": {
+    "category_min": null,
+    "failing_categories": [],
+    "failing_key_measures": [],
+    "key_measure_min": 2.5,
+    "passed": false,
+    "total": 3.5,
+    "total_failed": false,
+    "total_min": 2.5
+   }
+  },
+  "currentPackActs": [
+   "MO 712 bis/2026-08-27",
+   "MO 792/2026-09-18 (Ordin 2/2026)"
+  ],
+  "dnscUniqueId": "DNSC-1",
+  "externalSupplier": "",
+  "history": [],
+  "latestRevision": 0,
+  "levelProvenance": {
+   "declared_by": "initial",
+   "kind": "risk_score",
+   "score": 42
+  },
+  "managementSignoff": null,
+  "name": "",
+  "pack": null,
+  "packActs": [
+   "MO 712 bis/2026-08-27",
+   "MO 792/2026-09-18 (Ordin 2/2026)"
+  ],
+  "packId": "ro.dnsc.o1-2026",
+  "pending": null,
+  "remediation": [],
+  "reopenedFrom": null,
+  "scores": {
+   "GV.OC-03.1": {
+    "documentation": 4,
+    "excluded": false,
+    "implementation": 3,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "GV.PO-01.1": {
+    "documentation": 4,
+    "excluded": false,
+    "implementation": 3,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "GV.RM-03.1": {
+    "documentation": 4,
+    "excluded": false,
+    "implementation": 3,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "GV.RR-04.1": {
+    "documentation": 4,
+    "excluded": false,
+    "implementation": 3,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   },
+   "ID.AM-01.1": {
+    "documentation": 4,
+    "excluded": false,
+    "implementation": 3,
+    "justification": {
+     "documentation": "politica",
+     "implementation": "proces"
+    }
+   }
+  },
+  "sectoralRequirements": "",
+  "stale": {
+   "newerPackActs": false
+  },
+  "state": "draft",
+  "submitErrors": [
+   {
+    "code": "unscored",
+    "ids": [
+     "DE.AE-03.1",
+     "DE.CM-01.1",
+     "DE.CM-01.2",
+     "DE.CM-03.1",
+     "ID.AM-02.1",
+     "ID.AM-05.1",
+     "ID.AM-07.1",
+     "ID.AM-08.2",
+     "ID.IM-03.1",
+     "ID.RA-01.1",
+     "ID.RA-05.1",
+     "PR.AA-01.1",
+     "PR.AA-03.1",
+     "PR.AA-03.2",
+     "PR.AA-05.1",
+     "PR.AA-05.2",
+     "PR.AA-05.3",
+     "PR.AA-05.4",
+     "PR.AA-06.1",
+     "PR.AT-01.1",
+     "PR.DS-01.9",
+     "PR.DS-11.1",
+     "PR.IR-01.1",
+     "PR.IR-01.2",
+     "PR.PS-04.1",
+     "PR.PS-05.1",
+     "RC.RP-01.1",
+     "RS.CO-02.1",
+     "RS.MA-01.1"
+    ]
+   },
+   {
+    "code": "management_signoff_missing"
+   },
+   {
+    "code": "completion_date_missing"
+   }
+  ],
+  "tenantId": "tn_golden",
+  "updatedAt": "2026-11-14T10:00:00Z",
+  "updatedBy": "initial",
+  "updatedByName": null
+ }
+}

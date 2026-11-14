@@ -28,7 +28,7 @@ from ..references.framework_packs import (
   load_framework_pack,
   load_framework_text,
 )
-from ..services.framework_scoring import AXES, CAPS, NA, SCORE_VALUES, score, validate_for_submit, validate_scores
+from ..services.framework_scoring import AXES, CAPS, NA, SCORE_VALUES, scorer_for, validate_scores
 from . import account_profile
 from .ports import TenantStoreError
 
@@ -521,8 +521,9 @@ def pack_view(pack, text, level):
 def assessment_view(row, pack, *, can_manage, text=None, names=_no_names, tenant=None):
   """The DTO. Never a document reference. With `text`, the pack view rides along (reads only)."""
   level = row.get("assurance_level")
-  computed = score(pack, level, row.get("scores") or {}) if level else None
-  submit_errors = validate_for_submit(pack, level, row)[0] if level else [{"code": "level_missing"}]
+  scorer = scorer_for(pack)
+  computed = scorer.compute(pack, level, row.get("scores") or {}) if level else None
+  submit_errors = scorer.validate_for_submit(pack, {}, level, row)[0] if level else [{"code": "level_missing"}]
   return {
     "pack": pack_view(pack, text, level) if text is not None else None,
     "tenantId": row["tenant_id"], "packId": row["pack_id"], "assessmentId": row.get("assessment_id") or DEFAULT_ID,
@@ -669,7 +670,7 @@ def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revis
     if "claimant_digest" in pending and pending["claimant_digest"] != claimant_digest(tenant):
       raise _denied(409, "conflict")
     level = row["assurance_level"]
-    computed = score(pack, level, row["scores"])
+    computed = scorer_for(pack).compute(pack, level, row["scores"])
     return {"outcome": "resume", "revision": pending["revision"],
             "assessment_revision": row["assessment_revision"],
             "envelope": build_snapshot(row, tenant, computed, pending)}
@@ -683,7 +684,7 @@ def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revis
   level = row.get("assurance_level")
   if level is None:
     raise _denied(400, "assessment_invalid", errors=[{"code": "level_missing"}])
-  errors, computed = validate_for_submit(pack, level, row)
+  errors, computed = scorer_for(pack).validate_for_submit(pack, {}, level, row)
   if errors:
     raise _denied(400, "assessment_invalid", errors=errors)
   if list(row["pack_acts"]) != list(pack["acts"]):
@@ -730,7 +731,7 @@ def record_submit(service, actor, tenant_id, pack_id, request_id, ref, expected_
   if (pending is None or pending["request_id"] != request_id or pending["actor"] != account.account_id
       or row["assessment_revision"] != expected_assessment_revision or row["state"] != "draft"):
     raise _denied(409, "assessment_submit_superseded")
-  computed = score(pack, row["assurance_level"], row["scores"])
+  computed = scorer_for(pack).compute(pack, row["assurance_level"], row["scores"])
   submission = {
     "revision": pending["revision"], "ref": {"store": ref["store"], "ref": ref["ref"]},
     "submitted_at": pending["submitted_at"], "actor": account.account_id,

@@ -1,0 +1,54 @@
+{
+ "computed": null,
+ "intent_digest": "aca1f48ca89bc1bffe9f99c308d88b291daf77f339598e7cb45dca2775e8d5fb",
+ "pack_view_sha256": "b7a442cceb0338df09a04c6bca9565f02f2fb2a4d8902047d2b24ba620f621e2",
+ "snapshot_envelope": null,
+ "view": {
+  "archived": false,
+  "assessmentId": "default",
+  "assessmentRevision": 1,
+  "assuranceLevel": null,
+  "canManage": true,
+  "claimant": {
+   "legal_name": "Example SRL",
+   "registration_id": "RO123"
+  },
+  "completionDate": "",
+  "computed": null,
+  "currentPackActs": [
+   "MO 712 bis/2026-08-27",
+   "MO 792/2026-09-18 (Ordin 2/2026)"
+  ],
+  "dnscUniqueId": "",
+  "externalSupplier": "",
+  "history": [],
+  "latestRevision": 0,
+  "levelProvenance": null,
+  "managementSignoff": null,
+  "name": "",
+  "pack": null,
+  "packActs": [
+   "MO 712 bis/2026-08-27",
+   "MO 792/2026-09-18 (Ordin 2/2026)"
+  ],
+  "packId": "ro.dnsc.o1-2026",
+  "pending": null,
+  "remediation": [],
+  "reopenedFrom": null,
+  "scores": {},
+  "sectoralRequirements": "",
+  "stale": {
+   "newerPackActs": false
+  },
+  "state": "draft",
+  "submitErrors": [
+   {
+    "code": "level_missing"
+   }
+  ],
+  "tenantId": "tn_golden",
+  "updatedAt": "2026-11-14T10:00:00Z",
+  "updatedBy": "initial",
+  "updatedByName": null
+ }
+}
