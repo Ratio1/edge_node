@@ -1029,7 +1029,17 @@ class _DauthMixin(object):
 
     # set supervisor secrets if this is a protocol oracle; dAuth-only secrets
     # are additionally gated by the dAuth oracle registry.
-    if is_node and requester_node_address in oracles:
+    # The role is decided from the chain by the requester's own eth address,
+    # not from `oracles`: that list only holds keys this server has already
+    # heard heartbeats from, so a freshly keyed oracle would be missed.
+    requester_is_oracle = False
+    if is_node:
+      try:
+        requester_eth = self.bc.node_address_to_eth_address(requester_node_address)
+        requester_is_oracle = self._is_protocol_oracle_eth(requester_eth)
+      except Exception:
+        pass  # chain read errors are already logged by get_oracles() above
+    if requester_is_oracle:
       requester_is_dauth_oracle = False
       try:
         requester_is_dauth_oracle = self.bc.is_dauth_oracle(node_address_eth=sender_eth_address)
