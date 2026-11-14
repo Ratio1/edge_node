@@ -138,6 +138,7 @@ CASES = [
   # KEV additions.
   # CVE-2026-123158 (musl without PAM) is not a row: a version-only row would fire on every glibc host.
   ("openssh", "10.5", "CVE-2026-123158", False),
+  ("erlang_ssh", "5.2.2", "CVE-2025-32433", True),
   ("mongodb", "7.0.27", "CVE-2025-14847", True),
   ("mongodb", "7.0.28", "CVE-2025-14847", False),
   ("exim", "4.91", "CVE-2019-10149", True),
@@ -192,6 +193,55 @@ CASES = [
   ("wordpress", "6.7.8", "CVE-2026-87902", True),
 ]
 
+# Report 2 "WRONG" rows: last affected and first fixed version of every branch.
+# (product, last_affected, first_fixed, cve_id[, applicability])
+BRANCH_EDGES = [
+  ("apache", "2.2.32", "2.2.33", "CVE-2017-3169"),
+  ("apache", "2.4.25", "2.4.26", "CVE-2017-3169"),
+  ("apache", "2.4.29", "2.4.30", "CVE-2018-1312"),
+  ("openssl", "3.0.6", "3.0.7", "CVE-2022-3602"),
+  ("openssl", "1.0.2w", "1.0.2x", "CVE-2020-1971"),
+  ("openssl", "1.1.1h", "1.1.1i", "CVE-2020-1971"),
+  ("openssl", "1.0.1t", "1.0.1u", "CVE-2016-2177"),
+  ("openssl", "1.0.2h", "1.0.2i", "CVE-2016-2177"),
+  ("bind", "9.16.32", "9.16.33", "CVE-2022-3080"),
+  ("bind", "9.18.6", "9.18.7", "CVE-2022-3080"),
+  ("bind", "9.19.4", "9.19.5", "CVE-2022-3080"),
+  ("mysql", "8.0.35", "8.0.36", "CVE-2024-20973"),
+  ("mysql", "8.2.0", "8.2.1", "CVE-2024-20973"),
+  ("redis", "5.0.12", "5.0.13", "CVE-2021-32761"),
+  ("redis", "6.0.14", "6.0.15", "CVE-2021-32761"),
+  ("redis", "6.2.4", "6.2.5", "CVE-2021-32761"),
+  ("redis", "6.2.16", "6.2.17", "CVE-2024-46981"),
+  ("redis", "7.2.6", "7.2.7", "CVE-2024-46981"),
+  ("redis", "7.4.1", "7.4.2", "CVE-2024-46981"),
+  ("asterisk", "18.24.1", "18.24.2", "CVE-2024-42365"),
+  ("asterisk", "20.9.1", "20.9.2", "CVE-2024-42365"),
+  ("asterisk", "21.4.1", "21.4.2", "CVE-2024-42365"),
+  ("mongodb", "5.0.13", "5.0.14", "CVE-2024-8207"),
+  ("mongodb", "6.0.2", "6.0.3", "CVE-2024-8207"),
+  ("mongodb", "6.1.0", "6.1.1", "CVE-2024-8207"),
+  # Erlang/OTP ssh application versions (the banner carries the app version).
+  ("erlang_ssh", "4.15.3.11", "4.15.3.12", "CVE-2025-32433"),
+  ("erlang_ssh", "5.1.4.7", "5.1.4.8", "CVE-2025-32433"),
+  ("erlang_ssh", "5.2.9", "5.2.10", "CVE-2025-32433"),
+  ("erlang_ssh", "25.3.2.19", "25.3.2.20", "CVE-2025-32433"),
+  ("erlang_ssh", "26.2.5.10", "26.2.5.11", "CVE-2025-32433"),
+  ("erlang_ssh", "27.3.2", "27.3.3", "CVE-2025-32433"),
+]
+for _cve in ("CVE-2024-10979", "CVE-2024-10976"):
+  for _l, _f in (("12.20", "12.21"), ("13.16", "13.17"), ("14.13", "14.14"),
+                     ("15.8", "15.9"), ("16.4", "16.5"), ("17.0", "17.1")):
+    BRANCH_EDGES.append(("postgresql", _l, _f, _cve))
+# CVE-2025-1094 is client-side: it fires only for the client applicability.
+CLIENT_BRANCH_EDGES = [
+  ("postgresql", "13.18", "13.19", "CVE-2025-1094"),
+  ("postgresql", "14.15", "14.16", "CVE-2025-1094"),
+  ("postgresql", "15.10", "15.11", "CVE-2025-1094"),
+  ("postgresql", "16.6", "16.7", "CVE-2025-1094"),
+  ("postgresql", "17.2", "17.3", "CVE-2025-1094"),
+]
+
 
 class TestCorrectedRows(unittest.TestCase):
 
@@ -199,6 +249,23 @@ class TestCorrectedRows(unittest.TestCase):
     for product, version, cve_id, expected in CASES:
       with self.subTest(product=product, version=version, cve=cve_id):
         self.assertEqual(_fires(product, version, cve_id), expected)
+
+  def test_branch_edges_last_affected_and_first_fixed(self):
+    for product, last, fixed, cve_id in BRANCH_EDGES:
+      with self.subTest(product=product, cve=cve_id, last_affected=last):
+        self.assertTrue(_fires(product, last, cve_id))
+      with self.subTest(product=product, cve=cve_id, first_fixed=fixed):
+        self.assertFalse(_fires(product, fixed, cve_id))
+    for product, last, fixed, cve_id in CLIENT_BRANCH_EDGES:
+      with self.subTest(product=product, cve=cve_id, client_last_affected=last):
+        self.assertTrue(_fires(product, last, cve_id, applicability="client"))
+      with self.subTest(product=product, cve=cve_id, client_first_fixed=fixed):
+        self.assertFalse(_fires(product, fixed, cve_id, applicability="client"))
+
+  def test_packetbeat_cve_not_filed_under_elasticsearch(self):
+    self.assertEqual([e for e in CVE_DATABASE if e.cve_id == "CVE-2017-11480"], [])
+    for version in ("5.6.3", "5.6.4", "5.6.5", "2.4.0"):
+      self.assertFalse(_fires("elasticsearch", version, "CVE-2017-11480"), version)
 
   def test_no_equality_constraint_remains(self):
     self.assertEqual([e.cve_id for e in CVE_DATABASE if "==" in e.constraint], [])
