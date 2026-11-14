@@ -35,6 +35,8 @@ class TestMysqlProbeRange(unittest.TestCase):
 class TestProbeKeys(unittest.TestCase):
 
   def test_products_without_probe_is_what_no_probe_names(self):
+    # A text scan, so a heuristic: a product key quoted anywhere under worker/ (even a comment or a log line) counts as named.
+    # It catches a key added to or dropped from a probe's product map, not a call site that never runs.
     text = "".join(p.read_text() for p in (RED_MESH / "worker").rglob("*.py"))
     unnamed = {e.product for e in CVE_DATABASE if not re.search(r"""['"]%s['"]""" % re.escape(e.product), text)}
     self.assertEqual(set(PRODUCTS_WITHOUT_PROBE), unnamed)

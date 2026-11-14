@@ -10,6 +10,7 @@ import json
 import re
 import sqlite3
 import sys
+from bisect import bisect_left, bisect_right
 from collections import namedtuple
 from pathlib import Path
 
@@ -21,7 +22,7 @@ PIN_PATH = Path(__file__).resolve().parent / "pin.json"
 
 _CLAUSE = re.compile(r"(>=|<=|>|<|==)(.+)")
 # Numeric parts of a full version, where a banner can be shorter than that: `Apache/2.4` is not 2.4.0. Default 3.
-_FULL_DEPTH = {"openssh": 2, "postgresql": 2, "exim": 2, "dropbear": 2, "libssh": 2}
+_FULL_DEPTH = {"openssh": 2, "postgresql": 2, "exim": 2, "dropbear": 2, "wordpress": 2}
 
 Match = namedtuple("Match", (
   "cve_id", "product", "constraint", "source", "confidence", "reason", "platform_dependent", "client_side",
@@ -94,6 +95,7 @@ class VulndbReader:
     self._vulns = vulns
     self._exact = {}   # (product, normalised numbers, tail) -> [affected row]
     self._ranges = {}  # product -> [(clauses, affected row)]
+    self._exact_sorted = {}  # product -> [(key, affected row)] sorted by key, built on the first span query
     rows_by_cve = {}   # (product, cve_id) -> [clauses or None (unparsed), affected row], for the end-of-life rules
     cache = {}
     for row in rows:
@@ -151,11 +153,31 @@ class VulndbReader:
       return None
     return parsed, (parsed[0] + [999999] * (depth - len(parsed[0])), parsed[1])
 
+  def _sorted_exact(self, product):
+    """`(keys, rows)` of the `==` rows of a product, sorted by `(normalised numbers, tail)` as the matcher compares."""
+    if product not in self._exact_sorted:
+      pairs = sorted(((key[1], key[2]), row) for key, rows in self._exact.items() if key[0] == product for row in rows)
+      pairs.sort(key=lambda e: e[0])
+      self._exact_sorted[product] = ([e[0] for e in pairs], [e[1] for e in pairs])
+    return self._exact_sorted[product]
+
+  def _inside(self, product, low, high, seen):
+    """Rows not in `seen` whose constraint names a version strictly between `low` and `high`: possible, not provable."""
+    out = []
+    for clauses, row in self._ranges.get(product, ()):
+      if row not in seen and any(_compare_versions(low, t) < 0 < _compare_versions(high, t) for _, t in clauses):
+        out.append(row)
+    keys, rows = self._sorted_exact(product)
+    start, end = bisect_right(keys, (_norm(low[0]), low[1])), bisect_left(keys, (_norm(high[0]), high[1]))
+    out.extend(row for row in rows[start:end] if row not in seen)
+    return out
+
   def query(self, product, version, inferred_span=None):
     """Rows of `product` whose constraint holds for `version`, one per CVE.
 
-    Over a span (see `_span`) a row that holds at both ends keeps its confidence; a row that holds at one end only cannot be
-    told apart at this precision and is returned tentative with reason `inferred_version`; a row at neither end is dropped.
+    Over a span (see `_span`) a row that holds at both ends keeps its confidence. A row that holds at one end only, or whose
+    constraint names a version strictly inside the span, cannot be told apart at this precision and is returned tentative with
+    reason `inferred_version`. Any other row is dropped.
     """
     parsed = _parse_version(version, product)
     if parsed is None:
@@ -165,8 +187,11 @@ class VulndbReader:
       found, partial = self._found(product, parsed), []
     else:
       low, high = (self._found(product, p) for p in span)
-      found = [row for row in low if row in high]
-      partial = [row[:4] + ("tentative", "inferred_version") + row[6:] for row in low + high if row not in found]
+      high_set, low_set = set(high), set(low)
+      found = [row for row in low if row in high_set]
+      seen = low_set | high_set
+      partial = [row for row in low + high if row not in found] + self._inside(product, span[0], span[1], seen)
+      partial = [row[:4] + ("tentative", "inferred_version") + row[6:] for row in partial]
     best = {}  # one row per CVE: firm/certain over tentative, then platform-independent over dependent
     for row in found + partial:
       rank = (row[4] == "tentative", row[6])
