@@ -4819,8 +4819,9 @@ class ContainerAppRunnerPlugin(
     """
     Perform periodic monitoring tasks.
 
-    Executes the one sweep of the node's Docker store when it is due, image update checks, tunnel health checks,
-    and any subclass-defined additional checks. It is called only while the app's container is running.
+    Executes image update checks, tunnel health checks, and any subclass-defined additional checks. It is called
+    only while the app's container is running; the sweep of the node's Docker store is not here for that reason
+    (`process` calls it in every lap).
 
     Returns
     -------
@@ -4828,12 +4829,9 @@ class ContainerAppRunnerPlugin(
 
     Examples
     --------
-    >>> self._perform_periodic_monitoring()   # one lap: sweep when due, update check, tunnels, subclass checks
+    >>> self._perform_periodic_monitoring()   # one lap of a running app: update check, tunnels, subclass checks
     """
     current_time = self.time()
-
-    # First, while this app's own container is known to run and so holds its image: the store sweep of this node run.
-    self._maybe_sweep_docker_store()
 
     if self.cfg_autoupdate:
       self._check_image_updates(current_time)
@@ -4975,6 +4973,7 @@ class ContainerAppRunnerPlugin(
     Main process loop for the plugin.
 
     Called every PROCESS_DELAY seconds. Performs:
+    0. Sweep the node's Docker store when that is due (once per node run, by one app)
     1. Check for paused state (manual stop)
     2. Handle initial launch if container not started
     3. Initialize and start tunnel engine if needed
@@ -4987,11 +4986,26 @@ class ContainerAppRunnerPlugin(
     -------
     None
 
+    Raises
+    ------
+    docker.errors.APIError, requests.exceptions.RequestException
+      From the store sweep, in the one lap of a node run that does it (`_maybe_sweep_docker_store`).
+
     Notes
     -----
     The process loop implements a state machine for container lifecycle
     management with automatic restart based on configured policies.
+
+    Examples
+    --------
+    >>> self.process()   # one lap: sweep when due, then start, watch or restart the app's container
     """
+    # First in every lap, whatever state the app is in: the one sweep of the node's Docker store, when it is due.
+    # The store now survives a node restart, so only this sweep frees it. From the monitoring of a running app,
+    # where the call was before, a node whose apps cannot start (store on a full disk), are stopped by hand or
+    # have no container yet never reached it and kept a full store until its host was cleaned by hand.
+    self._maybe_sweep_docker_store()
+
     # Use state machine instead of deprecated _is_manually_stopped flag
     if self.container_state == ContainerState.PAUSED:
       # Log paused message periodically instead of every process cycle

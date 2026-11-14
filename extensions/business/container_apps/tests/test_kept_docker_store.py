@@ -27,8 +27,8 @@ install_docker_stub_if_needed()
 from extensions.business.container_apps.tests.support import install_dummy_base_plugin, make_lifecycle_runner
 # The runner module itself, for its sweep delay and to load it a second time.
 from extensions.business.container_apps import container_app_runner as car_module
-# The reason an update restart is made with.
-from extensions.business.container_apps.container_app_runner import StopReason
+# The state of an app that was stopped by hand, and the reason an update restart is made with.
+from extensions.business.container_apps.container_app_runner import ContainerState, StopReason
 
 
 # The wall-clock time the plugin reads in the sweep tests.
@@ -330,18 +330,52 @@ class TestDockerStoreSweep(unittest.TestCase):
     # Not tried again.
     self.assertEqual(self.client.containers.prune.call_count, 1)
 
-  def test_the_monitoring_of_a_running_app_calls_the_sweep(self):
-    """The sweep is reached from the periodic monitoring, which runs only while the app's container is running."""
+  def test_an_app_that_cannot_start_sweeps_the_store_in_its_lap(self):
+    """A store on a full disk lets no container be created: the lap of an app without a container still frees the store."""
+    # The app has no container, as after a node restart.
+    self.plugin.container = None
+    # Docker cannot create one, as on a full disk.
+    self.client.containers.run.side_effect = RuntimeError("no space left on device")
+    # The node has been running for two hours.
+    self.plugin.get_node_running_time = lambda: 2 * DELAY
+    # One lap of the app.
+    self.plugin.process()
+    # The start was tried ...
+    self.client.containers.run.assert_called_once()
+    # ... and failed: still no container, so the lap never reached the monitoring of a running app.
+    self.assertIsNone(self.plugin.container)
+    # The store was swept all the same; before, such a node kept a full store until someone cleaned its host.
+    self.assertEqual(len(self.swept()), 3)
+
+  def test_a_paused_app_sweeps_the_store_in_its_lap(self):
+    """A node whose apps are all stopped by hand still frees what the earlier run left."""
+    # No container: a manual stop removed it.
+    self.plugin.container = None
+    # The state a manual stop leaves; such a lap ends right after its log line.
+    self.plugin.container_state = ContainerState.PAUSED
+    # The node has been running for two hours.
+    self.plugin.get_node_running_time = lambda: 2 * DELAY
+    # One lap of the app.
+    self.plugin.process()
+    # No start was tried.
+    self.client.containers.run.assert_not_called()
+    # The store was swept.
+    self.assertEqual(len(self.swept()), 3)
+
+  def test_a_lap_asks_for_the_sweep_once_and_first(self):
+    """Every lap reaches the sweep exactly once, before the app's own container is looked at."""
+    # Records the order of the two steps below.
+    order = MagicMock()
     # The sweep itself is tested above.
-    self.plugin._maybe_sweep_docker_store = MagicMock()
-    # The update check is not under test.
-    self.plugin._check_image_updates = MagicMock()
-    # Nor are the checks of subclasses and mixins.
-    self.plugin._perform_additional_checks = MagicMock(return_value=None)
-    # One monitoring lap.
-    self.plugin._perform_periodic_monitoring()
-    # It asked for the sweep, once.
-    self.plugin._maybe_sweep_docker_store.assert_called_once_with()
+    self.plugin._maybe_sweep_docker_store = order.sweep
+    # The look at the app's container; its answer counts as "running", so the lap goes on to the monitoring.
+    self.plugin._check_container_status = order.status
+    # One full lap of a running app.
+    self.plugin.process()
+    # The sweep came first, then the container check.
+    self.assertEqual(order.mock_calls[:2], [call.sweep(), call.status()])
+    # Once per lap: not from the monitoring of the running app as well.
+    self.assertEqual(order.sweep.call_count, 1)
 
   def test_the_delay_is_one_hour(self):
     """The sweep waits one hour into a node run."""

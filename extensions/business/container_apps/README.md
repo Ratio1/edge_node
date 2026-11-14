@@ -383,7 +383,10 @@ because the disk API of plugin code refuses that folder (the core's `RESTRICTED_
 - **Sweep:** one hour into each node run, one app removes from the store the stopped containers of earlier
   runs, the anonymous volumes no container holds and every image no container uses. An app without a
   container at that moment (stopped by hand, waiting for another app) pulls its image at its next start. An
-  image loaded by hand that no container uses at that moment is removed too.
+  image loaded by hand that no container uses at that moment is removed too. The sweep is the first step of
+  every app's lap, whatever state the app is in: apps that cannot start because the store filled the disk
+  still free it, one hour into the node run after a restart. A node without any container app does not
+  sweep and keeps what its last apps left, without adding to it.
 - **Disk:** the images of the apps that have a container, plus what a run adds after its sweep (the previous
   image of each updated app, images and containers of apps removed since).
 - **Docker major:** the directory is named after the Docker major that writes it, and each image build stops
