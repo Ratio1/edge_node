@@ -34,6 +34,11 @@ SECRET_REVISIONS_HKEY = "DAUTH_JOB_SECRET_REVISIONS"
 # each operation's own completion: the sends of operations stay spread as their completion times are, before and
 # after a restart.
 REPAIR_AGES = (600, 1200, 2400) + tuple(range(4800, 86400, 3600))
+# An operation that is not completed and whose snapshot has not changed for this many seconds is re-sent to the peers
+# as repair once per this many seconds, no longer every 30 s. An operation that waits for something that never comes
+# (a blocked one) keeps the same snapshot for as long as it waits, and every oracle received and answered that
+# snapshot about 115 times an hour.
+OPEN_REPAIR_SECONDS = 600
 class DeploymentAuthenticationError(ValueError):
   """The reusable read authorization is invalid or expired."""
 
@@ -438,16 +443,26 @@ class _DeploymentOperationsMixin:
     an error. Before this throttle the unchanged snapshot was re-sent to every
     oracle peer on every 2 s pass of the worker.
 
+    An operation that is not completed keeps the 30 s repair only while its
+    snapshot is younger than `OPEN_REPAIR_SECONDS` (600 s, by `updated_at`).
+    Once the snapshot has not changed for that long, its repair waits 600 s
+    after the last send instead: 6 sends an hour, where a blocked operation
+    was sent about 115 times an hour to every oracle. A change of the
+    operation makes a new snapshot, which is young again.
+
     Parameters
     ----------
     operation : dict
       A signed operation snapshot exactly as stored, with `operation_id`,
-      `sequence` and `EE_SIGN`. It is written as is and never modified.
+      `sequence`, `phase`, `updated_at` and `EE_SIGN`. It is written as is
+      and never modified.
     every : float, optional
       Seconds a repair waits after the last send of the same snapshot.
       Default 30; `_reconcile_coordinator_operations` passes 0 for an
       operation completed 600 s or more ago, whose sends its repair schedule
-      times.
+      times. For an operation that is not completed and whose snapshot is
+      `OPEN_REPAIR_SECONDS` old or older, the wait is `OPEN_REPAIR_SECONDS`
+      whatever is passed.
 
     Returns
     -------
@@ -468,6 +483,12 @@ class _DeploymentOperationsMixin:
     backwards) counts as expired, so the record is sent rather than held
     back. A failed repair send also restarts the timer.
 
+    The send times are kept in process memory, so after a restart the first
+    call sends the snapshot at once, whatever its age, and the wait counts
+    from that send. With the longer wait an oracle that missed an unchanged
+    open snapshot gets it within 600 s instead of 30 s; until then it does
+    not see that operation, or sees an older snapshot of it.
+
     Examples
     --------
     >>> plugin._replicate_operation(operation)  # not confirmed yet: writes and records the send
@@ -475,7 +496,13 @@ class _DeploymentOperationsMixin:
     >>> plugin.now += 31
     >>> plugin._replicate_operation(operation)  # repair: the same record is sent once more
     >>> plugin._replicate_operation(operation, every=0)  # no wait: the same record is sent once more
+    >>> plugin.now += 600
+    >>> plugin._replicate_operation(operation)  # open, unchanged for 600 s: sent, and then once per 600 s
     """
+    if operation["phase"] != "completed" and self.time() - operation["updated_at"] >= OPEN_REPAIR_SECONDS:
+      # An open operation whose snapshot has not changed for 600 s is repaired once per 600 s, not per 30 s:
+      # a blocked operation was re-sent about 115 times an hour to every oracle with nothing new in it.
+      every = OPEN_REPAIR_SECONDS
     # Read the confirmations kept in process memory since init; the signed snapshot carries no send bookkeeping.
     confirmed = self._operations_confirmed
     # Identify the snapshot by sequence and signature, and look up when it was last sent with confirmation.
