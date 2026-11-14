@@ -35,6 +35,8 @@ from .control_files import JsonControlFile, JsonControlFileUnsafeError
 from .constants import (
   SYNC_PROCESSING_FILE,
   SYNC_REQUEST_FILE,
+  # Name of the ENV variable that holds the set's secret: read from the config, removed from the container env.
+  SYNC_SECRET_ENV,
   STAGE_RUNTIME_STOP,
   SYSTEM_VOLUME_FS,
   SYSTEM_VOLUME_MOUNT,
@@ -210,7 +212,7 @@ class _SyncMixin:
   # ----- env-var injection -----------------------------------------------
 
   def _inject_sync_env_vars(self):
-    """Add the ``R1_*`` env vars to the container's environment.
+    """Add the ``R1_*`` env vars to the container's environment and remove the set's secret from it.
 
     ``R1_SYSTEM_VOLUME`` / ``R1_VOLUME_SYNC_DIR`` / ``R1_SYNC_REQUEST_FILE``
     are always set so apps can write the request unconditionally; CAR just
@@ -221,9 +223,33 @@ class _SyncMixin:
     If ``_sync_unavailable`` was set during ``_configure_system_volume``
     (host tools missing), inject nothing — advertising a mount that was
     never provisioned would route the app's writes into a phantom path.
+
+    ``R1EN_SYNC_SECRET`` is removed from ``self.env`` first, whatever the SYNC state (enabled, disabled,
+    unavailable) and whether the env build took it from ``ENV`` or from ``DYNAMIC_ENV``: the set's own
+    containers must not see the secret. CAR reads it from the config (``cfg_sync_secret``), never from here.
+
+    Returns
+    -------
+    None
+      ``self.env`` is changed in place; nothing happens when it is not a dict.
+
+    Notes
+    -----
+    Call this after every env build (``_setup_env_and_ports``), as the three call sites in the runner do: a
+    build without it leaves the secret in the container's environment.
+
+    Examples
+    --------
+    >>> plugin.env = {"R1EN_SYNC_SECRET": "ab" * 32, "APP": "1"}
+    >>> plugin._inject_sync_env_vars()
+    >>> "R1EN_SYNC_SECRET" in plugin.env, plugin.env["R1_SYSTEM_VOLUME"]
+    (False, '/r1en_system')
     """
     if not isinstance(getattr(self, "env", None), dict):
       return
+    # The set's secret never reaches the container: dropped here, before the unavailable return below, so it
+    # is removed after every env build in every SYNC state.
+    self.env.pop(SYNC_SECRET_ENV, None)
     if getattr(self, "_sync_unavailable", False):
       return
     self.env["R1_SYSTEM_VOLUME"] = SYSTEM_VOLUME_MOUNT
@@ -288,6 +314,31 @@ class _SyncMixin:
   @property
   def cfg_sync_key(self):
     return self._sync_cfg().get("KEY")
+
+  @property
+  def cfg_sync_secret(self):
+    """The set's secret as configured, or None for a set that uses the shared key.
+
+    Read from the job's configured ``ENV`` (``cfg_env``), never from ``self.env``: the container copy can be
+    changed by ``DYNAMIC_ENV``, and ``_inject_sync_env_vars`` removes the variable from it.
+
+    Returns
+    -------
+    object
+      The configured ``R1EN_SYNC_SECRET`` value as it is (``_validate_sync_config`` disables SYNC unless it is
+      64 lowercase hex characters), or None when the job has no ``ENV``, no such variable, or a null value.
+
+    Examples
+    --------
+    >>> plugin.cfg_env = {"R1EN_SYNC_SECRET": "ab" * 32}
+    >>> plugin.cfg_sync_secret == "ab" * 32
+    True
+    >>> plugin.cfg_env = {}
+    >>> plugin.cfg_sync_secret is None
+    True
+    """
+    # The config's value: a missing ENV (None) or a missing variable both mean a set without a secret.
+    return (self.cfg_env or {}).get(SYNC_SECRET_ENV)
 
   @property
   def cfg_sync_type(self):

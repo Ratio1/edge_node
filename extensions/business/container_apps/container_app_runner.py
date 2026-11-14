@@ -93,6 +93,8 @@ from .mixins import (
 from .env_overrides import _EnvOverridesMixin
 from .reset import _ResetMixin
 from .sync import _SyncMixin
+# The 64-hex pattern that checks a set's sync secret, and the two archive format tags the "SYNC enabled" line names.
+from .sync.constants import ARCHIVE_ENCRYPTION, ARCHIVE_ENCRYPTION_SET, HEX64_RE
 
 __VER__ = "0.7.1"
 
@@ -1431,9 +1433,33 @@ class ContainerAppRunnerPlugin(
 
   def _validate_sync_config(self):
     """
-    Validate the SYNC config block when ENABLED. Disables SYNC with a
-    warning rather than raising; the system volume itself is independent
-    and the rest of the plugin must keep running.
+    Validate the SYNC config block when ENABLED.
+
+    Disables SYNC with a red log line rather than raising; the system volume itself is independent and the
+    rest of the plugin must keep running. Checked in this order: ``SYNC.KEY`` is a non-empty string,
+    ``SYNC.TYPE`` is ``provider`` or ``consumer``, and the set's secret (``ENV.R1EN_SYNC_SECRET``), when the
+    job has one, is exactly 64 lowercase hex characters. A secret in any other form (a passphrase, uppercase
+    hex, an empty string, a number) disables SYNC on this job: there is no fallback to the shared key, because
+    a job that was given a secret must never publish or apply under the key every node holds.
+
+    Returns
+    -------
+    None
+      ``SYNC.ENABLED`` is set to False in place when a check fails.
+
+    Notes
+    -----
+    Runs at init and at every restart, config edits included. The log lines never contain the secret: the
+    refusal names the variable, and the green line names the archive format (``r1fs-set-v1`` with a secret,
+    ``r1fs-default`` without).
+
+    Examples
+    --------
+    >>> plugin.cfg_sync = {"ENABLED": True, "KEY": "k", "TYPE": "provider"}
+    >>> plugin.cfg_env = {"R1EN_SYNC_SECRET": "not-64-hex"}
+    >>> plugin._validate_sync_config()
+    >>> plugin.cfg_sync["ENABLED"]
+    False
     """
     if not self._sync_enabled():
       return
@@ -1454,9 +1480,21 @@ class ContainerAppRunnerPlugin(
       )
       sync["ENABLED"] = False
       return
+    # The set's secret from the job's configured ENV; None means a set that uses the shared key.
+    secret = self.cfg_sync_secret
+    # A configured secret must be 64 lowercase hex characters, whole string (fullmatch: the pattern is unanchored).
+    if secret is not None and not (isinstance(secret, str) and HEX64_RE.fullmatch(secret)):
+      self.P(
+        "[sync] R1EN_SYNC_SECRET must be 64 lowercase hex characters; disabling SYNC.",
+        color="r",
+      )
+      # No shared-key fallback: with a malformed secret this job neither publishes nor applies.
+      sync["ENABLED"] = False
+      return
     self.P(
       f"[sync] SYNC enabled: role={role}, key={key}, "
-      f"poll={self._sync_poll_interval()}s",
+      f"poll={self._sync_poll_interval()}s, "
+      f"encryption={ARCHIVE_ENCRYPTION_SET if secret is not None else ARCHIVE_ENCRYPTION}",
       color="g",
     )
     return

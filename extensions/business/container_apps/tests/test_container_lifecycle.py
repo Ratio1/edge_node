@@ -1681,5 +1681,183 @@ class TestImagePullBackoff(unittest.TestCase):
     self.assertGreaterEqual(backoff, expected_min)
 
 
+# ===========================================================================
+# The per-set sync secret in a job's configured ENV
+# ===========================================================================
+
+class TestSyncSecretConfig(unittest.TestCase):
+  """How _validate_sync_config and the env build treat ENV.R1EN_SYNC_SECRET on a real runner."""
+
+  # A secret in the accepted form: 64 lowercase hex characters (a fixed test value).
+  VALID = "0123456789abcdef" * 4
+
+  def setUp(self):
+    """Create the folder the runners of one test keep their data in.
+
+    Returns
+    -------
+    None
+    """
+    # Removed in tearDown.
+    self._tmp = tempfile.TemporaryDirectory()
+
+  def tearDown(self):
+    """Remove that folder.
+
+    Returns
+    -------
+    None
+    """
+    # Everything the runners wrote.
+    self._tmp.cleanup()
+
+  def _runner(self, env, role="provider"):
+    """Build a runner with SYNC enabled and the given configured ENV, recording its log lines with their color.
+
+    Parameters
+    ----------
+    env : dict
+      The job's configured ``ENV`` (``cfg_env``).
+    role : str, optional
+      ``SYNC.TYPE``: ``provider`` (default) or ``consumer``.
+
+    Returns
+    -------
+    tuple
+      ``(plugin, lines)``; ``lines`` is the list of ``(color, text)`` the plugin logs from now on.
+
+    Examples
+    --------
+    >>> plugin, lines = self._runner({"R1EN_SYNC_SECRET": self.VALID})
+    >>> plugin._validate_sync_config()
+    >>> plugin.cfg_sync["ENABLED"]
+    True
+    """
+    # A real runner on a mocked Docker client.
+    plugin, _client, _container = make_lifecycle_runner()
+    # A fresh, enabled SYNC block for this runner.
+    plugin.cfg_sync = {"ENABLED": True, "KEY": "set-key-1", "TYPE": role}
+    # The system volume was provisioned.
+    plugin._sync_unavailable = False
+    # The job's configured ENV.
+    plugin.cfg_env = dict(env)
+    # The data folder the env build's local-override step reads.
+    plugin.get_data_folder = lambda: self._tmp.name
+    # Local overrides are available.
+    plugin._env_overrides_unavailable = False
+    # Their manager is created on first use.
+    plugin._env_overrides_manager = None
+    # Each logged line with its color, to tell the red refusal from the green "SYNC enabled" line.
+    lines = []
+    # The plugin's logger.
+    plugin.P = lambda msg, color=None, **_kwargs: lines.append((color, str(msg)))
+    # R1FS, which a publish or an apply would call.
+    plugin.r1fs = MagicMock()
+    # The three chain-store calls of a publish or a consumer tick.
+    plugin.chainstore_hset, plugin.chainstore_hget, plugin.chainstore_hsync = MagicMock(), MagicMock(), MagicMock()
+    # The runner and what it logs.
+    return plugin, lines
+
+  def test_invalid_sync_secret_disables_sync(self):
+    """A secret in any other form than 64 lowercase hex disables SYNC on the job, with no shared-key fallback."""
+    # Wrong forms; three start with a full valid secret, so only a whole-string check refuses them.
+    invalid = [
+      ("empty string", ""),
+      ("32 x a", "a" * 32),
+      ("63 characters", self.VALID[:63]),
+      ("65 characters", self.VALID + "0"),
+      ("valid plus a newline", self.VALID + "\n"),
+      ("valid plus a letter", self.VALID + "x"),
+      ("uppercase", self.VALID.upper()),
+      ("int", 1234567890123456),
+    ]
+    # Both roles.
+    for role in ("provider", "consumer"):
+      # Every wrong form.
+      for label, secret in invalid:
+        # A failure names the role and the form.
+        with self.subTest(role=role, secret=label):
+          # A job whose ENV holds the malformed secret.
+          plugin, lines = self._runner({"R1EN_SYNC_SECRET": secret, "APP_VAR": "1"}, role=role)
+          # The check that runs at init and at every restart.
+          plugin._validate_sync_config()
+          # The red line names the variable.
+          self.assertIn(
+            ("r", "[sync] R1EN_SYNC_SECRET must be 64 lowercase hex characters; disabling SYNC."), lines,
+          )
+          # SYNC is off and no line reports it as enabled.
+          self.assertEqual(
+            (plugin.cfg_sync["ENABLED"], [text for _color, text in lines if "SYNC enabled" in text]), (False, []),
+          )
+          if secret != "":
+            # No line repeats the value (its first 32 characters stand for the whole).
+            self.assertEqual([text for _color, text in lines if str(secret)[:32] in text], [])
+          # The real env build.
+          plugin._setup_env_and_ports()
+          # The injection that follows every build.
+          plugin._inject_sync_env_vars()
+          # No set KEY for the app, no secret; the app's own variable is kept.
+          self.assertEqual(
+            ("R1_SYNC_KEY" in plugin.env, "R1EN_SYNC_SECRET" in plugin.env, plugin.env["APP_VAR"]),
+            (False, False, "1"),
+          )
+          # No manager for this job.
+          self.assertIsNone(plugin._ensure_sync_manager())
+          # A provider tick.
+          plugin._sync_provider_tick(1000.0)
+          # A consumer tick.
+          plugin._sync_consumer_tick(1000.0)
+          # Nothing was published or fetched under any key, and the store was neither written nor read.
+          self.assertEqual(
+            (plugin.r1fs.add_file.call_count, plugin.r1fs.get_file.call_count,
+             plugin.chainstore_hset.call_count, plugin.chainstore_hget.call_count),
+            (0, 0, 0, 0),
+          )
+
+  def test_valid_sync_secret_keeps_sync_enabled(self):
+    """A 64-lowercase-hex secret keeps SYNC enabled; the green line names the archive format, not the value."""
+    # A job whose ENV holds a well-formed secret.
+    plugin, lines = self._runner({"R1EN_SYNC_SECRET": self.VALID, "APP_VAR": "1"})
+    # The check that runs at init and at every restart.
+    plugin._validate_sync_config()
+    # The green "SYNC enabled" lines.
+    greens = [text for color, text in lines if color == "g" and "SYNC enabled" in text]
+    # SYNC stays on, with one such line.
+    self.assertEqual((plugin.cfg_sync["ENABLED"], len(greens)), (True, 1))
+    # It names the set format.
+    self.assertIn("encryption=r1fs-set-v1", greens[0])
+    # No line holds the secret or its first half.
+    self.assertEqual([text for _color, text in lines if self.VALID[:32] in text], [])
+    # The real env build copies the configured variable into the container env.
+    plugin._setup_env_and_ports()
+    # It is there before the injection.
+    self.assertEqual(plugin.env["R1EN_SYNC_SECRET"], self.VALID)
+    # The injection that follows every build.
+    plugin._inject_sync_env_vars()
+    # The KEY is exported, the secret's variable is gone, the app's own variable is kept.
+    self.assertEqual(
+      (plugin.env["R1_SYNC_KEY"], "R1EN_SYNC_SECRET" in plugin.env, plugin.env["APP_VAR"]),
+      ("set-key-1", False, "1"),
+    )
+    # No other variable holds the secret's value.
+    self.assertNotIn(self.VALID, [str(value) for value in plugin.env.values()])
+    # The node still reads it from the config.
+    self.assertEqual(plugin.cfg_sync_secret, self.VALID)
+    # A job without the variable, or with a JSON null.
+    for env in ({"APP_VAR": "1"}, {"R1EN_SYNC_SECRET": None}):
+      # A failure names the ENV.
+      with self.subTest(cfg_env=env):
+        # A job of a set that uses the shared key.
+        plugin, lines = self._runner(env)
+        # The same check.
+        plugin._validate_sync_config()
+        # The green "SYNC enabled" lines.
+        greens = [text for color, text in lines if color == "g" and "SYNC enabled" in text]
+        # SYNC stays on, with one such line.
+        self.assertEqual((plugin.cfg_sync["ENABLED"], len(greens)), (True, 1))
+        # It names the shared-key format.
+        self.assertIn("encryption=r1fs-default", greens[0])
+
+
 if __name__ == "__main__":
   unittest.main()

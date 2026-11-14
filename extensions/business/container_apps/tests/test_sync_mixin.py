@@ -29,6 +29,10 @@ from extensions.business.container_apps.tests.test_sync_manager import (
   _FakeDockerArchiveContainer,
   _FakeChainStore,
   _FakeR1FS,
+  # A second fixed test secret, standing for a value that is not the configured one.
+  _OTHER_SECRET,
+  # A fixed test secret in the accepted form (64 lowercase hex characters).
+  _SET_SECRET,
   _make_owner,
   _tar_bytes,
 )
@@ -302,6 +306,63 @@ class TestEnvInjection(unittest.TestCase):
     chown.assert_any_call(str(volume_sync_dir(plugin).parent), 0, 0)
     chown.assert_any_call(str(volume_sync_dir(plugin)), 0, 0)
     self.assertFalse(plugin._sync_unavailable)
+
+  def test_secret_read_from_config_not_dynamic_env(self):
+    """The sync secret is the job's configured ENV value, not what DYNAMIC_ENV put into the container env."""
+    # A plugin over the stub; the stub has no cfg_env yet.
+    plugin, owner = _make_plugin(self.tmpdir)
+    # The stub's own attribute holds a marker: an answer equal to it would mean the property was bypassed.
+    owner.cfg_sync_secret = "from-the-stub"
+    # The configured ENV holds the set's secret.
+    owner.cfg_env = {"R1EN_SYNC_SECRET": _SET_SECRET, "APP_VAR": "1"}
+    # DYNAMIC_ENV names the same variable with another value.
+    owner.dynamic_env = {"R1EN_SYNC_SECRET": _OTHER_SECRET}
+    # The env build writes the DYNAMIC_ENV value over the container copy.
+    owner.env = {"R1EN_SYNC_SECRET": _OTHER_SECRET, "APP_VAR": "1"}
+    # The node's secret is the configured one.
+    self.assertEqual(plugin.cfg_sync_secret, _SET_SECRET)
+    # No ENV at all, an empty one, or one without the variable.
+    for env in (None, {}, {"APP_VAR": "1"}):
+      # A failure names the ENV.
+      with self.subTest(cfg_env=env):
+        # The job's configured ENV in this case.
+        owner.cfg_env = env
+        # A set without a secret: None, not the stub's marker and not the container env's value.
+        self.assertIsNone(plugin.cfg_sync_secret)
+
+  def test_sync_secret_removed_from_container_env(self):
+    """R1EN_SYNC_SECRET does not stay in the container env, whatever the SYNC state or the value's source."""
+    # (label, SYNC.ENABLED, system volume unavailable)
+    states = [
+      ("enabled", True, False),
+      ("system volume unavailable", True, True),
+      ("SYNC disabled", False, False),
+    ]
+    # The value the env build leaves in the container env: the configured one, or DYNAMIC_ENV's written over it.
+    sources = [("ENV", _SET_SECRET), ("DYNAMIC_ENV", _OTHER_SECRET)]
+    # Every SYNC state.
+    for state, enabled, unavailable in states:
+      # With the value from either source.
+      for source, value in sources:
+        # A failure names the state and the source.
+        with self.subTest(state=state, source=source):
+          # A folder of its own for each case: _make_owner needs an unused one.
+          plugin, owner = _make_plugin(self.tmpdir / f"{state}-{source}", enabled=enabled)
+          # The job's configured ENV holds the set's secret.
+          owner.cfg_env = {"R1EN_SYNC_SECRET": _SET_SECRET}
+          # The state the system volume setup left.
+          plugin._sync_unavailable = unavailable
+          # The container env after the env build, before the injection that follows every build.
+          owner.env = {"R1EN_SYNC_SECRET": value, "APP_VAR": "1"}
+          # The injection.
+          plugin._inject_sync_env_vars()
+          # The secret is gone; the app's own variable is not.
+          self.assertEqual(("R1EN_SYNC_SECRET" in plugin.env, plugin.env["APP_VAR"]), (False, "1"))
+          # The config still holds it for the node's own use.
+          self.assertEqual(owner.cfg_env["R1EN_SYNC_SECRET"], _SET_SECRET)
+          if enabled and not unavailable:
+            # The set's KEY is still exported to the app.
+            self.assertEqual(plugin.env["R1_SYNC_KEY"], "SYNC-KEY-1")
 
 
 # ---------------------------------------------------------------------------

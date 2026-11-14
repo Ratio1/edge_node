@@ -24,6 +24,10 @@ import json
 import os
 import copy
 import hashlib
+# HMAC-SHA256 of a set's records, and the constant-time comparison of a received MAC.
+import hmac
+# isfinite: a NaN or infinite record timestamp cannot order two records, so the replay rule refuses it.
+import math
 import stat
 import tarfile
 import tempfile
@@ -66,8 +70,12 @@ _CONSUMER_APPLY_MODES = {
 
 from .constants import (
   ARCHIVE_ENCRYPTION,
+  # Manifest tag of a set with a secret; this node expects it exactly when its own job holds a secret.
+  ARCHIVE_ENCRYPTION_SET,
   ARCHIVE_FORMAT,
   CHAINSTORE_SYNC_HKEY,
+  # 64 lowercase hex characters: the form of a record MAC, checked with fullmatch before any comparison.
+  HEX64_RE,
   MANIFEST_SCHEMA_VERSION,
   STAGE_ARCHIVE_BUILD,
   STAGE_CHAINSTORE_PUBLISH,
@@ -79,6 +87,8 @@ from .constants import (
   SYNC_HISTORY_SENT,
   SYNC_INVALID_FILE,
   SYNC_LAST_APPLY_FILE,
+  # Fixed message that turns the set's secret into the MAC subkey.
+  SYNC_MAC_CONTEXT,
   SYNC_PROCESSING_FILE,
   SYNC_REQUEST_FILE,
   SYNC_RESPONSE_FILE,
@@ -596,12 +606,136 @@ class SyncManager:
 
   @staticmethod
   def _record_digest(record: dict) -> str:
+    """Digest that names a record's quarantine file.
+
+    SHA-256 over the canonical JSON of the record's ``cid`` and ``manifest``, and of its ``mac`` when the record
+    has one. A record without ``mac`` (a set that uses the shared key) keeps the digest it had before records
+    carried a MAC, so quarantine files written by older code still match. With ``mac`` in the digest, a forged
+    copy of a set's record (same ``cid`` and ``manifest``, another ``mac``) gets its own quarantine file and
+    does not hold back the genuine record.
+
+    Parameters
+    ----------
+    record : dict
+      A sync record as read from the store.
+
+    Returns
+    -------
+    str
+      64 lowercase hex characters; the quarantine file name uses the first 16.
+
+    Examples
+    --------
+    >>> plain = {"cid": "QmA", "manifest": {"schema_version": 1}}
+    >>> SyncManager._record_digest(plain) == SyncManager._record_digest({**plain, "mac": "00" * 32})
+    False
+    >>> SyncManager._record_digest(plain) == SyncManager._record_digest({**plain, "version": 7})
+    True
+    """
     payload = {
       "cid": record.get("cid"),
       "manifest": record.get("manifest") if isinstance(record, dict) else None,
     }
+    if "mac" in record:
+      # Only when present: a record without a MAC keeps its earlier digest; a forged twin gets its own.
+      payload["mac"] = record["mac"]
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+  def _record_mac(self, record: dict, secret: str) -> str:
+    """MAC that binds a set's record to the set's secret and to its ``SYNC.KEY``.
+
+    HMAC-SHA256 over the canonical JSON (sorted keys, no spaces, ASCII only) of
+    ``{"key": SYNC.KEY, "record": record without "mac"}``. The HMAC key is a subkey,
+    ``HMAC-SHA256(secret, b"r1en-volume-sync-record-v1")``, so the secret itself, whose SHA-256 is the archive
+    key, is never used as a MAC key. Every field of the record is covered, whatever its name: a changed, added
+    or removed field, or the same record under another KEY, gives another MAC.
+
+    Parameters
+    ----------
+    record : dict
+      The record as published or as read from the store (JSON data, string keys); its ``mac`` field, when
+      present, is left out of the MAC.
+    secret : str
+      The set's secret, 64 lowercase hex characters (``_validate_sync_config`` admits no other form).
+
+    Returns
+    -------
+    str
+      64 lowercase hex characters.
+
+    Notes
+    -----
+    Neither the secret nor the subkey is logged or stored. The record is JSON data, so ``json.dumps`` cannot
+    fail on it, and a Python JSON round trip (key order, non-ASCII text, float repr) leaves the MAC unchanged.
+
+    Examples
+    --------
+    >>> record = {"cid": "QmA", "version": 7, "manifest": {"schema_version": 1}}
+    >>> mac = manager._record_mac(record, "ab" * 32)
+    >>> len(mac), mac == manager._record_mac({**record, "mac": mac}, "ab" * 32)
+    (64, True)
+    >>> mac == manager._record_mac({**record, "version": 8}, "ab" * 32)
+    False
+    """
+    # MAC subkey: derived from the secret with a fixed context, so the MAC key differs from the archive key.
+    subkey = hmac.new(secret.encode("ascii"), SYNC_MAC_CONTEXT, hashlib.sha256).digest()
+    # Everything the record holds except the MAC itself, so no field can be changed, added or removed unnoticed.
+    body = {name: value for name, value in record.items() if name != "mac"}
+    # Canonical form: the same bytes on publisher and consumer whatever the key order or the text encoding.
+    message = json.dumps(
+      {"key": self.owner.cfg_sync_key, "record": body},
+      sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    )
+    # The MAC as lowercase hex, the form HEX64_RE checks on the consumer.
+    return hmac.new(subkey, message.encode("ascii"), hashlib.sha256).hexdigest()
+
+  @staticmethod
+  def _order_key(version, timestamp):
+    """Order key of a record for the replay rule, or None when its values cannot order records.
+
+    Parameters
+    ----------
+    version : object
+      The record's ``version``; only a true int (not a bool) is accepted.
+    timestamp : object
+      The record's ``timestamp`` (``source_timestamp`` in a received-history entry); accepted when it is an
+      int whose absolute value is below 2**53 (exact as a float) or a finite float. A bool, a string, None,
+      NaN, an infinity or a larger int is not accepted.
+
+    Returns
+    -------
+    tuple or None
+      ``(version, float(timestamp))``, compared as a tuple, or None. A None key makes the replay rule refuse
+      a re-seen record (fail closed).
+
+    Notes
+    -----
+    No conversion here can raise: the int bound is checked before ``float`` is called, so an int of any
+    length (JSON allows them) ends in None, not in OverflowError.
+
+    Examples
+    --------
+    >>> SyncManager._order_key(7, 7.5)
+    (7, 7.5)
+    >>> SyncManager._order_key(7, 8)
+    (7, 8.0)
+    >>> SyncManager._order_key(7, "8") is None, SyncManager._order_key(True, 8.0) is None
+    (True, True)
+    >>> SyncManager._order_key(7, float("nan")) is None, SyncManager._order_key(7, 10 ** 400) is None
+    (True, True)
+    """
+    if type(version) is not int:
+      # A bool, a string or a missing version cannot order records.
+      return None
+    if type(timestamp) is int and abs(timestamp) < 2 ** 53:
+      # An int this small converts to a float exactly and cannot overflow.
+      return (version, float(timestamp))
+    if type(timestamp) is float and math.isfinite(timestamp):
+      # A finite float orders as it is.
+      return (version, timestamp)
+    # A bool, a string, None, NaN, an infinity or a larger int: no order key, so the caller fails closed.
+    return None
 
   def _quarantine_path(self, record: dict) -> Path:
     cid = str(record.get("cid") or "no_cid")
@@ -1010,9 +1144,35 @@ class SyncManager:
     history append → response.json → clear .invalid → delete .processing →
     retire previous CID.
 
-    Returns True on success, False on any failure (and writes
-    response.json/error + request.json.invalid for the app).
-    Always cleans up the archive tmp file.
+    Always cleans up the archive tmp file. When this job holds the set's secret (``owner.cfg_sync_secret``),
+    the archive is added to R1FS under that secret, the manifest's ``encryption`` is ``r1fs-set-v1`` and the
+    record carries ``mac`` (see ``_record_mac``). Without a secret nothing changes: R1FS gets ``secret=None``
+    (its default key), the tag is ``r1fs-default`` and the record has no ``mac``.
+
+    Parameters
+    ----------
+    request : SyncRequest or list of str
+      The claimed request, or its ``archive_paths`` alone (older callers and tests).
+    metadata : dict, optional
+      The request's metadata, used only when ``request`` is a path list.
+
+    Returns
+    -------
+    bool
+      True on success. False on any failure, after ``response.json`` (error) and ``request.json.invalid``
+      were written for the app.
+
+    Notes
+    -----
+    The secret is never logged and is not part of the record, the history entry or ``response.json``.
+
+    Examples
+    --------
+    >>> manager.publish_snapshot(["/app/data/"], {"epoch": 1})
+    True
+    >>> record = owner.chainstore_hget(hkey="CHAINSTORE_SYNC", key=owner.cfg_sync_key)
+    >>> record["manifest"]["encryption"], "mac" in record   # a job without a secret
+    ('r1fs-default', False)
     """
     sync_request = self._coerce_sync_request(request, metadata)
     archive_paths = sync_request.archive_paths
@@ -1037,9 +1197,13 @@ class SyncManager:
         self._fail_request(request_body, STAGE_ARCHIVE_BUILD, str(exc), proc_path)
         return False
 
+      # The set's secret from this job's config; None for a set that uses the shared key.
+      secret = self.owner.cfg_sync_secret
+
       # ---- Stage: r1fs_upload
       try:
-        cid = self.owner.r1fs.add_file(tar_path)
+        # A set with a secret encrypts under it; None (never "") keeps R1FS on its default key, as before.
+        cid = self.owner.r1fs.add_file(tar_path, secret=secret)
       except Exception as exc:
         self._fail_request(request_body, STAGE_R1FS_UPLOAD, str(exc), proc_path)
         return False
@@ -1059,7 +1223,8 @@ class SyncManager:
         "archive_paths": list(archive_paths),
         "archive_format": ARCHIVE_FORMAT,
         "archive_size_bytes": size_bytes,
-        "encryption": ARCHIVE_ENCRYPTION,
+        # Format tag: tells a consumer which kind of set published this; it never selects the key.
+        "encryption": ARCHIVE_ENCRYPTION_SET if secret is not None else ARCHIVE_ENCRYPTION,
         "runtime": runtime_payload,
       }
       record = {
@@ -1071,6 +1236,9 @@ class SyncManager:
         "runtime": runtime_payload,
         "manifest": manifest,
       }
+      if secret is not None:
+        # Bind the finished record to the set's secret and KEY; a record of a shared-key set gets no "mac".
+        record["mac"] = self._record_mac(record, secret)
 
       # ---- Stage: chainstore_publish
       try:
@@ -1234,11 +1402,35 @@ class SyncManager:
     Reasons are surfaced for:
       - missing/wrong ``schema_version`` (must be an int <= MANIFEST_SCHEMA_VERSION)
       - unexpected ``archive_format`` (must equal ARCHIVE_FORMAT)
-      - unexpected ``encryption`` (must equal ARCHIVE_ENCRYPTION)
+      - unexpected ``encryption``: must equal ARCHIVE_ENCRYPTION_SET when this job holds the set's secret
+        and ARCHIVE_ENCRYPTION when it holds none
       - ``archive_paths`` entries that don't map to a mount on this consumer
 
     Format/schema checks come first so they short-circuit before we burn
     cycles resolving paths against a manifest we can't read anyway.
+
+    Parameters
+    ----------
+    record : dict
+      The sync record; anything else gives one reason.
+
+    Returns
+    -------
+    list of str
+      The rejection reasons, empty when the manifest is acceptable.
+
+    Notes
+    -----
+    The expected ``encryption`` tag comes from this node's own config, never from the record: a consumer with
+    a secret refuses a shared-key record (no downgrade) and a consumer without one refuses a set's record,
+    both before any download. The tag does not choose the key either; ``prepare_apply`` always uses this
+    job's secret.
+
+    Examples
+    --------
+    >>> manager.validate_manifest({"manifest": {"schema_version": 1, "archive_format": "tar.gz",
+    ...   "encryption": "r1fs-set-v1", "archive_paths": ["/app/data/"]}})   # a job without a secret
+    ["unsupported encryption: 'r1fs-set-v1' (expected: 'r1fs-default')"]
     """
     if not isinstance(record, dict):
       return ["manifest record is not a dict"]
@@ -1263,11 +1455,12 @@ class SyncManager:
         f"unsupported archive_format: {fmt!r} (expected: {ARCHIVE_FORMAT!r})"
       )
 
+    # The tag this node accepts follows its own config: the set tag with a secret, the shared-key tag without.
+    expected_enc = ARCHIVE_ENCRYPTION_SET if self.owner.cfg_sync_secret is not None else ARCHIVE_ENCRYPTION
     enc = manifest.get("encryption")
-    if enc != ARCHIVE_ENCRYPTION:
-      reasons.append(
-        f"unsupported encryption: {enc!r} (expected: {ARCHIVE_ENCRYPTION!r})"
-      )
+    if enc != expected_enc:
+      # Names both tags, never a secret: the line an operator sees when the two ends differ in format.
+      reasons.append(f"unsupported encryption: {enc!r} (expected: {expected_enc!r})")
 
     raw_paths = manifest.get("archive_paths")
     paths: list[str] = []
@@ -1298,6 +1491,45 @@ class SyncManager:
 
     This covers the record envelope plus the manifest. ``validate_manifest`` is
     kept as the manifest-focused helper used by older tests and callers.
+
+    The checks run in this order and each step returns at its first reason, all before any download:
+
+    1. the envelope (``cid``, ``version``) and the manifest, the ``encryption`` tag among them; any reason
+       ends here, with no MAC computed and no history read;
+    2. a job without a secret returns here: the path of a set that uses the shared key;
+    3. ``mac`` is a string of 64 lowercase hex characters, so step 4 cannot raise on it;
+    4. ``mac`` equals ``_record_mac(record, secret)``, compared in constant time;
+    5. the replay rule: a record whose ``cid`` is in the received history (this node applied it before) is
+       refused unless its ``(version, timestamp)`` is newer than the last applied record's.
+
+    Parameters
+    ----------
+    record : dict
+      The record as read from the store; anything else gives one reason.
+
+    Returns
+    -------
+    list of str
+      The rejection reasons, empty when the record may be applied. No reason contains the ``mac`` value or
+      any secret material.
+
+    Notes
+    -----
+    Step 5 reads the received history once, only after the MAC matched, and is reached only for a CID other
+    than the last applied one (the consumer tick stops on that one). "Last applied" is the history entry
+    written last, whose ``version`` and ``source_timestamp`` this node copied from the record it applied; both
+    order keys are the publishers' clocks. The rule guarantees only that a consumer ends on the current record
+    once that record returns: a record applied before can be applied once more when it is newer than the last
+    applied one, and a valid record this node never applied is accepted once. A value that cannot order
+    records (see ``_order_key``) refuses the re-seen record. When a publisher's clock steps back, or differs
+    from the previous publisher's, two re-seen records can be misordered until the next publish.
+
+    Examples
+    --------
+    >>> manager.validate_record_for_apply({"cid": "", "version": "1", "manifest": {}})[:2]
+    ['record cid must be a non-empty string', 'record version must be an int']
+    >>> manager.validate_record_for_apply(record_with_another_sets_mac)   # a job with a secret
+    ["record mac does not match this node's sync secret"]
     """
     if not isinstance(record, dict):
       return ["sync record is not a dict"]
@@ -1309,6 +1541,32 @@ class SyncManager:
     if not isinstance(version, int):
       reasons.append("record version must be an int")
     reasons.extend(self.validate_manifest(record))
+    # Steps 1 and 2: this job's secret; None means a set that uses the shared key, checked as before.
+    secret = self.owner.cfg_sync_secret
+    if reasons or secret is None:
+      # A refused record stops at its envelope or manifest reasons; without a secret there is nothing more to check.
+      return reasons
+    # Step 3: the MAC's form, checked on the whole string before it is compared (compare_digest raises on
+    # a non-ASCII string or a non-string).
+    mac = record.get("mac")
+    if not (isinstance(mac, str) and HEX64_RE.fullmatch(mac)):
+      # The value is not echoed: it is network input and of no use to the operator.
+      return ["record mac is missing or malformed"]
+    if not hmac.compare_digest(mac, self._record_mac(record, secret)):
+      # Step 4: another secret, another KEY, or a record changed after it was published.
+      return ["record mac does not match this node's sync secret"]
+    # Step 5: one read of what this node applied, only now that the record is known to come from the set.
+    entries = self._read_history_entries(history_received_dir(self.owner))
+    if any(entry.get("cid") == cid for _, entry, _ in entries):
+      # The last applied record: the entry written last, the choice latest_received makes.
+      last = max(entries, key=lambda item: item[2])[1]
+      # The record's own publisher clock values, covered by the MAC just checked.
+      record_key = self._order_key(version, record.get("timestamp"))
+      # The same two values of the last applied record, as this node copied them from that record at its apply.
+      last_key = self._order_key(last.get("version"), last.get("source_timestamp"))
+      if record_key is None or last_key is None or record_key <= last_key:
+        # A re-seen record that is not newer than the last applied one is a replay; unorderable values too.
+        return [f"cid {cid} was applied before and is not newer than the last applied record"]
     return reasons
 
   @staticmethod
@@ -1576,7 +1834,35 @@ class SyncManager:
     return staging_path
 
   def prepare_apply(self, record: dict) -> Optional[PreparedApply]:
-    """Validate and stage a consumer snapshot before stopping the app."""
+    """Validate and stage a consumer snapshot before stopping the app.
+
+    The record is validated first (``validate_record_for_apply``); a refused record is logged, quarantined
+    with its retry back-off and never downloaded. An accepted one is fetched from R1FS with this job's sync
+    secret (None for a set that uses the shared key, which is R1FS's default key), then every tar member is
+    checked and staged.
+
+    Parameters
+    ----------
+    record : dict
+      The sync record read from the store.
+
+    Returns
+    -------
+    PreparedApply or None
+      The staged apply plan, or None when the record was refused, the download failed or the archive is
+      unsafe; each of those is logged and quarantined.
+
+    Notes
+    -----
+    The key comes from this job's config, never from the record. With another secret R1FS cannot decrypt the
+    file and returns no path, which is quarantined as a download failure.
+
+    Examples
+    --------
+    >>> prepared = manager.prepare_apply(record)
+    >>> prepared is None or prepared.cid == record["cid"]
+    True
+    """
     rejection_reasons = self.validate_record_for_apply(record)
     if rejection_reasons:
       cid = record.get("cid") if isinstance(record, dict) else None
@@ -1595,7 +1881,8 @@ class SyncManager:
       self.owner.P(f"[sync] failed to write apply preparing state: {exc}", color="r")
 
     try:
-      local_path = self.owner.r1fs.get_file(cid)
+      # Decrypt under this job's secret; None keeps R1FS on its default key for a shared-key set.
+      local_path = self.owner.r1fs.get_file(cid, secret=self.owner.cfg_sync_secret)
     except Exception as exc:
       self.owner.P(f"[sync] r1fs.get_file({cid}) failed: {exc}", color="r")
       self._record_preflight_failure(record, "r1fs_download", str(exc))

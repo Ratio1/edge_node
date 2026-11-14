@@ -6,9 +6,17 @@ plugin-data directory and a stub owner that mimics the BasePlugin surface
 the manager depends on.
 """
 
+# deepcopy: a test changes a copy of a stored record, never the dict the fake store holds.
+import copy
+# SHA-256: the test secrets, and the archive key a test must not find in any output.
+import hashlib
+# HMAC: the record MAC and its subkey, computed independently of the manager.
+import hmac
 import json
 import os
 import io
+# fullmatch: the form of a published MAC.
+import re
 import stat
 import tarfile
 import tempfile
@@ -33,6 +41,10 @@ from extensions.business.container_apps.sync.manager import (
   PROVIDER_CAPTURE_ONLINE,
   SyncRequest,
   SyncRuntimePolicy,
+  # Host-private file the secret tests read: the consumer's apply state.
+  apply_state_path,
+  # Host-private folder they read: the quarantine files of refused records.
+  quarantine_dir,
 )
 
 
@@ -62,7 +74,20 @@ class _FakeR1FS:
   """Minimal r1fs stub for orchestrator tests."""
 
   def __init__(self):
+    """Start with an empty store and no forced failure.
+
+    ``added`` maps a CID to the file's bytes and ``secrets`` maps it to the secret its ``add_file`` call
+    received; ``get_calls`` lists every ``get_file`` call as ``(cid, secret)``, refused ones included.
+
+    Returns
+    -------
+    None
+    """
     self.added: dict[str, bytes] = {}
+    # The secret each CID was added under, exactly as add_file received it (None for the default key).
+    self.secrets: dict[str, object] = {}
+    # Every get_file call as (cid, secret), so a test can count downloads and see the secret that was passed.
+    self.get_calls: list[tuple[str, object]] = []
     self.deleted: list[tuple[str, bool, bool]] = []
     self.add_should_raise: Exception | None = None
     self.add_should_return_empty = False
@@ -70,7 +95,33 @@ class _FakeR1FS:
     self.delete_should_raise: Exception | None = None
     self._counter = 0
 
-  def add_file(self, file_path: str) -> str:
+  def add_file(self, file_path: str, secret=None) -> str:
+    """Store a file's bytes under a new CID, remembering the secret it was added under.
+
+    Parameters
+    ----------
+    file_path : str
+      The file to read.
+    secret : object, optional
+      The secret the caller passed, kept as received; None stands for R1FS's default key.
+
+    Returns
+    -------
+    str
+      The new CID, or ``""`` when ``add_should_return_empty`` is set.
+
+    Raises
+    ------
+    Exception
+      ``add_should_raise``, when a test set it.
+
+    Examples
+    --------
+    >>> fake = _FakeR1FS()
+    >>> cid = fake.add_file("/tmp/archive.tar.gz", secret="ab" * 32)
+    >>> fake.secrets[cid] == "ab" * 32
+    True
+    """
     if self.add_should_raise:
       raise self.add_should_raise
     if self.add_should_return_empty:
@@ -79,12 +130,49 @@ class _FakeR1FS:
     cid = f"QmFAKE{self._counter:08d}"
     with open(file_path, "rb") as handle:
       self.added[cid] = handle.read()
+    # Remember the key of this CID so get_file can refuse another one, as R1FS's decryption does.
+    self.secrets[cid] = secret
     return cid
 
-  def get_file(self, cid: str) -> str:
+  def get_file(self, cid: str, secret=None) -> str:
+    """Write a stored file to a temporary path, only for the secret it was added under.
+
+    Like the real R1FS, a file asked for with another secret cannot be decrypted and no path is returned.
+    A CID that a test placed straight into ``added`` counts as added under the default key.
+
+    Parameters
+    ----------
+    cid : str
+      The CID to fetch.
+    secret : object, optional
+      The secret the caller passed; None stands for R1FS's default key.
+
+    Returns
+    -------
+    str
+      The path of a temporary copy, or ``""`` for an unknown CID or another secret.
+
+    Raises
+    ------
+    Exception
+      ``get_should_raise``, when a test set it.
+
+    Examples
+    --------
+    >>> fake = _FakeR1FS()
+    >>> cid = fake.add_file("/tmp/archive.tar.gz", secret="ab" * 32)
+    >>> fake.get_file(cid), fake.get_calls
+    ('', [('QmFAKE00000001', None)])
+    """
+    # Count the call before any refusal: a test that expects no download sees every attempt.
+    self.get_calls.append((cid, secret))
     if self.get_should_raise:
       raise self.get_should_raise
     if cid not in self.added:
+      return ""
+    if secret != self.secrets.get(cid):
+      # Another secret than the one the file was added under: no plaintext, no path. A CID a test placed
+      # straight into ``added`` has no entry and counts as added under the default key (None).
       return ""
     fd, path = tempfile.mkstemp(suffix=".tar.gz")
     with os.fdopen(fd, "wb") as out:
@@ -134,7 +222,29 @@ class _FakeChainStore:
 
 
 def _make_owner(tmpdir: Path) -> SimpleNamespace:
-  """Build a minimal owner stub for SyncManager tests."""
+  """Build a minimal owner stub for SyncManager tests.
+
+  The stub has the plugin surface the manager reads: the data folders, a fixed-size ``/app/data`` mount, a
+  clock that advances one second per call, fake R1FS and chain-store handles, and the sync config values
+  (``cfg_sync_key``, ``cfg_sync_type``, and ``cfg_sync_secret=None``, a set without a secret).
+
+  Parameters
+  ----------
+  tmpdir : Path
+    An empty directory that receives the stub's data and output folders.
+
+  Returns
+  -------
+  SimpleNamespace
+    The owner stub; ``_msgs`` collects its log lines, ``_r1fs`` and ``_cs`` are the fakes, ``_fixed_root``
+    is the host side of its mounts.
+
+  Examples
+  --------
+  >>> owner = _make_owner(Path(tempfile.mkdtemp()))
+  >>> owner.cfg_sync_secret is None and SyncManager(owner).owner is owner
+  True
+  """
   data_folder = tmpdir / "_local_cache" / "_data"
   data_folder.mkdir(parents=True)
   instance_subfolder = "pipelines_data/test_pipe/test_inst"
@@ -175,6 +285,8 @@ def _make_owner(tmpdir: Path) -> SimpleNamespace:
     ee_id="ee_test_provider",
     cfg_sync_key="11111111-1111-1111-1111-111111111111",
     cfg_sync_type="provider",
+    # A set without a secret by default; the manager reads this attribute directly.
+    cfg_sync_secret=None,
     r1fs=r1fs,
     chainstore_hset=cs.hset,
     chainstore_hget=cs.hget,
@@ -1863,6 +1975,754 @@ class TestConsumerFlow(unittest.TestCase):
                         for (cid, _, cleanup) in deleted))
     self.assertTrue(any(cid == older["cid"] and not unpin_remote
                         for (cid, unpin_remote, _) in deleted))
+
+
+# ---------------------------------------------------------------------------
+# A set with its own secret: archive key, record MAC, the two formats, replay
+# ---------------------------------------------------------------------------
+
+# A fixed test secret in the accepted form (64 lowercase hex characters); it is used nowhere outside the tests.
+_SET_SECRET = hashlib.sha256(b"volume-sync test secret one").hexdigest()
+# A second one, for a job that holds another secret and for MACs that must not match.
+_OTHER_SECRET = hashlib.sha256(b"volume-sync test secret two").hexdigest()
+# The refusal reason for a MAC that is absent or not 64 lowercase hex characters.
+_REASON_MAC_FORM = "record mac is missing or malformed"
+# The refusal reason for a well-formed MAC that this job's secret and KEY do not produce.
+_REASON_MAC = "record mac does not match this node's sync secret"
+# The tail of the replay rule's refusal reason; it starts with "cid <cid> ".
+_REASON_REPLAY = "was applied before and is not newer than the last applied record"
+# The fields of a record as published before sets had secrets.
+_RECORD_FIELDS = {"cid", "version", "timestamp", "node_id", "metadata", "runtime", "manifest"}
+# The fields of its manifest.
+_MANIFEST_FIELDS = {
+  "schema_version", "archive_paths", "archive_format", "archive_size_bytes", "encryption", "runtime",
+}
+
+
+class _RetainingR1FS(_FakeR1FS):
+  """R1FS stub that keeps a file's bytes when it is deleted.
+
+  The provider retires its previous CID at every publish and the consumer at every apply. The replay tests
+  present older records again, and an older record matters only while its archive can still be fetched, so
+  this stub records the delete call and keeps the bytes.
+  """
+
+  def delete_file(self, cid, unpin_remote=False, cleanup_local_files=False, **_kwargs):
+    """Record a delete call without dropping the stored bytes.
+
+    Parameters
+    ----------
+    cid : str
+      The CID a manager retires.
+    unpin_remote : bool, optional
+      Recorded as received.
+    cleanup_local_files : bool, optional
+      Recorded as received.
+    **_kwargs : dict
+      Ignored, as in the parent stub.
+
+    Returns
+    -------
+    dict
+      ``{"ok": True}``, as the parent stub returns.
+
+    Examples
+    --------
+    >>> fake = _RetainingR1FS()
+    >>> fake.added["QmA"] = b"tar"
+    >>> fake.delete_file("QmA", unpin_remote=True), "QmA" in fake.added
+    ({'ok': True}, True)
+    """
+    # The parent's bookkeeping without its pop: the archive stays fetchable.
+    self.deleted.append((cid, unpin_remote, cleanup_local_files))
+    # The parent's answer.
+    return {"ok": True}
+
+
+class TestSetSecret(unittest.TestCase):
+  """A sync set with its own secret, next to a set that uses the shared key."""
+
+  def setUp(self):
+    """Build one provider and one consumer of the same KEY on a shared fake R1FS and chain store.
+
+    Neither holds a secret yet; a test gives them one with ``_use_secret``. The R1FS stub keeps retired
+    archives (``_RetainingR1FS``) so that older records can be presented again.
+
+    Returns
+    -------
+    None
+    """
+    # The temporary tree both ends keep their folders in.
+    self._tmp = tempfile.TemporaryDirectory()
+    # Its path.
+    self.tmpdir = Path(self._tmp.name)
+    # One R1FS for both ends: what the provider adds is what the consumer fetches.
+    self.r1fs = _RetainingR1FS()
+    # One chain store for both ends, for the same reason.
+    shared_cs = _FakeChainStore()
+    # The provider's plugin stub.
+    self.provider = _make_owner(self.tmpdir / "p")
+    # The consumer's plugin stub, with the same KEY.
+    self.consumer = _make_owner(self.tmpdir / "c")
+    # Each _make_owner call built its own fakes: point both stubs at the shared ones.
+    for owner in (self.provider, self.consumer):
+      # The handle the manager uses, and the one tests inspect.
+      owner.r1fs = owner._r1fs = self.r1fs
+      # The three chain-store calls of the plugin API.
+      owner.chainstore_hset, owner.chainstore_hget, owner.chainstore_hsync = (
+        shared_cs.hset, shared_cs.hget, shared_cs.hsync,
+      )
+      # The store itself, for tests that read what was written.
+      owner._cs = shared_cs
+    # The second stub is the consumer of the set.
+    self.consumer.cfg_sync_type = "consumer"
+    # The set's KEY, the same on both ends.
+    self.key = self.provider.cfg_sync_key
+    # The provider's manager.
+    self.sm_p = SyncManager(self.provider)
+    # The consumer's manager.
+    self.sm_c = SyncManager(self.consumer)
+    # The control directories the system volume would provide.
+    for owner in (self.provider, self.consumer):
+      # Created empty, as after the volume is provisioned.
+      volume_sync_dir(owner).mkdir(parents=True, exist_ok=True)
+
+  def tearDown(self):
+    """Remove the temporary tree.
+
+    Returns
+    -------
+    None
+    """
+    # Everything both ends wrote.
+    self._tmp.cleanup()
+
+  def _use_secret(self, provider=None, consumer=None):
+    """Give each end its configured sync secret.
+
+    Parameters
+    ----------
+    provider : str, optional
+      The provider job's secret; None leaves it on the shared key.
+    consumer : str, optional
+      The consumer job's secret; None leaves it on the shared key.
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> self._use_secret(provider=_SET_SECRET, consumer=_SET_SECRET)   # one set, both ends hold its secret
+    """
+    # The attribute the manager reads on its owner (the plugin's cfg_sync_secret property in production).
+    self.provider.cfg_sync_secret = provider
+    # The same on the consumer.
+    self.consumer.cfg_sync_secret = consumer
+
+  def _publish(self, content, metadata=None):
+    """Publish one snapshot of ``/app/data/`` from the provider and return a copy of the stored record.
+
+    Parameters
+    ----------
+    content : bytes
+      What the provider's ``weights.bin`` holds in this snapshot.
+    metadata : dict, optional
+      The request metadata; empty when omitted.
+
+    Returns
+    -------
+    dict
+      A deep copy of the record under the set's KEY, safe to change.
+
+    Examples
+    --------
+    >>> record = self._publish(b"v1", {"epoch": 1})
+    >>> record["metadata"]
+    {'epoch': 1}
+    """
+    # The volume content of this snapshot.
+    (self.provider._fixed_root / "appdata" / "weights.bin").write_bytes(content)
+    # The claimed-request marker a provider tick would have left.
+    (volume_sync_dir(self.provider) / SYNC_PROCESSING_FILE).write_text("{}")
+    # The publish itself must succeed.
+    self.assertTrue(self.sm_p.publish_snapshot(["/app/data/"], metadata or {}))
+    # A copy: the fake store keeps the very dict the manager built.
+    return copy.deepcopy(self.provider._cs.store[("CHAINSTORE_SYNC", self.key)])
+
+  def _applied(self):
+    """Return what the consumer's volume holds now.
+
+    Returns
+    -------
+    bytes
+      The content of the consumer's ``weights.bin``.
+    """
+    # The file every snapshot in these tests replaces.
+    return (self.consumer._fixed_root / "appdata" / "weights.bin").read_bytes()
+
+  def _remac(self, record, **fields):
+    """Return a copy of a record with some fields changed and a MAC that is valid for the result.
+
+    This is what a holder of the set's secret can publish; a test uses it to reach the replay rule with
+    chosen ``version`` and ``timestamp`` values.
+
+    Parameters
+    ----------
+    record : dict
+      The record to copy.
+    **fields : dict
+      Top-level fields to set on the copy.
+
+    Returns
+    -------
+    dict
+      The changed record with its own ``mac`` under ``_SET_SECRET`` and the set's KEY.
+
+    Examples
+    --------
+    >>> replay = self._remac(record, version=record["version"] + 10)
+    >>> self.sm_c.validate_record_for_apply(replay)   # on a consumer that never applied this CID
+    []
+    """
+    # Everything but the old MAC, with the changes on top.
+    signed = {**{name: value for name, value in record.items() if name != "mac"}, **fields}
+    # The MAC a provider of this set would compute for the changed record.
+    signed["mac"] = self.sm_p._record_mac(signed, _SET_SECRET)
+    # A complete, valid record of the set.
+    return signed
+
+  def _changed(self, record, field, value, inner=None):
+    """Return a deep copy of a record with one field set and the MAC left as it was.
+
+    Parameters
+    ----------
+    record : dict
+      The record to copy.
+    field : str
+      A top-level field, or ``manifest`` when ``inner`` is given.
+    value : object
+      The value to set.
+    inner : str, optional
+      A field of the manifest to set instead of the top-level field.
+
+    Returns
+    -------
+    dict
+      The changed copy; its ``mac`` is the original record's unless ``field`` is ``mac``.
+
+    Examples
+    --------
+    >>> self._changed(record, "manifest", 0, inner="schema_version")["manifest"]["schema_version"]
+    0
+    """
+    # A copy of its own, nested values included.
+    changed = copy.deepcopy(record)
+    if inner is None:
+      # A top-level field.
+      changed[field] = value
+    else:
+      # A field of the manifest.
+      changed[field][inner] = value
+    # What a party without the secret can do to a record: change it, not re-MAC it.
+    return changed
+
+  def _assert_refused(self, record, reason):
+    """Assert that the consumer refuses a record before any download, logs the reason and quarantines it.
+
+    Parameters
+    ----------
+    record : dict
+      The record presented to the consumer.
+    reason : str
+      Text the red ``cannot prepare`` line must contain.
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> self._assert_refused(record_with_wrong_mac, _REASON_MAC)
+    """
+    # The downloads so far.
+    downloads = list(self.r1fs.get_calls)
+    # The log lines so far.
+    lines = len(self.consumer._msgs)
+    # A refusal is a False result, not an exception.
+    self.assertFalse(self.sm_c.apply_snapshot(record))
+    # Nothing was downloaded for it.
+    self.assertEqual(self.r1fs.get_calls, downloads)
+    # The refusal lines this record caused.
+    refusals = [line for line in self.consumer._msgs[lines:] if "cannot prepare" in line]
+    # Exactly one, in red.
+    self.assertEqual([line[:4] for line in refusals], ["[r] "])
+    # It gives the reason.
+    self.assertIn(reason, refusals[0])
+    # The record is held by the quarantine until its back-off passes.
+    self.assertIsNotNone(self.sm_c.quarantined_record(record))
+
+  def test_legacy_publish_record_unchanged(self):
+    """Without a secret the provider publishes the record it published before sets had secrets."""
+    # A publish from a job without a secret.
+    record = self._publish(b"shared-key")
+    # The earlier fields exactly (no "mac"), the shared-key tag and schema version 1.
+    self.assertEqual(
+      (set(record), set(record["manifest"]), record["manifest"]["encryption"], record["manifest"]["schema_version"]),
+      (_RECORD_FIELDS, _MANIFEST_FIELDS, "r1fs-default", 1),
+    )
+    # R1FS was asked for its default key: None, not an empty string.
+    self.assertIsNone(self.r1fs.secrets[record["cid"]])
+
+  def test_legacy_apply_unchanged(self):
+    """Without a secret a consumer applies a shared-key record as before, fetching with the default key."""
+    # A shared-key record.
+    record = self._publish(b"shared-key")
+    # No reason at any step.
+    self.assertEqual(self.sm_c.validate_record_for_apply(record), [])
+    # It applies.
+    self.assertTrue(self.sm_c.apply_snapshot(record))
+    # The consumer holds the provider's file, fetched once with secret=None.
+    self.assertEqual((self._applied(), self.r1fs.get_calls), (b"shared-key", [(record["cid"], None)]))
+
+  def test_set_publish_uses_set_secret(self):
+    """With a secret the archive is added under it, the tag is the set tag and the record carries its MAC."""
+    # Only the provider matters here.
+    self._use_secret(provider=_SET_SECRET)
+    # A publish from a job with a secret.
+    record = self._publish(b"set-data", {"epoch": 1})
+    # The archive key is the secret, and the tag says so.
+    self.assertEqual(
+      (self.r1fs.secrets[record["cid"]], record["manifest"]["encryption"]), (_SET_SECRET, "r1fs-set-v1"),
+    )
+    # The earlier fields plus "mac"; the manifest has no new field.
+    self.assertEqual((set(record), set(record["manifest"])), (_RECORD_FIELDS | {"mac"}, _MANIFEST_FIELDS))
+    # The MAC is 64 lowercase hex characters.
+    self.assertIsNotNone(re.fullmatch(r"[0-9a-f]{64}", record["mac"]))
+    # It is the manager's MAC of this record.
+    self.assertEqual(record["mac"], self.sm_p._record_mac(record, _SET_SECRET))
+    # The same MAC from the format's definition. First the subkey: HMAC of a fixed context under the secret.
+    subkey = hmac.new(_SET_SECRET.encode("ascii"), b"r1en-volume-sync-record-v1", hashlib.sha256).digest()
+    # Then the canonical JSON of the KEY and the record without its MAC.
+    message = json.dumps(
+      {"key": self.key, "record": {name: value for name, value in record.items() if name != "mac"}},
+      sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    )
+    # Its HMAC under the subkey, in hex.
+    self.assertEqual(record["mac"], hmac.new(subkey, message.encode("ascii"), hashlib.sha256).hexdigest())
+
+  def test_set_roundtrip_applies(self):
+    """Provider and consumer with the same KEY and secret sync; the download uses the secret."""
+    # One set: both ends hold its secret.
+    self._use_secret(provider=_SET_SECRET, consumer=_SET_SECRET)
+    # A record of the set.
+    record = self._publish(b"set-data")
+    # It applies.
+    self.assertTrue(self.sm_c.apply_snapshot(record))
+    # The consumer holds the provider's file, fetched once under the set's secret.
+    self.assertEqual((self._applied(), self.r1fs.get_calls), (b"set-data", [(record["cid"], _SET_SECRET)]))
+
+  def test_set_consumer_refuses_legacy_record(self):
+    """A consumer with a secret refuses a shared-key record by its tag (no downgrade), with no download."""
+    # The provider has no secret, the consumer has one.
+    self._use_secret(consumer=_SET_SECRET)
+    # Refused by the tag, quarantined.
+    self._assert_refused(
+      self._publish(b"shared-key"), "unsupported encryption: 'r1fs-default' (expected: 'r1fs-set-v1')",
+    )
+    # No download at all.
+    self.assertEqual(self.r1fs.get_calls, [])
+
+  def test_legacy_consumer_refuses_set_record(self):
+    """A consumer without a secret refuses a set's record by its tag, with no download."""
+    # The provider has a secret, the consumer has none.
+    self._use_secret(provider=_SET_SECRET)
+    # Refused by the tag, quarantined.
+    self._assert_refused(
+      self._publish(b"set-data"), "unsupported encryption: 'r1fs-set-v1' (expected: 'r1fs-default')",
+    )
+    # No download at all.
+    self.assertEqual(self.r1fs.get_calls, [])
+
+  def test_wrong_secret_refused_before_download(self):
+    """A consumer with another secret refuses the record by its MAC and downloads nothing."""
+    # Two different secrets under one KEY.
+    self._use_secret(provider=_SET_SECRET, consumer=_OTHER_SECRET)
+    # Refused by the MAC, quarantined.
+    self._assert_refused(self._publish(b"set-data"), _REASON_MAC)
+    # No download at all.
+    self.assertEqual(self.r1fs.get_calls, [])
+
+  def test_record_mac_covers_every_field(self):
+    """A change to any record or manifest field gives another MAC and the record is refused."""
+    # One set: both ends hold its secret.
+    self._use_secret(provider=_SET_SECRET, consumer=_SET_SECRET)
+    # A record of the set.
+    record = self._publish(b"set-data", {"epoch": 1})
+    # Another runtime policy, for the two runtime fields.
+    other_runtime = dict(record["runtime"], consumer_apply="online_restart")
+    # (field, manifest field, new value): each passes the envelope and manifest checks, so only the MAC refuses it.
+    mac_only = [
+      ("cid", None, record["cid"] + "x"),
+      ("version", None, record["version"] + 1),
+      ("timestamp", None, record["timestamp"] + 0.5),
+      ("node_id", None, "ee_other"),
+      ("metadata", None, {"epoch": 2}),
+      ("runtime", None, other_runtime),
+      ("manifest", "schema_version", 0),
+      ("manifest", "archive_paths", ["/app/data/sub/"]),
+      ("manifest", "archive_size_bytes", record["manifest"]["archive_size_bytes"] + 1),
+      ("manifest", "runtime", other_runtime),
+    ]
+    # These two are refused by their own manifest check first; the MAC must differ all the same.
+    checked_earlier = [("manifest", "archive_format", "zip"), ("manifest", "encryption", "r1fs-default")]
+    # Every change, one at a time.
+    for field, inner, value in mac_only + checked_earlier:
+      # A failure names the field.
+      with self.subTest(field=field, inner=inner):
+        # The record with that one change and its original MAC.
+        changed = self._changed(record, field, value, inner)
+        # The changed content has another MAC, so the carried one no longer fits.
+        self.assertNotEqual(self.sm_p._record_mac(changed, _SET_SECRET), record["mac"])
+        # Refused: by the MAC when nothing else objects, by the manifest's own reason for the two checked earlier.
+        self._assert_refused(changed, _REASON_MAC if (field, inner, value) in mac_only else "unsupported")
+    # A removed field is a change too.
+    self._assert_refused({name: value for name, value in record.items() if name != "node_id"}, _REASON_MAC)
+    # Nothing was downloaded, and the untouched record is still accepted.
+    self.assertEqual((self.r1fs.get_calls, self.sm_c.validate_record_for_apply(record)), ([], []))
+
+  def test_record_with_added_field_refused(self):
+    """A field added to the record or to its manifest breaks the MAC: the MAC covers unknown fields too."""
+    # One set: both ends hold its secret.
+    self._use_secret(provider=_SET_SECRET, consumer=_SET_SECRET)
+    # A record of the set.
+    record = self._publish(b"set-data")
+    # One more top-level field.
+    self._assert_refused(self._changed(record, "extra", 1), _REASON_MAC)
+    # One more manifest field.
+    self._assert_refused(self._changed(record, "manifest", 1, inner="extra"), _REASON_MAC)
+    # No download at all.
+    self.assertEqual(self.r1fs.get_calls, [])
+
+  def test_record_from_other_key_refused(self):
+    """A record of one set is refused under another KEY even when both sets hold the same secret."""
+    # Both ends hold the same secret.
+    self._use_secret(provider=_SET_SECRET, consumer=_SET_SECRET)
+    # A record published under the provider's KEY.
+    record = self._publish(b"set-data")
+    # The consumer belongs to another set: another KEY, the same secret.
+    self.consumer.cfg_sync_key = "22222222-2222-2222-2222-222222222222"
+    # Refused by the MAC, which covers the KEY.
+    self._assert_refused(record, _REASON_MAC)
+    # No download at all.
+    self.assertEqual(self.r1fs.get_calls, [])
+
+  def test_record_mac_survives_json_round_trip(self):
+    """The MAC holds after a JSON round trip with reordered keys, non-ASCII text and a float timestamp."""
+    # One set: both ends hold its secret.
+    self._use_secret(provider=_SET_SECRET, consumer=_SET_SECRET)
+    # Steps of the provider's clock.
+    ticks = iter(range(1, 1000))
+    # A clock with a fractional part, so the record's timestamp is a float that is not a whole number.
+    self.provider.time = lambda: 1714742400.123456 + next(ticks) * 1.000001
+    # A record with non-ASCII text and a float in its metadata.
+    record = self._publish(b"set-data", {"name": "naïve café 東京", "ratio": 0.1})
+    # The timestamp has digits after the point.
+    self.assertNotEqual(record["timestamp"], int(record["timestamp"]))
+    # Both ways a transport can write non-ASCII text: escaped and raw.
+    for text in (json.dumps(record), json.dumps(record, ensure_ascii=False)):
+      # What the receiving side decodes.
+      decoded = json.loads(text)
+      # The same record with its keys in the opposite order.
+      reordered = {name: decoded[name] for name in reversed(list(decoded))}
+      # The manifest's keys in the opposite order too.
+      reordered["manifest"] = {name: decoded["manifest"][name] for name in reversed(list(decoded["manifest"]))}
+      # The order really differs from the published one.
+      self.assertNotEqual(list(reordered), list(record))
+      # Accepted: no reason at any step.
+      self.assertEqual(self.sm_c.validate_record_for_apply(reordered), [])
+    # And it applies.
+    self.assertTrue(self.sm_c.apply_snapshot(reordered))
+    # The consumer holds the provider's file.
+    self.assertEqual(self._applied(), b"set-data")
+
+  def test_malformed_mac_quarantined_without_exception(self):
+    """A MAC in any wrong form is refused and quarantined: no exception, no download, no echo."""
+    # One set: both ends hold its secret.
+    self._use_secret(provider=_SET_SECRET, consumer=_SET_SECRET)
+    # A record of the set.
+    record = self._publish(b"set-data")
+    # Its valid MAC.
+    good = record["mac"]
+    # Wrong forms; the last three are not strings, and good + "0" starts with a full valid MAC.
+    malformed = [
+      ("non-ASCII", "é" * 64),
+      ("not hex", "g" * 64),
+      ("uppercase hex", "AB" * 32),
+      ("63 characters", good[:63]),
+      ("65 characters", good + "0"),
+      ("int", 1234567890123456789),
+      ("None", None),
+      ("list", [good]),
+    ]
+    # Every wrong form, one at a time.
+    for label, value in malformed:
+      # A failure names the form.
+      with self.subTest(mac=label):
+        # Refused for its form, quarantined, no exception.
+        self._assert_refused(self._changed(record, "mac", value), _REASON_MAC_FORM)
+    # A set record with no "mac" field at all.
+    self._assert_refused({name: value for name, value in record.items() if name != "mac"}, _REASON_MAC_FORM)
+    # No download at all.
+    self.assertEqual(self.r1fs.get_calls, [])
+    # The quarantine files.
+    files = list(quarantine_dir(self.consumer).glob("*.json"))
+    # One per refused record.
+    self.assertEqual(len(files), len(malformed) + 1)
+    # Every log line and every quarantine file of the consumer.
+    written = "\n".join(self.consumer._msgs) + "".join(path.read_text() for path in files)
+    # None repeats a refused value (good[:63] also stands for good itself).
+    for value in ("é" * 64, "g" * 64, "AB" * 32, good[:63], "1234567890123456789"):
+      # Not in a line, not in a file.
+      self.assertNotIn(value, written)
+
+  def test_applied_cid_replay_refused(self):
+    """A record applied before and superseded by a newer apply is refused when it comes back."""
+    # One set: both ends hold its secret.
+    self._use_secret(provider=_SET_SECRET, consumer=_SET_SECRET)
+    # The first record, A.
+    rec_a = self._publish(b"A")
+    # The consumer applies A.
+    self.assertTrue(self.sm_c.apply_snapshot(rec_a))
+    # The newer record, B.
+    rec_b = self._publish(b"B")
+    # The consumer applies B.
+    self.assertTrue(self.sm_c.apply_snapshot(rec_b))
+    # The downloads so far.
+    downloads = list(self.r1fs.get_calls)
+    # A comes back with its valid MAC: seen before and older than B, so refused with no download.
+    self._assert_refused(rec_a, f"cid {rec_a['cid']} {_REASON_REPLAY}")
+    # B again does nothing: the consumer tick stops on the last applied CID, which is still B after the
+    # refusal wrote its failed state; the volume holds B and nothing more was downloaded.
+    self.assertEqual(
+      (self.sm_c.latest_applied()["cid"], self._applied(), self.r1fs.get_calls), (rec_b["cid"], b"B", downloads),
+    )
+    # The next publish, C.
+    rec_c = self._publish(b"C")
+    # It applies.
+    self.assertTrue(self.sm_c.apply_snapshot(rec_c))
+    # The consumer holds C.
+    self.assertEqual(self._applied(), b"C")
+
+  def test_never_applied_cid_accepted(self):
+    """A valid record this consumer never applied is accepted, even an older one (the documented gap)."""
+    # One set: both ends hold its secret.
+    self._use_secret(provider=_SET_SECRET, consumer=_SET_SECRET)
+    # Any valid CID on an empty history is applied.
+    self.assertTrue(self.sm_c.apply_snapshot(self._publish(b"first")))
+    # Two publishes between two consumer ticks: this one is replaced before the consumer sees it.
+    skipped = self._publish(b"skipped")
+    # The consumer sees and applies only the second.
+    self.assertTrue(self.sm_c.apply_snapshot(self._publish(b"current")))
+    # The replaced record arrives later: older than the last applied one, never applied here, so no reason.
+    self.assertEqual(self.sm_c.validate_record_for_apply(skipped), [])
+    # It is applied, once.
+    self.assertTrue(self.sm_c.apply_snapshot(skipped))
+    # The consumer holds the older data.
+    self.assertEqual(self._applied(), b"skipped")
+
+  def test_history_read_only_after_mac_match(self):
+    """The received history is read once, and only for a record whose MAC matched."""
+    # One set: both ends hold its secret.
+    self._use_secret(provider=_SET_SECRET, consumer=_SET_SECRET)
+    # A record of the set.
+    record = self._publish(b"set-data")
+    # A tag refusal, a manifest format refusal, a MAC form refusal and a MAC mismatch.
+    refused = [
+      self._changed(record, "manifest", "r1fs-default", inner="encryption"),
+      self._changed(record, "manifest", "zip", inner="archive_format"),
+      self._changed(record, "mac", "g" * 64),
+      self._changed(record, "mac", self.sm_p._record_mac(record, _OTHER_SECRET)),
+    ]
+    # Count the calls of the history reader while it keeps working.
+    with patch.object(self.sm_c, "_read_history_entries", wraps=self.sm_c._read_history_entries) as reader:
+      # Each refusal, through the path the consumer tick uses.
+      for changed in refused:
+        # Refused before staging.
+        self.assertIsNone(self.sm_c.prepare_apply(changed))
+      # None of them read the history.
+      reader.assert_not_called()
+      # The genuine record is accepted.
+      self.assertEqual(self.sm_c.validate_record_for_apply(record), [])
+      # After exactly one read.
+      reader.assert_called_once()
+
+  def test_forged_twin_does_not_hold_back_genuine(self):
+    """A forged copy of a record is quarantined under its own digest; a record without MAC keeps its digest."""
+    # One set: both ends hold its secret.
+    self._use_secret(provider=_SET_SECRET, consumer=_SET_SECRET)
+    # The genuine record.
+    genuine = self._publish(b"genuine")
+    # Its twin: same cid and manifest, a MAC made with another secret.
+    twin = self._changed(genuine, "mac", self.sm_p._record_mac(genuine, _OTHER_SECRET))
+    # The twin is refused and quarantined.
+    self._assert_refused(twin, _REASON_MAC)
+    # The two digests differ, so the twin's quarantine file is not the genuine record's.
+    self.assertNotEqual(SyncManager._record_digest(twin), SyncManager._record_digest(genuine))
+    # The genuine record is not held.
+    self.assertIsNone(self.sm_c.quarantined_record(genuine))
+    # It applies next.
+    self.assertTrue(self.sm_c.apply_snapshot(genuine))
+    # The consumer holds its data.
+    self.assertEqual(self._applied(), b"genuine")
+    # A record without "mac", as a shared-key set publishes it.
+    plain = {
+      "cid": "QmLegacyRecord",
+      "version": 7,
+      "manifest": {
+        "schema_version": 1, "archive_paths": ["/app/data/"], "archive_format": "tar.gz",
+        "archive_size_bytes": 10, "encryption": "r1fs-default",
+      },
+    }
+    # Its digest is the one the code gave before records carried a MAC (this value was computed with that code).
+    self.assertEqual(
+      SyncManager._record_digest(plain), "0409b570e7c18a2da002acd43699615b99c927f9293a99dffd9e2afa53979cde",
+    )
+
+  def test_no_secret_material_in_outputs(self):
+    """Nothing a publish, an apply or a refusal writes or logs holds the secret or a key made from it."""
+    # One set: both ends hold its secret.
+    self._use_secret(provider=_SET_SECRET, consumer=_SET_SECRET)
+    # A first record.
+    first = self._publish(b"one", {"epoch": 1})
+    # The consumer applies it.
+    self.assertTrue(self.sm_c.apply_snapshot(first))
+    # A second record.
+    second = self._publish(b"two", {"epoch": 2})
+    # A refusal in between (a forged twin), so a quarantine file and a failed apply state are written too.
+    self._assert_refused(self._changed(second, "mac", self.sm_p._record_mac(second, _OTHER_SECRET)), _REASON_MAC)
+    # The consumer applies the second record.
+    self.assertTrue(self.sm_c.apply_snapshot(second))
+    # The provider's response, the consumer's notification and its apply state.
+    outputs = [
+      volume_sync_dir(self.provider) / "response.json",
+      volume_sync_dir(self.consumer) / "last_apply.json",
+      apply_state_path(self.consumer),
+    ]
+    # The sent history, the received history and the quarantine files.
+    for folder in (
+      history_sent_dir(self.provider), history_received_dir(self.consumer), quarantine_dir(self.consumer),
+    ):
+      # Every entry of the folder.
+      outputs += sorted(folder.glob("*.json"))
+    # Three single files, two entries in each history, one quarantine file.
+    self.assertEqual(len(outputs), 3 + 2 + 2 + 1)
+    # Every file under both ends' folders.
+    files = [path for path in self.tmpdir.rglob("*") if path.is_file()]
+    # The outputs above exist and are among them.
+    self.assertLessEqual(set(outputs), set(files))
+    # The content of every file.
+    scanned = "\n".join(path.read_bytes().decode("latin-1") for path in files)
+    # Every log line of both ends.
+    scanned += "\n".join(self.provider._msgs + self.consumer._msgs)
+    # Every record written to the store.
+    scanned += json.dumps([value for _hkey, _key, value in self.provider._cs.hset_calls])
+    # The scan sees real content: a published CID is in it.
+    self.assertIn(first["cid"], scanned)
+    # The archive key: the SHA-256 of the secret.
+    archive_key = hashlib.sha256(_SET_SECRET.encode("ascii")).hexdigest()
+    # The MAC subkey.
+    subkey = hmac.new(_SET_SECRET.encode("ascii"), b"r1en-volume-sync-record-v1", hashlib.sha256).hexdigest()
+    # The secret, the archive key in full and as its first 16 bytes, and the MAC subkey.
+    for needle in (_SET_SECRET, archive_key, archive_key[:32], subkey):
+      # In no file, no log line and no stored record.
+      self.assertNotIn(needle, scanned)
+
+  def test_current_record_reapplies_after_older_never_applied(self):
+    """After an older, never-applied record was applied, the current record applies again when it returns."""
+    # One set: both ends hold its secret.
+    self._use_secret(provider=_SET_SECRET, consumer=_SET_SECRET)
+    # W is published first and replaced before the consumer sees it.
+    rec_w = self._publish(b"W")
+    # X is the current record.
+    rec_x = self._publish(b"X")
+    # The consumer applies X.
+    self.assertTrue(self.sm_c.apply_snapshot(rec_x))
+    # W arrives (a stale answer): valid, older, never applied here, so it is applied.
+    self.assertTrue(self.sm_c.apply_snapshot(rec_w))
+    # The consumer holds the older data.
+    self.assertEqual(self._applied(), b"W")
+    # The downloads so far.
+    downloads = list(self.r1fs.get_calls)
+    # X returns: applied before, but newer than the last applied record (W), so it applies again.
+    self.assertTrue(self.sm_c.apply_snapshot(rec_x))
+    # One more download, of X under the set's secret, and the consumer holds X again.
+    self.assertEqual((self.r1fs.get_calls, self._applied()), (downloads + [(rec_x["cid"], _SET_SECRET)], b"X"))
+    # W returns once more: now seen and older than X, refused with no download.
+    self._assert_refused(rec_w, f"cid {rec_w['cid']} {_REASON_REPLAY}")
+    # The consumer still holds X.
+    self.assertEqual(self._applied(), b"X")
+
+  def test_replay_order_key_fails_closed(self):
+    """A re-seen CID whose order cannot be established, or is equal, is refused without an exception."""
+    # One set: both ends hold its secret.
+    self._use_secret(provider=_SET_SECRET, consumer=_SET_SECRET)
+    # The first record, A.
+    rec_a = self._publish(b"A")
+    # The consumer applies A.
+    self.assertTrue(self.sm_c.apply_snapshot(rec_a))
+    # The newer record, B.
+    rec_b = self._publish(b"B")
+    # The consumer applies B, its last applied record from here on.
+    self.assertTrue(self.sm_c.apply_snapshot(rec_b))
+    # The downloads so far.
+    downloads = list(self.r1fs.get_calls)
+    # The refusal every case below must get.
+    reason = f"cid {rec_a['cid']} {_REASON_REPLAY}"
+    # A version above the last applied one: with a usable timestamp such a record counts as newer.
+    newer = rec_b["version"] + 10
+    # A's CID again, validly MAC'd, with the last applied key itself or a timestamp that is not a usable number.
+    unusable = [
+      ("equal key", rec_b["version"], rec_b["timestamp"]),
+      ("str timestamp", newer, "9999999999.0"),
+      ("bool timestamp", newer, True),
+      ("NaN timestamp", newer, float("nan")),
+      ("infinite timestamp", newer, float("inf")),
+      ("400-digit int timestamp", newer, 10 ** 399),
+    ]
+    # Every case, one at a time.
+    for label, version, timestamp in unusable:
+      # A failure names the case.
+      with self.subTest(case=label):
+        # Refused by the replay rule, quarantined, no exception.
+        self._assert_refused(self._remac(rec_a, version=version, timestamp=timestamp), reason)
+    # The control: the same CID with a newer, well-formed key passes the rule.
+    self.assertEqual(
+      self.sm_c.validate_record_for_apply(self._remac(rec_a, version=newer, timestamp=float(newer))), [],
+    )
+    # The history entry written last and its file.
+    path, entry, _ = max(
+      self.sm_c._read_history_entries(history_received_dir(self.consumer)), key=lambda item: item[2],
+    )
+    # It is B's.
+    self.assertEqual(entry["cid"], rec_b["cid"])
+    # That entry as an older or damaged history file could hold it: no source_timestamp, or a str.
+    damaged_entries = [
+      ("last entry without source_timestamp", {k: v for k, v in entry.items() if k != "source_timestamp"}),
+      ("last entry with a str source_timestamp", dict(entry, source_timestamp="1714742400.0")),
+    ]
+    # Each damaged form, one at a time.
+    for offset, (label, damaged) in enumerate(damaged_entries, start=1):
+      # A failure names the case.
+      with self.subTest(case=label):
+        # The last applied entry now has no usable order key.
+        path.write_text(json.dumps(damaged))
+        # A record of its own for each case (another version), newer and well formed like the control: refused.
+        self._assert_refused(
+          self._remac(rec_a, version=newer + offset, timestamp=float(newer + offset)), reason,
+        )
+    # Nothing was downloaded for any of them, and the volume still holds B.
+    self.assertEqual((self.r1fs.get_calls, self._applied()), (downloads, b"B"))
 
 
 if __name__ == "__main__":
