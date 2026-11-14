@@ -271,6 +271,44 @@ class FindingFieldTests(unittest.TestCase):
                        ("vulndb-bbbbbbbbbbbb", "2026-11-15"))
 
 
+class LocalVectorReasonTests(unittest.TestCase):
+  """`local_vector` (step 2d): every v3 vector is AV:L or AV:P, so a banner cannot show the CVE applies."""
+
+  @staticmethod
+  def match(*vectors, confidence="firm", reason="nvd_range", pdep=0):
+    cvss = tuple({"version": v.split("/")[0].split(":")[1], "vector": v, "score": 7.0, "source": "nvd"} for v in vectors)
+    return type("M", (), {"confidence": confidence, "reason": reason, "platform_dependent": pdep, "cvss": cvss})()
+
+  def reason(self, match, product="exim", status=cve_db.BACKPORT_UNKNOWN_NO_PACKAGE):
+    return cve_db._confidence_reason(status, match, product)
+
+  def test_local_only_is_tentative_local_vector(self):
+    local = "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"
+    self.assertEqual(self.reason(self.match(local), product="libssh"), ("tentative", "local_vector"))
+    self.assertEqual(self.reason(self.match("CVSS:3.0/AV:P/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"), product="libssh"),
+                     ("tentative", "local_vector"))
+
+  def test_any_network_or_adjacent_vector_keeps_the_build_reason(self):
+    local = "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"
+    for other in (V31, "CVSS:3.1/AV:A/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"):
+      self.assertEqual(self.reason(self.match(local, other), product="libssh"), ("firm", "nvd_range"))
+
+  def test_no_v3_vector_is_not_local(self):
+    self.assertEqual(self.reason(self.match(V40), product="libssh"), ("firm", "nvd_range"))
+    self.assertEqual(self.reason(self.match(), product="libssh"), ("firm", "nvd_range"))
+
+  def test_order_around_local_vector(self):
+    local = "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"
+    self.assertEqual(self.reason(self.match(local, pdep=1)), ("tentative", "platform_dependent"))
+    self.assertEqual(self.reason(self.match(local, confidence="tentative", reason="inferred_version")),
+                     ("tentative", "inferred_version"))
+    self.assertEqual(self.reason(self.match(local)), ("tentative", "local_vector"))  # exim is a backported product
+
+  def test_static_has_no_local_vector(self):
+    for f in cve_db.check_cves("exim", "4.70"):
+      self.assertNotEqual(f.confidence_reason, "local_vector")
+
+
 class PluginWiringTests(unittest.TestCase):
   def run_init(self, source, db=None, pin=None):
     Plugin = api_fixtures.TestPhase3Archive()._get_plugin_class()

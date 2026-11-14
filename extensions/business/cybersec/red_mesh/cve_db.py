@@ -657,7 +657,7 @@ _BACKPORTED_PRODUCTS = frozenset({
   "proftpd", "redis", "memcached", "mongodb", "couchdb", "tomcat", "vsftpd", "dovecot", "postfix",
 })
 # Order in which one reason wins when several apply (report-findings.md, Per-finding fields).
-_TENTATIVE_REASON_ORDER = ("eol_unassessed", "inferred_version", "platform_dependent", "backport_unknown", "banner_only", "nvd_exact", "cna_range")
+_TENTATIVE_REASON_ORDER = ("eol_unassessed", "inferred_version", "platform_dependent", "local_vector", "backport_unknown", "banner_only", "nvd_exact", "cna_range")
 
 
 def _static_cwe_id(cve_id: str) -> str:
@@ -674,6 +674,12 @@ def _static_cwe_id(cve_id: str) -> str:
 _STATIC_CWE = None
 
 
+def _local_vector_only(match) -> bool:
+  """True when the CVE has v3 vectors and every one is AV:L or AV:P: a network banner cannot show it applies."""
+  vectors = [str(c.get("vector", "")) for c in (getattr(match, "cvss", None) or ()) if str(c.get("version", "")).startswith("3.")]
+  return bool(vectors) and all(re.search(r"/AV:[LP](/|$)", v) for v in vectors)
+
+
 def _confidence_reason(backport_status: str, match, product: str) -> tuple:
   """`(confidence, reason)` of a CVE finding. `match` is a reader `Match`, or None under `static`."""
   if backport_status == BACKPORT_NOT_FIXED and not (match and match.platform_dependent):
@@ -683,6 +689,8 @@ def _confidence_reason(backport_status: str, match, product: str) -> tuple:
   reasons = set()
   if match.platform_dependent:
     reasons.add("platform_dependent")
+  if _local_vector_only(match):
+    reasons.add("local_vector")
   if product in _BACKPORTED_PRODUCTS and backport_status != BACKPORT_NOT_FIXED:
     reasons.add("backport_unknown" if backport_status == BACKPORT_UNKNOWN else "banner_only")
   if match.confidence == "tentative":
