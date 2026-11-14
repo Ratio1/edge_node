@@ -15,6 +15,7 @@ from ..tenancy.job_artifacts import (
 )
 from ..tenancy.ports import TenantStoreError
 from ..tenancy.administration import AdministrationDenied
+from ..cve_view import build_cve_view
 from .reconciliation import reconcile_job_workers
 from .report_review import review_summaries
 from .triage import get_job_archive_with_triage
@@ -292,6 +293,20 @@ def get_job_data(owner, job_id: str, *, checked_job=_UNSET, snapshot_mode="tenan
   }
 
 
+def with_cve_views(archive: dict) -> dict:
+  """A copy of `archive` whose passes carry a computed `cve_view` beside `findings` (RM-169).
+
+  Only for generated CVE findings: a pass with none gets no key. Never stored: the stored archive is not
+  touched and this runs on every read. `triage` is not passed yet (the triage phase), and the archive holds no
+  not-applicable records (they live in the pass's aggregated report), so `counts.dropped` reads 0 here.
+  """
+  passes = []
+  for pass_data in archive.get("passes") or []:
+    view = build_cve_view(pass_data.get("findings") or []) if isinstance(pass_data, dict) else None
+    passes.append({**pass_data, "cve_view": view} if view else pass_data)
+  return {**archive, "passes": passes}
+
+
 def get_job_archive(owner, job_id: str, summary_only: bool = False, pass_offset: int = 0, pass_limit: int = 0,
                     *, checked_job=_UNSET, snapshot_mode="tenant_bound"):
   """
@@ -306,6 +321,7 @@ def get_job_archive(owner, job_id: str, summary_only: bool = False, pass_offset:
     return result
   if result["archive"].get("job_type") == "model_test":
     return result
+  result = {**result, "archive": with_cve_views(result["archive"])}
   if summary_only or int(pass_offset or 0) > 0 or int(pass_limit or 0) > 0:
     result = dict(result)
     result["archive"] = _paginate_archive_passes(
