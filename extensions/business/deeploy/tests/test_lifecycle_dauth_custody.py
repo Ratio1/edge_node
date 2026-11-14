@@ -670,3 +670,108 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.assertEqual(self.state.writes, [])
     self.assertEqual(self.state.blobs.data, {})
     self.assertEqual(self.http.call_count, 0)
+
+  def prepare_with_failed_write(self, word):
+    """
+    Admit a create whose target secret record's write fails as ``word``, on a fresh fixture.
+
+    Parameters
+    ----------
+    word : str
+      How the write of the target copy ends: 'before' or 'after' (see ``Node.chainstore_hset``), or one of the
+      chain store's outcome words, such as 'refused_too_large'.
+
+    Returns
+    -------
+    list of Exception
+      What the dAuth node raised while it served the preparation: one error.
+
+    Examples
+    --------
+    >>> [type(error).__name__ for error in self.prepare_with_failed_write('after')]
+    ['RuntimeError']
+    """
+    # A fresh coordinator, dAuth node and stores: the sub-tests of one test must not see each other's operation.
+    self.setUp()
+    # Only the target copy of the secret record fails; every other write is stored and confirmed.
+    self.state.fail_write = lambda namespace, key: (
+      word if namespace == 'DAUTH_JOB_SECRET_REVISIONS' and key.endswith(':deploy') else None)
+    # The dAuth node's own handler of a custody request, wrapped below.
+    serve = self.dauth.process_dauth_reconcile_secrets_request
+    # What it raised, in order.
+    raised = []
+
+    def recording(body):
+      """
+      Serve a custody request as the dAuth node does and keep the error it raises.
+
+      Parameters
+      ----------
+      body : dict
+        The signed request body.
+
+      Returns
+      -------
+      dict
+        The dAuth node's result, when it does not raise.
+
+      Examples
+      --------
+      >>> recording(body)["status"]
+      'success'
+      """
+      try:
+        # The real handler.
+        return serve(body)
+      except Exception as error:
+        # Kept for the test.
+        raised.append(error)
+        # Raised on, so the fixture's HTTP side answers it as a dAuth server does, with one fixed text.
+        raise
+
+    # The fixture's HTTP side looks the handler up on the node at each request.
+    self.dauth.process_dauth_reconcile_secrets_request = recording
+    # The coordinator gets the SDK's error for a refused custody request, whatever the dAuth node raised.
+    with self.assertRaises(RuntimeError):
+      # A create of job 7 on node A with one fresh secret value, 'fresh-token'.
+      self.admit()
+    # The dAuth node's errors.
+    return raised
+
+  def test_a_secret_record_refused_for_its_size_ends_in_an_error_that_names_the_cause_and_no_value(self):
+    """When the chain store refuses a deployment's secret record for its size, the dAuth node's preparation ends in
+    a ValueError that says the record is too large and what the job must change, with no job id, node, key or
+    secret value in it; before, it ended in the same "pending" error as a write that was not confirmed."""
+    # The chain store's outcome word for a record over its size cap.
+    raised = self.prepare_with_failed_write('refused_too_large')
+    # One error, final for the request (a ValueError), with exactly this text.
+    self.assertEqual([(type(error), str(error)) for error in raised], [(ValueError, (
+      "The deployment's secret record is larger than the store accepts: "
+      "the job must target fewer nodes or carry smaller configurations."))])
+    # The operation the coordinator recorded, for the values the text must not hold.
+    operation = self.operation()
+    # Neither the secret value, the operation id (part of the record's key), the namespace nor the app's name.
+    for part in ('fresh-token', operation['operation_id'], 'DAUTH_JOB_SECRET_REVISIONS', 'app'):
+      # Not in the error text.
+      self.assertNotIn(part, str(raised[0]))
+    # No digit either: no job id, size or limit is named.
+    self.assertFalse(any(character.isdigit() for character in str(raised[0])))
+    # The refused record is not held, and the secret value is in no public store.
+    self.assertNotIn(('DAUTH_JOB_SECRET_REVISIONS', '7|' + operation['operation_id'] + ':deploy'), self.state.secrets)
+    # Nor in the plan or the operation record.
+    self.assertNotIn('fresh-token', str(self.state.public) + str(self.state.blobs.data))
+
+  def test_every_other_failed_write_of_a_secret_record_keeps_the_pending_error(self):
+    """A secret record's write that fails for any reason but its size still ends in the retryable error
+    "Deployment secret preparation is pending.": lost before or after the store took it, refused by another rule
+    of the chain store, not confirmed, or a call that raised."""
+    # 'before' and 'after' are the fixture's two failures; the others are outcome words of the chain store.
+    for word in ('before', 'after', 'unconfirmed', 'refused_by_peers', 'refused_not_member', 'refused_secret_rule',
+                 'refused_unencodable', 'refused_too_deep', 'refused_no_peers', 'error'):
+      # One sub-test each, on its own fixture.
+      with self.subTest(failure=word):
+        # What the dAuth node raised.
+        raised = self.prepare_with_failed_write(word)
+        # Today's type and text, unchanged.
+        self.assertEqual([(type(error), str(error)) for error in raised],
+                         [(RuntimeError, 'Deployment secret preparation is pending.')])

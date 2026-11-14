@@ -138,7 +138,58 @@ class _DauthDeploymentSecretsMixin:
     return record
 
   def _prepare_deployment_secret_revisions(self, job_id, operation, plan, body):
-    """Reconcile target and restoration copies without changing the active CID."""
+    """
+    Reconcile target and restoration copies without changing the active CID.
+
+    Checks that the job's active pipeline is still the one the operation was built on and collects the secret
+    values the previous revision holds. It then builds one secret-revision record per attempt of the plan: the
+    restoration copy (``previous_configs``) and the target copy (``configs``). A record holds the job's secret
+    values and one pipeline configuration per target node, so it grows with the number of nodes and with the
+    size of the configurations. Both records are built and checked before either is written; each is then
+    written to the dAuth registry peers and must be confirmed.
+
+    Parameters
+    ----------
+    job_id : str
+      The normalized Deeploy job ID.
+    operation : dict
+      The authenticated operation from ``_deployment_secret_context``, in its "preparing" phase.
+    plan : dict
+      The operation's verified plan: ``configs`` and ``previous_configs``, each keyed by node.
+    body : dict
+      The verified request body. ``new_secrets`` and ``previous_new_secrets`` carry fresh secret values;
+      ``identity_aliases`` and ``node_aliases`` carry the renames of a scale-up and of a relink.
+
+    Returns
+    -------
+    None
+      The records are in the chain store, under ``DAUTH_JOB_SECRET_REVISIONS``.
+
+    Raises
+    ------
+    ValueError
+      When the active pipeline or the previous revision changed, a create would replace an active pipeline,
+      a staged revision would get other values, the secret values cannot be completed, or the chain store
+      refuses a record for its size. All are final: the same request fails again.
+    RuntimeError
+      When the previous secret revision is not available, or a record's write failed for another reason,
+      such as no confirmation in time (retryable).
+
+    Notes
+    -----
+    The chain store refuses a record over its size cap and reports the outcome word ``refused_too_large``
+    through ``result_info``. Every oracle applies the same cap, so that refusal gets its own error, which says
+    what the job's owner can change and names no value, key or node. This error is raised on the dAuth server:
+    ``reconcile_job_secrets`` answers every failure with one fixed text and logs the error's type and line,
+    never its text.
+
+    Examples
+    --------
+    >>> self._prepare_deployment_secret_revisions("42", operation, plan, body)   # an update of job 42
+    >>> staged = self.chainstore_hgetall(hkey="DAUTH_JOB_SECRET_REVISIONS")
+    >>> sorted(key for key in staged if key.startswith("42|" + operation["operation_id"]))
+    ['42|<operation_id>:deploy', '42|<operation_id>:restore']
+    """
     prior_cid, prior_pipeline = self._load_dauth_job_pipeline_record(job_id)
     if prior_cid != operation.get("previous_pipeline_cid"):
       raise ValueError("The active pipeline changed before preparation.")
@@ -200,8 +251,17 @@ class _DauthDeploymentSecretsMixin:
     # Validate both copies before staging either. A partial replication can still
     # need recovery, but invalid target placeholders must not create an orphan.
     for reference, record in records:
+      # The dict the chain store fills with its word for how the write ended; read when the write failed.
+      info = {}
+      # The same write as before, now with the caller's dict, so a failure can be told by its cause.
       if not self.chainstore_hset(hkey=REVISIONS, key=job_id + "|" + reference, value=record,
-                                  **dauth_registry_write_kwargs(self)):
+                                  result_info=info, **dauth_registry_write_kwargs(self)):
+        if info["outcome"] == "refused_too_large":
+          # The record is over the chain store's size cap, here and on every other oracle: no retry can store
+          # it, so it is a final error that says what to change. Before, it ended in the retryable "pending"
+          # error below, like a write that was only not confirmed yet.
+          raise ValueError("The deployment's secret record is larger than the store accepts: "
+                           "the job must target fewer nodes or carry smaller configurations.")
         raise RuntimeError("Deployment secret preparation is pending.")
 
   def _deployment_secrets_prepared(self, job_id, operation, plan):

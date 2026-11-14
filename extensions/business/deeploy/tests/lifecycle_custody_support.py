@@ -213,12 +213,52 @@ class Node:
   def chainstore_hgetall(self, hkey):
     return {key: copy.deepcopy(value) for (namespace, key), value in self.storage(hkey).items() if namespace == hkey}
 
-  def chainstore_hset(self, hkey, key, value, **kwargs):
+  def chainstore_hset(self, hkey, key, value, result_info=None, **kwargs):
+    """
+    The chain store's hash write for a fixture node, with the failures a test asks for.
+
+    The write is recorded in ``state.writes``. ``state.fail_write(hkey, key)`` then says how it ends: None (or no
+    ``fail_write``) stores the value and confirms it; 'after' stores it but it is not confirmed; 'before', or an
+    outcome word of the chain store such as 'refused_too_large', stores nothing. A caller that passes
+    ``result_info`` gets the outcome word in it, as the chain store fills it.
+
+    Parameters
+    ----------
+    hkey : str
+      The hash namespace; a secret namespace is only open to the dAuth node (see ``storage``).
+    key : str
+      The field.
+    value : any
+      The value; a copy is stored.
+    result_info : dict, optional
+      The caller's dict; its ``"outcome"`` is set to 'changed' for a stored and confirmed write, 'unconfirmed'
+      for 'after', 'refused_no_peers' for 'before' (a refusal that is not about the record), or the word
+      ``fail_write`` returned. Default None: nothing is reported.
+    **kwargs
+      The write's routing options; not used.
+
+    Returns
+    -------
+    bool
+      True when stored and confirmed, False for every failure.
+
+    Examples
+    --------
+    >>> state.fail_write = lambda hkey, key: 'refused_too_large'
+    >>> info = {}
+    >>> custodian.chainstore_hset('DAUTH_JOB_SECRET_REVISIONS', '7|op:deploy', {}, result_info=info), info
+    (False, {'outcome': 'refused_too_large'})
+    """
     store = self.storage(hkey)
     self.state.writes.append((self.address, hkey, key))
     fail = self.state.fail_write and self.state.fail_write(hkey, key)
-    if fail != 'before':
+    # Stored when the write did not fail, or failed only after the store took it; before, everything but 'before'
+    # was stored, which would also store a write the chain store refuses by an outcome word.
+    if not fail or fail == 'after':
       store[hkey, str(key)] = copy.deepcopy(value)
+    if result_info is not None:
+      # The word the chain store reports for this end of the write; an outcome word a test gives is passed on.
+      result_info['outcome'] = {None: 'changed', 'after': 'unconfirmed', 'before': 'refused_no_peers'}.get(fail, fail)
     return not fail
 
   def chainstore_hsync(self, hkey, **kwargs):
