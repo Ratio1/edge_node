@@ -2,14 +2,21 @@ import unittest
 import copy
 from collections import defaultdict
 import ipaddress
+# Whether torch is installed, without importing it.
+import importlib.util
 import sys
 import types
 
 from cryptography import x509
 
 
-for _mod_name in ("torch", "torch.nn", "torch.nn.functional"):
-  sys.modules.setdefault(_mod_name, types.ModuleType(_mod_name))
+# The bare torch stub only where torch is not installed: it breaks every later import in the same process that
+# reads torch's attributes (scipy reads torch.Tensor). Not looked up once stubbed.
+if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
+  # Each torch module that naeural_core imports.
+  for _mod_name in ("torch", "torch.nn", "torch.nn.functional"):
+    # A bare stub of it.
+    sys.modules.setdefault(_mod_name, types.ModuleType(_mod_name))
 
 from naeural_core.main.net_mon import NetMonCt
 

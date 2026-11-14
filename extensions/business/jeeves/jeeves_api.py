@@ -543,6 +543,12 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       """
       Add one or more documents to the RAG agents' context.
 
+      A list of documents is stored in R1FS as a JSON file, {"DOCUMENTS": [...], "CONTEXT_ID": ...}, encrypted
+      with the context ID; the doc-embedding serving reads a ".json" file with ``json.load`` and takes its
+      "DOCUMENTS" list. A CID given by the caller is passed on as it is; the serving reads it by its stored file
+      type (".json", ".txt", ".pdf", ".docx" or ".docs") and answers any other type, a pickled file included, as a bad
+      request. Either way an ADD_DOC request carrying the CID is queued for the agents.
+
       Parameters
       ----------
       context_id : str
@@ -556,16 +562,30 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       documents_cid : str
           The CID of the documents to add to the context. If not provided,
           the documents will be added to IPFS and the CID will be used.
+
       Returns
       -------
+      dict or postponed request
+          {'error': ...} when neither documents nor a CID is given, or when the documents cannot be stored;
+          otherwise what ``solve_postponed_request`` returns for the queued request: its result once the
+          agents answered or the request timed out, else a postponed request.
 
+      Examples
+      --------
+      >>> result = plugin.add_documents(context_id='docs', documents=['First document.'])   # stored as data.json
+      >>> plugin.add_documents(context_id='docs')
+      {'error': 'Either documents or documents_cid must be provided'}
       """
       if len(documents_cid) == 0:
         if documents is None:
           return {
             'error': 'Either documents or documents_cid must be provided',
           }
-        documents_cid = self.r1fs.add_pickle(
+        # Stored as JSON (default stored name "data.json"), which the serving loads as plain data; a pickled file
+        # named by a request could run code in the serving when loaded.
+        documents_cid = self.r1fs.add_json(
+          # Not logged: add_json would print the whole text of the documents into the node log.
+          show_logs=False,
           data={
             'DOCUMENTS': documents,
             'CONTEXT_ID': context_id,
@@ -574,6 +594,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         )
         if documents_cid is None:
           msg = f"Failed to add documents to context '{context_id}'"
+          self.P(msg, color='r')
           return {
             'error': msg,
           }

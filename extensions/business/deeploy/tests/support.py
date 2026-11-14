@@ -6,9 +6,14 @@ import sys
 import types
 from types import SimpleNamespace
 
-# Stub heavy optional dependencies so naeural_core can be imported in lightweight test environments
-for _mod_name in ("torch", "torch.nn", "torch.nn.functional"):
-  sys.modules.setdefault(_mod_name, types.ModuleType(_mod_name))
+# Stub heavy optional dependencies so naeural_core can be imported in lightweight test environments. Only where torch
+# is not installed: a bare stub breaks every later import in the same process that reads torch's attributes (scipy
+# reads torch.Tensor), as the doc-embedding serving test does after a Deeploy test. Not looked up once stubbed.
+if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
+  # Each torch module that naeural_core imports.
+  for _mod_name in ("torch", "torch.nn", "torch.nn.functional"):
+    # A bare stub of it.
+    sys.modules.setdefault(_mod_name, types.ModuleType(_mod_name))
 
 from naeural_core import constants as ct
 
