@@ -88,8 +88,8 @@ def dauth_request_label(body):
 
   Examples
   --------
-  >>> dauth_request_label({"EE_SENDER": "0xai_Node", "EE_ETH_SENDER": "0xE7h", "job_id": 49})
-  "sender '0xai_Node' ETH '0xE7h' job 49"
+  >>> dauth_request_label({"EE_SENDER": "0xai_Node", "EE_ETH_SENDER": "0xE7h", "job_id": 7})
+  "sender '0xai_Node' ETH '0xE7h' job 7"
   >>> dauth_request_label(None)
   'sender None ETH None job None'
   """
