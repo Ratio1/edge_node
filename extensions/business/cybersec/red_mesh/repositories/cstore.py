@@ -279,23 +279,25 @@ class JobStateRepository:
     )
     return
 
+  # Legacy job-keyed triage (`{cfg}:triage`, `{cfg}:triage:audit`, field `{job_id}:{finding_id}`): no reader uses
+  # it any more and nothing writes it. It stays only so a purge can delete what an older release left.
   @staticmethod
-  def triage_key(job_id, finding_id):
+  def legacy_triage_key(job_id, finding_id):
     return f"{job_id}:{finding_id}"
 
-  def get_finding_triage(self, job_id, finding_id):
+  def legacy_get_finding_triage(self, job_id, finding_id):
     return self.owner.chainstore_hget(
       hkey=self._triage_hkey,
-      key=self.triage_key(job_id, finding_id),
+      key=self.legacy_triage_key(job_id, finding_id),
     )
 
-  def get_finding_triage_model(self, job_id, finding_id):
-    payload = self.get_finding_triage(job_id, finding_id)
+  def legacy_get_finding_triage_model(self, job_id, finding_id):
+    payload = self.legacy_get_finding_triage(job_id, finding_id)
     if not isinstance(payload, dict):
       return None
     return FindingTriageState.from_dict(payload)
 
-  def list_job_triage(self, job_id):
+  def legacy_list_job_triage(self, job_id):
     payload = self.owner.chainstore_hgetall(hkey=self._triage_hkey) or {}
     prefix = f"{job_id}:"
     return {
@@ -304,32 +306,32 @@ class JobStateRepository:
       if isinstance(key, str) and key.startswith(prefix) and isinstance(value, dict)
     }
 
-  def list_job_triage_models(self, job_id):
+  def legacy_list_job_triage_models(self, job_id):
     return {
       finding_id: FindingTriageState.from_dict(value)
-      for finding_id, value in self.list_job_triage(job_id).items()
+      for finding_id, value in self.legacy_list_job_triage(job_id).items()
     }
 
-  def put_finding_triage(self, triage):
+  def legacy_put_finding_triage(self, triage):
     if isinstance(triage, FindingTriageState):
       payload = triage.to_dict()
     else:
       payload = FindingTriageState.from_dict(triage).to_dict()
     self.owner.chainstore_hset(
       hkey=self._triage_hkey,
-      key=self.triage_key(payload["job_id"], payload["finding_id"]),
+      key=self.legacy_triage_key(payload["job_id"], payload["finding_id"]),
       value=payload,
     )
     return payload
 
-  def get_finding_triage_audit(self, job_id, finding_id):
+  def legacy_get_finding_triage_audit(self, job_id, finding_id):
     payload = self.owner.chainstore_hget(
       hkey=self._triage_audit_hkey,
-      key=self.triage_key(job_id, finding_id),
+      key=self.legacy_triage_key(job_id, finding_id),
     )
     return payload if isinstance(payload, list) else []
 
-  def list_job_triage_audit(self, job_id):
+  def legacy_list_job_triage_audit(self, job_id):
     payload = self.owner.chainstore_hgetall(hkey=self._triage_audit_hkey) or {}
     prefix = f"{job_id}:"
     return {
@@ -338,13 +340,13 @@ class JobStateRepository:
       if isinstance(key, str) and key.startswith(prefix) and isinstance(value, list)
     }
 
-  def append_finding_triage_audit(self, entry):
+  def legacy_append_finding_triage_audit(self, entry):
     if isinstance(entry, FindingTriageAuditEntry):
       payload = entry.to_dict()
     else:
       payload = FindingTriageAuditEntry.from_dict(entry).to_dict()
-    key = self.triage_key(payload["job_id"], payload["finding_id"])
-    audit_log = list(self.get_finding_triage_audit(payload["job_id"], payload["finding_id"]))
+    key = self.legacy_triage_key(payload["job_id"], payload["finding_id"])
+    audit_log = list(self.legacy_get_finding_triage_audit(payload["job_id"], payload["finding_id"]))
     audit_log.append(payload)
     self.owner.chainstore_hset(hkey=self._triage_audit_hkey, key=key, value=audit_log)
     return audit_log
@@ -401,17 +403,17 @@ class JobStateRepository:
     )
     return audit_log
 
-  def delete_job_triage(self, job_id):
-    for finding_id in list(self.list_job_triage(job_id)):
+  def legacy_delete_job_triage(self, job_id):
+    for finding_id in list(self.legacy_list_job_triage(job_id)):
       self.owner.chainstore_hset(
         hkey=self._triage_hkey,
-        key=self.triage_key(job_id, finding_id),
+        key=self.legacy_triage_key(job_id, finding_id),
         value=None,
       )
-    for finding_id in list(self.list_job_triage_audit(job_id)):
+    for finding_id in list(self.legacy_list_job_triage_audit(job_id)):
       self.owner.chainstore_hset(
         hkey=self._triage_audit_hkey,
-        key=self.triage_key(job_id, finding_id),
+        key=self.legacy_triage_key(job_id, finding_id),
         value=None,
       )
     return

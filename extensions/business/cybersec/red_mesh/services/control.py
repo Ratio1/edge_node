@@ -1,3 +1,4 @@
+import json
 from contextlib import ExitStack
 
 from ..constants import (
@@ -333,7 +334,8 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
       if key.startswith(prefix):
         _job_repo(owner).delete_live_progress(key)
 
-  _job_repo(owner).delete_job_triage(job_id)
+  # Host-scoped triage outlives any one job (report-findings.md §Triage): only legacy job-keyed rows go.
+  _job_repo(owner).legacy_delete_job_triage(job_id)
   _job_repo(owner).delete_job_rulebook_reviews(job_id)
   _job_repo(owner).delete_job_report_review(job_id)
   _delete_job_record(owner, job_id)
@@ -671,6 +673,55 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
         errors.append({"job_id": job_id_prefix or "", "scope": hkey, "message": type(exc).__name__})
     return rows_deleted
 
+  def _host_triage_tenants():
+    """Tenants whose host triage this call may delete: those of the admitted jobs' bindings and, for a
+    whole-node purge only, every tenant the tenancy store names (their jobs may be gone while the records stay)."""
+    tenants = set()
+    for payload in raw_jobs.values():
+      binding = payload.get("execution_binding") if isinstance(payload, dict) else None
+      tenant = binding.get("tenant_id") if isinstance(binding, dict) else None
+      if isinstance(tenant, str) and tenant.strip():
+        tenants.add(tenant)
+    namespace = getattr(owner, "cfg_tenancy_namespace", None)
+    if swept_ids is None and isinstance(namespace, str) and namespace.strip():
+      tenancy_hkey = json.dumps(["redmesh", "tenancy", 1, namespace], separators=(",", ":"))
+      try:
+        rows = owner.chainstore_hgetall(hkey=tenancy_hkey)
+      except Exception as exc:
+        errors.append({"job_id": "", "scope": tenancy_hkey, "message": type(exc).__name__})
+        rows = None
+      for field, value in (rows.items() if isinstance(rows, dict) else ()):
+        try:
+          decoded = json.loads(field)
+        except (TypeError, ValueError):
+          continue
+        if (value is not None and isinstance(decoded, list) and len(decoded) == 3 and decoded[0] == "tenant"
+            and decoded[1] == namespace and isinstance(decoded[2], str)):
+          tenants.add(decoded[2])
+    return tenants
+
+  def _sweep_host_triage():
+    """Whole-purge only: host-scoped records are no job's, so a purge of jobs keeps them; this is the wipe.
+
+    Skipped while any job failed to purge, as the integration status sweep is, so a retry finds them intact.
+    """
+    if jobs_failed or cids_failed:
+      return
+    repo = _job_repo(owner)
+    for tenant in sorted(_host_triage_tenants()):
+      try:
+        hkeys = (repo.host_triage_hkey(tenant), repo.host_triage_audit_hkey(tenant))
+      except ValueError:
+        continue
+      for hkey in hkeys:
+        try:
+          rows = owner.chainstore_hgetall(hkey=hkey)
+          for key, value in list((rows or {}).items()):
+            if value is not None:
+              owner.chainstore_hset(hkey=hkey, key=key, value=None)
+        except Exception as exc:
+          errors.append({"job_id": "", "scope": hkey, "message": type(exc).__name__})
+
   def _sweep_submission_hash():
     nonlocal cids_deleted, cids_failed
 
@@ -811,6 +862,7 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
   _sweep_hash(live_hkey, dict)
   _sweep_hash(triage_hkey, dict)
   _sweep_hash(triage_audit_hkey, list)
+  _sweep_host_triage()
   _sweep_hash(rulebook_review_hkey, dict)
   _sweep_hash(rulebook_review_audit_hkey, list)
   _sweep_submission_hash()

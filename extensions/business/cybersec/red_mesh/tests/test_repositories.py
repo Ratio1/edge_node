@@ -247,9 +247,9 @@ class TestJobStateRepository(unittest.TestCase):
     ]
     repo = JobStateRepository(owner)
 
-    triage = repo.get_finding_triage_model("job-1", "f-1")
-    audit = repo.get_finding_triage_audit("job-1", "f-1")
-    repo.delete_job_triage("job-1")
+    triage = repo.legacy_get_finding_triage_model("job-1", "f-1")
+    audit = repo.legacy_get_finding_triage_audit("job-1", "f-1")
+    repo.legacy_delete_job_triage("job-1")
 
     self.assertEqual(triage.status, "accepted_risk")
     self.assertEqual(audit[0]["finding_id"], "f-1")
