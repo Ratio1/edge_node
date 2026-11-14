@@ -24,8 +24,9 @@ class VulndbFetchTests(unittest.TestCase):
         self.make_db(self.db)
         self.pin = {
             "schema": 1, "repo": vv.REPO, "build_id": BUILD_ID, "asset": vv.ASSET,
-            "sha256": "a" * 64, "sha256_sqlite": hashlib.sha256(self.db.read_bytes()).hexdigest(),
+            "sha256": "a" * 64, "size": 1, "size_zst": 1, "sha256_sqlite": hashlib.sha256(self.db.read_bytes()).hexdigest(),
         }
+        self.pin["size"] = self.db.stat().st_size
 
     @staticmethod
     def make_db(path, model=1, build_id=BUILD_ID):
@@ -49,7 +50,7 @@ class VulndbFetchTests(unittest.TestCase):
 
     def test_pin_fields_are_validated(self):
         for change in ({"repo": "evil/repo"}, {"asset": "../x"}, {"build_id": "v1; rm -rf /"},
-                       {"sha256": "zz"}, {"schema": 2}, {"origin": "local"}):
+                       {"sha256": "zz"}, {"size": 0}, {"size_zst": "9"}, {"size": True}, {"schema": 2}, {"origin": "local"}):
             with self.assertRaises(ValueError, msg=str(change)):
                 vv.load_pin(self.write_pin(**change))
 
@@ -57,6 +58,8 @@ class VulndbFetchTests(unittest.TestCase):
         pin = vv.load_pin(self.write_pin())
         with self.assertRaisesRegex(ValueError, "sha256_sqlite"):
             vv.verify_sqlite(dict(pin, sha256_sqlite="b" * 64), self.db, supported=(1,))
+        with self.assertRaisesRegex(ValueError, "size"):
+            vv.verify_sqlite(dict(pin, size=pin["size"] + 1), self.db, supported=(1,))
         with self.assertRaisesRegex(ValueError, "MODEL"):
             vv.verify_sqlite(pin, self.db, supported=(2,))
         with self.assertRaisesRegex(ValueError, "build_id"):
@@ -78,7 +81,12 @@ class VulndbFetchTests(unittest.TestCase):
         for name, jobs in (("build_develop.yml", 4), ("build_main.yml", 2)):
             text = (ROOT / ".github/workflows" / name).read_text()
             self.assertEqual(text.count("uses: ./.github/actions/fetch-vulndb"), jobs)
-        self.assertFalse((ROOT / "extensions/business/cybersec/red_mesh/vulndb/pin.json").exists())
+
+    def test_action_skips_when_no_pin(self):
+        text = (ROOT / ".github/actions/fetch-vulndb/action.yml").read_text()
+        self.assertIn('if [ ! -f "$pin" ]', text)
+        self.assertIn("present=false", text)
+        self.assertEqual(text.count("if: steps.pin.outputs.present == 'true'"), 3)
 
 
 if __name__ == "__main__":

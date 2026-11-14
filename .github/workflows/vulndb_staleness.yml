@@ -30,10 +30,11 @@ jobs:
           else
             tag=${latest%% *}
             published=${latest##* }
-            age_days=$(( (now - $(date -d "$published" +%s)) / 86400 ))
+            age=$(( now - $(date -d "$published" +%s) ))
+            age_days=$(( age / 86400 ))
             summary="Latest release ${tag}, published ${published} (${age_days} days ago)."
             stale=false
-            if [ "$age_days" -gt 8 ]; then stale=true; fi
+            if [ "$age" -gt $(( 8 * 86400 )) ]; then stale=true; fi
           fi
           echo "$summary"
           last_commit=$(gh api "repos/${VULNDB_REPO}/commits/main" --jq '.commit.committer.date')

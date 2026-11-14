@@ -18,6 +18,8 @@ jobs:
   mainnet-cpu:
     name: Build mainnet CPU
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # pushes the version tag
     steps:
       - uses: actions/checkout@v4
 
