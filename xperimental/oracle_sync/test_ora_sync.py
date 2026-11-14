@@ -13,7 +13,6 @@ import json
 import os
 import pickle
 import sys
-import tempfile
 import types
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -167,14 +166,44 @@ class FakeR1FS:
     self._store[cid] = obj
     return cid
 
-  def get_file(self, cid, show_logs=True):
+  def get_pickle(self, cid, show_logs=True, raise_on_error=False):
+    """
+    Serve the object stored under a CID as the SDK's get_pickle loads it: a copy of its own.
+
+    Oracle sync fetches and loads a file named by a CID through ``r1fs.get_pickle`` with
+    ``raise_on_error=True``; this fake keeps the objects in memory instead of files. The SDK's
+    restricted loader is not run here (``test_ora_sync_r1fs_guard.py`` runs it).
+
+    Parameters
+    ----------
+    cid : str
+      The CID of a stored object.
+    show_logs : bool, optional
+      Ignored.
+    raise_on_error : bool, optional
+      Ignored: a failed fetch always raises, as the SDK's get_pickle does when oracle sync passes True.
+
+    Returns
+    -------
+    Any
+      A copy of the stored object.
+
+    Raises
+    ------
+    FileNotFoundError
+      When ``fail_get`` is set or the CID was never stored.
+
+    Examples
+    --------
+    >>> r1fs = FakeR1FS()
+    >>> r1fs.get_pickle(r1fs.add_pickle({"b": 2}))
+    {'b': 2}
+    """
     if self.fail_get or cid not in self._store:
+      # A failed fetch raises, as the SDK's get_pickle does with raise_on_error=True.
       raise FileNotFoundError(cid)
-    fd, path = tempfile.mkstemp(prefix="fake_r1fs_", suffix=".pkl")
-    os.close(fd)
-    with open(path, "wb") as f:
-      pickle.dump(self._store[cid], f)
-    return path
+    # A round trip through pickle gives the caller its own copy, as a load from a file does.
+    return pickle.loads(pickle.dumps(self._store[cid]))
 
 
 class FakeEpochManager:
@@ -385,6 +414,24 @@ class OracleHarness:
   use_r1fs_during_consensus: bool = False
 
   def build(self):
+    """
+    Build one oracle-sync plugin over the fakes of this harness.
+
+    The plugin gets the fake clock, R1FS, blockchain and network monitor, the harness's R1FS
+    settings, and a payload hook that broadcasts on the message bus when there is one; then its
+    ``on_init`` runs.
+
+    Returns
+    -------
+    OracleSync01Plugin
+      The initialized plugin.
+
+    Examples
+    --------
+    >>> clock = FakeClock()
+    >>> OracleHarness("oracle_a", ["oracle_a"], FakeEpochManager(clock), clock).build().node_addr
+    'oracle_a'
+    """
     oracle = OracleSync01Plugin()
     oracle._name__ = "oracle_sync_test"
     oracle.node_addr = self.node_addr
@@ -396,8 +443,6 @@ class OracleHarness:
     oracle.defaultdict = defaultdict
     oracle.json_dumps = _json_dumps
     oracle.deepcopy = lambda d: json.loads(json.dumps(d))
-    oracle.os_path = os.path
-    oracle.diskapi_load_pickle_from_output = lambda filename: pickle.load(open(filename, "rb"))
     oracle.get_hash = _get_hash
     oracle.np = _get_numpy_like()
     oracle.trace_info = lambda: "trace"
