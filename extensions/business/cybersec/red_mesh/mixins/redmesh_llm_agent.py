@@ -15,7 +15,7 @@ from typing import Optional
 
 from ..constants import RUN_MODE_SINGLEPASS
 from ..credential_redaction import redact_credential_text
-from ..cve_view import filter_listed
+from ..cve_view import build_cve_view, filter_listed, summarize_view
 from ..models.finding_schema import is_coverage_result as _is_coverage_result
 from ..services.config import get_llm_agent_config
 from ..services.resilience import run_bounded_retry
@@ -608,11 +608,18 @@ class _RedMeshLlmAgentMixin(object):
         break
     return compact, {
       "total_findings": total_findings,
+      # Under generated this counts the listed CVE findings after dedup, not every CVE record.
       "deduplicated_findings": len(deduped),
       "included_findings": len(compact),
       "included_by_severity": included_by_severity,
       "truncated_findings_count": max(len(deduped) - len(compact), 0),
     }
+
+  def _llm_cve_view(self, aggregated_report: dict):
+    """The RM-169 CVE view of the deduplicated findings, or None (`static`: no generated CVE finding)."""
+    findings = [f for f in self._deduplicate_findings(self._extract_report_findings(aggregated_report))
+                if not _is_coverage_result(f)]
+    return build_cve_view(findings, (aggregated_report.get("cves_not_applicable") or {}).values())
 
   def _build_llm_findings_summary(self, aggregated_report: dict) -> dict:
     findings = self._deduplicate_findings(self._extract_report_findings(aggregated_report))
@@ -621,10 +628,14 @@ class _RedMeshLlmAgentMixin(object):
     for finding in real_findings:
       severity = str(finding.get("severity") or "UNKNOWN").upper()
       counts[severity] = counts.get(severity, 0) + 1
-    return {
+    summary = {
       "total_findings": len(real_findings),
-      "by_severity": counts,
+      "by_severity": counts,  # raw: every record; the view counts sit beside it under generated
     }
+    view = self._llm_cve_view(aggregated_report)
+    if view:
+      summary["cve_view_counts"] = dict(view["counts"])
+    return summary
 
   def _build_llm_coverage_summary(self, aggregated_report: dict, analysis_type: str) -> dict:
     open_ports = aggregated_report.get("open_ports") or []
@@ -825,6 +836,7 @@ class _RedMeshLlmAgentMixin(object):
       services, service_meta = self._build_network_service_summary(aggregated_report, analysis_type)
       top_findings, finding_meta = self._build_llm_top_findings(aggregated_report, analysis_type)
       findings_summary = self._build_llm_findings_summary(aggregated_report)
+      cve_view = self._llm_cve_view(aggregated_report)
       return {
         "metadata": self._build_llm_metadata(job_id, target, scan_type, job_config),
         "stats": {
@@ -838,6 +850,8 @@ class _RedMeshLlmAgentMixin(object):
         },
         "services": services,
         "top_findings": top_findings,
+        # RM-169, generated CVE findings only: counts, rollups and the possible summary; absent under `static`.
+        **({"cve_view": summarize_view(cve_view)} if cve_view else {}),
         "coverage": self._build_llm_coverage_summary(aggregated_report, analysis_type),
         "attack_surface": self._build_attack_surface_summary(services, findings_summary),
         "truncation": {
