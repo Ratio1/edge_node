@@ -329,3 +329,30 @@ class TestLiveSmoke(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestNvdPrimarySourcePick(unittest.TestCase):
+  """The NVD fetcher takes the Primary (NVD) metric, not whichever entry comes first."""
+
+  def test_primary_metric_wins_over_a_secondary_listed_first(self):
+    cache = DynamicReferenceCache(sqlite_path=":memory:")
+    self.addCleanup(cache.close)
+    secondary = {"source": "cna@example.org", "type": "Secondary",
+                 "cvssData": {"version": "3.1", "baseScore": 5.3, "baseSeverity": "MEDIUM",
+                              "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"}}
+    primary = {"source": "nvd@nist.gov", "type": "Primary",
+               "cvssData": {"version": "3.1", "baseScore": 9.8, "baseSeverity": "CRITICAL",
+                            "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}}
+    payload = {"vulnerabilities": [{"cve": {"metrics": {"cvssMetricV31": [secondary, primary]}}}]}
+    cache._http_get_json = lambda url: payload
+    rec = cache._fetch_cvss_from_nvd("CVE-2099-0001")
+    self.assertEqual(rec.score, 9.8)
+    self.assertEqual(rec.severity, "CRITICAL")
+
+  def test_first_entry_when_no_primary(self):
+    cache = DynamicReferenceCache(sqlite_path=":memory:")
+    self.addCleanup(cache.close)
+    only = {"source": "cna@example.org", "type": "Secondary",
+            "cvssData": {"version": "3.1", "baseScore": 5.3, "baseSeverity": "MEDIUM", "vectorString": "v"}}
+    cache._http_get_json = lambda url: {"vulnerabilities": [{"cve": {"metrics": {"cvssMetricV31": [only]}}}]}
+    self.assertEqual(cache._fetch_cvss_from_nvd("CVE-2099-0002").score, 5.3)
