@@ -225,7 +225,11 @@ def build_llm_input(
   # RM-169, generated CVE findings: the listed ones go in `findings`; the view's counts, rollups and possible
   # summary go in `scan_summary`. None under `static`.
   not_applicable = ((aggregated_report or {}).get("cves_not_applicable") or {}).values()
-  cve_view = build_cve_view(real_findings, not_applicable)
+  # The caller stamps the live host triage record on a finding (`apply_triage`) before it comes here; the
+  # stored report findings carry none.
+  triage = {f["finding_id"]: f["triage"] for f in real_findings
+            if isinstance(f.get("triage"), dict) and f.get("finding_id")}
+  cve_view = build_cve_view(real_findings, not_applicable, triage)
   real_findings = filter_listed(real_findings, view=cve_view)
   real_findings.sort(key=_key)
   truncated = real_findings[:max_findings]

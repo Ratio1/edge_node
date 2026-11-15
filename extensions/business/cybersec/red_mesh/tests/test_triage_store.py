@@ -31,6 +31,9 @@ class _Store:
   def chainstore_hgetall(self, hkey):
     return dict(self.hashes.get(hkey, {}))
 
+  def chainstore_hkeys(self, hkey):
+    return list(self.hashes.get(hkey, {}))
+
 
 def state(tenant, host, finding="f1", job="job-1", status="false_positive"):
   return FindingTriageState(job_id=job, finding_id=finding, status=status, tenant_id=tenant, host=host)
@@ -47,6 +50,8 @@ class TestHostTriageStore(unittest.TestCase):
       job_id="job-1", finding_id="f1", status="open", tenant_id=TENANT_A, host="192.0.2.10"))
     self.assertEqual(set(self.owner.hashes), {f"inst:triage:t:{TENANT_A}", f"inst:triage:audit:{TENANT_A}"})
     self.assertIn("192.0.2.10\x1ff1", self.owner.hashes[f"inst:triage:t:{TENANT_A}"])
+    (audit_field,) = self.owner.hashes[f"inst:triage:audit:{TENANT_A}"]
+    self.assertRegex(audit_field, r"\A192\.0\.2\.10\x1ff1\x1f\d{15}-[0-9a-f]{8}\Z")
     # a tenant literally named `audit` cannot reach the audit hkey, nor the legacy ones
     hkey = self.repo.host_triage_hkey("audit")
     self.assertEqual(hkey, "inst:triage:t:audit")
@@ -67,13 +72,51 @@ class TestHostTriageStore(unittest.TestCase):
     self.repo.put_host_triage(state(TENANT_A, "a.example.org", finding="y"))
     self.assertEqual(set(self.repo.list_host_triage(TENANT_A, "a.example")), {"x"})
 
-  def test_audit_appends(self):
-    for status in ("open", "remediated"):
-      log = self.repo.append_host_triage_audit(FindingTriageAuditEntry(
-        job_id="job-1", finding_id="f1", status=status, tenant_id=TENANT_A, host="h"))
-    self.assertEqual([e["status"] for e in log], ["open", "remediated"])
-    self.assertEqual(len(self.repo.get_host_triage_audit(TENANT_A, "h", "f1")), 2)
+  def test_audit_appends_one_field_per_entry_and_reads_back_in_time_order(self):
+    for stamp, status in ((2.0, "remediated"), (1.0, "open"), (3.0, "false_positive")):
+      stored = self.repo.append_host_triage_audit(FindingTriageAuditEntry(
+        job_id="job-1", finding_id="f1", status=status, timestamp=stamp, tenant_id=TENANT_A, host="h"))
+      self.assertEqual(stored["status"], status)
+    self.assertEqual(len(self.owner.hashes[f"inst:triage:audit:{TENANT_A}"]), 3)
+    self.assertEqual([e["status"] for e in self.repo.get_host_triage_audit(TENANT_A, "h", "f1")],
+                     ["open", "remediated", "false_positive"])
     self.assertEqual(self.repo.get_host_triage_audit(TENANT_B, "h", "f1"), [])
+    self.assertEqual(self.repo.get_host_triage_audit(TENANT_A, "h", "f2"), [])
+
+  def test_an_append_never_rewrites_an_entry_another_node_wrote(self):
+    first = FindingTriageAuditEntry(job_id="job-1", finding_id="f1", status="open", timestamp=1.0,
+                                    tenant_id=TENANT_A, host="h")
+    self.repo.append_host_triage_audit(first)
+    (field,) = self.owner.hashes[f"inst:triage:audit:{TENANT_A}"]
+    writes = []
+    real = self.owner.chainstore_hset
+    self.owner.chainstore_hset = lambda hkey, key, value: (writes.append(key), real(hkey, key, value))
+    self.repo.append_host_triage_audit(FindingTriageAuditEntry(
+      job_id="job-2", finding_id="f1", status="remediated", timestamp=2.0, tenant_id=TENANT_A, host="h"))
+    self.assertEqual(len(writes), 1)
+    self.assertNotIn(field, writes)
+
+  def test_audit_keeps_the_newest_50_per_host_and_finding_only(self):
+    for n in range(60):
+      self.repo.append_host_triage_audit(FindingTriageAuditEntry(
+        job_id="job-1", finding_id="f1", status="open", note=str(n), timestamp=float(n), tenant_id=TENANT_A,
+        host="h"))
+    self.repo.append_host_triage_audit(FindingTriageAuditEntry(
+      job_id="job-1", finding_id="f2", status="open", timestamp=1.0, tenant_id=TENANT_A, host="h"))
+    log = self.repo.get_host_triage_audit(TENANT_A, "h", "f1")
+    self.assertEqual([e["note"] for e in log], [str(n) for n in range(10, 60)])
+    live = [k for k, v in self.owner.hashes[f"inst:triage:audit:{TENANT_A}"].items() if v is not None]
+    self.assertEqual(len(live), 51)  # 50 of f1 and the one of f2
+
+  def test_a_failed_prune_does_not_lose_the_entry(self):
+    real = self.owner.chainstore_hkeys
+    def broken(hkey):
+      raise RuntimeError("down")
+    self.owner.chainstore_hkeys = broken
+    self.repo.append_host_triage_audit(FindingTriageAuditEntry(
+      job_id="job-1", finding_id="f1", status="open", tenant_id=TENANT_A, host="h"))
+    self.owner.chainstore_hkeys = real
+    self.assertEqual(len(self.repo.get_host_triage_audit(TENANT_A, "h", "f1")), 1)
 
   def test_unscoped_or_separator_input_is_refused(self):
     with self.assertRaises(ValueError):

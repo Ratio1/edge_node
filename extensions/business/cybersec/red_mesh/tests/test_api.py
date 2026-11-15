@@ -5373,13 +5373,14 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin.chainstore_hgetall.side_effect = lambda hkey: (
       {"fin-job": stub} if hkey == "test-instance" else {k: v for (h, k), v in rows.items() if h == hkey})
     plugin.chainstore_hset.side_effect = lambda hkey, key, value: rows.__setitem__((hkey, key), value)
+    plugin.chainstore_hkeys.side_effect = lambda hkey: [k for (h, k) in rows if h == hkey]
 
     result = update_finding_triage(plugin, "fin-job", "f-1", "accepted_risk", note="Approved by analyst",
                                    actor="alice", review_at=456.0)
 
     member = result["results"][0]
     self.assertEqual(member["triage"]["status"], "accepted_risk")
-    self.assertEqual(member["audit"][-1]["actor"], "alice")
+    self.assertEqual(member["audit"]["actor"], "alice")
     hkey = f"test-instance:triage:t:{binding['tenant_id']}"
     self.assertEqual(rows[(hkey, "192.0.2.10\x1ff-1")]["review_at"], 456.0)
     plugin._log_audit_event.assert_called_once()

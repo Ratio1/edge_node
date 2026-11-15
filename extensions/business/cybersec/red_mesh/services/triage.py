@@ -1,7 +1,8 @@
+import time
 from copy import deepcopy
 from contextlib import ExitStack
 
-from ..cve_view import apply_triage
+from ..cve_view import apply_triage, effective_status
 from ..model_testing.artifacts import ModelTestArchive
 from ..model_testing.constants import is_model_test_job
 from ..models import FindingTriageAuditEntry, FindingTriageState, JobArchive, VALID_TRIAGE_STATUSES
@@ -12,6 +13,7 @@ from ..tenancy.job_artifacts import (
 )
 from ..tenancy.execution import triage_scope
 from ..tenancy.ports import TenantStoreError
+from ..tenancy.tenant_assets import NOTES_MAX
 from .event_hooks import emit_finding_event
 
 _UNSET = object()
@@ -126,6 +128,15 @@ def _checked_triage_map(owner, job, archive, finding_id=""):
     raise TenantStoreError("Tenant finding state is unavailable") from None
 
 
+def _with_effective_status(owner, triage_map):
+  """Each record with `effective_status` beside the stored `status`: an `accepted_risk` past its `review_at`
+  reads `reopened`, so a reader does not re-implement the expiry. A read-time copy, never stored."""
+  clock = getattr(owner, "time", None)
+  now = clock() if callable(clock) else time.time()
+  return {finding_id: {**record, "effective_status": effective_status(record, now)}
+          for finding_id, record in triage_map.items()}
+
+
 def get_job_triage(owner, job_id: str, finding_id: str = "", *, checked_job=_UNSET, snapshot_mode="tenant_bound"):
   validate_snapshot_mode(snapshot_mode, snapshot_supplied=checked_job is not _UNSET)
   if checked_job is not _UNSET:
@@ -138,7 +149,7 @@ def get_job_triage(owner, job_id: str, finding_id: str = "", *, checked_job=_UNS
         raise AdministrationDenied(404, "not_found")
       triage_map = {}
     else:
-      triage_map = _checked_triage_map(owner, job, archive, finding_id)
+      triage_map = _with_effective_status(owner, _checked_triage_map(owner, job, archive, finding_id))
     result = {"job_id": job_id}
     if snapshot_mode == "tenant_bound":
       result["execution_binding"] = job["execution_binding"]
@@ -149,7 +160,7 @@ def get_job_triage(owner, job_id: str, finding_id: str = "", *, checked_job=_UNS
       result["triage"] = triage_map
     return result
   record = owner._get_job_from_cstore(job_id)
-  triage_map = _job_repo(owner).list_triage_for_record(record)
+  triage_map = _with_effective_status(owner, _job_repo(owner).list_triage_for_record(record))
   if finding_id:
     state = triage_map.get(finding_id)
     scope = triage_scope(record.get("execution_binding")) if isinstance(record, dict) and record.get("execution_binding") else None
@@ -198,6 +209,18 @@ def update_finding_triage(owner, job_id: str, finding_ids, status: str, note: st
   if (not isinstance(ids, (list, tuple)) or not ids or len(ids) > MAX_TRIAGE_FINDINGS
       or any(not isinstance(item, str) or not item.strip() or "\x1f" in item for item in ids)):
     return _error("validation_error", "finding_ids must be 1 to %d finding ids." % MAX_TRIAGE_FINDINGS)
+  if not isinstance(note, str) or len(note) > NOTES_MAX:
+    return _error("validation_error", "note must be text of at most %d characters." % NOTES_MAX)
+  if status not in VALID_TRIAGE_STATUSES:
+    return _error("validation_error",
+                  f"Unsupported triage status: {status}. Allowed: {sorted(VALID_TRIAGE_STATUSES)}")
+  if status == "accepted_risk":
+    if type(review_at) not in (int, float) or review_at <= owner.time():
+      return _error("validation_error", "accepted_risk requires review_at, a future time (epoch seconds).")
+  else:
+    review_at = 0
+  if confirm and status != "open":
+    return _error("validation_error", "A confirmation is recorded with status open.")
   ids = list(dict.fromkeys(ids))
   job = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
   if not isinstance(job, dict) or not job:
@@ -229,17 +252,7 @@ def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, 
                                   checked, ledger):
   from ..tenancy.effects import EffectState
 
-  if status not in VALID_TRIAGE_STATUSES:
-    return _error("validation_error",
-                  f"Unsupported triage status: {status}. Allowed: {sorted(VALID_TRIAGE_STATUSES)}")
   now = owner.time()
-  if status == "accepted_risk":
-    if type(review_at) not in (int, float) or review_at <= now:
-      return _error("validation_error", "accepted_risk requires review_at, a future time (epoch seconds).")
-  else:
-    review_at = 0
-  if confirm and status != "open":
-    return _error("validation_error", "A confirmation is recorded with status open.")
   if is_model_test_job(job):
     return _error("model_test_not_supported", "Model-test jobs have no finding triage.", job_id=job_id)
   if scope is None:
@@ -271,9 +284,14 @@ def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, 
       results.append({"finding_id": finding_id, "outcome": "not_tentative"})
       continue
     stored = repo.get_host_triage(tenant_id, host, finding_id)
+    # A write keeps an earlier confirmation unless it is a new one or the finding is dismissed as a false positive.
+    kept = isinstance(stored, dict) and stored.get("confirmed") is True and status != "false_positive"
+    confirmed = True if confirm or kept else None
+    confirmed_by = stored.get("confirmed_by") if kept else ((actor or "") if confirm else None)
     same = (isinstance(stored, dict) and stored.get("status") == status and stored.get("note", "") == (note or "")
             and stored.get("review_at") == (review_at or None)
-            and bool(stored.get("confirmed")) == bool(confirm))
+            and bool(stored.get("confirmed")) == bool(confirmed)
+            and (not confirmed or stored.get("confirmed_by") == confirmed_by))
     if same:
       results.append({"finding_id": finding_id, "outcome": "unchanged", "triage": deepcopy(stored)})
       continue
@@ -282,7 +300,7 @@ def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, 
     state_payload = repo.put_host_triage(FindingTriageState(
       job_id=job_id, finding_id=finding_id, status=status, note=note or "", actor=actor or "", updated_at=now,
       review_at=review_at or None, tenant_id=tenant_id, host=host,
-      confirmed=True if confirm else None, confirmed_by=(actor or "") if confirm else None))
+      confirmed=confirmed, confirmed_by=confirmed_by))
     if ledger is not None:
       ledger.record(EffectState.PERSISTED)
     audit_payload = repo.append_host_triage_audit(FindingTriageAuditEntry(
@@ -320,7 +338,8 @@ def get_job_archive_with_triage(owner, job_id: str, *, checked_job=_UNSET, snaps
     try:
       model = ModelTestArchive if is_model_test_job(job) else JobArchive
       archive = model.from_dict(payload).to_dict()
-      triage_map = {} if is_model_test_job(job) else _checked_triage_map(owner, job, payload)
+      triage_map = {} if is_model_test_job(job) else _with_effective_status(
+        owner, _checked_triage_map(owner, job, payload))
       return {**result, "archive": _merge_triage_into_archive_dict(archive, triage_map), "triage": triage_map}
     except Exception:
       raise TenantStoreError("Tenant archive is unavailable") from None
@@ -377,7 +396,7 @@ def get_job_archive_with_triage(owner, job_id: str, *, checked_job=_UNSET, snaps
 
   archived_ids = {finding.get("finding_id") for pass_report in archive.get("passes", []) or []
                   for finding in pass_report.get("findings", []) or [] if isinstance(finding, dict)}
-  triage_map = {key: value for key, value in _job_repo(owner).list_triage_for_record(job_specs).items()
-                if key in archived_ids}
+  triage_map = _with_effective_status(owner, {
+    key: value for key, value in _job_repo(owner).list_triage_for_record(job_specs).items() if key in archived_ids})
   merged_archive = _merge_triage_into_archive_dict(archive, triage_map)
   return {"job_id": job_id, "archive": merged_archive, "triage": triage_map}

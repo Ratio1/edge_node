@@ -62,26 +62,31 @@ class TestRiskWalkWithHostTriage(unittest.TestCase):
     after, flat = compute(findings, {"id0001": {"status": "open", "confirmed": True, "confirmed_by": "a"}})
     self.assertGreater(after["findings_score"], 0)
     self.assertEqual((after["finding_counts"]["CRITICAL"], after["cve_view_counts"]["possible"]), (1, 0))
-    self.assertEqual((flat[0]["confidence"], flat[0]["confidence_reason"], flat[0]["verified_by"]),
-                     ("certain", "triage_confirmed", "a"))
+    # the stored list is not stamped: a confirmed possible finding reads certain only through the live map
+    self.assertEqual((flat[0]["confidence"], flat[0]["confidence_reason"]), ("tentative", "banner_only"))
+    self.assertNotIn("triage", flat[0])
 
-  def test_a_closed_member_leaves_the_score_and_every_finding_carries_its_triage(self):
+  def test_a_closed_member_leaves_the_score_and_no_stored_finding_carries_triage(self):
     findings = [raw(1, "CRITICAL", kev=True), raw(2, "HIGH")]
     base, _ = compute(findings)
     closed, flat = compute(findings, {"id0002": {"status": "false_positive", "actor": "a"}})
     self.assertLess(closed["findings_score"], base["findings_score"])
     self.assertEqual(closed["cve_view_counts"]["closed"], 1)
     by_id = {f["finding_id"]: f for f in flat}
-    self.assertEqual(by_id["id0002"]["triage"]["status"], "false_positive")  # exports keep a closed CVE, with triage
-    self.assertNotIn("triage", by_id["id0001"])
+    # the persisted list keeps a closed CVE (exports see it) but no triage record: R1FS is immutable
+    self.assertIn("id0002", by_id)
+    self.assertTrue(all("triage" not in f for f in flat))
 
-  def test_closed_findings_in_the_flat_list_leave_a_later_view_without_the_map(self):
-    # What `with_cve_views`, `filter_listed` and the LLM input see: the embedded record alone closes the member.
-    _, flat = compute([raw(1, "CRITICAL", kev=True), raw(2, "HIGH", kev=True)],
-                      {"id0002": {"status": "remediated"}})
-    view = build_cve_view(flat)
-    self.assertEqual((view["counts"]["closed"], view["services"][0]["listed"]), (1, ["id0001"]))
-    conserved(self, view)
+  def test_a_removed_record_does_not_read_closed_from_a_copy_embedded_on_the_finding(self):
+    findings = [raw(1, "CRITICAL", kev=True), raw(2, "HIGH", kev=True)]
+    _, flat = compute(findings, {"id0002": {"status": "remediated"}})
+    view = build_cve_view(flat)  # no map: nothing is closed, whatever a finding carries
+    self.assertEqual((view["counts"]["closed"], view["services"][0]["listed"]), (0, ["id0001", "id0002"]))
+    stamped = [{**f, "triage": {"status": "remediated"}} for f in flat]
+    self.assertEqual(build_cve_view(stamped)["counts"]["closed"], 0)
+    closed = build_cve_view(flat, triage={"id0002": {"status": "remediated"}})
+    self.assertEqual((closed["counts"]["closed"], closed["services"][0]["listed"]), (1, ["id0001"]))
+    conserved(self, closed)
 
 
 class TestArchiveMerge(unittest.TestCase):
@@ -100,8 +105,20 @@ class TestArchiveMerge(unittest.TestCase):
     self.assertEqual(second["triage"]["status"], "remediated")
     self.assertEqual(merged["ui_aggregate"]["top_findings"][0]["triage"]["status"], "remediated")
     # the view built from the merged archive closes the remediated member and lists the confirmed one
-    view = build_cve_view(merged["passes"][0]["findings"])
+    view = build_cve_view(merged["passes"][0]["findings"], triage={"id0002": {"status": "remediated"}})
     self.assertEqual(view["counts"]["closed"], 1)
+
+
+class TestArchiveReadUsesTheLiveMap(unittest.TestCase):
+  def test_with_cve_views_closes_members_from_the_map_not_from_the_findings(self):
+    from extensions.business.cybersec.red_mesh.services.query import with_cve_views
+    archive = {"passes": [{"findings": [raw(1, "CRITICAL", kev=True), raw(2, "HIGH", kev=True)]}]}
+    self.assertEqual(with_cve_views(archive)["passes"][0]["cve_view"]["counts"]["closed"], 0)
+    live = with_cve_views(archive, {"id0002": {"status": "remediated"}})
+    self.assertEqual(live["passes"][0]["cve_view"]["counts"]["closed"], 1)
+    embedded = {"passes": [{"findings": [raw(1, "CRITICAL", kev=True),
+                                         {**raw(2, "HIGH", kev=True), "triage": {"status": "remediated"}}]}]}
+    self.assertEqual(with_cve_views(embedded)["passes"][0]["cve_view"]["counts"]["closed"], 0)
 
 
 class TestFinalizationReadsHostTriage(unittest.TestCase):
@@ -135,9 +152,9 @@ class TestFinalizationReadsHostTriage(unittest.TestCase):
                                      "deployment:triage:t:tn_other": {"192.0.2.10\x1ff2": record}})
     self.assertEqual(seen, [{"f1": record}])
 
-  def test_without_triage_the_compute_is_called_as_before(self):
+  def test_without_triage_the_compute_gets_an_empty_map(self):
     seen, _ = self.run_finalization({})
-    self.assertEqual(seen, [None])
+    self.assertEqual(seen, [{}])  # always passed, empty when the host has none
 
 
 if __name__ == "__main__":

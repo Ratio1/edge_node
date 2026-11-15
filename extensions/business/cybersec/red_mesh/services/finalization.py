@@ -17,6 +17,7 @@ from ..constants import (
   RUN_MODE_SINGLEPASS,
 )
 from ..credential_redaction import redact_credential_text
+from ..cve_view import apply_triage
 from ..models import (
   AggregatedScanData,
   PassReport,
@@ -544,6 +545,7 @@ def maybe_finalize_pass(owner):
 
       risk_score = 0
       flat_findings = []
+      host_triage = {}
       risk_result = None
       abort_state = _pass_abort_state(aggregated, node_reports)
       empty_abort = bool(abort_state and abort_state["empty"])
@@ -555,8 +557,7 @@ def maybe_finalize_pass(owner):
         except Exception as exc:
           owner.P(f"[FINALIZE] {job_id} host triage unavailable: {type(exc).__name__}", color='y')
           host_triage = {}
-        risk_result, flat_findings = owner._compute_risk_and_findings(
-          *((aggregated, host_triage) if host_triage else (aggregated,)))
+        risk_result, flat_findings = owner._compute_risk_and_findings(aggregated, host_triage)
         risk_score = risk_result["score"]
         if empty_abort:
           # Nothing was tested, so there is nothing to score. The flat findings
@@ -609,7 +610,7 @@ def maybe_finalize_pass(owner):
             future = executor.submit(
               owner._run_structured_report_sections,
               job_id=job_id,
-              findings=flat_findings,
+              findings=apply_triage(flat_findings, host_triage),  # stamped for the analysis only
               aggregated_report=aggregated,
               engagement=(
                 job_config.get("engagement")

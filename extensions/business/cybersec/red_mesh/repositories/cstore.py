@@ -1,3 +1,5 @@
+import secrets
+
 from ..models import (
   CStoreJobFinalized,
   CStoreJobRunning,
@@ -285,18 +287,6 @@ class JobStateRepository:
   def legacy_triage_key(job_id, finding_id):
     return f"{job_id}:{finding_id}"
 
-  def legacy_get_finding_triage(self, job_id, finding_id):
-    return self.owner.chainstore_hget(
-      hkey=self._triage_hkey,
-      key=self.legacy_triage_key(job_id, finding_id),
-    )
-
-  def legacy_get_finding_triage_model(self, job_id, finding_id):
-    payload = self.legacy_get_finding_triage(job_id, finding_id)
-    if not isinstance(payload, dict):
-      return None
-    return FindingTriageState.from_dict(payload)
-
   def legacy_list_job_triage(self, job_id):
     payload = self.owner.chainstore_hgetall(hkey=self._triage_hkey) or {}
     prefix = f"{job_id}:"
@@ -306,31 +296,6 @@ class JobStateRepository:
       if isinstance(key, str) and key.startswith(prefix) and isinstance(value, dict)
     }
 
-  def legacy_list_job_triage_models(self, job_id):
-    return {
-      finding_id: FindingTriageState.from_dict(value)
-      for finding_id, value in self.legacy_list_job_triage(job_id).items()
-    }
-
-  def legacy_put_finding_triage(self, triage):
-    if isinstance(triage, FindingTriageState):
-      payload = triage.to_dict()
-    else:
-      payload = FindingTriageState.from_dict(triage).to_dict()
-    self.owner.chainstore_hset(
-      hkey=self._triage_hkey,
-      key=self.legacy_triage_key(payload["job_id"], payload["finding_id"]),
-      value=payload,
-    )
-    return payload
-
-  def legacy_get_finding_triage_audit(self, job_id, finding_id):
-    payload = self.owner.chainstore_hget(
-      hkey=self._triage_audit_hkey,
-      key=self.legacy_triage_key(job_id, finding_id),
-    )
-    return payload if isinstance(payload, list) else []
-
   def legacy_list_job_triage_audit(self, job_id):
     payload = self.owner.chainstore_hgetall(hkey=self._triage_audit_hkey) or {}
     prefix = f"{job_id}:"
@@ -339,17 +304,6 @@ class JobStateRepository:
       for key, value in payload.items()
       if isinstance(key, str) and key.startswith(prefix) and isinstance(value, list)
     }
-
-  def legacy_append_finding_triage_audit(self, entry):
-    if isinstance(entry, FindingTriageAuditEntry):
-      payload = entry.to_dict()
-    else:
-      payload = FindingTriageAuditEntry.from_dict(entry).to_dict()
-    key = self.legacy_triage_key(payload["job_id"], payload["finding_id"])
-    audit_log = list(self.legacy_get_finding_triage_audit(payload["job_id"], payload["finding_id"]))
-    audit_log.append(payload)
-    self.owner.chainstore_hset(hkey=self._triage_audit_hkey, key=key, value=audit_log)
-    return audit_log
 
   def get_host_triage(self, tenant_id, host, finding_id):
     """The stored value as is (None when absent); a caller that trusts it validates its shape."""
@@ -385,23 +339,49 @@ class JobStateRepository:
     )
     return payload
 
+  # The audit is append-only: one field per entry, so nodes writing the same (tenant, host, finding) never
+  # overwrite one another. `chainstore_hkeys` lists fields from local memory (tombstones included).
+  HOST_AUDIT_KEEP = 50
+  _HOST_AUDIT_HEAL = 5
+
+  @classmethod
+  def host_triage_audit_prefix(cls, host, finding_id):
+    return f"{cls.host_triage_key(host, finding_id)}\x1f"
+
+  def _host_audit_fields(self, tenant_id, host, finding_id):
+    """The entry fields of one (host, finding), oldest first (the entry id sorts by time)."""
+    prefix = self.host_triage_audit_prefix(host, finding_id)
+    fields = self.owner.chainstore_hkeys(hkey=self.host_triage_audit_hkey(tenant_id)) or []
+    return sorted(f for f in fields if isinstance(f, str) and f.startswith(prefix) and "\x1f" not in f[len(prefix):])
+
   def get_host_triage_audit(self, tenant_id, host, finding_id):
-    payload = self.owner.chainstore_hget(
-      hkey=self.host_triage_audit_hkey(tenant_id), key=self.host_triage_key(host, finding_id))
-    return payload if isinstance(payload, list) else []
+    """The newest `HOST_AUDIT_KEEP` entries of one (host, finding), oldest first."""
+    hkey = self.host_triage_audit_hkey(tenant_id)
+    entries = (self.owner.chainstore_hget(hkey=hkey, key=field)
+               for field in self._host_audit_fields(tenant_id, host, finding_id)[-self.HOST_AUDIT_KEEP:])
+    return [entry for entry in entries if isinstance(entry, dict)]
 
   def append_host_triage_audit(self, entry):
+    """Write one entry under its own field, then prune what fell out of the newest `HOST_AUDIT_KEEP`.
+
+    The prune is best effort: a concurrent writer may leave a few extra entries, never lose a recent one.
+    Returns the stored entry.
+    """
     payload = (entry if isinstance(entry, FindingTriageAuditEntry)
                else FindingTriageAuditEntry.from_dict(entry)).to_dict()
     tenant_id, host = payload.get("tenant_id"), payload.get("host")
-    audit_log = self.get_host_triage_audit(tenant_id, host, payload["finding_id"])
-    audit_log.append(payload)
+    hkey = self.host_triage_audit_hkey(tenant_id)
+    entry_id = f"{int(payload.get('timestamp', 0) * 1000):015d}-{secrets.token_hex(4)}"
     self.owner.chainstore_hset(
-      hkey=self.host_triage_audit_hkey(tenant_id),
-      key=self.host_triage_key(host, payload["finding_id"]),
-      value=audit_log,
-    )
-    return audit_log
+      hkey=hkey, key=f"{self.host_triage_audit_prefix(host, payload['finding_id'])}{entry_id}", value=payload)
+    try:
+      old = self._host_audit_fields(tenant_id, host, payload["finding_id"])[:-self.HOST_AUDIT_KEEP]
+      for field in old[-self._HOST_AUDIT_HEAL:]:
+        if self.owner.chainstore_hget(hkey=hkey, key=field) is not None:
+          self.owner.chainstore_hset(hkey=hkey, key=field, value=None)
+    except Exception:
+      pass
+    return payload
 
   def legacy_delete_job_triage(self, job_id):
     for finding_id in list(self.legacy_list_job_triage(job_id)):
