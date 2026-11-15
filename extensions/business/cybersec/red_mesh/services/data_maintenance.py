@@ -832,6 +832,17 @@ def _clean_row(owner, inventory, target, delete_file, job_id=None):
   return result
 
 
+def _is_pruned_triage_audit(owner, inventory, listed, hkey, field):
+  """A triage audit entry the prune tombstoned: the field is listed but reads None. A backup taken before the
+  prune must not bring it back outside the kept window."""
+  triage = inventory._triage_tenant(hkey)
+  if triage is None or triage[0] != "audit":
+    return False
+  if hkey not in listed:
+    listed[hkey] = set(owner.chainstore_hkeys(hkey=hkey) or [])
+  return field in listed[hkey] and owner.chainstore_hget(hkey=hkey, key=field) is None
+
+
 def restore_records(owner, inventory, rows):
   if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_TARGETS:
     raise MaintenanceError(400, "invalid_request")
@@ -841,12 +852,14 @@ def restore_records(owner, inventory, rows):
         or not isinstance(row["hkey"], str) or not isinstance(row["field"], str)
         or not row["field"] or row["value"] is None):
       raise MaintenanceError(400, "invalid_request")
+  tombstoned = {}  # audit hkey -> its fields as listed: a listed field that reads None was pruned
   for row in rows:
     hkey, field, value = row["hkey"], row["field"], row["value"]
     outcome = "written"
     if (not inventory.accepts(hkey) or inventory.is_retired_field(hkey, field)
         or inventory.is_unreadable_override(hkey, field, value)
-        or inventory.is_mismatched_triage(hkey, field, value)):
+        or inventory.is_mismatched_triage(hkey, field, value)
+        or _is_pruned_triage_audit(owner, inventory, tombstoned, hkey, field)):
       outcome = "refused"
     else:
       stored = owner.chainstore_hget(hkey=hkey, key=field)

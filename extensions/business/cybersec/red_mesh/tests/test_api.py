@@ -3402,8 +3402,8 @@ class TestPhase4UiAggregate(unittest.TestCase):
     plugin._extract_graybox_ui_stats = lambda aggregated, latest_pass=None: Plugin._extract_graybox_ui_stats(
       plugin, aggregated, latest_pass
     )
-    plugin._compute_ui_aggregate = lambda passes, agg, job_config=None: Plugin._compute_ui_aggregate(
-      plugin, passes, agg, job_config=job_config
+    plugin._compute_ui_aggregate = lambda passes, agg, job_config=None, triage=None: Plugin._compute_ui_aggregate(
+      plugin, passes, agg, job_config=job_config, triage=triage
     )
     plugin.SEVERITY_ORDER = Plugin.SEVERITY_ORDER
     plugin.CONFIDENCE_ORDER = Plugin.CONFIDENCE_ORDER
@@ -3781,8 +3781,8 @@ class TestPhase3Archive(unittest.TestCase):
 
     # Bind real methods for archive building
     Plugin = self._get_plugin_class()
-    plugin._compute_ui_aggregate = lambda passes, agg, job_config=None: Plugin._compute_ui_aggregate(
-      plugin, passes, agg, job_config=job_config
+    plugin._compute_ui_aggregate = lambda passes, agg, job_config=None, triage=None: Plugin._compute_ui_aggregate(
+      plugin, passes, agg, job_config=job_config, triage=triage
     )
     plugin._count_services = lambda si: Plugin._count_services(plugin, si)
     plugin._dedupe_items = lambda items: Plugin._dedupe_items(items)
@@ -3811,6 +3811,19 @@ class TestPhase3Archive(unittest.TestCase):
     self.assertEqual(len(archive_dict["passes"]), 1)
     self.assertIn("ui_aggregate", archive_dict)
     self.assertIn("total_open_ports", archive_dict["ui_aggregate"])
+
+  def test_archive_top_findings_read_the_live_host_triage_map(self):
+    """RM-169 4a: a closed finding takes no top_findings slot; the stored pass stays unstamped."""
+    from extensions.business.cybersec.red_mesh.repositories.cstore import JobStateRepository
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin()
+    with patch.object(JobStateRepository, "list_triage_for_record",
+                      return_value={"f1a": {"status": "false_positive"}}) as read:
+      Plugin._build_job_archive(plugin, "test-job", job_specs)
+    read.assert_called_once()
+    archive_dict = plugin.r1fs.add_json.call_args[0][0]
+    self.assertNotIn("top_findings", archive_dict["ui_aggregate"])  # the only HIGH was closed
+    self.assertEqual([f["finding_id"] for f in archive_dict["passes"][0]["findings"]], ["f1a", "f1b"])
 
   def test_duplicate_archive_finalization_reuses_existing_cid(self):
     """Retrying finalization after prune is harmless and writes no artifact."""

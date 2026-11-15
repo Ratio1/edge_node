@@ -341,6 +341,9 @@ class JobStateRepository:
 
   # The audit is append-only: one field per entry, so nodes writing the same (tenant, host, finding) never
   # overwrite one another. `chainstore_hkeys` lists fields from local memory (tombstones included).
+  # Known limits, accepted for v1: every append and read lists every field of the tenant's audit hkey, so the
+  # cost grows with the tenant's whole history (tombstones too), not with one finding's; and the entry id comes
+  # from the writer's clock, so with clock skew entries order by their timestamp, not by write order.
   HOST_AUDIT_KEEP = 50
   _HOST_AUDIT_HEAL = 5
 
