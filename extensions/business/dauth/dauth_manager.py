@@ -45,6 +45,8 @@ from extensions.business.dauth.dauth_revoked_nodes import _DauthRevokedNodesMixi
 from extensions.business.dauth.deployment_secrets import _DauthDeploymentSecretsMixin, DeploymentSecretRecordTooLarge
 # The name of the reason field of a refusal and its one code, shared with the client that reads them.
 from ratio1.const.base import dAuth
+# How many times a failed registry read's time the SDK answers that read's error without a read.
+from ratio1.bc.evm import _ORACLE_REGISTRY_FAILURE_FACTOR
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 from extensions.business.deeploy.deeploy_job_mixin import _DeeployJobMixin
 
@@ -231,10 +233,47 @@ class DauthManagerPlugin(
     return self._refresh_dauth_registry(force=True)
 
   def _refresh_dauth_registry(self, force=False):
+    """
+    Read the dAuth registry when a refresh is due and enable or disable this node's dAuth server by it.
+
+    A refresh is due every ``DAUTH_REGISTRY_REFRESH_INTERVAL`` seconds after a refresh that read the registry,
+    and after a failed read once ``DAUTH_REGISTRY_REFRESH_RETRY_INTERVAL`` seconds have passed or, if later, once
+    three times the failed read's time has passed (the SDK's ``_ORACLE_REGISTRY_FAILURE_FACTOR``), both counted
+    from the end of the read. The server is enabled when this node's address is in the registry and the
+    registry's peers resolve; a failed read disables it.
+
+    Parameters
+    ----------
+    force : bool, optional
+      True reads the registry whatever the time since the last refresh (the start-up check). Default False.
+
+    Returns
+    -------
+    bool
+      Whether this node's dAuth server is enabled after the call.
+
+    Notes
+    -----
+    The SDK answers every read of a registry within three times a failed read's time after that failure with
+    the error of that read, without a read. A retry inside that time failed without a read and paused the
+    server for another retry interval: a read that hung 20.2 s, retried 60 s after its start (40 s after it
+    failed), kept a dAuth server paused up to 99 s after its RPC endpoint answered again. Counted from the end
+    of the read and no sooner than the SDK reads again, the retry finds the endpoint as it is: such a server
+    resumes about 60 s after the failure, the SDK's memory being the floor (120 s for a read of 40 s). A
+    refresh that gets the remembered failure of another thread's read takes no time: it is tried again one
+    retry interval later, and again while that memory lasts.
+
+    Examples
+    --------
+    >>> plugin._refresh_dauth_registry(force=True)   # this node is registered and its peers resolve
+    True
+    """
     now = self.time()
     last_refresh = getattr(self, "_last_dauth_registry_refresh", None)
     refresh_interval = (
-      self.cfg_dauth_registry_refresh_retry_interval
+      # After a failed read, the retry interval or, if longer, as long as the SDK answers that read's error from
+      # its memory: a retry inside it fails without a read. Before, only the retry interval, from the read's start.
+      max(self.cfg_dauth_registry_refresh_retry_interval, _ORACLE_REGISTRY_FAILURE_FACTOR * self._dauth_registry_read_seconds)
       if getattr(self, "_dauth_registry_refresh_failed", False)
       else self.cfg_dauth_registry_refresh_interval
     )
@@ -246,7 +285,6 @@ class DauthManagerPlugin(
       return self._is_dauth_server_enabled()
     # endif
 
-    self._last_dauth_registry_refresh = now
     previous_enabled = getattr(self, "_dauth_server_enabled", None)
     previous_eth_oracles = getattr(self, "_dauth_registry_eth_oracles", None)
 
@@ -261,6 +299,11 @@ class DauthManagerPlugin(
       error = str(e)
     # end try
 
+    # The next refresh is timed from the end of this read, no longer from its start: a read that hangs 20 s ends
+    # a third of the way into a retry interval counted from its start.
+    self._last_dauth_registry_refresh = self.time()
+    # How long the read took, for the retry after a failed one.
+    self._dauth_registry_read_seconds = self._last_dauth_registry_refresh - now
     message = None if enabled else error or "current node is not registered as a dAuth oracle"
     self._dauth_registry_eth_oracles = eth_oracles if enabled else None
     self._dauth_registry_internal_peers = peers if enabled else None

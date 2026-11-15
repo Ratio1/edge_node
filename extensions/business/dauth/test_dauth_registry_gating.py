@@ -1216,6 +1216,60 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     self.assertTrue(plugin.should_resume())
     self.assertEqual(plugin.bc.calls, 3)
 
+  def test_a_slow_failed_registry_read_is_tried_again_once_the_sdk_reads_the_registry_again(self):
+    """A refresh whose read hangs 20.5 s and fails pauses the server and is tried again three times that time after
+    the read ended (61.5 s, more than the 60 s retry interval), when the SDK's memory of the failure is over and it
+    reads the registry again; that retry resumes the server. Before, the retry came 60 s after the read's start,
+    inside that memory, and failed without a read."""
+    # A registered dAuth oracle, started.
+    plugin = self._make_manager(dauth_oracle=True)
+    # The start-up read lists it.
+    plugin.on_init()
+
+    def hanging():
+      """
+      Stand in for a registry read that hangs 20.5 s on the plugin's clock and then fails.
+
+      Returns
+      -------
+      None
+        Nothing is returned: the call always raises.
+
+      Raises
+      ------
+      TimeoutError
+        Always, 20.5 s later on the plugin's clock.
+
+      Examples
+      --------
+      >>> hanging()
+      Traceback (most recent call last):
+      TimeoutError: read timed out
+      """
+      # The read's time passes.
+      plugin._now += 20.5
+      # It ends without an answer.
+      raise TimeoutError("read timed out")
+
+    # The registry's read hangs from now on.
+    plugin.bc.get_eth_dauth_oracles = hanging
+    # The hourly refresh.
+    plugin._now += 60 * 60
+    # Its read fails: the server pauses.
+    self.assertTrue(plugin.should_pause())
+    # The endpoint answers again right after: the registry is read as before and lists this node.
+    del plugin.bc.get_eth_dauth_oracles
+    # The registry reads made so far.
+    calls = plugin.bc.calls
+    # 61 s after the failed read ended: past the retry interval, still inside three times the read's time.
+    plugin._now += 61
+    # Still paused, and no read: the SDK would answer the failure from its memory.
+    self.assertEqual((plugin.should_resume(), plugin.bc.calls), (False, calls))
+    # Three times the read's time after it ended.
+    plugin._now += 0.5
+    # The registry is read and the server resumes.
+    self.assertEqual((plugin.should_resume(), plugin.bc.calls), (True, calls + 1))
+
   def test_pause_tears_down_and_resume_restarts_only_request_monitor(self):
     plugin = self._make_manager(dauth_oracle=True)
     plugin.on_init()
