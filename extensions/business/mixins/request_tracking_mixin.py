@@ -271,6 +271,14 @@ class _RequestTrackingMixin(object):
     The monitor admits no request while this runs. The write does not wait for the other oracles, but
     it takes the chain store's lock, which a save or a namespace-sync merge can hold.
 
+    Measured on the node image's interpreter under a 0.35 CPU limit, with the core's write path on its
+    test harness (a replica of 5,700 records, 10 peers) and the node's logger, over 2,000 writes: one
+    write takes 1.1 ms (median) and 2.2 ms (99th percentile) in an otherwise idle process. With one more
+    thread that keeps the process at its CPU limit it takes 22 ms (median) and 32 ms (99th percentile):
+    the write's four debug lines (``debug=True``) each wait about 5 ms for the interpreter lock. Without
+    those lines it took 0.5 to 0.6 ms (median) and 0.9 ms (99th percentile) in both cases. A call with
+    nothing due takes about 0.001 ms.
+
     Examples
     --------
     >>> def on_request_monitor_tick(self):
