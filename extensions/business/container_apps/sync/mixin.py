@@ -58,6 +58,8 @@ from .manager import (
 
 class _SyncMixin:
   """
+  Volume-sync provider and consumer behaviour for a container app runner.
+
   Required attributes on the composing plugin:
     - self.P, self.time, self.cfg_*                  (BasePlugin)
     - self.get_data_folder, _get_instance_data_subfolder
@@ -69,7 +71,29 @@ class _SyncMixin:
       self.start_container()  (CAR lifecycle)
     - self.cfg_sync                                  (CAR config block)
     - self.ee_id                                     (BasePlugin identity)
+
+  Attributes
+  ----------
+  _sync_config_refused : bool
+    True while the runner's last ``_validate_sync_config`` run refused the SYNC block (no KEY, a wrong TYPE or
+    a malformed secret). Only that method writes it, and ``_sync_enabled`` reads it. False before the first
+    run.
+
+  Examples
+  --------
+  >>> class Runner(_SyncMixin):
+  ...   cfg_sync = {"ENABLED": True}
+  >>> runner = Runner()
+  >>> runner._sync_enabled()
+  True
+  >>> runner._sync_config_refused = True
+  >>> runner._sync_enabled()
+  False
   """
+
+  # The verdict of the runner's SYNC check lives on the plugin, not in the SYNC block: on a node `cfg_sync` is
+  # a copy of that block, so a refusal written into it was lost and SYNC stayed on.
+  _sync_config_refused = False
 
   # ----- system volume provisioning --------------------------------------
 
@@ -272,7 +296,30 @@ class _SyncMixin:
     return cfg if isinstance(cfg, dict) else {}
 
   def _sync_enabled(self) -> bool:
+    """Whether SYNC is on for this job; every tick, the manager handle and the env injection ask here.
+
+    SYNC is on when the system volume is available, the runner's last ``_validate_sync_config`` run did not
+    refuse the SYNC block, and ``SYNC.ENABLED`` is truthy. A refusal wins over ``SYNC.ENABLED``: the stored
+    block is left as the owner sent it.
+
+    Returns
+    -------
+    bool
+      True when the provider or consumer tick may work and the app gets ``R1_SYNC_TYPE`` and ``R1_SYNC_KEY``.
+
+    Examples
+    --------
+    >>> plugin.cfg_sync = {"ENABLED": True, "KEY": "k", "TYPE": "consumer"}
+    >>> plugin._sync_enabled()
+    True
+    >>> plugin._sync_config_refused = True
+    >>> plugin._sync_enabled()
+    False
+    """
     if getattr(self, "_sync_unavailable", False):
+      return False
+    if self._sync_config_refused:
+      # The SYNC check refused this block: no tick work and no SYNC role or key for the app.
       return False
     return bool(self._sync_cfg().get("ENABLED"))
 
