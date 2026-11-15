@@ -408,10 +408,14 @@ because the disk API of plugin code refuses that folder (the core's `RESTRICTED_
   privileges, an iptables fault, a wrong `DOCKERD_READY_TIMEOUT` or a daemon that takes longer than that
   time (120 s) to answer. A start with `EE_DD=0` starts no daemon and removes nothing. A container started
   with another entrypoint (`--entrypoint`, `entrypoint:` in a compose file) does not get this recovery.
-- **One node per cache folder:** never start a second container of a node image on the `_local_cache` of a
-  running node (use `docker exec`, or start it with `EE_DD=0`). The second daemon cannot open a store that is
-  in use, its start fails, and the script then removes the store the running node's daemon is using; that
-  node needs a restart afterwards.
+- **One node per cache folder:** before it starts the daemon, `cmds/node_entrypoint` locks
+  `_bin/docker/29.lock` (beside the store, not in it), and the node container holds that lock until it ends,
+  also after a kill; nothing has to remove it. A second container of a node image started on the
+  `_local_cache` of a running node, with or without `EE_DD=0`, logs "The kept Docker store is locked by
+  another container on this cache folder, or could not be locked: not starting." and stops with exit code 1:
+  it starts no daemon, removes nothing, and the running node goes on. The same line, after the shell's own
+  error, stops a start when `flock` is missing. To run a command in a running node, use `docker exec`. A
+  container started with another entrypoint takes no lock and removes nothing.
 - **Copying a node's `_local_cache`** to another host: leave `_bin/docker` out; it holds only what can be
   pulled again.
 
