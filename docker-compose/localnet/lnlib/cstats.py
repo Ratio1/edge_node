@@ -15,11 +15,13 @@ Lines are read from ``docker logs --timestamps``, so each one carries the time D
 import json
 # Colour codes and Docker's time stamps are matched by pattern.
 import re
+# docker logs is read as bytes, without the newline translation of a text-mode pipe.
+import subprocess
 # Docker's time stamps are UTC.
 from datetime import datetime, timezone
 
-# The node container's name, and the shell helper that runs docker logs.
-from .common import container, sh
+# The node container's name.
+from .common import container
 # The bucket of a namespace, composed as the chain store composes it.
 from .replicas import bucket
 
@@ -106,7 +108,11 @@ def parse(text):
       epoch = stamp.timestamp() + (float('0.' + match.group(2)) if match.group(2) else 0.0)
       # The line's time, its clock time for reading against logs, and its object.
       found[kind].append({'time': round(epoch, 3), 'utc': stamp.strftime('%H:%M:%S'), 'data': data})
-  # Both kinds, in log order.
+  # Both kinds of line.
+  for kind in found:
+    # In time order, also when the text joined two streams.
+    found[kind].sort(key=lambda item: item['time'])
+  # Both kinds.
   return found
 
 
@@ -145,8 +151,12 @@ def node_lines(name, since=None, until=None):
     if value is not None:
       # RFC 3339 in UTC, which docker logs accepts.
       window += [option, datetime.fromtimestamp(value, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')]
-  # Time stamps on, so each line carries the time Docker received it.
-  out = sh('docker', 'logs', '--timestamps', *window, container(name), check=False, timeout=300).stdout or ''
+  # Time stamps on, so each line carries the time Docker received it. Read as bytes: a text-mode pipe turns the
+  # carriage return the node puts after Docker's time stamp into a newline, which cuts the stamp off its line.
+  proc = subprocess.run(['docker', 'logs', '--timestamps', *window, container(name)], capture_output=True,
+                        timeout=300, check=False)
+  # Both streams (the node logs to both), decoded without any newline translation.
+  out = (proc.stdout + proc.stderr).decode('utf-8', errors='replace')
   # The two kinds of line in that output.
   return parse(out)
 
