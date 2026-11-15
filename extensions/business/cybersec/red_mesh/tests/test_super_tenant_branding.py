@@ -123,7 +123,7 @@ class TestBrandingName(_BrandingCase):
     self.assertEqual(data, {**EMPTY, "display_name": "Acme Cyber", "name_in": where})
     self.assertEqual(self.events, [("super_tenant_branding_updated", {"actor": "creator", "changed": ["display_name", "name_in"]})])
     self.assertEqual(ok(self, self.get(self.member)), data)
-    self.assertEqual(ok(self, self.plugin.get_public_branding()), {**data, "branded": False})
+    self.assertEqual(ok(self, self.plugin.get_public_branding()), data)
     # Same values again: nothing written or audited; the theme alone keeps the name.
     writes = len(self.store.writes)
     ok(self, self.update({"display_name": "Acme Cyber", "name_in": dict(where)}))
@@ -148,7 +148,7 @@ class TestBrandingName(_BrandingCase):
     self.store.data[BRANDING_KEY] = {"schemaVersion": 1, "namespace": "deployment", "kind": "super_tenant_branding", "ids": ["deployment"], "theme": "navy", "logo": None,
                                     "updated_by": "creator", "updated_at": "2026-10-13T00:00:00Z"}
     self.assertEqual(ok(self, self.get(self.member)), {**EMPTY, "theme": "navy"})
-    self.assertEqual(ok(self, self.plugin.get_public_branding()), {**EMPTY, "theme": "navy", "branded": False})
+    self.assertEqual(ok(self, self.plugin.get_public_branding()), {**EMPTY, "theme": "navy"})
     # An unchanged default name writes nothing; a theme change keeps the row valid.
     ok(self, self.update({"display_name": "", "name_in": NAME_OFF}))
     self.assertEqual(self.store.writes, [])
@@ -288,37 +288,17 @@ class TestPublicBranding(_BrandingCase):
   """The sign-in page's reads: no actor, the same answers as the actor-bound reads."""
 
   def test_the_default_is_read_without_an_actor_or_a_write_and_no_logo_is_not_found(self):
-    self.assertEqual(ok(self, self.plugin.get_public_branding()), {**EMPTY, "branded": False})
+    self.assertEqual(ok(self, self.plugin.get_public_branding()), EMPTY)
     refused(self, self.plugin.download_public_branding_logo(), 404, "not_found")
     self.assertEqual((self.store.writes, self.events), ([], []))
 
   def test_a_set_theme_and_logo_read_as_the_actor_bound_reads_do(self):
     raw = png()
     data = ok(self, self.update({"logo": upload(raw), "theme": "light"}))
-    self.assertEqual(ok(self, self.plugin.get_public_branding()), {**data, "branded": True})
-    self.assertNotIn("branded", data)
-    self.assertNotIn("branded", ok(self, self.get()))
+    self.assertEqual(ok(self, self.plugin.get_public_branding()), data)
     got = ok(self, self.plugin.download_public_branding_logo())
     self.assertEqual(got, ok(self, self.download()))
     self.assertEqual(base64.b64decode(got["content_b64"]), raw)
-
-  def _profile(self, legal_name):
-    ok(self, self.plugin.update_super_tenant_profile(self.actor, {"legal_name": legal_name}))
-
-  def test_branded_is_true_with_a_logo_or_a_legal_name_and_false_with_neither(self):
-    self.assertIs(ok(self, self.plugin.get_public_branding())["branded"], False)
-    self._profile("   ")
-    self.assertIs(ok(self, self.plugin.get_public_branding())["branded"], False)
-    self._profile("Acme Cyber SRL")
-    public = ok(self, self.plugin.get_public_branding())
-    self.assertIs(public["branded"], True)
-    self.assertNotIn("Acme", repr(public))
-    self.assertEqual(set(public), {"theme", "logo", "display_name", "name_in", "branded"})
-    self._profile("")
-    self.assertIs(ok(self, self.plugin.get_public_branding())["branded"], False)
-    ok(self, self.update({"logo": upload(png())}))
-    self.assertIs(ok(self, self.plugin.get_public_branding())["branded"], True)
-    self.assertEqual(set(ok(self, self.get())), {"theme", "logo", "display_name", "name_in"})
 
   def test_a_tampered_file_answers_integrity_and_a_lost_one_not_found(self):
     ok(self, self.update({"logo": upload(png())}))
