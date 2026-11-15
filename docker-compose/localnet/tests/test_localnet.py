@@ -100,6 +100,31 @@ class TestTopology(unittest.TestCase):
     self.assertFalse(any(item.get('DISABLED') for item in full.values()))
     self.assertFalse(full['DAUTH_MANAGER']['TUNNEL_ENGINE_ENABLED'])
 
+  def test_a_node_startup_entry_adds_to_the_localnet_overrides_in_its_own_order(self):
+    """A ``--startup-of`` entry keeps the localnet's overrides, adds its plugins after them in its own order, and a
+    node without one gets the same overrides as before (sorted keys)."""
+    from lnlib import nodes
+    # The entry of the resync rerun: two empty plugins first, so the chain store keeps its start position.
+    entry = {'ADMIN_PIPELINE': {'PLUGIN_MONITOR_01': {}, 'LOCAL_COMMS_01': {},
+                                'CHAIN_STORE_BASE': {'CHAIN_STORE_DEBUG': True},
+                                'ORACLE_API': {'LOG_EXTRA': True}},
+             'CAPTURE_ENVIRONMENT': {'DEBUG_IOT_PAYLOADS': True}}
+    # A headless node with that entry, merged.
+    merged = nodes.node_startup({'headless': True, 'startup': entry})
+    # The admin plugins in the order they reach the start-up file.
+    order = list(merged['ADMIN_PIPELINE'])
+    # The localnet's own plugins first, sorted, then the entry's new ones in the entry's order.
+    self.assertEqual(order[-3:], ['PLUGIN_MONITOR_01', 'LOCAL_COMMS_01', 'CHAIN_STORE_BASE'])
+    self.assertEqual(order[:-3], sorted(nodes._startup_overrides({'headless': True})['ADMIN_PIPELINE']))
+    # A plugin the localnet already overrides keeps its settings and gets the entry's.
+    self.assertTrue(merged['ADMIN_PIPELINE']['ORACLE_API']['DISABLED'])
+    self.assertTrue(merged['ADMIN_PIPELINE']['ORACLE_API']['LOG_EXTRA'])
+    # A section the localnet does not override is taken as given.
+    self.assertEqual(merged['CAPTURE_ENVIRONMENT'], {'DEBUG_IOT_PAYLOADS': True})
+    # Without an entry: the overrides as node.json held them before, with sorted keys at every level.
+    plain = nodes.node_startup({'headless': True})
+    self.assertEqual(json.dumps(plain), json.dumps(nodes._startup_overrides({'headless': True}), sort_keys=True))
+
 
 class TestSeeding(unittest.TestCase):
 

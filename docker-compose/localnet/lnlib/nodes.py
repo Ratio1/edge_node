@@ -391,7 +391,81 @@ def node_env(node, manifest, secrets):
   return env
 
 
+def node_startup(node):
+  """
+  Start-up overrides of one node: the localnet's own, then the node's ``startup`` entry (``init --startup-of``).
+
+  ``node/launch.py`` merges the result into the production start-up file of the node's source tree, two levels
+  deep: a section such as ``ADMIN_PIPELINE`` or ``CAPTURE_ENVIRONMENT`` is merged key by key, and a plugin's
+  settings are added to the ones it already has. The node's entry is merged here the same way, so it adds to the
+  localnet's own overrides (web plugin ports, no tunnels, disabled web plugins) instead of replacing them.
+
+  Parameters
+  ----------
+  node : dict
+    A node of ``plan``; reads ``headless`` and ``web`` (through ``_startup_overrides``) and ``startup``.
+
+  Returns
+  -------
+  dict
+    The overrides written to the node's ``node.json``: the localnet's own in sorted key order at every level (the
+    order the file always had), then each plugin or setting the localnet does not override, in the order the
+    node's entry gives it.
+
+  Notes
+  -----
+  The order matters for the admin pipeline: the node starts the plugins named in the start-up file first, in
+  that order, and then the mandatory ones it lacks. A plugin added here therefore starts earlier than it would
+  otherwise, unless the plugins that precede it are listed before it too (with empty settings).
+
+  Examples
+  --------
+  >>> startup = node_startup({'headless': True, 'startup': {'ADMIN_PIPELINE': {'CHAIN_STORE_BASE': {'CHAIN_STORE_DEBUG': True}}}})
+  >>> startup['ADMIN_PIPELINE']['CHAIN_STORE_BASE'], startup['ADMIN_PIPELINE']['ORACLE_API']['DISABLED']
+  ({'CHAIN_STORE_DEBUG': True}, True)
+  """
+  # The localnet's own overrides, a new dict on each call, in sorted key order at every level: node.json was
+  # written with sorted keys, and launch.py adds the admin plugins in the file's order, so they start as before.
+  merged = json.loads(json.dumps(_startup_overrides(node), sort_keys=True))
+  # Each section or setting of the node's own entry, in its order.
+  for key, value in (node.get('startup') or {}).items():
+    if isinstance(value, dict) and isinstance(merged.get(key), dict):
+      # Both are sections: merged key by key, as launch.py merges them into the production file.
+      for sub_key, sub_value in value.items():
+        if isinstance(sub_value, dict) and isinstance(merged[key].get(sub_key), dict):
+          # A plugin the localnet already overrides keeps its overrides and gets these settings too.
+          merged[key][sub_key] = dict(merged[key][sub_key], **sub_value)
+        else:
+          # A plugin or setting the localnet does not override, added after its own.
+          merged[key][sub_key] = sub_value
+    else:
+      # A section or setting the localnet does not override.
+      merged[key] = value
+  # What write_node_files puts under "startup" in node.json.
+  return merged
+
+
 def write_node_files(home, manifest, secrets):
+  """
+  Write each node's environment file and ``node.json`` (name, role, source tree, start-up overrides).
+
+  Parameters
+  ----------
+  home : Home
+    The localnet's state folder; the files go to ``<run>/nodes/<name>/``.
+  manifest : dict
+    The localnet's manifest; reads ``nodes`` and what ``node_env`` reads.
+  secrets : dict
+    The localnet's generated secrets (broker and relay credentials of the seeds).
+
+  Returns
+  -------
+  None
+
+  Examples
+  --------
+  >>> write_node_files(home, home.manifest(), home.secrets())   # before "up" and after "switch"
+  """
   for node in manifest['nodes']:
     ndir = home.run / 'nodes' / node['name']
     ndir.mkdir(parents=True, exist_ok=True)
@@ -399,10 +473,16 @@ def write_node_files(home, manifest, secrets):
     env = node_env(node, manifest, secrets)
     (ndir / 'env').write_text(''.join('{}={}\n'.format(key, val) for key, val in sorted(env.items())))
     os.chmod(ndir / 'env', 0o600)
+    # Keys in sorted order and no sort on writing: the same file as before for a node without a start-up entry,
+    # and the entry's own order for the plugins it adds (sorting them would change the order the node starts them).
     (ndir / 'node.json').write_text(json.dumps({
-      'name': node['name'], 'role': node['role'], 'arm': node['arm'],
-      'startup': dict(_startup_overrides(node), **(node.get('startup') or {})),
-    }, indent=1, sort_keys=True))
+      # The node's tree, name and role, written in the sorted order sort_keys gave them before.
+      'arm': node['arm'], 'name': node['name'], 'role': node['role'],
+      # The localnet's overrides with the node's own entry merged in (before, a shallow merge: a section of the
+      # entry would have replaced the localnet's section of the same name).
+      'startup': node_startup(node),
+      # Indented as before; no sort_keys, which would reorder the plugins an entry adds.
+    }, indent=1))
   return
 
 

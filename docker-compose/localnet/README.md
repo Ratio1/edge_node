@@ -94,7 +94,11 @@ $LN init --arm new --infra-cpus 0,6 --node-cpus 1-5,7-11 && $LN up
 $LN scenario docker-compose/localnet/scenarios/incident.json
 ```
 
-`--arm-of NODE=TREE` on `init` gives single nodes another version (mixed fleets).
+`--arm-of NODE=TREE` on `init` gives single nodes another version (mixed fleets). `--startup-of NODE=JSON`
+adds production start-up settings to one node only, merged two levels deep into its start-up file, for
+example a plugin's debug switch: `r1s-db='{"ADMIN_PIPELINE":{"CHAIN_STORE_BASE":{"CHAIN_STORE_DEBUG":true}}}'`.
+The node starts the admin plugins its file names first, in that order, so a plugin added this way starts
+earlier unless the plugins before it are listed first with `{}`.
 
 ### Container apps
 

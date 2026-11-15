@@ -125,7 +125,8 @@ def cmd_init(args):
   Parameters
   ----------
   args : argparse.Namespace
-    Options of ``init`` (see ``main``), among them ``docker_nodes``, ``web_plugins`` and ``web_of``.
+    Options of ``init`` (see ``main``), among them ``docker_nodes``, ``web_plugins``, ``web_of`` and
+    ``startup_of`` (``NODE=JSON``: start-up settings of one node, merged by ``nodes.node_startup``).
 
   Returns
   -------
@@ -135,7 +136,8 @@ def cmd_init(args):
   Raises
   ------
   LocalnetError
-    A source tree is not staged, or the topology options are inconsistent.
+    A source tree is not staged, the topology options are inconsistent, or a ``--startup-of`` names an unknown
+    node or is not a JSON object.
 
   Examples
   --------
@@ -166,6 +168,26 @@ def cmd_init(args):
     for node in plan:
       # Every node's probe samples at this period (node/launch.py reads the variable).
       node['env'] = dict(node.get('env') or {}, R1_LOCALNET_PROBE_PERIOD=str(args.probe_period))
+  # The nodes of this topology by name, for the --startup-of entries.
+  by_name = {node['name']: node for node in plan}
+  # Each NODE=JSON, before anything slow is generated.
+  for item in args.startup_of or []:
+    # The node's name and its JSON text (a JSON object holds '=' too, so only the first one splits).
+    name, _, text = item.partition('=')
+    if name not in by_name:
+      # A misspelt name would otherwise be ignored without a word.
+      raise LocalnetError('--startup-of names unknown node {} (this topology has: {})'.format(name, ', '.join(sorted(by_name))))
+    try:
+      # The settings, in the order given: the order the node starts the admin plugins they add.
+      settings = json.loads(text)
+    except ValueError as exc:
+      # Refused with the parser's reason.
+      raise LocalnetError('--startup-of {}: not JSON ({})'.format(name, exc))
+    if not isinstance(settings, dict):
+      # Only an object can be merged into the start-up file.
+      raise LocalnetError('--startup-of {}: expected a JSON object'.format(name))
+    # Kept in the manifest; written into the node's node.json by nodes.write_node_files at init, up and switch.
+    by_name[name]['startup'] = settings
   infra_repo = infra.find_infra_repo(args.infra_repo)
   log('rendering the mainnet broker mesh (infra repo: {})'.format(infra_repo))
   mesh = infra.render_brokers(home, infra_repo, nofile=args.broker_nofile)
@@ -821,6 +843,10 @@ def main():
   one.add_argument('--web-of', action='append', metavar='NODE=SIG,SIG', help='web plugins one node keeps')
   # A shorter period resolves the pauses of a node's loops; the default is the probe's own 5 s.
   one.add_argument('--probe-period', type=float, help='seconds between two samples of the in-node probe (default 5)')
+  # Per node, repeatable: production start-up settings for one node only, such as a plugin's debug switch.
+  one.add_argument('--startup-of', action='append', metavar='NODE=JSON',
+                   help='start-up settings one node adds to the production file, as a JSON object merged two levels '
+                        'deep, for example r1s-db=\'{"ADMIN_PIPELINE":{"CHAIN_STORE_BASE":{"CHAIN_STORE_DEBUG":true}}}\'')
   one.set_defaults(func=cmd_init)
 
   one = sub.add_parser('up', help='start the localnet')
