@@ -224,14 +224,15 @@ class _RequestTrackingMixin(object):
     info = {}
     # wait=False: stored here and queued for the other oracles, with no wait for their confirmations, so the
     # monitor thread goes back to admitting requests. Before, the plugin thread waited here for up to 3 x 10 s
-    # and the result was not read.
+    # and the result was not read. No debug=True any more: its four log lines per write each waited for the
+    # interpreter lock on a node at its CPU limit, 22 ms a write (median) against 0.35 ms without them, measured
+    # under a 0.35 CPU limit.
     if not self.chainstore_hset(
       hkey=self.__rt_cstore_hkey,
       key=self.ee_id,
       value=list(self.__rt_recent_requests),
       wait=False,
       result_info=info,
-      debug=True
     ):
       # Not stored and not queued: the record stays marked as changed, so the save one interval later tries
       # again. Before, a write that failed was forgotten until the next tracked change.
@@ -273,11 +274,11 @@ class _RequestTrackingMixin(object):
 
     Measured on the node image's interpreter under a 0.35 CPU limit, with the core's write path on its
     test harness (a replica of 5,700 records, 10 peers) and the node's logger, over 2,000 writes: one
-    write takes 1.1 ms (median) and 2.2 ms (99th percentile) in an otherwise idle process. With one more
-    thread that keeps the process at its CPU limit it takes 22 ms (median) and 32 ms (99th percentile):
-    the write's four debug lines (``debug=True``) each wait about 5 ms for the interpreter lock. Without
-    those lines it took 0.5 to 0.6 ms (median) and 0.9 ms (99th percentile) in both cases. A call with
-    nothing due takes about 0.001 ms.
+    write takes about 0.35 ms (median) and 0.9 ms (99th percentile), in an otherwise idle process and
+    with one more thread that keeps the process at its CPU limit alike. The write passes no ``debug``
+    flag. With ``debug=True``, as it was first written, it took 1.1 ms (median) in an idle process and,
+    at the CPU limit, 22 ms (median) and 32 ms (99th percentile): its four log lines each waited about
+    5 ms for the interpreter lock. A call with nothing due takes about 0.001 ms.
 
     Examples
     --------

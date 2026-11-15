@@ -134,12 +134,14 @@ class _Api(_RequestTrackingMixin):
     """
     return str(value)
 
-  def chainstore_hset(self, hkey, key, value, debug, wait, result_info):
+  def chainstore_hset(self, hkey, key, value, wait, result_info):
     """
     The chain store's hash write as the mixin uses it: every option the mixin passes is required.
 
     A stored write is kept as what the other oracles would then hold. A refused one (``self.refusal`` set) stores
-    nothing. Either way the caller's dict gets the outcome word, as the chain store fills it.
+    nothing. Either way the caller's dict gets the outcome word, as the chain store fills it. There is no
+    ``debug`` option here: the trace write must not ask for the store's debug lines (a call that passes one
+    fails), because each of them waits for the interpreter lock on a node at its CPU limit.
 
     Parameters
     ----------
@@ -149,8 +151,6 @@ class _Api(_RequestTrackingMixin):
       The field: this node's id.
     value : list of dict
       The record: one dict per request.
-    debug : bool
-      The write's debug flag; not used.
     wait : bool
       Whether the caller waits for the other oracles' confirmations; kept in ``self.waits``.
     result_info : dict
@@ -164,7 +164,7 @@ class _Api(_RequestTrackingMixin):
     Examples
     --------
     >>> api, info = _Api(DEEPLOY_CONFIG), {}
-    >>> api.chainstore_hset("DEEPLOY_REQUESTS", "oracle-1", [], debug=True, wait=False, result_info=info), info
+    >>> api.chainstore_hset("DEEPLOY_REQUESTS", "oracle-1", [], wait=False, result_info=info), info
     (True, {'outcome': 'changed'})
     """
     # Whether this call waits, for the tests that require a non-blocking write.
@@ -420,9 +420,9 @@ class _InitOrderPlugin(DeeployManagerApiPlugin):
     """
     return
 
-  def chainstore_hset(self, hkey, key, value, debug, wait, result_info):
+  def chainstore_hset(self, hkey, key, value, wait, result_info):
     """
-    The chain store's hash write as the trace uses it: the write is stored and queued.
+    The chain store's hash write as the trace uses it (no ``debug`` option): the write is stored and queued.
 
     Parameters
     ----------
@@ -432,8 +432,6 @@ class _InitOrderPlugin(DeeployManagerApiPlugin):
       The field: this node's id.
     value : list of dict
       The record: one dict per request.
-    debug : bool
-      The write's debug flag; not used.
     wait : bool
       Whether the caller waits for confirmations; not used.
     result_info : dict
@@ -447,7 +445,7 @@ class _InitOrderPlugin(DeeployManagerApiPlugin):
     Examples
     --------
     >>> plugin, info = _InitOrderPlugin(), {}
-    >>> plugin.chainstore_hset("DEEPLOY_REQUESTS", "oracle-1", [], debug=True, wait=False, result_info=info)
+    >>> plugin.chainstore_hset("DEEPLOY_REQUESTS", "oracle-1", [], wait=False, result_info=info)
     True
     """
     # What the other oracles would now hold: (request id, answered or not) per request.
@@ -520,6 +518,55 @@ class RequestTrackingTests(unittest.TestCase):
       api.tick(0.25)
     # Still the one write.
     self.assertEqual(len(api.waits), 1)
+
+  def test_the_trace_write_asks_the_chain_store_for_no_debug_lines(self):
+    """The trace write passes only ``wait`` and ``result_info`` beside the key and the value, and no ``debug``:
+    the four debug lines of a write each waited for the interpreter lock on a node at its CPU limit."""
+    # The Deeploy API's trace.
+    api = _Api(DEEPLOY_CONFIG)
+    # The options of every write call, by name.
+    seen = []
+
+    def chainstore_hset(hkey, key, value, **options):
+      """
+      Take the write whatever options it passes, and keep their names.
+
+      Parameters
+      ----------
+      hkey : str
+        The hash namespace.
+      key : str
+        The field: this node's id.
+      value : list of dict
+        The record.
+      **options
+        Every other option of the call; ``result_info`` gets the outcome word.
+
+      Returns
+      -------
+      bool
+        True: stored and queued.
+
+      Examples
+      --------
+      >>> chainstore_hset("DEEPLOY_REQUESTS", "oracle-1", [], wait=False, result_info={})
+      True
+      """
+      # The names of the options this call passed.
+      seen.append(sorted(options))
+      # The word of a write that changed the replica.
+      options["result_info"]["outcome"] = "changed"
+      # Stored and queued.
+      return True
+
+    # The recording write in place of the host's own.
+    api.chainstore_hset = chainstore_hset
+    # A tracked request, then the monitor's turn that writes it.
+    api.receive("create-1", "create_pipeline")
+    # The write.
+    api.tick()
+    # One write, with these two options only.
+    self.assertEqual(seen, [["result_info", "wait"]])
 
   def test_a_request_is_written_unanswered_at_once_and_its_answer_at_the_end_of_the_interval(self):
     """A request is written as not answered at the tick after it was queued; its answer, stamped by the plugin
