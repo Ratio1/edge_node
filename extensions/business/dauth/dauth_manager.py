@@ -627,8 +627,9 @@ class DauthManagerPlugin(
 
     The reason code is a constant from a closed set of one (`DAUTH_REASON_RECORD_TOO_LARGE`), given for the
     error type `DeploymentSecretRecordTooLarge` and for nothing else. No text of an error and no value, key or
-    size is answered; from the code the caller's client tells the job's owner to target fewer nodes or to
-    carry smaller configurations. The type is raised in one place, at the write of a secret-revision record
+    size is answered; from the code the caller's client tells the job's owner that the new revision, or the
+    current one kept for a rollback, has too many nodes or too large configurations (either copy can be the
+    one refused). The type is raised in one place, at the write of a secret-revision record
     during a "prepare", which a request reaches only after every earlier check passed: this node is a
     registered dAuth oracle, the body is signed
     by a key that is not revoked, its nonce is fresh, the sender is a protocol oracle, the operation is signed

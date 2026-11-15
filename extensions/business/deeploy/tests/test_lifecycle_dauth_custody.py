@@ -673,15 +673,20 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.assertEqual(self.state.blobs.data, {})
     self.assertEqual(self.http.call_count, 0)
 
-  def prepare_with_failed_write(self, word):
+  def prepare_with_failed_write(self, word, attempt='deploy'):
     """
-    Admit a create whose target secret record's write fails as ``word``, on a fresh fixture.
+    Admit a deployment one of whose secret records' write fails as ``word``, on a fresh fixture.
+
+    The target copy is tried with a create; the restoration copy, which only an update has, with an update of a
+    job stored before versioned secrets (see ``legacy``).
 
     Parameters
     ----------
     word : str
-      How the write of the target copy ends: 'before' or 'after' (see ``Node.chainstore_hset``), or one of the
+      How the write of that copy ends: 'before' or 'after' (see ``Node.chainstore_hset``), or one of the
       chain store's outcome words, such as 'refused_too_large'.
+    attempt : str, optional
+      The copy whose write fails: 'deploy' (the default), the target copy, or 'restore', the restoration copy.
 
     Returns
     -------
@@ -692,12 +697,17 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     --------
     >>> [type(error).__name__ for error in self.prepare_with_failed_write('after')]
     ['RuntimeError']
+    >>> [type(error).__name__ for error in self.prepare_with_failed_write('refused_too_large', 'restore')]
+    ['DeploymentSecretRecordTooLarge']
     """
     # A fresh coordinator, dAuth node and stores: the sub-tests of one test must not see each other's operation.
     self.setUp()
-    # Only the target copy of the secret record fails; every other write is stored and confirmed.
+    # The job's stored revision for an update, which has a restoration copy; none for a create.
+    previous = self.legacy()[0] if attempt == 'restore' else None
+    # Only that copy of the secret record fails; every other write is stored and confirmed.
     self.state.fail_write = lambda namespace, key: (
-      word if namespace == 'DAUTH_JOB_SECRET_REVISIONS' and key.endswith(':deploy') else None)
+      # The word for the write of the copy named by ``attempt``; None, a stored write, for every other.
+      word if namespace == 'DAUTH_JOB_SECRET_REVISIONS' and key.endswith(':' + attempt) else None)
     # The dAuth node's own handler of a custody request, wrapped below.
     serve = self.dauth.process_dauth_reconcile_secrets_request
     # What it raised, in order.
@@ -736,36 +746,41 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     # So the coordinator gets the SDK's error of a refusal without a reason, whatever the dAuth node raised;
     # the real endpoint, which names the size refusal, is under test in test_secret_record_size_refusal.py.
     with self.assertRaises(RuntimeError):
-      # A create of job 7 on node A with one fresh secret value, 'fresh-token'.
-      self.admit()
+      # A create (or an update) of job 7 on node A with one fresh secret value, 'fresh-token'.
+      self.admit(previous)
     # The dAuth node's errors.
     return raised
 
   def test_a_secret_record_refused_for_its_size_ends_in_an_error_that_names_the_cause_and_no_value(self):
     """When the chain store refuses a deployment's secret record for its size, the dAuth node's preparation ends in
-    an error of a type of its own (a ValueError) that says the record is too large and what the job must change,
-    with no job id, node, key or secret value in it; before, it ended in the same "pending" error as a write that
-    was not confirmed."""
+    an error of a type of its own (a ValueError) that carries no text, so no job id, node, key or secret value;
+    before, it ended in the same "pending" error as a write that was not confirmed."""
     # The chain store's outcome word for a record over its size cap.
     raised = self.prepare_with_failed_write('refused_too_large')
-    # One error of the type the dAuth endpoint names to the caller, with exactly this text.
-    self.assertEqual([(type(error), str(error)) for error in raised], [(DeploymentSecretRecordTooLarge, (
-      "The deployment's secret record is larger than the store accepts: "
-      "the job must target fewer nodes or carry smaller configurations."))])
+    # One error of the type the dAuth endpoint names to the caller, without a text: the client words it.
+    self.assertEqual([(type(error), str(error)) for error in raised], [(DeploymentSecretRecordTooLarge, '')])
     # Final for the request, like every ValueError of the custody code.
     self.assertIsInstance(raised[0], ValueError)
-    # The operation the coordinator recorded, for the values the text must not hold.
+    # The operation the coordinator recorded.
     operation = self.operation()
-    # Neither the secret value, the operation id (part of the record's key), the namespace nor the app's name.
-    for part in ('fresh-token', operation['operation_id'], 'DAUTH_JOB_SECRET_REVISIONS', 'app'):
-      # Not in the error text.
-      self.assertNotIn(part, str(raised[0]))
-    # No digit either: no job id, size or limit is named.
-    self.assertFalse(any(character.isdigit() for character in str(raised[0])))
     # The refused record is not held, and the secret value is in no public store.
     self.assertNotIn(('DAUTH_JOB_SECRET_REVISIONS', '7|' + operation['operation_id'] + ':deploy'), self.state.secrets)
     # Nor in the plan or the operation record.
     self.assertNotIn('fresh-token', str(self.state.public) + str(self.state.blobs.data))
+
+  def test_a_restoration_copy_refused_for_its_size_ends_in_the_same_error(self):
+    """The copy of the job's current revision that a failed update restores, refused for its size, ends in the same
+    error type as the target copy, and nothing of the update is stored (that copy is written first); refused for
+    another reason, it keeps the "pending" error."""
+    # An update whose restoration copy the chain store refuses for its size.
+    raised = self.prepare_with_failed_write('refused_too_large', 'restore')
+    # The size refusal's own type, which the dAuth endpoint names to the caller.
+    self.assertEqual([type(error) for error in raised], [DeploymentSecretRecordTooLarge])
+    # No secret record of the update is held: the target copy was not written either.
+    self.assertEqual([key for namespace, key in self.state.secrets if namespace == 'DAUTH_JOB_SECRET_REVISIONS'], [])
+    # The same copy refused for its depth: the retryable error of before.
+    self.assertEqual([(type(error), str(error)) for error in self.prepare_with_failed_write('refused_too_deep', 'restore')],
+                     [(RuntimeError, 'Deployment secret preparation is pending.')])
 
   def test_every_other_failed_write_of_a_secret_record_keeps_the_pending_error(self):
     """A secret record's write that fails for any reason but its size still ends in the retryable error

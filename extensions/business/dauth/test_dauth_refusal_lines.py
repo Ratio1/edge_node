@@ -523,9 +523,9 @@ class RefusalLineNamesTests(unittest.TestCase):
     class LookAlike(ValueError):
       """An error type with the size refusal's name pattern that is not the size refusal."""
 
-    # The text the size refusal carries on the server, here on a plain ValueError.
-    same_text = ValueError("The deployment's secret record is larger than the store accepts: "
-                           "the job must target fewer nodes or carry smaller configurations.")
+    # The text a job's owner is told about a size refusal (the client's), here on a plain ValueError.
+    same_text = ValueError("The deployment's secret record is larger than the store accepts: the new revision, or "
+                           "the current one kept for a rollback, has too many nodes or too large configurations.")
     # Failures of other kinds: the type decides, never a text.
     errors = [same_text, ValueError("record_too_large"), LookAlike("record_too_large"), KeyError("reason"),
               RuntimeError("Deployment secret preparation is pending."), DauthRefused("Sender is revoked.")]
