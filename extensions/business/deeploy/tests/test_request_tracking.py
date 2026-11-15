@@ -635,12 +635,13 @@ class RequestTrackingTests(unittest.TestCase):
     # The second write, with what the record holds then.
     self.assertEqual(len(api.writes), 2)
 
-  def test_a_write_the_store_was_not_ready_for_or_that_raised_is_tried_again_after_each_interval(self):
-    """A write that failed for a transient cause (the store had not started, or the call raised) is not forgotten:
-    one red line names the store's word, no further try is made inside the interval, a second failure in a row
-    keeps the record for the interval after it, and the first tick after the store takes writes again writes it."""
-    # The two transient words.
-    for word in ("not_ready", "error"):
+  def test_a_write_that_failed_for_a_transient_cause_is_tried_again_after_each_interval(self):
+    """A write that failed for a transient cause (the store had not started, the call raised, or the node saw no
+    other oracle online) is not forgotten: one red line names the store's word, no further try is made inside the
+    interval, a second failure in a row keeps the record for the interval after it, and the first tick after the
+    store takes writes again writes it."""
+    # The three transient words; refused_no_peers clears once the node sees the oracles online again.
+    for word in ("not_ready", "error", "refused_no_peers"):
       # One sub-test each.
       with self.subTest(outcome=word):
         # The Deeploy API's trace.
@@ -675,11 +676,11 @@ class RequestTrackingTests(unittest.TestCase):
         self.assertEqual(api.writes, [[("create-1", False)]])
 
   def test_a_write_the_store_refuses_for_good_is_logged_once_and_not_tried_again(self):
-    """A write the store refuses by a final word (no peer to send to, a field another owner holds) is logged in
-    red once and not tried again, however long the record stays the same; a later change of the record is written
-    as usual. Before, it was tried again with a red line every 30 s, for ever."""
-    # Three of the final words.
-    for word in ("refused_no_peers", "refused_readonly", "refused_token"):
+    """A write the store refuses by a final word (a field another owner holds) is logged in red once and not tried
+    again, however long the record stays the same; a later change of the record is written as usual. Before, it
+    was tried again with a red line every 30 s, for ever."""
+    # Two of the final words.
+    for word in ("refused_readonly", "refused_token"):
       # One sub-test each.
       with self.subTest(outcome=word):
         # The Deeploy API's trace.

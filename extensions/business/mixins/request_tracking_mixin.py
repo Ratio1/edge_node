@@ -207,11 +207,14 @@ class _RequestTrackingMixin(object):
     every oracle under this node's id, and the call returns; the chain store sends it again while no
     oracle confirmed it. The changed flag is cleared before the record is copied, so an answer that the
     plugin thread stamps while the write runs sets it again and is written by the next save. A write the
-    store does not take is logged in red with the store's word for it. Only the two transient words,
-    ``not_ready`` (the store has not started, or restarts) and ``error`` (the call raised), leave the
-    record marked as changed, so the save one interval later tries again. A refusal (``refused_no_peers``,
-    ``refused_readonly``, ``refused_token`` and every other ``refused_*`` word) is final for this record:
-    it is not tried again, and the record is written again only when it changes.
+    store does not take is logged in red with the store's word for it. Only the three transient words,
+    ``not_ready`` (the store has not started, or restarts), ``error`` (the call raised) and
+    ``refused_no_peers`` (this node sees no other oracle online, as while its broker link is down for
+    over a minute; the store's peer list is refreshed every 60 s), leave the record marked as changed, so
+    the save one interval later tries again. Every other refusal (``refused_readonly``, ``refused_token``
+    and the other ``refused_*`` words) is final for this record: it is not tried again, and the record is
+    written again only when it changes. A seed whose peer list holds only itself is refused with
+    ``refused_no_peers`` at every try, so it logs one red line per interval while its record is unsent.
 
     Returns
     -------
@@ -220,7 +223,7 @@ class _RequestTrackingMixin(object):
     Examples
     --------
     >>> self.__rt_save()   # the chain store has not started: red line, tried again one interval later
-    >>> self.__rt_save()   # this node has no peer to send to: one red line, not tried again
+    >>> self.__rt_save()   # another owner holds the field (refused_readonly): one red line, not tried again
     """
     # Clear the flag before the copy below: clearing it after the write forgot a change made
     # during the write, which then stayed unwritten until another tracked change.
@@ -239,12 +242,14 @@ class _RequestTrackingMixin(object):
       wait=False,
       result_info=info,
     ):
-      # Not stored and not queued. Only a store that has not started (or restarts) or a call that raised can
-      # take the same write later; every refused_* word is final for this record.
-      retry = info["outcome"] in ("not_ready", "error")
+      # Not stored and not queued. A store that has not started (or restarts), a call that raised, or a node that
+      # sees no other oracle online can take the same write later; every other refused_* word is final for this
+      # record. refused_no_peers is retried: as a final word, the trace of a request received while the node was
+      # cut off from the oracles stayed unsent after they came back online, until the next tracked request.
+      retry = info["outcome"] in ("not_ready", "error", "refused_no_peers")
       if retry:
         # The record stays marked as changed, so the save one interval later tries again. Before, every
-        # refusal was tried again: a final one (no peer, a field another owner holds) every 30 s, for ever.
+        # refusal was tried again: a final one (a field another owner holds) every 30 s, for ever.
         self.__rt_dirty = True
       # One red line per write the store did not take, for the operator reading the node log: the store's word
       # and whether the record is tried again.
