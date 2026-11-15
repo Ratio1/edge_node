@@ -37,10 +37,9 @@ def _score(f):
 
 
 def triage_record(f, triage):
-  """The host triage record of finding `f`: the map's, else the one embedded on the finding (an archive read
-  merges it there, a report build stamps it)."""
-  record = (triage or {}).get(f.get("finding_id"))
-  return record if record is not None else f.get("triage")
+  """The host triage record of finding `f`, from the live map only: a record embedded on the finding is a
+  read-time stamp, never a source (a removed record must not read closed)."""
+  return (triage or {}).get(f.get("finding_id"))
 
 
 def effective_status(record, now):
@@ -54,14 +53,8 @@ def effective_status(record, now):
 
 
 def _is_closed(f, triage, now):
-  record = triage_record(f, triage)
-  status = effective_status(record, now)
-  if status in CLOSED_STATUSES:
-    return True
-  if status != "accepted_risk":
-    return False
-  review_at = record.get("review_at") if isinstance(record, dict) else None
-  return not isinstance(review_at, (int, float)) or review_at > now  # past `review_at` it reads `reopened`
+  status = effective_status(triage_record(f, triage), now)
+  return status in CLOSED_STATUSES or status == "accepted_risk"  # past `review_at` the status reads `reopened`
 
 
 def apply_triage(findings, triage):

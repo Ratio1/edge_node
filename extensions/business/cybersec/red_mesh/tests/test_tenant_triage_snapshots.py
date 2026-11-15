@@ -23,11 +23,12 @@ class TestTenantTriageSnapshots(unittest.TestCase):
     self.state = {"job_id": "job-0", "finding_id": "finding-1", "status": "open", "note": "reviewed",
                   "actor": "reviewer", "updated_at": 1, "tenant_id": self.tenant, "host": "192.0.2.10"}
     self.owner.points[self.point] = self.state
+    self.read = {**self.state, "effective_status": "open"}  # what a reader gets: the record and its effective status
 
   def test_archive_uses_point_state_and_preserves_detached_binding(self):
     result = triage.get_job_archive_with_triage(self.owner, "job-1", checked_job=self.job)
     self.assertEqual(self.owner.reads, [("artifact", "archive"), self.point])
-    self.assertEqual(result["archive"]["passes"][0]["findings"][0]["triage"], self.state)
+    self.assertEqual(result["archive"]["passes"][0]["findings"][0]["triage"], self.read)
     self.assertEqual(result["execution_binding"], self.job["execution_binding"])
     result["triage"]["finding-1"]["note"] = "changed"
     self.assertEqual(self.state["note"], "reviewed")
@@ -36,8 +37,21 @@ class TestTenantTriageSnapshots(unittest.TestCase):
     result = triage.get_job_triage(self.owner, "job-1", "finding-1", checked_job=self.job)
     self.assertTrue(result["found"])
     self.assertNotIn("audit", result)
-    self.assertEqual(result["triage"], self.state)
+    self.assertEqual(result["triage"], self.read)
     self.assertEqual(self.owner.reads, [("artifact", "archive"), self.point])
+
+  def test_an_expired_accepted_risk_reads_reopened_beside_its_stored_status(self):
+    self.owner.points[self.point] = {**self.state, "status": "accepted_risk", "review_at": 5}
+    for result in (triage.get_job_triage(self.owner, "job-1", "finding-1", checked_job=self.job),
+                   {"triage": triage.get_job_triage(self.owner, "job-1", checked_job=self.job)["triage"]["finding-1"]},
+                   {"triage": triage.get_job_archive_with_triage(
+                     self.owner, "job-1", checked_job=self.job)["triage"]["finding-1"]}):
+      self.assertEqual((result["triage"]["status"], result["triage"]["effective_status"]),
+                       ("accepted_risk", "reopened"))
+    self.owner.points[self.point] = {**self.state, "status": "accepted_risk", "review_at": 10**12}
+    live = triage.get_job_triage(self.owner, "job-1", "finding-1", checked_job=self.job)
+    self.assertEqual(live["triage"]["effective_status"], "accepted_risk")
+    self.assertEqual(self.owner.points[self.point]["status"], "accepted_risk")  # the store is untouched
 
   def test_unknown_finding_denies_before_state_read(self):
     with self.assertRaises(AdministrationDenied) as caught:
@@ -105,7 +119,7 @@ class TestTenantTriageSnapshots(unittest.TestCase):
   def test_exact_finding_budget_succeeds_and_duplicates_read_state_once(self):
     self.archive["passes"][0]["findings"] = [{"finding_id": "finding-1"} for _ in range(10000)]
     result = triage.get_job_triage(self.owner, "job-1", checked_job=self.job)
-    self.assertEqual(result["triage"], {"finding-1": self.state})
+    self.assertEqual(result["triage"], {"finding-1": self.read})
     self.assertEqual(self.owner.reads, [("artifact", "archive"), self.point])
 
   def test_missing_archive_and_broken_reference_are_distinct(self):

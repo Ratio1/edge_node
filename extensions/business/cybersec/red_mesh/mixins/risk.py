@@ -512,12 +512,14 @@ class _RiskScoringMixin:
     # leave the walk, and so do closed ones (the triage map). A rollup scores once, as its highest-severity member (that member's confidence); possible
     # findings add 0. Non-CVE tentative findings keep the 0.5 multiplier.
     # The host triage map: a closed finding leaves the walk; a confirmed possible one is certain from here on.
-    flat_findings = apply_triage(flat_findings, triage)
-    cve_view = build_cve_view(flat_findings, (aggregated_report.get("cves_not_applicable") or {}).values(), triage)
-    scored = flat_findings
+    # The stamped copies only score; the returned list stays unstamped, because it is persisted in R1FS and a
+    # triage record there would outlive its removal (readers stamp the live map on read).
+    stamped = apply_triage(flat_findings, triage)
+    cve_view = build_cve_view(stamped, (aggregated_report.get("cves_not_applicable") or {}).values(), triage)
+    scored = stamped
     if cve_view:
       listed_ids = view_members(cve_view)[0]
-      by_id = {f["finding_id"]: f for f in flat_findings if is_view_finding(f) and f.get("finding_id")}
+      by_id = {f["finding_id"]: f for f in stamped if is_view_finding(f) and f.get("finding_id")}
       rollup_tops = [
         max((by_id[i] for i in service["rollup"]["member_finding_ids"]),
             key=lambda m: (SEVERITY_RANK.get(str(m.get("severity")).upper(), 0),
@@ -525,7 +527,7 @@ class _RiskScoringMixin:
         for service in cve_view["services"] if service["rollup"]
       ]
       # A view finding scores only when listed; a closed one leaves with the folded ones.
-      scored = [f for f in flat_findings
+      scored = [f for f in stamped
                 if not is_view_finding(f) or f["finding_id"] in listed_ids] + rollup_tops
     for f in scored:
       if _is_coverage_result(f):

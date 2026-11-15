@@ -293,17 +293,18 @@ def get_job_data(owner, job_id: str, *, checked_job=_UNSET, snapshot_mode="tenan
   }
 
 
-def with_cve_views(archive: dict) -> dict:
+def with_cve_views(archive: dict, triage=None) -> dict:
   """A copy of `archive` whose passes carry a computed `cve_view` beside `findings` (RM-169).
 
   Only for generated CVE findings: a pass with none gets no key. Never stored: the stored archive is not
-  touched and this runs on every read. `triage` is not passed yet (the triage phase). The archive holds no
+  touched and this runs on every read. `triage` is the live host triage map: a closed finding is counted in
+  `closed` only; the finding's own embedded record is not read. The archive holds no
   not-applicable records (they live in the pass's aggregated report), so `counts.dropped` is the one the pass
   stored in `risk_breakdown.cve_view_counts` (0 when it has none), added to `raw`.
   """
   passes = []
   for pass_data in archive.get("passes") or []:
-    view = build_cve_view(pass_data.get("findings") or []) if isinstance(pass_data, dict) else None
+    view = build_cve_view(pass_data.get("findings") or [], triage=triage) if isinstance(pass_data, dict) else None
     if view:
       stored = ((pass_data.get("risk_breakdown") or {}).get("cve_view_counts") or {}).get("dropped")
       dropped = stored if type(stored) is int and stored > 0 else 0
@@ -327,7 +328,7 @@ def get_job_archive(owner, job_id: str, summary_only: bool = False, pass_offset:
     return result
   if result["archive"].get("job_type") == "model_test":
     return result
-  result = {**result, "archive": with_cve_views(result["archive"])}
+  result = {**result, "archive": with_cve_views(result["archive"], result.get("triage"))}
   if summary_only or int(pass_offset or 0) > 0 or int(pass_limit or 0) > 0:
     result = dict(result)
     result["archive"] = _paginate_archive_passes(

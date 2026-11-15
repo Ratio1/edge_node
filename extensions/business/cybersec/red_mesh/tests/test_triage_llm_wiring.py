@@ -1,6 +1,7 @@
 """Step 4a S6: closed and confirmed findings in the LLM payload of the agent mixin and in the structured input."""
 import unittest
 
+from extensions.business.cybersec.red_mesh.cve_view import apply_triage
 from extensions.business.cybersec.red_mesh.llm_input_builder import build_llm_input
 from extensions.business.cybersec.red_mesh.mixins.redmesh_llm_agent import _RedMeshLlmAgentMixin
 from .test_execution_binding_models import binding_payload
@@ -87,11 +88,12 @@ class TestAgentPayloadReadsHostTriage(unittest.TestCase):
 
 
 class TestStructuredInputReadsStampedFindings(unittest.TestCase):
-  def test_the_structured_llm_input_drops_a_closed_cve_via_the_stamp_from_the_report_build(self):
-    # finalization passes the flat findings of `_compute_risk_and_findings` (stamped) to the structured analysis
+  def test_the_structured_llm_input_drops_a_closed_cve_via_the_stamp_from_the_live_map(self):
+    # finalization stamps the live host map on the flat findings (`apply_triage`) for the structured analysis only
     findings = [finding(1, "CRITICAL", kev=True), finding(2, "HIGH", kev=True)]
-    _, flat = compute(findings, {"id0002": {"status": "remediated"}})
-    out = build_llm_input(findings=flat, aggregated_report={})
+    triage = {"id0002": {"status": "remediated"}}
+    _, flat = compute(findings, triage)
+    out = build_llm_input(findings=apply_triage(flat, triage), aggregated_report={})
     self.assertEqual(out.to_dict()["scan_summary"]["cve_view"]["counts"]["closed"], 1)
     self.assertEqual(len(out.to_dict()["findings"]), 1)
 

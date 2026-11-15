@@ -85,7 +85,7 @@ class TestTriageWrite(unittest.TestCase):
     stored = self.owner.hashes[self.hkey][f"{HOST}\x1ff1"]
     self.assertEqual((stored["status"], stored["tenant_id"], stored["host"], stored["job_id"], stored["actor"]),
                      ("false_positive", TENANT_A, HOST, "job-1", "analyst"))
-    self.assertEqual(self.owner.hashes[f"inst:triage:audit:{TENANT_A}"][f"{HOST}\x1ff1"][0]["actor"], "analyst")
+    self.assertEqual(triage._job_repo(self.owner).get_host_triage_audit(TENANT_A, HOST, "f1")[0]["actor"], "analyst")
     self.assertEqual(emit.call_args.kwargs["event_action"], "triaged")
     self.assertEqual(self.owner.audit[0][0], "finding_triage_updated")
     self.assertNotIn("inst:triage", self.owner.hashes)  # nothing under the legacy keys
@@ -110,7 +110,7 @@ class TestTriageWrite(unittest.TestCase):
     self.assertTrue(again["complete"])
     emit.assert_not_called()
     audit = self.owner.hashes[f"inst:triage:audit:{TENANT_A}"]
-    self.assertEqual({len(v) for v in audit.values()}, {1})
+    self.assertEqual(len(audit), 3)  # one entry per member, none added by the retry
 
   def test_a_member_outside_the_archive_is_listed_and_the_set_is_not_complete(self):
     result, _ = write(self.owner, ids=["f1", "zzz"])
@@ -141,6 +141,15 @@ class TestTriageWrite(unittest.TestCase):
     self.assertEqual(write(self.owner, status="false_positive", confirm=True)[0]["error"], "validation_error")
     self.assertNotIn(self.hkey, self.owner.hashes)
 
+  def test_a_note_over_the_cap_is_refused_before_any_write(self):
+    from extensions.business.cybersec.red_mesh.tenancy.tenant_assets import NOTES_MAX
+    self.assertEqual(NOTES_MAX, 2000)
+    result, _ = write(self.owner, note="x" * 2001)
+    self.assertEqual(result["error"], "validation_error")
+    self.assertNotIn(self.hkey, self.owner.hashes)
+    ok, _ = write(self.owner, note="x" * 2000)
+    self.assertNotIn("error", ok)
+
   def test_confirm_records_the_actor_on_a_tentative_finding_only(self):
     self.owner.add_job("job-t", findings=("t1",), confidence="tentative")
     result, _ = write(self.owner, job_id="job-t", ids="t1", status="open", confirm=True)
@@ -149,6 +158,26 @@ class TestTriageWrite(unittest.TestCase):
     firm, _ = write(self.owner, ids="f1", status="open", confirm=True)
     self.assertEqual(firm["results"][0]["outcome"], "not_tentative")
     self.assertNotIn(f"{HOST}\x1ff1", self.owner.hashes.get(self.hkey, {}))
+
+  def test_bad_input_is_a_validation_error_even_while_a_submission_is_pending(self):
+    self.owner.pending("job-1")
+    for kw in ({"status": "wont_fix"}, {"status": "accepted_risk", "review_at": 1.0}, {"confirm": True},
+               {"note": "x" * 2001}, {"ids": []}):
+      self.assertEqual(write(self.owner, **kw)[0]["error"], "validation_error", kw)
+    self.assertEqual(write(self.owner)[0]["error"], "submission_in_progress")
+
+  def test_a_later_write_keeps_the_confirmation_unless_dismissed_as_false_positive(self):
+    self.owner.add_job("job-t", findings=("t1",), confidence="tentative")
+    write(self.owner, job_id="job-t", ids="t1", status="open", confirm=True)
+    kept, _ = write(self.owner, job_id="job-t", ids="t1", status="remediated", actor="other", note="fixed")
+    stored = kept["results"][0]["triage"]
+    self.assertEqual((stored["status"], stored["confirmed"], stored["confirmed_by"]), ("remediated", True, "analyst"))
+    again, _ = write(self.owner, job_id="job-t", ids="t1", status="remediated", actor="other", note="fixed")
+    self.assertEqual(again["results"][0]["outcome"], "unchanged")
+    dismissed, _ = write(self.owner, job_id="job-t", ids="t1", status="false_positive")
+    stored = dismissed["results"][0]["triage"]
+    self.assertNotIn("confirmed", stored)
+    self.assertNotIn("confirmed_by", stored)
 
   def test_model_unbound_running_and_foreign_launcher_jobs_are_refused(self):
     model = {"kind": "model", "adapter": "openai_compatible",

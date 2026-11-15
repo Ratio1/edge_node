@@ -409,14 +409,27 @@ class Inventory:
 
   def _triage_class(self, kind, tenant_id, field, value):
     """A row is current while its tenant is live, its field names a host and finding, and the value has the
-    shape the writer stores; with the tenant gone it is an orphan (or old when the tenant row is stored but
-    not current), as an integration status row is."""
+    shape and identity the writer stores; with the tenant gone it is an orphan (or old when the tenant row is
+    stored but not current), as an integration status row is."""
     if tenant_id not in self._live_tenants():
       stored = any(k == "tenant" and ids == [tenant_id] and row is not None
                    for _, k, ids, row in self._tenancy_fields())
       return (OLD, "old_tenant") if stored else (ORPHAN, "tenant_gone")
-    shaped = isinstance(field, str) and field.count("\x1f") == 1 and all(field.split("\x1f"))
-    return (CURRENT, "") if shaped and isinstance(value, dict if kind == "t" else list) else (OLD, "unrecognized")
+    return (CURRENT, "") if self._triage_identity_ok(kind, tenant_id, field, value) else (OLD, "unrecognized")
+
+  @staticmethod
+  def _triage_identity_ok(kind, tenant_id, field, value):
+    """A `t` row is `host, finding`; an audit entry is `host, finding, entry id`; the value must name the same
+    tenant, host and finding, as the writer stores it (a restored row is read by unchecked readers)."""
+    parts = field.split("\x1f") if isinstance(field, str) else []
+    return (len(parts) == (2 if kind == "t" else 3) and all(parts) and isinstance(value, dict)
+            and value.get("tenant_id") == tenant_id and value.get("host") == parts[0]
+            and value.get("finding_id") == parts[1])
+
+  def is_mismatched_triage(self, hkey, field, value):
+    """A host-triage row whose field or value does not match its hkey: a restore never writes it."""
+    triage = self._triage_tenant(hkey)
+    return triage is not None and not self._triage_identity_ok(*triage, field, value)
 
   def is_status_hkey(self, hkey):
     return isinstance(hkey, str) and hkey.startswith(f"{self._instance}:integrations")
@@ -832,7 +845,8 @@ def restore_records(owner, inventory, rows):
     hkey, field, value = row["hkey"], row["field"], row["value"]
     outcome = "written"
     if (not inventory.accepts(hkey) or inventory.is_retired_field(hkey, field)
-        or inventory.is_unreadable_override(hkey, field, value)):
+        or inventory.is_unreadable_override(hkey, field, value)
+        or inventory.is_mismatched_triage(hkey, field, value)):
       outcome = "refused"
     else:
       stored = owner.chainstore_hget(hkey=hkey, key=field)
