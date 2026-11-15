@@ -5,9 +5,11 @@ import os
 from .common import HERE, LABEL, NODE_IMAGE, PROJECT, PYTHON, LocalnetError, container, ip, sh
 from .nodes import FLEET_VOLUME
 
-GENERATORS = ('fleet', 'cstore', 'dauth', 'deeploy', 'probe')
-# Fixed addresses: the front can then send one generator's requests to a chosen oracle (see "pin").
-ADDRESS = {'fleet': ip(211), 'cstore': ip(212), 'dauth': ip(213), 'deeploy': ip(214)}
+# The generators of load/, among them the one-write CStore client and the late-answering dAuth relay.
+GENERATORS = ('fleet', 'cstore', 'dauth', 'deeploy', 'probe', 'cstore_put', 'slowdauth')
+# Fixed addresses: the front can then send one generator's requests to a chosen oracle (see "pin"), and the
+# late-answering dAuth relay has an address the front's pin can name.
+ADDRESS = {'fleet': ip(211), 'cstore': ip(212), 'dauth': ip(213), 'deeploy': ip(214), 'slowdauth': ip(215)}
 
 
 def name_of(generator, tag=None):

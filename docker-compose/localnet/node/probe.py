@@ -17,6 +17,9 @@ handled   recv - dropped - queue
 hz        plugin loop rate as the plugin reports it
 iter      loop iterations so far
 errors    plugin loop exceptions so far
+
+Per sample, besides process and control-group counters: ``main_iter``, the node's main-loop iterations so
+far. The period is ``R1_LOCALNET_PROBE_PERIOD`` seconds (default 5; ``init --probe-period``).
 """
 
 import json
@@ -135,6 +138,21 @@ class Probe(threading.Thread):
     return res
 
   def sample(self):
+    """
+    One sample of the process, its control group and, once the node is attached, its plugins and main loop.
+
+    Returns
+    -------
+    dict
+      ``t`` (epoch seconds), ``up`` (seconds since the probe started), ``cpu`` (process CPU seconds), open file
+      descriptors, process and control-group counters and, with the node attached, ``plugins`` (per plugin
+      instance: inputs, queue, loop rate and iterations) and ``main_iter`` (main-loop iterations so far).
+
+    Examples
+    --------
+    >>> Probe('/out/probe.jsonl').sample()['up'] >= 0
+    True
+    """
     row = {
       't': round(time.time(), 3),
       'up': round(time.time() - self._t0, 1),
@@ -146,6 +164,9 @@ class Probe(threading.Thread):
     row.update(_read_cgroup())
     if self.eng is not None:
       row['plugins'] = self._plugins()
+      # Iterations of the node's main loop so far (the "itr" of its heartbeat line), so a reader can find the
+      # pauses of the main loop at the probe's resolution instead of the heartbeat line's 20 s average.
+      row['main_iter'] = self.eng._main_loop_counts['ITER']
     return row
 
   def run(self):

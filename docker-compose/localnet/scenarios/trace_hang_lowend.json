@@ -1,0 +1,16 @@
+{
+ "name": "trace_hang_lowend",
+ "about": "Start A of trace_hang.json with the Deeploy oracle r1s-01 limited to 0.35 CPU (set 120 s before the request). Run after trace_hang.json on the same cluster: it reuses the jobs that scenario registered and the dAuth relay it started, which keeps running.",
+ "steps": [
+  {"do": "node", "node": "r1s-01", "cpus": 0.35},
+  {"do": "wait", "seconds": 120},
+  {"do": "pin", "client": "r1s-01", "to": "slowdauth"},
+  {"do": "mark", "name": "c"},
+  {"do": "load", "generator": "deeploy", "tag": "run", "args": ["create", "--job", "3003", "--nodes", "r1w-01"]},
+  {"do": "trace", "node": "r1s-01", "endpoint": "create_pipeline", "from": "c", "timeout": 150, "name": "c_lowend"},
+  {"do": "pin", "client": "r1s-01", "to": null},
+  {"do": "wait", "until": "c", "seconds": 240},
+  {"do": "loops", "node": "r1s-01", "from": "c", "name": "r1s-01_lowend"},
+  {"do": "cstats", "name": "run", "from": "scenario", "nodes": ["r1s-01", "r1s-02", "r1s-db"]}
+ ]
+}

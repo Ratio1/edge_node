@@ -115,6 +115,170 @@ def node_probe(home, name, start, end):
   return result
 
 
+def _loop_series(times, counts, floor_hz, window_s):
+  """
+  Pauses and slow stretches of one loop, from its iteration counter sampled over time.
+
+  Parameters
+  ----------
+  times : list of float
+    Sample times, epoch seconds, increasing, from one run of the process (the counter never goes back).
+  counts : list of int
+    The loop's iterations so far at each sample.
+  floor_hz : float
+    The lowest acceptable average rate.
+  window_s : float
+    Length of the shortest stretch the rate is averaged over.
+
+  Returns
+  -------
+  dict
+    ``stall_s``: the longest time the counter did not move, at least (first to last of equal samples) and
+    ``stall_bound_s`` at most (one sample more on each side), with ``stall_at`` (epoch seconds, its start);
+    ``under_floor_s``: the longest stretch whose average rate stayed under ``floor_hz``, with ``under_floor_at``;
+    ``min_rate_hz``: the lowest average rate over any stretch of at least ``window_s``; ``p50_hz``: the median rate
+    between two samples.
+
+  Examples
+  --------
+  >>> _loop_series([0, 1, 2, 3, 4], [0, 10, 10, 10, 20], 1.0, 2.0)['stall_s']
+  2
+  """
+  # No stall found yet.
+  best = {'stall_s': 0, 'stall_bound_s': 0, 'stall_at': None}
+  # Walk the samples, one run of equal counts at a time.
+  idx = 1
+  # Until the last sample.
+  while idx < len(times):
+    if counts[idx] != counts[idx - 1]:
+      # The loop moved between these two samples.
+      idx += 1
+      continue
+    # A run of equal samples starts at idx - 1; find its last sample.
+    last = idx
+    # Up to the last sample with the same count.
+    while last + 1 < len(times) and counts[last + 1] == counts[idx - 1]:
+      # The run goes on.
+      last += 1
+    # At least the span of the equal samples, at most one sample more on each side.
+    low = times[last] - times[idx - 1]
+    # The upper bound reaches the samples just outside the run (or the ends of the series).
+    high = times[min(last + 1, len(times) - 1)] - times[max(idx - 2, 0)]
+    if low > best['stall_s']:
+      # The longest stall so far, with its bounds and start.
+      best = {'stall_s': round(low, 1), 'stall_bound_s': round(high, 1), 'stall_at': times[idx - 1]}
+    # On to the sample after the run.
+    idx = last + 1
+  # The longest stretch whose average rate stayed under the floor (every pair of samples; a few thousand at most).
+  under, under_at = 0.0, None
+  # From each sample as the stretch's start.
+  for first in range(len(times)):
+    # Longest stretch first, so the first one under the floor is the longest from this start.
+    for later in range(len(times) - 1, first, -1):
+      # The stretch's length.
+      span = times[later] - times[first]
+      if span <= under:
+        break
+      if (counts[later] - counts[first]) / span < floor_hz:
+        # The longest under-floor stretch that starts at this sample.
+        under, under_at = span, times[first]
+        break
+  # The lowest average over the shortest stretch of at least window_s from each sample.
+  rates = []
+  # From each sample as the stretch's start.
+  for first in range(len(times)):
+    # The first later sample at least window_s away.
+    later = next((k for k in range(first + 1, len(times)) if times[k] - times[first] >= window_s), None)
+    if later is not None:
+      # That stretch's average rate.
+      rates.append((counts[later] - counts[first]) / (times[later] - times[first]))
+  # The rate between each two neighbouring samples.
+  steps = [(counts[k] - counts[k - 1]) / (times[k] - times[k - 1]) for k in range(1, len(times)) if times[k] > times[k - 1]]
+  # The stall, the slow stretch, the lowest windowed rate and the median rate.
+  return dict(best, under_floor_s=round(under, 1), under_floor_at=under_at,
+              min_rate_hz=rnd(min(rates), 2) if rates else None, p50_hz=rnd(pct(steps, 50), 1))
+
+
+def loop_gaps(home, name, start, end, floor_hz=1.0, window_s=10.0):
+  """
+  How the main loop and the chain-store plugin loop of one node kept going in a window, from its probe.
+
+  Parameters
+  ----------
+  home : Home
+    Folder layout of the localnet; the node's ``probe.jsonl`` is read.
+  name : str
+    Node name.
+  start : float
+    Window start, epoch seconds.
+  end : float
+    Window end, epoch seconds.
+  floor_hz : float, optional
+    Lowest acceptable average loop rate (default 1 Hz).
+  window_s : float, optional
+    Shortest stretch the rate is averaged over (default 10 s).
+
+  Returns
+  -------
+  dict
+    ``samples``, ``period_s`` (median spacing of the samples, the resolution of every figure) and, for ``main``
+    (the node's main loop, probe field ``main_iter``) and ``chain_store`` (the chain-store plugin's own loop),
+    what ``_loop_series`` returns, taken over the longest part of the window without a restart of the node.
+
+  Examples
+  --------
+  >>> loop_gaps(home, 'r1s-db', time.time() - 900, time.time())['main']['stall_s']
+  1.0
+  """
+  # The probe's samples in the window.
+  rows = read_jsonl(home.run / 'out' / name / 'probe.jsonl', start, end)
+  # Split at a restart of the node (the probe's uptime goes back); keep the longest part.
+  parts, current = [], []
+  # Each sample in order.
+  for row in rows:
+    if current and row['up'] < current[-1]['up']:
+      # A new process: the part before it is closed.
+      parts.append(current)
+      # And a new part begins.
+      current = []
+    # The sample joins the current part.
+    current.append(row)
+  # The last part.
+  parts.append(current)
+  # The longest part: its counters never go back.
+  rows = max(parts, key=len)
+  if len(rows) < 3:
+    # Too few samples for any figure.
+    return {'samples': len(rows)}
+  # Sample times.
+  times = [row['t'] for row in rows]
+  # The resolution of every figure below, and when the part starts.
+  result = {'samples': len(rows), 'period_s': rnd(pct([b - a for a, b in zip(times, times[1:])], 50), 2),
+            'from_utc': datetime.fromtimestamp(times[0], timezone.utc).strftime('%H:%M:%S')}
+  # The main loop, in samples that carry its counter (a probe of an earlier tool version has none).
+  main = [(row['t'], row['main_iter']) for row in rows if 'main_iter' in row]
+  if len(main) >= 3:
+    # Its stall, slow stretch and rates.
+    result['main'] = _loop_series([item[0] for item in main], [item[1] for item in main], floor_hz, window_s)
+  # The chain-store plugin's loop: its instance key carries the signature as the middle part.
+  key = next((key for key in (rows[-1].get('plugins') or {}) if key.split('|')[1] == 'CHAIN_STORE_BASE'), None)
+  # Its iteration counter in each sample that has it.
+  store = [(row['t'], row['plugins'][key]['iter']) for row in rows
+           if key in (row.get('plugins') or {}) and isinstance(row['plugins'][key].get('iter'), int)]
+  if len(store) >= 3:
+    # Its stall, slow stretch and rates.
+    result['chain_store'] = _loop_series([item[0] for item in store], [item[1] for item in store], floor_hz, window_s)
+  # Each loop measured.
+  for loop in ('main', 'chain_store'):
+    # Each time field.
+    for field in ('stall_at', 'under_floor_at'):
+      if result.get(loop, {}).get(field):
+        # Times also as UTC clock times, for reading against node logs.
+        result[loop][field + '_utc'] = datetime.fromtimestamp(result[loop][field], timezone.utc).strftime('%H:%M:%S')
+  # Both loops.
+  return result
+
+
 def node_log(name, start, end):
   stamp = lambda value: datetime.fromtimestamp(value, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
   out = sh('docker', 'logs', '--since', stamp(start), '--until', stamp(end), container(name), check=False, timeout=180).stdout or ''

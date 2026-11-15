@@ -162,9 +162,11 @@ class TestSeeding(unittest.TestCase):
 
 class TestScenarios(unittest.TestCase):
 
-  # Every step type lnlib/scenario.py runs, the container-app steps (custody and secret scan included).
+  # Every step type lnlib/scenario.py runs, the container-app steps (custody and secret scan included), and the
+  # marks, statistics lines, loop pauses, request trace and held fields of the catch-up, cap and trace scenarios.
   STEPS = {'load', 'run', 'unload', 'wait', 'phase', 'node', 'chain', 'profile', 'replicas', 'pin', 'note',
-           'image', 'isolation', 'sync', 'switch', 'custody', 'scan', 'seed_history'}
+           'image', 'isolation', 'sync', 'switch', 'custody', 'scan', 'seed_history',
+           'mark', 'cstats', 'loops', 'trace', 'held'}
 
   def test_shipped_scenarios_use_known_steps_and_generators(self):
     """Every shipped scenario names itself, has unique phases, and uses only step types and generators that exist."""
@@ -181,6 +183,70 @@ class TestScenarios(unittest.TestCase):
         if step['do'] in ('load', 'run'):
           # A load step must name a generator script that exists under load/.
           self.assertTrue((HERE / 'load' / (step['generator'] + '.py')).exists(), step)
+
+
+class TestCatchupReaders(unittest.TestCase):
+
+  def test_a_statistics_line_names_its_buckets_and_sums_its_refusals(self):
+    """A CSTORE_STATS line of docker logs is read with its time, named buckets, resync counters and refusal sum."""
+    from lnlib import cstats
+    from lnlib.replicas import bucket
+    ops, dauth = bucket('DEEPLOY_OPERATIONS'), bucket('DAUTH_JOB_SECRETS')
+    # A docker time stamp whose trailing zeros were dropped, colour codes, and text after the object.
+    counts = {ops + '/resync/asked': 1, ops + '/resync/answered': 2, ops + '/resync/merged': 7,
+              dauth + '/remote/refused_not_member': 4, 'plain/remote/refused_invalid_key': 1, 'plain/local/error': 2,
+              'saves': 3}
+    line = '2026-11-15T01:00:00.25Z \x1b[1;37m[EE] CSTORE_STATS ' + json.dumps(
+      {'counts': counts, 'lost_inputs': 0, 'queue_peak': 5, 'period_s': 300}) + '\x1b[0m'
+    found = cstats.parse(line + '\nanother line\n')
+    # One statistics line, at the stamp's time with its fraction.
+    self.assertEqual(len(found['stats']), 1)
+    self.assertAlmostEqual(found['stats'][0]['time'] % 60, 0.25)
+    row = cstats.summary(found)['lines'][0]
+    # Resync counters under the namespace's name.
+    self.assertEqual(row['resync'], {'DEEPLOY_OPERATIONS': {'asked': 1, 'answered': 2, 'merged': 7}})
+    # Every refusal and error is listed; the sum leaves out remote refused_not_member, as gate G0 does.
+    self.assertEqual(row['refusals']['DAUTH_JOB_SECRETS/remote/refused_not_member'], 4)
+    self.assertEqual(row['refusal_sum'], 3)
+
+  def test_replica_counts_are_kept_apart_per_namespace(self):
+    """What an oracle lacks, holds otherwise or holds alone is counted in all and under one namespace's bucket."""
+    from lnlib.replicas import _counts, bucket, field
+    ops = bucket('DEEPLOY_OPERATIONS')
+    # The majority holds two records of the namespace and one plain key.
+    majority = {ops + 'YQ': 'd1', ops + 'Yg': 'd2', 'plain': 'd3'}
+    # This oracle lacks one, holds the other with another value, and holds one record nobody else holds.
+    mine = {ops + 'Yg': 'zz', ops + 'Yw': 'd4', 'plain': 'd3'}
+    self.assertEqual(_counts(majority, mine, ops), {'records': 2, 'missing': 1, 'different': 1, 'only_here': 1})
+    self.assertEqual(_counts(majority, mine), {'records': 3, 'missing': 1, 'different': 1, 'only_here': 1})
+    # A field part without its padding decodes; a key of another namespace gives None.
+    self.assertEqual(field(ops + 'cjFzLTAx', ops), 'r1s-01')
+    self.assertIsNone(field('plain', ops))
+
+  def test_a_loop_stall_and_a_slow_stretch_are_found(self):
+    """The longest stall of a loop counter is bounded from both sides, and a stretch under the floor rate is found."""
+    from lnlib.metrics import _loop_series
+    # Ten samples a second apart: 10 Hz, then 4 s without an iteration, then 10 Hz again.
+    times = list(range(10))
+    counts = [0, 10, 20, 20, 20, 20, 20, 30, 40, 50]
+    result = _loop_series(times, counts, 1.0, 2.0)
+    # Equal samples from t=2 to t=6: at least 4 s, at most 6 s.
+    self.assertEqual((result['stall_s'], result['stall_bound_s'], result['stall_at']), (4, 6, 2))
+    # The longest stretch under 1 Hz is the stall itself; over 2 s the lowest rate is 0.
+    self.assertEqual(result['under_floor_s'], 4.0)
+    self.assertEqual(result['min_rate_hz'], 0.0)
+
+  def test_the_request_trace_of_a_writer_is_found_by_its_field(self):
+    """The Deeploy request trace of one oracle is read from a replica by the decoded field of its key."""
+    from lnlib import trace
+    from lnlib.replicas import bucket
+    requests = [{'endpoint': 'create_pipeline', 'date_start': '2026-11-15 01:00:00', 'date_complete': None}]
+    # The trace of r1s-01 and of another oracle, keyed as the chain store keys them.
+    replica = {bucket('DEEPLOY_REQUESTS') + 'cjFzLTAx': {'value': requests},
+               bucket('DEEPLOY_REQUESTS') + 'cjFzLTAy': {'value': []}}
+    self.assertEqual(trace.trace_of(replica, 'r1s-01'), requests)
+    # A writer with no record holds no request.
+    self.assertEqual(trace.trace_of(replica, 'r1s-03'), [])
 
 
 class TestContainerApps(unittest.TestCase):

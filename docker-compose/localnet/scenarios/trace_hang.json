@@ -1,0 +1,25 @@
+{
+ "name": "trace_hang",
+ "about": "Does the request trace of a Deeploy request held in its endpoint reach the other oracles? The create endpoint of r1s-01 calls dAuth ('prepare') on its plugin thread and waits for the answer. For one request at a time, r1s-01's dAuth calls go through the front to load/slowdauth.py, which holds each call 45 s and then passes it to r1s-02's dAuth (the SDK's read timeout is 60 s, so the request then completes). No node code is changed. Start A: no tracked request on r1s-01 in the 30 s before. Start B: a quick tracked request (a refused delete) about 5 s before. Every oracle's saved replica is read about once a second until it shows the request answered. Starts after 300 s, as the previous release writes no trace in the first 300 s of the plugin.",
+ "steps": [
+  {"do": "run", "generator": "deeploy", "args": ["setup", "--first-job", "3001", "--jobs", "10", "--job-type", "16"]},
+  {"do": "load", "generator": "slowdauth", "args": ["--target", "172.31.90.52:31301", "--hold", "45"]},
+  {"do": "wait", "until": "scenario", "seconds": 330},
+  {"do": "pin", "client": "r1s-01", "to": "slowdauth"},
+  {"do": "mark", "name": "a"},
+  {"do": "load", "generator": "deeploy", "tag": "run", "args": ["create", "--job", "3001", "--nodes", "r1w-01"]},
+  {"do": "trace", "node": "r1s-01", "endpoint": "create_pipeline", "from": "a", "timeout": 110, "name": "a_idle"},
+  {"do": "pin", "client": "r1s-01", "to": null},
+  {"do": "wait", "until": "a", "seconds": 200},
+  {"do": "run", "generator": "deeploy", "args": ["delete", "--job", "3009", "--no-wait"]},
+  {"do": "mark", "name": "b_quick"},
+  {"do": "pin", "client": "r1s-01", "to": "slowdauth"},
+  {"do": "wait", "until": "b_quick", "seconds": 2},
+  {"do": "mark", "name": "b"},
+  {"do": "load", "generator": "deeploy", "tag": "run", "args": ["create", "--job", "3002", "--nodes", "r1w-02"]},
+  {"do": "trace", "node": "r1s-01", "endpoint": "create_pipeline", "from": "b", "timeout": 110, "name": "b_after_quick"},
+  {"do": "pin", "client": "r1s-01", "to": null},
+  {"do": "wait", "until": "b", "seconds": 200},
+  {"do": "cstats", "name": "run", "from": "scenario", "nodes": ["r1s-01", "r1s-02", "r1s-db"]}
+ ]
+}

@@ -15,6 +15,7 @@ create    deploy a small job on real workers and wait for it
 update    change a running job
 delete    remove a job
 load      create several jobs one after another
+cycle     create jobs one after another and delete each one after the next one is created
 watch     print the state of a job's operation every few seconds
 sync-app  deploy one container app of a container-sync set (provider or consumer) on
           one worker, as the Deeploy web app builds it; the worker must run Docker;
@@ -316,6 +317,46 @@ def worker_addresses(manifest, names):
   return [node['address'] for node in manifest['nodes'] if node['role'] == 'worker' and (not wanted or node['name'] in wanted)]
 
 
+def delete_job(client, job_id, wait=True):
+  """
+  Delete one job through the Deeploy API, as the ``delete`` command does, and record the outcome.
+
+  Parameters
+  ----------
+  client : Client
+    The signed client of the job owner.
+  job_id : int
+    The job to delete.
+  wait : bool, optional
+    Wait until the delete operation completes (default True).
+
+  Returns
+  -------
+  dict
+    The JSON line recorded for the delete (admission, phase timeline, outcome).
+
+  Examples
+  --------
+  >>> delete_job(client, 2001)['phase']
+  'completed'
+  """
+  # The job's current app and revision, which the delete request must name.
+  current = client.status(job_id=job_id)['body']
+  # A refused status answer names no app.
+  current = current if isinstance(current, dict) else {}
+  # The delete request, with the app and the revision it expects.
+  payload = {'request_id': 'delete-{}-{}'.format(job_id, uuid.uuid4().hex[:12]), 'job_id': int(job_id),
+             'app_id': current.get('app_id'), 'expected_revision': int(current.get('revision') or 0)}
+  # Signed by the job owner, through the public Deeploy name.
+  accepted = client.submit('delete_pipeline', payload)
+  # The admission answer (an error body on a refusal).
+  body = accepted['body'] if isinstance(accepted['body'], dict) else {}
+  # The operation's end, when it was accepted and the caller waits.
+  final = client.wait(body['operation_id']) if body.get('status') == 'accepted' and wait else None
+  # One JSON line with the admission, the phase timeline and the outcome.
+  return client.record('delete', job_id, accepted, final)
+
+
 def main():
   """
   Command line of the Deeploy client (see the module docstring for the commands).
@@ -374,6 +415,18 @@ def main():
   one.add_argument('--jobs', type=int, default=5)
   one.add_argument('--nodes', nargs='*')
   one.add_argument('--config-bytes', type=int, default=0)
+  # Creates and deletes in turn, as a user who replaces a job: writes every Deeploy and dAuth namespace.
+  one = sub.add_parser('cycle')
+  # Jobs registered by "setup"; each is created once and deleted after the next one is created.
+  one.add_argument('--first-job', type=int, default=2001)
+  # How many jobs in all; the cycle ends after the last one.
+  one.add_argument('--jobs', type=int, default=40)
+  # Worker names, taken in turn (default: all workers).
+  one.add_argument('--nodes', nargs='*')
+  # Settings that make each job as large as a production job, as for "create".
+  one.add_argument('--config-bytes', type=int, default=0)
+  # Seconds between two steps of the cycle.
+  one.add_argument('--pause', type=float, default=5.0)
   args = parser.parse_args()
 
   # The cluster's private settings also give each named set its secret (sync-app --secret).
@@ -436,15 +489,37 @@ def main():
       client.record('create', job_id, accepted, final)
     return 0
 
+  if args.cmd == 'cycle':
+    # The workers' node addresses.
+    workers = worker_addresses(manifest, args.nodes)
+    # The job created last, deleted after the next one is created, so one job stays alive between steps.
+    previous = None
+    # Each registered job once.
+    for idx, job_id in enumerate(range(args.first_job, args.first_job + args.jobs)):
+      # One worker per job, taken in turn.
+      accepted = client.submit('create_pipeline', create_payload(job_id, [workers[idx % len(workers)]], 'lnet{}'.format(job_id),
+                                                                config_bytes=args.config_bytes))
+      # The admission answer (an error body on a refusal).
+      body = accepted['body'] if isinstance(accepted['body'], dict) else {}
+      # Each create is waited for, so the operations follow one another as a user's do.
+      final = client.wait(body['operation_id']) if body.get('status') == 'accepted' else None
+      # One JSON line per create.
+      client.record('create', job_id, accepted, final)
+      if previous is not None:
+        # The job before it goes, which rewrites records written before it.
+        delete_job(client, previous)
+      # This job is deleted after the next one is created.
+      previous = job_id
+      # A short pause between two steps of the cycle.
+      time.sleep(args.pause)
+    # Every job was created (and all but the last deleted).
+    return 0
+
   current = client.status(job_id=args.job)['body']
   current = current if isinstance(current, dict) else {}
   if args.cmd == 'delete':
-    payload = {'request_id': 'delete-{}-{}'.format(args.job, uuid.uuid4().hex[:12]), 'job_id': int(args.job),
-               'app_id': current.get('app_id'), 'expected_revision': int(current.get('revision') or 0)}
-    accepted = client.submit('delete_pipeline', payload)
-    body = accepted['body'] if isinstance(accepted['body'], dict) else {}
-    final = client.wait(body['operation_id']) if body.get('status') == 'accepted' and not args.no_wait else None
-    client.record('delete', args.job, accepted, final)
+    # The same request and record as before, through the helper the cycle shares.
+    delete_job(client, args.job, wait=not args.no_wait)
   elif args.cmd == 'update':
     payload = {
       'request_id': 'update-{}-{}'.format(args.job, uuid.uuid4().hex[:12]), 'app_id': current.get('app_id'),

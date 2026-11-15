@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # apps: container apps on nodes that run their own Docker daemon (images, sync check, teardown).
 from lnlib import apps as applib, compare as comparelib, infra, load as loadlib, metrics, nodes as nodelib, profile as profilelib, replicas as replicalib, scenario as scenariolib  # noqa: E402
+# The statistics line reader and the request-trace watcher.
+from lnlib import cstats as cstatslib, trace as tracelib  # noqa: E402
 from lnlib.common import (  # noqa: E402
   HERE, LABEL, NODE_IMAGE, PROJECT, PYTHON, SUBNET, Home, LocalnetError,
   # sync_secret: a set's secret from its name, for the custody check and the scan.
@@ -159,6 +161,11 @@ def cmd_init(args):
   plan = nodelib.plan(oracles=args.oracles, workers=args.workers, arms=arms, default_arm=args.arm, evm_net=args.evm_net,
                       full_oracles=args.full_oracles, full_workers=args.full_workers, docker_nodes=docker_names,
                       web=web, web_of=web_of)
+  if args.probe_period:
+    # Each node of the topology.
+    for node in plan:
+      # Every node's probe samples at this period (node/launch.py reads the variable).
+      node['env'] = dict(node.get('env') or {}, R1_LOCALNET_PROBE_PERIOD=str(args.probe_period))
   infra_repo = infra.find_infra_repo(args.infra_repo)
   log('rendering the mainnet broker mesh (infra repo: {})'.format(infra_repo))
   mesh = infra.render_brokers(home, infra_repo, nofile=args.broker_nofile)
@@ -378,12 +385,138 @@ def cmd_scenario(args):
 
 
 def cmd_replicas(args):
+  """
+  Compare the oracles' saved replicas, in all and per named namespace.
+
+  Parameters
+  ----------
+  args : argparse.Namespace
+    Options of ``replicas``: ``out`` and ``namespaces`` (a comma list, or None).
+
+  Returns
+  -------
+  int
+    0.
+
+  Examples
+  --------
+  >>> cmd_replicas(parser.parse_args(['replicas', '--namespaces', 'DEEPLOY_OPERATIONS,DAUTH_JOB_SECRETS']))
+  0
+  """
   home = Home(args.home)
-  report = replicalib.compare(home.manifest())
+  # The namespaces to report apart, from the comma list.
+  namespaces = [name for name in (args.namespaces or '').split(',') if name] or None
+  # Totals, and per namespace when some are named.
+  report = replicalib.compare(home.manifest(), namespaces=namespaces)
   if args.out:
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(report, indent=1, sort_keys=True))
   print(replicalib.text(report))
+  return 0
+
+
+def cmd_cstats(args):
+  """
+  Print the chain store's statistics and census lines of nodes, with named namespaces.
+
+  Parameters
+  ----------
+  args : argparse.Namespace
+    Options of ``cstats``: ``nodes``, ``since``, ``until``, ``namespaces`` and ``out``.
+
+  Returns
+  -------
+  int
+    0.
+
+  Examples
+  --------
+  >>> cmd_cstats(parser.parse_args(['cstats', 'r1s-db', '--since', str(time.time() - 900)]))
+  0
+  """
+  # The localnet's folders and manifest.
+  home = Home(args.home)
+  # Every node of the manifest unless some are named.
+  names = args.nodes or [node['name'] for node in home.manifest()['nodes']]
+  # More namespaces to name, from the comma list.
+  extra = [name for name in (args.namespaces or '').split(',') if name]
+  # Each node's statistics and census lines in the window, with named buckets.
+  report = {name: cstatslib.summary(cstatslib.node_lines(name, since=args.since, until=args.until), extra=extra)
+            for name in names}
+  if args.out:
+    # The output's folder, made when missing.
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    # The full summary as JSON.
+    Path(args.out).write_text(json.dumps(report, indent=1, sort_keys=True))
+  print(cstatslib.text(report))
+  # Done.
+  return 0
+
+
+def cmd_loops(args):
+  """
+  Print the pauses of a node's main loop and chain-store loop in a window, from its probe.
+
+  Parameters
+  ----------
+  args : argparse.Namespace
+    Options of ``loops``: ``node``, ``start``, ``end``, ``floor_hz``, ``window_s`` and ``out``.
+
+  Returns
+  -------
+  int
+    0.
+
+  Examples
+  --------
+  >>> cmd_loops(parser.parse_args(['loops', 'r1s-db', '--start', str(time.time() - 900)]))
+  0
+  """
+  # The localnet's folders, where the node's probe file is.
+  home = Home(args.home)
+  # The window ends now unless an end is given.
+  report = metrics.loop_gaps(home, args.node, args.start, args.end or time.time(), floor_hz=args.floor_hz,
+                             window_s=args.window_s)
+  if args.out:
+    # The output's folder, made when missing.
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    # The report as JSON.
+    Path(args.out).write_text(json.dumps(report, indent=1, sort_keys=True))
+  print(json.dumps(report, indent=1, sort_keys=True))
+  # Done.
+  return 0
+
+
+def cmd_trace(args):
+  """
+  Watch every oracle's saved replica for a Deeploy request in another oracle's request trace.
+
+  Parameters
+  ----------
+  args : argparse.Namespace
+    Options of ``trace``: ``node``, ``endpoint``, ``since``, ``timeout`` and ``out``.
+
+  Returns
+  -------
+  int
+    0.
+
+  Examples
+  --------
+  >>> cmd_trace(parser.parse_args(['trace', 'r1s-01', '--since', str(time.time())]))
+  0
+  """
+  # The localnet's folders and manifest.
+  home = Home(args.home)
+  # Every oracle read about once a second until each shows the request answered, or the time is up.
+  report = tracelib.watch(home.manifest(), args.node, args.endpoint, args.since, timeout=args.timeout)
+  if args.out:
+    # The output's folder, made when missing.
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    # The report as JSON.
+    Path(args.out).write_text(json.dumps(report, indent=1, sort_keys=True))
+  print(tracelib.text(report))
+  # Done.
   return 0
 
 
@@ -686,6 +819,8 @@ def main():
                    help='web plugins every non-headless node keeps (default: all); seeds must keep DAUTH_MANAGER')
   # Per node, repeatable; overrides --web-plugins for that node.
   one.add_argument('--web-of', action='append', metavar='NODE=SIG,SIG', help='web plugins one node keeps')
+  # A shorter period resolves the pauses of a node's loops; the default is the probe's own 5 s.
+  one.add_argument('--probe-period', type=float, help='seconds between two samples of the in-node probe (default 5)')
   one.set_defaults(func=cmd_init)
 
   one = sub.add_parser('up', help='start the localnet')
@@ -732,7 +867,56 @@ def main():
 
   one = sub.add_parser('replicas', help='compare the chain-store replicas of the oracles')
   one.add_argument('--out', help='write the comparison as JSON to this file')
+  # For example the five signed namespaces.
+  one.add_argument('--namespaces', metavar='NAME,NAME', help='also count per hash namespace')
   one.set_defaults(func=cmd_replicas)
+
+  # The chain store's own statistics and census lines.
+  one = sub.add_parser('cstats', help='the chain store\'s statistics and census lines of nodes, with named namespaces')
+  # Every node unless some are named.
+  one.add_argument('nodes', nargs='*', help='node names (default: every node)')
+  # A window in epoch seconds; open on a side that is not given.
+  one.add_argument('--since', type=float, help='window start (epoch seconds)')
+  # The window's end.
+  one.add_argument('--until', type=float, help='window end (epoch seconds)')
+  # A test namespace, for example.
+  one.add_argument('--namespaces', metavar='NAME,NAME', help='more namespaces to name')
+  # The full summary as JSON.
+  one.add_argument('--out', help='write the summary as JSON to this file')
+  # Run by main().
+  one.set_defaults(func=cmd_cstats)
+
+  # Pauses of a node's loops, from its probe.
+  one = sub.add_parser('loops', help='pauses of a node\'s main loop and chain-store loop, from its probe')
+  # The node measured.
+  one.add_argument('node', help='node name')
+  # The window, epoch seconds; it ends now by default.
+  one.add_argument('--start', type=float, required=True, help='window start (epoch seconds)')
+  # The window's end.
+  one.add_argument('--end', type=float, help='window end (epoch seconds, default now)')
+  # The slow-stretch rule: an average under this rate for longer than the window.
+  one.add_argument('--floor-hz', type=float, default=1.0, help='lowest acceptable average loop rate')
+  # The window of that rule.
+  one.add_argument('--window-s', type=float, default=10.0, help='shortest stretch a rate is averaged over')
+  # The report as JSON.
+  one.add_argument('--out', help='write the report as JSON to this file')
+  # Run by main().
+  one.set_defaults(func=cmd_loops)
+
+  # When the other oracles see a request in one oracle's request trace.
+  one = sub.add_parser('trace', help='time when every oracle sees a Deeploy request in another oracle\'s request trace')
+  # The oracle whose Deeploy API received the request.
+  one.add_argument('node', help='oracle that received the request')
+  # The request's endpoint.
+  one.add_argument('--endpoint', default='create_pipeline', help='endpoint of the request (default create_pipeline)')
+  # The request is the first one of the endpoint received at or after this time.
+  one.add_argument('--since', type=float, required=True, help='epoch seconds before the request was sent')
+  # How long to keep reading.
+  one.add_argument('--timeout', type=float, default=90, help='seconds to keep reading')
+  # The report as JSON.
+  one.add_argument('--out', help='write the report as JSON to this file')
+  # Run by main().
+  one.set_defaults(func=cmd_trace)
 
   one = sub.add_parser('compare', help='put runs of one scenario on different code versions side by side')
   one.add_argument('scenario', help='scenario name, for example incident')

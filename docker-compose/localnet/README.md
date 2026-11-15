@@ -155,7 +155,13 @@ oracles that run it.
   throwaway privileged container on the internal network; it reports any loop device left.
 
 Other commands: `status`, `collect` (measure the last minutes by hand), `profile` (which threads and
-functions hold the interpreter lock), `replicas` (records each oracle lacks compared with the others),
+functions hold the interpreter lock), `replicas` (records each oracle lacks compared with the others;
+`--namespaces A,B` also per hash namespace; the replica file is copied out with `docker cp` and read on the
+host, so a node under a CPU limit is not slowed by the reading), `cstats` (the chain store's `CSTORE_STATS`
+and `CSTORE_CENSUS` lines of nodes, with the buckets of the Deeploy and dAuth namespaces named, the refusal
+labels summed and the resync counters per namespace), `loops` (the longest pause of a node's main loop and
+chain-store loop, from its probe; `init --probe-period 1` gives a one-second resolution), `trace` (when every
+oracle's saved replica shows a Deeploy request in another oracle's request trace),
 `compare <scenario> <version> ...` (runs of one scenario side by side; `--curve` prints one line per
 phase for the node a scenario squeezes), `load start|run|stop|logs <generator>`, `ctl` (run a command on
 the isolated network), `down [--purge]`.
@@ -176,6 +182,9 @@ the isolated network), `down [--purge]`.
 | `scenarios/container_sync_secret_fleet.json` | A shared-key set and a set with a secret on six workers, with consumers that must refuse (no, wrong or malformed secret), a kill and start of one consumer, then a rollback of three workers to `old` and their re-upgrade |
 | `scenarios/container_sync_secret_mixed.json` | A set with a secret created through a Deeploy oracle on `old`, with one consumer on `old` that refuses, then moves to `next` |
 | `scenarios/container_sync_rolling_lowend.json`, `container_sync_secret_lowend.json` | The rolling scenario and the all-`next` part of the fleet scenario with r1w-02 limited to 0.35 CPU and its consumer apps given 1,000 received-history entries each (step `seed_history`) |
+| `scenarios/restart_catchup.json`, `restart_catchup_lowend.json` | Deeploy creates and deletes without pause (`deeploy cycle`) while the headless oracle r1s-db is killed for 12 minutes; per signed namespace, what each oracle lacks from 60 s to 810 s after r1s-db's start, its statistics lines and loop pauses. The second limits r1s-db to 0.35 CPU before its start |
+| `scenarios/cap_depth_mixed.json` | Writes over and under the 512 KiB record cap and at 64 and 65 levels of nesting through r1w-01's own CStore API, then an oversize value and a `dl:` key from r1s-02 moved to `old`; what every node holds and its counters for 10 minutes |
+| `scenarios/trace_hang.json`, `trace_hang_lowend.json` | A Deeploy create held 45 s in its endpoint by a dAuth call that answers late (`load/slowdauth.py`, pinned for r1s-01 only), with no and with one tracked request just before: when every oracle shows the request in r1s-01's request trace. The second repeats the first start with r1s-01 at 0.35 CPU |
 
 A scenario is a list of steps (start a load, wait, begin a measurement phase, stop or throttle a node,
 slow the chain, take a profile). See `lnlib/scenario.py` for the step types.

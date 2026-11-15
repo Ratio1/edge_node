@@ -400,10 +400,37 @@ def pin_upstream(node_name):
   return 'dauth_only_' + node_name.replace('-', '_')
 
 
-def pin_dauth(home, client_ip=None, node_name=None):
-  """Send every dAuth request of one client address to one oracle (or clear all pins) and reload the front."""
+def pin_dauth(home, client_ip=None, node_name=None, address=None):
+  """
+  Send every dAuth request of one client address to one oracle or one address (or clear all pins), and reload
+  the front.
+
+  Parameters
+  ----------
+  home : Home
+    Folder layout of the localnet; the pin file is under ``run/edge``.
+  client_ip : str, optional
+    Address of the client whose dAuth requests are pinned (a load generator, or a node); None clears all pins.
+  node_name : str, optional
+    Oracle that serves dAuth, by name.
+  address : str, optional
+    ``ip:port`` to send them to instead of an oracle (for example the late-answering relay of
+    ``load/slowdauth.py``); an IP literal needs no resolver in the front.
+
+  Returns
+  -------
+  None
+
+  Examples
+  --------
+  >>> pin_dauth(home, '172.31.90.51', address='172.31.90.215:31301')   # r1s-01's dAuth calls go to the relay
+  >>> pin_dauth(home)   # every client spread over the dAuth oracles again
+  """
   path = home.run / 'edge' / 'pins_dauth.conf'
-  path.write_text('{} {};\n'.format(client_ip, pin_upstream(node_name)) if client_ip and node_name else '')
+  # The target: an address as given, or the upstream that holds only the named oracle.
+  target = address or (pin_upstream(node_name) if node_name else None)
+  # One map line "client target;", or an empty file that clears every pin.
+  path.write_text('{} {};\n'.format(client_ip, target) if client_ip and target else '')
   sh('docker', 'exec', container('edge'), 'nginx', '-s', 'reload')
   return
 

@@ -1,0 +1,24 @@
+{
+ "name": "cap_depth_mixed",
+ "about": "The record size cap (512 KiB) and the depth bound (64 levels) on real nodes, then one oracle on the previous release. The worker r1w-01 writes through its own CStore API a value just under the cap, one just over it, one nested 64 levels and one nested 65; what every oracle and the worker hold is read. Then r1s-02 moves to tree 'old' (one step of a rolling update) and writes, through its own CStore API, a value over the cap and a plain key under the tombstone prefix 'dl:' (which a node of the previous release accepts and sends, and the new nodes must drop); the new nodes' counters are read over the next 10 minutes, to see whether anything sends the record again. Needs a cluster where every node runs tree 'next', r1w-01 runs CSTORE_MANAGER_API (--full-workers 1 --web-of r1w-01=CSTORE_MANAGER_API) and r1s-02 runs it beside dAuth.",
+ "steps": [
+  {"do": "mark", "name": "cap"},
+  {"do": "run", "generator": "cstore_put", "args": ["--node", "r1w-01", "--hkey", "LNET_CAP_TEST", "--key", "under", "--bytes", "523000"]},
+  {"do": "run", "generator": "cstore_put", "args": ["--node", "r1w-01", "--hkey", "LNET_CAP_TEST", "--key", "over", "--bytes", "525000"]},
+  {"do": "run", "generator": "cstore_put", "args": ["--node", "r1w-01", "--hkey", "LNET_CAP_TEST", "--key", "deep64", "--depth", "64"]},
+  {"do": "run", "generator": "cstore_put", "args": ["--node", "r1w-01", "--hkey", "LNET_CAP_TEST", "--key", "deep65", "--depth", "65"]},
+  {"do": "wait", "until": "cap", "seconds": 60},
+  {"do": "held", "name": "1_next_writes", "namespace": "LNET_CAP_TEST", "nodes": ["r1s-01", "r1s-02", "r1s-03", "r1s-04", "r1s-db", "r1s-ai01", "r1w-01", "r1w-02"]},
+  {"do": "wait", "until": "cap", "seconds": 330},
+  {"do": "cstats", "name": "1_next_writes", "from": "cap", "namespaces": ["LNET_CAP_TEST"]},
+  {"do": "switch", "node": "r1s-02", "arm": "old"},
+  {"do": "mark", "name": "old_write"},
+  {"do": "run", "generator": "cstore_put", "args": ["--node", "r1s-02", "--hkey", "LNET_CAP_TEST", "--key", "over_old", "--bytes", "525000"]},
+  {"do": "run", "generator": "cstore_put", "args": ["--node", "r1s-02", "--plain", "--key", "dl:lnet-malformed", "--bytes", "10"]},
+  {"do": "wait", "until": "old_write", "seconds": 60},
+  {"do": "held", "name": "2_old_writes", "namespace": "LNET_CAP_TEST", "keys": ["dl:lnet-malformed"], "nodes": ["r1s-01", "r1s-02", "r1s-03", "r1s-04", "r1s-db", "r1s-ai01", "r1w-01", "r1w-02"]},
+  {"do": "wait", "until": "old_write", "seconds": 640},
+  {"do": "held", "name": "3_after_10_min", "namespace": "LNET_CAP_TEST", "keys": ["dl:lnet-malformed"], "nodes": ["r1s-01", "r1s-02", "r1s-03", "r1s-04", "r1s-db", "r1s-ai01", "r1w-01", "r1w-02"]},
+  {"do": "cstats", "name": "run", "from": "cap", "namespaces": ["LNET_CAP_TEST"]}
+ ]
+}
