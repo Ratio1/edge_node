@@ -2,7 +2,7 @@ import time
 from copy import deepcopy
 from contextlib import ExitStack
 
-from ..cve_view import apply_triage, effective_status
+from ..cve_view import apply_triage, drop_closed, effective_status
 from ..model_testing.artifacts import ModelTestArchive
 from ..model_testing.constants import is_model_test_job
 from ..models import FindingTriageAuditEntry, FindingTriageState, JobArchive, VALID_TRIAGE_STATUSES
@@ -71,6 +71,9 @@ def _merge_triage_into_archive_dict(archive: dict, triage_map: dict) -> dict:
         _stamp(finding, triage)
   ui = merged.get("ui_aggregate")
   if isinstance(ui, dict):
+    # A finding closed after the build leaves the stored top findings; the stored score is not recomputed.
+    if isinstance(ui.get("top_findings"), list):
+      ui["top_findings"] = drop_closed(ui["top_findings"], triage_map)
     for finding in ui.get("top_findings", []) or []:
       if not isinstance(finding, dict):
         continue

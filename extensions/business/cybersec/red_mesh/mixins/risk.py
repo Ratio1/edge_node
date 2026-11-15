@@ -21,7 +21,7 @@ from ..models.finding_identity import (
   dedup_key as _dedup_key,
   parse_cwe_list as _parse_cwe_list,
 )
-from ..cve_view import apply_triage, build_cve_view, is_view_finding, view_members
+from ..cve_view import apply_triage, build_cve_view, drop_closed, is_view_finding, view_members
 from ..constants import (
   RISK_SEVERITY_WEIGHTS,
   RISK_CONFIDENCE_MULTIPLIERS,
@@ -529,6 +529,7 @@ class _RiskScoringMixin:
       # A view finding scores only when listed; a closed one leaves with the folded ones.
       scored = [f for f in stamped
                 if not is_view_finding(f) or f["finding_id"] in listed_ids] + rollup_tops
+    scored = drop_closed(scored, triage)  # every closed finding, CVE or not, leaves the walk
     for f in scored:
       if _is_coverage_result(f):
         status = str(f.get("status") or "").lower()

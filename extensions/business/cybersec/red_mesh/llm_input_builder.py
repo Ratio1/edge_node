@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .credential_redaction import redact_credential_text
-from .cve_view import build_cve_view, filter_listed, summarize_view
+from .cve_view import build_cve_view, drop_closed, filter_listed, summarize_view
 from .models.finding_schema import is_coverage_result as _is_coverage_result
 
 
@@ -230,7 +230,7 @@ def build_llm_input(
   triage = {f["finding_id"]: f["triage"] for f in real_findings
             if isinstance(f.get("triage"), dict) and f.get("finding_id")}
   cve_view = build_cve_view(real_findings, not_applicable, triage)
-  real_findings = filter_listed(real_findings, view=cve_view)
+  real_findings = drop_closed(filter_listed(real_findings, view=cve_view), triage)
   real_findings.sort(key=_key)
   truncated = real_findings[:max_findings]
 

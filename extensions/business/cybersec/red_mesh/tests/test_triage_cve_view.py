@@ -103,7 +103,7 @@ class TestArchiveMerge(unittest.TestCase):
     first, second = merged["passes"][0]["findings"]
     self.assertEqual((first["confidence"], first["triage"]["status"]), ("certain", "open"))
     self.assertEqual(second["triage"]["status"], "remediated")
-    self.assertEqual(merged["ui_aggregate"]["top_findings"][0]["triage"]["status"], "remediated")
+    self.assertEqual(merged["ui_aggregate"]["top_findings"], [])  # closed after the build: off the top findings
     # the view built from the merged archive closes the remediated member and lists the confirmed one
     view = build_cve_view(merged["passes"][0]["findings"], triage={"id0002": {"status": "remediated"}})
     self.assertEqual(view["counts"]["closed"], 1)

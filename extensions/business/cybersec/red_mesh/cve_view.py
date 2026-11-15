@@ -57,6 +57,17 @@ def _is_closed(f, triage, now):
   return status in CLOSED_STATUSES or status == "accepted_risk"  # past `review_at` the status reads `reopened`
 
 
+def drop_closed(findings, triage, now=None):
+  """`findings` without any finding (CVE or not) the live host triage map reads closed.
+
+  For scoring, ranking and the LLM input only; exports keep closed findings. An empty map changes nothing.
+  """
+  if not triage:
+    return list(findings)
+  now = time.time() if now is None else now
+  return [f for f in findings if not (isinstance(f, dict) and _is_closed(f, triage, now))]
+
+
 def apply_triage(findings, triage):
   """`findings` with the host triage embedded as `triage`, and a confirmed tentative finding made certain.
 
