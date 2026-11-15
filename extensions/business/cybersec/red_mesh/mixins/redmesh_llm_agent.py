@@ -15,7 +15,7 @@ from typing import Optional
 
 from ..constants import RUN_MODE_SINGLEPASS
 from ..credential_redaction import redact_credential_text
-from ..cve_view import apply_triage, build_cve_view, filter_listed, summarize_view
+from ..cve_view import apply_triage, build_cve_view, drop_closed, filter_listed, summarize_view
 from ..models.finding_schema import is_coverage_result as _is_coverage_result
 from ..services.config import get_llm_agent_config
 from ..services.resilience import run_bounded_retry
@@ -573,7 +573,8 @@ class _RedMeshLlmAgentMixin(object):
     total_findings = len(findings)
     # Generated CVE findings: the listed ones only (rollup and possible rows are not sent one by one).
     # The host triage map: a closed CVE finding is not sent, a confirmed possible one is certain.
-    deduped = filter_listed(apply_triage(self._deduplicate_findings(findings), triage), triage=triage)
+    deduped = drop_closed(
+      filter_listed(apply_triage(self._deduplicate_findings(findings), triage), triage=triage), triage)
     ranked = self._rank_findings(deduped)
     limits = self._get_llm_payload_limits(analysis_type)
     bucket_limits = _LLM_FINDING_BUCKETS.get(analysis_type, _LLM_FINDING_BUCKETS["security_assessment"])
