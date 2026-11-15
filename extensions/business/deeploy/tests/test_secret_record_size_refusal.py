@@ -327,6 +327,22 @@ class SecretRecordSizeRefusalTests(unittest.TestCase):
     self.assertEqual((operation['phase'], operation['preparation_deadline'] - operation['created_at']),
                      ('preparing', 120))
 
+  def test_another_value_error_of_the_preparation_leaves_the_operation_to_the_worker(self):
+    """Only the size refusal ends the operation at once: a dAuth answer that the client refuses after the records
+    were stored (a ValueError of another type) is answered 400 as before, and the operation stays "preparing" with
+    its deadline at created + 120 s, so the worker can still find the preparation complete and accept it."""
+    # Both sides; every write is stored and confirmed.
+    stack = _Stack(self)
+    # The dAuth server says "prepared" in a form the client refuses.
+    stack.rewrite = lambda answer: answer.update(prepared='yes')
+    # The API answers 400 with the client's text, as before.
+    self.assertEqual(stack.create()['error']['message'], 'Invalid dAuth preparation status.')
+    # The operation as the coordinator saved it.
+    operation = next(iter(stack.coordinator._operation_records().values()))
+    # Still preparing, with its deadline at created + 120 s: left to the worker.
+    self.assertEqual((operation['phase'], operation['preparation_deadline'] - operation['created_at']),
+                     ('preparing', 120))
+
   def test_a_size_refusal_ends_the_operation_at_once_and_a_corrected_request_is_accepted(self):
     """A size refusal fails the operation at once, with the text the owner was answered, so the same request finds
     a failed operation; the worker's next pass cleans up what dAuth staged, without asking dAuth for the status of
