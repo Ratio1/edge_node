@@ -275,6 +275,17 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertEqual([item["outcome"] for item in done["data"]["outcomes"]],
                      ["written", "written"] + ["refused"] * 6)
 
+  def test_restore_skips_a_triage_audit_entry_the_prune_tombstoned(self):
+    host = "192.0.2.10"
+    a_hkey = f"{JOBS}:triage:audit:{self.tenant}"
+    row = {"job_id": "new1", "finding_id": "f1", "status": "open", "tenant_id": self.tenant, "host": host}
+    pruned, fresh = f"{host}\x1ff1\x1f000000000001000-aa", f"{host}\x1ff1\x1f000000000002000-bb"
+    self.put(a_hkey, pruned, None)  # listed by hkeys, reads None
+    done = self.plugin.restore_redmesh_records(self.actor, [
+      {"hkey": a_hkey, "field": pruned, "value": row}, {"hkey": a_hkey, "field": fresh, "value": row}])
+    self.assertEqual([item["outcome"] for item in done["data"]["outcomes"]], ["refused", "written"])
+    self.assertIsNone(self.storage.data[(a_hkey, pruned)])
+
   def test_a_job_lists_the_files_its_record_config_and_archive_name(self):
     row = self.scan()[(JOBS, "old1")]
     self.assertEqual({item["cid"] for item in row["cids"]}, {CONFIG, ARCHIVE, REPORT, SECRET, BUNDLE, SHARED})

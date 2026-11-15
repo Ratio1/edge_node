@@ -81,6 +81,27 @@ class TestClosedNonCveFindings(unittest.TestCase):
     self.assertEqual(len(build_llm_input(findings=open_both, aggregated_report={}).findings), 2)
 
 
+class TestCoverageRowsAreNotClosable(unittest.TestCase):
+  def test_drop_closed_keeps_a_triaged_coverage_row(self):
+    coverage = {"finding_id": "cov", "status": "not_vulnerable", "severity": "INFO", "title": "scenario ran"}
+    other = dict(OTHER, finding_id="b")
+    kept = drop_closed([coverage, other], {"cov": {"status": "false_positive"}, "b": {"status": "false_positive"}})
+    self.assertEqual(kept, [coverage])
+
+  def test_coverage_counts_ignore_the_triage_map(self):
+    from .test_cve_view import _Host as Host
+    coverage = {"finding_id": "cov", "status": "not_vulnerable", "severity": "INFO", "confidence": "firm",
+                "title": "scenario ran", "probe": "p", "category": "x", "finding_signature": "sc"}
+    report = {"target": "t", "port_protocols": {"80": "http"},
+              "service_info": {"80": {"_service_info_http": {"findings": [dict(coverage)]}}}}
+    base = Host()._compute_risk_and_findings(report)[0]["breakdown"]["coverage_counts"]
+    flat = Host()._compute_risk_and_findings(report)[1]
+    cid = next(f for f in flat if f.get("status") == "not_vulnerable")["finding_id"]
+    triaged = Host()._compute_risk_and_findings(report, {cid: {"status": "false_positive"}})[0]["breakdown"]["coverage_counts"]
+    self.assertEqual(sum(base.values()), 1)
+    self.assertEqual(triaged, base)
+
+
 class TestTopFindingsReadRefilter(unittest.TestCase):
   def archive(self):
     top = [dict(WEB, finding_id="a"), dict(OTHER, finding_id="b")]

@@ -9,6 +9,7 @@ import re
 import time
 
 from .cve_db import _compare_versions, _parse_version
+from .models.finding_schema import is_coverage_result
 
 MAX_LISTED = 10
 MAX_POSSIBLE_TOP = 3
@@ -61,11 +62,12 @@ def drop_closed(findings, triage, now=None):
   """`findings` without any finding (CVE or not) the live host triage map reads closed.
 
   For scoring, ranking and the LLM input only; exports keep closed findings. An empty map changes nothing.
+  A coverage row is not a finding: triage never drops it, so `coverage_counts` does not depend on the map.
   """
   if not triage:
     return list(findings)
   now = time.time() if now is None else now
-  return [f for f in findings if not (isinstance(f, dict) and _is_closed(f, triage, now))]
+  return [f for f in findings if not (isinstance(f, dict) and not is_coverage_result(f) and _is_closed(f, triage, now))]
 
 
 def apply_triage(findings, triage):

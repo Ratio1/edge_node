@@ -264,6 +264,28 @@ class RiskAndConsumerTests(unittest.TestCase):
     self.assertEqual([f["finding_id"] for f in ui.top_findings], ["id0001", "n1"])
     self.assertEqual(ui.total_findings, 4)  # raw record count
 
+  def _top(self, findings, triage=None):
+    passes = [{"pass_nr": 1, "findings": findings}]
+    ui = _AggHost()._compute_ui_aggregate(passes, {"open_ports": [], "service_info": {}}, triage=triage)
+    return [f["finding_id"] for f in ui.top_findings or []], ui
+
+  def test_top_findings_confirmed_possible_cve_reaches_the_rerun(self):
+    findings = [raw(1, "CRITICAL", kev=True, confidence="tentative", reason="banner_only")]
+    self.assertEqual(self._top(findings)[0], [])
+    top, ui = self._top(findings, {"id0001": {"status": "open", "confirmed": True, "confirmed_by": "a"}})
+    self.assertEqual(top, ["id0001"])
+    self.assertNotIn("triage", ui.top_findings[0])  # the record is not kept on the stored row
+    self.assertNotIn("triage", findings[0])  # stored findings stay unstamped
+
+  def test_top_findings_closed_cve_takes_no_slot_and_folds_no_sibling(self):
+    findings = [raw(1, "CRITICAL", kev=True), raw(2, "HIGH", kev=True), raw(3, "HIGH", kev=True)]
+    top, _ = self._top(findings, {"id0001": {"status": "false_positive"}})
+    self.assertEqual(sorted(top), ["id0002", "id0003"])
+
+  def test_top_findings_empty_map_is_identical(self):
+    findings = [raw(1, "CRITICAL", kev=True), raw(2, "HIGH", score=5.0), {"finding_id": "n1", "severity": "HIGH"}]
+    self.assertEqual(self._top(findings, {})[1].to_dict(), self._top(findings)[1].to_dict())
+
   def test_llm_input_carries_the_view_summary_under_generated_only(self):
     findings = [raw(1, kev=True), raw(2, score=5.0), raw(3, confidence="tentative", reason="banner_only")]
     out = build_llm_input(findings=findings, aggregated_report={})

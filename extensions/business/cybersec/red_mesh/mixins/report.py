@@ -13,7 +13,7 @@ import struct as _struct
 from ..worker import PentestLocalWorker
 from .live_progress import _LiveProgressMixin
 from ..models import UiAggregate
-from ..cve_view import filter_listed
+from ..cve_view import apply_triage, drop_closed, filter_listed
 from ..models.finding_identity import (
   worker_attribution_fields as _worker_attribution_fields,
   volatile_non_content_fields as _volatile_non_content_fields,
@@ -1053,7 +1053,7 @@ class _ReportMixin:
       })
     return comparison
 
-  def _compute_ui_aggregate(self, passes, latest_aggregated, job_config=None):
+  def _compute_ui_aggregate(self, passes, latest_aggregated, job_config=None, triage=None):
     """Compute pre-aggregated view for frontend from pass reports.
 
     Parameters
@@ -1062,6 +1062,9 @@ class _ReportMixin:
       List of pass report dicts (PassReport.to_dict()).
     latest_aggregated : dict
       AggregatedScanData dict for the latest pass.
+    triage : dict or None
+      The live host triage map. `top_findings` is built over stamped copies, so a confirmed possible CVE can
+      reach it and a closed finding takes no slot; stored findings stay unstamped. Empty: unchanged.
 
     Returns
     -------
@@ -1098,7 +1101,13 @@ class _ReportMixin:
     # without the filter a scenario that concluded nothing was ranked into the
     # customer-facing top-findings list as a HIGH.
     # Generated CVE findings: listed ones only (the rest are in a rollup or the possible section).
-    crit_high = [f for f in filter_listed(real_findings) if f.get("severity") in ("CRITICAL", "HIGH")]
+    # The stamped copies only rank; the triage record is not kept on what is stored in the archive.
+    stamped = apply_triage(real_findings, triage)
+    crit_high = [
+      {k: v for k, v in f.items() if k != "triage"} if triage and "triage" in f else f
+      for f in drop_closed(filter_listed(stamped, triage=triage), triage)
+      if f.get("severity") in ("CRITICAL", "HIGH")
+    ]
     crit_high.sort(key=lambda f: (
       self.SEVERITY_ORDER.get(f.get("severity"), 9),
       self.CONFIDENCE_ORDER.get(f.get("confidence"), 9),
