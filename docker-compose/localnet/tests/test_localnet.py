@@ -190,7 +190,9 @@ class TestScenarios(unittest.TestCase):
   # marks, statistics lines, loop pauses, request trace and held fields of the catch-up, cap and trace scenarios.
   STEPS = {'load', 'run', 'unload', 'wait', 'phase', 'node', 'chain', 'profile', 'replicas', 'pin', 'note',
            'image', 'isolation', 'sync', 'switch', 'custody', 'scan', 'seed_history',
-           'mark', 'cstats', 'loops', 'trace', 'held'}
+           'mark', 'cstats', 'loops', 'trace', 'held',
+           # The refused-SYNC check and the tick-cost window of the C18 rehearsal.
+           'sync_off', 'ticks'}
 
   def test_shipped_scenarios_use_known_steps_and_generators(self):
     """Every shipped scenario names itself, has unique phases, and uses only step types and generators that exist."""
@@ -815,6 +817,70 @@ class TestContainerApps(unittest.TestCase):
     finally:
       apps._exec_python, apps.app_file = saved
 
+  def test_sync_off_passes_only_when_a_refused_config_really_turns_sync_off(self):
+    """A job with a refused secret passes sync_off only with SYNC really off; run 2's unfixed consumer F (red line, app running, but store reads, refusals and SYNC variables) fails."""
+    from lnlib import apps
+    # The node's prefix of a log line, as Docker keeps it.
+    prefix = '[EE][25-11-15 19:12:49][BP:lnsync3009_ab:CONTAINER_APP_RUNNER] '
+    # A fixed node: the volume set-up, the red line, one app start, and the app's own lines.
+    fixed = prefix + '[sync] system volume ready: /x -> /r1en_system\n' + prefix + '[sync] ' + apps.SECRET_REFUSAL + '\n' + \
+      prefix + 'Container started (ID: ab12cd)\n'
+    # Its app: one running container with only the variables every app gets, and a count of 0.
+    app = {'containers': ['car_lnsync3009_ab_i'], 'running': True, 'env_names': list(apps.SYNC_OFF_PRESENT), 'secret_len': '0'}
+    # Nothing received, quarantined or downloaded; the saved pipeline still enabled with the placeholder.
+    state = {'received': [], 'quarantine': [], 'downloads': []}
+    stored = [{'path': '/s/lnsync3009_ab.json', 'enabled': True, 'secret': 'placeholder'}]
+    # All of it: PASS.
+    report = apps.sync_off_verdict(fixed, app, state, stored)
+    self.assertTrue(report['ok'], report['failures'])
+    self.assertEqual((report['refusal_lines'], report['app_starts']), (1, 1))
+    # Run 2's F on the unfixed code: the same red line and start, then store reads and refusals, and SYNC variables.
+    unfixed = fixed + (prefix + '[sync] chainstore_hsync ok (0.10s)\n') * 51 + \
+      (prefix + "[sync] cannot prepare v2 (cid=Qm2): record mac does not match this node's sync secret\n") * 92
+    # Its app has R1_SYNC_KEY and R1_SYNC_TYPE as well.
+    leaky = dict(app, env_names=list(apps.SYNC_OFF_PRESENT) + ['R1_SYNC_KEY', 'R1_SYNC_TYPE'])
+    # It fails, naming the store reads, the refusals and the variables.
+    failures = ' '.join(apps.sync_off_verdict(unfixed, leaky, dict(state, quarantine=['Qm2']), stored)['failures'])
+    for text in ('51 "[sync] chainstore_hsync"', '92 "[sync] cannot prepare"', "has ['R1_SYNC_KEY', 'R1_SYNC_TYPE']", "quarantine ['Qm2']"):
+      # Each piece of evidence is a reason of its own.
+      self.assertIn(text, failures)
+    # Each single deviation fails on its own: no red line, a green line, a red line without its app start, a variable
+    # every app gets missing (so a prefix match on R1_SYNC could not pass), the secret's bytes, a stopped app.
+    for bad_text, bad_app in ((fixed.replace(apps.SECRET_REFUSAL, 'x'), app),
+                              (fixed + prefix + '[sync] SYNC enabled: role=consumer, key=k\n', app),
+                              (fixed + prefix + '[sync] ' + apps.SECRET_REFUSAL + '\n', app),
+                              (fixed, dict(app, env_names=['R1_SYSTEM_VOLUME', 'R1_VOLUME_SYNC_DIR'])),
+                              (fixed, dict(app, secret_len='65')), (fixed, dict(app, running=False)),
+                              (fixed, dict(app, containers=[]))):
+      # Not a PASS.
+      self.assertFalse(apps.sync_off_verdict(bad_text, bad_app, state, stored)['ok'])
+    # The node rewrote its saved copy, or no copy was found: fails.
+    self.assertFalse(apps.sync_off_verdict(fixed, app, state, [dict(stored[0], enabled=False)])['ok'])
+    self.assertFalse(apps.sync_off_verdict(fixed, app, state, [])['ok'])
+
+  def test_stored_reader_reports_enabled_and_secret_kind_of_the_saved_pipeline(self):
+    """The node-side reader finds the job's saved pipeline under any config folder's streams folder and prints SYNC.ENABLED and the kind of value at the secret variable, never the value."""
+    import subprocess
+    from lnlib import apps
+    # A throwaway cache folder, removed at the end.
+    with tempfile.TemporaryDirectory() as tmp:
+      # The node's saved pipelines folder.
+      folder = os.path.join(tmp, '_data', 'box_configuration', 'streams')
+      os.makedirs(folder)
+      # Job 3009's pipeline (malformed value in ENV), and another job's, which the reader must leave out.
+      doc = {'NAME': 'lnsync3009_ab', 'PLUGINS': [{'SIGNATURE': 'CONTAINER_APP_RUNNER', 'INSTANCES': [
+        {'INSTANCE_ID': 'i', 'ENV': {'R1EN_SYNC_SECRET': 'a' * 32}, 'SYNC': {'ENABLED': True, 'TYPE': 'consumer', 'KEY': 'k'}}]}]}
+      Path(folder, 'lnsync3009_ab.json').write_text(json.dumps(doc))
+      Path(folder, 'lnsync3001_cd.json').write_text(json.dumps(dict(doc, NAME='lnsync3001_cd')))
+      # The reader as it runs in a node, pointed at this folder, with the placeholder in front.
+      code = apps._with_values(apps.STORED_READER.replace("'/edge_node/_local_cache/_data", repr(tmp + '/_data')[:-1]),
+                               PLACEHOLDER=apps.DAUTH_PLACEHOLDER)
+      out = subprocess.run([sys.executable, '-I', '-', '3009'], input=code, capture_output=True, text=True, timeout=60).stdout
+    # One block, of job 3009: enabled as stored, a value that is not the placeholder, and the value not printed.
+    self.assertEqual([(os.path.basename(item['path']), item['enabled'], item['secret']) for item in apps._tagged(out, 'STORED')],
+                     [('lnsync3009_ab.json', True, 'other')])
+    self.assertNotIn('a' * 32, out)
+
 
 class TestMetrics(unittest.TestCase):
 
@@ -848,6 +914,46 @@ class TestMetrics(unittest.TestCase):
     self.assertFalse(result['restarted'])
     # The whole container: 3 s of CPU and 1.5 s of throttling in every 5 s sample, 2 GiB.
     self.assertEqual((result['container_cores'], result['throttled_share'], result['container_mb']), (0.6, 0.3, 2048))
+
+  def test_tick_window_pools_process_time_and_bounds_one_node_by_another(self):
+    """The tick window pools the process timer of a node's app runners over the window (count x mean differences), gives main-loop rate and CPU, keeps one node process, and the comparison bounds time and CPU up and the loop rate down."""
+    from lnlib import metrics
+
+    class Home:
+      run = None
+
+    # Two app runner instances and the chain store (not read) in every sample.
+    one, two = 's1|CONTAINER_APP_RUNNER|a', 's2|CONTAINER_APP_RUNNER|b'
+    with tempfile.TemporaryDirectory() as folder:
+      Home.run = Path(folder)
+      out = Path(folder) / 'out' / 'n1'
+      out.mkdir(parents=True)
+      # A restart first (a short earlier process), then 7 samples 10 s apart of the process the window keeps.
+      rows = [{'t': 95, 'up': 500, 'cpu': 99.0, 'main_iter': 9999, 'plugins': {}}]
+      for idx in range(7):
+        # Each instance: 2 calls per sample; instance a at 0.1 s each, instance b at 0.3 s each, so the running means
+        # stay 0.1 and 0.3 and the pooled window mean is 0.2. Main loop 10 Hz, 0.25 CPU, container 0.3, throttled 0.1.
+        rows.append({'t': 100 + 10 * idx, 'up': 10 + 10 * idx, 'cpu': 0.25 * 10 * idx, 'main_iter': 100 * idx,
+                     'cg_usage_usec': 3000000 * idx, 'cg_throttled_usec': 1000000 * idx, 'plugins': {
+                       one: {'pn': 10 + 2 * idx, 'pm': 0.1}, two: {'pn': 10 + 2 * idx, 'pm': 0.3},
+                       'x|CHAIN_STORE_BASE|c': {'pn': 5 * idx, 'pm': 9.0}}})
+      (out / 'probe.jsonl').write_text('\n'.join(json.dumps(row) for row in rows))
+      result = metrics.tick_window(Home, 'n1', 90, 200, parts=3)
+    # The restart's earlier sample is left out; the instances of the signature only.
+    self.assertEqual((result['samples'], result['instances']), (7, [one, two]))
+    # 24 timed calls in the window, pooled mean 0.2 s; 10 Hz, 0.25 / 0.3 cores, 10 % throttled.
+    self.assertEqual((result['calls'], result['process_mean_s'], result['main_hz']), (24, 0.2, 10.0))
+    self.assertEqual((result['cpu_cores'], result['container_cores'], result['throttled_share']), (0.25, 0.3, 0.1))
+    # Three parts of 20 s each, with the same figures.
+    self.assertEqual([(part['seconds'], part['process_mean_s']) for part in result['parts']], [(20.0, 0.2)] * 3)
+    # The bound: the same figures pass; 15 % more process time, or 15 % less loop rate, fail; a missing figure fails.
+    base = {'process_mean_s': 0.2, 'main_hz': 10.0, 'cpu_cores': 0.25, 'container_cores': 0.3}
+    self.assertTrue(metrics.tick_compare({'new': dict(base), 'old': base}, 'new', 'old')['ok'])
+    self.assertFalse(metrics.tick_compare({'new': dict(base, process_mean_s=0.23), 'old': base}, 'new', 'old')['ok'])
+    self.assertFalse(metrics.tick_compare({'new': dict(base, main_hz=8.5), 'old': base}, 'new', 'old')['ok'])
+    self.assertFalse(metrics.tick_compare({'new': dict(base, process_mean_s=None), 'old': base}, 'new', 'old')['ok'])
+    # Better figures (less time, a faster loop) pass.
+    self.assertTrue(metrics.tick_compare({'new': dict(base, process_mean_s=0.1, main_hz=12.0), 'old': base}, 'new', 'old')['ok'])
 
   def test_curve_gives_one_line_per_phase_for_the_squeezed_node(self):
     from lnlib import compare

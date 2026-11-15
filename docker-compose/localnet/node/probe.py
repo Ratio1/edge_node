@@ -17,6 +17,9 @@ handled   recv - dropped - queue
 hz        plugin loop rate as the plugin reports it
 iter      loop iterations so far
 errors    plugin loop exceptions so far
+pn, pm    calls of the plugin's ``process`` so far and their mean wall time in seconds, from the
+          plugin's own ``process`` timer (the core times every call while its logger runs with
+          DEBUG; both None otherwise), so a reader gets the mean process time of any window
 
 Per sample, besides process and control-group counters: ``main_iter``, the node's main-loop iterations so
 far. The period is ``R1_LOCALNET_PROBE_PERIOD`` seconds (default 5; ``init --probe-period``).
@@ -109,6 +112,23 @@ class Probe(threading.Thread):
   # -- sampling -------------------------------------------------------------
 
   def _plugins(self):
+    """
+    One sample of every running plugin instance of the node.
+
+    Reads public attributes and counters only (queues, loop rate, iterations, the plugin's ``process`` timer); it
+    never calls into a plugin, so the node does the same with and without the probe.
+
+    Returns
+    -------
+    dict
+      ``<stream>|<signature>|<instance>`` -> the fields listed in the module docstring (``recv`` ... ``pm``); a
+      plugin whose attributes could not be read is left out and counted in ``probe_errors``.
+
+    Examples
+    --------
+    >>> sorted(Probe('/out/probe.jsonl')._plugins())
+    []
+    """
     res = {}
     manager = getattr(self.eng, '_business_manager', None)
     if manager is None:
@@ -132,6 +152,11 @@ class Probe(threading.Thread):
           'iter': getattr(plugin, 'current_process_iteration', None),
           'errors': getattr(plugin, 'n_plugin_exceptions', None),
         }
+        # The plugin's own "process" timer: the core's logger keeps it per plugin section, with the number of
+        # timed calls and their running mean (an empty dict when the logger does not time, or before the first call).
+        timer = ((getattr(getattr(plugin, 'log', None), 'timers', None) or {}).get(getattr(plugin, '_timers_section', None)) or {}).get('process') or {}
+        # Calls so far and their mean wall time (s): a window's mean is (pm2 * pn2 - pm1 * pn1) / (pn2 - pn1).
+        row.update(pn=timer.get('COUNT'), pm=timer.get('MEAN'))
         res['{}|{}|{}'.format(stream, signature, instance)] = row
       except Exception:
         self._errors += 1

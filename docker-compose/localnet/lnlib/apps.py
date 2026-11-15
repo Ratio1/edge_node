@@ -134,7 +134,8 @@ def read(cid):
   dec.update(blob[16:16 + meta_len])
   # The content, authenticated by the tag.
   return (dec.update(blob[16 + meta_len:-16]) + dec.finalize_with_tag(blob[-16:])).decode()
-def walk(doc, values, paths):
+# Collects, per instance holding the variable, its kind of value, its selections and its SYNC.ENABLED.
+def walk(doc, values, paths, enabled):
   if isinstance(doc, dict):
     # An instance's variables.
     env = doc.get('ENV')
@@ -143,26 +144,84 @@ def walk(doc, values, paths):
       values.append('placeholder' if env['R1EN_SYNC_SECRET'] == PLACEHOLDER else 'other')
       # The instance's selections, as Deeploy keeps them.
       paths.append(doc.get('SECRET_PATHS'))
+      # SYNC.ENABLED as stored (None without a SYNC block): a node that refuses the block must not rewrite it.
+      enabled.append(doc['SYNC'].get('ENABLED') if isinstance(doc.get('SYNC'), dict) else None)
     for item in doc.values():
-      walk(item, values, paths)
+      # Instances sit at any depth of a stored job or plan.
+      walk(item, values, paths, enabled)
   elif isinstance(doc, list):
     for item in doc:
-      walk(item, values, paths)
+      # And inside lists (plugins, instances).
+      walk(item, values, paths, enabled)
 # Per document: what was found.
 docs = {}
 # The stored job, then the plan.
 for kind, cid in cids.items():
   # The plain text, None when the object could not be fetched.
   text = read(cid) if cid else None
-  # What the instances hold at the variable, and their selections.
-  values, paths = [], []
+  # What the instances hold at the variable, their selections and their SYNC.ENABLED.
+  values, paths, enabled = [], [], []
   if text is not None:
-    walk(json.loads(text), values, paths)
-  # Kinds and selections only; the secret is looked up, never echoed.
-  docs[kind] = {'cid': cid, 'readable': text is not None, 'values': values, 'secret_paths': paths,
+    # The whole document, read as JSON.
+    walk(json.loads(text), values, paths, enabled)
+  # Kinds, selections and flags only; the secret is looked up, never echoed.
+  docs[kind] = {'cid': cid, 'readable': text is not None, 'values': values, 'secret_paths': paths, 'sync_enabled': enabled,
                 'secret_in_doc': text is not None and NEEDLE in text}
 # One tagged line for the host.
 print('CUSTODY ' + json.dumps({'pointer': type(pointer).__name__ if pointer else None, 'docs': docs}))'''
+
+# The red line a node writes when it refuses a malformed set secret and turns SYNC off on that job: what a
+# sync_off check expects by default.
+SECRET_REFUSAL = 'R1EN_SYNC_SECRET must be 64 lowercase hex characters; disabling SYNC.'
+# Lines that show an app's sync code at work (its green line, a store read, a refusal, a quarantine skip, an
+# apply, a provider claim): an app whose SYNC is off writes none of them.
+SYNC_WORK_MARKERS = ('[sync] SYNC enabled:', '[sync] chainstore_hsync', '[sync] cannot prepare', '[sync] skipping quarantined',
+                     '[sync] consumer tick: applying', '[sync] provider tick')
+# The other kind of [sync] line an app with SYNC off writes: the set-up of its system volume, which every app gets.
+SYNC_SETUP_MARKER = '[sync] system volume ready'
+# The line a node writes each time it starts an app container (the refusal is logged once per start).
+APP_START_MARKER = 'Container started (ID:'
+# Variables an app whose SYNC is off must not have (the two SYNC ones by exact name, and the secret) ...
+SYNC_OFF_ABSENT = ('R1_SYNC_KEY', 'R1_SYNC_TYPE', 'R1EN_SYNC_SECRET')
+# ... and the ones every app gets whatever its SYNC state, so a prefix match on R1_SYNC would be wrong.
+SYNC_OFF_PRESENT = ('R1_SYSTEM_VOLUME', 'R1_VOLUME_SYNC_DIR', 'R1_SYNC_REQUEST_FILE')
+# Inside an app container: the names of those variables it has, one per line, never a value.
+ENV_NAMES = 'for v in {}; do if printenv "$v" > /dev/null; then echo "$v"; fi; done'.format(' '.join(SYNC_OFF_ABSENT + SYNC_OFF_PRESENT))
+
+# On a node: every SYNC block of the node's saved copy of a job's pipeline (the node saves each pipeline it runs
+# as <data folder>/<config folder>/streams/<pipeline name>.json, and the pipeline is named after the job). Prints,
+# per block, ENABLED as stored and what the instance holds at ENV.R1EN_SYNC_SECRET ("absent", "placeholder" or
+# "other", never a value). PLACEHOLDER is put in front by the caller.
+STORED_READER = r'''
+# Standard library only (-I).
+import glob, json, sys
+# The Deeploy job.
+job = sys.argv[1]
+# One entry per block that has a SYNC dict.
+blocks = []
+# Collects every dict with a SYNC dict (an app instance) at any depth of one saved file.
+def walk(doc, path):
+  if isinstance(doc, dict):
+    if isinstance(doc.get('SYNC'), dict):
+      # The instance's variables (none when it has no ENV dict).
+      env = doc.get('ENV') if isinstance(doc.get('ENV'), dict) else {}
+      # ENABLED as stored, and the kind of value at the secret variable.
+      blocks.append({'path': path, 'enabled': doc['SYNC'].get('ENABLED'),
+                     'secret': 'absent' if 'R1EN_SYNC_SECRET' not in env else 'placeholder' if env['R1EN_SYNC_SECRET'] == PLACEHOLDER else 'other'})
+    for item in doc.values():
+      # Deeper dicts.
+      walk(item, path)
+  elif isinstance(doc, list):
+    for item in doc:
+      # And list items (plugins, instances).
+      walk(item, path)
+# Every saved copy of the job's pipeline.
+for path in sorted(glob.glob('/edge_node/_local_cache/_data/**/streams/lnsync{}_*.json'.format(job), recursive=True)):
+  with open(path) as fh:
+    # Its blocks.
+    walk(json.load(fh), path)
+# One tagged line for the host.
+print('STORED ' + json.dumps(blocks))'''
 
 # On any node: every file under the node's cache folder (logs, plugin data, the apps' mounted system and data
 # volumes, R1FS downloads, store files), read as bytes and searched for each form of the secret (NEEDLES,
@@ -1121,8 +1180,8 @@ def custody(job, secret, oracle, node=None, key=None, image='localnet/syncapp:1'
   -------
   dict
     ``pointer`` (its type, or None), ``docs`` (per stored document: cid, readable, what the instances hold at
-    the variable as "placeholder"/"other", their SECRET_PATHS, whether the secret occurs in it), the app's
-    ``secret_len``, ``failures`` and ``ok``.
+    the variable as "placeholder"/"other", their SECRET_PATHS, their ``sync_enabled`` as stored (reported, not
+    checked), whether the secret occurs in it), the app's ``secret_len``, ``failures`` and ``ok``.
 
   Examples
   --------
@@ -1199,13 +1258,202 @@ def custody_text(report):
     report['job'], report['pointer'], report['oracle'], report['waited_s'])]
   # One line per stored document.
   for kind, doc in report['docs'].items():
-    # What it holds at the variable, its selections, and whether the secret is in it.
-    lines.append('  stored {} {}: readable {}, ENV.R1EN_SYNC_SECRET {}, SECRET_PATHS {}, secret in it {}'.format(
-      kind, doc['cid'], doc['readable'], doc['values'], doc['secret_paths'], doc['secret_in_doc']))
+    # What it holds at the variable, its selections, SYNC.ENABLED as stored (absent from reports of older tool
+    # versions), and whether the secret is in it.
+    lines.append('  stored {} {}: readable {}, ENV.R1EN_SYNC_SECRET {}, SECRET_PATHS {}, SYNC.ENABLED {}, secret in it {}'.format(
+      kind, doc['cid'], doc['readable'], doc['values'], doc['secret_paths'], doc.get('sync_enabled'), doc['secret_in_doc']))
   if report['node']:
     # The app's count.
     lines.append('  {} app: {} bytes of R1EN_SYNC_SECRET in its environment (expected {})'.format(
       report['node'], report['secret_len'], report['expected_secret_len']))
+  # The verdict last.
+  lines.append('PASS' if report['ok'] else 'FAIL: ' + '; '.join(report['failures']))
+  # One text block.
+  return '\n'.join(lines)
+
+
+def sync_off_verdict(text, app, state, stored, reason=SECRET_REFUSAL):
+  """
+  Judge, from what was read on a node, whether a job's refused SYNC configuration really turned SYNC off.
+
+  Pass values (C18 fix report, section 7): the refusal line once per start of the app container and no green
+  line; none of the sync code's work lines (store reads, refusals, quarantine skips, applies, provider claims) and
+  no other ``[sync]`` line than the system-volume set-up; the app running, without ``R1_SYNC_KEY``,
+  ``R1_SYNC_TYPE`` or ``R1EN_SYNC_SECRET`` (count 0 in ``/data/secret_len``) and with the three variables every
+  app gets; no received-history entry of the set, no quarantine file, no download; the node's saved copy of the
+  job still says ``SYNC.ENABLED`` true (the node does not rewrite it). "The line is logged and the app runs" also
+  holds on code where SYNC stays on, so the negative checks carry the verdict.
+
+  Parameters
+  ----------
+  text : str
+    The node's log; the node must run no other app (every ``[sync]`` line of the node is counted).
+  app : dict
+    The job's app: ``containers`` (inner containers named after the job), ``running``, ``env_names`` (which of
+    ``SYNC_OFF_ABSENT`` and ``SYNC_OFF_PRESENT`` it has) and ``secret_len`` (the text of its count file).
+  state : dict
+    ``sync_state`` of the node for the set's key.
+  stored : list of dict or None
+    The blocks ``STORED_READER`` printed (path, enabled, secret kind); None when the reader failed.
+  reason : str, optional
+    The refusal line's text (default: the malformed-secret refusal).
+
+  Returns
+  -------
+  dict
+    ``refusal_lines``, ``app_starts``, ``work_lines`` (marker -> count), ``other_sync_lines`` (distinct, cut to 100
+    characters), ``app``, ``received``, ``quarantine``, ``downloads``, ``stored``, ``failures`` and ``ok``.
+
+  Examples
+  --------
+  >>> sync_off_verdict('[sync] ' + SECRET_REFUSAL + '\\nContainer started (ID: ab12)\\n',
+  ...                  {'containers': ['car_lnsync3009_x_i'], 'running': True, 'env_names': list(SYNC_OFF_PRESENT),
+  ...                   'secret_len': '0'}, {'received': [], 'quarantine': [], 'downloads': []},
+  ...                  [{'path': 'p', 'enabled': True, 'secret': 'placeholder'}])['ok']
+  True
+  """
+  # Each [sync] line from its tag on (the node's prefix of time, pipeline and plugin left out).
+  lines = [line[line.index('[sync]'):] for line in text.splitlines() if '[sync]' in line]
+  # The refusal lines.
+  red = [line for line in lines if reason in line]
+  # How many times the node started an app container (the refusal is logged before each start).
+  starts = sum(APP_START_MARKER in line for line in text.splitlines())
+  # Lines of the sync code at work, per kind.
+  work = {marker: sum(marker in line for line in lines) for marker in SYNC_WORK_MARKERS}
+  # Any other [sync] line than the refusal, the work lines and the system-volume set-up, by its first 100 characters.
+  other = sorted({line[:100] for line in lines if reason not in line and not line.startswith(SYNC_SETUP_MARKER)
+                  and not any(marker in line for marker in SYNC_WORK_MARKERS)})
+  # Reasons the check failed; empty means PASS.
+  failures = []
+  if not red:
+    # The node never refused the configuration.
+    failures.append('no "{}" line'.format(reason))
+  elif len(red) != starts:
+    # The refusal is logged once per start of the app container.
+    failures.append('{} refusal lines for {} app container starts'.format(len(red), starts))
+  # Each kind of work line found.
+  for marker, count in work.items():
+    if count:
+      # The sync code ran although the configuration was refused.
+      failures.append('{} "{}" lines'.format(count, marker))
+  if other:
+    # A [sync] line this check does not expect from an app with SYNC off.
+    failures.append('other [sync] lines: {}'.format(other))
+  if len(app['containers']) != 1:
+    # The job's app could not be told apart, or is missing.
+    failures.append('the job has {} app containers on the node: {}'.format(len(app['containers']), app['containers']))
+  else:
+    if not app['running']:
+      # The container must keep running with SYNC off.
+      failures.append('app container {} is not running'.format(app['containers'][0]))
+    # The variables it must not have but has.
+    extra = [item for item in SYNC_OFF_ABSENT if item in app['env_names']]
+    # The ones every app gets that it lacks.
+    missing = [item for item in SYNC_OFF_PRESENT if item not in app['env_names']]
+    if extra or missing:
+      # The node advertised SYNC to the app, or left out what every app gets.
+      failures.append('app environment has {} and lacks {}'.format(extra, missing))
+    if app['secret_len'] != '0':
+      # The secret reached the container (or the count file is missing).
+      failures.append('app reports {!r} bytes of R1EN_SYNC_SECRET, expected 0'.format(app['secret_len']))
+  if state['received'] or state['quarantine'] or state['downloads']:
+    # The consumer applied, refused or fetched something.
+    failures.append('{} received entries, quarantine {}, downloads {}'.format(len(state['received']), state['quarantine'], state['downloads']))
+  if not stored:
+    # No saved copy of the pipeline, or the reader failed: no proof the node kept the block.
+    failures.append('no saved copy of the job\'s pipeline with a SYNC block was read: {}'.format(stored))
+  elif any(block['enabled'] is not True for block in stored):
+    # The node rewrote the stored configuration.
+    failures.append('saved SYNC blocks not enabled: {}'.format([block['enabled'] for block in stored]))
+  # The whole judgement.
+  return {'refusal_lines': len(red), 'app_starts': starts, 'work_lines': work, 'other_sync_lines': other, 'app': app,
+          'received': len(state['received']), 'quarantine': state['quarantine'], 'downloads': state['downloads'],
+          'stored': stored, 'failures': failures, 'ok': not failures}
+
+
+def sync_off(name, job, key, reason=SECRET_REFUSAL):
+  """
+  Check that a node whose job carries a refused SYNC configuration really runs that job's app with SYNC off.
+
+  Reads the node's log, the job's app container (named after the job's pipeline) in the node's daemon, the
+  set's sync history on the node and the node's saved copy of the job's pipeline, then judges with
+  ``sync_off_verdict``.
+
+  Parameters
+  ----------
+  name : str
+    Node name; the node must run this job's app only.
+  job : int
+    The Deeploy job id.
+  key : str
+    The set's sync key, for its history entries on the node.
+  reason : str, optional
+    The refusal line's text (default: the malformed-secret refusal).
+
+  Returns
+  -------
+  dict
+    ``node``, ``job``, ``key`` and what ``sync_off_verdict`` returns.
+
+  Examples
+  --------
+  >>> sync_off('r1w-06', 3009, 'lnet-sync-k1')['ok']
+  True
+  """
+  # The node's log as Docker keeps it (the node is not restarted in the scenarios that use this check).
+  text = node_log(name)
+  # The job's app containers: the runner names each one after its pipeline, which is named after the job.
+  names = sh('docker', 'exec', container(name), 'docker', 'ps', '-a', '--filter', 'name=lnsync{}_'.format(job), '--format', '{{.Names}}',
+             check=False).stdout.split()
+  # What is read of the app; empty when there is not exactly one.
+  app = {'containers': names, 'running': None, 'env_names': [], 'secret_len': None}
+  if len(names) == 1:
+    # Whether it runs.
+    app['running'] = sh('docker', 'exec', container(name), 'docker', 'inspect', '-f', '{{.State.Running}}', names[0],
+                        check=False).stdout.strip() == 'true'
+    # The names of the variables of interest it has, never their values.
+    app['env_names'] = sh('docker', 'exec', container(name), 'docker', 'exec', names[0], 'sh', '-c', ENV_NAMES,
+                          check=False).stdout.split()
+    # The count of the secret's bytes the app wrote at its start.
+    app['secret_len'] = sh('docker', 'exec', container(name), 'docker', 'exec', names[0], 'cat', '/data/secret_len',
+                           check=False).stdout.strip()
+  # The node's saved copy of the job's pipeline, with the placeholder in front of the reader.
+  stored = _tagged(_exec_python(name, _with_values(STORED_READER, PLACEHOLDER=DAUTH_PLACEHOLDER), str(job)), 'STORED')
+  # The judgement, with what was checked.
+  return dict(sync_off_verdict(text, app, sync_state(name, key), stored, reason=reason), node=name, job=job, key=key)
+
+
+def sync_off_text(report):
+  """
+  A short human summary of a ``sync_off`` report.
+
+  Parameters
+  ----------
+  report : dict
+    Result of ``sync_off``.
+
+  Returns
+  -------
+  str
+    A few lines ending with ``PASS`` or ``FAIL`` and the reasons.
+
+  Examples
+  --------
+  >>> print(sync_off_text(report).splitlines()[-1])
+  PASS
+  """
+  # The job, and its refusal lines against its app's starts.
+  lines = ['sync off: job {} on {} (set {}): {} refusal line(s) for {} app container start(s)'.format(
+    report['job'], report['node'], report['key'], report['refusal_lines'], report['app_starts'])]
+  # The sync code's work lines and any other [sync] line.
+  lines.append('  work lines {}; other [sync] lines {}'.format(report['work_lines'], report['other_sync_lines']))
+  # The app: container, state, variables present (names only) and its count of secret bytes.
+  lines.append('  app {} running {}, variables {}, secret_len {}'.format(
+    report['app']['containers'], report['app']['running'], report['app']['env_names'], report['app']['secret_len']))
+  # What the consumer holds of the set.
+  lines.append('  received entries {}, quarantine {}, downloads {}'.format(report['received'], report['quarantine'], report['downloads']))
+  # The saved copy of the job's pipeline.
+  lines.append('  saved pipeline blocks {}'.format(report['stored']))
   # The verdict last.
   lines.append('PASS' if report['ok'] else 'FAIL: ' + '; '.join(report['failures']))
   # One text block.

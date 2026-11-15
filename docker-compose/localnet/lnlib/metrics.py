@@ -307,6 +307,171 @@ def loop_gaps(home, name, start, end, floor_hz=1.0, window_s=10.0):
   return result
 
 
+def _tick_figures(first, last, keys):
+  """
+  What a node did between two probe samples: main-loop rate, CPU, and the mean process time of some plugin instances.
+
+  Parameters
+  ----------
+  first : dict
+    The earlier probe sample.
+  last : dict
+    The later probe sample of the same node process.
+  keys : list of str
+    Plugin instance keys (``<stream>|<signature>|<instance>``) whose ``process`` timer is read.
+
+  Returns
+  -------
+  dict
+    ``seconds``; ``main_hz`` (main-loop iterations per second); ``cpu_cores`` (node process CPU seconds per second);
+    ``container_cores`` and ``throttled_share`` (the container's control group); ``calls`` and ``process_mean_s``
+    (all timed ``process`` calls of the instances in the window and their mean wall time, pooled: total time over
+    total calls; None without timed calls).
+
+  Examples
+  --------
+  >>> _tick_figures({'t': 0, 'cpu': 0, 'main_iter': 0, 'plugins': {'k': {'pn': 10, 'pm': 0.1}}},
+  ...               {'t': 10, 'cpu': 2, 'main_iter': 100, 'plugins': {'k': {'pn': 12, 'pm': 0.15}}}, ['k'])['process_mean_s']
+  0.4
+  """
+  # The time between the two samples.
+  span = max(1e-9, last['t'] - first['t'])
+  # Timed calls and their total time, summed over the instances present in both samples with a timer.
+  calls, total = 0, 0.0
+  # Each instance asked for.
+  for key in keys:
+    # Its two readings, empty when it is missing from a sample.
+    one, two = (first.get('plugins') or {}).get(key) or {}, (last.get('plugins') or {}).get(key) or {}
+    if all(isinstance(item.get(field), (int, float)) for item in (one, two) for field in ('pn', 'pm')):
+      # The timer keeps a running mean: count x mean is the total time so far; the window is the difference.
+      calls, total = calls + two['pn'] - one['pn'], total + two['pm'] * two['pn'] - one['pm'] * one['pn']
+  # The node figures; the control-group ones only when both samples carry them.
+  return {
+    'seconds': rnd(span, 1),
+    'main_hz': rnd((last['main_iter'] - first['main_iter']) / span, 3) if 'main_iter' in first and 'main_iter' in last else None,
+    'cpu_cores': rnd((last['cpu'] - first['cpu']) / span, 4),
+    'container_cores': rnd((last['cg_usage_usec'] - first['cg_usage_usec']) / 1e6 / span, 4)
+                       if 'cg_usage_usec' in first and 'cg_usage_usec' in last else None,
+    'throttled_share': rnd((last['cg_throttled_usec'] - first['cg_throttled_usec']) / 1e6 / span, 4)
+                       if 'cg_throttled_usec' in first and 'cg_throttled_usec' in last else None,
+    # Pooled mean process time: every timed call of the instances weighs the same.
+    'calls': calls, 'process_mean_s': rnd(total / calls, 5) if calls > 0 else None,
+  }
+
+
+def tick_window(home, name, start, end, signature='CONTAINER_APP_RUNNER', parts=3):
+  """
+  The mean process time of one node's instances of a plugin, its main-loop rate and its CPU in a window, from its probe.
+
+  The process time is what the core's own ``process`` timer of each instance measured (probe fields ``pn`` and
+  ``pm``): for the container app runner, one call every 5 s that runs the app's sync tick every 10 s, so its mean
+  is the mean tick cost as the node lives it (wall time, waits for the CPU and the interpreter lock included).
+
+  Parameters
+  ----------
+  home : Home
+    Folder layout of the localnet; the node's ``probe.jsonl`` is read.
+  name : str
+    Node name.
+  start : float
+    Window start, epoch seconds.
+  end : float
+    Window end, epoch seconds.
+  signature : str, optional
+    Plugin signature of the instances whose ``process`` timer is read (default the container app runner).
+  parts : int, optional
+    Equal sub-windows the same figures are also given for, to show how much they move within the window.
+
+  Returns
+  -------
+  dict
+    ``samples``, ``from_utc``, ``to_utc``, ``instances`` (the instance keys read), the ``_tick_figures`` of the
+    whole window, and ``parts`` (the same figures per sub-window); only ``samples`` when fewer than two samples of
+    one node process fall in the window.
+
+  Examples
+  --------
+  >>> tick_window(home, 'r1w-02', marks['refusing'], marks['refusing_end'])['process_mean_s']
+  0.0412
+  """
+  # The probe's samples in the window.
+  rows = read_jsonl(home.run / 'out' / name / 'probe.jsonl', start, end)
+  # Split at a restart of the node (the probe's uptime goes back); keep the longest part, whose counters never go back.
+  chunks, current = [], []
+  # Each sample in order.
+  for row in rows:
+    if current and row['up'] < current[-1]['up']:
+      # A new process: the part before it is closed.
+      chunks.append(current)
+      # And a new part begins.
+      current = []
+    # The sample joins the current part.
+    current.append(row)
+  # The last part, then the longest.
+  rows = max(chunks + [current], key=len)
+  if len(rows) < 2:
+    # No span to measure.
+    return {'samples': len(rows)}
+  # The instances of the signature in the last sample (the key's middle part is the signature).
+  keys = sorted(key for key in (rows[-1].get('plugins') or {}) if key.split('|')[1] == signature)
+  # Sample indexes that cut the window into equal parts (neighbouring parts share a sample).
+  cuts = [round(idx * (len(rows) - 1) / parts) for idx in range(parts + 1)]
+  # The whole window and its parts.
+  return dict(_tick_figures(rows[0], rows[-1], keys), samples=len(rows), instances=keys,
+              from_utc=datetime.fromtimestamp(rows[0]['t'], timezone.utc).strftime('%H:%M:%S'),
+              to_utc=datetime.fromtimestamp(rows[-1]['t'], timezone.utc).strftime('%H:%M:%S'),
+              # Parts with at least one sample between their ends.
+              parts=[_tick_figures(rows[one], rows[two], keys) for one, two in zip(cuts, cuts[1:]) if two > one])
+
+
+def tick_compare(report, node, base, share=0.10):
+  """
+  Whether one node's window figures stay within a share of another node's (the weak-host bound of a code change).
+
+  Parameters
+  ----------
+  report : dict
+    Node name -> ``tick_window`` result of the same window.
+  node : str
+    The node on the code under test.
+  base : str
+    The node on the code it replaces, under the same load.
+  share : float, optional
+    The bound (default 0.10): ``node``'s mean process time and CPU at most ``1 + share`` times ``base``'s, its
+    main-loop rate at least ``1 - share`` times ``base``'s.
+
+  Returns
+  -------
+  dict
+    ``ratios`` (node / base for process_mean_s, main_hz, cpu_cores, container_cores), ``failures`` (empty when the
+    bound holds; a missing figure is a failure) and ``ok``.
+
+  Examples
+  --------
+  >>> tick_compare({'b': {'process_mean_s': 0.05, 'main_hz': 9.0, 'cpu_cores': 0.2},
+  ...               'a': {'process_mean_s': 0.05, 'main_hz': 10.0, 'cpu_cores': 0.2}}, 'b', 'a')['ok']
+  True
+  """
+  # The figures compared, and which way is worse: up for time and CPU, down for the loop rate.
+  worse_up = {'process_mean_s': True, 'main_hz': False, 'cpu_cores': True}
+  # Ratios of every figure both nodes have (container CPU only reported).
+  ratios = {field: rnd(report[node][field] / report[base][field], 3)
+            for field in list(worse_up) + ['container_cores']
+            if report[node].get(field) is not None and report[base].get(field)}
+  # Reasons the bound does not hold; empty means it holds.
+  failures = []
+  # Each bounded figure.
+  for field, up in worse_up.items():
+    if field not in ratios:
+      # A figure that could not be measured is no proof.
+      failures.append('{}: not measured on both nodes'.format(field))
+    elif (ratios[field] > 1 + share) if up else (ratios[field] < 1 - share):
+      # Outside the bound, in the worse direction.
+      failures.append('{}: {} on {} is {} x {} on {}'.format(field, report[node][field], node, ratios[field], report[base][field], base))
+  # The comparison.
+  return {'node': node, 'base': base, 'share': share, 'ratios': ratios, 'failures': failures, 'ok': not failures}
+
+
 def node_log(name, start, end):
   stamp = lambda value: datetime.fromtimestamp(value, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
   out = sh('docker', 'logs', '--since', stamp(start), '--until', stamp(end), container(name), check=False, timeout=180).stdout or ''

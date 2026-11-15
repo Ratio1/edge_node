@@ -143,6 +143,13 @@ oracles that run it.
 - `custody <job> --secret NAME [--node N --key K --secret-len N]` reads the job's stored copy and
   deployment plan from R1FS with the default key on an oracle (they must hold only the dAuth placeholder
   at `ENV.R1EN_SYNC_SECRET` and not the secret) and the app's `/data/secret_len`.
+- Scenario step `sync_off` (node, job, key) checks a job whose SYNC configuration the node refused (a
+  malformed secret by default) on a node that runs only that app: the refusal line once per start of the app
+  container and no green line; no store read, refusal, quarantine skip, apply or provider line, and no other
+  `[sync]` line than the system-volume set-up; the app running without `R1_SYNC_KEY`, `R1_SYNC_TYPE` or
+  `R1EN_SYNC_SECRET` (matched by exact name: every app keeps `R1_SYSTEM_VOLUME`, `R1_VOLUME_SYNC_DIR` and
+  `R1_SYNC_REQUEST_FILE`), count 0; nothing received, quarantined or downloaded; the node's saved copy of the
+  pipeline still says `SYNC.ENABLED` true. `custody` also reports `SYNC.ENABLED` of the stored documents.
 - `scan NAME` searches every node's log and cache folder (logs, plugin data, the apps' mounted volumes,
   downloads, store files) for the secret, its SHA-256 (the archive key), that key's first 16 bytes and
   the record MAC subkey; dAuth's bundle records in the chain store (`DAUTH_JOB_SECRETS`,
@@ -183,7 +190,8 @@ the isolated network), `down [--purge]`.
 | `scenarios/container_sync_rolling.json` | A set that keeps publishing while its workers move to tree `next` one at a time and back to `old` |
 | `scenarios/container_sync_custody.json` | A provider created with a set secret through `secret_paths`: the sync check, the custody check (placeholder in R1FS, the app's count), and the secret scan |
 | `scenarios/container_sync_secret.json` | A provider and a consumer both created with a set secret on code that supports it: the sync check with the set's format, custody of both jobs (count 0 in the apps), the secret scan |
-| `scenarios/container_sync_secret_fleet.json` | A shared-key set and a set with a secret on six workers, with consumers that must refuse (no, wrong or malformed secret), a kill and start of one consumer, then a rollback of three workers to `old` and their re-upgrade |
+| `scenarios/container_sync_secret_fleet.json` | A shared-key set and a set with a secret on six workers, with consumers that must refuse (no, wrong or malformed secret), a kill and start of one consumer, then a rollback of three workers to `old` and their re-upgrade; last, the consumer with the malformed secret must have run with SYNC off (`sync_off`) |
+| `scenarios/container_sync_tickcost_lowend.json` | Two weak consumer hosts at 0.35 CPU, one on `old` and one on `next`, each refusing every record of a set with two apps of 1,000 history entries: mean `process` time of their app runners, main-loop rate and CPU over the same 1,200 s, `next` within 10 % of `old` (`ticks`) |
 | `scenarios/container_sync_secret_mixed.json` | A set with a secret created through a Deeploy oracle on `old`, with one consumer on `old` that refuses, then moves to `next` |
 | `scenarios/container_sync_rolling_lowend.json`, `container_sync_secret_lowend.json` | The rolling scenario and the all-`next` part of the fleet scenario with r1w-02 limited to 0.35 CPU and its consumer apps given 1,000 received-history entries each (step `seed_history`) |
 | `scenarios/restart_catchup.json`, `restart_catchup_lowend.json` | Deeploy creates and deletes without pause (`deeploy cycle`) while the headless oracle r1s-db is killed for 12 minutes; per signed namespace, what each oracle lacks from 60 s to 810 s after r1s-db's start, its statistics lines and loop pauses. The second limits r1s-db to 0.35 CPU before its start |
@@ -199,8 +207,11 @@ Each phase of a scenario produces one JSON file. Everything is measured the same
 version:
 
 - per node, from a sampler inside the node (`node/probe.py`): inputs received, handled and dropped per
-  plugin, queue depth, plugin loop rate, CPU time and memory of the node process, and CPU time, throttled
-  time and memory of the whole container (node process, web servers, managers) from its control group;
+  plugin, queue depth, plugin loop rate, the calls and mean wall time of each plugin's `process` (the core's
+  own timer), CPU time and memory of the node process, and CPU time, throttled time and memory of the whole
+  container (node process, web servers, managers) from its control group; the scenario step `ticks` gives,
+  between two marks, a node's mean `process` time of its container app runners (the loop that runs the sync
+  tick), main-loop rate and CPU, and can bound one node's figures by another's;
 - what users saw, from the load generators: chain-store writes confirmed and their latency, replication
   delay to every other serving node, refresh outcomes, dAuth outcomes and latency, Deeploy admission time
   and operation timeline;

@@ -52,6 +52,14 @@ pin       with ``client`` (a node) and ``to`` (a load generator with a fixed add
           ``slowdauth``): send that node's dAuth calls through the front to that generator
 held      the fields of one hash namespace (``namespace``) and some plain keys (``keys``) each node's
           saved replica holds, with their sizes (default nodes: the oracles): held_<name>.json
+sync_off  check that a job whose SYNC configuration a node refused (a malformed secret by default;
+          ``reason`` names another refusal line) runs with SYNC off: node, job, key, name; writes
+          sync_off_<name>.json and .txt, and a FAIL fails the scenario
+ticks     per node, the mean ``process`` time of its container app runner instances (the sync tick's
+          loop), its main-loop rate and CPU, between two marks (``from``, ``to``; ``to`` defaults to now):
+          nodes, name, parts; with ``compare`` [node, base] and ``share`` (0.10) the first node's figures
+          must stay within that share of the second's (time and CPU up, loop rate down), else the step
+          fails the scenario after writing ticks_<name>.json and .txt
 
 Every phase is measured with ``metrics.collect`` when it ends; the result goes
 to ``<results>/<run>/<phase>.json`` and a summary table to ``summary.txt``.
@@ -434,6 +442,46 @@ def _steps(home, spec, manifest, out, phase, note, close_phase, marks):
       report = applib.seed_history(step['node'], step['job'], step['count'])
       # What was written, in the run journal.
       note('seed_history {} job {}: {} files in {}'.format(step['node'], step['job'], report['files'], report['folder']))
+    elif do == 'sync_off':
+      # Names the report files.
+      label = step.get('name') or 'sync_off'
+      # The node's log, the job's app, the set's history and the saved pipeline, judged against the refusal line.
+      report = applib.sync_off(step['node'], step['job'], step['key'], reason=step.get('reason', applib.SECRET_REFUSAL))
+      # The full report (names, counts and kinds only), kept with the run.
+      (out / 'sync_off_{}.json'.format(label)).write_text(json.dumps(report, indent=1, sort_keys=True))
+      # The short summary next to it.
+      (out / 'sync_off_{}.txt'.format(label)).write_text(applib.sync_off_text(report) + '\n')
+      # The summary also goes into the run journal, one line at a time.
+      for line in applib.sync_off_text(report).splitlines():
+        # Prefixed with the check's name.
+        note('sync_off {}: {}'.format(label, line))
+      # A failed check fails the scenario (exit code 2), after its report is written.
+      if not report['ok']:
+        # The reasons become the scenario's error message.
+        raise LocalnetError('sync_off check {} failed: {}'.format(label, '; '.join(report['failures'])))
+    elif do == 'ticks':
+      # Names the report files.
+      label = step.get('name') or 'ticks'
+      # The window: from a mark to another mark, or to now.
+      start, end = marks[step.get('from', 'scenario')], marks[step['to']] if step.get('to') else time.time()
+      # Each named node's figures over the same window, from its probe.
+      report = {name: metrics.tick_window(home, name, start, end, parts=step.get('parts', 3)) for name in step['nodes']}
+      # With a comparison: the node under test against the base node, within the share.
+      verdict = metrics.tick_compare(report, step['compare'][0], step['compare'][1], share=step.get('share', 0.10)) if step.get('compare') else None
+      # The figures and the verdict, kept with the run.
+      (out / 'ticks_{}.json'.format(label)).write_text(json.dumps({'nodes': report, 'compare': verdict}, indent=1, sort_keys=True))
+      # One line per node (the parts stay in the JSON file), then the verdict.
+      text = ['{} {}'.format(name, json.dumps({key: val for key, val in item.items() if key not in ('parts', 'instances')}, sort_keys=True))
+              for name, item in report.items()] + ([json.dumps(verdict, sort_keys=True)] if verdict else [])
+      # The readable view next to it.
+      (out / 'ticks_{}.txt'.format(label)).write_text('\n'.join(text) + '\n')
+      # Each line in the run journal too.
+      for line in text:
+        # Prefixed with the window's name.
+        note('ticks {}: {}'.format(label, line))
+      if verdict and not verdict['ok']:
+        # The bound does not hold: the scenario fails (exit code 2), after the report is written.
+        raise LocalnetError('ticks {} outside the bound: {}'.format(label, '; '.join(verdict['failures'])))
     else:
       raise LocalnetError('unknown scenario step {}'.format(do))
   return
