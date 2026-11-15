@@ -3,6 +3,8 @@ import sys
 import threading
 import types
 from collections import deque
+# The core builds each `cfg_` property from a partial of its getter; `read_config_like_a_node` does the same.
+from functools import partial
 from unittest.mock import MagicMock
 
 import numpy as _np
@@ -539,3 +541,52 @@ def make_lifecycle_runner(docker_client=None, mock_container=None, **cfg_overrid
     setattr(plugin, key, value)
 
   return plugin, docker_client, mock_container
+
+
+def read_config_like_a_node(plugin, **config_data):
+  """
+  Make a runner read the given configuration keys the way a node does: through the core's `cfg_` getters.
+
+  On a node the core gives the plugin class one read-only `cfg_<key>` property per configuration key
+  (`create_config_handlers`), each built from the core's `getter`, and that getter returns a copy of a dict
+  value. A runner whose `cfg_*` are plain attributes hands out the same dict on every read, so a write into
+  it lasts there while a node loses it. A test of code that reads a dict-valued key and must not depend on
+  such a write takes its runner through this helper.
+
+  Parameters
+  ----------
+  plugin : ContainerAppRunnerPlugin
+    A runner from `make_container_app_runner()` or `make_lifecycle_runner()`.
+  **config_data : dict
+    Configuration keys as the node stores them (upper case) with their values, for example
+    `SYNC={"ENABLED": True}, ENV={}`. They become `plugin.config_data`.
+
+  Returns
+  -------
+  ContainerAppRunnerPlugin
+    The same runner. Its class is now a subclass that carries the properties, and they hide any plain
+    attribute of the same name; `plugin.config_data` is the dict to change when a test edits the configuration.
+
+  Raises
+  ------
+  ImportError
+    When the core (`naeural_core`) is not on the path: the getter under test is the core's own.
+
+  Examples
+  --------
+  >>> plugin, _client, _container = make_lifecycle_runner()
+  >>> plugin = read_config_like_a_node(plugin, SYNC={"ENABLED": True})
+  >>> plugin.cfg_sync["ENABLED"] = False
+  >>> plugin.cfg_sync["ENABLED"]
+  True
+  """
+  # The core's own getter, imported here so this module still loads where only the dummy base plugin exists.
+  from naeural_core.local_libraries.config_handler_mixin import getter
+  # One property per key, named and built as `create_config_handlers` does (`cfg_` plus the key in lower case).
+  handlers = {"cfg_" + key.lower(): property(fget=partial(getter, key=key)) for key in config_data}
+  # On a node the properties sit on the plugin class; here on a subclass, so other tests keep plain attributes.
+  plugin.__class__ = type(type(plugin).__name__, (type(plugin),), handlers)
+  # What the getters read: the node's configuration of this plugin.
+  plugin.config_data = config_data
+  # The same runner, now reading these keys as a node does.
+  return plugin

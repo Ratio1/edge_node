@@ -93,6 +93,8 @@ from .mixins import (
 from .env_overrides import _EnvOverridesMixin
 from .reset import _ResetMixin
 from .sync import _SyncMixin
+# The 64-hex pattern that checks a set's sync secret, and the two archive format tags the "SYNC enabled" line names.
+from .sync.constants import ARCHIVE_ENCRYPTION, ARCHIVE_ENCRYPTION_SET, HEX64_RE
 
 __VER__ = "0.7.1"
 
@@ -1431,10 +1433,41 @@ class ContainerAppRunnerPlugin(
 
   def _validate_sync_config(self):
     """
-    Validate the SYNC config block when ENABLED. Disables SYNC with a
-    warning rather than raising; the system volume itself is independent
-    and the rest of the plugin must keep running.
+    Validate the SYNC config block when ENABLED.
+
+    Disables SYNC with a red log line rather than raising; the system volume itself is independent and the
+    rest of the plugin must keep running. Checked in this order: ``SYNC.KEY`` is a non-empty string,
+    ``SYNC.TYPE`` is ``provider`` or ``consumer``, and the set's secret (``ENV.R1EN_SYNC_SECRET``), when the
+    job has one, is exactly 64 lowercase hex characters. A secret in any other form (a passphrase, uppercase
+    hex, an empty string, a number) disables SYNC on this job: there is no fallback to the shared key, because
+    a job that was given a secret must never publish or apply under the key every node holds.
+
+    Returns
+    -------
+    None
+      The verdict is kept in ``_sync_config_refused`` (True when a check fails), which ``_sync_enabled``
+      reads. The configuration is not changed.
+
+    Notes
+    -----
+    Runs at init and at every restart, config edits included. Each run decides again from the current
+    configuration: a refused block logs its red line once per run and keeps SYNC off (no provider or consumer
+    tick work, no ``R1_SYNC_TYPE`` or ``R1_SYNC_KEY`` for the app), and the run after a corrected
+    configuration turns SYNC back on. The verdict is not written into ``SYNC.ENABLED``: on a node
+    ``cfg_sync`` is a copy of the block, so that write would be lost. The log lines never contain the secret:
+    the refusal names the variable, and the green line names the archive format (``r1fs-set-v1`` with a
+    secret, ``r1fs-default`` without).
+
+    Examples
+    --------
+    >>> plugin.config_data["SYNC"] = {"ENABLED": True, "KEY": "k", "TYPE": "provider"}
+    >>> plugin.config_data["ENV"] = {"R1EN_SYNC_SECRET": "not-64-hex"}
+    >>> plugin._validate_sync_config()
+    >>> plugin._sync_enabled(), plugin.cfg_sync["ENABLED"]
+    (False, True)
     """
+    # Each run decides again: without this a block refused once would stay refused after it was corrected.
+    self._sync_config_refused = False
     if not self._sync_enabled():
       return
     sync = self._sync_cfg()
@@ -1445,18 +1478,33 @@ class ContainerAppRunnerPlugin(
         "[sync] SYNC.ENABLED but SYNC.KEY missing/empty; disabling SYNC.",
         color="r",
       )
-      sync["ENABLED"] = False
+      # Kept on the plugin: `sync` is a copy of the block on a node, so a write to it left SYNC on.
+      self._sync_config_refused = True
       return
     if role not in ("provider", "consumer"):
       self.P(
         f"[sync] SYNC.TYPE must be 'provider' or 'consumer' (got {role!r}); disabling SYNC.",
         color="r",
       )
-      sync["ENABLED"] = False
+      # Kept on the plugin for the same reason; before, the app still got this TYPE and the KEY in its env.
+      self._sync_config_refused = True
+      return
+    # The set's secret from the job's configured ENV; None means a set that uses the shared key.
+    secret = self.cfg_sync_secret
+    # A configured secret must be 64 lowercase hex characters, whole string (fullmatch: the pattern is unanchored).
+    if secret is not None and not (isinstance(secret, str) and HEX64_RE.fullmatch(secret)):
+      self.P(
+        "[sync] R1EN_SYNC_SECRET must be 64 lowercase hex characters; disabling SYNC.",
+        color="r",
+      )
+      # No shared-key fallback: with a malformed secret this job neither publishes nor applies. Kept on the
+      # plugin: written into the copy `sync`, the refusal was lost and the job went on publishing or applying.
+      self._sync_config_refused = True
       return
     self.P(
       f"[sync] SYNC enabled: role={role}, key={key}, "
-      f"poll={self._sync_poll_interval()}s",
+      f"poll={self._sync_poll_interval()}s, "
+      f"encryption={ARCHIVE_ENCRYPTION_SET if secret is not None else ARCHIVE_ENCRYPTION}",
       color="g",
     )
     return
