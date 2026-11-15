@@ -14,7 +14,8 @@ class _RequestTrackingMixin(object):
   The record is written on the request monitor thread, from the web app's ``on_request_monitor_tick``
   hook (see ``_maybe_publish_tracked_requests``), and the write does not wait for the other nodes.
   The monitor thread is not held by an endpoint, so a request is published as not answered at the
-  monitor's next turn after it was queued, also when its endpoint then hangs and holds the plugin
+  monitor's next turn after it was queued when no write was made in the last ``REQUESTS_SAVE_INTERVAL``
+  seconds, else at the end of that interval, also when its endpoint then hangs and holds the plugin
   thread. The answer is stamped by the plugin thread and published at the end of the interval, so the
   other nodes can show a request as not answered for up to ``REQUESTS_SAVE_INTERVAL`` seconds after it
   was answered. Before, the plugin thread wrote the record at the end of its lap and waited for the
@@ -229,8 +230,8 @@ class _RequestTrackingMixin(object):
     # wait=False: stored here and queued for the other oracles, with no wait for their confirmations, so the
     # monitor thread goes back to admitting requests. Before, the plugin thread waited here for up to 3 x 10 s
     # and the result was not read. No debug=True any more: its four log lines per write each waited for the
-    # interpreter lock on a node at its CPU limit, 22 ms a write (median) against 0.35 ms without them, measured
-    # under a 0.35 CPU limit.
+    # interpreter lock on a node at its CPU limit, 22 ms a write (median) against 0.3 to 0.6 ms without them,
+    # measured under a 0.35 CPU limit.
     if not self.chainstore_hset(
       hkey=self.__rt_cstore_hkey,
       key=self.ee_id,
@@ -265,9 +266,10 @@ class _RequestTrackingMixin(object):
     seconds. The first change after a quiet period is written by the first call that sees it; a change
     inside the interval waits for its end.
 
-    So a request is written as not answered right after it was queued, whatever its endpoint then does,
-    and a request that is answered is written a second time, with its answer, at the end of the
-    interval. A request refused with a 503 before it ran is written as not answered too.
+    So a request is written as not answered right after it was queued when it ends a quiet period, else
+    at the end of the interval, whatever its endpoint then does; a request that is answered is written
+    a second time, with its answer, at the end of the interval. A request refused with a 503 before it
+    ran is written as not answered too.
 
     Returns
     -------
@@ -284,12 +286,13 @@ class _RequestTrackingMixin(object):
     it takes the chain store's lock, which a save or a namespace-sync merge can hold.
 
     Measured on the node image's interpreter under a 0.35 CPU limit, with the core's write path on its
-    test harness (a replica of 5,700 records, 10 peers) and the node's logger, over 2,000 writes: one
-    write takes about 0.35 ms (median) and 0.9 ms (99th percentile), in an otherwise idle process and
-    with one more thread that keeps the process at its CPU limit alike. The write passes no ``debug``
-    flag. With ``debug=True``, as it was first written, it took 1.1 ms (median) in an idle process and,
-    at the CPU limit, 22 ms (median) and 32 ms (99th percentile): its four log lines each waited about
-    5 ms for the interpreter lock. A call with nothing due takes about 0.001 ms.
+    test harness (a replica of 5,700 records, 10 peers) and the node's logger, over 2,000 writes per run:
+    one write takes 0.3 to 0.6 ms (median; the spread is from run to run) and under 1 ms (99th
+    percentile), in an otherwise idle process and with one more thread that keeps the process at its CPU
+    limit alike. The write passes no ``debug`` flag. With ``debug=True``, as it was first written, it
+    took 1.1 ms (median) in an idle process and, at the CPU limit, 22 ms (median) and 32 ms (99th
+    percentile): its four log lines each waited about 5 ms for the interpreter lock. A call with nothing
+    due takes about 0.001 ms.
 
     Examples
     --------
