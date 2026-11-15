@@ -196,7 +196,8 @@ class TestCatchupReaders(unittest.TestCase):
     counts = {ops + '/resync/asked': 1, ops + '/resync/answered': 2, ops + '/resync/merged': 7,
               dauth + '/remote/refused_not_member': 4, 'plain/remote/refused_invalid_key': 1, 'plain/local/error': 2,
               'saves': 3}
-    line = '2026-11-15T01:00:00.25Z \x1b[1;37m[EE] CSTORE_STATS ' + json.dumps(
+    # The node starts each console line with a carriage return, after Docker's time stamp.
+    line = '2026-11-15T01:00:00.25Z \r\x1b[1;37m[EE] CSTORE_STATS ' + json.dumps(
       {'counts': counts, 'lost_inputs': 0, 'queue_peak': 5, 'period_s': 300}) + '\x1b[0m'
     found = cstats.parse(line + '\nanother line\n')
     # One statistics line, at the stamp's time with its fraction.
@@ -235,6 +236,15 @@ class TestCatchupReaders(unittest.TestCase):
     # The longest stretch under 1 Hz is the stall itself; over 2 s the lowest rate is 0.
     self.assertEqual(result['under_floor_s'], 4.0)
     self.assertEqual(result['min_rate_hz'], 0.0)
+
+  def test_the_time_before_a_loop_first_ran_is_not_a_pause(self):
+    """Samples taken during the node's start-up, before its loop moved, are left out but the last one."""
+    from lnlib.metrics import started
+    # 17 s of start-up at count 0, then the loop runs.
+    series = [(t, 0) for t in range(18)] + [(18, 10), (19, 20)]
+    self.assertEqual(started(series), [(17, 0), (18, 10), (19, 20)])
+    # A counter that never moved keeps every sample (a loop that never ran is a pause).
+    self.assertEqual(started([(0, 3), (1, 3)]), [(0, 3), (1, 3)])
 
   def test_the_request_trace_of_a_writer_is_found_by_its_field(self):
     """The Deeploy request trace of one oracle is read from a replica by the decoded field of its key."""

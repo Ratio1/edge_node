@@ -82,8 +82,9 @@ def parse(text):
   found = {'stats': [], 'census': []}
   # One JSON decoder reads the object that starts after the marker and ignores what follows it.
   decoder = json.JSONDecoder()
-  # Every line, without colour codes.
-  for line in ANSI.sub('', text).splitlines():
+  # Every line, without colour codes; split at newlines only and the carriage returns dropped, because the node
+  # starts each console line with one and splitlines() would cut Docker's time stamp off its line.
+  for line in ANSI.sub('', text).replace('\r', '').split('\n'):
     # A line is of at most one kind; both markers are tried.
     for marker, kind in zip(MARKERS, ('stats', 'census')):
       # Where the object starts, or -1 for a line of another kind.

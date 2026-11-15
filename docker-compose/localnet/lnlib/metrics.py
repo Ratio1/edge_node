@@ -199,6 +199,32 @@ def _loop_series(times, counts, floor_hz, window_s):
               min_rate_hz=rnd(min(rates), 2) if rates else None, p50_hz=rnd(pct(steps, 50), 1))
 
 
+def started(series):
+  """
+  A loop's samples from the last one before its counter first moved.
+
+  Parameters
+  ----------
+  series : list of tuple
+    ``(time, iterations so far)`` in time order.
+
+  Returns
+  -------
+  list of tuple
+    The samples from the last one that still shows the first value onwards, so the time before the loop ran
+    (the node's start-up) is not counted as a pause; all of them when the counter never moved.
+
+  Examples
+  --------
+  >>> started([(0, 0), (1, 0), (2, 0), (3, 5), (4, 9)])
+  [(2, 0), (3, 5), (4, 9)]
+  """
+  # The first sample whose count differs from the first sample's.
+  moved = next((idx for idx in range(1, len(series)) if series[idx][1] != series[0][1]), None)
+  # From the sample just before that one, or every sample.
+  return series[moved - 1:] if moved else series
+
+
 def loop_gaps(home, name, start, end, floor_hz=1.0, window_s=10.0):
   """
   How the main loop and the chain-store plugin loop of one node kept going in a window, from its probe.
@@ -223,7 +249,8 @@ def loop_gaps(home, name, start, end, floor_hz=1.0, window_s=10.0):
   dict
     ``samples``, ``period_s`` (median spacing of the samples, the resolution of every figure) and, for ``main``
     (the node's main loop, probe field ``main_iter``) and ``chain_store`` (the chain-store plugin's own loop),
-    what ``_loop_series`` returns, taken over the longest part of the window without a restart of the node.
+    what ``_loop_series`` returns, taken over the longest part of the window without a restart of the node and
+    from each loop's first iteration in it (``started``).
 
   Examples
   --------
@@ -255,16 +282,17 @@ def loop_gaps(home, name, start, end, floor_hz=1.0, window_s=10.0):
   # The resolution of every figure below, and when the part starts.
   result = {'samples': len(rows), 'period_s': rnd(pct([b - a for a, b in zip(times, times[1:])], 50), 2),
             'from_utc': datetime.fromtimestamp(times[0], timezone.utc).strftime('%H:%M:%S')}
-  # The main loop, in samples that carry its counter (a probe of an earlier tool version has none).
-  main = [(row['t'], row['main_iter']) for row in rows if 'main_iter' in row]
+  # The main loop, in samples that carry its counter (a probe of an earlier tool version has none), from its first
+  # iteration on: the probe starts before the node's start-up ends, which is not a pause of the loop.
+  main = started([(row['t'], row['main_iter']) for row in rows if 'main_iter' in row])
   if len(main) >= 3:
     # Its stall, slow stretch and rates.
     result['main'] = _loop_series([item[0] for item in main], [item[1] for item in main], floor_hz, window_s)
   # The chain-store plugin's loop: its instance key carries the signature as the middle part.
   key = next((key for key in (rows[-1].get('plugins') or {}) if key.split('|')[1] == 'CHAIN_STORE_BASE'), None)
-  # Its iteration counter in each sample that has it.
-  store = [(row['t'], row['plugins'][key]['iter']) for row in rows
-           if key in (row.get('plugins') or {}) and isinstance(row['plugins'][key].get('iter'), int)]
+  # Its iteration counter in each sample that has it, from the plugin's first iteration on.
+  store = started([(row['t'], row['plugins'][key]['iter']) for row in rows
+                   if key in (row.get('plugins') or {}) and isinstance(row['plugins'][key].get('iter'), int)])
   if len(store) >= 3:
     # Its stall, slow stretch and rates.
     result['chain_store'] = _loop_series([item[0] for item in store], [item[1] for item in store], floor_hz, window_s)
