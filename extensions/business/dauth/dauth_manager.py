@@ -22,6 +22,9 @@ WHITELIST (oracles)
 """
 # The call path of a failed secret reconciliation is logged (function names only).
 import traceback
+# The registry read is timed on the monotonic clock, the one the SDK times its memory of a failed read on: on the
+# wall clock, a forward step during a failed read lengthened the retry's wait by three times the step.
+from time import monotonic
 
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
@@ -239,8 +242,9 @@ class DauthManagerPlugin(
     A refresh is due every ``DAUTH_REGISTRY_REFRESH_INTERVAL`` seconds after a refresh that read the registry,
     and after a failed read once ``DAUTH_REGISTRY_REFRESH_RETRY_INTERVAL`` seconds have passed or, if later, once
     three times the failed read's time has passed (the SDK's ``_ORACLE_REGISTRY_FAILURE_FACTOR``), both counted
-    from the end of the read. The server is enabled when this node's address is in the registry and the
-    registry's peers resolve; a failed read disables it.
+    from the end of the read. The read's time is taken on the monotonic clock, as the SDK takes it, so a step
+    of the wall clock during the read does not change it. The server is enabled when this node's address is in
+    the registry and the registry's peers resolve; a failed read disables it.
 
     Parameters
     ----------
@@ -263,12 +267,20 @@ class DauthManagerPlugin(
     refresh that gets the remembered failure of another thread's read takes no time: it is tried again one
     retry interval later, and again while that memory lasts.
 
+    The read's time was first the difference of two wall clock readings. A forward step of S seconds during a
+    failed read (an NTP step after boot) then paused the server for three times the read plus S: 1800 s for a
+    600 s step after a read of 0.13 s, whose memory in the SDK had ended within a second. On the monotonic
+    clock the wait is what it is without the step: the retry interval, 60 s, for that read.
+
     Examples
     --------
     >>> plugin._refresh_dauth_registry(force=True)   # this node is registered and its peers resolve
     True
     """
     now = self.time()
+    # The read's start on the monotonic clock: its time decides the retry's wait after a failure, and a wall clock
+    # step during the read must not count as read time.
+    read_started = monotonic()
     last_refresh = getattr(self, "_last_dauth_registry_refresh", None)
     refresh_interval = (
       # After a failed read, the retry interval or, if longer, as long as the SDK answers that read's error from
@@ -302,8 +314,9 @@ class DauthManagerPlugin(
     # The next refresh is timed from the end of this read, no longer from its start: a read that hangs 20 s ends
     # a third of the way into a retry interval counted from its start.
     self._last_dauth_registry_refresh = self.time()
-    # How long the read took, for the retry after a failed one.
-    self._dauth_registry_read_seconds = self._last_dauth_registry_refresh - now
+    # How long the read took, for the retry after a failed one, on the monotonic clock as the SDK counts it. On the
+    # wall clock, a 600 s forward step during a failed read paused the server 1800 s instead of 60 s.
+    self._dauth_registry_read_seconds = monotonic() - read_started
     message = None if enabled else error or "current node is not registered as a dAuth oracle"
     self._dauth_registry_eth_oracles = eth_oracles if enabled else None
     self._dauth_registry_internal_peers = peers if enabled else None

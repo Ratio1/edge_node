@@ -5,6 +5,8 @@ import threading
 import unittest
 from copy import deepcopy
 from pathlib import Path
+# Two gate tests give the manager a monotonic clock of their own.
+from unittest.mock import patch
 
 from ratio1.const.base import dAuth
 
@@ -179,6 +181,8 @@ def _load_dauth_manager_class():
 
 
 DauthManagerPlugin = _load_dauth_manager_class()
+# The loaded manager module's globals, where a test puts a monotonic clock of its own.
+_MANAGER_GLOBALS = DauthManagerPlugin._refresh_dauth_registry.__globals__
 
 
 class _FakeDauthConst:
@@ -1225,6 +1229,8 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin = self._make_manager(dauth_oracle=True)
     # The start-up read lists it.
     plugin.on_init()
+    # The manager times its reads on the monotonic clock; here that clock follows the plugin's clock.
+    self.enterContext(patch.dict(_MANAGER_GLOBALS, monotonic=lambda: plugin._now))
 
     def hanging():
       """
@@ -1267,6 +1273,65 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     self.assertEqual((plugin.should_resume(), plugin.bc.calls), (False, calls))
     # Three times the read's time after it ended.
     plugin._now += 0.5
+    # The registry is read and the server resumes.
+    self.assertEqual((plugin.should_resume(), plugin.bc.calls), (True, calls + 1))
+
+  def test_a_wall_clock_step_during_a_failed_registry_read_does_not_lengthen_the_retry(self):
+    """A refresh whose read fails after 0.13 s while the wall clock steps 600 s forward (an NTP step) is tried again
+    the retry interval (60 s) after the read ended, as without the step, and resumes the server: the read's time is
+    taken on the monotonic clock. Before, the read counted 600.13 s and the retry waited three times that, 1800 s."""
+    # A registered dAuth oracle, started.
+    plugin = self._make_manager(dauth_oracle=True)
+    # The start-up read lists it.
+    plugin.on_init()
+    # The monotonic clock of this test, which no wall clock step moves.
+    mono = [0.0]
+    # The manager reads it.
+    self.enterContext(patch.dict(_MANAGER_GLOBALS, monotonic=lambda: mono[0]))
+
+    def stepping():
+      """
+      Stand in for a registry read that fails after 0.13 s while the wall clock steps 600 s forward.
+
+      Returns
+      -------
+      None
+        Nothing is returned: the call always raises.
+
+      Raises
+      ------
+      TimeoutError
+        Always, 0.13 s later on the monotonic clock and 600.13 s later on the plugin's wall clock.
+
+      Examples
+      --------
+      >>> stepping()
+      Traceback (most recent call last):
+      TimeoutError: read timed out
+      """
+      # The read's time passes on the monotonic clock.
+      mono[0] += 0.13
+      # The wall clock passes the same time and steps 600 s forward.
+      plugin._now += 0.13 + 600
+      # It ends without an answer.
+      raise TimeoutError("read timed out")
+
+    # The registry's read fails, with the step, from now on.
+    plugin.bc.get_eth_dauth_oracles = stepping
+    # The hourly refresh.
+    plugin._now += 60 * 60
+    # Its read fails: the server pauses.
+    self.assertTrue(plugin.should_pause())
+    # The endpoint answers again right after: the registry is read as before and lists this node.
+    del plugin.bc.get_eth_dauth_oracles
+    # The registry reads made so far.
+    calls = plugin.bc.calls
+    # 59 s after the failed read ended: inside the retry interval.
+    plugin._now += 59
+    # Still paused, and no read.
+    self.assertEqual((plugin.should_resume(), plugin.bc.calls), (False, calls))
+    # The retry interval after the read ended.
+    plugin._now += 1
     # The registry is read and the server resumes.
     self.assertEqual((plugin.should_resume(), plugin.bc.calls), (True, calls + 1))
 
