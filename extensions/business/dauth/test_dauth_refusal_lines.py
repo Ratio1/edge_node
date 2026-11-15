@@ -13,6 +13,8 @@ from extensions.business.dauth.dauth_mixin import (
   DauthRefused,
   dauth_request_label,
 )
+# The one failure of a reconciliation whose cause the endpoint names to the caller.
+from extensions.business.dauth.deployment_secrets import DeploymentSecretRecordTooLarge
 # The harness of the revoked-node tests: two requester addresses, their ETH addresses, a request body and the stand-in.
 from extensions.business.dauth.test_dauth_revoked_nodes import ALLOWED, ETH, REVOKED, _auth_body, _harness
 # A dAuth server that holds job 7 as an existing pipeline, and the request its runner sends.
@@ -450,6 +452,91 @@ class RefusalLineNamesTests(unittest.TestCase):
     self.assertEqual(response["error"], "dAuth secret reconciliation failed")
     # The error text is neither answered nor logged.
     self.assertNotIn("credential-in-dependency-error", str(response) + str(lines))
+
+  def reconcile_answer(self, error):
+    """
+    Answer one reconciliation request on a manager whose handler raises ``error``.
+
+    Parameters
+    ----------
+    error : Exception
+      What the reconciliation handler raises for the request.
+
+    Returns
+    -------
+    tuple
+      ``(response, lines)``: the endpoint's answer and the ``(text, color)`` lines it logged.
+
+    Examples
+    --------
+    >>> self.reconcile_answer(RuntimeError("pending"))[0]
+    {'nonce': 'n1', 'error': 'dAuth secret reconciliation failed'}
+    """
+    def failing(body):
+      """
+      Fail as the reconciliation handler would.
+
+      Parameters
+      ----------
+      body : dict
+        The request body; not read.
+
+      Returns
+      -------
+      None
+        Never returns.
+
+      Raises
+      ------
+      Exception
+        The error given to ``reconcile_answer``, always.
+      """
+      # The failure under test.
+      raise error
+    # A manager whose reconciliation handler is the failing one.
+    manager, lines = _manager("process_dauth_reconcile_secrets_request", failing)
+    # A request that names its sender and its job.
+    body = {"nonce": "n1", "EE_SENDER": "node-oracle", "EE_ETH_SENDER": "0xORACLE", "job_id": 7}
+    # The endpoint's answer to it.
+    response = manager.reconcile_job_secrets(body)
+    # The answer and the lines.
+    return response, lines
+
+  def test_reconcile_answer_names_a_secret_record_refused_for_its_size_by_one_fixed_code(self):
+    """When the reconciliation failed because the chain store refused the secret record for its size, the answer
+    carries the reason code "record_too_large" beside the unchanged error text, and nothing of the error's own
+    text; before, the answer was the same as for every other failure."""
+    # The size refusal, with a text that stands for something that must not leave the server.
+    response, lines = self.reconcile_answer(DeploymentSecretRecordTooLarge("text-with-a-value-of-the-request"))
+    # The whole answer: the nonce, the error text of every failure and the one reason code.
+    self.assertEqual(response, {"nonce": "n1", "error": "dAuth secret reconciliation failed",
+                                "reason": "record_too_large"})
+    # One red line as for every failure; it names the error's type, so the log tells the cause too.
+    self.assertEqual([(color, "DeploymentSecretRecordTooLarge in reconcile_job_secrets" in text)
+                      for text, color in lines], [("r", True)])
+    # The error's text is neither answered nor logged.
+    self.assertNotIn("text-with-a-value-of-the-request", str(response) + str(lines))
+
+  def test_reconcile_answer_of_every_other_failure_carries_no_reason(self):
+    """Only the size refusal's own error type gets the code: another error with the same text, with the code as
+    its text, with a look-alike type or of any other kind is answered exactly as before."""
+    class LookAlike(ValueError):
+      """An error type with the size refusal's name pattern that is not the size refusal."""
+
+    # The text the size refusal carries on the server, here on a plain ValueError.
+    same_text = ValueError("The deployment's secret record is larger than the store accepts: "
+                           "the job must target fewer nodes or carry smaller configurations.")
+    # Failures of other kinds: the type decides, never a text.
+    errors = [same_text, ValueError("record_too_large"), LookAlike("record_too_large"), KeyError("reason"),
+              RuntimeError("Deployment secret preparation is pending."), DauthRefused("Sender is revoked.")]
+    # Each failure in turn.
+    for error in errors:
+      # Each reports on its own.
+      with self.subTest(error=repr(error)):
+        # The endpoint's answer to it.
+        response, _ = self.reconcile_answer(error)
+        # Exactly the answer of before: no reason field.
+        self.assertEqual(response, {"nonce": "n1", "error": "dAuth secret reconciliation failed"})
 
   def test_label_escapes_and_cuts_what_the_request_names(self):
     """Text the requester controls cannot add a log line or grow one without bound."""

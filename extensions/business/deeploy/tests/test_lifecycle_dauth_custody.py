@@ -4,6 +4,8 @@ import unittest
 from unittest.mock import Mock
 
 from ratio1.const.base import dAuth
+# The error type of a secret record the chain store refused for its size.
+from extensions.business.dauth.deployment_secrets import DeploymentSecretRecordTooLarge
 from extensions.business.deeploy.tests.lifecycle_custody_support import (
   Coordinator, Custodian, State, pipeline, connect, report,
 )
@@ -726,12 +728,13 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
       except Exception as error:
         # Kept for the test.
         raised.append(error)
-        # Raised on, so the fixture's HTTP side answers it as a dAuth server does, with one fixed text.
+        # Raised on: the fixture's HTTP side answers every refusal with one fixed text and no reason code.
         raise
 
     # The fixture's HTTP side looks the handler up on the node at each request.
     self.dauth.process_dauth_reconcile_secrets_request = recording
-    # The coordinator gets the SDK's error for a refused custody request, whatever the dAuth node raised.
+    # So the coordinator gets the SDK's error of a refusal without a reason, whatever the dAuth node raised;
+    # the real endpoint, which names the size refusal, is under test in test_secret_record_size_refusal.py.
     with self.assertRaises(RuntimeError):
       # A create of job 7 on node A with one fresh secret value, 'fresh-token'.
       self.admit()
@@ -740,14 +743,17 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
 
   def test_a_secret_record_refused_for_its_size_ends_in_an_error_that_names_the_cause_and_no_value(self):
     """When the chain store refuses a deployment's secret record for its size, the dAuth node's preparation ends in
-    a ValueError that says the record is too large and what the job must change, with no job id, node, key or
-    secret value in it; before, it ended in the same "pending" error as a write that was not confirmed."""
+    an error of a type of its own (a ValueError) that says the record is too large and what the job must change,
+    with no job id, node, key or secret value in it; before, it ended in the same "pending" error as a write that
+    was not confirmed."""
     # The chain store's outcome word for a record over its size cap.
     raised = self.prepare_with_failed_write('refused_too_large')
-    # One error, final for the request (a ValueError), with exactly this text.
-    self.assertEqual([(type(error), str(error)) for error in raised], [(ValueError, (
+    # One error of the type the dAuth endpoint names to the caller, with exactly this text.
+    self.assertEqual([(type(error), str(error)) for error in raised], [(DeploymentSecretRecordTooLarge, (
       "The deployment's secret record is larger than the store accepts: "
       "the job must target fewer nodes or carry smaller configurations."))])
+    # Final for the request, like every ValueError of the custody code.
+    self.assertIsInstance(raised[0], ValueError)
     # The operation the coordinator recorded, for the values the text must not hold.
     operation = self.operation()
     # Neither the secret value, the operation id (part of the record's key), the namespace nor the app's name.

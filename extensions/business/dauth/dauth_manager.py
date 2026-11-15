@@ -41,7 +41,10 @@ from extensions.business.dauth.dauth_registry import (
 from extensions.business.dauth.dauth_mixin import DauthRefused, dauth_request_label
 from extensions.business.dauth.dauth_revoked_nodes import _DauthRevokedNodesMixin
 
-from extensions.business.dauth.deployment_secrets import _DauthDeploymentSecretsMixin
+# The custody mixin, and the one failure of a reconciliation whose cause the caller is told.
+from extensions.business.dauth.deployment_secrets import _DauthDeploymentSecretsMixin, DeploymentSecretRecordTooLarge
+# The name of the reason field of a refusal and its one code, shared with the client that reads them.
+from ratio1.const.base import dAuth
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 from extensions.business.deeploy.deeploy_job_mixin import _DeeployJobMixin
 
@@ -611,7 +614,8 @@ class DauthManagerPlugin(
     dict
       The signed response with the request's `nonce`, the server fields this node adds (alias, version,
       time, epoch, uptime) and either the reconciliation result or `error`. When reconciliation fails, the
-      caller is told only that it failed, never why.
+      caller is told only that it failed, never why, with one exception: when the chain store refused the
+      job's secret record for its size, the response also carries `reason` with the code `record_too_large`.
 
     Notes
     -----
@@ -621,12 +625,24 @@ class DauthManagerPlugin(
     one function holds several checks that raise the same type. The error text is not logged: new secret
     values can be present in the request or in a dependency's error.
 
+    The reason code is a constant from a closed set of one (`DAUTH_REASON_RECORD_TOO_LARGE`), given for the
+    error type `DeploymentSecretRecordTooLarge` and for nothing else. No text of an error and no value, key or
+    size is answered; from the code the caller's client tells the job's owner to target fewer nodes or to
+    carry smaller configurations. The type is raised in one place, at the write of a secret-revision record
+    during a "prepare", which a request reaches only after every earlier check passed: this node is a
+    registered dAuth oracle, the body is signed
+    by a key that is not revoked, its nonce is fresh, the sender is a protocol oracle, the operation is signed
+    by that same sender as its coordinator, its plan matches it and holds no plaintext secret, and the job's
+    active revision is the one the operation was built on. A caller that fails any of them gets the answer
+    of every other failure. A dAuth server of an earlier release never sends `reason`, and a client of an
+    earlier release does not read it: the `error` text is the same as before.
+
     Examples
     --------
     >>> body = {"nonce": "n1", "EE_SENDER": "0xai_...", "action": "prepare"}  # unsigned: refused
     >>> response = plugin.reconcile_job_secrets(body)  # on a registered dAuth oracle
-    >>> response["nonce"], response["error"]
-    ('n1', 'dAuth secret reconciliation failed')
+    >>> response["nonce"], response["error"], "reason" in response
+    ('n1', 'dAuth secret reconciliation failed', False)
     """
     nonce = body.get("nonce") if isinstance(body, dict) else None
     if not self._is_dauth_server_enabled():
@@ -650,6 +666,11 @@ class DauthManagerPlugin(
           self.get_request_client_ip(), dauth_request_label(body), type(exc).__name__, path,
           frames[-1].lineno, frames[-1].name), color='r')
         data = {'error': 'dAuth secret reconciliation failed'}
+        if isinstance(exc, DeploymentSecretRecordTooLarge):
+          # The one cause the caller is told, as a fixed code and by the error's type alone: the chain store
+          # refused the job's secret record for its size, so the job's owner can be told what to change.
+          # Before, this answer was the same as for a write that was only not confirmed yet.
+          data[dAuth.DAUTH_REASON] = dAuth.DAUTH_REASON_RECORD_TOO_LARGE
     return self.__get_response({'nonce': nonce, **data})
 
   @BasePlugin.endpoint(method="post")
