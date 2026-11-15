@@ -635,11 +635,51 @@ class RequestTrackingTests(unittest.TestCase):
     # The second write, with what the record holds then.
     self.assertEqual(len(api.writes), 2)
 
-  def test_a_refused_write_is_logged_in_red_once_and_tried_again_after_the_interval(self):
-    """A write the store refuses (not started, no peer, a failed call) is not forgotten: one red line names the
-    store's word, no further try is made inside the interval, and the first tick after it writes the record."""
-    # The words of the three ways a non-blocking write is not stored.
-    for word in ("not_ready", "refused_no_peers", "error"):
+  def test_a_write_the_store_was_not_ready_for_or_that_raised_is_tried_again_after_each_interval(self):
+    """A write that failed for a transient cause (the store had not started, or the call raised) is not forgotten:
+    one red line names the store's word, no further try is made inside the interval, a second failure in a row
+    keeps the record for the interval after it, and the first tick after the store takes writes again writes it."""
+    # The two transient words.
+    for word in ("not_ready", "error"):
+      # One sub-test each.
+      with self.subTest(outcome=word):
+        # The Deeploy API's trace.
+        api = _Api(DEEPLOY_CONFIG)
+        # The write fails.
+        api.refusal = word
+        # Received and queued.
+        api.receive("create-1", "create_pipeline")
+        # The monitor's turn: the failed write.
+        api.tick()
+        # The red lines so far.
+        red = [text for text, color in api.lines if color == "r"]
+        # One non-blocking try, nothing stored, one red line.
+        self.assertEqual((api.waits, api.writes, len(red)), ([False], [], 1))
+        # The line names the store's word and says the record is tried again.
+        self.assertEqual((word in red[0], "it is tried again in 30 s" in red[0]), (True, True))
+        # 119 turns, 0.25 s apart: up to 29.75 s after the try.
+        for _ in range(119):
+          # Inside the interval nothing is tried.
+          api.tick(0.25)
+        # Still one try and one red line.
+        self.assertEqual((len(api.waits), sum(color == "r" for _, color in api.lines)), (1, 1))
+        # The turn at 30 s: the second try fails too, as with a store that has not started for over 30 s.
+        api.tick(0.25)
+        # Two tries, two red lines, nothing stored.
+        self.assertEqual((len(api.waits), sum(color == "r" for _, color in api.lines), api.writes), (2, 2, []))
+        # The store takes writes again.
+        api.refusal = None
+        # The turn 30 s after the second try.
+        api.tick(30)
+        # The record is out, still not answered: the second failure did not drop it.
+        self.assertEqual(api.writes, [[("create-1", False)]])
+
+  def test_a_write_the_store_refuses_for_good_is_logged_once_and_not_tried_again(self):
+    """A write the store refuses by a final word (no peer to send to, a field another owner holds) is logged in
+    red once and not tried again, however long the record stays the same; a later change of the record is written
+    as usual. Before, it was tried again with a red line every 30 s, for ever."""
+    # Three of the final words.
+    for word in ("refused_no_peers", "refused_readonly", "refused_token"):
       # One sub-test each.
       with self.subTest(outcome=word):
         # The Deeploy API's trace.
@@ -652,22 +692,23 @@ class RequestTrackingTests(unittest.TestCase):
         api.tick()
         # The red lines so far.
         red = [text for text, color in api.lines if color == "r"]
-        # One non-blocking try, nothing stored, one red line.
-        self.assertEqual((api.waits, api.writes, len(red)), ([False], [], 1))
-        # The line names the store's word.
-        self.assertIn(word, red[0])
-        # 119 turns, 0.25 s apart: up to 29.75 s after the try.
-        for _ in range(119):
-          # Inside the interval nothing is tried.
-          api.tick(0.25)
+        # One try and one red line, which names the word and says the record is not tried again.
+        self.assertEqual((len(api.waits), len(red), word in red[0], "is not tried again" in red[0]),
+                         (1, 1, True, True))
+        # Ten minutes of turns, a second apart.
+        for _ in range(600):
+          # Nothing changed, so nothing is tried.
+          api.tick(1)
         # Still one try and one red line.
         self.assertEqual((len(api.waits), sum(color == "r" for _, color in api.lines)), (1, 1))
-        # The store takes writes again.
+        # The store takes writes again, and a new request changes the record.
         api.refusal = None
-        # The turn at 30 s.
-        api.tick(0.25)
-        # The record is out, still not answered.
-        self.assertEqual(api.writes, [[("create-1", False)]])
+        # Received and queued.
+        api.receive("create-2", "create_pipeline")
+        # The monitor's turn.
+        api.tick()
+        # The record is written, both requests in it.
+        self.assertEqual(api.writes, [[("create-1", False), ("create-2", False)]])
 
   def test_the_plugin_lap_writes_nothing_and_logs_the_records_of_all_nodes_every_interval(self):
     """The plugin lap no longer writes the record: with a changed record and no tick, laps cause no write call

@@ -206,8 +206,11 @@ class _RequestTrackingMixin(object):
     every oracle under this node's id, and the call returns; the chain store sends it again while no
     oracle confirmed it. The changed flag is cleared before the record is copied, so an answer that the
     plugin thread stamps while the write runs sets it again and is written by the next save. A write the
-    store does not take (it has not started, it has no peer, the call failed) leaves the record marked
-    as changed and is logged in red with the store's word for it; the save one interval later tries again.
+    store does not take is logged in red with the store's word for it. Only the two transient words,
+    ``not_ready`` (the store has not started, or restarts) and ``error`` (the call raised), leave the
+    record marked as changed, so the save one interval later tries again. A refusal (``refused_no_peers``,
+    ``refused_readonly``, ``refused_token`` and every other ``refused_*`` word) is final for this record:
+    it is not tried again, and the record is written again only when it changes.
 
     Returns
     -------
@@ -216,6 +219,7 @@ class _RequestTrackingMixin(object):
     Examples
     --------
     >>> self.__rt_save()   # the chain store has not started: red line, tried again one interval later
+    >>> self.__rt_save()   # this node has no peer to send to: one red line, not tried again
     """
     # Clear the flag before the copy below: clearing it after the write forgot a change made
     # during the write, which then stayed unwritten until another tracked change.
@@ -234,11 +238,18 @@ class _RequestTrackingMixin(object):
       wait=False,
       result_info=info,
     ):
-      # Not stored and not queued: the record stays marked as changed, so the save one interval later tries
-      # again. Before, a write that failed was forgotten until the next tracked change.
-      self.__rt_dirty = True
-      self.P(f"Request trace {self.__rt_cstore_hkey} was not published ({info['outcome']}); it is tried again in "
-             f"{self.cfg_requests_save_interval} s.", color='r')
+      # Not stored and not queued. Only a store that has not started (or restarts) or a call that raised can
+      # take the same write later; every refused_* word is final for this record.
+      retry = info["outcome"] in ("not_ready", "error")
+      if retry:
+        # The record stays marked as changed, so the save one interval later tries again. Before, every
+        # refusal was tried again: a final one (no peer, a field another owner holds) every 30 s, for ever.
+        self.__rt_dirty = True
+      # One red line per write the store did not take, for the operator reading the node log: the store's word
+      # and whether the record is tried again.
+      self.P(f"Request trace {self.__rt_cstore_hkey} was not published ({info['outcome']}); " + (
+        f"it is tried again in {self.cfg_requests_save_interval} s." if retry else
+        "it is not tried again until the record changes."), color='r')
     # Start of the quiet period that REQUESTS_SAVE_INTERVAL enforces before the next write.
     self.__rt_last_save_time = self.time()
     return
