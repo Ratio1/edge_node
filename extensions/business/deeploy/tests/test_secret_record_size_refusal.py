@@ -399,6 +399,74 @@ class SecretRecordSizeRefusalTests(unittest.TestCase):
       request=corrected, auth_result={'escrow_owner': operation['owner']}, app_id='app',
       configs={'A': custody.pipeline()}, prior_pipeline=None, is_create=True)['status_code'], 202)
 
+  def test_a_size_refusal_whose_ending_save_is_not_confirmed_is_still_answered_400(self):
+    """When the save that ends the operation is not confirmed, the API still answers 400 with the size text, and
+    the worker finishes from what is stored: a stored, unconfirmed snapshot is cleaned up at its next pass; with
+    nothing stored, the operation is the "preparing" one, left to the 120 s path. Before, the save's error replaced
+    the size error, and the API answered 503 "retry with the same request_id" for a request that can never work."""
+    # 'after': the ending snapshot is stored, not confirmed; 'before': nothing is stored.
+    for word, phase in (('after', 'cleaning_up_preparation'), ('before', 'preparing')):
+      # Each reports on its own, on a fresh stack.
+      with self.subTest(save=word):
+        # Both sides.
+        stack = _Stack(self)
+        # The operation's snapshots written so far.
+        saves = []
+
+        def fail(namespace, key):
+          """
+          End the job's target secret record as too large, and the operation's second snapshot as ``word``.
+
+          Parameters
+          ----------
+          namespace : str
+            The written hash namespace.
+          key : str
+            The written field.
+
+          Returns
+          -------
+          str or None
+            'refused_too_large' for the target record, ``word`` for the operation's second snapshot (the one that
+            ends it), None (stored and confirmed) for every other write.
+
+          Examples
+          --------
+          >>> fail('DAUTH_JOB_SECRET_REVISIONS', '7|op:deploy')
+          'refused_too_large'
+          """
+          if namespace == 'DAUTH_JOB_SECRET_REVISIONS' and key.endswith(':deploy'):
+            # The job's target secret record is refused for its size.
+            return 'refused_too_large'
+          if namespace == 'DEEPLOY_OPERATIONS':
+            # One more snapshot of the operation.
+            saves.append(key)
+            # The first ("preparing") is confirmed; the second, the one that ends the operation, ends as word.
+            return word if len(saves) == 2 else None
+          # Every other write is stored and confirmed.
+          return None
+
+        # The chain store writes end so.
+        stack.state.fail_write = fail
+        # The owner is told the size text with a 400, not the 503 of an uncertain acceptance.
+        self.assertEqual(stack.create(), {'status_code': 400, 'status': 'error', 'error': {
+          'code': 'INVALID_DEPLOYMENT_REQUEST', 'message': TOO_LARGE, 'retryable': False}})
+        # The operation as it is stored: ended when the snapshot was stored, else still preparing.
+        operation = next(iter(stack.coordinator._operation_records().values()))
+        # The stored phase.
+        self.assertEqual(operation['phase'], phase)
+        if word == 'after':
+          # The writes take again.
+          stack.state.fail_write = None
+          # The worker's next pass, 2 s later.
+          stack.state.now += 2
+          # One pass of the operations worker.
+          stack.coordinator._reconcile_coordinator_operations()
+          # The operation is completed, failed: the stored snapshot was enough.
+          self.assertEqual({key: value for key, value in next(iter(
+            stack.coordinator._operation_records().values())).items() if key in ('phase', 'outcome')},
+            {'phase': 'completed', 'outcome': 'failed'})
+
 
 if __name__ == "__main__":
   # Run this file's tests when it is started as a script.

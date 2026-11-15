@@ -7,6 +7,8 @@ other oracles only aggregate replicated observations for polling.
 """
 # The repair schedule of a completed operation is looked up by age in a sorted tuple.
 import bisect
+# A size refusal stays the error admission raises when the save that ends its operation is not confirmed.
+import contextlib
 import copy
 import hashlib
 import json
@@ -741,8 +743,10 @@ class _DeploymentOperationsMixin:
     Raises
     ------
     DauthSecretRecordTooLarge
-      When dAuth refused a secret record of the job for its size. The
-      operation is then already failed with the error's text and in cleanup.
+      When dAuth refused a secret record of the job for its size, also when
+      the save that ends the operation is not confirmed. The operation is then
+      already failed with the error's text and in cleanup, or, with that save
+      unconfirmed, left to the worker as it is stored.
     DeploymentConflictError
       When the request's expected revision is not the stored one.
     ValueError
@@ -763,7 +767,11 @@ class _DeploymentOperationsMixin:
     job takes a corrected request right after it. Before, the operation stayed
     "preparing" until created + 120 s: the worker asked dAuth for its status
     on every 2 s pass, the same request was answered 202 for it and a
-    corrected one 409.
+    corrected one 409. When the save that ends the operation is not confirmed,
+    the size error is still the one raised (the API answers 400), not the
+    save's RuntimeError (503 "retry with the same request_id"): the worker
+    finishes from what is stored, the cleanup, or the 120 s path when nothing
+    was stored.
 
     Examples
     --------
@@ -879,8 +887,12 @@ class _DeploymentOperationsMixin:
       # (no "prepare" of it can still be in flight), and this one's only "prepare" was answered. Before, the
       # deadline stayed at created + 120 s, and with it the status calls and the 409 for a corrected request.
       operation["preparation_deadline"] = self.time()
-      # Failed at once with the SDK's text, which the job's owner reads in the operation's status too.
-      self._expire_deployment_preparation(operation, str(exc))
+      # An unconfirmed save ("replication is pending") must not replace the size error: it made the API answer 503
+      # "retry with the same request_id" for a request that can never succeed. The worker then ends the operation
+      # from what is stored: the cleanup, or the 120 s path when nothing was stored.
+      with contextlib.suppress(RuntimeError):
+        # Failed at once with the SDK's text, which the job's owner reads in the operation's status too.
+        self._expire_deployment_preparation(operation, str(exc))
       # Raised on, as before: the API answers 400 with the same text.
       raise
     finally:
