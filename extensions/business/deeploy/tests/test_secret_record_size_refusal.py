@@ -23,13 +23,16 @@ from extensions.business.deeploy.tests.support import submit_deployment
 from extensions.business.deeploy.tests import lifecycle_custody_support as custody
 # The dAuth plugin, for its real reconciliation endpoint.
 from extensions.business.dauth.dauth_manager import DauthManagerPlugin
+# The error of a request for a job that a running operation holds.
+from extensions.business.deeploy.deployment_operations import DeploymentConflictError
 # The node constants the API stand-in reads.
 from naeural_core import constants as ct
 
 
-# What the job's owner is told: the SDK client's own text for the reason code "record_too_large".
-TOO_LARGE = ("The deployment's secret record is larger than the store accepts: "
-             "the job must target fewer nodes or carry smaller configurations.")
+# What the job's owner is told: the SDK client's own text for the reason code "record_too_large", true of both
+# copies a dAuth server refuses for size.
+TOO_LARGE = ("The deployment's secret record is larger than the store accepts: the new revision, or the current one "
+             "kept for a rollback, has too many nodes or too large configurations.")
 # The dAuth endpoint's answer to every failed reconciliation, as before.
 FAILED = {'error': 'dAuth secret reconciliation failed'}
 # The API's answer when it cannot tell whether a deployment was accepted, as before.
@@ -252,8 +255,9 @@ class SecretRecordSizeRefusalTests(unittest.TestCase):
 
   def test_the_reason_code_is_not_given_to_a_request_that_fails_an_earlier_check(self):
     """The code is answered only to a request that passed every check before the write: the same request sent
-    again unsigned, changed after signing, with a nonce that expired, by a sender that is no protocol oracle, with
-    an operation another node signed, or to a node that is no dAuth oracle gets the answer of every failure."""
+    again once the dAuth node holds the snapshot that ended its operation, unsigned, changed after signing, with a
+    nonce that expired, by a sender that is no protocol oracle, with an operation another node signed, or to a node
+    that is no dAuth oracle gets the answer of every failure."""
     # Both sides; the chain store refuses the secret record as too large for the whole test.
     stack = _Stack(self)
     # So a request that passes every check is answered with the code.
@@ -262,6 +266,16 @@ class SecretRecordSizeRefusalTests(unittest.TestCase):
     stack.create()
     # The signed preparation request the coordinator sent.
     body = stack.bodies[0]
+    # Sent again as it is, it is refused before the write: the coordinator ended the operation at once, and the
+    # dAuth node holds that newer snapshot.
+    self.assertEqual(stack.serve(copy.deepcopy(body)), FAILED)
+    # The snapshots of the operation newer than the one the request carries: the one that ended it.
+    newer = [key for key, record in stack.state.public.items()
+             if key[0] == 'DEEPLOY_OPERATIONS' and record['sequence'] > body['operation']['sequence']]
+    # One.
+    self.assertEqual(len(newer), 1)
+    # From here on the dAuth node has not received it yet, as a node the write has not reached.
+    del stack.state.public[newer[0]]
     # Sent again as it is, it gets the code again: the checks below are what keeps it from the others.
     self.assertEqual(stack.serve(copy.deepcopy(body)), {**FAILED, 'reason': 'record_too_large'})
     # The same request without its signature.
@@ -297,7 +311,8 @@ class SecretRecordSizeRefusalTests(unittest.TestCase):
 
   def test_a_dauth_server_of_the_previous_release_is_answered_as_before(self):
     """A dAuth server of the previous release sends no reason: the same refusal without the field gets the API's
-    503, as before, also when the cause was the record's size."""
+    503, as before, also when the cause was the record's size, and the operation stays "preparing" for the worker
+    until its deadline, as before."""
     # Both sides.
     stack = _Stack(self)
     # The store refuses the secret record as too large.
@@ -306,6 +321,67 @@ class SecretRecordSizeRefusalTests(unittest.TestCase):
     stack.rewrite = lambda answer: answer.pop('reason')
     # The API cannot tell whether the deployment was accepted, as before.
     self.assertEqual(stack.create(), UNCERTAIN)
+    # The operation as the coordinator saved it.
+    operation = next(iter(stack.coordinator._operation_records().values()))
+    # Still preparing, with its deadline at created + 120 s: nothing ends it early without the code.
+    self.assertEqual((operation['phase'], operation['preparation_deadline'] - operation['created_at']),
+                     ('preparing', 120))
+
+  def test_a_size_refusal_ends_the_operation_at_once_and_a_corrected_request_is_accepted(self):
+    """A size refusal fails the operation at once, with the text the owner was answered, so the same request finds
+    a failed operation; the worker's next pass cleans up what dAuth staged, without asking dAuth for the status of
+    the preparation, and a corrected request for the job is accepted. Before, the operation stayed "preparing" for
+    120 s: about 60 status calls, the same request answered 202 for an operation still running, a corrected one
+    409."""
+    # Both sides; the store refuses the job's secret record as too large.
+    stack = _Stack(self)
+    # The target copy of the record is the one refused.
+    stack.refuse('refused_too_large')
+    # The request bodies the API hands to admission, for the same request sent again below.
+    admitted = []
+    # Admission as the stack wires it.
+    admit = stack.api._admit_prepared_deployment
+    # Kept, then admitted as before.
+    stack.api._admit_prepared_deployment = lambda **kwargs: admitted.append(kwargs['request']) or admit(**kwargs)
+    # The owner is told, as before.
+    self.assertEqual(stack.create()['error']['message'], TOO_LARGE)
+    # The operation as the coordinator saved it, right after the answer.
+    operation = next(iter(stack.coordinator._operation_records().values()))
+    # Failed at once, with the same text and the code every oracle's status reads as an unrestored preparation.
+    self.assertEqual((operation['phase'], operation['outcome'], operation['error']), ('cleaning_up_preparation', 'failed', {
+      'code': 'ADMISSION_PREPARATION_FAILED', 'message': TOO_LARGE, 'retryable': False}))
+    # Its preparation ended when the refusal came, so dAuth takes the cleanup at once.
+    self.assertEqual(operation['preparation_deadline'], stack.state.now)
+    # The same request finds that operation, which already says how it ended.
+    same = stack.coordinator._find_request_operation(admitted[0], operation['owner'], 'create')
+    # The failed one, not a new or a running one.
+    self.assertEqual((same['operation_id'], same['outcome']), (operation['operation_id'], 'failed'))
+    # A corrected request for the job.
+    corrected = {'job_id': 7, 'request_id': 'corrected'}
+    # Until the cleanup ran, the job is still busy with the failed operation.
+    with self.assertRaises(DeploymentConflictError):
+      # Looked up as the API does before it admits.
+      stack.coordinator._find_request_operation(corrected, operation['owner'], 'create')
+    # Only the oversized record is refused; the small revoked records of the cleanup are stored.
+    stack.state.fail_write = None
+    # The requests dAuth got so far.
+    sent = len(stack.bodies)
+    # The worker's next pass, 2 s later.
+    stack.state.now += 2
+    # One pass of the operations worker.
+    stack.coordinator._reconcile_coordinator_operations()
+    # One custody call: the revocation, accepted. No status call: the preparation is over.
+    self.assertEqual([body['action'] for body in stack.bodies[sent:]], ['revoke'])
+    # The operation is completed, failed.
+    self.assertEqual({key: value for key, value in next(iter(stack.coordinator._operation_records().values())).items()
+                      if key in ('phase', 'outcome', 'recovery')},
+                     {'phase': 'completed', 'outcome': 'failed', 'recovery': 'completed'})
+    # The corrected request finds no running operation now.
+    self.assertIsNone(stack.coordinator._find_request_operation(corrected, operation['owner'], 'create'))
+    # And it is accepted: a create of the fixture's small app on node A.
+    self.assertEqual(stack.coordinator._admit_prepared_deployment(
+      request=corrected, auth_result={'escrow_owner': operation['owner']}, app_id='app',
+      configs={'A': custody.pipeline()}, prior_pipeline=None, is_create=True)['status_code'], 202)
 
 
 if __name__ == "__main__":

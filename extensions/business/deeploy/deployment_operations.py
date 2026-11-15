@@ -18,6 +18,8 @@ import uuid
 from collections import OrderedDict
 
 from ratio1.const.base import BCct, dAuth
+# The SDK client's error for a secret record a dAuth server refused for its size: it ends a preparation at once.
+from ratio1.bc.base import DauthSecretRecordTooLarge
 from .selected_secrets import inherit_selections
 
 from extensions.business.dauth.dauth_registry import get_dauth_registry_internal_peers
@@ -567,8 +569,10 @@ class _DeploymentOperationsMixin:
     the call failed or timed out (dAuth may still have received it), when dAuth answered with an HTTP error
     or refused, and when a preparation is not finished; that error is raised again as
     `DeploymentCustodyError`, so the operations worker can wait before it calls the same dAuth server again.
-    A ValueError (invalid payload, answer, signature or signer) is raised unchanged and is tried again on the
-    next pass, as before.
+    A ValueError (invalid payload, answer, signature or signer, and the SDK's `DauthSecretRecordTooLarge` for a
+    secret record a dAuth server refused for its size) is raised unchanged: admission answers 400 for it, and the
+    worker tries its own call again on the next pass, as before. Only a "prepare", which admission sends, can be
+    refused for size.
 
     Parameters
     ----------
@@ -591,6 +595,9 @@ class _DeploymentOperationsMixin:
       It is a RuntimeError, so admission still answers 503 (`ADMISSION_UNAVAILABLE`) for it.
     ValueError
       When the payload or dAuth's answer is invalid, unchanged; admission still answers 400 for it.
+    DauthSecretRecordTooLarge
+      When dAuth refused a "prepare" because the chain store does not accept a secret record of the job for its
+      size (a ValueError too); admission ends the operation at once for it.
 
     Notes
     -----
@@ -693,6 +700,12 @@ class _DeploymentOperationsMixin:
                                  restore_owner=None, identity_aliases=None, node_aliases=None):
     """Save exact redacted plans and secret revisions before accepting work.
 
+    Builds the operation's redacted plan (the target configs and, for an update,
+    the previous configs to restore), stores it in R1FS, saves the operation in
+    its "preparing" phase and asks dAuth to prepare the secret revisions. The
+    operation is accepted when dAuth prepared them before the preparation
+    deadline (created + 120 s).
+
     Parameters
     ----------
     request : dict
@@ -708,6 +721,14 @@ class _DeploymentOperationsMixin:
       The job's stored copy in R1FS, for restoration planning.
     is_create : bool
       Whether this operation creates a previously absent deployment.
+    mutation : str, optional
+      The kind of update for the record ("scale_up", "owner_transfer",
+      "node_relink"); None for a create or a plain update.
+    restore_owner : str, optional
+      The owner the previous configs get for a restore (an owner transfer).
+    identity_aliases : dict, optional
+      Current plugin identity -> source identity for the instances a
+      scale-up generates, so they inherit the source's secret values.
     node_aliases : dict, optional
       Old node -> new node for a relink. ``prior_pipeline`` still names the old
       node; its previous configs and placement are renamed here.
@@ -716,6 +737,39 @@ class _DeploymentOperationsMixin:
     -------
     dict
       Signed HTTP acceptance response.
+
+    Raises
+    ------
+    DauthSecretRecordTooLarge
+      When dAuth refused a secret record of the job for its size. The
+      operation is then already failed with the error's text and in cleanup.
+    DeploymentConflictError
+      When the request's expected revision is not the stored one.
+    ValueError
+      When the configs or an update's previous revision are invalid (such as
+      conflicting secret values at one path, or no exact placement to
+      restore), or dAuth's answer is invalid.
+    RuntimeError
+      When the plan cannot be stored, a write is not confirmed, or a dAuth
+      custody call fails (``DeploymentCustodyError``); the operation, if
+      saved, is left to the worker.
+
+    Notes
+    -----
+    A size refusal is final: no retry can store the record. The operation is
+    then marked failed at once (``ADMISSION_PREPARATION_FAILED`` with the SDK
+    error's text) and its preparation deadline is set to now, so that dAuth
+    accepts the cleanup of anything staged at the worker's next pass and the
+    job takes a corrected request right after it. Before, the operation stayed
+    "preparing" until created + 120 s: the worker asked dAuth for its status
+    on every 2 s pass, the same request was answered 202 for it and a
+    corrected one 409.
+
+    Examples
+    --------
+    >>> plugin._admit_prepared_deployment(request, auth_result, "app", {"A": config},
+    ...                                   prior_pipeline=None, is_create=True)["status_code"]
+    202
     """
     owner = auth_result[DEEPLOY_KEYS.ESCROW_OWNER]
     job_id = request["job_id"]
@@ -820,6 +874,15 @@ class _DeploymentOperationsMixin:
         self._expire_deployment_preparation(operation)
       else:
         self._save_operation(operation, "accepted", "Deployment accepted.")
+    except DauthSecretRecordTooLarge as exc:
+      # The preparation ends now: dAuth accepts the cleanup of an operation only past its preparation deadline
+      # (no "prepare" of it can still be in flight), and this one's only "prepare" was answered. Before, the
+      # deadline stayed at created + 120 s, and with it the status calls and the 409 for a corrected request.
+      operation["preparation_deadline"] = self.time()
+      # Failed at once with the SDK's text, which the job's owner reads in the operation's status too.
+      self._expire_deployment_preparation(operation, str(exc))
+      # Raised on, as before: the API answers 400 with the same text.
+      raise
     finally:
       # Keep the marker until the worker discards its old snapshots and reloads
       # durable state. This also hands interrupted admission to recovery.
@@ -1097,11 +1160,40 @@ class _DeploymentOperationsMixin:
       self._save_operation(operation, "completed",
                            "Previous revision restored." if restored else "Deployment completed.")
 
-  def _expire_deployment_preparation(self, operation):
-    """Record deadline failure before waiting for plan or secret cleanup."""
+  def _expire_deployment_preparation(self, operation,
+                                     message="Deployment preparation did not complete; the running revision is unchanged."):
+    """Record deadline failure before waiting for plan or secret cleanup.
+
+    Marks the operation failed with the error ``ADMISSION_PREPARATION_FAILED`` (not retryable) and saves it in
+    the "cleaning_up_preparation" phase, in which the worker asks dAuth to revoke whatever was staged.
+
+    Parameters
+    ----------
+    operation : dict
+      The coordinator's operation snapshot, in its "preparing" phase; replaced in place by the saved snapshot.
+    message : str, optional
+      The error's text. The default says that the preparation did not complete; admission passes the SDK's text
+      of a secret record refused for its size.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    RuntimeError
+      When the replicated write of the snapshot is not confirmed (see ``_save_operation``).
+
+    Examples
+    --------
+    >>> plugin._expire_deployment_preparation(operation)
+    >>> operation["phase"], operation["error"]["code"]
+    ('cleaning_up_preparation', 'ADMISSION_PREPARATION_FAILED')
+    """
     operation.update(outcome="failed", recovery="in_progress", error=dict(
       code="ADMISSION_PREPARATION_FAILED",
-      message="Deployment preparation did not complete; the running revision is unchanged.",
+      # The caller's text: a size refusal gets the SDK's text in place of "did not complete".
+      message=message,
       retryable=False,
     ))
     self._save_operation(operation, "cleaning_up_preparation",
