@@ -35,9 +35,10 @@ flock -n 9 || { echo "The kept Docker store is locked by another container on th
 # When that entrypoint fails, say so and remove the kept store: a store dockerd refuses would fail every later
 # start in the same way, until someone removed it on the host. The entrypoint does not report why it failed, so the
 # store goes after ANY failed start (a damaged store file, a container without privileges, iptables, a wrong
-# DOCKERD_READY_TIMEOUT, a daemon that did not answer in time). Only the holder of the lock gets here, so no other
-# daemon is using the store it removes. The directory is the "data-root" of docker/daemon.json; a test keeps the
-# two equal.
+# DOCKERD_READY_TIMEOUT, a daemon that did not answer in time). Only the holder of the lock gets here, so no node
+# container that started through this script is using the store it removes. A container started on this cache
+# folder through another entrypoint takes no lock, and its daemon is not seen here. The directory is the
+# "data-root" of docker/daemon.json; a test keeps the two equal.
 # Exit non-zero, as the base entrypoint did: the container stops, and whoever starts it again (the host's service)
 # starts on an empty store.
 /usr/local/bin/entrypoint.sh true || { echo "The inner Docker daemon did not start: removing its kept store." >&2; rm -rf /edge_node/_local_cache/_bin/docker/29; exit 1; }
