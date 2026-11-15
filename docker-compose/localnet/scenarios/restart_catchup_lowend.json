@@ -18,6 +18,7 @@
   {
    "do": "load",
    "generator": "deeploy",
+   "tag": "run",
    "args": [
     "cycle",
     "--first-job",
