@@ -101,16 +101,15 @@ class TestTopology(unittest.TestCase):
     self.assertFalse(full['DAUTH_MANAGER']['TUNNEL_ENGINE_ENABLED'])
 
   def test_a_node_startup_entry_adds_to_the_localnet_overrides_in_its_own_order(self):
-    """A ``--startup-of`` entry keeps the localnet's overrides, adds its plugins after them in its own order, and a
-    node without one gets the same overrides as before (sorted keys)."""
+    """A ``--startup-of`` entry keeps the localnet's overrides, adds its plugins after them in its own order (also
+    after the manifest's sorted save), and a node without one gets the same overrides as before (sorted keys)."""
     from lnlib import nodes
     # The entry of the resync rerun: two empty plugins first, so the chain store keeps its start position.
-    entry = {'ADMIN_PIPELINE': {'PLUGIN_MONITOR_01': {}, 'LOCAL_COMMS_01': {},
-                                'CHAIN_STORE_BASE': {'CHAIN_STORE_DEBUG': True},
-                                'ORACLE_API': {'LOG_EXTRA': True}},
-             'CAPTURE_ENVIRONMENT': {'DEBUG_IOT_PAYLOADS': True}}
-    # A headless node with that entry, merged.
-    merged = nodes.node_startup({'headless': True, 'startup': entry})
+    entry = ('{"ADMIN_PIPELINE":{"PLUGIN_MONITOR_01":{},"LOCAL_COMMS_01":{},"CHAIN_STORE_BASE":{"CHAIN_STORE_DEBUG":true},'
+             '"ORACLE_API":{"LOG_EXTRA":true}},"CAPTURE_ENVIRONMENT":{"DEBUG_IOT_PAYLOADS":true}}')
+    # A headless node with that entry, saved and read back as the manifest is (sorted keys), then merged.
+    node = json.loads(json.dumps({'headless': True, 'startup_json': entry}, sort_keys=True))
+    merged = nodes.node_startup(node)
     # The admin plugins in the order they reach the start-up file.
     order = list(merged['ADMIN_PIPELINE'])
     # The localnet's own plugins first, sorted, then the entry's new ones in the entry's order.

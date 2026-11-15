@@ -393,7 +393,7 @@ def node_env(node, manifest, secrets):
 
 def node_startup(node):
   """
-  Start-up overrides of one node: the localnet's own, then the node's ``startup`` entry (``init --startup-of``).
+  Start-up overrides of one node: the localnet's own, then the node's ``startup_json`` entry (``init --startup-of``).
 
   ``node/launch.py`` merges the result into the production start-up file of the node's source tree, two levels
   deep: a section such as ``ADMIN_PIPELINE`` or ``CAPTURE_ENVIRONMENT`` is merged key by key, and a plugin's
@@ -403,7 +403,9 @@ def node_startup(node):
   Parameters
   ----------
   node : dict
-    A node of ``plan``; reads ``headless`` and ``web`` (through ``_startup_overrides``) and ``startup``.
+    A node of ``plan``; reads ``headless`` and ``web`` (through ``_startup_overrides``) and ``startup_json``, the
+    entry as the JSON text of a JSON object. It is kept as text because the manifest is saved with sorted keys,
+    which would reorder the plugins of an object.
 
   Returns
   -------
@@ -420,15 +422,17 @@ def node_startup(node):
 
   Examples
   --------
-  >>> startup = node_startup({'headless': True, 'startup': {'ADMIN_PIPELINE': {'CHAIN_STORE_BASE': {'CHAIN_STORE_DEBUG': True}}}})
+  >>> startup = node_startup({'headless': True, 'startup_json': '{"ADMIN_PIPELINE":{"CHAIN_STORE_BASE":{"CHAIN_STORE_DEBUG":true}}}'})
   >>> startup['ADMIN_PIPELINE']['CHAIN_STORE_BASE'], startup['ADMIN_PIPELINE']['ORACLE_API']['DISABLED']
   ({'CHAIN_STORE_DEBUG': True}, True)
   """
   # The localnet's own overrides, a new dict on each call, in sorted key order at every level: node.json was
   # written with sorted keys, and launch.py adds the admin plugins in the file's order, so they start as before.
   merged = json.loads(json.dumps(_startup_overrides(node), sort_keys=True))
+  # The node's own entry, parsed from its text in the order it was given (none: an empty entry).
+  entry = json.loads(node.get('startup_json') or '{}')
   # Each section or setting of the node's own entry, in its order.
-  for key, value in (node.get('startup') or {}).items():
+  for key, value in entry.items():
     if isinstance(value, dict) and isinstance(merged.get(key), dict):
       # Both are sections: merged key by key, as launch.py merges them into the production file.
       for sub_key, sub_value in value.items():

@@ -178,7 +178,7 @@ def cmd_init(args):
       # A misspelt name would otherwise be ignored without a word.
       raise LocalnetError('--startup-of names unknown node {} (this topology has: {})'.format(name, ', '.join(sorted(by_name))))
     try:
-      # The settings, in the order given: the order the node starts the admin plugins they add.
+      # Parsed here only to refuse a bad entry before anything slow is generated.
       settings = json.loads(text)
     except ValueError as exc:
       # Refused with the parser's reason.
@@ -186,8 +186,9 @@ def cmd_init(args):
     if not isinstance(settings, dict):
       # Only an object can be merged into the start-up file.
       raise LocalnetError('--startup-of {}: expected a JSON object'.format(name))
-    # Kept in the manifest; written into the node's node.json by nodes.write_node_files at init, up and switch.
-    by_name[name]['startup'] = settings
+    # Kept in the manifest as its text, whose order survives the manifest's sorted keys (an object's would not);
+    # written into the node's node.json by nodes.write_node_files at init, up and switch.
+    by_name[name]['startup_json'] = text
   infra_repo = infra.find_infra_repo(args.infra_repo)
   log('rendering the mainnet broker mesh (infra repo: {})'.format(infra_repo))
   mesh = infra.render_brokers(home, infra_repo, nofile=args.broker_nofile)
