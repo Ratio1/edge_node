@@ -9,6 +9,12 @@ from unittest import mock
 # The core's web app, whose request monitor calls the hook the Deeploy API overrides.
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin
 
+# Imported for the web-app base's stand-in it puts in place, before the dAuth and Deeploy modules below load: they are
+# then built on the base every other Deeploy test file uses, whichever file one process imports first. Before, this
+# file imported first built them on the core's base, whose ct has no setter, and the files on the stand-in then
+# errored ("property 'ct' ... has no setter": 12 tests and sub-tests of test_process_request.py, 13 of
+# test_secret_record_size_refusal.py, which borrows its _ProcessRequestStub).
+import extensions.business.deeploy.tests.test_process_request
 from extensions.business.dauth.dauth_manager import _CONFIG as DAUTH_CONFIG
 # The module, for the base class its plugin calls on_init of.
 from extensions.business.deeploy import deeploy_manager_api
