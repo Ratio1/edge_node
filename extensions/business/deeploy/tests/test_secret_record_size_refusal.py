@@ -87,13 +87,13 @@ class _Stack:
     self.rewrite = None
     # The SDK posts to the endpoint below.
     http = patch('ratio1.bc.base.requests.post', side_effect=self.post)
-    # From now on.
+    # Started here, so every custody call of the test reaches the real endpoint above and none the network.
     http.start()
     # Until the test ends.
     test.addCleanup(http.stop)
     # The SDK stamps its requests with the shared clock.
     clock = patch('ratio1.bc.base.time', side_effect=lambda: self.state.now)
-    # From now on.
+    # Started here, so a test that moves the shared clock (an expired nonce) moves the SDK's stamps with it.
     clock.start()
     # Until the test ends.
     test.addCleanup(clock.stop)
@@ -244,7 +244,7 @@ class SecretRecordSizeRefusalTests(unittest.TestCase):
     for word in ('before', 'after', 'unconfirmed', 'refused_too_deep', 'refused_unencodable', 'refused_not_member'):
       # Each reports on its own, on a fresh stack.
       with self.subTest(failure=word):
-        # Both sides.
+        # A new coordinator and dAuth node, so no record of the failure before is left in their stores.
         stack = _Stack(self)
         # The write fails this way.
         stack.refuse(word)
@@ -272,7 +272,7 @@ class SecretRecordSizeRefusalTests(unittest.TestCase):
     # The snapshots of the operation newer than the one the request carries: the one that ended it.
     newer = [key for key, record in stack.state.public.items()
              if key[0] == 'DEEPLOY_OPERATIONS' and record['sequence'] > body['operation']['sequence']]
-    # One.
+    # Exactly one: the snapshot the coordinator saved when the refusal ended the operation.
     self.assertEqual(len(newer), 1)
     # From here on the dAuth node has not received it yet, as a node the write has not reached.
     del stack.state.public[newer[0]]
@@ -304,7 +304,7 @@ class SecretRecordSizeRefusalTests(unittest.TestCase):
     self.assertEqual(stack.serve(copy.deepcopy(body)), FAILED)
     # Back in time, on a node that is not a registered dAuth oracle.
     stack.state.now -= 121
-    # Not registered.
+    # The flag the dAuth plugin clears when its registry read fails or does not list this node.
     stack.manager._dauth_server_enabled = False
     # Its own fixed answer, as before, without a reason.
     self.assertEqual(stack.serve(copy.deepcopy(body)), {'error': 'dAuth server is not registered as a dAuth oracle'})
@@ -313,7 +313,7 @@ class SecretRecordSizeRefusalTests(unittest.TestCase):
     """A dAuth server of the previous release sends no reason: the same refusal without the field gets the API's
     503, as before, also when the cause was the record's size, and the operation stays "preparing" for the worker
     until its deadline, as before."""
-    # Both sides.
+    # The coordinator and the dAuth node, with the real endpoint between them.
     stack = _Stack(self)
     # The store refuses the secret record as too large.
     stack.refuse('refused_too_large')
@@ -408,7 +408,7 @@ class SecretRecordSizeRefusalTests(unittest.TestCase):
     for word, phase in (('after', 'cleaning_up_preparation'), ('before', 'preparing')):
       # Each reports on its own, on a fresh stack.
       with self.subTest(save=word):
-        # Both sides.
+        # A new coordinator and dAuth node, so the saves counted below are this case's only.
         stack = _Stack(self)
         # The operation's snapshots written so far.
         saves = []
