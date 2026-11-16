@@ -1,0 +1,2429 @@
+{
+  "basic": {
+    "assuranceLevel": "basic",
+    "generatedAt": "2026-02-02T02:55:00Z",
+    "jobsAvailable": 3,
+    "jobsConsidered": 3,
+    "jobsSkipped": 0,
+    "overriding": [
+      {
+        "control_id": "ID.AM-08.2",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "ID.RA-01.1",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "PR.AA-01.1",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "PR.AA-03.2",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "PR.AA-05.3",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "PR.AA-05.4",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      }
+    ],
+    "packId": "ro.dnsc.o1-2026",
+    "reason": null,
+    "suggestions": {
+      "DE.AE-03.1": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "soc_incident_evidence",
+          "status": "needs_review",
+          "summary": "No completed SOC export or detection correlation is recorded for this job."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "soc_incident_evidence",
+          "status": "supported",
+          "summary": "SOC export or detection correlation completed for this job."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "soc_incident_evidence",
+          "status": "needs_review",
+          "summary": "No completed SOC export or detection correlation is recorded for this job."
+        }
+      ],
+      "ID.AM-08.2": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "vulnerability_management",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 1
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "ID.RA-01.1": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "vulnerability_management",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 1
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "ID.RA-05.1": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        }
+      ],
+      "PR.AA-01.1": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "auth_access_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "PR.AA-03.2": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "auth_access_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "PR.AA-05.3": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "auth_access_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "PR.AA-05.4": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "auth_access_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ]
+    }
+  },
+  "essential": {
+    "assuranceLevel": "essential",
+    "generatedAt": "2026-02-02T02:55:00Z",
+    "jobsAvailable": 3,
+    "jobsConsidered": 3,
+    "jobsSkipped": 0,
+    "overriding": [
+      {
+        "control_id": "ID.AM-08.2",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "ID.RA-01.1",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "ID.RA-01.2",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "ID.RA-01.3",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "ID.RA-01.6",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "ID.RA-08.1",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "ID.RA-08.2",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "PR.AA-01.1",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "PR.AA-01.2",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "PR.AA-01.4",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "PR.AA-03.2",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "PR.AA-05.3",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "PR.AA-05.4",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "PR.AA-05.7",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "PR.AA-05.9",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      }
+    ],
+    "packId": "ro.dnsc.o1-2026",
+    "reason": null,
+    "suggestions": {
+      "DE.AE-02.2": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "soc_incident_evidence",
+          "status": "needs_review",
+          "summary": "No completed SOC export or detection correlation is recorded for this job."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "soc_incident_evidence",
+          "status": "supported",
+          "summary": "SOC export or detection correlation completed for this job."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "soc_incident_evidence",
+          "status": "needs_review",
+          "summary": "No completed SOC export or detection correlation is recorded for this job."
+        }
+      ],
+      "DE.AE-03.1": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "soc_incident_evidence",
+          "status": "needs_review",
+          "summary": "No completed SOC export or detection correlation is recorded for this job."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "soc_incident_evidence",
+          "status": "supported",
+          "summary": "SOC export or detection correlation completed for this job."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "soc_incident_evidence",
+          "status": "needs_review",
+          "summary": "No completed SOC export or detection correlation is recorded for this job."
+        }
+      ],
+      "DE.AE-03.3": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        }
+      ],
+      "DE.CM-09.1": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "soc_incident_evidence",
+          "status": "needs_review",
+          "summary": "No completed SOC export or detection correlation is recorded for this job."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "soc_incident_evidence",
+          "status": "supported",
+          "summary": "SOC export or detection correlation completed for this job."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "soc_incident_evidence",
+          "status": "needs_review",
+          "summary": "No completed SOC export or detection correlation is recorded for this job."
+        }
+      ],
+      "ID.AM-08.2": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "vulnerability_management",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 1
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "ID.IM-02.1": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        }
+      ],
+      "ID.RA-01.1": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "vulnerability_management",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 1
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "ID.RA-01.2": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "vulnerability_management",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 1
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "ID.RA-01.3": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "vulnerability_management",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 1
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "ID.RA-01.5": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        }
+      ],
+      "ID.RA-01.6": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "vulnerability_management",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 1
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "ID.RA-05.1": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        }
+      ],
+      "ID.RA-05.2": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        }
+      ],
+      "ID.RA-08.1": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "vulnerability_management",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 1
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "ID.RA-08.2": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "vulnerability_management",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 1
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "PR.AA-01.1": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "auth_access_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "PR.AA-01.2": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "auth_access_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "PR.AA-01.4": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "auth_access_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "PR.AA-03.2": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "auth_access_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "PR.AA-03.4": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "crypto_transport_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 1
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "crypto_transport_findings",
+          "status": "needs_review",
+          "summary": "1 lower-severity or inconclusive finding(s) in pass 2 need interpretation."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "crypto_transport_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        }
+      ],
+      "PR.AA-05.3": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "auth_access_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "PR.AA-05.4": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "auth_access_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "PR.AA-05.7": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "auth_access_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "PR.AA-05.9": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "auth_access_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "PR.DS-02.2": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "crypto_transport_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 1
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "crypto_transport_findings",
+          "status": "needs_review",
+          "summary": "1 lower-severity or inconclusive finding(s) in pass 2 need interpretation."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "crypto_transport_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        }
+      ]
+    }
+  },
+  "important": {
+    "assuranceLevel": "important",
+    "generatedAt": "2026-02-02T02:55:00Z",
+    "jobsAvailable": 3,
+    "jobsConsidered": 3,
+    "jobsSkipped": 0,
+    "overriding": [
+      {
+        "control_id": "ID.AM-08.2",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "ID.RA-01.1",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "ID.RA-01.2",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "ID.RA-01.3",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "ID.RA-01.6",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "ID.RA-08.1",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "PR.AA-01.1",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "PR.AA-01.2",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "PR.AA-03.2",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "PR.AA-05.3",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "PR.AA-05.4",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      },
+      {
+        "control_id": "PR.AA-05.7",
+        "job_id": "job-other",
+        "pass_nr": 2,
+        "ref": "job:job-other:2",
+        "severities": {
+          "HIGH": 1
+        }
+      }
+    ],
+    "packId": "ro.dnsc.o1-2026",
+    "reason": null,
+    "suggestions": {
+      "DE.AE-03.1": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "soc_incident_evidence",
+          "status": "needs_review",
+          "summary": "No completed SOC export or detection correlation is recorded for this job."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "soc_incident_evidence",
+          "status": "supported",
+          "summary": "SOC export or detection correlation completed for this job."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "soc_incident_evidence",
+          "status": "needs_review",
+          "summary": "No completed SOC export or detection correlation is recorded for this job."
+        }
+      ],
+      "DE.CM-09.1": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "soc_incident_evidence",
+          "status": "needs_review",
+          "summary": "No completed SOC export or detection correlation is recorded for this job."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "soc_incident_evidence",
+          "status": "supported",
+          "summary": "SOC export or detection correlation completed for this job."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "soc_incident_evidence",
+          "status": "needs_review",
+          "summary": "No completed SOC export or detection correlation is recorded for this job."
+        }
+      ],
+      "ID.AM-08.2": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "vulnerability_management",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 1
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "ID.IM-02.1": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        }
+      ],
+      "ID.RA-01.1": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "vulnerability_management",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 1
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "ID.RA-01.2": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "vulnerability_management",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 1
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "ID.RA-01.3": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "vulnerability_management",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 1
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "ID.RA-01.5": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        }
+      ],
+      "ID.RA-01.6": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "vulnerability_management",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 1
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "ID.RA-05.1": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        }
+      ],
+      "ID.RA-05.2": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "assessment_performed",
+          "status": "supported",
+          "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+        }
+      ],
+      "ID.RA-08.1": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "vulnerability_management",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 1
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "vulnerability_management",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "PR.AA-01.1": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "auth_access_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "PR.AA-01.2": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "auth_access_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "PR.AA-03.2": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "auth_access_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "PR.AA-05.3": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "auth_access_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "PR.AA-05.4": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "auth_access_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ],
+      "PR.AA-05.7": [
+        {
+          "completed_at": "2026-02-02T02:50:00Z",
+          "counts": {
+            "gap": 0,
+            "review": 0
+          },
+          "job_id": "job-clean",
+          "pass_nr": 2,
+          "ref": "job:job-clean:2",
+          "signal_kind": "auth_access_findings",
+          "status": "supported",
+          "summary": "No unresolved matching finding in pass 2."
+        },
+        {
+          "completed_at": "2026-02-02T02:45:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-open",
+          "pass_nr": 2,
+          "ref": "job:job-open:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        },
+        {
+          "completed_at": "2026-02-02T02:40:00Z",
+          "counts": {
+            "gap": 1,
+            "review": 0
+          },
+          "job_id": "job-other",
+          "pass_nr": 2,
+          "ref": "job:job-other:2",
+          "signal_kind": "auth_access_findings",
+          "status": "gap",
+          "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+        }
+      ]
+    }
+  }
+}
