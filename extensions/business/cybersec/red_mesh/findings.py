@@ -141,6 +141,10 @@ class Finding:
 
   # Risk scoring extensions
   cvss_version: str = "3.1"
+  # Who scored `cvss_vector`: "nvd" for a vector taken from NVD (live record or
+  # the static catalog table), "" for a probe or registry-template vector. With
+  # `cvss_version` it lets a report label an NVD-only v3.0 vector as NVD's.
+  cvss_source: str = ""
   cvss_score_env: float | None = None    # Environmental score
   cvss_vector_env: str = ""              # Environmental vector
   cvss_data_freshness: str = ""          # ISO 8601 — when CVSS was fetched from NVD
