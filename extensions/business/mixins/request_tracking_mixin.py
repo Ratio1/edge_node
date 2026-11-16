@@ -89,6 +89,9 @@ class _RequestTrackingMixin(object):
     # Time of the last write of the record. 0 lets the first change be written at the request
     # monitor's next turn, without waiting for an interval.
     self.__rt_last_save_time = 0
+    # The store's word for the last write, which a write the store did not take is compared with before its red line:
+    # None before the first write, so the first refusal is logged.
+    self.__rt_last_outcome = None
     if self.__rt_cstore_hkey:
       # A plain list, not a deque(maxlen): _track_request replaces it with a changed copy, so the
       # plugin thread, which iterates the record while the monitor thread adds to it, never
@@ -207,22 +210,31 @@ class _RequestTrackingMixin(object):
     every oracle under this node's id, and the call returns; the chain store sends it again while no
     oracle confirmed it. The changed flag is cleared before the record is copied, so an answer that the
     plugin thread stamps while the write runs sets it again and is written by the next save. A write the
-    store does not take is logged in red with the store's word for it. Only the three transient words,
-    ``not_ready`` (the store has not started, or restarts), ``error`` (the call raised) and
+    store does not take is logged in red with the store's word for it, when that word differs from the
+    word of the write before it (a stored write's word included). Only the three transient words,
+    ``not_ready`` (the store has not started or restarts, or another thread held the store's lock for
+    more than 1 ms: the write waits at most 1 ms for it), ``error`` (the call raised) and
     ``refused_no_peers`` (this node sees no other oracle online, as while its broker link is down for
     over a minute; the store's peer list is refreshed every 60 s), leave the record marked as changed, so
     the save one interval later tries again. Every other refusal (``refused_readonly``, ``refused_token``
     and the other ``refused_*`` words) is final for this record: it is not tried again, and the record is
-    written again only when it changes. A seed whose peer list holds only itself is refused with
-    ``refused_no_peers`` at every try, so it logs one red line per interval while its record is unsent.
+    written again only when it changes.
 
     Returns
     -------
     None
 
+    Notes
+    -----
+    A word that stays logs one red line, not one per interval: a seed whose peer list holds only itself
+    is refused with ``refused_no_peers`` at every try, and a store whose lock a namespace-sync merge keeps
+    busy answers ``not_ready`` at every try while the merge runs. A stored write between two refusals, or
+    another word, logs the next refusal again.
+
     Examples
     --------
     >>> self.__rt_save()   # the chain store has not started: red line, tried again one interval later
+    >>> self.__rt_save()   # not_ready again one interval later: tried again, no second red line
     >>> self.__rt_save()   # another owner holds the field (refused_readonly): one red line, not tried again
     """
     # Clear the flag before the copy below: clearing it after the write forgot a change made
@@ -242,20 +254,27 @@ class _RequestTrackingMixin(object):
       wait=False,
       result_info=info,
     ):
-      # Not stored and not queued. A store that has not started (or restarts), a call that raised, or a node that
-      # sees no other oracle online can take the same write later; every other refused_* word is final for this
-      # record. refused_no_peers is retried: as a final word, the trace of a request received while the node was
-      # cut off from the oracles stayed unsent after they came back online, until the next tracked request.
+      # Not stored and not queued. A store that has not started (or restarts) or whose lock another thread held for
+      # more than 1 ms, a call that raised, or a node that sees no other oracle online can take the same write later;
+      # every other refused_* word is final for this record. refused_no_peers is retried: as a final word, the trace
+      # of a request received while the node was cut off from the oracles stayed unsent after they came back online,
+      # until the next tracked request.
       retry = info["outcome"] in ("not_ready", "error", "refused_no_peers")
       if retry:
         # The record stays marked as changed, so the save one interval later tries again. Before, every
         # refusal was tried again: a final one (a field another owner holds) every 30 s, for ever.
         self.__rt_dirty = True
-      # One red line per write the store did not take, for the operator reading the node log: the store's word
-      # and whether the record is tried again.
-      self.P(f"Request trace {self.__rt_cstore_hkey} was not published ({info['outcome']}); " + (
-        f"it is tried again in {self.cfg_requests_save_interval} s." if retry else
-        "it is not tried again until the record changes."), color='r')
+      # One red line, for the operator reading the node log, only when this write's word differs from the last
+      # write's. Before, a word that stayed (a seed with no other oracle, a lock a merge keeps busy) logged the same
+      # line every 30 s.
+      if info["outcome"] != self.__rt_last_outcome:
+        # The store's word and whether the record is tried again.
+        self.P(f"Request trace {self.__rt_cstore_hkey} was not published ({info['outcome']}); " + (
+          f"it is tried again in {self.cfg_requests_save_interval} s." if retry else
+          "it is not tried again until the record changes."), color='r')
+    # This write's word, which the next write the store does not take is compared with; a stored write's word
+    # ("changed", "identical") differs from every refusal, so the first refusal after it is logged again.
+    self.__rt_last_outcome = info["outcome"]
     # Start of the quiet period that REQUESTS_SAVE_INTERVAL enforces before the next write.
     self.__rt_last_save_time = self.time()
     return
@@ -287,8 +306,9 @@ class _RequestTrackingMixin(object):
     could make every oracle store a record, and save its whole replica, once per call. With
     it a node writes its record at most ``60 / REQUESTS_SAVE_INTERVAL`` times a minute.
 
-    The monitor admits no request while this runs. The write does not wait for the other oracles, but
-    it takes the chain store's lock, which a save or a namespace-sync merge can hold.
+    The monitor admits no request while this runs. The write does not wait for the other oracles, and it
+    waits at most 1 ms for the chain store's lock, which a save's copy or a namespace-sync merge can hold
+    for seconds: when the lock stays held, the write ends ``not_ready`` and is tried one interval later.
 
     Measured on the node image's interpreter under a 0.35 CPU limit, with the core's write path on its
     test harness (a replica of 5,700 records, 10 peers) and the node's logger, over 2,000 writes per run:

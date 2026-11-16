@@ -636,10 +636,10 @@ class RequestTrackingTests(unittest.TestCase):
     self.assertEqual(len(api.writes), 2)
 
   def test_a_write_that_failed_for_a_transient_cause_is_tried_again_after_each_interval(self):
-    """A write that failed for a transient cause (the store had not started, the call raised, or the node saw no
-    other oracle online) is not forgotten: one red line names the store's word, no further try is made inside the
-    interval, a second failure in a row keeps the record for the interval after it, and the first tick after the
-    store takes writes again writes it."""
+    """A write that failed for a transient cause (the store had not started or its lock was busy, the call raised,
+    or the node saw no other oracle online) is not forgotten: one red line names the store's word, no further try
+    is made inside the interval, a second failure in a row with the same word keeps the record for the interval
+    after it without a second red line, and the first tick after the store takes writes again writes it."""
     # The three transient words; refused_no_peers clears once the node sees the oracles online again.
     for word in ("not_ready", "error", "refused_no_peers"):
       # One sub-test each.
@@ -666,14 +666,38 @@ class RequestTrackingTests(unittest.TestCase):
         self.assertEqual((len(api.waits), sum(color == "r" for _, color in api.lines)), (1, 1))
         # The turn at 30 s: the second try fails too, as with a store that has not started for over 30 s.
         api.tick(0.25)
-        # Two tries, two red lines, nothing stored.
-        self.assertEqual((len(api.waits), sum(color == "r" for _, color in api.lines), api.writes), (2, 2, []))
+        # Two tries and nothing stored, but still one red line: the word is the same, and a store whose lock a
+        # merge keeps busy, or a seed with no other oracle, must not log the same line every 30 s.
+        self.assertEqual((len(api.waits), sum(color == "r" for _, color in api.lines), api.writes), (2, 1, []))
         # The store takes writes again.
         api.refusal = None
         # The turn 30 s after the second try.
         api.tick(30)
         # The record is out, still not answered: the second failure did not drop it.
         self.assertEqual(api.writes, [[("create-1", False)]])
+
+  def test_a_red_line_comes_again_only_when_a_write_ends_with_another_word(self):
+    """The red line of a write the store did not take is logged again only when a write ends with another word
+    than the write before it: a word that stays logs once, a new word logs, and a failure right after a stored
+    write logs again, so the log still shows each new episode."""
+    # The Deeploy API's trace.
+    api = _Api(DEEPLOY_CONFIG)
+    # Per step: the store's word for that step's write (None: stored and queued), and the red lines after it.
+    for word, red in (("not_ready", 1), ("not_ready", 1), ("error", 2), (None, 2), ("error", 3)):
+      # The store answers the next write with this word.
+      api.refusal = word
+      # A new request, so the record has a change to write also after a stored write.
+      api.receive("create-%d" % len(api.waits), "create_pipeline")
+      # The first turn after the interval makes the write.
+      api.tick(30)
+      # The red lines so far: none for a word the write before had too, none for a stored write.
+      self.assertEqual(sum(color == "r" for _, color in api.lines), red)
+    # Five writes were made, one per step, so every step above was a write and not a skipped turn.
+    self.assertEqual(len(api.waits), 5)
+    # The words the red lines name, read from the brackets of each line: the first not_ready, the first error,
+    # and the error that followed the stored write.
+    self.assertEqual([text.split("(")[1].split(")")[0] for text, color in api.lines if color == "r"],
+                     ["not_ready", "error", "error"])
 
   def test_a_write_the_store_refuses_for_good_is_logged_once_and_not_tried_again(self):
     """A write the store refuses by a final word (a field another owner holds) is logged in red once and not tried
