@@ -43,8 +43,10 @@ ENV AINODE_DOCKER_SOURCE=main
 # enable Docker-in-Docker in the optional base-image entrypoint
 ENV EE_DD=1
 # The base image must bring no settings file for its Docker daemon: the copy below would replace it without a word
-# and what it set would be lost on every node. Fail the build instead.
-RUN test ! -e /etc/docker/daemon.json
+# and what it set would be lost on every node. Fail the build instead. It must also have flock, which
+# cmds/node_entrypoint locks the kept store with before it starts the daemon: without it every node start would stop
+# with exit 1, so the build stops here, with a line that says so.
+RUN test ! -e /etc/docker/daemon.json && { command -v flock || { echo "The base image has no flock, which cmds/node_entrypoint locks the kept Docker store with: not building." >&2; exit 1; }; }
 # Keep the store of the inner Docker daemon (images, containers, volumes) in the directory this file names, under
 # the mounted /edge_node/_local_cache, so app images survive a node restart. Before, the store was /var/lib/docker on
 # this container's own layer, deleted at every stop: every app image was pulled again at every start (9-54 s per app).

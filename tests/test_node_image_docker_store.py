@@ -48,6 +48,14 @@ ENTRYPOINT_FLAG_KEYS = {"hosts", "tls", "tlsverify", "tlscacert", "tlscert", "tl
 # parent folder of the repository; every other image from the repository itself.
 COPY_SOURCES = {"Dockerfile_devnet_local": "./edge_node/docker/daemon.json"}
 
+# The build step before the copy that looks at the base image: no daemon file of its own, which the copy would replace
+# without a word, and flock, which cmds/node_entrypoint locks the kept store with (without it every node start would
+# stop at that lock, so the build stops here with a line that says so).
+BASE_IMAGE_LINE = (
+  'RUN test ! -e /etc/docker/daemon.json && { command -v flock || { echo "The base image has no flock, which'
+  ' cmds/node_entrypoint locks the kept Docker store with: not building." >&2; exit 1; }; }'
+)
+
 # The build step that asks dockerd whether it accepts the installed file together with the entrypoint's flags.
 VALIDATE_LINE = (
   "RUN dockerd --validate --host=unix:///var/run/docker.sock --storage-driver=vfs"
@@ -118,7 +126,7 @@ def store_steps(name):
   Returns
   -------
   list
-    Five instruction lines: no daemon file in the base image, the copy, dockerd accepts the file with the
+    Five instruction lines: no daemon file but flock in the base image, the copy, dockerd accepts the file with the
     entrypoint's flags, the entrypoint sets neither the store directory nor another settings file, and the Docker
     major is the one the store directory is named after.
 
@@ -133,8 +141,9 @@ def store_steps(name):
   major = daemon_config()["data-root"].rsplit("/", 1)[-1]
   # The five steps, as each Dockerfile must spell them.
   return [
-    # A daemon file of the base image would be replaced by the copy without a word.
-    "RUN test ! -e /etc/docker/daemon.json",
+    # A daemon file of the base image would be replaced by the copy without a word; without flock in it, the build
+    # stops there with a line that names flock.
+    BASE_IMAGE_LINE,
     # The file of this repository, from where this Dockerfile's build context has it.
     "COPY {} /etc/docker/daemon.json".format(COPY_SOURCES.get(name, "./docker/daemon.json")),
     # dockerd accepts the file and the flags together.
@@ -414,6 +423,48 @@ class TestNodeImageDockerStore(unittest.TestCase):
     keys = {"hosts" if flag == "host" else flag for flag in flags}
     # `tls` and `tlsverify` in the file fail the build without a flag: dockerd then wants certificates the image lacks.
     self.assertEqual(keys, ENTRYPOINT_FLAG_KEYS - {"tls", "tlsverify"})
+
+  def test_the_build_stops_with_a_line_that_names_flock_on_a_base_image_without_it(self):
+    """The step before the copy stops the build on a base image without flock, with a line that names it, since the
+    script's lock would stop every node start; it passes on a base image with flock, and still stops, without that
+    line, on a base image with a daemon file of its own."""
+    # Every node Dockerfile, each reported under its own name.
+    for dockerfile, text in node_dockerfiles().items():
+      # One result per Dockerfile, so a failure names the file; a folder of its own for the stand-in paths.
+      with self.subTest(dockerfile=dockerfile), tempfile.TemporaryDirectory() as folder:
+        # The step that looks at the base image before the copy, as this Dockerfile spells it (another test pins it
+        # once, first of the five), without its RUN: the shell text the build's /bin/sh runs.
+        step = next(line for line in text.splitlines() if line.startswith("RUN test ! -e /etc/docker/daemon.json"))
+        # The daemon file it looks for moved into this folder, so the host that runs the test cannot change the answer.
+        script = step[len("RUN "):].replace("/etc/docker/daemon.json", folder + "/daemon.json")
+        # The only folder on the PATH of a base image with flock.
+        with_flock = pathlib.Path(folder, "with_flock")
+        # Created, with an executable named flock in it: the step only looks for one.
+        with_flock.mkdir()
+        # Any content will do.
+        (with_flock / "flock").write_text("#!/bin/sh\n")
+        # Executable, as the real one.
+        (with_flock / "flock").chmod(0o755)
+        # Per base image: the step's exit code and what it printed as errors.
+        ended = {}
+        # A base image with flock, one without it (a PATH folder that does not exist), and one with flock and a
+        # daemon file of its own; the last creates the file, so it runs last.
+        for name, path in (("flock", str(with_flock)), ("no flock", folder + "/none"), ("daemon file", str(with_flock))):
+          if name == "daemon file":
+            # The base image brings a daemon file.
+            pathlib.Path(folder, "daemon.json").write_text("{}")
+          # The step on that base image, with only its PATH, through which the shell finds flock.
+          run = subprocess.run(["/bin/sh", "-c", script], env={"PATH": path}, capture_output=True, text=True,
+                               timeout=60)
+          # How it ended.
+          ended[name] = (run.returncode, run.stderr)
+        # Passes with flock; stops with the line without it; stops without that line on the base image's daemon file.
+        self.assertEqual(ended, {
+          "flock": (0, ""),
+          "no flock": (1, "The base image has no flock, which cmds/node_entrypoint locks the kept Docker store with:"
+                          " not building.\n"),
+          "daemon file": (1, ""),
+        })
 
 
 class TestNodeImageEntrypoint(unittest.TestCase):
