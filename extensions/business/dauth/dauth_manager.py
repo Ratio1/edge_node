@@ -48,8 +48,9 @@ from extensions.business.dauth.dauth_revoked_nodes import _DauthRevokedNodesMixi
 from extensions.business.dauth.deployment_secrets import _DauthDeploymentSecretsMixin, DeploymentSecretRecordTooLarge
 # The name of the reason field of a refusal and its one code, shared with the client that reads them.
 from ratio1.const.base import dAuth
-# How many times a failed registry read's time the SDK answers that read's error without a read.
-from ratio1.bc.evm import _ORACLE_REGISTRY_FAILURE_FACTOR
+# How many times a failed registry read's time the SDK answers that read's error without a read; its public name,
+# which the SDK keeps for this caller (a private name could be renamed there and fail this plugin at import).
+from ratio1.bc.evm import ORACLE_REGISTRY_FAILURE_FACTOR
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 from extensions.business.deeploy.deeploy_job_mixin import _DeeployJobMixin
 
@@ -241,7 +242,7 @@ class DauthManagerPlugin(
 
     A refresh is due every ``DAUTH_REGISTRY_REFRESH_INTERVAL`` seconds after a refresh that read the registry,
     and after a failed read once ``DAUTH_REGISTRY_REFRESH_RETRY_INTERVAL`` seconds have passed or, if later, once
-    three times the failed read's time has passed (the SDK's ``_ORACLE_REGISTRY_FAILURE_FACTOR``), both counted
+    three times the failed read's time has passed (the SDK's ``ORACLE_REGISTRY_FAILURE_FACTOR``), both counted
     from the end of the read. The read's time is taken on the monotonic clock, as the SDK takes it, so a step
     of the wall clock during the read does not change it. The server is enabled when this node's address is in
     the registry and the registry's peers resolve; a failed read disables it.
@@ -285,7 +286,7 @@ class DauthManagerPlugin(
     refresh_interval = (
       # After a failed read, the retry interval or, if longer, as long as the SDK answers that read's error from
       # its memory: a retry inside it fails without a read. Before, only the retry interval, from the read's start.
-      max(self.cfg_dauth_registry_refresh_retry_interval, _ORACLE_REGISTRY_FAILURE_FACTOR * self._dauth_registry_read_seconds)
+      max(self.cfg_dauth_registry_refresh_retry_interval, ORACLE_REGISTRY_FAILURE_FACTOR * self._dauth_registry_read_seconds)
       if getattr(self, "_dauth_registry_refresh_failed", False)
       else self.cfg_dauth_registry_refresh_interval
     )
