@@ -399,7 +399,7 @@ class TestFrameworkReview(FrameworkAssessmentFixture):
     before = self.ok(self.review())
     key = next(key for key, value in self.storage.data.items() if isinstance(value, dict) and value.get('kind') == r.KIND)
     original = copy.deepcopy(self.storage.data[key])
-    with patch.object(r, 'ROW_BYTES_MAX', r._size(original) + 1024):
+    with patch.object(r, 'ROW_WRITE_BYTES_MAX', r._size(original) + 1024):
       self.refused(self.mutate('comment', control=next(iter(self.basic_scores())), comment='界' * r.COMMENT_MAX), 409, 'review_capacity')
     self.assertEqual(self.ok(self.review())['history'], before['history'])
     self.storage.data[key]['oversized'] = 'x' * r.ROW_BYTES_MAX

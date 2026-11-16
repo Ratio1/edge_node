@@ -67,8 +67,8 @@ class TestShippedManifest(unittest.TestCase):
 
   def test_pack_ids_and_the_dnsc_entry_come_from_the_manifest(self):
     manifest = packs.load_manifest()
-    self.assertEqual((manifest["schema"], manifest["manifest_version"]), ("redmesh.framework_manifest.v1", 1))
-    self.assertEqual(packs.list_framework_pack_ids(), (DNSC,))
+    self.assertEqual((manifest["schema"], manifest["manifest_version"]), ("redmesh.framework_manifest.v1", 2))
+    self.assertEqual(packs.list_framework_pack_ids(), (DNSC, "eu.ec.ir-2024-2690"))
     dnsc = packs.manifest_pack(DNSC)
     self.assertEqual((dnsc["version"], dnsc["status"], dnsc["scoring"], dnsc["languages"]), (1, "active", "maturity_two_axis.v1", ["ro"]))
     self.assertEqual(dnsc["rules"]["entity_fields"], ["dnsc_unique_id", "external_supplier"])

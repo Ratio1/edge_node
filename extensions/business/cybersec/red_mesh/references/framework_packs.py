@@ -28,7 +28,7 @@ TEXT_SCHEMAS = ("redmesh.framework_text.v1",)
 # Draft fields only some regimes accept; a pack lists the ones it takes in `rules.entity_fields`.
 REGIME_FIELDS = ("dnsc_unique_id", "external_supplier")
 # The member states a `jurisdiction: "EU"` entry covers (ISO 3166-1 alpha-2; Greece is `GR`).
-EU_MEMBER_STATES = frozenset("AT BE BG HR CY CZ DK EE FI FR DE GR IE IT LV LT LU MT NL PL PT RO SK SI ES SE".split())
+EU_MEMBER_STATES = frozenset("AT BE BG HR CY CZ DK EE FI FR DE GR HU IE IT LV LT LU MT NL PL PT RO SK SI ES SE".split())
 _RULE_SWITCHES = ("justification_required", "exclusion_reason_required", "remediation_on_fail", "signoff_required")
 _RULE_LISTS = ("level_provenance_kinds", "exports")
 _ENTRY_KEYS = ("country", "jurisdiction", "sectors", "legal_force", "accepted_alternatives", "source_url",

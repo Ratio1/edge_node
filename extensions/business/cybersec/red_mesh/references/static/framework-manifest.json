@@ -1,6 +1,6 @@
 {
   "schema": "redmesh.framework_manifest.v1",
-  "manifest_version": 1,
+  "manifest_version": 2,
   "packs": [
     {
       "pack_id": "ro.dnsc.o1-2026",
@@ -13,8 +13,12 @@
       "pack_schema": "redmesh.framework_pack.v1",
       "text_schema": "redmesh.framework_text.v1",
       "pack_sha256": "0b9e8c60011be5fbc447f5a89933586db750273f6752771df0fafb94d88e6a62",
-      "text_sha256": {"ro": "92fe6d9ed20ef5dfd63a32ad4dab375bcf3e991a749f4383d27bc74bbaeff8ec"},
-      "languages": ["ro"],
+      "text_sha256": {
+        "ro": "92fe6d9ed20ef5dfd63a32ad4dab375bcf3e991a749f4383d27bc74bbaeff8ec"
+      },
+      "languages": [
+        "ro"
+      ],
       "licence": {
         "id": "RO-OFFICIAL-ADMINISTRATIVE-TEXT",
         "attribution": "DNSC Ordin 1/2026, Anexa 1 (MO 712 bis/2026-08-27, amended by MO 792/2026-09-18)",
@@ -25,9 +29,20 @@
         "exclusion_reason_required": true,
         "remediation_on_fail": true,
         "signoff_required": true,
-        "entity_fields": ["dnsc_unique_id", "external_supplier"],
-        "level_provenance_kinds": ["risk_score", "declared"],
-        "exports": ["json", "csv", "pdf", "eval_mms"]
+        "entity_fields": [
+          "dnsc_unique_id",
+          "external_supplier"
+        ],
+        "level_provenance_kinds": [
+          "risk_score",
+          "declared"
+        ],
+        "exports": [
+          "json",
+          "csv",
+          "pdf",
+          "eval_mms"
+        ]
       },
       "entries": [
         {
@@ -40,6 +55,55 @@
           "legal_reference": "DNSC Ordin 1/2026, Anexa 1",
           "verified_at": "2026-10-06",
           "verified_by": "project-red-mesh:workbooks/redmesh-framework-pack (pinned official sources)"
+        }
+      ]
+    },
+    {
+      "pack_id": "eu.ec.ir-2024-2690",
+      "title": "NIS2 Implementing Regulation 2024/2690 — Annex self-assessment",
+      "version": 1,
+      "status": "active",
+      "supersedes": null,
+      "derived_from": null,
+      "scoring": "compliance_status.v1",
+      "pack_schema": "redmesh.framework_pack.v1",
+      "text_schema": "redmesh.framework_text.v1",
+      "pack_sha256": "3ff9e6a1bf2790e74dd597710a0091654f31212707c3046f7e5a7bfbd8849e05",
+      "text_sha256": {
+        "en": "25c2012253fa19dde2495c1bea396876fec9fb03ff3bf852d760b1402254b9da"
+      },
+      "languages": [
+        "en"
+      ],
+      "licence": {
+        "id": "EUR-LEX-REUSE",
+        "attribution": "European Commission, Implementing Regulation (EU) 2024/2690, Annex, original English Official Journal text; extracted and reformatted. Reuse under the EUR-Lex reuse notice (https://eur-lex.europa.eu/content/legal-notice/legal-notice.html).",
+        "ship_text": true
+      },
+      "rules": {
+        "justification_required": false,
+        "exclusion_reason_required": true,
+        "remediation_on_fail": false,
+        "signoff_required": false,
+        "entity_fields": [],
+        "level_provenance_kinds": [],
+        "exports": [
+          "json",
+          "csv",
+          "pdf"
+        ]
+      },
+      "entries": [
+        {
+          "country": null,
+          "jurisdiction": "EU",
+          "sectors": [],
+          "legal_force": "binding for listed entity types",
+          "accepted_alternatives": [],
+          "source_url": "http://data.europa.eu/eli/reg_impl/2024/2690/oj",
+          "legal_reference": "Commission Implementing Regulation (EU) 2024/2690, Annex; Article 2 and Recital 4",
+          "verified_at": "2026-11-16",
+          "verified_by": "project-red-mesh:workbooks/redmesh-framework-pack (pinned official English source and completeness checks)"
         }
       ]
     }

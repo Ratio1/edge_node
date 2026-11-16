@@ -83,7 +83,7 @@ class TestPackList(LifecycleFixture):
 
   def test_the_list_carries_the_active_packs_with_levels_rules_licence_and_capabilities(self):
     data = self.packs()
-    self.assertEqual((data["schema"], data["manifestVersion"]), ("redmesh.framework_pack_list.v1", 1))
+    self.assertEqual((data["schema"], data["manifestVersion"]), ("redmesh.framework_pack_list.v1", 2))
     by_id = {p["packId"]: p for p in data["packs"]}
     self.assertEqual(set(by_id), set(packs.list_framework_pack_ids()))
     dnsc = by_id[DNSC]
@@ -104,7 +104,7 @@ class TestPackList(LifecycleFixture):
     self.assertEqual((by_id[STATUS]["levels"], by_id[STATUS]["capabilities"]["has_levels"]), ([], False))
 
   def test_it_needs_the_view_permission_and_a_member_tenant(self):
-    self.assertEqual(self.packs(self.viewer)["manifestVersion"], 1)
+    self.assertEqual(self.packs(self.viewer)["manifestVersion"], 2)
     self.assertFalse(self.plugin.list_framework_packs(self.stranger, self.tenant)["success"])
     result = self.plugin.list_framework_packs(self.pentester, self.tenant)
     self.assertFalse(result["success"], result)

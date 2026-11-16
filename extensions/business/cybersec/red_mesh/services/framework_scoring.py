@@ -26,7 +26,6 @@ Arithmetic is exact (`Fraction`); the verdict is taken from the exact values; `c
 """
 from __future__ import annotations
 
-import re
 from fractions import Fraction
 from types import SimpleNamespace
 
@@ -36,23 +35,16 @@ from extensions.business.cybersec.red_mesh.references.framework_packs import (
   pack_levels,
 )
 
+from .framework_entry_validation import (
+  CAPS, JOB_REF, _EVIDENCE_REF, AssessmentInvalid, bounded_text, normalize_evidence_refs,
+)
+
 SCORING_ID = "maturity_two_axis.v1"
 AXES = ("documentation", "implementation")
 NA = "N/A"
 SCORE_VALUES = (1, 2, 3, 4, 5)
 _THRESHOLD_KEYS = ("key_measure_min", "category_min", "total_min", "excluded_value", "max_excluded")
 _CONTROL_KEYS = ("category", "subcategory", "entry_level", "key_measure", "management_aspect")
-
-# Caps from the contract. Validation uses them; the Navigator mirrors them.
-CAPS = {
-  "justification": 500,
-  "exclusion_justification": 500,
-  "evidence_refs": 5,
-  "sectoral_requirements": 2000,
-  "remediation_items": 50,
-  "remediation_action": 500,
-}
-
 
 def _err(code: str, ids=None, **extra) -> dict:
   out = {"code": code}
@@ -318,60 +310,8 @@ def validate_for_submit(pack: dict, level: str, draft: dict, rules: dict | None 
 # -- entry hooks: the caller's `scores[ref_id]` in, the stored entry out --------------------------------
 # (moved here from `tenancy/compliance.py`; `compliance` re-exports the names it and the tests use)
 
-# The `job:` grammar is one object: the evidence-ref validator and the ownership check in
-# `services/framework_evidence.py` share it, so a ref one accepts the other always sees.
-JOB_REF = re.compile(r"job:([A-Za-z0-9_-]{1,80}):[0-9]{1,6}\Z")
-_EVIDENCE_REF = re.compile(
-  r"(?:engagement:[A-Za-z0-9_-]{1,80}/document:ed_[0-9]{1,4}|contract"
-  r"|nis2:[A-Za-z0-9_-]{1,80}:[0-9]{1,6}|" + JOB_REF.pattern[:-2] + r")\Z")
-_REVIEW_STATES = ("linked",)
 _ENTRY_KEYS = frozenset({"documentation", "implementation", "excluded", "justification", "exclusion_justification",
                          "evidence_refs", "updated_by", "updated_at"})
-
-
-class AssessmentInvalid(ValueError):
-  def __init__(self, code, ids=None, **extra):
-    super().__init__(code)
-    self.code = code
-    self.ids = sorted(ids) if ids else None
-    self.extra = extra
-
-  def as_error(self):
-    out = {"code": self.code}
-    if self.ids:
-      out["ids"] = self.ids
-    out.update(self.extra)
-    return out
-
-
-def bounded_text(value, limit, *, required=False):
-  if value is None:
-    value = ""
-  if not isinstance(value, str):
-    raise AssessmentInvalid("invalid_request")
-  value = value.strip()
-  if len(value) > limit or (required and not value):
-    raise AssessmentInvalid("invalid_request")
-  return value
-
-
-def normalize_evidence_refs(value):
-  if value is None:
-    return []
-  if not isinstance(value, list) or len(value) > CAPS["evidence_refs"]:
-    raise AssessmentInvalid("evidence_ref_invalid")
-  refs = []
-  seen = set()
-  for entry in value:
-    ref = entry.get("ref") if isinstance(entry, dict) else entry
-    if not isinstance(ref, str) or not _EVIDENCE_REF.match(ref) or ref in seen:
-      raise AssessmentInvalid("evidence_ref_invalid")
-    state = entry.get("review_state", "linked") if isinstance(entry, dict) else "linked"
-    if state not in _REVIEW_STATES:
-      raise AssessmentInvalid("evidence_ref_invalid")
-    seen.add(ref)
-    refs.append({"ref": ref, "review_state": state})
-  return refs
 
 
 def _axis(value):
@@ -501,3 +441,7 @@ register_scorer(SCORING_ID, SimpleNamespace(
   pack_view_extras=pack_view_extras,
   capabilities=capabilities,
 ))
+
+# Status implementation depends only on shared entry validators, never this registry.
+from . import framework_status_scoring
+register_scorer(framework_status_scoring.SCORING_ID, framework_status_scoring)

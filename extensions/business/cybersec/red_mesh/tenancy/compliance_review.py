@@ -15,7 +15,8 @@ KIND = "framework_assessment_review"
 REVIEW = "compliance_assessments:review"
 COMMENT_MAX = 2000
 EVENT_MAX = 500
-ROW_BYTES_MAX = 2 * 1024 * 1024
+ROW_BYTES_MAX = 2 * 1024 * 1024  # historical read/validation ceiling
+ROW_WRITE_BYTES_MAX = 512 * 1024  # transport-safe admission; retain 1 KiB mutation reserve
 CONTEXT_BYTES_MAX = 1024 * 1024
 _REVISION = re.compile(r"[1-9][0-9]*\Z")
 _ACTIONS = {"submit", "comment", "approve", "return"}
@@ -76,7 +77,7 @@ def event(sub, action, actor, request_id, *, control_id=None, comment=None, time
 
 def _append(review, entry):
   updated = {**review, "history": [*review["history"], entry], "review_revision": review["review_revision"] + 1}
-  if len(updated["history"]) > EVENT_MAX or _size(updated) > ROW_BYTES_MAX - 1024:
+  if len(updated["history"]) > EVENT_MAX or _size(updated) > ROW_WRITE_BYTES_MAX - 1024:
     raise c._denied(409, "review_capacity")
   return updated
 
