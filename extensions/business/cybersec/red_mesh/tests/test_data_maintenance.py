@@ -139,6 +139,35 @@ class TestDataMaintenance(unittest.TestCase):
             "remediation": [], "state": "draft", "assessment_revision": 1, "reopened_from": None, "pending": None,
             "scores": {}, "submissions": [], "created_by": "initial", "created_at": "t", "updated_by": "initial", "updated_at": "t"}
 
+  def test_profile_singleton_backup_restore_and_current_old_orphan_classification(self):
+    result = self.plugin.save_tenant_compliance_profile(self.actor, self.tenant, {"country": "DE"}, 0, str(uuid4()))
+    self.assertTrue(result["success"], result)
+    field = json.dumps(["compliance_profile", "deployment", self.tenant], separators=(",", ":"))
+    rows = self.scan()
+    current = rows[(COMPLIANCE, field)]
+    self.assertEqual(current["class"], "current")
+    self.assertEqual(current["cids"], [])
+    row = current["value"]
+    self.storage.data[(COMPLIANCE, field)] = None
+    restored = self.plugin.restore_redmesh_records(self.actor, [{"hkey": COMPLIANCE, "field": field, "value": row}])
+    self.assertTrue(restored["success"], restored)
+    self.assertEqual(restored["data"]["outcomes"][0]["outcome"], "written")
+    self.assertEqual(self.storage.data[(COMPLIANCE, field)], row)
+    tenant_key = json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":"))
+    tenant = self.storage.data[(TENANCY, tenant_key)]
+    tenant["active"] = False
+    self.assertEqual(self.scan()[(COMPLIANCE, field)]["class"], "current")
+    tenant["schemaVersion"] = 0
+    self.assertEqual(self.scan()[(COMPLIANCE, field)]["class"], "old")
+    self.storage.data[(TENANCY, tenant_key)] = None
+    orphan = self.scan()[(COMPLIANCE, field)]
+    self.assertEqual(orphan["class"], "orphan")
+    self.assertEqual(self.clean(orphan)[0]["outcome"], "deleted")
+    # Malformed singleton is recognized as old, rather than accidentally parsed as assessment ids.
+    row["revision"] = 0
+    self.put(COMPLIANCE, field, row)
+    self.assertEqual(self.scan()[(COMPLIANCE, field)]["class"], "old")
+
   def test_review_rows_classify_current_old_orphan_and_inventory_bytes(self):
     def review(tenant, **extra):
       return {"schemaVersion": 1, "namespace": "deployment", "kind": "framework_assessment_review",

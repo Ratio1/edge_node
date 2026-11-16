@@ -11,10 +11,11 @@ import json
 
 from ..compliance import ASSESSMENT_ID, KIND as ASSESSMENT_KIND, validate_framework_assessment
 from ..compliance_review import KIND as REVIEW_KIND, valid_ids, validate_review
+from ..compliance_profile import KIND as PROFILE_KIND, validate_profile
 from ..ports import TenantStoreError
 from .cstore_administration import MAX_ENUMERATED_RECORDS
 
-_KINDS = frozenset({ASSESSMENT_KIND, REVIEW_KIND})
+_KINDS = frozenset({ASSESSMENT_KIND, REVIEW_KIND, PROFILE_KIND})
 
 
 class CstoreComplianceStore:
@@ -33,6 +34,7 @@ class CstoreComplianceStore:
   def _location(self, kind, ids):
     if (not isinstance(self._namespace, str) or not self._namespace.strip()
         or kind not in _KINDS
+        or (kind == PROFILE_KIND and len(ids) != 1)
         or (kind == REVIEW_KIND and not valid_ids(ids))
         or (kind == ASSESSMENT_KIND and len(ids) not in (2, 3))
         or any(not isinstance(value, str) or not value.strip() for value in ids)
@@ -52,7 +54,8 @@ class CstoreComplianceStore:
         or raw.get("kind") != kind or raw.get("ids") != list(ids)):
       raise TenantStoreError("Invalid compliance storage record")
     try:
-      (validate_review if kind == REVIEW_KIND else validate_framework_assessment)(raw, ids)
+      {REVIEW_KIND: validate_review, PROFILE_KIND: validate_profile,
+       ASSESSMENT_KIND: validate_framework_assessment}[kind](raw, ids)
     except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
       raise TenantStoreError("Invalid framework assessment storage record") from exc
     return raw
@@ -122,6 +125,12 @@ class CstoreComplianceStore:
     network); each row is then read once, because a tombstone still lists. Both key shapes."""
     if kind not in _KINDS or not isinstance(tenant_id, str) or not tenant_id.strip():
       raise TenantStoreError("Invalid compliance storage binding")
+    if kind == PROFILE_KIND:
+      hkey, key = self._location(kind, (tenant_id,))
+      try:
+        return [[tenant_id]] if self._owner.chainstore_hget(hkey=hkey, key=key) is not None else []
+      except Exception as exc:
+        raise TenantStoreError("Compliance storage cannot be read") from exc
     try:
       keys = self._owner.chainstore_hkeys(hkey=self.hkey)
     except Exception as exc:

@@ -554,7 +554,7 @@ def _compute_context(row):
   return {"function_tiers": row["function_tiers"]} if "function_tiers" in row else None
 
 
-def assessment_view(row, pack, *, can_manage, text=None, names=_no_names, tenant=None):
+def assessment_view(row, pack, *, can_manage, text=None, names=_no_names, tenant=None, persisted=True):
   """The DTO. Never a document reference. With `text`, the pack view rides along (reads only)."""
   level = row.get("assurance_level")
   scorer, ready = scorer_for(pack), bool(level) or not pack_levels(pack)  # no level is fine for a tier-less pack only
@@ -578,7 +578,7 @@ def assessment_view(row, pack, *, can_manage, text=None, names=_no_names, tenant
     "scores": row.get("scores") or {},
     "computed": computed, "submitErrors": submit_errors,
     "history": _history(row, names),
-    "canManage": can_manage,
+    "canManage": can_manage, "persisted": persisted,
     "updatedBy": row["updated_by"], "updatedByName": names(row["updated_by"]), "updatedAt": row["updated_at"],
   }
 
@@ -662,9 +662,10 @@ def get_assessment(service, actor, tenant_id, pack_id, include_pack=True, assess
       text = load_framework_text(pack_id) or {}
     except FrameworkPackError as exc:
       raise TenantStoreError("Framework pack text unavailable") from exc
-  row = _row(service, tenant_id, pack_id, assessment_id) or new_row(tenant_id, pack, actor=account.account_id, now=_now_iso())
+  stored = _row(service, tenant_id, pack_id, assessment_id)
+  row = stored if stored is not None else new_row(tenant_id, pack, actor=account.account_id, now=_now_iso())
   return assessment_view(row, pack, can_manage=service._permission(account, tenant, MANAGE), text=text,
-                         names=name_resolver(service), tenant=tenant)
+                         names=name_resolver(service), tenant=tenant, persisted=stored is not None)
 
 
 def authorize_manage(service, actor, tenant_id, pack_id):
@@ -894,7 +895,8 @@ def delete_rows(service, tenant_id):
     return 0
   from .compliance_review import KIND as REVIEW_KIND
   count = 0
-  for kind in (KIND, REVIEW_KIND):
+  from .compliance_profile import KIND as PROFILE_KIND
+  for kind in (KIND, REVIEW_KIND, PROFILE_KIND):
     ids = store.tenant_record_ids(kind, tenant_id)
     for record_ids in ids:
       store.delete(kind, *record_ids)

@@ -1594,6 +1594,7 @@
   ],
   "packId": "ro.dnsc.o1-2026",
   "pending": null,
+  "persisted": true,
   "remediation": [
    {
     "action": "fix",

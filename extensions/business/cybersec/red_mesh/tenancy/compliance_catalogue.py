@@ -114,7 +114,7 @@ def list_packs(service, actor, tenant_id):
                   "languages": list(entry["languages"]), "status": entry["status"],
                   "entries": [{k: v for k, v in e.items() if k != "verified_by"} for e in entry["entries"]], "capabilities": scorer_for(pack).capabilities()})
   return {"schema": "redmesh.framework_pack_list.v1", "manifestVersion": load_manifest()["manifest_version"],
-          "packs": packs}
+          "sectorTaxonomy": load_manifest()["sector_taxonomy"], "packs": packs}
 
 
 def create_assessment(service, actor, tenant_id, pack_id, request_id, name, assurance_level=None,

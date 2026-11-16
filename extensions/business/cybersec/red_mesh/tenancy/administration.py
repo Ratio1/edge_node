@@ -1598,6 +1598,16 @@ class TenantAdministrationService:
       expected_review_revision, request_id, control_id, comment, assessment_id)
 
   @_endpoint
+  def get_tenant_compliance_profile(self, actor, tenant_id):
+    from . import compliance_profile
+    return compliance_profile.read(self, actor, tenant_id)
+
+  @_endpoint
+  def save_tenant_compliance_profile(self, actor, tenant_id, profile, expected_revision, request_id):
+    from . import compliance_profile
+    return compliance_profile.save(self, actor, tenant_id, profile, expected_revision, request_id)
+
+  @_endpoint
   def get_framework_assessment(self, actor, tenant_id, pack_id, include_pack=True, assessment_id="default"):
     return compliance.get_assessment(self, actor, tenant_id, pack_id, include_pack=include_pack,
                                      assessment_id=assessment_id)

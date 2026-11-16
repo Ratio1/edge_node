@@ -1,11 +1,11 @@
 {
   "schema": "redmesh.framework_manifest.v1",
-  "manifest_version": 3,
+  "manifest_version": 4,
   "packs": [
     {
       "pack_id": "ro.dnsc.o1-2026",
       "title": "DNSC Order 1/2026",
-      "version": 1,
+      "version": 2,
       "status": "active",
       "supersedes": null,
       "derived_from": null,
@@ -54,14 +54,20 @@
           "source_url": "https://legislatie.just.ro/Public/DetaliiDocument/314360",
           "legal_reference": "DNSC Ordin 1/2026, Anexa 1",
           "verified_at": "2026-10-06",
-          "verified_by": "project-red-mesh:workbooks/redmesh-framework-pack (pinned official sources)"
+          "verified_by": "project-red-mesh:workbooks/redmesh-framework-pack (pinned official sources)",
+          "sector_taxonomy": {
+            "id": "redmesh.nis2-sectors",
+            "version": 1
+          },
+          "sector_coverage": "cross_sector",
+          "sector_scope_note": "Common catalogue; national, sectoral and DORA conditions still govern legal scope."
         }
       ]
     },
     {
       "pack_id": "eu.ec.ir-2024-2690",
       "title": "NIS2 Implementing Regulation 2024/2690 — Annex self-assessment",
-      "version": 1,
+      "version": 2,
       "status": "active",
       "supersedes": null,
       "derived_from": null,
@@ -97,20 +103,30 @@
         {
           "country": null,
           "jurisdiction": "EU",
-          "sectors": [],
+          "sectors": [
+            "rm.nis2.digital-infrastructure",
+            "rm.nis2.ict-service-management",
+            "rm.nis2.digital-providers"
+          ],
           "legal_force": "binding for listed entity types",
           "accepted_alternatives": [],
           "source_url": "http://data.europa.eu/eli/reg_impl/2024/2690/oj",
           "legal_reference": "Commission Implementing Regulation (EU) 2024/2690, Annex; Article 2 and Recital 4",
           "verified_at": "2026-11-16",
-          "verified_by": "project-red-mesh:workbooks/redmesh-framework-pack (pinned official English source and completeness checks)"
+          "verified_by": "project-red-mesh:workbooks/redmesh-framework-pack (pinned official English source and completeness checks)",
+          "sector_taxonomy": {
+            "id": "redmesh.nis2-sectors",
+            "version": 1
+          },
+          "sector_coverage": "listed",
+          "sector_scope_note": "Article 1 listed provider types only; not every entity in these sectors. Digital infrastructure includes entity types outside this Regulation."
         }
       ]
     },
     {
       "pack_id": "us.nist.csf-2.0",
       "title": "NIST CSF 2.0 — RedMesh profile",
-      "version": 1,
+      "version": 2,
       "status": "active",
       "supersedes": null,
       "derived_from": null,
@@ -152,9 +168,130 @@
           "source_url": "https://doi.org/10.6028/NIST.CSWP.29",
           "legal_reference": "NIST CSWP 29, February 2024",
           "verified_at": "2026-11-16",
-          "verified_by": "project-red-mesh:pinned official OSCAL and final CSWP29"
+          "verified_by": "project-red-mesh:pinned official OSCAL and final CSWP29",
+          "sector_taxonomy": {
+            "id": "redmesh.nis2-sectors",
+            "version": 1
+          },
+          "sector_coverage": "cross_sector",
+          "sector_scope_note": "Voluntary cross-sector framework catalogue, usable beyond these 18 named sectors; mandates may separately apply."
         }
       ]
     }
-  ]
+  ],
+  "sector_taxonomy": {
+    "id": "redmesh.nis2-sectors",
+    "version": 1,
+    "source_url": "https://eur-lex.europa.eu/eli/dir/2022/2555/oj/eng",
+    "sectors": [
+      {
+        "code": "rm.nis2.energy",
+        "label": "Energy",
+        "title": "Energy",
+        "source_location": "I.1"
+      },
+      {
+        "code": "rm.nis2.transport",
+        "label": "Transport",
+        "title": "Transport",
+        "source_location": "I.2"
+      },
+      {
+        "code": "rm.nis2.banking",
+        "label": "Banking",
+        "title": "Banking",
+        "source_location": "I.3"
+      },
+      {
+        "code": "rm.nis2.financial-market-infrastructures",
+        "label": "Financial market infrastructures",
+        "title": "Financial market infrastructures",
+        "source_location": "I.4"
+      },
+      {
+        "code": "rm.nis2.health",
+        "label": "Health",
+        "title": "Health",
+        "source_location": "I.5"
+      },
+      {
+        "code": "rm.nis2.drinking-water",
+        "label": "Drinking water",
+        "title": "Drinking water",
+        "source_location": "I.6"
+      },
+      {
+        "code": "rm.nis2.waste-water",
+        "label": "Waste water",
+        "title": "Waste water",
+        "source_location": "I.7"
+      },
+      {
+        "code": "rm.nis2.digital-infrastructure",
+        "label": "Digital infrastructure",
+        "title": "Digital infrastructure",
+        "source_location": "I.8"
+      },
+      {
+        "code": "rm.nis2.ict-service-management",
+        "label": "ICT service management (B2B)",
+        "title": "ICT service management (business-to-business)",
+        "source_location": "I.9"
+      },
+      {
+        "code": "rm.nis2.public-administration",
+        "label": "Public administration",
+        "title": "Public administration",
+        "source_location": "I.10"
+      },
+      {
+        "code": "rm.nis2.space",
+        "label": "Space",
+        "title": "Space",
+        "source_location": "I.11"
+      },
+      {
+        "code": "rm.nis2.postal-courier",
+        "label": "Postal and courier services",
+        "title": "Postal and courier services",
+        "source_location": "II.1"
+      },
+      {
+        "code": "rm.nis2.waste-management",
+        "label": "Waste management",
+        "title": "Waste management",
+        "source_location": "II.2"
+      },
+      {
+        "code": "rm.nis2.chemicals",
+        "label": "Chemicals",
+        "title": "Manufacture, production and distribution of chemicals",
+        "source_location": "II.3"
+      },
+      {
+        "code": "rm.nis2.food",
+        "label": "Food",
+        "title": "Production, processing and distribution of food",
+        "source_location": "II.4"
+      },
+      {
+        "code": "rm.nis2.manufacturing",
+        "label": "Manufacturing",
+        "title": "Manufacturing",
+        "source_location": "II.5"
+      },
+      {
+        "code": "rm.nis2.digital-providers",
+        "label": "Digital providers",
+        "title": "Digital providers",
+        "source_location": "II.6"
+      },
+      {
+        "code": "rm.nis2.research",
+        "label": "Research",
+        "title": "Research",
+        "source_location": "II.7"
+      }
+    ]
+  }
 }

@@ -17,6 +17,7 @@ when the issuing authority amends the act, and the amendment is appended to `act
 from __future__ import annotations
 
 import json
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -63,7 +64,7 @@ def _read(path: Path) -> dict:
   return data
 
 
-def _validate_manifest_pack(pack: dict) -> None:
+def _validate_manifest_pack(pack: dict, taxonomy: dict) -> None:
   pid = pack.get("pack_id") if isinstance(pack, dict) else None
   if not isinstance(pid, str):
     raise FrameworkPackError(f"manifest pack {pid!r}: bad pack_id")
@@ -95,6 +96,39 @@ def _validate_manifest_pack(pack: dict) -> None:
       raise FrameworkPackError(f"manifest pack {pid}: bad applicability entry (missing {missing}; "
                                "needs a valid country or jurisdiction EU/WORLDWIDE)")
 
+    codes = entry["sectors"]
+    coverage = entry.get("sector_coverage", "unknown")
+    ref = {"id": taxonomy["id"], "version": taxonomy["version"]}
+    supplied_ref = entry.get("sector_taxonomy", ref if coverage == "unknown" else None)
+    if (coverage not in ("listed", "cross_sector", "unknown")
+        or not isinstance(codes, list) or any(not isinstance(c, str) for c in codes)
+        or len(set(codes)) != len(codes) or not set(codes) <= {s["code"] for s in taxonomy["sectors"]}
+        or (bool(codes) != (coverage == "listed"))
+        or not isinstance(supplied_ref, dict) or supplied_ref != ref
+        or type(supplied_ref.get("version")) is not int
+        or not isinstance(entry.get("sector_scope_note", ""), str)
+        or len(entry.get("sector_scope_note", "")) > 1000):
+      raise FrameworkPackError(f"manifest pack {pid}: bad sector coverage")
+    entry.setdefault("sector_coverage", "unknown")
+    entry.setdefault("sector_taxonomy", ref)
+
+
+def _validate_taxonomy(taxonomy):
+  if (not isinstance(taxonomy, dict) or taxonomy.get("id") != "redmesh.nis2-sectors"
+      or type(taxonomy.get("version")) is not int or taxonomy["version"] != 1
+      or not isinstance(taxonomy.get("source_url"), str) or not taxonomy["source_url"].startswith("https://")
+      or not isinstance(taxonomy.get("sectors"), list) or len(taxonomy["sectors"]) != 18):
+    raise FrameworkPackError("framework manifest: bad sector taxonomy")
+  codes = set()
+  for sector in taxonomy["sectors"]:
+    if (not isinstance(sector, dict) or any(not isinstance(sector.get(k), str) or not 0 < len(sector[k]) <= 200
+        for k in ("code", "label", "title", "source_location"))
+        or re.fullmatch(r"rm\.nis2\.[a-z][a-z-]*", sector["code"]) is None
+        or re.fullmatch(r"I\.([1-9]|10|11)|II\.[1-7]", sector["source_location"]) is None
+        or sector["code"] in codes):
+      raise FrameworkPackError("framework manifest: bad sector declaration")
+    codes.add(sector["code"])
+
 
 @lru_cache(maxsize=1)
 def load_manifest() -> dict:
@@ -103,8 +137,9 @@ def load_manifest() -> dict:
   if (data.get("schema") != MANIFEST_SCHEMA or type(data.get("manifest_version")) is not int
       or not isinstance(data.get("packs"), list)):
     raise FrameworkPackError("framework manifest: bad schema, version or packs")
+  _validate_taxonomy(data.get("sector_taxonomy"))
   for pack in data["packs"]:
-    _validate_manifest_pack(pack)
+    _validate_manifest_pack(pack, data["sector_taxonomy"])
   if len({p["pack_id"] for p in data["packs"]}) != len(data["packs"]):
     raise FrameworkPackError("framework manifest: duplicate pack id")
   return data
