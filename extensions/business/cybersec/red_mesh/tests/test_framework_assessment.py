@@ -120,7 +120,7 @@ class FrameworkAssessmentFixture(unittest.TestCase):
     return {key: value for (hkey, key), value in self.storage.data.items() if hkey == COMPLIANCE_HKEY}
 
   def stored_row(self):
-    rows = [value for value in self.compliance_rows().values() if value is not None]
+    rows = [value for value in self.compliance_rows().values() if value is not None and value.get("kind") == compliance.KIND]
     self.assertEqual(len(rows), 1)
     return rows[0]
 

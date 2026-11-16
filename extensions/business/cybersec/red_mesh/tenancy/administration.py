@@ -570,7 +570,8 @@ class TenantAdministrationService:
     # RM-155: `reports:review` also needs the Super-Tenant Admin's designation, read here beside the matrix.
     reviewer = operation == "reports:review" and self._report_reviewer(account)
     decision = authorize_tenant_operation(account, operation, TenantPolicyContext(
-      tenant_id, tenant["active"], tenant["allow_pentester"]), report_reviewer=reviewer)
+      tenant_id, tenant["active"], tenant["allow_pentester"]), report_reviewer=reviewer,
+      compliance_reviewer=self._compliance_reviewer(account) if operation == "compliance_assessments:review" else None)
     if not decision.allowed:
       raise AdministrationDenied(decision.status_code, decision.error)
     return tenant, account
@@ -1584,6 +1585,19 @@ class TenantAdministrationService:
   # `framework_assessment_artifact_ref` resolved it under the lock.
 
   @_endpoint
+  def get_framework_assessment_review(self, actor, tenant_id, pack_id, revision, snapshot, assessment_id="default"):
+    from . import compliance_review
+    return compliance_review.read(self, actor, tenant_id, pack_id, revision, snapshot, assessment_id)
+
+  @_endpoint
+  def mutate_framework_assessment_review(self, actor, tenant_id, pack_id, revision, snapshot, action,
+                                         expected_review_revision, request_id, control_id=None, comment=None,
+                                         assessment_id="default"):
+    from . import compliance_review
+    return compliance_review.mutate(self, actor, tenant_id, pack_id, revision, snapshot, action,
+      expected_review_revision, request_id, control_id, comment, assessment_id)
+
+  @_endpoint
   def get_framework_assessment(self, actor, tenant_id, pack_id, include_pack=True, assessment_id="default"):
     return compliance.get_assessment(self, actor, tenant_id, pack_id, include_pack=include_pack,
                                      assessment_id=assessment_id)
@@ -1709,6 +1723,10 @@ class TenantAdministrationService:
   # it; only a Super-Tenant Admin sets `report_reviewer`. Certificate bytes never pass through
   # these methods: the plugin stores and deletes the files outside this lock.
 
+  def _compliance_reviewer(self, account):
+    row = self._own_profile_row(account)
+    return row.get("compliance_reviewer") if row is not None else None
+
   def _report_reviewer(self, account):
     """Whether the account is designated a report reviewer: false without a row of this
     incarnation of the account (fails closed)."""
@@ -1767,7 +1785,9 @@ class TenantAdministrationService:
   def _profile_dto(self, target, row):
     row = row if row is not None else account_profile.new_row(target.created_at)
     return {"account_id": target.account_id,
-            **account_profile.profile_dto(row, self.clock().date(), self._organization_default(target))}
+            **account_profile.profile_dto(row, self.clock().date(), self._organization_default(target)),
+            "compliance_reviewer": row.get("compliance_reviewer", any(
+              m.role == "super_tenant_admin" for m in target.tenant_memberships))}
 
   def _write_profile(self, target, row, actor_id):
     row = {**row, "updated_by": actor_id, "updated_at": datetime.now(timezone.utc).isoformat()}
@@ -1800,6 +1820,28 @@ class TenantAdministrationService:
     return {"profile": self._profile_dto(target, row),
             "changed": changed, "accountId": caller.account_id, "targetId": target.account_id,
             "dropped": [cert["ref"] for cert in dropped] + leftovers}
+
+  @_endpoint
+  def set_compliance_reviewer(self, actor, account_id=None, enabled=None):
+    """Tick or untick the reviewer designation. A full-portfolio Super-Tenant Admin only, on any
+    account that exists (active or archived); a change is written and reported, a repeat is not."""
+    caller = self._actor(actor, creator=True)
+    target_id = canonical_account_id(account_id)
+    if not target_id or type(enabled) is not bool:
+      raise AdministrationDenied(400, "invalid_request")
+    target = caller if target_id == caller.account_id else self.accounts.get_account(target_id)
+    if target is None or target.state not in (_ACTIVE_STATE, _DEACTIVATED_STATE):
+      raise AdministrationDenied(404, "not_found")
+    row = self._own_profile_row(target)
+    if (row.get("compliance_reviewer") if row is not None else None) is enabled:
+      return {"profile": self._profile_dto(target, row), "changed": False, "accountId": caller.account_id,
+              "targetId": target.account_id, "dropped": []}
+    stale = self._stale_profile(target)
+    row = self._write_profile(target, {**(row or account_profile.new_row(target.created_at)),
+                                       "compliance_reviewer": enabled}, caller.account_id)
+    return {"profile": self._profile_dto(target, row), "changed": True, "accountId": caller.account_id,
+            "targetId": target.account_id,
+            "dropped": account_profile.certificate_refs(stale) if stale is not None else []}
 
   @_endpoint
   def set_report_reviewer(self, actor, account_id=None, enabled=None):

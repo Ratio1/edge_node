@@ -778,12 +778,13 @@
     "name": "Ana Pop",
     "role": "Director"
    },
-   "manifest_version": 1,
+   "manifest_version": null,
+   "missing_historical_provenance": true,
    "pack_acts": [
     "MO 712 bis/2026-08-27",
     "MO 792/2026-09-18 (Ordin 2/2026)"
    ],
-   "pack_hash": "0b9e8c60011be5fbc447f5a89933586db750273f6752771df0fafb94d88e6a62",
+   "pack_hash": null,
    "pack_id": "ro.dnsc.o1-2026",
    "remediation": [
     {

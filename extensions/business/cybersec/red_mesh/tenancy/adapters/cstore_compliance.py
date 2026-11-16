@@ -10,10 +10,11 @@ tenant, engagement and node listings. Same envelope and read-back verification a
 import json
 
 from ..compliance import ASSESSMENT_ID, KIND as ASSESSMENT_KIND, validate_framework_assessment
+from ..compliance_review import KIND as REVIEW_KIND, valid_ids, validate_review
 from ..ports import TenantStoreError
 from .cstore_administration import MAX_ENUMERATED_RECORDS
 
-_KINDS = frozenset({ASSESSMENT_KIND})
+_KINDS = frozenset({ASSESSMENT_KIND, REVIEW_KIND})
 
 
 class CstoreComplianceStore:
@@ -31,9 +32,11 @@ class CstoreComplianceStore:
 
   def _location(self, kind, ids):
     if (not isinstance(self._namespace, str) or not self._namespace.strip()
-        or kind not in _KINDS or len(ids) not in (2, 3)
+        or kind not in _KINDS
+        or (kind == REVIEW_KIND and not valid_ids(ids))
+        or (kind == ASSESSMENT_KIND and len(ids) not in (2, 3))
         or any(not isinstance(value, str) or not value.strip() for value in ids)
-        or (len(ids) == 3 and not ASSESSMENT_ID.match(ids[2]))):
+        or (kind == ASSESSMENT_KIND and len(ids) == 3 and not ASSESSMENT_ID.match(ids[2]))):
       raise TenantStoreError("Invalid compliance storage binding")
     return self.hkey, json.dumps([kind, self._namespace, *ids], separators=(",", ":"))
 
@@ -49,7 +52,7 @@ class CstoreComplianceStore:
         or raw.get("kind") != kind or raw.get("ids") != list(ids)):
       raise TenantStoreError("Invalid compliance storage record")
     try:
-      validate_framework_assessment(raw, ids)
+      (validate_review if kind == REVIEW_KIND else validate_framework_assessment)(raw, ids)
     except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
       raise TenantStoreError("Invalid framework assessment storage record") from exc
     return raw
@@ -135,7 +138,7 @@ class CstoreComplianceStore:
         continue
       try:
         field = json.loads(key)
-        valid = (isinstance(field, list) and len(field) in (4, 5) and field[:3] == [kind, self._namespace, tenant_id]
+        valid = (isinstance(field, list) and len(field) in (4, 5, 6) and field[:3] == [kind, self._namespace, tenant_id]
                  and key == self._location(kind, field[2:])[1])
       except (ValueError, RecursionError, TenantStoreError):
         continue

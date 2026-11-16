@@ -184,7 +184,7 @@ def profile_dto(row, today, organization_default=""):
           "organization": row["organization"] or organization_default,
           "organization_default": organization_default, "contact_email": row["contact_email"],
           "signature": effective_signature(row), "qualifications": qualifications,
-          "report_reviewer": row["report_reviewer"], "profile_complete": bool(row["full_name"]),
+          "report_reviewer": row["report_reviewer"], "compliance_reviewer": row.get("compliance_reviewer"), "profile_complete": bool(row["full_name"]),
           "updated_by": row["updated_by"], "updated_at": row["updated_at"]}
 
 
@@ -232,6 +232,7 @@ def validate_account_profile(row, ids):
       or any(not _same(row.get(key)) for key in TEXT_FIELDS)
       or not _valid_email(row["contact_email"])
       or type(row.get("report_reviewer")) is not bool
+      or ("compliance_reviewer" in row and type(row["compliance_reviewer"]) is not bool)
       or not isinstance(qualifications, list) or len(qualifications) > MAX_QUALIFICATIONS
       or not all(_valid_qualification(q) for q in qualifications)
       or len({q["qualification_id"] for q in qualifications}) != len(qualifications)

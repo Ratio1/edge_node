@@ -139,6 +139,26 @@ class TestDataMaintenance(unittest.TestCase):
             "remediation": [], "state": "draft", "assessment_revision": 1, "reopened_from": None, "pending": None,
             "scores": {}, "submissions": [], "created_by": "initial", "created_at": "t", "updated_by": "initial", "updated_at": "t"}
 
+  def test_review_rows_classify_current_old_orphan_and_inventory_bytes(self):
+    def review(tenant, **extra):
+      return {"schemaVersion": 1, "namespace": "deployment", "kind": "framework_assessment_review",
+        "ids": [tenant, "ro.dnsc.o1-2026", "default", "1"], "tenant_id": tenant,
+        "pack_id": "ro.dnsc.o1-2026", "assessment_id": "default", "submitted_revision": 1,
+        "fingerprint": "a" * 64, "review_revision": 1, "history": [{"actor": "creator", "action": "submit",
+          "time": "2026-11-16T00:00:00Z", "revision": 1, "request_id": str(uuid4()),
+          "control_id": None, "comment": None, "self_approved": False}], **extra}
+    fields = {}
+    for tenant, extra in ((self.tenant, {}), ("tn_gone", {}), ("tn_bad", {"review_revision": 0})):
+      field = json.dumps(["framework_assessment_review", "deployment", tenant, "ro.dnsc.o1-2026", "default", "1"], separators=(",", ":"))
+      fields[tenant] = field
+      self.put(COMPLIANCE, field, review(tenant, **extra))
+    rows = self.scan()
+    for tenant, expected in ((self.tenant, "current"), ("tn_gone", "orphan"), ("tn_bad", "old")):
+      row = rows[(COMPLIANCE, fields[tenant])]
+      self.assertEqual(row["class"], expected)
+      self.assertIn("sha256", row)
+      self.assertGreater(len(json.dumps(row)), 200)
+
   def test_assessment_rows_are_registered_and_classified_by_their_tenant(self):
     field = lambda tenant_id: json.dumps(["framework_assessment", "deployment", tenant_id, "ro.dnsc.o1-2026"], separators=(",", ":"))
     self.put(COMPLIANCE, field(self.tenant), self.assessment_row(self.tenant))

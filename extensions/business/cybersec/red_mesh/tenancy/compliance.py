@@ -390,19 +390,45 @@ def _view_claimant(tenant):
   return {"legal_name": claimant["legal_name"], "registration_id": claimant["registration_id"]}
 
 
+def frozen_context(row, pack):
+  """Whitelist display provenance; never freeze operator verification identities or file paths."""
+  from .compliance_review import CONTEXT_BYTES_MAX
+  manifest = manifest_pack(row["pack_id"])
+  context = {"assessable_ids": [control["ref_id"] for control in
+               (controls_for_level(pack, row["assurance_level"]) if row["assurance_level"] else pack["controls"])],
+    "pack": pack_view(pack, load_framework_text(row["pack_id"]) or {}, row["assurance_level"]),
+    "manifest_version": framework_packs.load_manifest()["manifest_version"],
+    "manifest": {key: manifest[key] for key in ("title", "pack_sha256", "text_sha256", "licence", "version",
+                  "pack_version", "text_version", "exports", "scoring", "pack_schema", "text_schema", "languages") if key in manifest}}
+  context["manifest"]["entries"] = [
+    {key: entry[key] for key in ("country", "jurisdiction", "sectors", "legal_force", "accepted_alternatives",
+                                "source_url", "legal_reference") if key in entry}
+    for entry in manifest.get("entries", [])]
+  if len(json.dumps(context, ensure_ascii=False).encode("utf-8")) > CONTEXT_BYTES_MAX:
+    raise _denied(409, "review_capacity")
+  return context
+
+
 def build_snapshot(row, tenant, computed, pending):
+  context = pending.get("historical_context")
+  entity_fields = context["pack"]["rules"]["entity_fields"] if context else manifest_pack(row["pack_id"])["rules"]["entity_fields"]
   snapshot = {
     "schema": SNAPSHOT_SCHEMA, "artifact_kind": "self_assessment",
     **_draft_fields(row),
-    **{key: row.get(key) or "" for key in manifest_pack(row["pack_id"])["rules"]["entity_fields"]},  # a pack emits only the fields it takes
-    "country": row.get("country"), "manifest_version": framework_packs.load_manifest()["manifest_version"],
-    "pack_hash": manifest_pack(row["pack_id"])["pack_sha256"],
+    **{key: row.get(key) or "" for key in entity_fields},  # a pack emits only the fields it takes
+    "country": row.get("country"), "manifest_version": None, "pack_hash": None,
     "claimant": claimant_for(tenant),
     "computed": computed,
     "submission": {"revision": pending["revision"], "submitted_at": pending["submitted_at"],
                    "actor": pending["actor"], "request_id": pending["request_id"],
                    "fingerprint": pending["intent_digest"], "pack_acts": list(row["pack_acts"])},
   }
+  if "historical_context" in pending:
+    snapshot["historical_context"] = pending["historical_context"]
+    snapshot["manifest_version"] = pending["historical_context"]["manifest_version"]
+    snapshot["pack_hash"] = pending["historical_context"]["manifest"]["pack_sha256"]
+  else:
+    snapshot["missing_historical_provenance"] = True
   envelope = {"kind": SNAPSHOT_ENVELOPE_KIND, "schema_version": SNAPSHOT_ENVELOPE_VERSION,
               "schema": SNAPSHOT_SCHEMA, "tenant_id": row["tenant_id"], "pack_id": row["pack_id"],
               "revision": pending["revision"], "snapshot": snapshot}
@@ -569,6 +595,11 @@ def _row(service, tenant_id, pack_id, assessment_id=DEFAULT_ID):
     raise _denied(404, "assessment_not_found")
   if row is None and assessment_id != DEFAULT_ID:
     raise _denied(404, "assessment_not_found")
+  if row is not None:
+    from .compliance_review import reconcile
+    for sub in row["submissions"]:
+      if sub.get("review_return") is not None:
+        reconcile(service, row, sub)
   return row
 
 
@@ -660,6 +691,8 @@ def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revis
     if sub["request_id"] == request_id:
       if (sub["revision"] == latest_revision(row) and row["state"] == "submitted"
           and sub["fingerprint"] == digest and sub["actor"] == account.account_id):
+        from .compliance_review import reconcile
+        reconcile(service, row, sub)
         return {"outcome": "replayed", "revision": sub["revision"], "verdict": sub["verdict"]}
       raise _denied(409, "conflict")
   pending = row.get("pending")
@@ -669,7 +702,7 @@ def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revis
     # A pending written before the key existed resumes as it always did.
     if "claimant_digest" in pending and pending["claimant_digest"] != claimant_digest(tenant):
       raise _denied(409, "conflict")
-    computed = scorer_for(pack).compute(pack, row["assurance_level"], row["scores"])
+    computed = pending["computed"] if "computed" in pending else scorer_for(pack).compute(pack, row["assurance_level"], row["scores"])
     return {"outcome": "resume", "revision": pending["revision"],
             "assessment_revision": row["assessment_revision"],
             "envelope": build_snapshot(row, tenant, computed, pending)}
@@ -690,7 +723,8 @@ def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revis
     raise _denied(409, "assessment_pack_stale", current_pack_acts=_acts(pack))
   pending = {"request_id": request_id, "actor": account.account_id, "intent_digest": digest,
              "revision": latest_revision(row) + 1, "submitted_at": _now_iso(), "started_at": _epoch(),
-             "claimant_digest": claimant_digest(tenant)}
+             "claimant_digest": claimant_digest(tenant), "historical_context": frozen_context(row, pack),
+             "computed": computed, "verdict": scorer_for(pack).verdict_summary(computed)}
   updated = _stamp({**row, "pending": pending, "assessment_revision": row["assessment_revision"] + 1},
                    account.account_id)
   stored = _put(service, updated)
@@ -730,17 +764,21 @@ def record_submit(service, actor, tenant_id, pack_id, request_id, ref, expected_
   if (pending is None or pending["request_id"] != request_id or pending["actor"] != account.account_id
       or row["assessment_revision"] != expected_assessment_revision or row["state"] != "draft"):
     raise _denied(409, "assessment_submit_superseded")
-  computed = scorer_for(pack).compute(pack, row["assurance_level"], row["scores"])
+  computed = pending["computed"] if "computed" in pending else scorer_for(pack).compute(pack, row["assurance_level"], row["scores"])
   submission = {
     "revision": pending["revision"], "ref": {"store": ref["store"], "ref": ref["ref"]},
     "submitted_at": pending["submitted_at"], "actor": account.account_id,
     "pack_acts": list(row["pack_acts"]), "assurance_level": row["assurance_level"],
     "fingerprint": pending["intent_digest"], "request_id": request_id, "reopen_request_id": None,
-    "verdict": scorer_for(pack).verdict_summary(computed),
+    "verdict": pending["verdict"] if "verdict" in pending else scorer_for(pack).verdict_summary(computed),
   }
+  if "historical_context" in pending:
+    submission["historical_context"] = pending["historical_context"]
   updated = _stamp({**row, "state": "submitted", "pending": None,
                     "submissions": [*row["submissions"], submission]}, account.account_id)
   stored = _put(service, updated)
+  from .compliance_review import reconcile
+  reconcile(service, stored, stored["submissions"][-1])
   return {"revision": submission["revision"], "verdict": submission["verdict"], "replayed": False,
           "assessmentRevision": stored["assessment_revision"], "actor": account.account_id}
 
@@ -825,7 +863,12 @@ def delete_rows(service, tenant_id):
   store = getattr(service, "compliance", None)
   if store is None:
     return 0
-  ids = store.tenant_record_ids(KIND, tenant_id)
-  for record_ids in ids:
-    store.delete(KIND, *record_ids)
-  return len(ids)
+  from .compliance_review import KIND as REVIEW_KIND
+  count = 0
+  for kind in (KIND, REVIEW_KIND):
+    ids = store.tenant_record_ids(kind, tenant_id)
+    for record_ids in ids:
+      store.delete(kind, *record_ids)
+    if kind == KIND:
+      count += len(ids)
+  return count
