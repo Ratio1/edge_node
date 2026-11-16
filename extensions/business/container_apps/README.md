@@ -12,6 +12,7 @@ Container application plugins for running Docker containers with Cloudflare tunn
   - [Local Env Overrides](#local-env-overrides)
   - [Reset](#reset)
   - [Volume Sync](#volume-sync)
+  - [The Node's Docker Store](#the-nodes-docker-store)
 - [Future Enhancements](#future-enhancements)
   - [Continuous Health Monitoring](#continuous-health-monitoring)
   - [Per-Port Health Checks](#per-port-health-checks)
@@ -391,6 +392,63 @@ empty string) disables SYNC on that job with a red log line; there is no fallbac
   consumer stays on the older data until the next publish.
 - **After a secret is corrected.** A record refused under the wrong secret stays quarantined with the usual
   back-off: it can stay held for up to 1920 s (32 minutes), or until the next publish.
+
+### The Node's Docker Store
+
+Container apps run in the node's own Docker daemon, which the base image entrypoint starts. The node images
+install `docker/daemon.json`, so that daemon keeps its store (images, containers, volumes) in
+`/edge_node/_local_cache/_bin/docker/<Docker major>`, on the folder the host mounts into the node. The store
+survives a node restart: an app starts from the stored image without a pull. On a node started without that
+mount the directory is on the node container's own layer and is lost with that container, as before.
+
+The store holds the environment every app was started with, its layers and its logs. It is under `_bin`
+because the disk API of plugin code refuses that folder (the core's `RESTRICTED_LOCATIONS`), as it refused
+`/var/lib/docker`, the place the store had before. Do not move it to a folder plugins can read or delete.
+
+- **First start on such an image:** the store is empty and every app image is pulled once.
+- **AUTOUPDATE:** an app starts from the stored image. The first update check (`AUTOUPDATE_INTERVAL` after
+  the start) compares the registry's image with the one the container runs and restarts the app when the tag
+  moved while the node was down, so such an app starts twice.
+- **Leftover container:** a container with the app's name that an earlier run left is removed before every
+  start. A container removed at that point, at a stop, a restart or an update goes with its anonymous
+  volumes: the volumes Docker creates for a `VOLUME` of the image that no app volume covers. Data an app
+  must keep belongs in a configured app volume. (The clean-up of a deleted deployment removes the container
+  without them; they stay until the next sweep.)
+- **Sweep:** one hour into each node run, one app removes from the store the stopped containers of earlier
+  runs, the anonymous volumes no container holds and every image no container uses. An app without a
+  container at that moment (stopped by hand, waiting for another app) pulls its image at its next start. An
+  image loaded by hand that no container uses at that moment is removed too. The sweep is the first step of
+  every app's lap, whatever state the app is in: apps that cannot start because the store filled the disk
+  still free it, one hour into the node run after a restart. A node without any container app does not
+  sweep and keeps what its last apps left, without adding to it.
+- **Disk:** the images of the apps that have a container, plus what a run adds after its sweep (the previous
+  image of each updated app, images and containers of apps removed since).
+- **Docker major:** the directory is named after the Docker major that writes it, and each image build stops
+  when the base image has another major. The directory name in `docker/daemon.json` and that build check
+  change together; the store of the earlier major is then left on the host until it is removed.
+- **Rollback:** an image without `docker/daemon.json` does not see this store. It pulls every app image
+  into the node container's own layer, as before, while the store stays on the host: for that time the host
+  needs free space for the app images a second time.
+- **A daemon that does not start:** the node images start through `cmds/node_entrypoint`. It runs the base
+  image entrypoint and, when that fails, logs "The inner Docker daemon did not start: removing its kept
+  store.", removes the store directory and stops the container with exit code 1. The next start begins on an
+  empty store, as every start did before the store was kept: nothing has to be removed on the host, and
+  every app image is pulled again once (stopped containers and anonymous volumes in the store go with it).
+  The script cannot tell why the daemon did not start, so any failed start empties the store: a store file
+  dockerd refuses (seen only with a file damaged by hand), but also a node container started without
+  privileges, an iptables fault, a wrong `DOCKERD_READY_TIMEOUT` or a daemon that takes longer than that
+  time (120 s) to answer. A start with `EE_DD=0` starts no daemon and removes nothing. A container started
+  with another entrypoint (`--entrypoint`, `entrypoint:` in a compose file) does not get this recovery.
+- **One node per cache folder:** before it starts the daemon, `cmds/node_entrypoint` locks
+  `_bin/docker/29.lock` (beside the store, not in it), and the node container holds that lock until it ends,
+  also after a kill; nothing has to remove it. A second container of a node image started on the
+  `_local_cache` of a running node, with or without `EE_DD=0`, logs "The kept Docker store is locked by
+  another container on this cache folder, or could not be locked: not starting." and stops with exit code 1:
+  it starts no daemon, removes nothing, and the running node goes on. The same line, after the shell's own
+  error, stops a start when `flock` is missing. To run a command in a running node, use `docker exec`. A
+  container started with another entrypoint takes no lock and removes nothing.
+- **Copying a node's `_local_cache`** to another host: leave `_bin/docker` out; it holds only what can be
+  pulled again.
 
 ---
 

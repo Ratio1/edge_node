@@ -1,0 +1,48 @@
+#!/bin/sh
+###
+### node_entrypoint:
+###   The entrypoint of the node images (the ENTRYPOINT of the node Dockerfiles). It starts the inner Docker
+###   daemon with the unchanged base image entrypoint, then runs the node command as process 1.
+###
+###   The daemon keeps its store (images, containers, volumes) across node restarts. When the daemon does not
+###   start, this script removes that store and stops the container: the next start begins on an empty store, as
+###   every start did before the store was kept, and every app image is pulled once more.
+###
+###   First of all it takes a lock beside the store, which the container then holds until it ends. A second
+###   container started on the cache folder of a running node stops at that lock: it starts no daemon and removes
+###   nothing.
+###
+###   Not an operator command: the container runtime runs it, once, when the node container starts.
+###
+
+# The folder of the stores, which a first start does not find yet. The lock file goes there, beside the store and
+# not in it, so the removal below never takes it away.
+mkdir -p /edge_node/_local_cache/_bin/docker
+# Open the lock file (created empty when missing, never written) on descriptor 9 of this shell. Every process the
+# shell starts inherits that descriptor: the base entrypoint, dockerd and what dockerd starts, and the node command
+# that replaces the shell. A lock belongs to the open file, so it is held for as long as one of them runs, that is,
+# until the container ends, a kill included: nothing has to release or remove it. When the file cannot be opened
+# the shell stops here, non-zero.
+exec 9>>/edge_node/_local_cache/_bin/docker/29.lock
+# Take the lock, exclusive and without waiting. Another container that runs a node on this cache folder holds it,
+# and its daemon is using the store: stop here, non-zero, before a daemon is started and without removing anything.
+# A missing flock or a file system that refuses the lock stops the start in the same way. The lock is taken with
+# EE_DD=0 too: one node container per cache folder, whether it runs a daemon or not.
+flock -n 9 || { echo "The kept Docker store is locked by another container on this cache folder, or could not be locked: not starting." >&2; exit 1; }
+# Start the daemon: the base image entrypoint launches dockerd in the background, waits until it answers and then
+# runs the command it is given. That command is `true`, so the entrypoint returns here and dockerd stays behind as
+# a child of process 1. With EE_DD=0 it starts no daemon, runs `true` and nothing is removed.
+# When that entrypoint fails, say so and remove the kept store: a store dockerd refuses would fail every later
+# start in the same way, until someone removed it on the host. The entrypoint does not report why it failed, so the
+# store goes after ANY failed start (a damaged store file, a container without privileges, iptables, a wrong
+# DOCKERD_READY_TIMEOUT, a daemon that did not answer in time). Only the holder of the lock gets here, so no node
+# container that started through this script is using the store it removes. A container started on this cache
+# folder through another entrypoint takes no lock, and its daemon is not seen here. The directory is the
+# "data-root" of docker/daemon.json; a test keeps the two equal.
+# Exit non-zero, as the base entrypoint did: the container stops, and whoever starts it again (the host's service)
+# starts on an empty store.
+/usr/local/bin/entrypoint.sh true || { echo "The inner Docker daemon did not start: removing its kept store." >&2; rm -rf /edge_node/_local_cache/_bin/docker/29; exit 1; }
+# Run the node command the way the base entrypoint ran it: it replaces this shell, so the node is process 1,
+# receives the stop signal itself and has dockerd as its child, as before. Descriptor 9 stays open in it, and with
+# it the lock.
+exec "$@"

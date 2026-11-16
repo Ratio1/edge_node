@@ -118,6 +118,14 @@ _CONTAINER_LOGS_FILE = "container_logs.pkl"
 # Kept here only so we can migrate content once; do not use for new writes.
 _LEGACY_CONTAINER_APPS_SUBFOLDER = "container_apps"
 
+# Seconds a node runs before the one sweep of its Docker store (`_maybe_sweep_docker_store`): one hour, by which
+# the apps of the run hold their images through their containers.
+_STORE_SWEEP_DELAY = 3600
+
+# Key, in the memory all plugins of a node share, under which the app thread that sweeps the store leaves its marker.
+# State of this module would not do: the node loads the module again for every plugin instance it creates.
+_STORE_SWEEP_KEY = "__docker_store_sweep"
+
 
 class ContainerState(Enum):
   """Container lifecycle states for proper state machine management."""
@@ -2781,6 +2789,22 @@ class ContainerAppRunnerPlugin(
     of its state (running, stopped, created). This is a guardrail for deterministic
     container naming -- it handles crash recovery, incomplete cleanup, and any state
     where self.container is None but a Docker container still exists.
+
+    Returns
+    -------
+    None
+      A failed removal is logged, not raised; the start that follows then fails on the name that is still taken.
+
+    Notes
+    -----
+    The node's Docker store is kept across node restarts, so the container a killed node left is still there at
+    the next start, with the anonymous volumes Docker created for it (one per `VOLUME` of the image that no
+    configured app volume covers). The container is removed together with those volumes: the runner never gives
+    them to a later container, and left behind they would add up, one set per node restart, until the store sweep.
+
+    Examples
+    --------
+    >>> self._ensure_no_stale_container()   # before every `containers.run`; does nothing when the name is free
     """
     try:
       stale = self.docker_client.containers.get(self.container_name)
@@ -2788,7 +2812,9 @@ class ContainerAppRunnerPlugin(
         f"Found stale container '{self.container_name}' "
         f"(id={stale.short_id}, status={stale.status}), removing..."
       )
-      stale.remove(force=True)
+      # Forced, whatever its state, and with its anonymous volumes (v): no later container gets them. Without v,
+      # every node restart left one more set of them in the kept store.
+      stale.remove(force=True, v=True)
       self.P("Stale container removed.")
     except docker.errors.NotFound:
       pass
@@ -2934,6 +2960,14 @@ class ContainerAppRunnerPlugin(
     -----
     If no container exists, logs a warning and returns.
     Clears container and container_id attributes after successful removal.
+    The container is removed with its anonymous volumes (one per `VOLUME` of the image that no configured app
+    volume covers). The next container gets new ones, so the old ones would only fill the node's Docker store,
+    which is kept across node restarts. App volumes are host folders and are not touched.
+
+    Examples
+    --------
+    >>> self.stop_container()   # a running app: stopped within 5 s, removed, `self.container` is None
+    True
     """
     if not self.container:
       self.P("No container to stop", color='r')
@@ -2953,7 +2987,9 @@ class ContainerAppRunnerPlugin(
 
     try:
       self.P(f"Removing container {self.container.short_id}...")
-      self.container.remove()
+      # With its anonymous volumes (v): a later container never gets them, and without v each restart or update of
+      # the app left one more set in the kept store until the next store sweep.
+      self.container.remove(v=True)
       self.P(f"Container {self.container.short_id} removed successfully")
     except Exception as e:
       removed_ok = False
@@ -3999,27 +4035,53 @@ class ContainerAppRunnerPlugin(
 
   def _has_image_hash_changed(self, latest_hash):
     """
-    Check if image hash has changed from current version.
+    Check if the image the registry serves is another one than the app runs.
+
+    The version the app is on (`current_image_hash`) is unknown after every start. The first check of a run takes
+    it from the image the running container was started from, then compares as every later check does.
 
     Parameters
     ----------
-    latest_hash : str
-        Latest image hash from registry
+    latest_hash : str or None
+        Latest image hash from registry; None when the pull that reads it failed
 
     Returns
     -------
     bool
-        True if hash changed and update needed, False otherwise
+        True if hash changed and update needed, False otherwise (also when `latest_hash` is None)
+
+    Raises
+    ------
+    docker.errors.APIError, requests.exceptions.RequestException
+        On the first check of a run only: reading the image of the running container (`self.container.image`) is
+        a request to the Docker daemon, which can refuse it or not answer within the client timeout. The baseline
+        then stays unset and the next check reads it again.
+
+    Notes
+    -----
+    The node's Docker store is kept across node restarts, so an app starts from the stored image without a pull,
+    and its tag may have moved while the node was down. Before, the first check took the image it had just pulled
+    as the version the app is on and never compared it with the running one: such an app kept the old image until
+    the tag moved again. Only the caller runs with a container: `_check_image_updates`, from the monitoring of a
+    running app.
+
+    Examples
+    --------
+    >>> self.current_image_hash is None            # first check; the container runs sha256:aaa...
+    True
+    >>> self._has_image_hash_changed("sha256:bbb...")
+    True
     """
     if not latest_hash:
       # Pull failed, can't determine if update needed
       return False
 
     if not self.current_image_hash:
-      # First time - establish baseline
-      self.P(f"Establishing baseline image hash: {latest_hash}")
-      self.current_image_hash = latest_hash
-      return False
+      # First check of this run: the version the app is on is the image its running container was started from, read
+      # from the store by the same rule as the pulled one (registry digest, else image id). Before, it was the image
+      # just pulled, which is right only when every start pulls.
+      self.current_image_hash = self._get_image_digest(self.container.image)
+      self.P(f"Establishing baseline image hash: {self.current_image_hash}")
 
     # Compare hashes
     return latest_hash != self.current_image_hash
@@ -4775,16 +4837,87 @@ class ContainerAppRunnerPlugin(
     return
 
 
-  def _perform_periodic_monitoring(self):
+  def _maybe_sweep_docker_store(self):
     """
-    Perform periodic monitoring tasks.
+    Remove from the node's Docker store, once per node run, what no app of this run uses.
 
-    Executes image update checks, tunnel health checks,
-    and any subclass-defined additional checks.
+    The node image keeps the store of the node's inner Docker daemon across node restarts (`docker/daemon.json`),
+    so the app images are there at the next start. Before, the store was deleted with the node container at every
+    stop, which also removed everything left behind. This sweep takes over that part, one hour into the node run:
+    the stopped containers an earlier run left (a killed node removes none), the anonymous volumes no container
+    holds, and every image no container uses (the image a moved tag left behind, the image of an app that is no
+    longer on this node). After it the store holds the images of the apps that have a container, plus what this
+    run adds later, as a store did before within one run.
 
     Returns
     -------
     None
+
+    Raises
+    ------
+    docker.errors.APIError
+      When the Docker daemon refuses a request.
+    requests.exceptions.RequestException
+      When the daemon does not answer a request within the client timeout (`ReadTimeout`, 60 s) or cannot be
+      reached. Either error is raised into the plugin loop, which logs it, and the sweep is not tried again in
+      this node run.
+
+    Notes
+    -----
+    `process` calls this first in every lap, in every state of the app, so a node whose apps cannot start still
+    sweeps. All apps of a node share one store, so one sweep serves them all: the first app thread that comes
+    here after the delay does it, on its own Docker client, and leaves a marker in the memory the plugins of a
+    node share.
+    An app that has no container at that moment (stopped by hand, waiting for another app or for its image) loses
+    its stored image and pulls it at its next start, as every app did at every node start before. Only containers
+    created before this node run are removed: a container of this run that has exited stays for inspection.
+    The start of the run is the current time less the node's running time; a node clock set forward by more than
+    the age of a stopped container of this run would make that container count as left by an earlier run.
+    Each request waits for Docker at most the client timeout (60 s); a store too large or a host too slow for
+    that ends the sweep with the `ReadTimeout` above, with what was removed so far removed.
+
+    Examples
+    --------
+    >>> self._maybe_sweep_docker_store()   # does nothing in the first hour of the node run, and nothing after the sweep
+    """
+    if self.get_node_running_time() < _STORE_SWEEP_DELAY:
+      # Too early in the node run: apps are still starting and do not hold their images yet.
+      return
+    # A marker of this call only. `setdefault` stores the first marker of the node run and hands back the stored one,
+    # in one step, so exactly one app thread gets its own back; no lap of any app ever waits.
+    marker = object()
+    if self.plugins_shmem.setdefault(_STORE_SWEEP_KEY, marker) is not marker:
+      # The store was already swept in this node run, by this app or by another.
+      return
+    # When this node run started, in whole seconds: every container an earlier run left is older, none of this run is.
+    run_started = int(self.time() - self.get_node_running_time())
+    # Stopped containers created before this node run: what a killed node left of apps that are gone or not started
+    # yet. They are removed first, because an image or a volume a container holds is in use for Docker.
+    containers = self.docker_client.containers.prune(filters={"until": run_started})
+    # Anonymous volumes no container holds: a container is removed without them, and no later container gets them.
+    volumes = self.docker_client.volumes.prune()
+    # Every image no container uses, tagged ones too ("dangling": False): superseded versions and removed apps.
+    images = self.docker_client.images.prune(filters={"dangling": False})
+    # Bytes the three requests freed, for the one log line of the sweep.
+    freed = containers["SpaceReclaimed"] + volumes["SpaceReclaimed"] + images["SpaceReclaimed"]
+    self.P(f"Docker store swept once for this node run: {freed} bytes freed")
+    return
+
+  def _perform_periodic_monitoring(self):
+    """
+    Perform periodic monitoring tasks.
+
+    Executes image update checks, tunnel health checks, and any subclass-defined additional checks. It is called
+    only while the app's container is running; the sweep of the node's Docker store is not here for that reason
+    (`process` calls it in every lap).
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> self._perform_periodic_monitoring()   # one lap of a running app: update check, tunnels, subclass checks
     """
     current_time = self.time()
 
@@ -4928,6 +5061,7 @@ class ContainerAppRunnerPlugin(
     Main process loop for the plugin.
 
     Called every PROCESS_DELAY seconds. Performs:
+    0. Sweep the node's Docker store when that is due (once per node run, by one app)
     1. Check for paused state (manual stop)
     2. Handle initial launch if container not started
     3. Initialize and start tunnel engine if needed
@@ -4940,11 +5074,26 @@ class ContainerAppRunnerPlugin(
     -------
     None
 
+    Raises
+    ------
+    docker.errors.APIError, requests.exceptions.RequestException
+      From the store sweep, in the one lap of a node run that does it (`_maybe_sweep_docker_store`).
+
     Notes
     -----
     The process loop implements a state machine for container lifecycle
     management with automatic restart based on configured policies.
+
+    Examples
+    --------
+    >>> self.process()   # one lap: sweep when due, then start, watch or restart the app's container
     """
+    # First in every lap, whatever state the app is in: the one sweep of the node's Docker store, when it is due.
+    # The store now survives a node restart, so only this sweep frees it. From the monitoring of a running app,
+    # where the call was before, a node whose apps cannot start (store on a full disk), are stopped by hand or
+    # have no container yet never reached it and kept a full store until its host was cleaned by hand.
+    self._maybe_sweep_docker_store()
+
     # Use state machine instead of deprecated _is_manually_stopped flag
     if self.container_state == ContainerState.PAUSED:
       # Log paused message periodically instead of every process cycle

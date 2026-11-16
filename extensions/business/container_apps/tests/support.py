@@ -178,6 +178,23 @@ class _DummyBasePlugin:
   def time(self):
     return 0
 
+  def get_node_running_time(self):
+    """
+    Seconds since the node started, as the plugin base gives it.
+
+    Returns
+    -------
+    int
+      0: the node has just started, so nothing that waits for a later moment of the node run happens.
+
+    Examples
+    --------
+    >>> _DummyBasePlugin().get_node_running_time()
+    0
+    """
+    # A node that has just started.
+    return 0
+
   def sleep(self, *args, **kwargs):
     return
 
@@ -242,6 +259,24 @@ finally:
 
 
 def make_container_app_runner():
+  """
+  Create a container app runner plugin without a node around it.
+
+  The plugin is built without `__init__`; what the plugin base and the configuration give on a node is
+  set as plain attributes, and log lines are collected in `plugin.logged_messages`.
+
+  Returns
+  -------
+  ContainerAppRunnerPlugin
+    A plugin with a default test configuration, a placeholder container and its own, empty, memory
+    shared between plugins.
+
+  Examples
+  --------
+  >>> plugin = make_container_app_runner()
+  >>> plugin.cfg_image
+  'test/image:latest'
+  """
   plugin = ContainerAppRunnerPlugin.__new__(ContainerAppRunnerPlugin)
   plugin.logged_messages = []
 
@@ -258,6 +293,8 @@ def make_container_app_runner():
   plugin.np = _np
   plugin._stream_id = "test_stream"
   plugin.cfg_instance_id = "car_instance"
+  # The memory all plugins of one node share; a test with several apps of one node gives them the same dict.
+  plugin.plugins_shmem = {}
   plugin.uuid = lambda *a, **k: "efgh"
   plugin.time = lambda: 0
   plugin.cfg_max_log_lines = 10
@@ -348,7 +385,29 @@ def make_mock_container(status="running", exit_code=0):
 
 
 def make_mock_docker_client(container=None):
-  """Create a mock Docker client with all required methods."""
+  """
+  Create a mock Docker client with all required methods.
+
+  The client finds and pulls one image, starts one container from it, and has no container with the
+  runner's name yet.
+
+  Parameters
+  ----------
+  container : MagicMock, optional
+    The container `containers.run` returns; a new one from make_mock_container() when omitted.
+
+  Returns
+  -------
+  tuple
+    `(client, container)`. `container.image` is the image the client finds and pulls, as docker-py
+    gives it for a container that was started from that image.
+
+  Examples
+  --------
+  >>> client, container = make_mock_docker_client()
+  >>> container.image is client.images.pull.return_value
+  True
+  """
   import docker.errors
 
   client = MagicMock()
@@ -367,6 +426,9 @@ def make_mock_docker_client(container=None):
   mock_image.attrs = {"RepoDigests": ["test/image@sha256:abc123"]}
   client.images.get.return_value = mock_image
   client.images.pull.return_value = mock_image
+  # The container was started from that image: docker-py resolves `container.image` to it, and the first update
+  # check of a run reads the app's version from there.
+  container.image = mock_image
   client.login.return_value = {"Status": "Login Succeeded"}
   return client, container
 
