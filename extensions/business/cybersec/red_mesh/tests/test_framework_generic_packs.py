@@ -41,7 +41,7 @@ class GenericPackFixture(FrameworkAssessmentFixture):
     self.seen_rules = []
     stub = SimpleNamespace(
       check_pack=lambda pack, text: None,
-      compute=lambda pack, level, scores: {"scoring": "test_status.v1", "level": level, "verdict": {"passed": None}},
+      compute=lambda pack, level, scores, *, context=None: {"scoring": "test_status.v1", "level": level, "verdict": {"passed": None}},
       validate_for_submit=lambda pack, rules, level, draft: (
         self.seen_rules.append(rules) or [], {"scoring": "test_status.v1", "level": level, "verdict": {"passed": None}}),
       verdict_summary=lambda computed: {"passed": None}, normalise_patch=_status_normalise,

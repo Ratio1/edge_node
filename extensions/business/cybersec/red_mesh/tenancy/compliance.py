@@ -28,6 +28,7 @@ from ..references.framework_packs import (
   load_framework_text,
   manifest_pack,
   EU_MEMBER_STATES,
+  COUNTRY_CODES,
   pack_levels,
   pack_rules,
 )
@@ -40,6 +41,7 @@ from ..services.framework_scoring import (  # noqa: F401 - moved with the entry 
   scorer_for,
   validate_scores,
 )
+from ..services import framework_csf_scoring as csf
 from ..references import framework_packs
 from . import account_profile
 from .ports import TenantStoreError
@@ -193,7 +195,7 @@ def apply_patch(row, patch, pack, *, actor, now):
   if not isinstance(patch, dict):
     raise AssessmentInvalid("invalid_request")
   allowed = {"assurance_level", "level_provenance", "sectoral_requirements", "completion_date",
-             "management_signoff", "remediation", "scores", "name", *REGIME_FIELDS}
+             "management_signoff", "remediation", "scores", "name", "function_tiers", *REGIME_FIELDS}
   unknown = set(patch) - allowed
   if unknown:
     raise AssessmentInvalid("invalid_request", unknown_fields=sorted(unknown))
@@ -202,6 +204,10 @@ def apply_patch(row, patch, pack, *, actor, now):
   if foreign:
     raise AssessmentInvalid("field_not_in_regime", foreign)
   out = dict(row)
+  if "function_tiers" in patch:
+    if pack["scoring"] != csf.SCORING_ID:
+      raise AssessmentInvalid("field_not_in_regime", ["function_tiers"])
+    out["function_tiers"] = csf.normalize_tiers(patch["function_tiers"])
   if "assurance_level" in patch:
     out["assurance_level"] = normalize_level(patch["assurance_level"], pack)
   if "level_provenance" in patch:
@@ -265,13 +271,15 @@ def require_active(pack):
 
 def resolve_country(pack_id, value):
   """The assessment's country label: an ISO 3166-1 alpha-2 code the pack's entries name (an EU entry
-  covers the member states); None resolves to the country of a pack whose entries name exactly one."""
+  covers member states, WORLDWIDE covers valid ISO labels); None resolves to the country of a pack whose entries name exactly one."""
   entries = manifest_pack(pack_id)["entries"]
   named = {e["country"] for e in entries if e["country"]}
   if value is None:
     return next(iter(named)) if len(named) == 1 and not any(e["jurisdiction"] for e in entries) else None
   if (not isinstance(value, str) or not _COUNTRY.match(value)
-      or not (value in named or (value in EU_MEMBER_STATES and any(e["jurisdiction"] == "EU" for e in entries)))):
+      or not (value in named
+              or (value in COUNTRY_CODES and any(e["jurisdiction"] == "WORLDWIDE" for e in entries))
+              or (value in EU_MEMBER_STATES and any(e["jurisdiction"] == "EU" for e in entries)))):
     raise AssessmentInvalid("invalid_request")
   return value
 
@@ -279,6 +287,7 @@ def resolve_country(pack_id, value):
 def new_row(tenant_id, pack, *, actor, now, country=None):
   require_active(pack)
   return {
+    **({"function_tiers": {}} if pack["scoring"] == csf.SCORING_ID else {}),
     "row_format": ROW_FORMAT, "country": resolve_country(pack["pack_id"], country),
     "tenant_id": tenant_id, "pack_id": pack["pack_id"], "pack_acts": _acts(pack),
     "assurance_level": None, "level_provenance": None, "sectoral_requirements": "",
@@ -318,6 +327,18 @@ def validate_framework_assessment(row, ids):
       or not all(isinstance(row.get(key), str) for key in ("created_by", "created_at", "updated_by", "updated_at"))):
     raise ValueError("Invalid framework assessment record")
   pack = load_framework_pack(ids[1])
+  try:
+    resolve_country(ids[1], row.get("country"))
+  except AssessmentInvalid as exc:
+    raise ValueError("Invalid stored country") from exc
+  if pack["scoring"] == csf.SCORING_ID:
+    try:
+      if not isinstance(row.get("function_tiers"), dict) or csf.normalize_tiers(row["function_tiers"]) != row["function_tiers"]:
+        raise ValueError("Invalid stored Function tiers")
+    except AssessmentInvalid as exc:
+      raise ValueError("Invalid stored Function tiers") from exc
+  elif "function_tiers" in row:
+    raise ValueError("Function tiers not in regime")
   for ref_id, entry in row["scores"].items():
     if scorer_for(pack).validate_stored_entry(pack, ref_id, entry):
       raise ValueError("Invalid framework assessment score")
@@ -355,6 +376,8 @@ def _draft_fields(row):
   fields = {key: row.get(key) for key in ("tenant_id", "pack_id", "pack_acts", "assurance_level", "level_provenance",
                                           "sectoral_requirements", "completion_date", "management_signoff",
                                           "remediation", "scores")}
+  if "function_tiers" in row:
+    fields["function_tiers"] = row["function_tiers"]
   # Entity fields, name, assessment id and country join the digest only when set.
   fields.update({key: row[key] for key in ("dnsc_unique_id", "external_supplier", "name", "assessment_id", "country")
                  if row.get(key)})
@@ -527,11 +550,15 @@ def _entity_fields_view(row, pack):
   return {view_key: row.get(field) or "" for field, view_key in _ENTITY_VIEW_KEYS.items() if field in listed}
 
 
+def _compute_context(row):
+  return {"function_tiers": row["function_tiers"]} if "function_tiers" in row else None
+
+
 def assessment_view(row, pack, *, can_manage, text=None, names=_no_names, tenant=None):
   """The DTO. Never a document reference. With `text`, the pack view rides along (reads only)."""
   level = row.get("assurance_level")
   scorer, ready = scorer_for(pack), bool(level) or not pack_levels(pack)  # no level is fine for a tier-less pack only
-  computed = scorer.compute(pack, level, row.get("scores") or {}) if ready else None
+  computed = scorer.compute(pack, level, row.get("scores") or {}, context=_compute_context(row)) if ready else None
   submit_errors = scorer.validate_for_submit(pack, pack_rules(pack), level, row)[0] if ready else [{"code": "level_missing"}]
   return {
     "pack": pack_view(pack, text, level) if text is not None else None,
@@ -547,6 +574,7 @@ def assessment_view(row, pack, *, can_manage, text=None, names=_no_names, tenant
     "state": row["state"], "assessmentRevision": row["assessment_revision"],
     "reopenedFrom": row.get("reopened_from"), "latestRevision": latest_revision(row),
     "pending": _pending_view(row.get("pending"), names),
+    **({"function_tiers": row["function_tiers"]} if "function_tiers" in row else {}),
     "scores": row.get("scores") or {},
     "computed": computed, "submitErrors": submit_errors,
     "history": _history(row, names),
@@ -703,7 +731,7 @@ def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revis
     # A pending written before the key existed resumes as it always did.
     if "claimant_digest" in pending and pending["claimant_digest"] != claimant_digest(tenant):
       raise _denied(409, "conflict")
-    computed = pending["computed"] if "computed" in pending else scorer_for(pack).compute(pack, row["assurance_level"], row["scores"])
+    computed = pending["computed"] if "computed" in pending else scorer_for(pack).compute(pack, row["assurance_level"], row["scores"], context=_compute_context(row))
     return {"outcome": "resume", "revision": pending["revision"],
             "assessment_revision": row["assessment_revision"],
             "envelope": build_snapshot(row, tenant, computed, pending)}
@@ -765,7 +793,7 @@ def record_submit(service, actor, tenant_id, pack_id, request_id, ref, expected_
   if (pending is None or pending["request_id"] != request_id or pending["actor"] != account.account_id
       or row["assessment_revision"] != expected_assessment_revision or row["state"] != "draft"):
     raise _denied(409, "assessment_submit_superseded")
-  computed = pending["computed"] if "computed" in pending else scorer_for(pack).compute(pack, row["assurance_level"], row["scores"])
+  computed = pending["computed"] if "computed" in pending else scorer_for(pack).compute(pack, row["assurance_level"], row["scores"], context=_compute_context(row))
   submission = {
     "revision": pending["revision"], "ref": {"store": ref["store"], "ref": ref["ref"]},
     "submitted_at": pending["submitted_at"], "actor": account.account_id,

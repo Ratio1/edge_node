@@ -60,7 +60,7 @@ def validate_stored_entry(pack, ref_id, entry):
   return []
 
 
-def compute(pack, level, scores):
+def compute(pack, level, scores, *, context=None):
   counts = {key: 0 for key in (*STATUS_VALUES, "unanswered")}
   for control in pack["controls"]:
     value = (scores.get(control["ref_id"]) or {}).get("status")

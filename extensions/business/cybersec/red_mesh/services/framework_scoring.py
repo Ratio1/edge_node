@@ -146,7 +146,7 @@ def validate_scores(pack: dict, level: str, scores: dict, rules: dict | None = N
   return errors
 
 
-def score(pack: dict, level: str, scores: dict) -> dict:
+def score(pack: dict, level: str, scores: dict, *, context=None) -> dict:
   """Compute rollups and the verdict (rules 1, 3, 4) for the scored controls of `level`.
 
   Callers run validate_scores first; this function assumes the exclusion rules hold and treats
@@ -445,3 +445,6 @@ register_scorer(SCORING_ID, SimpleNamespace(
 # Status implementation depends only on shared entry validators, never this registry.
 from . import framework_status_scoring
 register_scorer(framework_status_scoring.SCORING_ID, framework_status_scoring)
+
+from . import framework_csf_scoring
+register_scorer(framework_csf_scoring.SCORING_ID, framework_csf_scoring)

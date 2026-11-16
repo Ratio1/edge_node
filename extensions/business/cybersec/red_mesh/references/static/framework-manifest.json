@@ -1,6 +1,6 @@
 {
   "schema": "redmesh.framework_manifest.v1",
-  "manifest_version": 2,
+  "manifest_version": 3,
   "packs": [
     {
       "pack_id": "ro.dnsc.o1-2026",
@@ -104,6 +104,55 @@
           "legal_reference": "Commission Implementing Regulation (EU) 2024/2690, Annex; Article 2 and Recital 4",
           "verified_at": "2026-11-16",
           "verified_by": "project-red-mesh:workbooks/redmesh-framework-pack (pinned official English source and completeness checks)"
+        }
+      ]
+    },
+    {
+      "pack_id": "us.nist.csf-2.0",
+      "title": "NIST CSF 2.0 — RedMesh profile",
+      "version": 1,
+      "status": "active",
+      "supersedes": null,
+      "derived_from": null,
+      "scoring": "csf_profile.v1",
+      "pack_schema": "redmesh.framework_pack.v1",
+      "text_schema": "redmesh.framework_text.v1",
+      "pack_sha256": "c8649acc218f1cc1ffdc5176c08bca96775112bea9eea54c235da793f4c10e92",
+      "text_sha256": {
+        "en": "9d40c0cf5a3c849c97b41666d65d82f835555f8e3ae3068d23f0017f4a57e71d"
+      },
+      "languages": [
+        "en"
+      ],
+      "licence": {
+        "id": "CC0-1.0",
+        "attribution": "Courtesy of the National Institute of Standards and Technology (NIST), The NIST Cybersecurity Framework (CSF) 2.0, https://doi.org/10.6028/NIST.CSWP.29. Extracted and reformatted from the official OSCAL Core. NIST public-domain text; OSCAL repository CC0. No NIST endorsement implied.",
+        "ship_text": true
+      },
+      "rules": {
+        "justification_required": false,
+        "exclusion_reason_required": true,
+        "remediation_on_fail": false,
+        "signoff_required": false,
+        "entity_fields": [],
+        "level_provenance_kinds": [],
+        "exports": [
+          "json",
+          "csv",
+          "pdf"
+        ]
+      },
+      "entries": [
+        {
+          "country": null,
+          "jurisdiction": "WORLDWIDE",
+          "sectors": [],
+          "legal_force": "voluntary",
+          "accepted_alternatives": [],
+          "source_url": "https://doi.org/10.6028/NIST.CSWP.29",
+          "legal_reference": "NIST CSWP 29, February 2024",
+          "verified_at": "2026-11-16",
+          "verified_by": "project-red-mesh:pinned official OSCAL and final CSWP29"
         }
       ]
     }
