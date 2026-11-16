@@ -89,8 +89,9 @@ class _RequestTrackingMixin(object):
     # Time of the last write of the record. 0 lets the first change be written at the request
     # monitor's next turn, without waiting for an interval.
     self.__rt_last_save_time = 0
-    # The store's word for the last write, which a write the store did not take is compared with before its red line:
-    # None before the first write, so the first refusal is logged.
+    # The store's word for the last write, which the next write compares with: a refused one before its red line, a
+    # stored one before its plain line. None before the first write, so the first refusal is logged and the first
+    # stored write logs nothing.
     self.__rt_last_outcome = None
     if self.__rt_cstore_hkey:
       # A plain list, not a deque(maxlen): _track_request replaces it with a changed copy, so the
@@ -211,7 +212,8 @@ class _RequestTrackingMixin(object):
     oracle confirmed it. The changed flag is cleared before the record is copied, so an answer that the
     plugin thread stamps while the write runs sets it again and is written by the next save. A write the
     store does not take is logged in red with the store's word for it, when that word differs from the
-    word of the write before it (a stored write's word included). Only the three transient words,
+    word of the write before it (a stored write's word included); the first stored write after one the
+    store did not take logs one plain line with the word of the write not taken. Only the three transient words,
     ``not_ready`` (the store has not started or restarts, or another thread held the store's lock for
     more than 1 ms: the write waits at most 1 ms for it), ``error`` (the call raised) and
     ``refused_no_peers`` (this node sees no other oracle online, as while its broker link is down for
@@ -231,10 +233,15 @@ class _RequestTrackingMixin(object):
     busy answers ``not_ready`` at every try while the merge runs. A stored write between two refusals, or
     another word, logs the next refusal again.
 
+    The store does not count a ``not_ready`` write in its CSTORE_STATS line, so the plain line of the first
+    stored write after a refusal (``... was published again after <word>.``) is what tells a trace that went
+    out again from one still unsent. The first write, and a stored write after a stored write, log nothing.
+
     Examples
     --------
     >>> self.__rt_save()   # the chain store has not started: red line, tried again one interval later
     >>> self.__rt_save()   # not_ready again one interval later: tried again, no second red line
+    >>> self.__rt_save()   # stored one interval later: one plain line, published again after not_ready
     >>> self.__rt_save()   # another owner holds the field (refused_readonly): one red line, not tried again
     """
     # Clear the flag before the copy below: clearing it after the write forgot a change made
@@ -272,8 +279,15 @@ class _RequestTrackingMixin(object):
         self.P(f"Request trace {self.__rt_cstore_hkey} was not published ({info['outcome']}); " + (
           f"it is tried again in {self.cfg_requests_save_interval} s." if retry else
           "it is not tried again until the record changes."), color='r')
-    # This write's word, which the next write the store does not take is compared with; a stored write's word
-    # ("changed", "identical") differs from every refusal, so the first refusal after it is logged again.
+    # A stored write right after a write the store did not take (the last word is neither None nor a stored write's
+    # word): one plain line with that word, for the operator who read the red line. Before, nothing followed the red
+    # line, and the store does not count a not_ready write in CSTORE_STATS, so the log read the same whether the
+    # trace went out again or stayed unsent for hours.
+    elif self.__rt_last_outcome not in (None, "changed", "identical"):
+      self.P(f"Request trace {self.__rt_cstore_hkey} was published again after {self.__rt_last_outcome}.")
+    # This write's word, which the next write compares with: a write the store does not take before its red line, a
+    # stored one before its plain line. A stored write's word ("changed", "identical") differs from every refusal,
+    # so the first refusal after it is logged again.
     self.__rt_last_outcome = info["outcome"]
     # Start of the quiet period that REQUESTS_SAVE_INTERVAL enforces before the next write.
     self.__rt_last_save_time = self.time()

@@ -685,25 +685,36 @@ class RequestTrackingTests(unittest.TestCase):
   def test_a_red_line_comes_again_only_when_a_write_ends_with_another_word(self):
     """The red line of a write the store did not take is logged again only when a write ends with another word
     than the write before it: a word that stays logs once, a new word logs, and a failure right after a stored
-    write logs again, so the log still shows each new episode."""
+    write logs again, so the log still shows each new episode. The first stored write after a failure logs one
+    plain line with the last failure's word, so the log shows that the record went out again; the first write
+    and a stored write after a stored write log nothing."""
     # The Deeploy API's trace.
     api = _Api(DEEPLOY_CONFIG)
-    # Per step: the store's word for that step's write (None: stored and queued), and the red lines after it.
-    for word, red in (("not_ready", 1), ("not_ready", 1), ("error", 2), (None, 2), ("error", 3)):
+    # Per step: the store's word for that step's write (None: stored and queued), and the red and the plain lines
+    # after it.
+    steps = ((None, 0, 0), ("not_ready", 1, 0), ("not_ready", 1, 0), ("error", 2, 0), (None, 2, 1), (None, 2, 1),
+             ("error", 3, 1))
+    # One write per step, in this order.
+    for word, red, plain in steps:
       # The store answers the next write with this word.
       api.refusal = word
       # A new request, so the record has a change to write also after a stored write.
       api.receive("create-%d" % len(api.waits), "create_pipeline")
       # The first turn after the interval makes the write.
       api.tick(30)
-      # The red lines so far: none for a word the write before had too, none for a stored write.
-      self.assertEqual(sum(color == "r" for _, color in api.lines), red)
-    # Five writes were made, one per step, so every step above was a write and not a skipped turn.
-    self.assertEqual(len(api.waits), 5)
+      # The red lines so far (none for a word the write before had too, none for a stored write) and the plain
+      # ones (only for the stored write that follows a failure).
+      self.assertEqual((sum(color == "r" for _, color in api.lines), sum(color is None for _, color in api.lines)),
+                       (red, plain))
+    # Seven writes were made, one per step, so every step above was a write and not a skipped turn.
+    self.assertEqual(len(api.waits), 7)
     # The words the red lines name, read from the brackets of each line: the first not_ready, the first error,
-    # and the error that followed the stored write.
+    # and the error that followed the stored writes.
     self.assertEqual([text.split("(")[1].split(")")[0] for text, color in api.lines if color == "r"],
                      ["not_ready", "error", "error"])
+    # The one plain line names the trace and the word of the last write the store did not take before it.
+    self.assertEqual([text for text, color in api.lines if color is None],
+                     ["Request trace DEEPLOY_REQUESTS was published again after error."])
 
   def test_a_write_the_store_refuses_for_good_is_logged_once_and_not_tried_again(self):
     """A write the store refuses by a final word (a field another owner holds) is logged in red once and not tried
