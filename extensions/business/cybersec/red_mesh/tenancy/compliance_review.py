@@ -128,12 +128,14 @@ def _bound(service, actor, tenant_id, pack_id, revision, snapshot, assessment_id
 
 
 def _view(service, tenant, account, row, review, snapshot, replayed=False):
+  names = c.name_resolver(service)
   decisions = [e for e in review["history"] if e["action"] in ("approve", "return")]
   decision = decisions[-1] if decisions else None
   active = (not row.get("archived") and row["state"] == "submitted"
             and c.latest_revision(row) == review["submitted_revision"])
   return {k: copy.deepcopy(review[k]) for k in ("tenant_id", "pack_id", "assessment_id", "submitted_revision",
       "fingerprint", "review_revision", "history")} | {
+    "actor_names": {e["actor"]: names(e["actor"]) for e in review["history"] if names(e["actor"])},
     "status": "internally_approved" if decision and decision["action"] == "approve" else
               "returned_for_changes" if decision else "submitted",
     "self_approved": bool(decision and decision["self_approved"]),

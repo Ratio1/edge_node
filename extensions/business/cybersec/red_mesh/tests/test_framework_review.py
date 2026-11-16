@@ -14,6 +14,26 @@ class TestFrameworkReview(FrameworkAssessmentFixture):
     return self.plugin.mutate_framework_assessment_review(actor or self.creator, self.tenant, PACK, revision,
       action, expected, request or str(uuid4()), control, comment)
 
+  def test_review_projects_authorized_actor_labels_without_profile_contacts(self):
+    self.submitted()
+    self.ok(self.plugin.update_account_profile(self.creator, 'initial', {'full_name': 'Reviewer Name', 'contact_email': 'private@example.com'}))
+    self.ok(self.plugin.set_compliance_reviewer(self.creator, 'initial', True))
+    self.ok(self.mutate('approve', actor=self.admin))
+    view = self.ok(self.review(actor=self.viewer))
+    self.assertEqual(view['actor_names']['initial'], 'Reviewer Name')
+    self.assertEqual(view['history'][-1]['actor'], 'initial')
+    self.assertNotIn('private@example.com', str(view))
+
+  def test_submission_freezes_export_capabilities_from_rules(self):
+    from unittest.mock import patch
+    from ..tenancy import compliance as c
+    self.submitted()
+    context = self.ok(self.review())['historical_context']
+    self.assertIn('eval_mms', context['manifest']['exports'])
+    manifest = {**c.manifest_pack(PACK), 'rules': {**c.manifest_pack(PACK)['rules'], 'exports': ['json']}}
+    with patch.object(c, 'manifest_pack', return_value=manifest):
+      self.assertEqual(self.ok(self.review())['historical_context'], context)
+
   def test_sta_defaults_on_submit_history_and_comment_revision_is_independent(self):
     self.submitted()
     before = self.ok(self.get())['assessmentRevision']

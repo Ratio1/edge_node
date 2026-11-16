@@ -399,7 +399,8 @@ def frozen_context(row, pack):
     "pack": pack_view(pack, load_framework_text(row["pack_id"]) or {}, row["assurance_level"]),
     "manifest_version": framework_packs.load_manifest()["manifest_version"],
     "manifest": {key: manifest[key] for key in ("title", "pack_sha256", "text_sha256", "licence", "version",
-                  "pack_version", "text_version", "exports", "scoring", "pack_schema", "text_schema", "languages") if key in manifest}}
+                  "pack_version", "text_version", "scoring", "pack_schema", "text_schema", "languages") if key in manifest}}
+  context["manifest"]["exports"] = list(manifest["rules"]["exports"])
   context["manifest"]["entries"] = [
     {key: entry[key] for key in ("country", "jurisdiction", "sectors", "legal_force", "accepted_alternatives",
                                 "source_url", "legal_reference") if key in entry}
