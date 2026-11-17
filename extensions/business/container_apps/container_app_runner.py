@@ -4858,8 +4858,8 @@ class ContainerAppRunnerPlugin(
     Raises
     ------
     docker.errors.APIError
-      When the Docker daemon refuses a request, for example the removal of an image that a container started on
-      after the list of containers was taken.
+      When the Docker daemon refuses a request, except the removal of an image in use, which it refuses with 409
+      and the sweep passes over.
     requests.exceptions.RequestException
       When the daemon does not answer a request within the client timeout (`ReadTimeout`, 60 s) or cannot be
       reached. Either error is raised into the plugin loop, which logs it, and the sweep is not tried again in
@@ -4876,10 +4876,12 @@ class ContainerAppRunnerPlugin(
     created before this node run are removed: a container of this run that has exited stays for inspection.
     The start of the run is the current time less the node's running time; a node clock set forward by more than
     the age of a stopped container of this run would make that container count as left by an earlier run.
-    The images are removed one by one, by id and with force, after the containers were listed: Docker refuses
-    the removal of an image a running container uses, but it removes an image that a container created in
-    between and not started yet uses, as force passes over stopped containers. The same short window existed
-    before for an image pulled just before the sweep and not yet used by a container.
+    The images are listed first, then the containers, then each unused image is removed by id and with force. An
+    image pulled after the image list is not looked at. Docker refuses with 409 the removal of an image a running
+    container uses, also of one started after the container list; the sweep keeps such an image and goes on, as
+    Docker's prune did. Force passes over stopped containers, so an image whose container was created after the
+    container list and not started yet is removed: that window runs from the container list to the removal of that
+    image, where Docker's prune, without force, checked each image when it removed it.
     Each request waits for Docker at most the client timeout (60 s); a store too large or a host too slow for
     that ends the sweep with the `ReadTimeout` above, with what was removed so far removed.
 
@@ -4903,23 +4905,38 @@ class ContainerAppRunnerPlugin(
     containers = self.docker_client.containers.prune(filters={"until": run_started})
     # Anonymous volumes no container holds: a container is removed without them, and no later container gets them.
     volumes = self.docker_client.volumes.prune()
+    # Every image of the store, tagged ones too, listed before the containers: an image pulled after this list is not
+    # looked at, and the slow part of the list (one inspect per image) comes before the container list, not between
+    # that list and the removals.
+    images = self.docker_client.images.list()
     # The ids of the images the remaining containers use, running or stopped, in one request (`sparse`: no inspect
     # per container). These images keep every tag: Docker's prune of tagged images deletes each tag of every image and
     # refuses only the last one of an image in use, so an app configured by another tag of it lost its image.
     used = {container.attrs["ImageID"] for container in self.docker_client.containers.list(all=True, sparse=True)}
-    # Every other image, tagged ones too: superseded versions and removed apps.
-    unused = [image for image in self.docker_client.images.list() if image.id not in used]
+    # Every other image: superseded versions and removed apps.
+    unused = [image for image in images if image.id not in used]
+    # The images actually removed, for the log line: an image Docker keeps is not counted.
+    removed = 0
     # Each of them is removed on its own.
     for image in unused:
-      # By id and with force, so it goes with all its tags (without force Docker refuses an image with several);
-      # Docker still refuses an image a running container uses.
-      self.docker_client.images.remove(image.id, force=True)
+      try:
+        # By id and with force, so it goes with all its tags (without force Docker refuses an image with several).
+        self.docker_client.images.remove(image.id, force=True)
+        # One image fewer in the store.
+        removed += 1
+      # Docker refuses with 409 ("conflict"), even with force, an image a running container uses (a container started
+      # on it after the container list) or one another image is built on: it is in use, so it stays and the sweep goes
+      # on with the next image, as Docker's prune of tagged images passed over it.
+      except docker.errors.APIError as error:
+        if error.status_code != 409:
+          # Any other refusal is raised into the plugin loop, as every other Docker error of the sweep.
+          raise
     # Bytes the container and volume requests freed (a removal by id does not report bytes) and the images removed,
     # for the one log line of the sweep.
     freed = containers["SpaceReclaimed"] + volumes["SpaceReclaimed"]
     self.P(
       f"Docker store swept once for this node run: {freed} bytes freed by containers and volumes, "
-      f"{len(unused)} unused images removed"
+      f"{removed} unused images removed"
     )
     return
 

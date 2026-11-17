@@ -27,6 +27,9 @@ from extensions.business.container_apps.tests.support import install_docker_stub
 # Before the runner module is imported below: it imports docker at its top.
 install_docker_stub_if_needed()
 
+# The same docker module the runner sees (docker-py or its stand-in), for the errors the fake store raises.
+import docker
+
 # The plugin base stand-in and the runner wired for lifecycle tests.
 from extensions.business.container_apps.tests.support import install_dummy_base_plugin, make_lifecycle_runner
 # The runner module itself, for its sweep delay and to load it a second time.
@@ -45,8 +48,36 @@ SWEEP_CALLS = ("containers.prune", "volumes.prune", "containers.list", "images.l
 SWEEP_REQUESTS = 7
 
 
-class StoreConflict(Exception):
-  """A request the fake Docker store refuses, where dockerd answers 409 ("conflict")."""
+class StoreConflict(docker.errors.APIError):
+  """
+  A request the fake Docker store refuses, raised as docker-py raises dockerd's answer 409 ("conflict").
+
+  Parameters
+  ----------
+  message : str
+    What dockerd says.
+
+  Examples
+  --------
+  >>> StoreConflict("unable to delete sha256:a - a container is using it").status_code
+  409
+  """
+
+  def __init__(self, message):
+    """
+    Make the error docker-py makes of dockerd's answer 409.
+
+    Parameters
+    ----------
+    message : str
+      What dockerd says.
+
+    Returns
+    -------
+    None
+    """
+    # The answer's status, which `status_code` reads, and the two fields docker-py's text of the error reads.
+    super().__init__(message, response=SimpleNamespace(status_code=409, reason="Conflict", url="/images"))
 
 
 class FakeImageStore:
@@ -105,7 +136,9 @@ class FakeImageStore:
     all : bool
       True: the stopped containers too; False: the running ones only, Docker's default.
     sparse : bool
-      As docker-py takes it; the attributes are those of Docker's list request either way.
+      As docker-py takes it; the fake gives the attributes of Docker's list request, with `ImageID`, either way.
+      docker-py gives those with `sparse` only: without it, it inspects each container, and the inspect
+      attributes name the image under `Image`, not `ImageID`.
 
     Returns
     -------
@@ -501,10 +534,10 @@ class TestDockerStoreSweep(unittest.TestCase):
       call.containers.prune(filters={"until": 999_996_000}),
       # Their anonymous volumes; a volume a container still holds is not touched by Docker.
       call.volumes.prune(),
+      # The images, before the containers: an image pulled after this list is not looked at.
+      call.images.list(),
       # The containers left, running or not, after those that held some images were removed.
       call.containers.list(all=True, sparse=True),
-      # The images.
-      call.images.list(),
       # Every image none of them uses, in the store's order, by id and with force: all its tags go with it. First
       # the version a moved tag left, under two tags.
       call.images.remove("sha256:old", force=True),
@@ -524,6 +557,34 @@ class TestDockerStoreSweep(unittest.TestCase):
     self.at(DELAY)
     # What the store holds afterwards.
     self.assertEqual(self.store.images, {"sha256:app": ["app:1", "app:configured"], "sha256:job": ["job:1"]})
+
+  def test_an_image_a_container_started_on_during_the_sweep_stays_and_the_sweep_goes_on(self):
+    """Docker refuses with 409 the removal of an image a container started on after the container list: the sweep
+    keeps that image with its tags, still removes the other unused images and counts only those in its line."""
+    # The containers as Docker lists them at the sweep: the running app and the exited job.
+    self.client.containers.list = MagicMock(return_value=self.store.list_containers(all=True))
+    # After that list an app starts a container on the version a moved tag left.
+    self.store.containers.append(("sha256:old", True))
+    # The lap that sweeps.
+    self.at(DELAY)
+    # That version stays with both tags; the image of the removed app and the untagged one are gone.
+    self.assertEqual(self.store.images, {"sha256:app": ["app:1", "app:configured"], "sha256:job": ["job:1"],
+                                         "sha256:old": ["old:1", "old:latest"]})
+    # The line counts the two images removed.
+    self.assertEqual(self.plugin.logged_messages.count(
+      "Docker store swept once for this node run: 210 bytes freed by containers and volumes, 2 unused images removed"), 1)
+
+  def test_any_other_refusal_of_an_image_removal_is_raised(self):
+    """A refusal other than 409 is not passed over: it is raised into the plugin loop and ends the sweep there."""
+    # Docker answers the first removal with a server error.
+    self.client.images.remove.side_effect = docker.errors.APIError("server error", response=SimpleNamespace(
+      status_code=500, reason="Internal Server Error", url="/images"))
+    # The error reaches the caller.
+    with self.assertRaises(docker.errors.APIError):
+      # The lap that sweeps.
+      self.at(DELAY)
+    # No removal after the refused one was asked for.
+    self.assertEqual(self.client.images.remove.call_count, 1)
 
   def test_dockers_prune_of_tagged_images_leaves_an_image_in_use_its_last_tag_only(self):
     """What Docker's own prune of tagged images, the sweep's earlier request, does to an image in use (dockerd

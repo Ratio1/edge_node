@@ -11,7 +11,24 @@ import numpy as _np
 
 
 def install_docker_stub_if_needed():
-  """Provide the tiny docker-py surface these unit tests need."""
+  """
+  Provide the tiny docker-py surface these unit tests need.
+
+  Installs stand-in `docker`, `docker.errors` and `docker.types` modules unless all three are already loaded. It
+  looks at the loaded modules only, so a test module imported before anything loaded docker-py runs on the stand-ins
+  even where docker-py is installed: the stand-ins carry what the runner code uses from docker-py.
+
+  Returns
+  -------
+  None
+
+  Examples
+  --------
+  >>> install_docker_stub_if_needed()
+  >>> import docker
+  >>> docker.errors.APIError("refused", response=types.SimpleNamespace(status_code=409)).status_code
+  409
+  """
   if "docker" in sys.modules and "docker.errors" in sys.modules and "docker.types" in sys.modules:
     return
 
@@ -25,12 +42,75 @@ def install_docker_stub_if_needed():
   class NotFound(DockerException):
     pass
 
+  class APIError(DockerException):
+    """
+    docker-py's error for a request the daemon refused, with the HTTP status of its answer.
+
+    Parameters
+    ----------
+    message : str
+      The text of the error.
+    response : object, optional
+      The daemon's answer; its `status_code` is the status. None when there is none.
+    explanation : str, optional
+      What the daemon said.
+
+    Examples
+    --------
+    >>> APIError("refused", response=types.SimpleNamespace(status_code=409)).status_code
+    409
+    """
+
+    def __init__(self, message, response=None, explanation=None):
+      """
+      Keep the answer and the explanation, as docker-py does.
+
+      Parameters
+      ----------
+      message : str
+        The text of the error.
+      response : object, optional
+        The daemon's answer, with `status_code`; None when there is none.
+      explanation : str, optional
+        What the daemon said.
+
+      Returns
+      -------
+      None
+      """
+      # The text, as the exception's argument.
+      super().__init__(message)
+      # The answer that `status_code` reads, as docker-py keeps it.
+      self.response = response
+      # The daemon's own words, as docker-py keeps them.
+      self.explanation = explanation
+
+    @property
+    def status_code(self):
+      """
+      The HTTP status of the daemon's answer, as docker-py gives it.
+
+      Returns
+      -------
+      int or None
+        The status, None without an answer.
+
+      Examples
+      --------
+      >>> APIError("refused").status_code is None
+      True
+      """
+      # docker-py reads the status from the answer and gives None without one.
+      return self.response.status_code if self.response is not None else None
+
   class DeviceRequest:
     def __init__(self, **kwargs):
       self.kwargs = kwargs
 
   errors_mod.DockerException = DockerException
   errors_mod.NotFound = NotFound
+  # The error the runner's store sweep reads the status of.
+  errors_mod.APIError = APIError
   types_mod.DeviceRequest = DeviceRequest
   docker_mod.errors = errors_mod
   docker_mod.types = types_mod
