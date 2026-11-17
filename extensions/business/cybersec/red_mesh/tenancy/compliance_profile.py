@@ -25,17 +25,20 @@ def taxonomy():
   return {"id": data["id"], "version": data["version"]}
 
 
-def normalize_profile(value):
+def normalize_profile(value, *, stored=False):
+  """A declaration against the current manifest (a write). `stored=True` checks shape only, so a
+  data-only manifest update never makes a stored profile unreadable."""
   if not isinstance(value, dict) or set(value) - _FIELDS:
     raise ValueError("Invalid profile fields")
   ref = value.get("sector_taxonomy", taxonomy())
-  if (not isinstance(ref, dict) or ref != taxonomy() or type(ref.get("version")) is not int):
+  if (not isinstance(ref, dict) or (not stored and ref != taxonomy()) or type(ref.get("version")) is not int
+      or not isinstance(ref.get("id"), str) or set(ref) != {"id", "version"}):
     raise ValueError("Invalid sector taxonomy")
   country, sectors = value.get("country"), value.get("sectors")
   codes = {s["code"] for s in load_manifest()["sector_taxonomy"]["sectors"]}
   if (country is not None and (not isinstance(country, str) or country not in COUNTRY_CODES)
       or sectors is not None and (not isinstance(sectors, list)
-        or any(not isinstance(s, str) or s not in codes for s in sectors)
+        or any(not isinstance(s, str) or (not stored and s not in codes) for s in sectors)
         or len(set(sectors)) != len(sectors))
       or value.get("entity_class") not in (None, "essential", "important", "none")
       or value.get("size_band") not in (None, "micro", "small", "medium", "large")):
@@ -64,13 +67,15 @@ def validate_profile(row, ids):
       or not isinstance(row["history"], list) or not 1 <= len(row["history"]) <= MAX_EVENTS
       or row["revision"] != len(row["history"]) or row_bytes(row) > MAX_READ_BYTES):
     raise ValueError("Invalid profile row")
-  previous, requests = normalize_profile({}), set()
+  previous, requests = None, set()
   for revision, event in enumerate(row["history"], 1):
     if not isinstance(event, dict) or set(event) != _EVENT:
       raise ValueError("Invalid profile event")
     request = canonical_uuid(event["request_id"])
-    after = normalize_profile(event["after"])
-    normalize_profile(event["before"])
+    after = normalize_profile(event["after"], stored=True)
+    before = normalize_profile(event["before"], stored=True)
+    if previous is None:  # the first event starts from the empty declaration of its day
+      previous = {**normalize_profile({}), "sector_taxonomy": before["sector_taxonomy"]}
     actor = event["actor"]
     if (not isinstance(actor, str) or not 1 <= len(actor) <= 255
         or type(event["revision"]) is not int or event["revision"] != revision
@@ -82,7 +87,7 @@ def validate_profile(row, ids):
       raise ValueError("Invalid profile event binding")
     requests.add(request)
     previous = after
-  normalize_profile(row["profile"])
+  normalize_profile(row["profile"], stored=True)
   if row["profile"] != previous:
     raise ValueError("Profile does not match history")
 

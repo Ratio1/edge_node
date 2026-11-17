@@ -307,6 +307,15 @@ def _levels_of(pack_id):
   return pack_levels(load_framework_pack(pack_id))
 
 
+def _canonical_tiers(tiers):
+  if not isinstance(tiers, dict):
+    return False
+  try:
+    return csf.normalize_tiers(tiers) == tiers
+  except AssessmentInvalid:
+    return False
+
+
 def validate_framework_assessment(row, ids):
   """Refuse a stored row the operations could not have written. Unknown fields are kept."""
   if (not isinstance(row, dict) or len(ids) not in (2, 3) or row.get("tenant_id") != ids[0]
@@ -327,16 +336,11 @@ def validate_framework_assessment(row, ids):
       or not all(isinstance(row.get(key), str) for key in ("created_by", "created_at", "updated_by", "updated_at"))):
     raise ValueError("Invalid framework assessment record")
   pack = load_framework_pack(ids[1])
-  try:
-    resolve_country(ids[1], row.get("country"))
-  except AssessmentInvalid as exc:
-    raise ValueError("Invalid stored country") from exc
+  if row.get("country") is not None and row["country"] not in COUNTRY_CODES:  # shape only: `resolve_country` runs on create
+    raise ValueError("Invalid stored country")
   if pack["scoring"] == csf.SCORING_ID:
-    try:
-      if not isinstance(row.get("function_tiers"), dict) or csf.normalize_tiers(row["function_tiers"]) != row["function_tiers"]:
-        raise ValueError("Invalid stored Function tiers")
-    except AssessmentInvalid as exc:
-      raise ValueError("Invalid stored Function tiers") from exc
+    if not _canonical_tiers(row.get("function_tiers")):
+      raise ValueError("Invalid stored Function tiers")
   elif "function_tiers" in row:
     raise ValueError("Function tiers not in regime")
   for ref_id, entry in row["scores"].items():
@@ -348,7 +352,11 @@ def validate_framework_assessment(row, ids):
         or not _valid_ref(sub.get("ref")) or not isinstance(sub.get("request_id"), str)
         or not isinstance(sub.get("fingerprint"), str) or not isinstance(sub.get("verdict"), dict)
         or not isinstance(sub.get("actor"), str) or not isinstance(sub.get("submitted_at"), str)
-        or not isinstance(sub.get("pack_acts"), list) or sub.get("assurance_level") not in (_levels_of(ids[1]) or (None,))):
+        or not isinstance(sub.get("pack_acts"), list) or sub.get("assurance_level") not in (_levels_of(ids[1]) or (None,))
+        or ("context_sha256" in sub) != ("assessable_ids" in sub)
+        or ("context_sha256" in sub and (not _SHA256_HEX.fullmatch(sub["context_sha256"] if isinstance(sub["context_sha256"], str) else "")
+                                         or not isinstance(sub["assessable_ids"], list)
+                                         or not all(isinstance(ref_id, str) for ref_id in sub["assessable_ids"])))):
       raise ValueError("Invalid framework assessment submission")
     revisions.append(sub["revision"])
   if revisions != list(range(1, len(revisions) + 1)):
@@ -388,6 +396,12 @@ def intent_digest(row):
   """Binds the stored draft, which is frozen while a submit is pending, plus the row format."""
   blob = json.dumps({**_draft_fields(row), "row_format": row.get("row_format")}, sort_keys=True,
                     separators=(",", ":"), ensure_ascii=False)
+  return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def context_digest(context):
+  """Digest of a frozen context: the assessment row keeps this, the snapshot document keeps the context."""
+  blob = json.dumps(context, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
   return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
@@ -618,17 +632,13 @@ def read_row(store, ids):
 
 def _row(service, tenant_id, pack_id, assessment_id=DEFAULT_ID):
   """The stored row; None only for the default (lazy first save). A missing `fa_*` row, and a row the
-  validator refuses (unavailable in the list), is a 404."""
+  validator refuses (unavailable in the list), is a 404. Never repairs a review row: only the review
+  and the submit and return paths do."""
   row, reason = read_row(_store(service), _ids(tenant_id, pack_id, assessment_id))
   if reason:
     raise _denied(404, "assessment_not_found")
   if row is None and assessment_id != DEFAULT_ID:
     raise _denied(404, "assessment_not_found")
-  if row is not None:
-    from .compliance_review import reconcile
-    for sub in row["submissions"]:
-      if sub.get("review_return") is not None:
-        reconcile(service, row, sub)
   return row
 
 
@@ -803,7 +813,9 @@ def record_submit(service, actor, tenant_id, pack_id, request_id, ref, expected_
     "verdict": pending["verdict"] if "verdict" in pending else scorer_for(pack).verdict_summary(computed),
   }
   if "historical_context" in pending:
-    submission["historical_context"] = pending["historical_context"]
+    context = pending["historical_context"]  # the full context rides in the snapshot document, never in the row
+    submission["context_sha256"] = context_digest(context)
+    submission["assessable_ids"] = list(context["assessable_ids"])
   updated = _stamp({**row, "state": "submitted", "pending": None,
                     "submissions": [*row["submissions"], submission]}, account.account_id)
   stored = _put(service, updated)

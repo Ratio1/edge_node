@@ -39,7 +39,7 @@ class TestFrameworkSectors(unittest.TestCase):
           packs.load_manifest()
 
   def test_malformed_taxonomy_and_duplicate_listed_codes_refused(self):
-    for update in (lambda t: t.update(version=True), lambda t: t["sectors"].pop(),
+    for update in (lambda t: t.update(version=True), lambda t: t["sectors"].clear(),
                    lambda t: t["sectors"][0].update(label=""),
                    lambda t: t["sectors"][0].update(code="official-code"),
                    lambda t: t["sectors"][1].update(code=t["sectors"][0]["code"])):

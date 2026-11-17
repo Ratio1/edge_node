@@ -184,7 +184,7 @@ def profile_dto(row, today, organization_default=""):
           "organization": row["organization"] or organization_default,
           "organization_default": organization_default, "contact_email": row["contact_email"],
           "signature": effective_signature(row), "qualifications": qualifications,
-          "report_reviewer": row["report_reviewer"], "compliance_reviewer": row.get("compliance_reviewer"), "profile_complete": bool(row["full_name"]),
+          "report_reviewer": row["report_reviewer"], "profile_complete": bool(row["full_name"]),
           "updated_by": row["updated_by"], "updated_at": row["updated_at"]}
 
 

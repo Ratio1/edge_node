@@ -115,9 +115,9 @@ def _validate_manifest_pack(pack: dict, taxonomy: dict) -> None:
 
 def _validate_taxonomy(taxonomy):
   if (not isinstance(taxonomy, dict) or taxonomy.get("id") != "redmesh.nis2-sectors"
-      or type(taxonomy.get("version")) is not int or taxonomy["version"] != 1
+      or type(taxonomy.get("version")) is not int
       or not isinstance(taxonomy.get("source_url"), str) or not taxonomy["source_url"].startswith("https://")
-      or not isinstance(taxonomy.get("sectors"), list) or len(taxonomy["sectors"]) != 18):
+      or not isinstance(taxonomy.get("sectors"), list) or not taxonomy["sectors"]):
     raise FrameworkPackError("framework manifest: bad sector taxonomy")
   codes = set()
   for sector in taxonomy["sectors"]:

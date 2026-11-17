@@ -42,7 +42,7 @@ CONTROL_SIGNALS = {
 }
 
 PACK_STRATEGIES = {
-  "ro.dnsc.o1-2026": {"strategy": "prefix", "authoritative": True,
+  "ro.dnsc.o1-2026": {"authoritative": True,
                        "overrides": CONTROL_SIGNALS["ro.dnsc.o1-2026"], "presentation": "legacy"},
   "us.nist.csf-2.0": {"strategy": "identity", "presentation": "candidate"},
 }
@@ -58,13 +58,12 @@ CANDIDATE_SUMMARIES = {
 def resolve(pack_id, controls):
   """Translate only selected controls; unknown packs deliberately have no inherited mapping."""
   config = PACK_STRATEGIES.get(pack_id, {})
-  strategy = config.get("strategy")
+  identity = config.get("strategy") == "identity"
   overrides = config.get("overrides", {})
   out = {}
   for control in controls:
     ref = control["ref_id"]
-    base = ref if strategy == "identity" else ref.rsplit(".", 1)[0] if strategy == "prefix" else config.get("mapping", {}).get(ref)
-    kind = overrides.get(ref) if config.get("authoritative") or ref in overrides else BASE_SIGNALS.get(base)
+    kind = overrides.get(ref) if config.get("authoritative") or ref in overrides else BASE_SIGNALS.get(ref) if identity else None
     if kind:
       out[ref] = kind
   return out

@@ -64,6 +64,30 @@ class TestComplianceProfile(FrameworkAssessmentFixture):
         self.refused(self.write(profile), 400, "profile_invalid")
     self.assertEqual(self.ok(self.read())["revision"], 0)
 
+  def test_stored_profile_reads_after_a_manifest_data_update_but_a_stale_save_is_refused(self):
+    from extensions.business.cybersec.red_mesh.tenancy import compliance_profile as cp
+    saved = self.ok(self.write({"country": "RO", "sectors": ["rm.nis2.energy", "rm.nis2.health"]}))
+    manifest = copy.deepcopy(cp.load_manifest())
+    manifest["sector_taxonomy"]["version"] += 1
+    manifest["sector_taxonomy"]["sectors"] = [s for s in manifest["sector_taxonomy"]["sectors"]
+                                              if s["code"] != "rm.nis2.energy"]
+    with patch.object(cp, "load_manifest", return_value=manifest):
+      self.assertEqual(self.ok(self.read())["profile"], saved["profile"])  # shape only on read
+      self.refused(self.write({"sectors": ["rm.nis2.energy"]}, 1), 400, "profile_invalid")
+      self.refused(self.write({"sectors": ["rm.nis2.health"], "sector_taxonomy": saved["profile"]["sector_taxonomy"]}, 1),
+                   400, "profile_invalid")
+      current = {"id": manifest["sector_taxonomy"]["id"], "version": manifest["sector_taxonomy"]["version"]}
+      self.assertEqual(self.ok(self.write({"sectors": ["rm.nis2.health"], "sector_taxonomy": current}, 1))["revision"], 2)
+      self.assertEqual(self.ok(self.read())["profile"]["sector_taxonomy"], current)
+
+  def test_stored_assessment_reads_after_its_country_entry_leaves_the_manifest(self):
+    from extensions.business.cybersec.red_mesh.tenancy import compliance
+    self.ok(self.save({}, 1))
+    self.assertEqual(self.stored_row()["country"], "RO")
+    manifest = {**compliance.manifest_pack(self.pack["pack_id"]), "entries": []}
+    with patch.object(compliance, "manifest_pack", return_value=manifest):
+      self.assertTrue(self.ok(self.get())["persisted"])  # was 404 once the entry no longer named RO
+
   def test_actual_persistence_virtual_and_stored_default(self):
     self.assertFalse(self.ok(self.get())["persisted"])
     from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_compliance import CstoreComplianceStore

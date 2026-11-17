@@ -15,8 +15,7 @@ KIND = "framework_assessment_review"
 REVIEW = "compliance_assessments:review"
 COMMENT_MAX = 2000
 EVENT_MAX = 500
-ROW_BYTES_MAX = 2 * 1024 * 1024  # historical read/validation ceiling
-ROW_WRITE_BYTES_MAX = 512 * 1024  # transport-safe admission; retain 1 KiB mutation reserve
+ROW_BYTES_MAX = 512 * 1024  # one cap, transport-safe; a write keeps a 1 KiB mutation reserve
 CONTEXT_BYTES_MAX = 1024 * 1024
 _REVISION = re.compile(r"[1-9][0-9]*\Z")
 _ACTIONS = {"submit", "comment", "approve", "return"}
@@ -77,7 +76,7 @@ def event(sub, action, actor, request_id, *, control_id=None, comment=None, time
 
 def _append(review, entry):
   updated = {**review, "history": [*review["history"], entry], "review_revision": review["review_revision"] + 1}
-  if len(updated["history"]) > EVENT_MAX or _size(updated) > ROW_WRITE_BYTES_MAX - 1024:
+  if len(updated["history"]) > EVENT_MAX or _size(updated) > ROW_BYTES_MAX - 1024:
     raise c._denied(409, "review_capacity")
   return updated
 
@@ -122,8 +121,8 @@ def _bound(service, actor, tenant_id, pack_id, revision, snapshot, assessment_id
       or snapshot["submission"].get("revision") != revision
       or snapshot["submission"].get("fingerprint") != sub["fingerprint"]):
     raise c._denied(409, "document_integrity")
-  context = snapshot.get("historical_context")
-  if context != sub.get("historical_context"):
+  context = snapshot.get("historical_context")  # the row keeps its digest; the snapshot document keeps the context
+  if (c.context_digest(context) if context is not None else None) != sub.get("context_sha256"):
     raise c._denied(409, "document_integrity")
   return tenant, account, row, sub, reconcile(service, row, sub)
 
@@ -166,8 +165,7 @@ def mutate(service, actor, tenant_id, pack_id, revision, snapshot, action, expec
       comment.encode("utf-8")
     except (c.AssessmentInvalid, UnicodeEncodeError):
       raise c._denied(400, "invalid_request") from None
-    context = snapshot.get("historical_context") or {}
-    if not isinstance(control_id, str) or control_id not in context.get("assessable_ids", []):
+    if not isinstance(control_id, str) or control_id not in sub.get("assessable_ids", []):
       raise c._denied(400, "review_control_invalid")
   elif control_id is not None or comment is not None:
     raise c._denied(400, "invalid_request")

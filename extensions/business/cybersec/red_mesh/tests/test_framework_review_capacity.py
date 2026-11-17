@@ -1,4 +1,4 @@
-"""Review transport admission preserves larger historical rows and durable receipts."""
+"""Review transport admission: one row cap, durable receipts."""
 import copy
 from uuid import uuid4
 from ..tenancy import compliance_review as r
@@ -39,14 +39,13 @@ class TestReviewTransportAdmission(FrameworkAssessmentFixture):
                 if isinstance(value, dict) and value.get('kind') == r.KIND)
 
   def test_exact_write_boundary_and_one_byte_over(self):
-    self.assertEqual(r.ROW_WRITE_BYTES_MAX, 512*1024)
-    self.assertEqual(r.ROW_BYTES_MAX, 2*1024*1024)
+    self.assertEqual(r.ROW_BYTES_MAX, 512*1024)
     self.submitted()
     original = self.storage.data[self.review_key()]
     entry = r.event({'revision':1,'actor':'initial'}, 'approve', 'creator', str(uuid4()))
     overhead = r._size({**original,'history':[*original['history'],entry],
                         'review_revision':original['review_revision']+1}) - r._size(original)
-    boundary = r.ROW_WRITE_BYTES_MAX - 1024
+    boundary = r.ROW_BYTES_MAX - 1024
     row = sized_history(original,boundary-overhead)
     accepted = r._append(row,entry)
     self.assertEqual(r._size(accepted),boundary)
@@ -54,7 +53,7 @@ class TestReviewTransportAdmission(FrameworkAssessmentFixture):
       r._append(sized_history(original,boundary-overhead+1),entry)
     self.assertEqual(raised.exception.error,'review_capacity')
 
-  def test_larger_old_row_reads_replays_and_refuses_all_new_mutations_without_writes(self):
+  def test_row_at_cap_reads_replays_and_refuses_all_new_mutations_without_writes(self):
     self.submitted()
     request = str(uuid4())
     control = next(iter(self.basic_scores()))
@@ -72,27 +71,37 @@ class TestReviewTransportAdmission(FrameworkAssessmentFixture):
       self.assertEqual(self.storage.data,before)
       self.assertEqual(len(self.storage.writes),writes)
 
-  def test_old_oversized_pending_return_preserves_receipt_and_refuses_repair_without_writes(self):
-    from unittest.mock import patch
+  def test_dnsc_row_with_fifty_submissions_stays_far_under_the_sender_guard(self):
+    import json
+    from ..tenancy import compliance as c
+    revision = self.complete_basic_draft()
+    for _ in range(c.MAX_SUBMISSIONS):
+      revision = self.ok(self.submit(revision, str(uuid4())))['assessmentRevision']
+      if len(self.stored_row()['submissions']) < c.MAX_SUBMISSIONS:
+        revision = self.ok(self.reopen(revision, str(uuid4())))['assessmentRevision']
+        revision = self.ok(self.save({'completion_date': '2026-10-06', 'management_signoff': {
+          'name': 'Ana Pop', 'role': 'Director', 'date': '2026-10-06'}}, revision))['assessmentRevision']
+    row = self.stored_row()
+    self.assertEqual(len(row['submissions']), c.MAX_SUBMISSIONS)
+    self.assertTrue(all('historical_context' not in sub and len(sub['context_sha256']) == 64 for sub in row['submissions']))
+    size = len(json.dumps(row, ensure_ascii=False).encode('utf-8'))
+    self.assertLess(size, 512 * 1024)
+
+  def test_assessment_get_never_reads_or_repairs_a_review_row(self):
     self.submitted()
-    key = self.review_key()
-    self.storage.data[key] = sized_history(self.storage.data[key], r.ROW_WRITE_BYTES_MAX + 4096)
     request = str(uuid4())
-    # Old software wrote assessment receipt, then failed writing its review event.
-    with patch.object(r,'ROW_WRITE_BYTES_MAX',r.ROW_BYTES_MAX):
-      self.storage.fail_write = len(self.storage.writes) + 2
-      self.refused(self.mutate('return',expected=self.storage.data[key]['review_revision'],request=request),503,'unavailable')
+    self.storage.fail_write = len(self.storage.writes) + 2
+    self.refused(self.mutate('return',request=request),503,'unavailable')
     self.storage.fail_write = None
-    receipt = copy.deepcopy(self.stored_row()['submissions'][0]['review_return'])
-    self.assertEqual(receipt['request_id'],request)
+    key = self.review_key()
+    self.storage.data[key]['oversized'] = 'x' * r.ROW_BYTES_MAX  # a review row the validator refuses
     before = copy.deepcopy(self.storage.data)
     writes = len(self.storage.writes)
     self.restart()
-    self.refused(self.get(),409,'review_capacity')
+    self.assertEqual(self.get()['success'],True)  # was 409 review_capacity
     self.assertEqual(self.storage.data,before)
     self.assertEqual(len(self.storage.writes),writes)
-    self.assertEqual(self.stored_row()['submissions'][0]['review_return'],receipt)
-    r.validate_review(self.storage.data[key],self.storage.data[key]['ids'])
+    self.refused(self.review(),503,'unavailable')
 
   def test_new_return_receipt_repairs_under_write_budget(self):
     self.submitted()

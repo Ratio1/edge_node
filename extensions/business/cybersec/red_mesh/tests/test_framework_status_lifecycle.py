@@ -71,7 +71,10 @@ class TestStatusLifecycle(StatusLifecycleFixture):
     self.documents.fail=False
     done=self.ok(self.submit_status(aid,saved['assessmentRevision'],request))
     self.assertIsNone(done['verdict']['passed'])
-    self.assertEqual(self.stored_row()['submissions'][0]['historical_context'],frozen)
+    submission=self.stored_row()['submissions'][0]
+    self.assertNotIn('historical_context',submission)
+    self.assertEqual(submission['context_sha256'],compliance.context_digest(frozen))
+    self.assertEqual(submission['assessable_ids'],frozen['assessable_ids'])
     review=self.ok(self.plugin.get_framework_assessment_review(self.creator,self.tenant,PACK,1,aid))
     self.assertEqual(review['historical_context'],frozen)
     reviewed=self.ok(self.plugin.mutate_framework_assessment_review(self.creator,self.tenant,PACK,1,'comment',1,str(uuid4()),refs[0],'Checked',aid))

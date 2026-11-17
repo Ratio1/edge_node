@@ -1796,8 +1796,8 @@ class TenantAdministrationService:
     row = row if row is not None else account_profile.new_row(target.created_at)
     return {"account_id": target.account_id,
             **account_profile.profile_dto(row, self.clock().date(), self._organization_default(target)),
-            "compliance_reviewer": row.get("compliance_reviewer", any(
-              m.role == "super_tenant_admin" for m in target.tenant_memberships))}
+            # the stored designation, else what policy defaults to: a deployment-wide Super-Tenant Admin
+            "compliance_reviewer": row.get("compliance_reviewer", holds_platform_role(target))}
 
   def _write_profile(self, target, row, actor_id):
     row = {**row, "updated_by": actor_id, "updated_at": datetime.now(timezone.utc).isoformat()}
@@ -1831,9 +1831,8 @@ class TenantAdministrationService:
             "changed": changed, "accountId": caller.account_id, "targetId": target.account_id,
             "dropped": [cert["ref"] for cert in dropped] + leftovers}
 
-  @_endpoint
-  def set_compliance_reviewer(self, actor, account_id=None, enabled=None):
-    """Tick or untick the reviewer designation. A full-portfolio Super-Tenant Admin only, on any
+  def _set_reviewer(self, actor, account_id, enabled, field):
+    """Tick or untick a reviewer designation (`field`). A full-portfolio Super-Tenant Admin only, on any
     account that exists (active or archived); a change is written and reported, a repeat is not."""
     caller = self._actor(actor, creator=True)
     target_id = canonical_account_id(account_id)
@@ -1843,37 +1842,23 @@ class TenantAdministrationService:
     if target is None or target.state not in (_ACTIVE_STATE, _DEACTIVATED_STATE):
       raise AdministrationDenied(404, "not_found")
     row = self._own_profile_row(target)
-    if (row.get("compliance_reviewer") if row is not None else None) is enabled:
+    if (row or account_profile.new_row(target.created_at)).get(field) is enabled:
       return {"profile": self._profile_dto(target, row), "changed": False, "accountId": caller.account_id,
               "targetId": target.account_id, "dropped": []}
     stale = self._stale_profile(target)
     row = self._write_profile(target, {**(row or account_profile.new_row(target.created_at)),
-                                       "compliance_reviewer": enabled}, caller.account_id)
+                                       field: enabled}, caller.account_id)
     return {"profile": self._profile_dto(target, row), "changed": True, "accountId": caller.account_id,
             "targetId": target.account_id,
             "dropped": account_profile.certificate_refs(stale) if stale is not None else []}
 
   @_endpoint
+  def set_compliance_reviewer(self, actor, account_id=None, enabled=None):
+    return self._set_reviewer(actor, account_id, enabled, "compliance_reviewer")
+
+  @_endpoint
   def set_report_reviewer(self, actor, account_id=None, enabled=None):
-    """Tick or untick the reviewer designation. A full-portfolio Super-Tenant Admin only, on any
-    account that exists (active or archived); a change is written and reported, a repeat is not."""
-    caller = self._actor(actor, creator=True)
-    target_id = canonical_account_id(account_id)
-    if not target_id or type(enabled) is not bool:
-      raise AdministrationDenied(400, "invalid_request")
-    target = caller if target_id == caller.account_id else self.accounts.get_account(target_id)
-    if target is None or target.state not in (_ACTIVE_STATE, _DEACTIVATED_STATE):
-      raise AdministrationDenied(404, "not_found")
-    row = self._own_profile_row(target)
-    if (row["report_reviewer"] if row is not None else False) is enabled:
-      return {"profile": self._profile_dto(target, row), "changed": False, "accountId": caller.account_id,
-              "targetId": target.account_id, "dropped": []}
-    stale = self._stale_profile(target)
-    row = self._write_profile(target, {**(row or account_profile.new_row(target.created_at)),
-                                       "report_reviewer": enabled}, caller.account_id)
-    return {"profile": self._profile_dto(target, row), "changed": True, "accountId": caller.account_id,
-            "targetId": target.account_id,
-            "dropped": account_profile.certificate_refs(stale) if stale is not None else []}
+    return self._set_reviewer(actor, account_id, enabled, "report_reviewer")
 
   def _qualification_row(self, target, qualification_id):
     row = self._own_profile_row(target)

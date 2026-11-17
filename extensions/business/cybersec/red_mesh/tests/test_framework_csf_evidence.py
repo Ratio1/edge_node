@@ -33,9 +33,11 @@ class TestCsfEvidence(FrameworkAssessmentFixture):
     from ..services.framework_evidence_mapping import resolve, PACK_STRATEGIES
     selected = [{'ref_id': 'ID.RA-01'}, {'ref_id': 'GV.OC-01'}]
     self.assertEqual(evidence.mapped_controls(CSF, selected), {'ID.RA-01': 'vulnerability_management'})
-    for strategy, controls in [('prefix', [{'ref_id': 'ID.RA-01.7'}]), ('mapping', [{'ref_id': 'LOCAL'}])]:
+    with patch.dict(PACK_STRATEGIES, {'test': {'strategy': 'identity'}}):
+      self.assertEqual(list(resolve('test', [{'ref_id': 'ID.RA-01'}]).values()), ['vulnerability_management'])
+    for strategy in ('prefix', 'mapping'):  # retired: a pack naming one translates nothing
       with patch.dict(PACK_STRATEGIES, {'test': {'strategy': strategy, 'mapping': {'LOCAL': 'ID.RA-01'}}}):
-        self.assertEqual(list(resolve('test', controls).values()), ['vulnerability_management'])
+        self.assertEqual(resolve('test', [{'ref_id': 'ID.RA-01.7'}, {'ref_id': 'LOCAL'}]), {})
     self.assertEqual(resolve('unknown', selected), {})
 
   def test_candidates_null_level_and_reads_preserve_every_answer_and_tier_without_writes(self):
