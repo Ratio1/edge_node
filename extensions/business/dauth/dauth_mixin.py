@@ -26,6 +26,8 @@ from .dauth_registry import (
 )
 # BCctbase names the sender fields of a signed request, which a refusal line reports.
 from ratio1.const.base import BCctbase, dAuth
+# The SDK engine class holds this process's oracle-only secret in memory; dAuth hands it to oracles.
+from ratio1.bc.base import BaseBlockEngine
 
 
 DAUTH_JOB_SECRETS_CSTORE_HKEY = "DAUTH_JOB_SECRETS"
@@ -1156,10 +1158,61 @@ class _DauthMixin(object):
     dauth_data,
     requester_node_address,
     is_node=False,
-    sender_eth_address=None
+    sender_eth_address=None,
+    requester_memory_secrets=False,
   ):
     """
-    Fill the data with the authentication data.
+    Fill data: put the settings of a served dAuth answer into its ``auth`` part.
+
+    Adds the broker candidates, the universal env keys and the predefined keys. For a node it also
+    adds the allowed senders (the oracles, then the whitelist), the node-only keys and the node tags.
+    A protocol oracle (a node in the oracle registry that ``bc.get_oracles`` reads) also gets
+    ``EE_SUPERVISOR=True`` and the supervisor keys; the dAuth-only keys go to it only when it is in
+    the dAuth registry. When its request says that its client keeps memory-only secrets, and this node
+    holds one, the oracle also gets the oracle-only secret. Every other requester gets
+    ``EE_SUPERVISOR=False`` and none of these.
+
+    Parameters
+    ----------
+    dauth_data : dict
+      The ``auth`` part of the answer, filled in place.
+    requester_node_address : str
+      The requester's node address.
+    is_node : bool, optional
+      True when the requester declared app, core and SDK versions (an edge node). Default False.
+    sender_eth_address : str, optional
+      The requester's ETH address, used for the dAuth registry check and the node tags.
+    requester_memory_secrets : bool, optional
+      True when the signed request carries ``sender_memory_secrets: true``, which means its client
+      keeps memory-only secrets out of its environment and logs. Default False.
+
+    Returns
+    -------
+    dict
+      ``dauth_data``, filled.
+
+    Raises
+    ------
+    ValueError
+      When the merged auth env keys or predefined keys are None. A configured value of None
+      already fails earlier, with a TypeError, when it is merged with the defaults.
+
+    Notes
+    -----
+    The oracle-only secret is read from this node's process memory (``BaseBlockEngine.oracle_secret``),
+    not from its environment. A seed deleted it from its environment at start; any other dAuth server
+    received it in its own start-up dAuth. A server that holds none sends no field at all, not None.
+    The field has no ``EE_`` prefix, so no client writes it to its environment. A client of an
+    earlier release does not send the flag and so never receives the field: some earlier clients
+    logged the whole answer.
+
+    Examples
+    --------
+    >>> data = self.fill_dauth_data(
+    ...   {}, "0xai_Oracle", is_node=True, sender_eth_address="0xE7h", requester_memory_secrets=True,
+    ... )
+    >>> data["EE_SUPERVISOR"], "oracle_r1fs_secret" in data   # an oracle, on a server that holds the secret
+    (True, True)
     """
     dAuthCt = self.const.BASE_CT.dAuth
     
@@ -1268,6 +1321,12 @@ class _DauthMixin(object):
           dauth_data[key] = self.os_environ.get(key)
         # end if
       # end for
+      # The oracle-only secret, from this node's process memory and not from its environment (a seed deleted
+      # it there at start). Sent only when the requester's client keeps it in memory too and this node holds one.
+      oracle_secret = BaseBlockEngine.oracle_secret()
+      if requester_memory_secrets and oracle_secret is not None:
+        # A field without the EE_ prefix: no client writes it to its environment.
+        dauth_data[dAuth.DAUTH_ORACLE_SECRET] = oracle_secret
     else:
       dauth_data["EE_SUPERVISOR"] = False
     # end set supervisor flag
@@ -1311,7 +1370,9 @@ class _DauthMixin(object):
     address, the signature, the declared versions, then whether the node is allowed (not
     revoked and licensed). An allowed requester gets the dAuth settings; any other gets an
     answer with `error` and no settings. A served answer can carry a non-critical note in
-    `error` too, such as a version warning.
+    `error` too, such as a version warning. A protocol oracle whose signed request carries
+    ``sender_memory_secrets: true`` also gets the oracle-only secret this node holds in memory
+    (see `fill_dauth_data`).
 
     Parameters
     ----------
@@ -1442,6 +1503,9 @@ class _DauthMixin(object):
       ### Finally we fill the data with the authentication data
       self.fill_dauth_data(
         dauth_data=dct_dauth, requester_node_address=requester, is_node=is_requester_a_node,
+        # The signed request says its client keeps memory-only secrets out of its environment and logs; only
+        # then may an oracle get the oracle-only secret. A previous-release client never sends it.
+        requester_memory_secrets=body.get(dAuth.DAUTH_SENDER_MEMORY_SECRETS) is True,
         sender_eth_address=requester_eth
       )
       self.P("dAuth req '{}' success for <{}> '{}' (ETH: {}) from {}".format(
