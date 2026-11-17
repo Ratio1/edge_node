@@ -13,7 +13,7 @@ import paramiko
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
 from ...cve_db import (
-  NOT_APPLICABLE_BEHAVIOUR_CLEARED, check_cves, clear_cve, confirm_cve, parse_distro_package, probe_cve_fields,
+  BANNER_NOT_ASSESSABLE, NOT_APPLICABLE_BEHAVIOUR_CLEARED, check_cves, clear_cve, confirm_cve, parse_distro_package, probe_cve_fields,
   withdraw_not_applicable,
 )
 from ...models.finding_schema import (
@@ -338,11 +338,14 @@ def _ssh_terrapin(kexinit):
 def _smtp_banner_verdict(mta, ehlo_features):
   """`(verified, why)` for an SMTP banner from the EHLO reply lines. Only judged when an EHLO 250 reply was read.
 
-  Exim always ends its EHLO reply with HELP; mailoney's reply has none.
+  Exim always ends its EHLO reply with HELP; mailoney's reply has none. Other MTAs have no check: not assessable,
+  even when EHLO was refused (a scanner identity that is not a domain gets 501 from OpenSMTPD).
   """
+  if mta != "exim":
+    return BANNER_NOT_ASSESSABLE, ""
   if not ehlo_features:
     return None, ""
-  if mta == "exim" and not any(f.strip().upper() == "HELP" for f in ehlo_features):
+  if not any(f.strip().upper() == "HELP" for f in ehlo_features):
     return False, "banner names Exim but the EHLO reply has no HELP line, which Exim always sends"
   return True, ""
 
@@ -1326,7 +1329,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
 
   def _record_banner_verdict(self, result, source, verified, why):
     """Put a banner verdict in the probe result and hand an unverified one to the honeypot correlation."""
-    if verified is None:
+    if verified is None or verified == BANNER_NOT_ASSESSABLE:
       return
     result["banner_verified"] = verified
     if verified is False:
