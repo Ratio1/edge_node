@@ -2,7 +2,11 @@ import os
 import pickle
 import shutil
 import tempfile
+import time
 import unittest
+from unittest.mock import patch
+from collections import OrderedDict, deque
+from datetime import datetime, timedelta, timezone
 
 from extensions.business.cybersec.red_mesh.services import checkpoint as ckpt
 
@@ -42,6 +46,20 @@ class _FakeOwner:
 
   def diskapi_delete_directory(self, path):
     shutil.rmtree(path)
+
+
+class _Evil:
+  def __reduce__(self):
+    return (os.system, ("echo pwned",))
+
+
+class _Custom:
+  pass
+
+
+class _CallsStr:
+  def __reduce__(self):
+    return (str, ("x",))
 
 
 def _payload(**kw):
@@ -99,13 +117,102 @@ class TestCheckpointStore(unittest.TestCase):
     self.assertEqual(ckpt.load_all(self.owner, "job1", 1), {})
     self.assertFalse(os.path.exists(os.path.join(self.base, "job1", "1_lst.pkl")))
 
-  def test_load_raising_is_ignored_and_deleted(self):
+  def test_truncated_file_is_ignored_and_deleted(self):
     ckpt.save(self.owner, "job1", 1, "a", _payload())
-    def boom(*a, **k):
-      raise RuntimeError("x")
-    self.owner.diskapi_load_pickle_from_data = boom
+    path = os.path.join(self.base, "job1", "1_a.pkl")
+    with open(path, "rb") as fh:
+      raw = fh.read()
+    with open(path, "wb") as fh:
+      fh.write(raw[:len(raw) // 2])
     self.assertEqual(ckpt.load_all(self.owner, "job1", 1), {})
-    self.assertFalse(os.path.exists(os.path.join(self.base, "job1", "1_a.pkl")))
+    self.assertFalse(os.path.exists(path))
+
+  def test_realistic_state_roundtrips_through_restricted_load(self):
+    state = {
+      "open_ports": [22, 80], "ports_scanned": [1, 2], "port_banners": {22: "SSH-2.0", 80: ""},
+      "service_info": {22: {"banner": "x", "findings": [{"title": "t", "severity": "HIGH"}]}},
+      "scan_metadata": {"internal_ips": ["10.0.0.1"], "seen": {1, 2}, "frozen": frozenset({3})},
+      "raw": b"\x00\xff", "odd": OrderedDict(a=1), "dq": deque([1, 2]),
+      "when": datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+      "delta": timedelta(seconds=5), "pair": (1, "a", None, 2.5, True),
+    }
+    ckpt.save(self.owner, "job1", 1, "a", _payload(state=state, metrics={"_connection_log": [(1.5, "connected")]}))
+    loaded = ckpt.load_all(self.owner, "job1", 1)["a"]
+    self.assertEqual(loaded["state"], state)
+    self.assertEqual(loaded["metrics"]["_connection_log"], [(1.5, "connected")])
+
+  def test_disallowed_global_is_rejected_and_deleted(self):
+    for prefix, obj in (("evil", _Evil()), ("custom", _Custom())):
+      ckpt.save(self.owner, "job1", 1, prefix, _payload(state={"x": obj}))
+    ckpt.save(self.owner, "job1", 1, "good", _payload())
+    self.assertEqual(list(ckpt.load_all(self.owner, "job1", 1)), ["good"])
+    self.assertFalse(os.path.exists(os.path.join(self.base, "job1", "1_evil.pkl")))
+    self.assertFalse(os.path.exists(os.path.join(self.base, "job1", "1_custom.pkl")))
+
+  def test_str_called_through_reduce_is_refused(self):
+    ckpt.save(self.owner, "job1", 1, "s", _payload(state={"x": _CallsStr()}))
+    self.assertEqual(ckpt.load_all(self.owner, "job1", 1), {})
+    self.assertFalse(os.path.exists(os.path.join(self.base, "job1", "1_s.pkl")))
+
+  def test_memo_shared_dag_is_rejected_and_deleted_quickly(self):
+    dag = []
+    for _ in range(30):  # 2**30 nodes when walked, a few hundred bytes on disk
+      dag = [dag, dag]
+    ckpt.save(self.owner, "job1", 1, "dag", _payload(state={"x": dag}))
+    ckpt.save(self.owner, "job1", 1, "ok", _payload())
+    path = os.path.join(self.base, "job1", "1_dag.pkl")
+    self.assertLess(os.path.getsize(path), 5000)
+    started = time.monotonic()
+    self.assertEqual(list(ckpt.load_all(self.owner, "job1", 1)), ["ok"])
+    self.assertLess(time.monotonic() - started, 10)
+    self.assertFalse(os.path.exists(path))
+
+  def test_node_bound_counts_each_shared_reference(self):
+    shared = list(range(10))
+    self.assertTrue(ckpt._within_node_bound({"a": shared, "b": shared}))
+    with patch.object(ckpt, "MAX_NODES", 20):
+      self.assertFalse(ckpt._within_node_bound({"a": shared, "b": shared}))
+      self.assertTrue(ckpt._within_node_bound({"a": shared}))
+
+  def test_full_port_range_state_stays_inside_the_bound(self):
+    ports = list(range(1, 65536))
+    state = {"ports_scanned": ports, "open_ports": ports[:50], "port_protocols": {p: "http" for p in ports[:50]}}
+    metrics = {"_connection_log": [(1.5, "refused")] * 65535, "_response_times": [0.1] * 65535}
+    ckpt.save(self.owner, "job1", 1, "big", _payload(state=state, metrics=metrics))
+    self.assertEqual(list(ckpt.load_all(self.owner, "job1", 1)), ["big"])
+
+  def test_bytearray_global_is_refused(self):
+    ckpt.save(self.owner, "job1", 1, "ba", _payload(state={"x": bytearray(b"ab")}))
+    self.assertEqual(ckpt.load_all(self.owner, "job1", 1), {})
+    self.assertFalse(os.path.exists(os.path.join(self.base, "job1", "1_ba.pkl")))
+
+  def test_oversized_file_is_corrupt_and_deleted(self):
+    ckpt.save(self.owner, "job1", 1, "big", _payload(blob="x" * 5000))
+    ckpt.save(self.owner, "job1", 1, "small", _payload())
+    with patch.object(ckpt, "MAX_FILE_BYTES", 2000):
+      self.assertEqual(list(ckpt.load_all(self.owner, "job1", 1)), ["small"])
+    self.assertFalse(os.path.exists(os.path.join(self.base, "job1", "1_big.pkl")))
+    self.assertEqual(ckpt.MAX_FILE_BYTES, 32 * 1024 * 1024)
+
+  def test_symlinked_file_is_skipped_and_never_followed(self):
+    ckpt.save(self.owner, "job1", 1, "real", _payload())
+    outside = os.path.join(self.tmp, "outside.pkl")
+    with open(outside, "wb") as fh:
+      pickle.dump(_payload(), fh)
+    link = os.path.join(self.base, "job1", "1_link.pkl")
+    os.symlink(outside, link)
+    self.assertEqual(list(ckpt.load_all(self.owner, "job1", 1)), ["real"])
+    ckpt.delete_pass(self.owner, "job1", 1)
+    self.assertTrue(os.path.islink(link))
+    self.assertTrue(os.path.exists(outside))
+
+  def test_symlinked_job_folder_is_skipped(self):
+    ckpt.save(self.owner, "real", 1, "a", _payload())
+    os.symlink(os.path.join(self.base, "real"), os.path.join(self.base, "job1"))
+    self.assertEqual(ckpt.load_all(self.owner, "job1", 1), {})
+    ckpt.delete_pass(self.owner, "job1", 1)
+    self.assertEqual(list(ckpt.load_all(self.owner, "real", 1)), ["a"])
+    self.assertEqual(ckpt.list_jobs(self.owner), ["real"])
 
   def test_bad_pass_nr_is_safe(self):
     self.assertFalse(ckpt.save(self.owner, "job1", "x", "a", _payload()))

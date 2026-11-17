@@ -1,4 +1,5 @@
 """Save points in the network worker (RM-201 phase 2)."""
+import copy
 import shutil
 import threading
 import tempfile
@@ -228,6 +229,187 @@ class TestWorkerCheckpoint(unittest.TestCase):
       w._checkpoint_after_port(250)
       w._maybe_checkpoint(force=True)
     self.assertEqual(ckpt.load_all(self.owner, "job1", 2), {})
+
+
+class _Crash(BaseException):
+  """Stands in for a node restart: leaves `execute_job` without a clean finish."""
+
+
+class TestWorkerResume(unittest.TestCase):
+  """Resume from a checkpoint with deterministic fake probes (RM-201 phase 3)."""
+
+  PORTS = [21, 22, 23, 79, 80, 81]
+  OPEN = {22, 80}
+
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+    self.owner = _Owner(self.tmp, config={"WORKER_CHECKPOINT": {"MIN_INTERVAL": 0.001}})
+
+  def _run(self, w, log, crash_on=None, fail_connect=None):
+    """Run `execute_job` with fake sockets and probes; `log` collects every probe made."""
+    open_ports = self.OPEN
+
+    class _Sock:
+      def __init__(self, *a, **k): pass
+      def settimeout(self, t): pass
+      def recv(self, n): return b""
+      def close(self): pass
+      def connect_ex(self, addr):
+        log.append(("connect", addr[1]))
+        if fail_connect == addr[1]:
+          w._maybe_checkpoint(force=True)
+          raise _Crash()
+        return 0 if addr[1] in open_ports else 111
+
+    def probe(name):
+      def run(target, port):
+        log.append((name, port))
+        if crash_on == (name, port):
+          w._maybe_checkpoint(force=True)
+          raise _Crash()
+        return {"findings": [{"title": f"{name}-{port}", "severity": "INFO"}]}
+      return run
+
+    for name in ("_svc_a", "_svc_b", "_web_a"):
+      setattr(w, name, probe(name))
+    w._active_fingerprint_ports = lambda: None
+    w._interruptible_sleep = lambda: False
+    methods = {"service": ["_svc_a", "_svc_b"], "web": ["_web_a"]}
+    w._get_enabled_feature_methods = lambda category=None: list(methods.get(category, []))
+    with patch("extensions.business.cybersec.red_mesh.worker.pentest_worker.socket.socket", _Sock):
+      w.execute_job()
+
+  def _clean(self):
+    w = _worker(_Owner(tempfile.mkdtemp()), ctx=None, ports=self.PORTS)
+    log = []
+    self._run(w, log)
+    return w, log
+
+  def _crash_then_resume(self, **crash):
+    w1 = _worker(self.owner, ports=self.PORTS)
+    with self.assertRaises(_Crash):
+      self._run(w1, [], **crash)
+    saved = ckpt.load_all(self.owner, "job1", 2)["1"]
+    w2 = _worker(self.owner, ports=self.PORTS)
+    w2.restore_from_checkpoint(copy.deepcopy(saved))
+    log = []
+    self._run(w2, log)
+    return w1, w2, saved, log
+
+  def _assert_same_result(self, resumed, clean):
+    for key in ("open_ports", "ports_scanned", "completed_tests", "service_info", "web_tests_info",
+                "port_protocols", "correlation_findings", "web_tested", "done", "canceled"):
+      self.assertEqual(resumed.state[key], clean.state[key], key)
+
+  def test_resume_mid_service_phase_skips_finished_work(self):
+    clean, _ = self._clean()
+    _, w2, saved, log = self._crash_then_resume(crash_on=("_svc_b", 80))
+    self.assertEqual([e for e in log if e[0] == "connect"], [])  # every port was scanned already
+    self.assertFalse([e for e in log if e[0] == "_svc_a"])  # finished method not probed again
+    self.assertEqual([e for e in log if e[0] == "_svc_b"], [("_svc_b", 22), ("_svc_b", 80)])  # cut off: reruns
+    self.assertIn("_web_a", {e[0] for e in log})
+    self._assert_same_result(w2, clean)
+    self.assertEqual(w2.local_worker_id, saved["local_worker_id"])
+
+  def test_resume_mid_port_scan_covers_only_remaining_ports(self):
+    clean, _ = self._clean()
+    _, w2, saved, log = self._crash_then_resume(fail_connect=79)
+    self.assertEqual(saved["state"]["ports_scanned"], [21, 22, 23])
+    self.assertEqual([e[1] for e in log if e[0] == "connect"], [79, 80, 81])
+    self._assert_same_result(w2, clean)
+
+  def test_resume_keeps_findings_without_duplicates(self):
+    _, w2, saved, _ = self._crash_then_resume(crash_on=("_web_a", 80))
+    self.assertEqual(saved["state"]["service_info"][22]["_svc_a"]["findings"][0]["title"], "_svc_a-22")
+    titles = [f["title"] for port in w2.state["service_info"].values() for info in port.values()
+              for f in info["findings"]]
+    self.assertEqual(len(titles), len(set(titles)))
+    self.assertEqual(sorted(titles), ["_svc_a-22", "_svc_a-80", "_svc_b-22", "_svc_b-80"])
+    self.assertEqual(w2.state["web_tests_info"][80]["_web_a"]["findings"][0]["title"], "_web_a-80")
+
+  def test_resume_phase_marker_skips_whole_phase(self):
+    _, w2, _, log = self._crash_then_resume(crash_on=("_web_a", 80))
+    self.assertEqual([e for e in log if e[0] in ("_svc_a", "_svc_b")], [])  # service phase marker present
+    self.assertEqual(log, [("_web_a", 80)])
+
+  def test_restore_keeps_scan_start_and_records_resume_event(self):
+    w1 = _worker(self.owner, ports=self.PORTS)
+    with self.assertRaises(_Crash):
+      self._run(w1, [], crash_on=("_svc_b", 22))
+    saved = ckpt.load_all(self.owner, "job1", 2)["1"]
+    w2 = _worker(self.owner, ports=self.PORTS)
+    with patch.object(w2.metrics, "start_scan") as start_scan:
+      w2.restore_from_checkpoint(copy.deepcopy(saved))
+      self._run(w2, [])
+    start_scan.assert_not_called()
+    self.assertEqual(w2.metrics._scan_start, saved["metrics"]["_scan_start"])
+    events = w2.state["resume_events"]
+    self.assertEqual(len(events), 1)
+    self.assertEqual(events[0]["from_checkpoint_at"], saved["saved_at"])
+    self.assertIn("resumed_at", events[0])
+    self.assertEqual(w2.get_status()["resume_events"], events)
+
+  def test_fresh_worker_has_no_resume_events_in_status(self):
+    clean, _ = self._clean()
+    self.assertNotIn("resume_events", clean.get_status())
+    self.assertIsNotNone(clean.metrics._scan_start)
+
+  def test_restored_worker_is_live_and_keeps_saving(self):
+    w1 = _worker(self.owner, ports=self.PORTS)
+    with self.assertRaises(_Crash):
+      self._run(w1, [], crash_on=("_svc_b", 22))
+    saved = ckpt.load_all(self.owner, "job1", 2)["1"]
+    saved["state"]["done"] = True
+    saved["state"]["canceled"] = True
+    w2 = _worker(self.owner, ports=self.PORTS)
+    w2.restore_from_checkpoint(saved)
+    self.assertFalse(w2.state["done"] or w2.state["canceled"])
+    self._run(w2, [])
+    final = ckpt.load_all(self.owner, "job1", 2)["1"]
+    self.assertIn("correlation_completed", final["state"]["completed_tests"])
+    self.assertEqual(len(final["state"]["resume_events"]), 1)
+
+  def test_restore_with_all_ports_scanned_adds_missing_port_marker(self):
+    w1 = _worker(self.owner, ports=self.PORTS)
+    w1.state["ports_scanned"] = list(self.PORTS)
+    w1._maybe_checkpoint(force=True)
+    w2 = _worker(self.owner, ports=self.PORTS)
+    w2.restore_from_checkpoint(ckpt.load_all(self.owner, "job1", 2)["1"])
+    self.assertEqual(w2.state["ports_to_scan"], [])
+    self.assertIn("scan_ports_step_completed", w2.state["completed_tests"])
+
+  def test_restore_ignores_unknown_metrics_keys(self):
+    w1 = _worker(self.owner, ports=self.PORTS)
+    w1._maybe_checkpoint(force=True)
+    saved = ckpt.load_all(self.owner, "job1", 2)["1"]
+    saved["metrics"].update({"evil": 1, "__class__": "x", "_ports_scanned": 3})
+    w2 = _worker(self.owner, ports=self.PORTS)
+    w2.restore_from_checkpoint(saved)
+    self.assertFalse(hasattr(w2.metrics, "evil"))
+    self.assertIsNot(w2.metrics.__class__, "x")
+    self.assertEqual(w2.metrics._ports_scanned, 3)  # a known key is restored
+
+  def test_second_restart_resumes_again_and_keeps_both_events(self):
+    clean, _ = self._clean()
+    w1 = _worker(self.owner, ports=self.PORTS)
+    with self.assertRaises(_Crash):
+      self._run(w1, [], crash_on=("_svc_b", 80))
+    first = ckpt.load_all(self.owner, "job1", 2)["1"]
+    w2 = _worker(self.owner, ports=self.PORTS)
+    w2.restore_from_checkpoint(copy.deepcopy(first))
+    with self.assertRaises(_Crash):
+      self._run(w2, [], crash_on=("_web_a", 80))
+    second = ckpt.load_all(self.owner, "job1", 2)["1"]
+    self.assertEqual(len(second["state"]["resume_events"]), 1)
+    w3 = _worker(self.owner, ports=self.PORTS)
+    w3.restore_from_checkpoint(copy.deepcopy(second))
+    log = []
+    self._run(w3, log)
+    self.assertEqual(len(w3.state["resume_events"]), 2)
+    self.assertEqual(w3.metrics._scan_start, first["metrics"]["_scan_start"])
+    self.assertEqual(log, [("_web_a", 80)])  # no port, no finished method probed again
+    self._assert_same_result(w3, clean)
 
 
 if __name__ == "__main__":
