@@ -626,6 +626,17 @@ def set_vulndb_reader(reader) -> None:
   _VULNDB_READER = reader
 
 
+def probe_cve_fields(cve_id: str) -> dict:
+  """KEV and build for a CVE a probe confirmed itself (Heartbleed), not matched by `check_cves`.
+
+  `static`: KEV not evaluated. `generated`: the build is named; KEV is None when the build has no row for the CVE.
+  """
+  reader = _VULNDB_READER
+  if reader is None:
+    return {"kev": None}
+  return {"kev": reader.kev(cve_id), "vulndb_build_id": reader.build_id}
+
+
 def set_dynamic_reference_cache(dynamic_cache):
   """Set the scan-local dynamic reference cache for check_cves callers."""
   return _CURRENT_DYNAMIC_CACHE.set(dynamic_cache)

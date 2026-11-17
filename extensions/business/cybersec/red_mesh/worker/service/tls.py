@@ -8,7 +8,7 @@ import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
-from ...cve_db import check_cves
+from ...cve_db import check_cves, probe_cve_fields
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
 
@@ -436,6 +436,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
               owasp_id="A06:2021",
               cwe_id="CWE-126",
               confidence="certain",
+              **probe_cve_fields("CVE-2014-0160"),
             )
         # TLS Alert (ContentType=21) = not vulnerable (server rejected heartbeat)
         elif response[0] == 21:
@@ -544,6 +545,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
             owasp_id="A06:2021",
             cwe_id="CWE-126",
             confidence="certain",
+            **probe_cve_fields("CVE-2014-0160"),
           )
     except Exception:
       pass
