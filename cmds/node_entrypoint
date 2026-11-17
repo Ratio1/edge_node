@@ -41,7 +41,10 @@ flock -n 9 || { echo "The kept Docker store is locked by another container on th
 # "data-root" of docker/daemon.json; a test keeps the two equal.
 # Exit non-zero, as the base entrypoint did: the container stops, and whoever starts it again (the host's service)
 # starts on an empty store.
-/usr/local/bin/entrypoint.sh true || { echo "The inner Docker daemon did not start: removing its kept store." >&2; rm -rf /edge_node/_local_cache/_bin/docker/29; exit 1; }
+# The daemon starts without EE_ORACLE_R1FS_SECRET, which only seed nodes are given: the node takes it into its memory
+# and overwrites it in its own environment, but dockerd would keep it in its environment, which every process of the
+# container can read, for as long as the container runs. The node command below still gets it.
+env -u EE_ORACLE_R1FS_SECRET /usr/local/bin/entrypoint.sh true || { echo "The inner Docker daemon did not start: removing its kept store." >&2; rm -rf /edge_node/_local_cache/_bin/docker/29; exit 1; }
 # Run the node command the way the base entrypoint ran it: it replaces this shell, so the node is process 1,
 # receives the stop signal itself and has dockerd as its child, as before. Descriptor 9 stays open in it, and with
 # it the lock.

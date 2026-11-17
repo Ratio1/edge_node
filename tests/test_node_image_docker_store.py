@@ -65,6 +65,9 @@ VALIDATE_LINE = (
 # The entrypoint of the base image, which starts the inner daemon: the build steps inspect it, the script runs it.
 BASE_ENTRYPOINT = "/usr/local/bin/entrypoint.sh"
 
+# How the script starts it: without the oracle-only secret, which the node keeps out of every other environment.
+DAEMON_START = "env -u EE_ORACLE_R1FS_SECRET " + BASE_ENTRYPOINT + " true || "
+
 # The script the node images start through. Every node Dockerfile copies `cmds/` to /usr/local/bin.
 ENTRYPOINT_SCRIPT = REPO_ROOT / "cmds" / "node_entrypoint"
 
@@ -203,14 +206,15 @@ def disk_api_accepts(paths):
   return json.loads(done.stdout.splitlines()[-1])
 
 
-def run_entrypoint_script(base_exit_code, command, lock_held=False, first_start=False):
+def run_entrypoint_script(base_exit_code, command, lock_held=False, first_start=False, env=None):
   """
   Run a copy of the entrypoint script in a folder of its own, with a stand-in for the base image entrypoint.
 
   The copy differs from `cmds/node_entrypoint` in two places only: the base image entrypoint becomes a stand-in
-  that writes down its arguments and whether the store's lock is held, then exits with `base_exit_code`; and the
-  cache folder becomes a stand-in cache folder, so the store, the folder of the stores and the lock file are the
-  same places under it, between files that are not the store's. Other tests pin the real paths.
+  that writes down its arguments, whether the store's lock is held and the oracle-only secret it got, then exits
+  with `base_exit_code`; and the cache folder becomes a stand-in cache folder, so the store, the folder of the
+  stores and the lock file are the same places under it, between files that are not the store's. Other tests pin
+  the real paths.
 
   Parameters
   ----------
@@ -224,13 +228,16 @@ def run_entrypoint_script(base_exit_code, command, lock_held=False, first_start=
   first_start : bool
     True: the cache folder holds node data only, without the folder of the stores, as on the first start of a
     node on an image that keeps the store.
+  env : dict, optional
+    Variables added to the environment the script is started with, as a container's environment; None adds none.
 
   Returns
   -------
   dict
     `pid`: the process id the script was started with; `exit_code`, `stdout` and `stderr` of the run;
     `base_arguments`: the arguments the stand-in got, None when it was not run; `base_lock_state`: "held", "free"
-    or "missing", the store's lock file as the stand-in found it, None when it was not run; `before` and `after`:
+    or "missing", the store's lock file as the stand-in found it, None when it was not run; `base_secret`: the
+    value of EE_ORACLE_R1FS_SECRET the stand-in got ("" when unset), None when it was not run; `before` and `after`:
     every path under the stand-in cache folder, relative to it and sorted, before and after the run; `store` and
     `lock`: the store directory and the lock file, relative in the same way.
 
@@ -285,12 +292,14 @@ def run_entrypoint_script(base_exit_code, command, lock_held=False, first_start=
       path.write_text("kept")
     # The stand-in base entrypoint: it writes one line per argument it got, then tries the store's lock through an
     # open file of its own (as a second container would; flock would create a missing file, so it looks first) and
-    # writes down what it found, then exits as this run asks.
+    # writes down what it found, then the oracle-only secret it got, then exits as this run asks.
     base = root / "base_entrypoint"
     # A shell file, as the real one.
     base.write_text(
       '#!/bin/sh\nprintf "%s\\n" "$@" > "$0.arguments"\nl="{}"\n'
       'if [ ! -e "$l" ]; then echo missing; elif flock -n "$l" true; then echo free; else echo held; fi > "$0.lock_state"\n'
+      # The oracle-only secret it got, empty when unset (the doubled braces are format's escape for one brace).
+      'printf "%s" "${{EE_ORACLE_R1FS_SECRET-}}" > "$0.secret"\n'
       'exit {}\n'.format(lock, base_exit_code)
     )
     # The script runs it by its path.
@@ -317,8 +326,10 @@ def run_entrypoint_script(base_exit_code, command, lock_held=False, first_start=
       fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
     # What is under the cache folder now.
     before = sorted(str(path.relative_to(cache)) for path in cache.rglob("*"))
-    # Start the copy with the node command as its arguments; it does not inherit the test's open file.
-    process = subprocess.Popen([str(copy)] + list(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # Start the copy with the node command as its arguments and the run's variables; it does not inherit the test's
+    # open file.
+    process = subprocess.Popen([str(copy)] + list(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                               env={**os.environ, **(env or {})})
     # Wait for its end; a script that hangs fails the test instead of the run.
     stdout, stderr = process.communicate(timeout=60)
     # Only when the test held the lock.
@@ -327,6 +338,8 @@ def run_entrypoint_script(base_exit_code, command, lock_held=False, first_start=
       holder.close()
     # The files the stand-in leaves when it was run.
     arguments, lock_state = root / "base_entrypoint.arguments", root / "base_entrypoint.lock_state"
+    # The file the stand-in writes the oracle-only secret it got to.
+    secret = root / "base_entrypoint.secret"
     # Everything a test asks about, read before the folder goes.
     return {
       # The process the script was started as.
@@ -341,6 +354,8 @@ def run_entrypoint_script(base_exit_code, command, lock_held=False, first_start=
       "base_arguments": arguments.read_text().splitlines() if arguments.exists() else None,
       # One word.
       "base_lock_state": lock_state.read_text().strip() if lock_state.exists() else None,
+      # The variable's value, empty when the stand-in did not get it.
+      "base_secret": secret.read_text() if secret.exists() else None,
       # The cache folder before the run.
       "before": before,
       # The cache folder after the run.
@@ -524,8 +539,8 @@ class TestNodeImageEntrypoint(unittest.TestCase):
     self.assertTrue(code[2].startswith("flock -n 9 || { echo ") and code[2].endswith(" >&2; exit 1; }"))
     # That step removes nothing.
     self.assertNotIn("rm ", code[2])
-    # Only under the lock: the daemon start, whose failure removes the store.
-    self.assertTrue(code[3].startswith(BASE_ENTRYPOINT + " true || "))
+    # Only under the lock: the daemon start, without the oracle-only secret, whose failure removes the store.
+    self.assertTrue(code[3].startswith(DAEMON_START))
     # Last, the node command in the place of the script's own process.
     self.assertEqual(code[4], 'exec "$@"')
 
@@ -533,8 +548,9 @@ class TestNodeImageEntrypoint(unittest.TestCase):
     """The script starts the daemon through the file the build checks for a store flag, and `cmds/` does not replace that file."""
     # The command lines of the script, without its comments and empty lines.
     code = [line for line in ENTRYPOINT_SCRIPT.read_text().splitlines() if line and not line.startswith("#")]
-    # One of them names the base image entrypoint: it runs it with `true`, and handles its failure on the same line.
-    self.assertEqual([line.startswith(BASE_ENTRYPOINT + " true || ") for line in code if BASE_ENTRYPOINT in line], [True])
+    # One of them names the base image entrypoint: it runs it with `true` and without the oracle-only secret, and
+    # handles its failure on the same line.
+    self.assertEqual([line.startswith(DAEMON_START) for line in code if BASE_ENTRYPOINT in line], [True])
     # Every node Dockerfile, each reported under its own name.
     for name in node_dockerfiles():
       # One result per Dockerfile, so a failure names the file.
@@ -571,6 +587,15 @@ class TestNodeImageEntrypoint(unittest.TestCase):
     self.assertEqual(result["exit_code"], 7)
     # The store and everything else are as they were; the lock file is new beside the store.
     self.assertEqual(result["after"], sorted(result["before"] + [result["lock"]]))
+
+  def test_the_daemon_starts_without_the_oracle_secret_and_the_node_command_keeps_it(self):
+    """With the oracle-only secret in the container's environment, as on a seed, the base entrypoint (and so the
+    dockerd it leaves running) does not get it, and the node command, which moves it into memory, does."""
+    # A good start whose node command prints the variable, in an environment that has it.
+    result = run_entrypoint_script(0, ["/bin/sh", "-c", 'echo "$EE_ORACLE_R1FS_SECRET"'],
+                                   env={"EE_ORACLE_R1FS_SECRET": "fake-oracle-secret-for-tests-only"})
+    # The base entrypoint got no value, and the node command got the value.
+    self.assertEqual((result["base_secret"], result["stdout"]), ("", "fake-oracle-secret-for-tests-only\n"))
 
   def test_a_daemon_that_does_not_start_costs_the_store_and_only_the_store(self):
     """After a failed daemon start the script says so, removes the store and nothing else, and ends non-zero without the node command."""
