@@ -107,7 +107,10 @@ A production node runs its own Docker daemon inside the node container (the imag
 volumes are ext4 images on loop devices the node mounts itself. `init --docker-nodes r1w-01,r1w-02`
 gives chosen nodes the same: `EE_DD=1`, privileged, a private cgroup namespace, the inner Docker data in
 its own volume, still attached to the internal network only and publishing no port. `node/dind.sh` runs
-the isolation guard before the daemon starts. The smallest cluster that runs container apps:
+the isolation guard before the daemon starts, then the image's own `/usr/local/bin/node_entrypoint` when
+the image has one (node images from edge 2.10.723 on: it locks the inner Docker store, which they keep in
+`_local_cache/_bin/docker/29` and not in that volume, and removes the store when the daemon does not
+start), else the base entrypoint. The smallest cluster that runs container apps:
 
 ```bash
 $LN init --arm base --oracles 4 --workers 2 --full-workers 0 --fleet 0 --revoked 1 \

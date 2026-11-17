@@ -26,5 +26,14 @@ if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
   sed -e 's/ / +/g' -e 's/^/+/' < /sys/fs/cgroup/cgroup.controllers > /sys/fs/cgroup/cgroup.subtree_control
 fi
 
-# The production entrypoint of the image: starts dockerd (EE_DD=1), waits for it, then runs "$@".
+# A node image from edge 2.10.723 on starts through its own ENTRYPOINT, /usr/local/bin/node_entrypoint: it
+# locks the inner Docker store kept in the node's cache folder, runs the base entrypoint below, and removes
+# that store when the daemon does not start. The compose service replaces the image's ENTRYPOINT with this
+# script, so run that script here when the image has one; otherwise its lock and self-heal would never run.
+if [ -x /usr/local/bin/node_entrypoint ]; then
+  # The node image's own entrypoint, as production runs it, with the node command.
+  exec /usr/local/bin/node_entrypoint "$@"
+fi
+# An image without it (the released 2.10.720 image): the base entrypoint, which starts dockerd (EE_DD=1),
+# waits for it, then runs "$@".
 exec /usr/local/bin/entrypoint.sh "$@"
