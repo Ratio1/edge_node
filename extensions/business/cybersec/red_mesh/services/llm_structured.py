@@ -35,6 +35,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from ..constants import LLM_PROMPT_VERSION_EXEC_SUMMARY
+from ..cve_view import effective_kev
 from ..llm_input_builder import LlmInput, build_llm_input
 from ..models.llm_output import (
   LlmReportSections,
@@ -975,7 +976,7 @@ def _compact_findings_for_structured_prompt(findings: list[dict]) -> list[dict]:
       "owasp_id": _compact_text(finding.get("owasp_id", ""), 32),
       "cwe_id": _compact_text(finding.get("cwe_id", ""), 32),
       "cvss_score": finding.get("cvss_score"),
-      "kev": bool(finding.get("kev")),
+      "kev": effective_kev(finding),
       "cve": _compact_list(finding.get("cve")),
       "tags": _compact_list(finding.get("tags")),
       "affected_assets": _compact_assets(finding.get("affected_assets")),

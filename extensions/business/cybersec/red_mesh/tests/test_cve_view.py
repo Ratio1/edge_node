@@ -262,7 +262,8 @@ class RiskAndConsumerTests(unittest.TestCase):
                 {"finding_id": "n1", "title": "plain", "severity": "HIGH", "confidence": "firm"}]
     ui = _AggHost()._compute_ui_aggregate([{"pass_nr": 1, "findings": findings}], {"open_ports": [], "service_info": {}})
     self.assertEqual([f["finding_id"] for f in ui.top_findings], ["id0001", "n1"])
-    self.assertEqual(ui.total_findings, 4)  # raw record count
+    # RM-200: the tentative CVE row is outside the total and counted apart (the raw findings stay in the archive).
+    self.assertEqual((ui.total_findings, ui.unconfirmed_version_matches), (3, 1))
 
   def _top(self, findings, triage=None):
     passes = [{"pass_nr": 1, "findings": findings}]

@@ -14,7 +14,8 @@ Without a cache the function behaves as before — static severity only
 
 import re
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from .cve_catalog_expansion import EXPANDED_CVE_ROWS
 from .cve_cvss_vectors import CVE_CVSS_VECTORS
 from .cvss import cvss31_base_score
@@ -512,15 +513,25 @@ def backport_status(product: str, cve_id: str, package) -> str:
   return BACKPORT_NOT_FIXED
 
 
+# The `banner_verified` contract of `check_cves` and `_confidence_reason` (RM-200). Owner ruling 2026-11-17:
+# "firm only on a verified banner" applies where a banner check exists (SSH, SMTP) and nowhere else.
+#   BANNER_NOT_ASSESSABLE (the default): no banner check exists for the product; confidence is unchanged.
+#   None:  a check exists but could not run (no KEXINIT, no EHLO reply); a database-firm row is tentative `banner_only`.
+#   True:  the protocol behaviour matches the announced implementation; confidence is unchanged.
+#   False: it contradicts it (an emulator); every row is tentative `banner_unverified`.
+BANNER_NOT_ASSESSABLE = "not_assessable"
+
 # Why a CVE whose version range matched was still not reported.
 NOT_APPLICABLE_CLIENT_SIDE = "client_side"
 NOT_APPLICABLE_BACKPORT_FIXED = "backport_fixed"
+# A probe read the service's own protocol behaviour and it clears the CVE (RM-200: Terrapin, from the KEXINIT).
+NOT_APPLICABLE_BEHAVIOUR_CLEARED = "behaviour_cleared"
 
 
 def _record_not_applicable(entry, product: str, version: str, package, reason: str) -> None:
   """Note a matched-but-skipped CVE in the scan-local collector, if one is set.
 
-  Only the two reasons a reader could dispute are recorded. A version outside
+  Only the three reasons a reader could dispute are recorded (client side, backport fixed, behaviour cleared). A version outside
   the CVE's range was never a candidate, so listing it would bury these rows
   under the whole catalog for the product.
   """
@@ -545,6 +556,54 @@ def _record_not_applicable(entry, product: str, version: str, package, reason: s
   }
 
 
+def clear_cve(findings: list, cve_id: str, product: str, version: str, package, reason: str) -> list:
+  """`findings` without the banner row of `cve_id`, which a probe's own evidence cleared (RM-200).
+
+  The row is not deleted silently: it is recorded as not applicable with `reason` (keyed by the current
+  probe port and the CVE), as a backport fix is.
+  """
+  kept = []
+  for f in findings:
+    if cve_id in (f.cve or ()):
+      _record_not_applicable(SimpleNamespace(cve_id=cve_id, title=f.title), product, version, package, reason)
+    else:
+      kept.append(f)
+  return kept
+
+
+def withdraw_not_applicable(cve_id: str) -> None:
+  """Drop this probe port's `backport_fixed` record of `cve_id`: the probe's own evidence says the CVE applies."""
+  collector = _CURRENT_NOT_APPLICABLE.get()
+  if collector is None:
+    return
+  port = current_probe_port()
+  key = f"{port if port is not None else ''}/{cve_id}"
+  if (collector.get(key) or {}).get("reason") == NOT_APPLICABLE_BACKPORT_FIXED:
+    del collector[key]
+
+
+def _stamp_identity(finding, product: str, version: str, tail: str):
+  """`finding` with both identity keys over `product:version:tail` (a CVE id, or `eol`)."""
+  identity = {"probe_id": f"cve:{product}", "asset_canonical": f"{product}:{version}:{tail}"}
+  return finding.with_identity(
+    finding_signature=finding.compute_signature(**identity),
+    finding_id=finding.compute_dedup_key(**identity),
+  )
+
+
+def confirm_cve(finding, product: str, version: str, evidence: str, reason: str = "behaviour_confirmed",
+                unverified: bool = False):
+  """`finding` with a probe's own evidence (RM-200: Terrapin from the KEXINIT); identity is recomputed.
+
+  Certain, unless the banner is unverified: an emulator's behaviour proves nothing about a real server, so the
+  row keeps the evidence but stays tentative `banner_unverified`.
+  """
+  confidence, reason = ("tentative", "banner_unverified") if unverified else ("certain", reason)
+  confirmed = replace(finding, confidence=confidence, confidence_reason=reason,
+                      evidence=f"{finding.evidence}; {evidence}" if finding.evidence else evidence)
+  return _stamp_identity(confirmed, product, version, finding.cve[0])
+
+
 def check_cves(
   product: str,
   version: str,
@@ -553,6 +612,7 @@ def check_cves(
   dynamic_cache=None,
   package=None,
   inferred_span=None,
+  banner_verified=BANNER_NOT_ASSESSABLE,
 ) -> list:
   """Match version against CVE database. Returns list of Findings.
 
@@ -570,6 +630,11 @@ def check_cves(
   ``inferred_span`` is a pair of versions a probe proved (Heartbleed: ``1.0.1`` to ``1.0.1f``). Under
   ``generated`` only rows that hold across the span keep their confidence; the rest are tentative
   ``inferred_version``. ``static`` ignores it.
+
+  ``banner_verified`` is the probe's verdict on the banner (RM-200); the contract is stated at
+  ``BANNER_NOT_ASSESSABLE``. Omitted: no check exists for the product and nothing changes. ``None``: the check
+  could not run, so a database-firm row is tentative ``banner_only``. ``True``: unchanged. ``False``: every row is
+  tentative ``banner_unverified``, under ``static`` too.
   """
   if dynamic_cache is None:
     dynamic_cache = get_dynamic_reference_cache()
@@ -588,7 +653,7 @@ def check_cves(
       if status == BACKPORT_FIXED:
         _record_not_applicable(match, product, version, package, NOT_APPLICABLE_BACKPORT_FIXED)
         continue
-      findings.append(_build_finding(match, product, version, dynamic_cache, backport_status=status, reader=reader))
+      findings.append(_build_finding(match, product, version, dynamic_cache, backport_status=status, reader=reader, banner_verified=banner_verified))
     oldest = reader.unsupported(product, version) if applicability in ("", SERVER_APPLICABILITY) else None
     if oldest:
       findings.append(_unsupported_finding(product, version, oldest, reader))
@@ -613,7 +678,7 @@ def check_cves(
     if status == BACKPORT_FIXED:
       _record_not_applicable(entry, product, version, package, NOT_APPLICABLE_BACKPORT_FIXED)
       continue
-    findings.append(_build_finding(entry, product, version, dynamic_cache, backport_status=status))
+    findings.append(_build_finding(entry, product, version, dynamic_cache, backport_status=status, banner_verified=banner_verified))
   return findings
 
 
@@ -668,7 +733,8 @@ _BACKPORTED_PRODUCTS = frozenset({
   "proftpd", "redis", "memcached", "mongodb", "couchdb", "tomcat", "vsftpd", "dovecot", "postfix",
 })
 # Order in which one reason wins when several apply (report-findings.md, Per-finding fields).
-_TENTATIVE_REASON_ORDER = ("eol_unassessed", "inferred_version", "platform_dependent", "local_vector", "backport_unknown", "banner_only", "nvd_exact", "cna_range")
+# `banner_unverified` is first: the version itself is untrusted, so no other reason is worth stating (RM-200).
+_TENTATIVE_REASON_ORDER = ("banner_unverified", "eol_unassessed", "inferred_version", "platform_dependent", "local_vector", "backport_unknown", "banner_only", "nvd_exact", "cna_range")
 
 
 def _static_cwe_id(cve_id: str) -> str:
@@ -691,8 +757,13 @@ def _local_vector_only(match) -> bool:
   return bool(vectors) and all(re.search(r"/AV:[LP](/|$)", v) for v in vectors)
 
 
-def _confidence_reason(backport_status: str, match, product: str) -> tuple:
-  """`(confidence, reason)` of a CVE finding. `match` is a reader `Match`, or None under `static`."""
+def _confidence_reason(backport_status: str, match, product: str, banner_verified=BANNER_NOT_ASSESSABLE) -> tuple:
+  """`(confidence, reason)` of a CVE finding. `match` is a reader `Match`, or None under `static`.
+
+  `banner_verified`: see `check_cves`. False wins over everything, under `static` too.
+  """
+  if banner_verified is False:
+    return "tentative", "banner_unverified"
   if backport_status == BACKPORT_NOT_FIXED and not (match and match.platform_dependent):
     return "firm", "distro_package"
   if match is None:
@@ -709,10 +780,14 @@ def _confidence_reason(backport_status: str, match, product: str) -> tuple:
   for reason in _TENTATIVE_REASON_ORDER + tuple(sorted(reasons - set(_TENTATIVE_REASON_ORDER))):
     if reason in reasons:
       return "tentative", reason
+  if banner_verified is None and match.confidence != "tentative":
+    # A database-firm row rests on the announced version alone: unproven for a banner no probe could check.
+    return "tentative", "banner_only"
   return match.confidence, match.reason
 
 
-def _build_finding(entry, product: str, version: str, dynamic_cache, backport_status: str = "", reader=None):
+def _build_finding(entry, product: str, version: str, dynamic_cache, backport_status: str = "", reader=None,
+                   banner_verified=BANNER_NOT_ASSESSABLE):
   """Construct a Finding for a matched CveEntry, optionally enriched
   via the dynamic reference cache. With a `reader`, `entry` is a reader `Match` (`generated`)."""
   generated = reader is not None
@@ -798,7 +873,7 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
   # left to the reader (RM-070). `not_fixed` is the one case the evidence
   # supports beyond the upstream version, so it is the one case that is not
   # `tentative`.
-  confidence, confidence_reason = _confidence_reason(backport_status, entry if generated else None, product)
+  confidence, confidence_reason = _confidence_reason(backport_status, entry if generated else None, product, banner_verified)
   if backport_status == BACKPORT_NOT_FIXED:
     backport_note = (
       " The distribution package is below the revision that carries the fix, "
@@ -857,14 +932,7 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
   # dedup key to be recomputed downstream by `enrich_finding_for_probe` from the
   # *probe* name with no override, so the finding travelled with a signature
   # built over one identity basis and a dedup key built over another.
-  identity = {
-    "probe_id": f"cve:{product}",
-    "asset_canonical": f"{product}:{version}:{entry.cve_id}",
-  }
-  return finding.with_identity(
-    finding_signature=finding.compute_signature(**identity),
-    finding_id=finding.compute_dedup_key(**identity),
-  )
+  return _stamp_identity(finding, product, version, entry.cve_id)
 
 
 def _unsupported_finding(product: str, version: str, oldest: str, reader):
@@ -884,11 +952,7 @@ def _unsupported_finding(product: str, version: str, oldest: str, reader):
     tags=("vulndb_eol", product),
     kev=False,
   )
-  identity = {"probe_id": f"cve:{product}", "asset_canonical": f"{product}:{version}:eol"}
-  return finding.with_identity(
-    finding_signature=finding.compute_signature(**identity),
-    finding_id=finding.compute_dedup_key(**identity),
-  )
+  return _stamp_identity(finding, product, version, "eol")
 
 
 def _parse_cwe_int(cwe_str: str) -> int:
