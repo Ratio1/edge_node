@@ -1963,7 +1963,7 @@ class TenantAdministrationService:
 
   @_endpoint
   def update_super_tenant_branding(self, actor, changes):
-    """`changes` = `{theme?, logo?}`, `logo` the plugin's stored reference or None. Answers the DTO,
+    """`changes` = `{theme?, logo?, display_name?, name_in?}`, `logo` the plugin's stored reference or None. Answers the DTO,
     the keys whose value changed and the reference the write dropped (the plugin deletes its file);
     nothing changed, nothing written."""
     account = self._branding_writer(actor)
