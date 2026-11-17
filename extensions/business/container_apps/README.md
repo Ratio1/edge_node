@@ -429,16 +429,23 @@ because the disk API of plugin code refuses that folder (the core's `RESTRICTED_
 - **Rollback:** an image without `docker/daemon.json` does not see this store. It pulls every app image
   into the node container's own layer, as before, while the store stays on the host: for that time the host
   needs free space for the app images a second time.
-- **A daemon that does not start:** the node images start through `cmds/node_entrypoint`. It runs the base
-  image entrypoint and, when that fails, logs "The inner Docker daemon did not start: removing its kept
-  store.", removes the store directory and stops the container with exit code 1. The next start begins on an
-  empty store, as every start did before the store was kept: nothing has to be removed on the host, and
-  every app image is pulled again once (stopped containers and anonymous volumes in the store go with it).
-  The script cannot tell why the daemon did not start, so any failed start empties the store: a store file
-  dockerd refuses (seen only with a file damaged by hand), but also a node container started without
-  privileges, an iptables fault, a wrong `DOCKERD_READY_TIMEOUT` or a daemon that takes longer than that
-  time (120 s) to answer. A start with `EE_DD=0` starts no daemon and removes nothing. A container started
-  with another entrypoint (`--entrypoint`, `entrypoint:` in a compose file) does not get this recovery.
+- **A daemon that does not start:** the node images start through `cmds/node_entrypoint`. Before each try it
+  removes `/var/run/docker/containerd/containerd.pid`, the file in which dockerd keeps the process number of
+  its containerd: a node container restarted in place (`docker stop` and `start`, `docker restart`, a restart
+  policy) keeps its `/var/run`, and in the new run that number often belongs to a live process, so dockerd
+  would refuse to start on a healthy store. It then runs the base image entrypoint. When that fails it logs
+  "The inner Docker daemon did not start: trying once more." and tries once more. When the second try fails
+  too it logs "The inner Docker daemon did not start a second time: removing its kept store.", removes the
+  store directory and stops the container with exit code 1. The next start begins on an empty store, as
+  every start did before the store was kept: nothing has to be removed on the host, and every app image is
+  pulled again once (stopped containers and anonymous volumes in the store go with it). The script cannot
+  tell why the daemon did not start, so any two failed tries empty the store: a store file dockerd refuses
+  (seen only with a file damaged by hand), but also a node container started without privileges, an
+  iptables fault, a wrong `DOCKERD_READY_TIMEOUT` or a daemon that takes longer than that time (120 s) to
+  answer. A try on a store dockerd refuses fails within seconds; a daemon that does not answer costs two
+  such waits before the store goes. A start with `EE_DD=0` starts no daemon and removes nothing but that
+  file. A container started with another entrypoint (`--entrypoint`, `entrypoint:` in a compose file) does
+  not get this recovery.
 - **One node per cache folder:** before it starts the daemon, `cmds/node_entrypoint` locks
   `_bin/docker/29.lock` (beside the store, not in it), and the node container holds that lock until it ends,
   also after a kill; nothing has to remove it. A second container of a node image started on the
