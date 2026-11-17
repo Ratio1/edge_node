@@ -148,9 +148,11 @@ class VerdictTests(unittest.TestCase):
     self.assertIn("HELP", why)
     self.assertEqual(_smtp_banner_verdict("exim", EXIM_EHLO), (True, ""))
 
-  def test_smtp_unjudged_without_ehlo_and_other_mtas_verified(self):
+  def test_smtp_unjudged_without_ehlo_and_other_mtas_not_assessable(self):
     self.assertEqual(_smtp_banner_verdict("exim", []), (None, ""))
-    self.assertEqual(_smtp_banner_verdict("postfix", MAILONEY_EHLO), (True, ""))
+    # Only Exim has a check (owner ruling 2026-11-17); other MTAs keep their confidence, with or without EHLO.
+    self.assertEqual(_smtp_banner_verdict("postfix", MAILONEY_EHLO), (cve_db.BANNER_NOT_ASSESSABLE, ""))
+    self.assertEqual(_smtp_banner_verdict("opensmtpd", []), (cve_db.BANNER_NOT_ASSESSABLE, ""))
 
 
 class TerrapinKexinitTests(unittest.TestCase):
