@@ -22,9 +22,13 @@ pn, pm    calls of the plugin's ``process`` so far and their mean wall time in s
           DEBUG; both None otherwise), so a reader gets the mean process time of any window
 
 Per sample, besides process and control-group counters: ``main_iter``, the node's main-loop iterations so
-far. The period is ``R1_LOCALNET_PROBE_PERIOD`` seconds (default 5; ``init --probe-period``).
+far, and two readings of the oracle-only secret: ``osec_env`` (its variable is in this process's ``os.environ``)
+and ``osec`` (``osec_check`` of the value the SDK holds in memory, None when it holds none, ``"n/a"`` for an SDK
+without the holder). The period is ``R1_LOCALNET_PROBE_PERIOD`` seconds (default 5; ``init --probe-period``).
 """
 
+# SHA-256 of the check of the oracle-only secret (osec_check).
+import hashlib
 import json
 import os
 import threading
@@ -58,6 +62,62 @@ def _read_cgroup():
   except Exception:
     pass
   return res
+
+
+# The seed variable of the oracle-only secret (the SDK's ``dAuth.DAUTH_ORACLE_SECRET_ENV_KEY``, from SDK 3.5.72).
+ORACLE_SECRET_ENV = 'EE_ORACLE_R1FS_SECRET'
+
+
+def osec_check(value):
+  """
+  Oracle secret check: a short hash of an oracle-only secret, the same as the host tool's ``lnlib.common.osec_check``.
+
+  Kept here because the probe runs inside the node process and imports nothing from the tool's packages.
+
+  Parameters
+  ----------
+  value : str
+    The secret.
+
+  Returns
+  -------
+  str
+    12 lowercase hex characters.
+
+  Examples
+  --------
+  >>> len(osec_check('ab' * 32))
+  12
+  """
+  # SHA-256 of a fixed context and the value, cut to 48 bits, as the host computes it.
+  return hashlib.sha256(b'localnet-osec-check:' + value.encode()).hexdigest()[:12]
+
+
+def _oracle_secret_state():
+  """
+  Oracle secret state: where this node process keeps the oracle-only secret, read from inside the process.
+
+  Returns
+  -------
+  dict
+    ``osec_env``: True when the variable is in ``os.environ`` (a seed's process before its engine build, or a node
+    whose SDK never removes it); ``osec``: ``osec_check`` of the value the SDK holds in memory, None when it holds
+    none, or ``"n/a"`` when the SDK has no holder (the previous release).
+
+  Examples
+  --------
+  >>> _oracle_secret_state()   # a worker on SDK 3.5.72
+  {'osec_env': False, 'osec': None}
+  """
+  # The SDK's engine class, from the overlay the node runs (already imported by the node at this point).
+  from ratio1.bc.base import BaseBlockEngine
+  # The reader of the in-memory holder; an SDK of the previous release has none.
+  reader = getattr(BaseBlockEngine, 'oracle_secret', None)
+  # The value this process holds, never written anywhere: only its check is.
+  held = reader() if reader is not None else None
+  # The variable's presence and the check of the held value.
+  return {'osec_env': ORACLE_SECRET_ENV in os.environ,
+          'osec': 'n/a' if reader is None else (None if held is None else osec_check(held))}
 
 
 def _open_fds():
@@ -171,7 +231,8 @@ class Probe(threading.Thread):
     dict
       ``t`` (epoch seconds), ``up`` (seconds since the probe started), ``cpu`` (process CPU seconds), open file
       descriptors, process and control-group counters and, with the node attached, ``plugins`` (per plugin
-      instance: inputs, queue, loop rate and iterations) and ``main_iter`` (main-loop iterations so far).
+      instance: inputs, queue, loop rate and iterations), ``main_iter`` (main-loop iterations so far) and the
+      oracle-only secret's ``osec_env`` and ``osec`` (``_oracle_secret_state``).
 
     Examples
     --------
@@ -192,6 +253,8 @@ class Probe(threading.Thread):
       # Iterations of the node's main loop so far (the "itr" of its heartbeat line), so a reader can find the
       # pauses of the main loop at the probe's resolution instead of the heartbeat line's 20 s average.
       row['main_iter'] = self.eng._main_loop_counts['ITER']
+      # Where the oracle-only secret is kept, from the node's own Python: in os.environ and in the SDK's holder.
+      row.update(_oracle_secret_state())
     return row
 
   def run(self):

@@ -166,3 +166,34 @@ def sync_secret(secrets, name):
   material = json.dumps(secrets, sort_keys=True).encode()
   # HMAC-SHA256 of the name, in hex: 32 bytes as 64 lowercase hex characters.
   return hmac.new(material, b'container-sync-secret:' + name.encode(), hashlib.sha256).hexdigest()
+
+
+# The seed variable of the oracle-only secret (the SDK's ``dAuth.DAUTH_ORACLE_SECRET_ENV_KEY``, from SDK 3.5.72).
+ORACLE_SECRET_ENV = 'EE_ORACLE_R1FS_SECRET'
+
+
+def osec_check(value):
+  """
+  Oracle secret check: a short hash of an oracle-only secret, so two values can be compared without writing either.
+
+  The node probe (``node/probe.py``, which imports nothing from this package) computes the same hash of the value a
+  node holds in memory; the host computes it of the value ``init --oracle-secret NAME`` gave the seeds. The context
+  prefix keeps it apart from every form ``sync_needles`` scans for (the value, its SHA-256 and the MAC subkey).
+
+  Parameters
+  ----------
+  value : str
+    The secret.
+
+  Returns
+  -------
+  str
+    12 lowercase hex characters.
+
+  Examples
+  --------
+  >>> osec_check('ab' * 32) == osec_check('ab' * 32), osec_check('ab' * 32) == osec_check('cd' * 32)
+  (True, False)
+  """
+  # SHA-256 of a fixed context and the value, cut to 48 bits: enough to tell two values apart, useless to find one.
+  return hashlib.sha256(b'localnet-osec-check:' + value.encode()).hexdigest()[:12]

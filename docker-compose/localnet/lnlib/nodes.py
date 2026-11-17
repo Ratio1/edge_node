@@ -15,6 +15,8 @@ import time
 
 from .common import (
   HERE, LABEL, NODE_IMAGE, PROJECT, PYTHON, LocalnetError, compose, container, ctl_exec, ip, log, sh, tool_run,
+  # The seeds' oracle-only secret (init --oracle-secret): its variable, its value from a name, its check hash.
+  ORACLE_SECRET_ENV, osec_check, sync_secret,
 )
 from .infra import BROKERS
 
@@ -356,6 +358,32 @@ def _startup_overrides(node):
 
 
 def node_env(node, manifest, secrets):
+  """
+  Node environment: the variables one node's container starts with.
+
+  Every node gets its name, network and the localnet's paths. A seed also gets the whole configuration a
+  mainnet seed keeps in its ``.env`` (brokers, relay, tunnels, dAuth marker, revoked list) and, when ``init
+  --oracle-secret`` named one, the fake oracle-only secret. Other nodes receive their settings from dAuth.
+
+  Parameters
+  ----------
+  node : dict
+    A node of ``plan``; reads ``name``, ``role``, ``evm_net``, ``broker``, ``relay`` and ``env``.
+  manifest : dict
+    The localnet's manifest; reads ``mesh``, ``relays``, ``revoked_addresses`` and ``oracle_secret``.
+  secrets : dict
+    The localnet's generated secrets (broker and relay credentials; the key of the derived oracle secret).
+
+  Returns
+  -------
+  dict
+    Variable name -> value, written to the node's ``env`` file.
+
+  Examples
+  --------
+  >>> node_env({'name': 'r1w-01', 'role': 'worker', 'evm_net': 'mainnet'}, manifest, secrets)['EE_ID']
+  'r1w-01'
+  """
   env = {
     'R1_LOCALNET': '1',
     'EE_EVM_NET': node['evm_net'],
@@ -387,8 +415,141 @@ def node_env(node, manifest, secrets):
       'EE_IPFS_CERTIFICATE_BASE64': relay['cert_b64'],
       'EE_SWARM_KEY_CONTENT_BASE64': secrets['relay']['swarm_key_b64'],
     })
+    if manifest.get('oracle_secret'):
+      # A fake oracle-only secret, as the team sets it in each mainnet seed's .env (seeds only): derived from the
+      # cluster's private settings and the name init --oracle-secret gave, so only this environment file holds it.
+      env[ORACLE_SECRET_ENV] = sync_secret(secrets, manifest['oracle_secret'])
   env.update(node.get('env') or {})
   return env
+
+
+def oracle_secret_state(home, manifest, value):
+  """
+  Oracle secret state: where every real node keeps the seeds' oracle-only secret, from each node's own probe.
+
+  The probe runs inside the node's Python process and writes, per sample, whether the variable is in that
+  process's ``os.environ`` (``osec_env``) and the check hash of the value its SDK holds in memory (``osec``).
+  The value itself is never read back: the host compares check hashes only.
+
+  Parameters
+  ----------
+  home : Home
+    The localnet's state folder; reads ``<run>/out/<node>/probe.jsonl``.
+  manifest : dict
+    The localnet's manifest; reads ``nodes`` (name, role, arm).
+  value : str
+    The seeds' secret (never printed; only its check hash is compared).
+
+  Returns
+  -------
+  dict
+    ``nodes``: per node its role, tree, samples with the readings, the last sample's time, ``env`` and ``held``
+    (``match``, ``other``, ``none`` or ``n/a``), the first time it held the seeds' value, the last time its
+    ``os.environ`` held the variable, and whether it ever held anything; ``failures`` and ``ok``. It fails when a
+    node's last sample still has the variable in ``os.environ``, when a seed or oracle whose SDK has the holder
+    does not hold the seeds' value at its last sample, when any node ever held another value, when a worker ever
+    held a value, or when a node has no sample with the readings.
+
+  Examples
+  --------
+  >>> oracle_secret_state(home, home.manifest(), sync_secret(home.secrets(), 'osec'))['ok']
+  True
+  """
+  # The check hash of the seeds' value, the only form compared.
+  expected = osec_check(value)
+  # Per node results, and the reasons for a FAIL.
+  nodes, failures = {}, []
+  # Every real node: seeds, oracles and workers.
+  for node in manifest['nodes']:
+    # The node's probe file on the host (bind-mounted at /out in its container).
+    path = home.run / 'out' / node['name'] / 'probe.jsonl'
+    # Its samples that carry the readings (the probe writes them once the node is attached).
+    rows = [row for row in (json.loads(line) for line in path.read_text().splitlines() if line.strip()) if 'osec' in row] if path.exists() else []
+    if not rows:
+      # A node that could not be read is no proof of anything.
+      failures.append('{}: no probe sample with the oracle secret readings'.format(node['name']))
+      continue
+    # Each sample's held value as a word: the seeds' value, another one, none, or no holder in this SDK.
+    words = ['n/a' if row['osec'] == 'n/a' else 'none' if row['osec'] is None else 'match' if row['osec'] == expected else 'other' for row in rows]
+    # The last sample decides the node's current state.
+    last, held = rows[-1], words[-1]
+    # The node's readings: role, tree, samples, last state, first match and last variable time, any value ever held.
+    nodes[node['name']] = {
+      'role': node['role'], 'arm': node['arm'], 'samples': len(rows), 'last_t': last['t'], 'env': last['osec_env'],
+      'held': held,
+      # When the node first held the seeds' value (a seed: its engine build; another oracle: its start-up dAuth).
+      'first_match_t': next((row['t'] for row, word in zip(rows, words) if word == 'match'), None),
+      # The last sample whose os.environ still held the variable (a seed: before its engine build).
+      'last_env_t': next((row['t'] for row in reversed(rows) if row['osec_env']), None),
+      # Whether any sample held any value.
+      'ever_held': any(word in ('match', 'other') for word in words),
+    }
+    if last['osec_env']:
+      # The variable is still in the node process's environment.
+      failures.append('{}: the variable is in os.environ at the last sample'.format(node['name']))
+    if node['role'] in ('seed', 'oracle') and held not in ('match', 'n/a'):
+      # An oracle with the holder must hold the seeds' value after its start-up dAuth (a seed after its build).
+      failures.append('{}: holds {} instead of the seeds\' value'.format(node['name'], held))
+    if 'other' in words:
+      # Another value anywhere means a wrong secret reached the node.
+      failures.append('{}: held another value'.format(node['name']))
+    if node['role'] == 'worker' and nodes[node['name']]['ever_held']:
+      # A worker must never receive the oracle-only secret.
+      failures.append('{}: a worker held an oracle secret'.format(node['name']))
+  # The whole check.
+  return {'nodes': nodes, 'failures': failures, 'ok': not failures}
+
+
+def oracle_secret_text(report):
+  """
+  Oracle secret text: a short human summary of an ``oracle_secret_state`` report.
+
+  Parameters
+  ----------
+  report : dict
+    Result of ``oracle_secret_state``.
+
+  Returns
+  -------
+  str
+    One line per node (role, tree, samples, last ``env`` and ``held``, first match and last variable time in UTC),
+    then ``PASS`` or ``FAIL`` and the reasons.
+
+  Examples
+  --------
+  >>> print(oracle_secret_text({'nodes': {}, 'failures': [], 'ok': True}))
+  PASS
+  """
+  # Epoch seconds as UTC clock time, or '-'.
+  def utc(value):
+    """
+    UTC: an epoch time as ``HH:MM:SS`` UTC.
+
+    Parameters
+    ----------
+    value : float or None
+      Epoch seconds.
+
+    Returns
+    -------
+    str
+      The clock time, or ``-`` for None.
+
+    Examples
+    --------
+    >>> utc(0)
+    '00:00:00'
+    """
+    # gmtime: the node log stamps are UTC as well.
+    return time.strftime('%H:%M:%S', time.gmtime(value)) if value is not None else '-'
+  # One line per node.
+  lines = ['  {:<9} {:<6} {:<5} samples {:>5}  env {!s:<5} held {:<5} first match {}  last env {}  last sample {}'.format(
+    name, item['role'], item['arm'], item['samples'], item['env'], item['held'], utc(item['first_match_t']),
+    utc(item['last_env_t']), utc(item['last_t'])) for name, item in report['nodes'].items()]
+  # The verdict last.
+  lines.append('PASS' if report['ok'] else 'FAIL: ' + '; '.join(report['failures']))
+  # One text block.
+  return '\n'.join(lines)
 
 
 def node_startup(node):

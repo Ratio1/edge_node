@@ -165,6 +165,16 @@ oracles that run it.
 - `down` kills each node that runs Docker and detaches the loop devices of its apps' volumes from a
   throwaway privileged container on the internal network; it reports any loop device left.
 
+### Oracle-only secret
+
+`init --oracle-secret NAME` puts a fake oracle-only secret in every seed's environment
+(`EE_ORACLE_R1FS_SECRET`, as mainnet seeds get it in their `.env`), derived from the cluster's private
+`secrets.json` and the name. The probe of every node records, from inside the node process, whether the
+variable is in its `os.environ` (`osec_env`) and a check hash of the value its SDK holds in memory (`osec`;
+`n/a` for an SDK without the holder). `osecret NAME` compares those readings with the seeds' value by check
+hash and prints PASS when no node keeps the variable, every seed and oracle with the holder holds the
+seeds' value, and no worker ever held one. `scan NAME` searches every node for the value itself.
+
 Other commands: `status`, `collect` (measure the last minutes by hand), `profile` (which threads and
 functions hold the interpreter lock), `replicas` (records each oracle lacks compared with the others;
 `--namespaces A,B` also per hash namespace; the replica file is copied out with `docker cp` and read on the

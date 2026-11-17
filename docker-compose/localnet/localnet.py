@@ -216,6 +216,8 @@ def cmd_init(args):
   log('creating {} emulated node identities ({} of them revoked)'.format(args.fleet + args.revoked, args.revoked))
   fleet = nodelib.create_fleet_identities(home, args.arm, args.evm_net, licensed=args.fleet, revoked=args.revoked)
   manifest = {
+    # The name of the seeds' fake oracle-only secret (None: no seed gets one); the value is derived, never stored.
+    'oracle_secret': args.oracle_secret,
     'created': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'mesh': mesh, 'relays': relays, 'nodes': plan,
     'evm_net': args.evm_net, 'fleet': fleet, 'legacy_jobs': (seeded or {}).get('legacy_jobs', []),
     'cpus': {'infra': args.infra_cpus, 'nodes': args.node_cpus} if args.infra_cpus or args.node_cpus else {},
@@ -672,6 +674,39 @@ def cmd_custody(args):
   return 0 if report['ok'] else 1
 
 
+def cmd_osecret(args):
+  """
+  Oracle secret: print where every node keeps the seeds' oracle-only secret, from each node's probe, and PASS or FAIL.
+
+  Parameters
+  ----------
+  args : argparse.Namespace
+    ``name`` (the secret's name, as ``init --oracle-secret``; the value is derived and never printed), ``out``.
+
+  Returns
+  -------
+  int
+    0 on PASS, 1 on FAIL.
+
+  Examples
+  --------
+  >>> cmd_osecret(parser.parse_args(['osecret', 'osec']))
+  0
+  """
+  # The localnet folder: its manifest names the nodes, its private settings give the value.
+  home = Home(args.home)
+  # Every node's probe readings, compared by check hash with the seeds' value.
+  report = nodelib.oracle_secret_state(home, home.manifest(), sync_secret(home.secrets(), args.name))
+  if args.out:
+    # The full report (words, times and counts only, no value), when asked for.
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    # Sorted keys keep two reports comparable with diff.
+    Path(args.out).write_text(json.dumps(report, indent=1, sort_keys=True))
+  print(nodelib.oracle_secret_text(report))
+  # The exit code carries the verdict.
+  return 0 if report['ok'] else 1
+
+
 def cmd_scan(args):
   """
   Search every node for a set's secret in any of its forms and print PASS or FAIL with where it was found.
@@ -848,6 +883,10 @@ def main():
   one.add_argument('--startup-of', action='append', metavar='NODE=JSON',
                    help='start-up settings one node adds to the production file, as a JSON object merged two levels '
                         'deep, for example r1s-db=\'{"ADMIN_PIPELINE":{"CHAIN_STORE_BASE":{"CHAIN_STORE_DEBUG":true}}}\'')
+  # The oracle-only secret (D24): a fake value in every seed's environment, as on mainnet seeds; scan and osecret take NAME.
+  one.add_argument('--oracle-secret', metavar='NAME',
+                   help='put a fake oracle-only secret, derived from the cluster\'s private settings and NAME, in every '
+                        'seed\'s environment (EE_ORACLE_R1FS_SECRET)')
   one.set_defaults(func=cmd_init)
 
   one = sub.add_parser('up', help='start the localnet')
@@ -1020,6 +1059,15 @@ def main():
   one.set_defaults(func=cmd_custody)
 
   # Scan every node for a set's secret.
+  # Where each node keeps the seeds' oracle-only secret, from its probe (needs init --oracle-secret NAME).
+  one = sub.add_parser('osecret', help='where every node keeps the seeds\' oracle-only secret, from its probe')
+  # The same name as init --oracle-secret.
+  one.add_argument('name', metavar='NAME', help='name given to init --oracle-secret')
+  # The full report, for the result folder.
+  one.add_argument('--out', help='write the full report as JSON to this file')
+  # Run by main().
+  one.set_defaults(func=cmd_osecret)
+
   one = sub.add_parser('scan', help='search node logs, plugin data and store files for a set\'s secret')
   # The set's name, as given to sync-app --secret.
   one.add_argument('secret', metavar='NAME', help='name of the set\'s secret (as sync-app --secret)')

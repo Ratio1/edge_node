@@ -90,6 +90,111 @@ class TestTopology(unittest.TestCase):
     for key in ('EE_MQTT_HOST', 'EE_MQTT', 'EE_SUPERVISOR', 'EE_DAUTH_URL', 'EE_SWARM_KEY_CONTENT_BASE64'):
       self.assertNotIn(key, other_env)  # a node that is not a seed gets these from dAuth
 
+  def test_only_seeds_get_the_oracle_secret_and_only_when_named(self):
+    """``init --oracle-secret NAME`` puts the derived value in every seed's environment and in no other node's; without
+    the name no node gets the variable."""
+    from lnlib import nodes
+    from lnlib.common import ORACLE_SECRET_ENV, sync_secret
+    # Two seeds, one more oracle and one worker.
+    plan = nodes.plan(oracles=5, workers=1)
+    # The fields node_env reads of a node with an identity.
+    for node in plan:
+      node.update(address='0xai_x', eth_address='0x0')
+    # The manifest fields node_env reads of a seed, with the secret's name.
+    manifest = {
+      'mesh': {'brokers': {name: {'ip': '10.0.0.%d' % idx} for idx, name in enumerate(('emqx-a', 'emqx-b', 'emqx-c', 'emqx-d'))}},
+      'relays': {name: {'multiaddr': '/ip4/1/tcp/4001/p2p/x', 'api': 'https://x', 'cert_b64': 'c'} for name in ('relay-03', 'relay-04')},
+      'revoked_addresses': [], 'oracle_secret': 'osec',
+    }
+    # Throwaway settings, as init writes them.
+    secrets = {'mesh': {'client_username': 'u', 'client_password': 'p'},
+               'relay': {'relay_api_key_b64': 'k', 'swarm_key_b64': 's'}}
+    # Each node's environment with the name set.
+    envs = {node['name']: nodes.node_env(node, manifest, secrets) for node in plan}
+    # Every seed holds the value derived from the name; the oracle and the worker do not hold the variable.
+    self.assertEqual({name for name, env in envs.items() if ORACLE_SECRET_ENV in env}, {'r1s-01', 'r1s-02', 'r1s-03', 'r1s-04'})
+    self.assertEqual(envs['r1s-01'][ORACLE_SECRET_ENV], sync_secret(secrets, 'osec'))
+    # Without the name, no node gets it.
+    manifest['oracle_secret'] = None
+    self.assertFalse(any(ORACLE_SECRET_ENV in nodes.node_env(node, manifest, secrets) for node in plan))
+
+  def test_the_probe_and_the_host_compute_the_same_oracle_secret_check(self):
+    """The probe's check hash equals the host's, differs between values, and is none of the forms the scan looks for."""
+    import probe
+    from lnlib import apps
+    from lnlib.common import osec_check
+    # Two throwaway values.
+    one, two = 'ab' * 32, 'cd' * 32
+    self.assertEqual(probe.osec_check(one), osec_check(one))
+    self.assertNotEqual(osec_check(one), osec_check(two))
+    # The check is not the value, its SHA-256, its first 16 bytes or the MAC subkey, nor part of any of them.
+    self.assertFalse(any(osec_check(one) in needle for needle in apps.sync_needles(one).values()))
+
+  def test_oracle_secret_state_passes_only_when_oracles_hold_it_and_nobody_keeps_the_variable(self):
+    """From probe rows: a scrubbed seed, an oracle that got it by dAuth, an old oracle without a holder and a worker
+    that holds none pass; a worker that held it, an oracle that holds none and a seed whose variable stayed fail."""
+    from lnlib import nodes
+    from lnlib.common import osec_check
+
+    class Home:
+      run = None
+
+    # The seeds' value and its check.
+    value = 'ab' * 32
+    good = osec_check(value)
+    # Probe rows per node: (osec_env, osec) per sample, 5 s apart.
+    rows = {
+      'r1s-01': [(True, None), (False, good), (False, good)],
+      'r1s-db': [(False, None), (False, good)],
+      'r1s-ai01': [(False, 'n/a'), (False, 'n/a')],
+      'r1w-01': [(False, None), (False, None)],
+    }
+    # One manifest node per row set, with its role and tree.
+    manifest = {'nodes': [{'name': 'r1s-01', 'role': 'seed', 'arm': 'next'}, {'name': 'r1s-db', 'role': 'oracle', 'arm': 'next'},
+                          {'name': 'r1s-ai01', 'role': 'oracle', 'arm': 'old'}, {'name': 'r1w-01', 'role': 'worker', 'arm': 'next'}]}
+
+    def verdict(samples):
+      """
+      Verdict: the oracle secret state of the four nodes for the given rows.
+
+      Parameters
+      ----------
+      samples : dict
+        Node name -> list of ``(osec_env, osec)``.
+
+      Returns
+      -------
+      dict
+        The ``oracle_secret_state`` report.
+
+      Examples
+      --------
+      >>> verdict(rows)['ok']
+      True
+      """
+      with tempfile.TemporaryDirectory() as folder:
+        # The probe files where the host tool reads them.
+        Home.run = Path(folder)
+        for name, items in samples.items():
+          # The node's out folder.
+          out = Path(folder) / 'out' / name
+          out.mkdir(parents=True)
+          # One JSON line per sample, with a sample that has no readings first (before the node is attached).
+          lines = [json.dumps({'t': 99})] + [json.dumps({'t': 100 + 5 * idx, 'osec_env': env, 'osec': osec}) for idx, (env, osec) in enumerate(items)]
+          (out / 'probe.jsonl').write_text('\n'.join(lines))
+        return nodes.oracle_secret_state(Home, manifest, value)
+
+    # All four as they should be.
+    report = verdict(rows)
+    self.assertTrue(report['ok'], report['failures'])
+    self.assertEqual((report['nodes']['r1s-01']['first_match_t'], report['nodes']['r1s-01']['last_env_t']), (105, 100))
+    self.assertEqual([report['nodes'][name]['held'] for name in ('r1s-01', 'r1s-db', 'r1s-ai01', 'r1w-01')], ['match', 'match', 'n/a', 'none'])
+    # A worker that held the value once, an oracle that holds none, a seed whose variable stayed: three failures.
+    bad = dict(rows, **{'r1w-01': [(False, good), (False, None)], 'r1s-db': [(False, None)], 'r1s-01': [(True, good)]})
+    self.assertEqual(len(verdict(bad)['failures']), 3)
+    # Another value on an oracle fails too.
+    self.assertFalse(verdict(dict(rows, **{'r1s-db': [(False, osec_check('cd' * 32))]}))['ok'])
+
   def test_headless_nodes_disable_only_web_plugins(self):
     from lnlib import nodes
     overrides = nodes._startup_overrides({'headless': True})['ADMIN_PIPELINE']
