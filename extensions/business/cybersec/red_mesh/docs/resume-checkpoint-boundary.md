@@ -29,8 +29,11 @@ A network (blackbox) worker may resume execution inside a pass from a checkpoint
 
 - Files are plain pickle under `plugin_data/redmesh_ckpt/<job_id>/<pass_nr>_<local_id_prefix>.pkl`,
   written only through `diskapi_save_pickle_to_data` (atomic) by `services/checkpoint.py`.
-- Resume granularity: per port, and per completed service or web method. A method cut off by the
-  restart may run again.
+- Resume granularity: per port, and per completed service or web method, as of the last save. Saves
+  are throttled (a port save every `PORT_EVERY` ports, a save after each method, and any save other
+  than worker start or phase end at most once per `MIN_INTERVAL`), so
+  ports scanned and methods finished after the last save run again after a restart. A method cut off by
+  the restart may run again.
 - Validity rules (applied on load, Phase 3). A file is used only when all hold: `version` equals the
   current version; `job_id`, `pass_nr`, `ee_addr`, `scan_type`, `config_cid`, `target_ports` and the
   port range match the current assignment; the file is younger than `MAX_AGE`; the worker is not
@@ -42,7 +45,9 @@ A network (blackbox) worker may resume execution inside a pass from a checkpoint
   `version`, `job_id`, `pass_nr`, `ee_addr`, `report_cid`, `done`, `saved_at` and the live-row summary
   (`assignment_revision_seen`, port counts, open ports, completed tests, `started_at`,
   `first_seen_live_at`, `live_metrics`, `threads`, `scan_type`, phase counts). It holds no findings and
-  no credentials. If the marker cannot be saved, the pass files stay. After a restart, when CStore does
+  no credentials. If the marker cannot be saved, or the close does not publish the terminal row (for
+  example an R1FS store failure), no marker is written and the pass files stay until GC removes them
+  (at most one `GC_INTERVAL` after CStore shows the worker `finished`). After a restart, when CStore does
   not yet show this worker `finished` but a marker for the job's current pass exists, the node
   publishes the terminal `:live` row again from it and does not scan. The marker must match the job,
   pass, node and assignment revision; a bad or mismatched marker is deleted and the worker resumes or
