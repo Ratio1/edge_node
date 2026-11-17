@@ -258,6 +258,38 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     return f"git clone {repo_url} {repo_path}"
 
   def _confirm_app_readiness(self):
+    """
+    Confirm readiness only once the container runs the source this deployment is bound to.
+
+    Until the check has passed (once after each restart from scratch, which resets it), each call
+    reads the clone's HEAD inside the container (`git rev-parse HEAD`), checks it against the bound
+    Git commit, records it with the runtime artifacts, and then confirms readiness as the container
+    runner does; after that it only confirms readiness. A clone that is not there yet keeps the
+    worker waiting. A HEAD that differs from the bound commit is reported as "failed"
+    (WORKLOAD_START_FAILED): that container never runs the bound source. Any other error of the check
+    (the Docker exec, a HEAD that is not a commit id, the save of the artifacts) is logged in red and
+    not reported: the next lap checks again, so a worker whose check passes later is reported ready
+    and not left "failed".
+
+    Returns
+    -------
+    bool
+      True when readiness is confirmed; False while the worker waits, or after an error of the check.
+
+    Raises
+    ------
+    Exception
+      Only what the container runner's confirmation raises on a call after the check has passed. Every
+      error of the check itself, the two it raises (a HEAD that is not a commit id, a HEAD other than
+      the bound commit) included, is caught, logged in red, and returned as False.
+
+    Examples
+    --------
+    >>> worker._confirm_app_readiness()   # the clone runs the bound commit
+    True
+    >>> worker._confirm_app_readiness()   # the Docker exec raised: logged, tried again on the next lap
+    False
+    """
     if getattr(self, "_deployment_git_captured", False):
       return super()._confirm_app_readiness()
     try:
@@ -275,17 +307,21 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
         raise RuntimeError("The running source revision is unavailable")
       artifacts = self._get_pinned_deployment_artifacts()
       if artifacts.get("git_commit") and artifacts["git_commit"] != commit:
+        # Proven: this container runs another commit than the bound one, which no later check changes, so it is
+        # reported as failed (only a tracked deployment has a binding). Before, every error of the check was.
+        self.report_deployment_status("failed", error_code="WORKLOAD_START_FAILED")
         raise RuntimeError("The running source does not match its immutable binding")
       artifacts.update(self.get_deployment_runtime_artifacts())
       artifacts["git_commit"] = commit
       self._save_deployment_artifacts(artifacts)
       self._deployment_git_captured = True
       return super()._confirm_app_readiness()
-    except Exception:
+    except Exception as exc:
       self._app_ready = False
       self.set_plugin_ready(False)
-      if self._deployment_tracks_runtime():
-        self.report_deployment_status("failed", error_code="WORKLOAD_START_FAILED")
+      # Only the proven mismatch above is reported as failed; any other error is not, and the next lap checks again,
+      # as for a clone not there yet. Before, every error was, and that failure stayed although the worker later ran.
+      self.P("Could not confirm the running source revision: {}. Checked again on the next lap.".format(exc), color='r')
       return False
 
   def _collect_exec_commands(self):

@@ -36,7 +36,11 @@ __VER__ = '0.6.0'
 _CONFIG = {
   **BasePlugin.CONFIG,
 
-  'PORT': None,
+  # A fixed port instead of a drawn one. With the generator seeded the same way on every node, this
+  # app drew 31653 everywhere; the value is kept, so whatever reaches the app on that local port (a
+  # tunnel ingress set to it) still does once the draws differ per node. A fixed port that is taken
+  # is retried every 5 s; it is not drawn again.
+  'PORT': 31653,
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   'REQUEST_TIMEOUT': 600,
@@ -57,8 +61,9 @@ _CONFIG = {
   # stored and saved again by every oracle.
   'REQUESTS_TRACKED_ENDPOINTS': ['create_pipeline', 'update_pipeline', 'scale_up_job_workers', 'delete_pipeline', 'send_instance_command', 'send_app_command', 'reconcile_csp_escrow_jobs', 'save_preferred_nodes'],
   # At most one write of the record every 30 s (two a minute), however often the endpoints above are called.
-  # A change after a quiet period is written by the next process() call that runs past WARMUP_DELAY; process()
-  # runs at the end of the plugin lap, after the queued requests.
+  # A change after a quiet period is written at the request monitor's next turn (within about 0.25 s), also
+  # while an endpoint holds the plugin thread and during WARMUP_DELAY; the write does not wait for the other
+  # oracles. Before, process() wrote it at the end of the plugin lap, past WARMUP_DELAY, and waited for them.
   'REQUESTS_SAVE_INTERVAL': 30,
   'REQUESTS_LOG_INTERVAL' : 5 * 60,
   'REQUESTS_MAX_RECORDS' : 2,
@@ -97,6 +102,31 @@ class DeeployManagerApiPlugin(
     return self.cfg_deeploy_verbose or super(DeeployManagerApiPlugin, self).check_debug_logging_enabled()
 
   def on_init(self):
+    """
+    Start the Deeploy API: the request trace's state, the web app, the balance check and the operations worker.
+
+    The trace state is created first. The base ``on_init`` starts the web app's request monitor thread, which
+    calls ``on_request`` and ``on_request_monitor_tick`` from its first turn on; both use the trace state. The
+    rest runs as before: the ETH balance check (the tunnel engine is stopped when the balance is too low), the
+    managed-update bookkeeping and the deployment operations worker.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Until this method returns, the request monitor already admits requests and writes the trace, while the
+    fields created after the base ``on_init`` do not exist yet.
+
+    Examples
+    --------
+    >>> plugin.on_init()   # called once by the plugin runtime, after the configuration was loaded
+    """
+    # The trace state before the base on_init: that call starts the request monitor thread, which records
+    # requests and writes the trace at once. Before, the state was created after it and after the web3
+    # balance check below, so a request that arrived in between raised AttributeError in on_request.
+    self._init_request_tracking()
     super(DeeployManagerApiPlugin, self).on_init()
     my_address = self.bc.address
     my_eth_address = self.bc.eth_address
@@ -113,7 +143,6 @@ class DeeployManagerApiPlugin(
         color='r', boxed=True
       )
       self.maybe_stop_tunnel_engine()
-    self._init_request_tracking()
     self._pending_managed_update_actions = {}
     self._applied_managed_update_actions = {}
     self._managed_update_action_lock = threading.Lock()
@@ -249,6 +278,33 @@ class DeeployManagerApiPlugin(
 
   def on_response(self, method, response):
     self._track_response(method, response)
+    return
+
+  def on_request_monitor_tick(self):
+    """
+    Write the request trace from the request monitor thread.
+
+    The web-app base calls this hook at each turn of its request monitor: about every 0.25 s while no request
+    comes and right after each request was queued or refused. The trace (which tracked requests this oracle
+    received, and whether it answered them) is written here when it changed, at most once per
+    ``REQUESTS_SAVE_INTERVAL``, with a chain-store write that does not wait for the other oracles.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    The monitor thread is not held by an endpoint. A request whose endpoint hangs holds the plugin thread, and
+    with it ``process()``, where the trace was written before: the other oracles then never learned that this
+    oracle held the request. The monitor admits no request while this runs, so the work here stays short.
+
+    Examples
+    --------
+    >>> plugin.on_request_monitor_tick()   # nothing changed since the last write: nothing is written
+    """
+    # The trace's write, moved here from process(): this thread still turns while an endpoint hangs.
+    self._maybe_publish_tracked_requests()
     return
 
 
@@ -1700,6 +1756,26 @@ class DeeployManagerApiPlugin(
     return (self.time() - self.__warmup_start_time) > self.cfg_warmup_delay
 
   def process(self):
+    """
+    The end of each plugin lap: admit the jobs of relinked nodes and log every oracle's request trace.
+
+    Nothing runs before ``WARMUP_DELAY`` seconds have passed since ``on_init``. After that each lap moves the
+    jobs of relinked nodes (an error there is logged in red and the lap goes on) and, every
+    ``REQUESTS_LOG_INTERVAL`` seconds, logs the request traces of all oracles from the local replica.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    The trace itself is not written here any more: ``on_request_monitor_tick`` writes it, also before
+    ``WARMUP_DELAY`` has passed.
+
+    Examples
+    --------
+    >>> plugin.process()   # called by the plugin loop after the lap's queued requests
+    """
     if not self.is_deeploy_warmed_up():
       return
 
@@ -1708,5 +1784,7 @@ class DeeployManagerApiPlugin(
     except Exception as e:
       self.P(f"Error moving jobs from relinked nodes: {e}", color='r')
 
-    self._maybe_log_and_save_tracked_requests()
+    # Only the periodic log of every oracle's trace is left on the plugin thread: the trace is written from
+    # on_request_monitor_tick, where an endpoint that hangs cannot hold it back.
+    self._maybe_log_tracked_requests()
     return

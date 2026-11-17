@@ -3,13 +3,32 @@ import sys
 import threading
 import types
 from collections import deque
+# The core builds each `cfg_` property from a partial of its getter; `read_config_like_a_node` does the same.
+from functools import partial
 from unittest.mock import MagicMock
 
 import numpy as _np
 
 
 def install_docker_stub_if_needed():
-  """Provide the tiny docker-py surface these unit tests need."""
+  """
+  Provide the tiny docker-py surface these unit tests need.
+
+  Installs stand-in `docker`, `docker.errors` and `docker.types` modules unless all three are already loaded. It
+  looks at the loaded modules only, so a test module imported before anything loaded docker-py runs on the stand-ins
+  even where docker-py is installed: the stand-ins carry what the runner code uses from docker-py.
+
+  Returns
+  -------
+  None
+
+  Examples
+  --------
+  >>> install_docker_stub_if_needed()
+  >>> import docker
+  >>> docker.errors.APIError("refused", response=types.SimpleNamespace(status_code=409)).status_code
+  409
+  """
   if "docker" in sys.modules and "docker.errors" in sys.modules and "docker.types" in sys.modules:
     return
 
@@ -23,12 +42,75 @@ def install_docker_stub_if_needed():
   class NotFound(DockerException):
     pass
 
+  class APIError(DockerException):
+    """
+    docker-py's error for a request the daemon refused, with the HTTP status of its answer.
+
+    Parameters
+    ----------
+    message : str
+      The text of the error.
+    response : object, optional
+      The daemon's answer; its `status_code` is the status. None when there is none.
+    explanation : str, optional
+      What the daemon said.
+
+    Examples
+    --------
+    >>> APIError("refused", response=types.SimpleNamespace(status_code=409)).status_code
+    409
+    """
+
+    def __init__(self, message, response=None, explanation=None):
+      """
+      Keep the answer and the explanation, as docker-py does.
+
+      Parameters
+      ----------
+      message : str
+        The text of the error.
+      response : object, optional
+        The daemon's answer, with `status_code`; None when there is none.
+      explanation : str, optional
+        What the daemon said.
+
+      Returns
+      -------
+      None
+      """
+      # The text, as the exception's argument.
+      super().__init__(message)
+      # The answer that `status_code` reads, as docker-py keeps it.
+      self.response = response
+      # The daemon's own words, as docker-py keeps them.
+      self.explanation = explanation
+
+    @property
+    def status_code(self):
+      """
+      The HTTP status of the daemon's answer, as docker-py gives it.
+
+      Returns
+      -------
+      int or None
+        The status, None without an answer.
+
+      Examples
+      --------
+      >>> APIError("refused").status_code is None
+      True
+      """
+      # docker-py reads the status from the answer and gives None without one.
+      return self.response.status_code if self.response is not None else None
+
   class DeviceRequest:
     def __init__(self, **kwargs):
       self.kwargs = kwargs
 
   errors_mod.DockerException = DockerException
   errors_mod.NotFound = NotFound
+  # The error the runner's store sweep reads the status of.
+  errors_mod.APIError = APIError
   types_mod.DeviceRequest = DeviceRequest
   docker_mod.errors = errors_mod
   docker_mod.types = types_mod
@@ -176,6 +258,23 @@ class _DummyBasePlugin:
   def time(self):
     return 0
 
+  def get_node_running_time(self):
+    """
+    Seconds since the node started, as the plugin base gives it.
+
+    Returns
+    -------
+    int
+      0: the node has just started, so nothing that waits for a later moment of the node run happens.
+
+    Examples
+    --------
+    >>> _DummyBasePlugin().get_node_running_time()
+    0
+    """
+    # A node that has just started.
+    return 0
+
   def sleep(self, *args, **kwargs):
     return
 
@@ -240,6 +339,24 @@ finally:
 
 
 def make_container_app_runner():
+  """
+  Create a container app runner plugin without a node around it.
+
+  The plugin is built without `__init__`; what the plugin base and the configuration give on a node is
+  set as plain attributes, and log lines are collected in `plugin.logged_messages`.
+
+  Returns
+  -------
+  ContainerAppRunnerPlugin
+    A plugin with a default test configuration, a placeholder container and its own, empty, memory
+    shared between plugins.
+
+  Examples
+  --------
+  >>> plugin = make_container_app_runner()
+  >>> plugin.cfg_image
+  'test/image:latest'
+  """
   plugin = ContainerAppRunnerPlugin.__new__(ContainerAppRunnerPlugin)
   plugin.logged_messages = []
 
@@ -256,6 +373,8 @@ def make_container_app_runner():
   plugin.np = _np
   plugin._stream_id = "test_stream"
   plugin.cfg_instance_id = "car_instance"
+  # The memory all plugins of one node share; a test with several apps of one node gives them the same dict.
+  plugin.plugins_shmem = {}
   plugin.uuid = lambda *a, **k: "efgh"
   plugin.time = lambda: 0
   plugin.cfg_max_log_lines = 10
@@ -346,7 +465,29 @@ def make_mock_container(status="running", exit_code=0):
 
 
 def make_mock_docker_client(container=None):
-  """Create a mock Docker client with all required methods."""
+  """
+  Create a mock Docker client with all required methods.
+
+  The client finds and pulls one image, starts one container from it, and has no container with the
+  runner's name yet.
+
+  Parameters
+  ----------
+  container : MagicMock, optional
+    The container `containers.run` returns; a new one from make_mock_container() when omitted.
+
+  Returns
+  -------
+  tuple
+    `(client, container)`. `container.image` is the image the client finds and pulls, as docker-py
+    gives it for a container that was started from that image.
+
+  Examples
+  --------
+  >>> client, container = make_mock_docker_client()
+  >>> container.image is client.images.pull.return_value
+  True
+  """
   import docker.errors
 
   client = MagicMock()
@@ -365,18 +506,41 @@ def make_mock_docker_client(container=None):
   mock_image.attrs = {"RepoDigests": ["test/image@sha256:abc123"]}
   client.images.get.return_value = mock_image
   client.images.pull.return_value = mock_image
+  # The container was started from that image: docker-py resolves `container.image` to it, and the first update
+  # check of a run reads the app's version from there.
+  container.image = mock_image
   client.login.return_value = {"Status": "Login Succeeded"}
   return client, container
 
 
 def make_lifecycle_runner(docker_client=None, mock_container=None, **cfg_overrides):
-  """Create a plugin fully wired for lifecycle testing.
+  """
+  Create a plugin fully wired for lifecycle testing.
 
   Extends make_container_app_runner() with all attributes needed to call
   on_init(), process(), _handle_initial_launch(), _restart_container(),
-  stop_container(), on_close(), and _check_container_status().
+  stop_container(), on_close(), and _check_container_status(), set as
+  `__reset_vars` and the configuration would set them on a node.
 
-  Returns (plugin, docker_client, mock_container).
+  Parameters
+  ----------
+  docker_client : MagicMock, optional
+    The mocked Docker client; a new one from make_mock_docker_client() when omitted.
+  mock_container : MagicMock, optional
+    The container that client starts, used only when `docker_client` is omitted.
+  **cfg_overrides : dict
+    Attributes set on the plugin last, for example `cfg_health_check={...}`.
+
+  Returns
+  -------
+  tuple
+    `(plugin, docker_client, mock_container)`.
+
+  Examples
+  --------
+  >>> plugin, client, container = make_lifecycle_runner(cfg_restart_policy="no")
+  >>> plugin.container is None
+  True
   """
   from extensions.business.container_apps.container_app_runner import (
     ContainerState, StopReason,
@@ -424,6 +588,8 @@ def make_lifecycle_runner(docker_client=None, mock_container=None, **cfg_overrid
   plugin._image_pull_failures = 0
   plugin._next_image_pull_time = 0
   plugin._fixed_volume_setup_pending = False
+  # As `__reset_vars` leaves it: no image check has found a bound image yet, so a launch would use the bound id.
+  plugin._bound_image_store_id = None
   plugin.cfg_image_pull_max_retries = 100
   plugin.cfg_image_pull_backoff_base = 20
 
@@ -517,3 +683,52 @@ def make_lifecycle_runner(docker_client=None, mock_container=None, **cfg_overrid
     setattr(plugin, key, value)
 
   return plugin, docker_client, mock_container
+
+
+def read_config_like_a_node(plugin, **config_data):
+  """
+  Make a runner read the given configuration keys the way a node does: through the core's `cfg_` getters.
+
+  On a node the core gives the plugin class one read-only `cfg_<key>` property per configuration key
+  (`create_config_handlers`), each built from the core's `getter`, and that getter returns a copy of a dict
+  value. A runner whose `cfg_*` are plain attributes hands out the same dict on every read, so a write into
+  it lasts there while a node loses it. A test of code that reads a dict-valued key and must not depend on
+  such a write takes its runner through this helper.
+
+  Parameters
+  ----------
+  plugin : ContainerAppRunnerPlugin
+    A runner from `make_container_app_runner()` or `make_lifecycle_runner()`.
+  **config_data : dict
+    Configuration keys as the node stores them (upper case) with their values, for example
+    `SYNC={"ENABLED": True}, ENV={}`. They become `plugin.config_data`.
+
+  Returns
+  -------
+  ContainerAppRunnerPlugin
+    The same runner. Its class is now a subclass that carries the properties, and they hide any plain
+    attribute of the same name; `plugin.config_data` is the dict to change when a test edits the configuration.
+
+  Raises
+  ------
+  ImportError
+    When the core (`naeural_core`) is not on the path: the getter under test is the core's own.
+
+  Examples
+  --------
+  >>> plugin, _client, _container = make_lifecycle_runner()
+  >>> plugin = read_config_like_a_node(plugin, SYNC={"ENABLED": True})
+  >>> plugin.cfg_sync["ENABLED"] = False
+  >>> plugin.cfg_sync["ENABLED"]
+  True
+  """
+  # The core's own getter, imported here so this module still loads where only the dummy base plugin exists.
+  from naeural_core.local_libraries.config_handler_mixin import getter
+  # One property per key, named and built as `create_config_handlers` does (`cfg_` plus the key in lower case).
+  handlers = {"cfg_" + key.lower(): property(fget=partial(getter, key=key)) for key in config_data}
+  # On a node the properties sit on the plugin class; here on a subclass, so other tests keep plain attributes.
+  plugin.__class__ = type(type(plugin).__name__, (type(plugin),), handlers)
+  # What the getters read: the node's configuration of this plugin.
+  plugin.config_data = config_data
+  # The same runner, now reading these keys as a node does.
+  return plugin

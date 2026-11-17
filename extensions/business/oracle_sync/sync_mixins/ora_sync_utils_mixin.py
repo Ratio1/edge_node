@@ -261,7 +261,18 @@ class _OraSyncUtilsMixin:
       Get the data from the IPFS using the CID.
 
       The CID will be used for retrieving the file from the IPFS.
-      That file should be a pickle file.
+      That file should be a pickle file. It is fetched, decrypted and loaded
+      by the SDK's ``get_pickle``, whose restricted loader builds plain data
+      only (None, bool, int, float, str, bytes, and lists, tuples, dicts, sets
+      and frozensets of these) and refuses a file that names any class or
+      function before anything of it is imported or called. Before the load,
+      it also refuses a file that is too large, uses one container in two
+      places, nests too deep or re-uses its values too much, so a few hundred
+      bytes cannot take exponential time or memory when the data is hashed or
+      its signature is checked. The CID comes from another oracle's message;
+      the full pickle load used before ran whatever the file named. Every file
+      oracle sync writes holds plain data: local and median tables, agreed
+      tables and agreement signatures, each container in one place.
 
       When the plugin is configured not to use R1FS (``USE_R1FS`` false), no
       file is fetched or loaded: one log line is written and None is returned,
@@ -278,13 +289,25 @@ class _OraSyncUtilsMixin:
       Returns
       -------
       dict or None
-          The data from the IPFS, or None when the retrieval failed or R1FS
-          use is disabled.
+          The data from the IPFS, or None when the retrieval failed (a refused
+          file included) or R1FS use is disabled.
+
+      Notes
+      -----
+      Three tries; a try whose fetch, decryption or load fails (it raises) is
+      followed by a 3 s pause, and with ``debug`` by a log line that gives the
+      error escaped (its ``repr``) and cut to 200 characters. The error names
+      the downloaded file's path before the reason (for a refused file, what
+      it names), so a long path, whose file name the sender chooses, can cut
+      the reason off. A file that holds None is tried again at once.
 
       Examples
       --------
       >>> plugin.cfg_use_r1fs = False
       >>> plugin.r1fs_get_pickle(cid="Qm...") is None
+      True
+      >>> plugin.cfg_use_r1fs = True
+      >>> plugin.r1fs_get_pickle(cid=cid_of_a_file_holding_a_class_instance) is None   # refused, nothing of it runs
       True
       """
       # R1FS is disabled for this plugin: fetch and load nothing named by a received message.
@@ -297,14 +320,17 @@ class _OraSyncUtilsMixin:
       sleep_time = 3
       for i in range(total_retries):
         try:
-          data_fn = self.r1fs.get_file(cid=cid, show_logs=debug)
-          data_full_path = self.os_path.abspath(data_fn)
-          retrieved_data = self.diskapi_load_pickle_from_output(filename=data_full_path)
+          # Fetch, decrypt and load through the SDK's restricted loader, which builds plain data only: the CID comes
+          # from another oracle's message, and the full pickle load used before ran whatever the file named. A failed
+          # fetch, decryption or load (a refused file included) raises, as a failed fetch did before.
+          retrieved_data = self.r1fs.get_pickle(cid=cid, show_logs=debug, raise_on_error=True)
           if retrieved_data is not None:
             break
         except Exception as e:
           if debug:
-            self.P(f"Failed try {i + 1}/{total_retries} to retrieve data from IPFS using CID {cid}.")
+            # The error text escaped (repr) and cut to 200 characters: a refused file's text carries the names the
+            # file asked for, of any length and with any characters, so it could write a huge or a forged log line.
+            self.P(f"Failed try {i + 1}/{total_retries} to retrieve data from IPFS using CID {cid}: {str(e)!r:.200}")
           self.sleep(sleep_time)
         # endtry to retrieve data
       # endif retries

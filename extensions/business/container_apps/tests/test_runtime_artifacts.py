@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, call, patch
 
 from extensions.business.container_apps.tests.support import make_lifecycle_runner, make_mock_container
 from extensions.business.container_apps.worker_app_runner import WorkerAppRunnerPlugin
+# The reason a restart is started with.
+from extensions.business.container_apps.container_app_runner import StopReason
 import docker
 
 
@@ -26,6 +28,29 @@ def bound(image_id=IMAGE_ID, **more):
 
 class RuntimeArtifactTests(unittest.TestCase):
   def runner(self, state=None):
+    """
+    Build a tracked container app on a mocked Docker client, with its saved state in a dict.
+
+    The runner belongs to the operation "operation|deploy"; its persistent state is read from and written
+    to `state` (deep copies, as the disk would), and its deployment reports are recorded by a mock.
+
+    Parameters
+    ----------
+    state : dict, optional
+      The saved state to start from, for example `bound(...)`; a new empty dict when omitted.
+
+    Returns
+    -------
+    tuple
+      `(plugin, docker_client, container, state)`: the runner, its mocked Docker client, the container
+      that client starts, and the dict that holds the saved state.
+
+    Examples
+    --------
+    >>> plugin, client, container, state = self.runner(bound(image_ref=REF))
+    >>> plugin._get_pinned_deployment_artifacts()["image_ref"] == REF
+    True
+    """
     plugin, client, container = make_lifecycle_runner()
     state = {} if state is None else state
     plugin._deployment_operation_key = "operation|deploy"
@@ -61,6 +86,147 @@ class RuntimeArtifactTests(unittest.TestCase):
     client.images.pull.assert_called_once_with(REF)  # repository@sha256, never the tag
     self.assertNotIn(call("failed", error_code="WORKLOAD_START_FAILED"), plugin.report_deployment_status.mock_calls)
     self.assertEqual(plugin._get_full_image_ref(), IMAGE_ID)
+
+  def test_an_image_pulled_by_its_exact_reference_runs_under_another_image_store_id_and_the_binding_stays(self):
+    """
+    Under another type of image store, the bound image pulled by its exact reference runs; the binding is kept.
+
+    Docker's classic and containerd image stores give the same image different ids. The pull by the saved
+    repository@sha256 reference returns the bound image under the new store's id: it is accepted because the
+    store lists it under that reference, the container is started by the new id, the start check accepts it,
+    and the saved and reported binding keeps the id the coordinator holds.
+    """
+    # The id the other type of image store gives the bound image.
+    other_id = "sha256:" + "5" * 64
+    # A binding made in the old store, with its exact reference.
+    plugin, client, container, state = self.runner(bound(image_ref=REF))
+    # The new store is empty.
+    client.images.get.side_effect = docker.errors.NotFound("nothing in this Docker store")
+    # The registry serves the bound image by its reference; the new store lists it there under its own id.
+    client.images.pull.return_value = image(other_id, REF)
+    # The container started from it runs that image.
+    container.image = image(other_id, REF)
+    # One launch lap: the image check, the start, and the check of what the started container runs.
+    plugin._handle_initial_launch()
+    # Only the exact reference was pulled; the configured tag was not needed.
+    self.assertEqual(client.images.pull.mock_calls, [call(REF)])
+    # Started by the id this store gives the image: the bound id names nothing here.
+    self.assertEqual(client.containers.run.call_args.args[0], other_id)
+    # The start check accepted the running image.
+    self.assertIs(plugin.container, container)
+    # Nothing was reported failed.
+    self.assertNotIn(call("failed", error_code="WORKLOAD_START_FAILED"), plugin.report_deployment_status.mock_calls)
+    # The binding the coordinator holds, not rewritten to the new id.
+    expected = {"image_id": IMAGE_ID, "image_ref": REF}
+    # It is the one saved.
+    self.assertEqual(state["deployment_runtime_artifacts"]["artifacts"], expected)
+    # And the one reported.
+    self.assertEqual(plugin.get_deployment_runtime_artifacts(), expected)
+
+  def test_an_image_listed_under_its_exact_reference_is_found_locally_and_a_tag_pull_needs_the_bound_id(self):
+    """
+    The local lookup finds the bound image by its exact reference; what a tag pull returns needs the bound id.
+
+    After a restart under the other type of image store, the image is in the store under its reference but not
+    under the bound id: it is found there and launched by the store's id, with no registry call. What a pull of
+    the configured tag returns is refused in that attempt when its id differs, even if it is listed under the
+    bound reference. A later local lookup by the reference accepts such an image, as in the first half: the
+    store lists an image under a repository@sha256 reference only for that content.
+    """
+    # The id the other type of image store gives the bound image.
+    other_id = "sha256:" + "5" * 64
+    # A tracked app bound with its exact reference.
+    plugin, client, _, _ = self.runner(bound(image_ref=REF))
+    # The bound id names nothing in this store; the exact reference names the image.
+    client.images.get.side_effect = [docker.errors.NotFound("no image with this id here"), image(other_id, REF)]
+    # Found locally.
+    self.assertTrue(plugin._ensure_image_available())
+    # By the bound id first, then by the exact reference.
+    self.assertEqual(client.images.get.mock_calls, [call(IMAGE_ID), call(REF)])
+    # Without asking the registry.
+    client.images.pull.assert_not_called()
+    # Launched by the id this store gives it.
+    self.assertEqual(plugin._get_full_image_ref(), other_id)
+    # Another app bound the same way.
+    guarded, guarded_client, _, _ = self.runner(bound(image_ref=REF))
+    # Its image is lost.
+    guarded_client.images.get.side_effect = docker.errors.NotFound("nothing in this Docker store")
+    # The exact reference cannot be pulled, and the tag gives an image with another id.
+    guarded_client.images.pull.side_effect = [RuntimeError("manifest unknown"), image(other_id, REF)]
+    # Refused in this attempt: a tag can move, so what its pull returns must carry the bound id.
+    self.assertFalse(guarded._ensure_image_available())
+    # Both references were pulled, the exact one first.
+    self.assertEqual(guarded_client.images.pull.mock_calls, [call(REF), call("test/image:latest")])
+    # Nothing but the bound id could be launched.
+    self.assertEqual(guarded._get_full_image_ref(), IMAGE_ID)
+
+  def test_a_restart_inspects_the_fixed_size_volume_owner_by_the_store_id_of_the_bound_image(self):
+    """
+    A restart keeps the id this Docker store gives the bound image across its state reset.
+
+    The fixed-size volume setup of a restart runs before the restart's image check. Under another type of image
+    store it must inspect the image by the id this store gives it, as the launch before did, and not by the bound
+    id, which names nothing here.
+    """
+    # The id the other type of image store gives the bound image.
+    other_id = "sha256:" + "5" * 64
+    # A tracked app bound with its exact reference.
+    plugin, client, container, _ = self.runner(bound(image_ref=REF))
+    # Only the exact reference names an image in this store; a lookup by anything else raises.
+    client.images.get.side_effect = lambda reference: {REF: image(other_id, REF)}[reference]
+    # The started container runs that image.
+    container.image = image(other_id, REF)
+    # The first launch finds the image by its reference and starts it by the store's id.
+    plugin._handle_initial_launch()
+    # What the fixed-size volume setup of the restart inspects, recorded when it runs.
+    owners = []
+    # It inspects the image the launch would use.
+    plugin._configure_fixed_size_volumes = lambda: owners.append(plugin._get_full_image_ref())
+    # The stop before the restart succeeds.
+    plugin._stop_container_and_save_logs_to_disk = lambda: True
+    # The restart's state reset makes a new Docker client: the same mocked one.
+    with patch.object(docker, "from_env", return_value=client):
+      # A restart after a crash.
+      self.assertTrue(plugin._restart_container(StopReason.CRASH))
+    # The volume setup inspected the image by the id this store gives it.
+    self.assertEqual(owners, [other_id])
+    # The restarted container was started by the same id.
+    self.assertEqual(client.containers.run.call_args.args[0], other_id)
+
+  def test_a_tracked_app_bound_without_a_registry_reference_says_so_in_red_at_each_start(self):
+    """
+    A bound app whose image has no reference in the configured repository logs one red line per start.
+
+    Without that reference a lost image can be found again only through the configured tag, which may have
+    moved; the line says so. Once the image is listed in the configured repository, the reference is saved
+    and the line is no longer logged.
+    """
+    # A binding without a registry reference.
+    plugin, _, container, state = self.runner(bound())
+    # Every log line recorded with its colour.
+    plugin.P = MagicMock()
+    # The container that has just started.
+    plugin.container = container
+    # The running image is listed only under another deployment's repository.
+    container.image = image(IMAGE_ID, "ghcr.io/other/copy@sha256:" + "1" * 64)
+    # The start check.
+    plugin._capture_deployment_image()
+    # The red lines it logged.
+    red = [entry.args[0] for entry in plugin.P.mock_calls if entry.kwargs.get("color") == "r"]
+    # Exactly one.
+    self.assertEqual(len(red), 1)
+    # Naming the configured tag as the only way back.
+    self.assertIn("only through the configured tag 'test/image:latest'", red[0])
+    # Forget the lines of that start.
+    plugin.P.reset_mock()
+    # The next start runs the image as pulled from the configured repository.
+    container.image = image(IMAGE_ID, REF)
+    # The start check.
+    plugin._capture_deployment_image()
+    # The reference is saved.
+    self.assertEqual(state["deployment_runtime_artifacts"]["artifacts"]["image_ref"], REF)
+    # And no red line was logged.
+    self.assertFalse([entry for entry in plugin.P.mock_calls if entry.kwargs.get("color") == "r"])
 
   def test_a_binding_without_a_reference_is_found_again_only_if_the_registry_still_serves_that_image(self):
     # Every deployment made before the reference was saved, the ones that are down included.
@@ -101,18 +267,35 @@ class RuntimeArtifactTests(unittest.TestCase):
     self.assertEqual(plugin._image_pull_failures, 5001)  # a local find is not a pull; only a registry find resets
 
   def test_a_registry_error_is_retried_and_not_reported_as_a_failed_deployment(self):
-    # A failed report cannot be taken back for that attempt, so it is kept for the case that is known.
+    """
+    A pull of the bound image that raises is reported as "pulling_image" and tried again, never as "failed".
+
+    A failed report that the coordinator reads ends the rollout of that attempt, so it is kept for the case that
+    is known to be final (a tag that moved); a registry error is not.
+    """
+    # A tracked app bound with its exact reference.
     plugin, client, _, _ = self.runner(bound(image_ref=REF))
+    # A clock the test moves.
     clock = [1000.0]
+    # The runner reads that clock.
     plugin.time = lambda: clock[0]
+    # The image is not in the local store.
     client.images.get.side_effect = docker.errors.NotFound("nothing in this Docker store")
+    # The registry does not answer.
     client.images.pull.side_effect = RuntimeError("registry unreachable")
+    # Nothing to start on this lap.
     self.assertFalse(plugin._ensure_image_available())
+    # Reported as pulling, and nothing else.
     self.assertEqual(plugin.report_deployment_status.mock_calls, [call("pulling_image")])
+    # The registry answers again.
     client.images.pull.side_effect = None
+    # With the bound image.
     client.images.pull.return_value = image(IMAGE_ID, REF)
+    # An hour later, past any pause.
     clock[0] += 3600
+    # The image is there now.
     self.assertTrue(plugin._ensure_image_available())
+    # The pause is cleared, so a later loss starts with short waits.
     self.assertEqual((plugin._image_pull_failures, plugin._next_image_pull_time), (0, 0))
 
   def test_a_pause_left_by_an_earlier_pull_does_not_stop_an_app_whose_image_is_present(self):
@@ -267,6 +450,57 @@ class RuntimeArtifactTests(unittest.TestCase):
     worker._capture_deployment_image()
     self.assertEqual(state["deployment_runtime_artifacts"]["artifacts"], {"image_id": IMAGE_ID, "git_commit": COMMIT})
 
+  def test_a_tracked_worker_asks_for_its_base_image_at_most_hourly_and_without_end_through_a_long_outage(self):
+    """
+    A tracked worker's base-image pull is never abandoned and never more than an hour apart.
+
+    Five days of registry outage after the node's Docker store was lost, one lap a minute: the worker tries more
+    often than the IMAGE_PULL_MAX_RETRIES (100) after which an untracked app gives up, its next try is never more
+    than an hour away, and nothing is reported failed. When the registry is back, the base image is pulled
+    within the hour.
+    """
+    # The harness state of a tracked runner, bound to its commit and to a base image id that was lost.
+    plugin, client, _, _ = self.runner(bound(image_id="sha256:" + "e" * 64, git_commit=COMMIT))
+    # A real worker instance.
+    worker = WorkerAppRunnerPlugin.__new__(WorkerAppRunnerPlugin)
+    # On that harness state.
+    worker.__dict__.update(plugin.__dict__)
+    # A worker's own default; with the "always" pull policy it pulls its base image before every start.
+    worker.cfg_autoupdate = False
+    # A clock the laps move forward.
+    clock = [1000.0]
+    # The worker reads that clock.
+    worker.time = lambda: clock[0]
+    # The Docker store is empty.
+    client.images.get.side_effect = docker.errors.NotFound("nothing in this Docker store")
+    # The registry does not answer.
+    client.images.pull.side_effect = RuntimeError("registry unreachable")
+    # Five days of laps, one a minute.
+    for _ in range(5 * 24 * 60):
+      # No base image on any of them.
+      self.assertFalse(worker._ensure_image_available())
+      # The next lap.
+      clock[0] += 60
+    # More attempts than an untracked app makes before it gives up.
+    self.assertGreater(worker._image_pull_failures, worker.cfg_image_pull_max_retries)
+    # None reported as abandoned.
+    self.assertNotIn(call("failed", error_code="IMAGE_PULL_FAILED"), worker.report_deployment_status.mock_calls)
+    # The next attempt is at most an hour away, however long the outage has lasted.
+    self.assertLessEqual(worker._next_image_pull_time - clock[0], 3600)
+    # The registry is back.
+    client.images.pull.side_effect = None
+    # It serves the base image.
+    client.images.pull.return_value = image(IMAGE_ID)
+    # One lap a minute for at most an hour and a minute, until the base image is there.
+    for _ in range(61):
+      if worker._ensure_image_available():
+        break
+      # The next lap.
+      clock[0] += 60
+    else:
+      # Still no base image an hour after the registry came back.
+      self.fail("the base image was not pulled within the hour after the registry came back")
+
   def test_a_container_app_must_still_run_exactly_its_bound_image(self):
     plugin, _, container, _ = self.runner(bound())
     plugin.container = container
@@ -332,24 +566,48 @@ class RuntimeArtifactTests(unittest.TestCase):
     self.assertIsNone(plugin._check_git_updates(100))
 
   def test_worker_records_actual_head_before_publishing_readiness(self):
+    """
+    A worker records the HEAD its container runs before it confirms readiness, and a HEAD that differs from the
+    bound commit is reported as failed and logged in red.
+    """
+    # A tracked worker bound to its commit.
     plugin = WorkerAppRunnerPlugin.__new__(WorkerAppRunnerPlugin)
+    # Its binding, as a restoration sends it.
     plugin.cfg_deeploy_runtime_artifacts = {"image_id": IMAGE_ID, "git_commit": COMMIT}
+    # Its running container.
     plugin.container = MagicMock()
+    # Whose clone runs the bound commit.
     plugin.container.exec_run.return_value = SimpleNamespace(exit_code=0, output=(COMMIT + "\n").encode())
+    # Not ready yet.
     plugin._app_ready = False
+    # The log, which the base plugin provides on a node.
+    plugin.P = MagicMock()
+    # The readiness calls, recorded.
     plugin.set_plugin_ready = MagicMock()
+    # The status reports, recorded.
     plugin.report_deployment_status = MagicMock()
+    # Readiness is published only after the HEAD was recorded.
     plugin._semaphore_set_ready_flag = MagicMock(side_effect=lambda: self.assertEqual(
       plugin.get_deployment_runtime_artifacts()["git_commit"], COMMIT,
     ))
+    # Confirmed on the bound commit.
     self.assertTrue(plugin._confirm_app_readiness())
+    # Readiness was published once.
     plugin._semaphore_set_ready_flag.assert_called_once()
+    # A new container start checks again.
     plugin._deployment_git_captured = False
+    # Count the publications from here on.
     plugin._semaphore_set_ready_flag.reset_mock()
+    # This time the clone runs another commit.
     plugin.container.exec_run.return_value.output = ("d" * 40).encode()
+    # Not confirmed.
     self.assertFalse(plugin._confirm_app_readiness())
+    # Readiness was not published.
     plugin._semaphore_set_ready_flag.assert_not_called()
+    # The proven mismatch is reported as failed.
     plugin.report_deployment_status.assert_called_with("failed", error_code="WORKLOAD_START_FAILED")
+    # And logged in red.
+    self.assertEqual(plugin.P.call_args.kwargs, {"color": "r"})
 
   def test_worker_waits_for_clone_without_publishing_ready_or_failure(self):
     plugin = WorkerAppRunnerPlugin.__new__(WorkerAppRunnerPlugin)

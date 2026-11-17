@@ -24,7 +24,10 @@ from .dauth_registry import (
   DAUTH_SECRET_PIPELINE_CID_KEY,
   dauth_registry_write_kwargs,
 )
-from ratio1.const.base import dAuth
+# BCctbase names the sender fields of a signed request, which a refusal line reports.
+from ratio1.const.base import BCctbase, dAuth
+# The SDK engine class holds this process's oracle-only secret in memory; dAuth hands it to oracles.
+from ratio1.bc.base import BaseBlockEngine
 
 
 DAUTH_JOB_SECRETS_CSTORE_HKEY = "DAUTH_JOB_SECRETS"
@@ -34,6 +37,14 @@ DAUTH_SECRET_REQUEST_MAX_AGE_SECONDS = 120
 DAUTH_SECRET_REVEAL_ACTION = "reveal_job_secrets"
 DAUTH_VIEW_SECRETS_PERMISSION = 1 << 4
 DEEPLOY_WALLET_MESSAGE_PREFIX = "Please sign this message for Deeploy: "
+# The oldest node release dAuth serves. The gate used to refuse every sender 10 or more build numbers
+# behind the answering server; releases are 10 or 20 build numbers apart, so a node one release behind
+# was refused whenever it started during a rolling update. A named release does not move when a server
+# is updated. Raise it on purpose, at a release, and keep it below that release: a minimum equal to
+# the release refuses the previous one again (test_dauth_version_gate.py checks the form and that bound).
+# The same tests fail once the minimum is more than 30 build numbers behind the release in ver.py, so
+# that it is raised and does not serve older and older nodes unnoticed.
+DAUTH_MIN_SENDER_APP_VERSION = "2.10.710"
 
 
 def version_to_int(version):
@@ -49,6 +60,60 @@ def version_to_int(version):
     except:
       pass
   return val
+
+def dauth_request_label(body):
+  """
+  Say who a dAuth request names as its sender and which job it is about, for a log line.
+
+  A refusal line of a secrets endpoint carries this label, so the log shows which node asked
+  for which job. Before, the line had only the source address and the reason, and a refused
+  node behind a shared address could not be told from another.
+
+  Parameters
+  ----------
+  body : dict
+    The request body. Anything else, and a body without the fields, gives ``None`` values.
+
+  Returns
+  -------
+  str
+    ``sender <node address> ETH <ETH address> job <job id>``, each value as its ``repr`` cut
+    to 60, 50 and 40 characters.
+
+  Notes
+  -----
+  The values are what the request says, read before or after its signature is checked: for a
+  request refused over its signature they are a claim, not a verified identity. They are
+  written as ``repr``, so a line break in a value cannot start a log line of its own, and
+  cut, so a value cannot grow the line. Only these three fields are read: never a secret
+  value, a configuration or an error text.
+
+  Examples
+  --------
+  >>> dauth_request_label({"EE_SENDER": "0xai_Node", "EE_ETH_SENDER": "0xE7h", "job_id": 7})
+  "sender '0xai_Node' ETH '0xE7h' job 7"
+  >>> dauth_request_label(None)
+  'sender None ETH None job None'
+  """
+  # A body that is not a dictionary names nothing: the label then says None three times.
+  fields = body if isinstance(body, dict) else {}
+  # repr() escapes line breaks and the precision cuts each value: the request controls this text.
+  return "sender {!r:.60} ETH {!r:.50} job {!r:.40}".format(
+    fields.get(BCctbase.SENDER), fields.get(BCctbase.ETH_SENDER), fields.get("job_id"),
+  )
+
+
+class DauthRefused(ValueError):
+  """
+  A request dAuth refuses as its verdict on the requester.
+
+  Raised where a correctly signed request is refused because of who asks: a revoked key, a node
+  that is not in the job's placement or in the revision's plan, a revoked secret revision. It
+  is a ``ValueError``, so every handler that treats a ``ValueError`` as a final answer still
+  does; the type only lets the endpoint log such a refusal in yellow and keep red for what it
+  could not judge (a bad signature, a missing or inconsistent record, a failed dependency).
+  """
+
 
 class _DotDict(dict):
   __getattr__ = dict.__getitem__
@@ -101,11 +166,48 @@ class _DauthMixin(object):
     sender_sdk_version : str
   ):
     """
-    Check the version of the node that is sending the request.
-    Returns `None` if all ok and a message if there is a problem.
-    
-    
-    """    
+    Check the versions a dAuth requester declares.
+
+    Types the requester from the versions it sends (a node sends app, core and SDK versions,
+    an SDK client only the SDK version) and refuses a node whose app version is below
+    `DAUTH_MIN_SENDER_APP_VERSION`. A node that is behind this server but at or above that
+    minimum is served, with a warning in the message.
+
+    Parameters
+    ----------
+    sender_app_version : str
+      The app (edge node) version the requester declares; None for an SDK client.
+    sender_core_version : str
+      The core version the requester declares; None for an SDK client.
+    sender_sdk_version : str
+      The SDK version the requester declares.
+
+    Returns
+    -------
+    VersionCheckData
+      `result` (False when the request must be refused), `message` (notes and warnings; for a
+      refusal it starts with the reason) and `requester_type`.
+
+    Notes
+    -----
+    The versions are declared by the requester and not proven, so this is an upgrade policy and
+    not a security control. The minimum is tested only for a sender older than this server: the
+    minimum is below this server's release, so a sender at or above the server is above it too.
+    Version texts are read by `version_to_int`, which keeps a partial sum for text it cannot
+    read. A sender whose app version text gives a sum above 0 and below the minimum is refused
+    as too old. A text that reads as 0 is not measured against the minimum: the sender is
+    typed by the other versions it declares, so it is served as an SDK client when its core
+    version also reads as 0 and its SDK version does not, and refused for invalid version
+    data otherwise.
+
+    Examples
+    --------
+    >>> self.ee_ver, self.ee_core_ver, self.ee_sdk_ver = "2.10.730", "7.7.357", "3.5.71"
+    >>> self.version_check("2.10.720", "7.7.357", "3.5.71").result
+    True
+    >>> self.version_check("2.10.700", "7.7.357", "3.5.71").message
+    ' FAIL: Sender app version 2.10.700 is too old (minimum: 2.10.710).'
+    """
     #
     output = VersionCheckData(result=True, message="")
     dAuthCt = self.const.BASE_CT.dAuth
@@ -136,10 +238,12 @@ class _DauthMixin(object):
     
     if int_sender_app_version > 0 and int_sender_app_version < int_server_app_version:
       output.message += f" WARNING: Sender app version {sender_app_version} is lower than server app version {self.ee_ver}."
-      diff = int_server_app_version - int_sender_app_version
-      if diff >= 10:
+      # Refuse only below the named minimum release, not at a distance from this server: the
+      # previous release stays served while the servers and the nodes are updated one by one.
+      if int_sender_app_version < version_to_int(DAUTH_MIN_SENDER_APP_VERSION):
         output.result = False
-        output.message = f" FAIL: Sender app version {sender_app_version} is too old (diff: {diff})."
+        # The words "is too old" are kept; the text names the release to reach, not the distance.
+        output.message = f" FAIL: Sender app version {sender_app_version} is too old (minimum: {DAUTH_MIN_SENDER_APP_VERSION})."
     #end app version check
       
     if int_sender_core_version > 0 and int_sender_core_version < int_server_core_version:
@@ -162,9 +266,44 @@ class _DauthMixin(object):
     dauth_data : dict = None,
   ):
     """
-    Check if the node address is allowed to request authentication data. A revoked
-    requester is also named in `dauth_data[dAuth.DAUTH_REVOKED]`, which tells the node
-    to replace its key.
+    Check if the node address is allowed to request authentication data.
+
+    A requester is allowed when its version check passed, its key is not revoked and the
+    chain says it holds a license. A revoked requester is also named in
+    `dauth_data[dAuth.DAUTH_REVOKED]`, which tells the node to replace its key. The license
+    answer comes through `_is_dauth_requester_licensed`, which reuses a recent "not
+    licensed" verdict instead of making one on-chain call per refused request.
+
+    Parameters
+    ----------
+    node_address : str
+      The requester's internal node address (the key that signed the request).
+    node_address_eth : str
+      The ETH address derived from that key.
+    version_check_data : VersionCheckData
+      The verdict of `version_check` for this request.
+    body : dict, optional
+      The request body; a revoked requester's declared versions and alias are recorded from it.
+    dauth_data : dict, optional
+      The `auth` part of the answer; receives `dAuth.DAUTH_REVOKED` for a revoked requester.
+
+    Returns
+    -------
+    tuple
+      `(allowed, message)`: `allowed` is True, False for a verdict (version, revoked key, no
+      license) or None when the check itself failed; `message` says why, as text for the
+      answer's error field.
+
+    Notes
+    -----
+    An exception in the revocation check or in the license lookup refuses the request with
+    the exception text in `message`; it is never treated as "allowed". None and False are
+    both falsy, so a caller that tests `not allowed` refuses in both cases.
+
+    Examples
+    --------
+    >>> self.check_if_node_allowed("0xai_A...", "0xUnlinked", version_check_data)
+    (False, 'node 0xUnlinked not allowed on mainnet')
     """
     self.Pd(f"Checking if node {node_address} (ETH: {node_address_eth}) is allowed")
     msg = ""
@@ -180,17 +319,56 @@ class _DauthMixin(object):
         )
         if revoked and dauth_data is not None:
           dauth_data[self.const.BASE_CT.dAuth.DAUTH_REVOKED] = node_address
-        result = not revoked and self.bc.is_node_licensed(node_address_eth=node_address_eth)
+        # The license answer of a requester that is not revoked comes through the short memo of
+        # "not licensed" verdicts: a node that keeps asking costs one on-chain call per 300 s.
+        result = not revoked and self._is_dauth_requester_licensed(node_address_eth)
         str_allowed = "allowed" if result else "not allowed"
         msg = f"{version_check_data.requester_type} {node_address_eth} {str_allowed} on {self.evm_network}"
       except Exception as e:
-        result = False
+        # None, not False: the request is refused all the same, but this is a check that failed
+        # on this server and not a verdict on the node, so its refusal line stays red.
+        result = None
         msg = "Error checking if node is allowed ({} on {}): {} ".format(
           node_address_eth, self.evm_network, e
         )
     return result, msg
 
   def _verify_signed_dauth_body(self, body, endpoint, log_hash_sign_fails=True):
+    """
+    Check who signed a dAuth request and that the signer is not revoked.
+
+    The sender's ETH address in the body must be the one derived from its node address, the
+    signature must be valid, and the signing key must not be on the denylist of revoked keys.
+
+    Parameters
+    ----------
+    body : dict
+      The request body, with the sender's node address, its ETH address and the signature.
+    endpoint : str
+      The endpoint name, recorded with a revoked sender's try.
+    log_hash_sign_fails : bool
+      Passed to the signature check: whether it logs a hash or signature failure itself.
+
+    Returns
+    -------
+    tuple
+      `(requester, requester_eth)`: the verified node address and its ETH address.
+
+    Raises
+    ------
+    ValueError
+      When the body is not a dict, a sender field is missing, the ETH address does not match
+      the node address, or the signature is invalid.
+    DauthRefused
+      When the signer's key is revoked: a verdict on the requester, also a ``ValueError``.
+    RuntimeError
+      When the denylist of revoked keys is not loaded.
+
+    Examples
+    --------
+    >>> self._verify_signed_dauth_body(body, endpoint="get_secrets")
+    ('0xai_A...', '0x37379B80c7657620E5631832c4437B51D67A88cB')
+    """
     if not isinstance(body, dict):
       raise ValueError("Invalid request body.")
 
@@ -215,7 +393,8 @@ class _DauthMixin(object):
     if self._is_dauth_node_revoked(
       endpoint=endpoint, node_address=requester, body=body,
     ):
-      raise ValueError(f"Sender {requester_eth} not allowed on {self.evm_network}.")
+      # A verdict on the requester (its key is revoked): typed, so the endpoint logs it in yellow.
+      raise DauthRefused(f"Sender {requester_eth} not allowed on {self.evm_network}.")
     return requester, requester_eth
 
   def _is_protocol_oracle_eth(self, node_address_eth):
@@ -751,9 +930,12 @@ class _DauthMixin(object):
 
     Raises
     ------
+    DauthRefused
+      When the requester is not one of the nodes that run the pipeline: a verdict on the
+      requester, also a ``ValueError``.
     ValueError
       When the job has no raw-CID pointer, the pipeline is versioned or belongs to
-      another job, the requester does not run it, the stored bundle is missing,
+      another job, the stored bundle is missing,
       versioned, deleted or revoked, or does not match the job or the CID, a
       pre-CID bundle cannot be bound to the current placeholders or stored, or the
       pointer changed while the bundle was being bound.
@@ -779,7 +961,8 @@ class _DauthMixin(object):
       raise ValueError("Secret revision is required for this pipeline.")
     nodes = [self._normalize_node_address_for_compare(node) for node in self._pipeline_runner_nodes(pipeline)]
     if self._normalize_node_address_for_compare(requester) not in nodes:
-      raise ValueError("Sender is not running the existing job.")
+      # A verdict on the requester (not in the job's placement), not a fault of this server.
+      raise DauthRefused("Sender is not running the existing job.")
     bundle = self._load_current_dauth_secret_bundle(
       job_id, pipeline_cid, pipeline, require_unversioned=True,
     )
@@ -819,19 +1002,57 @@ class _DauthMixin(object):
     return result
 
   def _load_revision_runner_secret_bundle(self, job_id, revision, requester):
-    """Authorize one exact immutable revision without a current-bundle fallback."""
+    """
+    Authorize one exact immutable revision without a current-bundle fallback.
+
+    Reads the stored record of the job's secret revision and returns it to a requester that
+    the revision's plan names. Nothing else is tried when the record is missing: the job's
+    current bundle is never served in its place.
+
+    Parameters
+    ----------
+    job_id : str
+      The normalized Deeploy job ID.
+    revision : str
+      The secret revision the request names.
+    requester : str
+      The verified node address that signed the request.
+
+    Returns
+    -------
+    dict
+      The revision record without its `pipelines` plan.
+
+    Raises
+    ------
+    DauthRefused
+      When the revision was revoked, or the requester is not in the revision's plan: verdicts
+      on the request, also ``ValueError``.
+    ValueError
+      When no revision is given, or the stored record is not a dict, names another job or
+      revision, or has no plan.
+    RuntimeError
+      When this server holds no record for the revision (the requester may retry).
+
+    Examples
+    --------
+    >>> self._load_revision_runner_secret_bundle("7", "op:deploy", "0xai_RunnerNodeAddress")
+    {'job_id': '7', 'revision': 'op:deploy', 'job_secrets': {...}, 'pipeline_cid': 'Qm...'}
+    """
     if not isinstance(revision, str) or not revision.strip():
       raise ValueError("Secret revision is required.")
     revision = revision.strip()
     key = "{}|{}".format(job_id, revision)
     revoked_key = key + "|revoked"
     if self.chainstore_hget(hkey=DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, key=revoked_key):
-      raise ValueError("dAuth secret revision has been revoked.")
+      # A verdict on the request (the revision was revoked on purpose), not a fault of this server.
+      raise DauthRefused("dAuth secret revision has been revoked.")
     secret_bundle = self.chainstore_hget(
       hkey=DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, key=key,
     )
     if isinstance(secret_bundle, dict) and secret_bundle.get("revoked"):
-      raise ValueError("dAuth secret revision has been revoked.")
+      # The same verdict, read from the revoked record itself.
+      raise DauthRefused("dAuth secret revision has been revoked.")
     if secret_bundle is None:
       raise RuntimeError("No dAuth secret bundle found for the requested revision.")
     if not isinstance(secret_bundle, dict):
@@ -845,7 +1066,8 @@ class _DauthMixin(object):
     if normalized_requester not in [
       self._normalize_node_address_for_compare(node) for node in pipelines
     ]:
-      raise ValueError("Sender is not authorized for the requested job revision.")
+      # A verdict on the requester (not in the revision's plan), not a fault of this server.
+      raise DauthRefused("Sender is not authorized for the requested job revision.")
     return {key: value for key, value in secret_bundle.items() if key != "pipelines"}
 
   def process_dauth_reveal_secret_request(self, body):
@@ -936,10 +1158,63 @@ class _DauthMixin(object):
     dauth_data,
     requester_node_address,
     is_node=False,
-    sender_eth_address=None
+    sender_eth_address=None,
+    requester_memory_secrets=False,
   ):
     """
-    Fill the data with the authentication data.
+    Fill data: put the settings of a served dAuth answer into its ``auth`` part.
+
+    Adds the broker candidates, the universal env keys and the predefined keys. For a node it also
+    adds the allowed senders (the oracles, then the whitelist), the node-only keys and the node tags.
+    A protocol oracle (a node in the oracle registry that ``bc.get_oracles`` reads) also gets
+    ``EE_SUPERVISOR=True`` and the supervisor keys; the dAuth-only keys go to it only when it is in
+    the dAuth registry. When its request says that its client keeps memory-only secrets, and this node
+    holds one, the oracle also gets the oracle-only secret, encrypted to its node key. Every other
+    requester gets ``EE_SUPERVISOR=False`` and none of these.
+
+    Parameters
+    ----------
+    dauth_data : dict
+      The ``auth`` part of the answer, filled in place.
+    requester_node_address : str
+      The requester's node address.
+    is_node : bool, optional
+      True when the requester declared app, core and SDK versions (an edge node). Default False.
+    sender_eth_address : str, optional
+      The requester's ETH address, used for the dAuth registry check and the node tags.
+    requester_memory_secrets : bool, optional
+      True when the signed request carries ``sender_memory_secrets: true``, which means its client
+      keeps memory-only secrets out of its environment and logs. Default False.
+
+    Returns
+    -------
+    dict
+      ``dauth_data``, filled.
+
+    Raises
+    ------
+    ValueError
+      When the merged auth env keys or predefined keys are None. A configured value of None
+      already fails earlier, with a TypeError, when it is merged with the defaults.
+
+    Notes
+    -----
+    The oracle-only secret is read from this node's process memory (``BaseBlockEngine.oracle_secret``),
+    not from its environment. A seed deleted it from its environment at start; any other dAuth server
+    received it in its own start-up dAuth. A server that holds none sends no field at all, not None.
+    The value is encrypted to the requester's node key, the key that signed the request, so only that
+    oracle can read it: a replayed request, the network path and a client that logs the answer see
+    ciphertext only. The field has no ``EE_`` prefix, so no client writes it to its environment. A
+    client of an earlier release does not send the flag and so never receives the field: some earlier
+    clients logged the whole answer.
+
+    Examples
+    --------
+    >>> data = self.fill_dauth_data(
+    ...   {}, "0xai_Oracle", is_node=True, sender_eth_address="0xE7h", requester_memory_secrets=True,
+    ... )
+    >>> data["EE_SUPERVISOR"], "oracle_r1fs_secret" in data   # an oracle, on a server that holds the secret
+    (True, True)
     """
     dAuthCt = self.const.BASE_CT.dAuth
     
@@ -1048,6 +1323,13 @@ class _DauthMixin(object):
           dauth_data[key] = self.os_environ.get(key)
         # end if
       # end for
+      # The oracle-only secret, from this node's process memory and not from its environment (a seed deleted
+      # it there at start). Sent only when the requester's client keeps it in memory too and this node holds one.
+      oracle_secret = BaseBlockEngine.oracle_secret()
+      if requester_memory_secrets and oracle_secret is not None:
+        # Encrypted to the key that signed the request, so a replayed request or a copy of the answer gives no one
+        # else the value; under a field without the EE_ prefix, which no client writes to its environment.
+        dauth_data[dAuth.DAUTH_ORACLE_SECRET] = self.bc.encrypt_str(oracle_secret, requester_node_address)
     else:
       dauth_data["EE_SUPERVISOR"] = False
     # end set supervisor flag
@@ -1085,9 +1367,43 @@ class _DauthMixin(object):
   
   def process_dauth_request(self, body):
     """
-    This is the main method that processes the request for authentication.
+    Process a request for authentication data (`get_auth_data`).
+
+    Checks, in this order and stopping at the first failure: the sender address and its ETH
+    address, the signature, the declared versions, then whether the node is allowed (not
+    revoked and licensed). An allowed requester gets the dAuth settings; any other gets an
+    answer with `error` and no settings. A served answer can carry a non-critical note in
+    `error` too, such as a version warning. A protocol oracle whose signed request carries
+    ``sender_memory_secrets: true`` also gets the oracle-only secret this node holds in memory,
+    encrypted to the key that signed the request (see `fill_dauth_data`).
+
+    Parameters
+    ----------
+    body : dict
+      The signed request: sender address and ETH address, nonce, alias and declared versions.
+
+    Returns
+    -------
+    dict
+      The answer: the `auth` part (the settings, or `error`) and the server information.
+
+    Notes
+    -----
+    A refusal writes one line with the nonce, the shortened sender address, the alias, the
+    shortened ETH address, the source address and the reason. The line is yellow when the
+    reason is the server's verdict on the requester (declared versions the gate refuses, no
+    license, revoked key) and red when the request could not be judged (wrong ETH address,
+    bad signature, a check that failed on this server). Red lines are also copied to the
+    error log.
+
+    Examples
+    --------
+    >>> self.process_dauth_request(body)["auth"]["error"]   # a node without a license
+    'Node not allowed to request auth data. node 0xUnlinked not allowed on mainnet'
     """
     error = None
+    # A refusal is logged in red unless it is the server's verdict on the requester (set below).
+    refusal_color = 'r'
     _non_critical_error = None
     requester_eth = None
     version_check_data = VersionCheckData(result=False, message="", requester_type=None)
@@ -1143,6 +1459,9 @@ class _DauthMixin(object):
       if not version_check_data.result:
         # not None means we have a error message
         error = 'Version check failed: {}'.format(version_check_data.message)
+        # Yellow: a verdict on the versions a correctly signed request declares. The gate refuses below
+        # a named minimum (or version data it cannot type), not at a distance from this server's release.
+        refusal_color = 'y'
       elif version_check_data.message not in [None, '']:
         _non_critical_error = version_check_data.message
 
@@ -1156,6 +1475,10 @@ class _DauthMixin(object):
       )
       if not allowed_to_dauth:
         error = 'Node not allowed to request auth data. ' + message
+        # No license or a revoked key is a correct verdict, logged in yellow so that the red
+        # lines, which are copied to the error log, are left to faults. A check that failed
+        # (None) stays red.
+        refusal_color = 'r' if allowed_to_dauth is None else 'y'
     
     if False and hasattr(self, "DEBUG_BYPASS") and self.DEBUG_BYPASS:
       # this is a debug flag that allows us to bypass the node check
@@ -1174,7 +1497,7 @@ class _DauthMixin(object):
     if error is not None:
       dct_dauth['error'] = error
       self.P("dAuth request '{}' failed for <{}>  '{}' (ETH: {}) from {}: {}".format(
-        sender_nonce, short_requester, requester_alias, short_eth, source_ip, error), color='r'
+        sender_nonce, short_requester, requester_alias, short_eth, source_ip, error), color=refusal_color
       )
     else:
       if _non_critical_error is not None:
@@ -1183,6 +1506,9 @@ class _DauthMixin(object):
       ### Finally we fill the data with the authentication data
       self.fill_dauth_data(
         dauth_data=dct_dauth, requester_node_address=requester, is_node=is_requester_a_node,
+        # The signed request says its client keeps memory-only secrets out of its environment and logs; only
+        # then may an oracle get the oracle-only secret. A previous-release client never sends it.
+        requester_memory_secrets=body.get(dAuth.DAUTH_SENDER_MEMORY_SECRETS) is True,
         sender_eth_address=requester_eth
       )
       self.P("dAuth req '{}' success for <{}> '{}' (ETH: {}) from {}".format(

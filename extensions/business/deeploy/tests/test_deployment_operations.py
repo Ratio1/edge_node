@@ -16,12 +16,38 @@ from extensions.business.deeploy.deployment_operations import (
 from extensions.business.deeploy.tests.support import LifecycleCustodyDouble
 
 
+# The ages after completion, in seconds, at which a completed operation's final snapshot is sent again: every 30 s up
+# to 600 s, then 1,200, 2,400 and 4,800 s, then every hour up to 84,000 s (45 sends).
+REPAIR_SCHEDULE = list(range(30, 630, 30)) + [1200, 2400] + list(range(4800, 86400, 3600))
 CONFIG = {"NAME": "app", "TYPE": "Void", "DEEPLOY_SPECS": {"revision": 1, "secret_revision": "op:deploy"},
           "PLUGINS": [{"SIGNATURE": "RUNNER", "INSTANCES": [{"INSTANCE_ID": "worker"}]}]}
 
 
 class Coordinator(_DeploymentOperationsMixin):
   def __init__(self, address="oracle"):
+    """
+    Build an offline coordinating oracle with the fields the operations mixin reads.
+
+    The signer, the chain store, R1FS and the clock are in-memory doubles: a record signs as valid, the store is
+    a dict keyed by (namespace, key), and the time stands still until a test moves it. The operation fields are
+    created as `_init_deployment_operations` creates them, without starting the worker thread.
+
+    Parameters
+    ----------
+    address : str, optional
+      The oracle's own address, used as the signer of every record it writes. Default "oracle".
+
+    Returns
+    -------
+    None
+      The fields are set on the new instance.
+
+    Examples
+    --------
+    >>> plugin = Coordinator()
+    >>> plugin.bc.address, plugin._verified_operation_records_dropped
+    ('oracle', 0)
+    """
     self.now = 100
     self.bc = SimpleNamespace(address=address, get_oracles=lambda **kw: (["oracle", "other"], []),
                               get_dauth_oracles=lambda: (["oracle", "other"], []),
@@ -39,9 +65,14 @@ class Coordinator(_DeploymentOperationsMixin):
     self._deployment_plan_cache_lock = threading.Lock()
     self._deployment_preparations = {}
     self._operations_confirmed = {}
+    # The served ages of each completed operation's repair schedule, as _init_deployment_operations creates them.
+    self._operations_repaired = {}
     self._operations_sent_at = {}
     self._verified_operation_records = OrderedDict()  # as _init_deployment_operations creates it
+    # The lock of the cache, as _init_deployment_operations creates it.
     self._verified_operation_records_lock = threading.Lock()
+    # The drop count of the cache, as _init_deployment_operations creates it; without it a drop refuses a valid record.
+    self._verified_operation_records_dropped = 0
     self._custody_retry = {}  # as _init_deployment_operations creates it
     self.cfg_deployment_readiness_timeout = 60
     self._get_response = lambda result: result
@@ -311,35 +342,82 @@ class DeploymentOperationTests(unittest.TestCase):
                      [(now, "status") for now in range(100, 220, 2)] + [(220, "revoke"), (230, "revoke"), (250, "revoke")])
 
   def test_a_chain_store_write_that_fails_is_still_tried_on_every_pass(self):
-    # Only a failed custody call makes an operation wait, also right after such a wait has run out.
+    """Only a failed custody call makes an operation wait, also right after such a wait has run out: a final
+    write that fails after the custody call succeeded is tried again on every 2 s pass, where a custody wait of
+    20 s would have held it back, and its red lines name no custody failure."""
+    # A coordinator whose log lines are kept with their colors.
     plugin = Coordinator()
+    # The log lines with their colors.
     lines = []
+    # Every log call lands in the list.
     plugin.P = lambda message, color=None, **kw: lines.append((message, color))
+    # An operation cleaning up after a failed preparation.
     operation = plugin.operation()
+    # Its cleanup phase, which makes a custody call.
     operation.update(phase="cleaning_up_preparation", outcome="failed", recovery="in_progress")
+    # Written and confirmed.
     plugin._save_operation(operation)
+    # The times of the custody calls and of the chain-store writes.
     calls, writes = [], []
 
     def custody(payload):
+      """
+      Answer a custody call as dAuth does: unavailable the first time, then a success.
+
+      Parameters
+      ----------
+      payload : dict
+        The custody request; not read.
+
+      Returns
+      -------
+      dict
+        An empty answer, from the second call on.
+
+      Raises
+      ------
+      RuntimeError
+        On the first call, as an unavailable dAuth.
+
+      Examples
+      --------
+      >>> custody({})  # the first call
+      Traceback (most recent call last):
+      RuntimeError: dAuth reconciliation service is unavailable.
+      """
+      # Record the call's time.
       calls.append(plugin.now)
       if len(calls) == 1:
         raise RuntimeError("dAuth reconciliation service is unavailable.")
       return {}
 
+    # dAuth's custody calls go to the fake above.
     plugin.bc.reconcile_dauth_job_secrets = custody
+    # The fake store's own write.
     store = plugin.chainstore_hset
+    # Record each write's time, keeping the fake store's behaviour.
     plugin.chainstore_hset = lambda namespace, key, value, **kw: writes.append(plugin.now) or store(namespace, key, value, **kw)
-    plugin._reconcile_coordinator_operations()  # custody failure 1, next try in 10 s
+    # Custody failure 1, next try in 10 s.
+    plugin._reconcile_coordinator_operations()
     # At 110 s the custody call succeeds, but no chain-store write is confirmed from then on.
     plugin.now, plugin.replicate = 110, False
+    # One pass every 2 s up to 116 s.
     for _ in range(4):
+      # One pass.
       plugin._reconcile_coordinator_operations()
+      # The worker's 2 s wait.
       plugin.now += 2
+    # dAuth was called at 100 s and, after the 10 s wait, at 110 s.
     self.assertEqual(calls, [100, 110])
+    # The final write at 110 s, then again on every pass.
     self.assertEqual(writes, [110, 112, 114, 116])
+    # The red lines.
     red = [message for message, color in lines if color == "r"]
+    # The custody failure and the four failed writes.
     self.assertEqual(len(red), 5)
+    # Only the first names a custody failure.
     self.assertTrue(red[0].endswith("(custody failure 1, next try in 10 s)"))
+    # The failed writes do not.
     self.assertFalse(any("custody failure" in message for message in red[1:]))
 
   def test_admission_answers_as_before_when_the_custody_call_fails(self):
@@ -631,125 +709,545 @@ class RuntimeCompletionTests(unittest.TestCase):
     self.assertFalse(plugin._verify_operation_record(record, "node_addr"))
 
   def test_verified_fingerprints_evict_only_the_oldest_insertion(self):
+    """A full cache drops only its oldest insertion, a hit does not move an entry, a failed record drops none."""
+    # A coordinator with an empty cache.
     plugin = Coordinator()
+    # A valid coordinator record; each sequence number below makes a distinct fingerprint.
     record = dict(coordinator="oracle", EE_SENDER="oracle", EE_SIGN="valid")
+    # Count the signature checks, while they still answer as the fixture does.
     plugin.bc.verify = Mock(wraps=plugin.bc.verify)
+    # Record every log call.
     plugin.P = Mock()
+    # Fill the cache to its 10,000 entries with sequences 0 to 9,999, in that order.
     for index in range(10000):
+      # Each one is valid, so each one is remembered.
       self.assertTrue(plugin._verify_operation_record(dict(record, sequence=index), "coordinator"))
+    # Full, and nothing was dropped yet.
     self.assertEqual(len(plugin._verified_operation_records), 10000)
+    # Count only the checks from here on.
     plugin.bc.verify.reset_mock()
     # A cache hit does not refresh insertion order.
     self.assertTrue(plugin._verify_operation_record(dict(record, sequence=0), "coordinator"))
+    # The hit was answered from memory, without a signature check.
     plugin.bc.verify.assert_not_called()
     # Neither invalid signatures nor a mismatched writer may evict a valid entry.
     for invalid in (dict(record, EE_SIGN="forged"), dict(record, EE_SENDER="other")):
+      # Twice each: a failed record is not remembered, so the second read is checked again.
       for _ in range(2):
+        # Each read is refused.
         self.assertFalse(plugin._verify_operation_record(invalid, "coordinator"))
+    # Two records read twice: four full checks.
     self.assertEqual(plugin.bc.verify.call_count, 4)
+    # Sequence 0 is still remembered: the refused records dropped nothing.
     self.assertTrue(plugin._verify_operation_record(dict(record, sequence=0), "coordinator"))
+    # No check was added for it.
     self.assertEqual(plugin.bc.verify.call_count, 4)
+    # A new valid record at capacity is remembered by dropping the oldest insertion, sequence 0.
     self.assertTrue(plugin._verify_operation_record(dict(record, sequence=10000), "coordinator"))
+    # Still full, never above it.
     self.assertEqual(len(plugin._verified_operation_records), 10000)
+    # Count only the checks from here on.
     plugin.bc.verify.reset_mock()
+    # The second oldest, the newest of the first fill and the new record are all still remembered.
     for index in (1, 9999, 10000):
+      # Each one is accepted.
       self.assertTrue(plugin._verify_operation_record(dict(record, sequence=index), "coordinator"))
+    # All three from memory.
     plugin.bc.verify.assert_not_called()
     # The evicted record is verified again; its reinsertion evicts the next oldest.
     for index in (0, 1):
+      # Sequence 0 drops sequence 1, which is then checked again and drops sequence 2.
       self.assertTrue(plugin._verify_operation_record(dict(record, sequence=index), "coordinator"))
+    # Both were checked in full.
     self.assertEqual(plugin.bc.verify.call_count, 2)
+    # Still full, never above it.
     self.assertEqual(len(plugin._verified_operation_records), 10000)
+    # Three drops in all are counted, fewer than the 10,000 that make one red line, so nothing was logged.
+    self.assertEqual(plugin._verified_operation_records_dropped, 3)
+    # No log call at all.
     plugin.P.assert_not_called()
 
   def test_concurrent_verified_fingerprints_remain_bounded_without_extra_evictions(self):
+    """Four threads that miss at once touch the cache only under its lock and drop exactly one entry per new record.
+
+    Run once with four distinct new records and once with the same new record four times, on a full cache.
+    """
     # A barrier alone can miss unprotected cache races under the GIL. Assert lock ownership too.
     test = self
 
+    # The cache lock, which also records the thread that holds it.
     class CacheLock:
+      """
+      A lock for the fingerprint cache that also records which thread holds it.
+
+      It replaces the plugin's `threading.Lock` for this test, so the checking cache below can assert that each
+      of its operations runs on the thread that holds the lock.
+
+      Examples
+      --------
+      >>> guard = CacheLock()
+      >>> with guard:
+      ...   guard.owner == threading.get_ident()
+      True
+      """
+
       def __init__(self):
+        """
+        Create the lock, held by no thread.
+
+        Returns
+        -------
+        None
+          `lock` is a new `threading.Lock`; `owner` is None.
+
+        Examples
+        --------
+        >>> CacheLock().owner is None
+        True
+        """
+        # The real lock behind the context manager.
         self.lock = threading.Lock()
+        # No thread holds it yet.
         self.owner = None
 
       def __enter__(self):
+        """
+        Take the lock, then record the calling thread as its holder.
+
+        Returns
+        -------
+        None
+          Nothing is bound by `with`.
+
+        Examples
+        --------
+        >>> with guard:
+        ...   guard.owner == threading.get_ident()
+        True
+        """
+        # Take the lock, then note who holds it.
         self.lock.acquire()
+        # The holder, as the cache below checks it.
         self.owner = threading.get_ident()
 
       def __exit__(self, *args):
+        """
+        Forget the holder, then release the lock.
+
+        Parameters
+        ----------
+        *args : tuple
+          The exception type, value and traceback of the `with` block, or three None; not used.
+
+        Returns
+        -------
+        None
+          An exception raised in the block is not suppressed.
+
+        Examples
+        --------
+        >>> with guard:
+        ...   pass
+        >>> guard.owner is None
+        True
+        """
+        # Forget the holder before the lock is released.
         self.owner = None
+        # Let the next thread in.
         self.lock.release()
 
+    # The cache, failing the test when one of its operations runs on a thread that does not hold the lock.
     class LockedCache(OrderedDict):
+      """
+      The fingerprint cache, failing the test when one of its operations runs without the cache lock.
+
+      Its `guard` attribute is the `CacheLock` the plugin uses. Lookup, size, insertion and drop each assert that
+      the calling thread holds it, then act as on a plain `OrderedDict`; an insertion also asserts the bound.
+
+      Examples
+      --------
+      >>> cache = LockedCache()
+      >>> cache.guard = CacheLock()
+      >>> with cache.guard:
+      ...   len(cache)
+      0
+      """
+
       def __contains__(self, key):
+        """
+        Look a fingerprint up, only on the thread that holds the cache lock.
+
+        Parameters
+        ----------
+        key : str
+          The fingerprint looked up.
+
+        Returns
+        -------
+        bool
+          Whether the cache holds it.
+
+        Examples
+        --------
+        >>> with cache.guard:
+        ...   "fingerprint" in cache
+        False
+        """
+        # A lookup only by the thread that holds the lock.
         test.assertEqual(self.guard.owner, threading.get_ident())
+        # Then the plain lookup.
         return super().__contains__(key)
 
       def __len__(self):
+        """
+        Read the size of the cache, only on the thread that holds the cache lock.
+
+        Returns
+        -------
+        int
+          The number of fingerprints held.
+
+        Examples
+        --------
+        >>> with cache.guard:
+        ...   len(cache)
+        0
+        """
+        # The size read only by the thread that holds the lock.
         test.assertEqual(self.guard.owner, threading.get_ident())
+        # Then the plain size.
         return super().__len__()
 
       def __setitem__(self, key, value):
+        """
+        Insert a fingerprint, only on the thread that holds the cache lock, and never above 10,000 entries.
+
+        Parameters
+        ----------
+        key : str
+          The fingerprint inserted.
+        value : bool
+          The value kept for it; the plugin keeps True.
+
+        Returns
+        -------
+        None
+
+        Examples
+        --------
+        >>> with cache.guard:
+        ...   cache["fingerprint"] = True
+        """
+        # An insertion only by the thread that holds the lock.
         test.assertEqual(self.guard.owner, threading.get_ident())
+        # Then the plain insertion.
         super().__setitem__(key, value)
+        # Never above 10,000 entries, read without the ownership check above.
         test.assertLessEqual(OrderedDict.__len__(self), 10000)
 
       def popitem(self, *args, **kwargs):
+        """
+        Drop an entry, only on the thread that holds the cache lock.
+
+        Parameters
+        ----------
+        *args : tuple
+          Passed to `OrderedDict.popitem`; the plugin passes none.
+        **kwargs : dict
+          Passed to `OrderedDict.popitem`; the plugin passes `last=False`, the oldest insertion.
+
+        Returns
+        -------
+        tuple
+          The dropped (fingerprint, value) pair.
+
+        Examples
+        --------
+        >>> with cache.guard:
+        ...   cache.popitem(last=False)
+        ('fingerprint', True)
+        """
+        # A drop only by the thread that holds the lock.
         test.assertEqual(self.guard.owner, threading.get_ident())
+        # Then the plain drop.
         return super().popitem(*args, **kwargs)
 
+    # Four distinct new records first, then one new record read four times at once.
     for duplicates in (False, True):
+      # Each case on a fresh plugin.
       with self.subTest(duplicates=duplicates):
+        # A coordinator with an empty cache.
         plugin = Coordinator()
+        # The checking cache, in place of the plugin's own.
         cache = LockedCache()
+        # The cache and the plugin share the recording lock.
         cache.guard = plugin._verified_operation_records_lock = CacheLock()
+        # The plugin uses the checking cache.
         plugin._verified_operation_records = cache
+        # A valid coordinator record; each sequence number below makes a distinct fingerprint.
         record = dict(coordinator="oracle", EE_SENDER="oracle", EE_SIGN="valid")
+        # Fill the cache to its 10,000 entries with sequences 0 to 9,999, in that order.
         for index in range(10000):
+          # Each one is valid, so each one is remembered.
           self.assertTrue(plugin._verify_operation_record(dict(record, sequence=index), "coordinator"))
+        # The fixture's signature check, wrapped below.
         verify = plugin.bc.verify
+        # The four checks below wait for each other here, so all four run at the same time.
         barrier = threading.Barrier(4, timeout=5)
 
         def concurrent_verify(value, **kwargs):
+          """
+          Check a signature only once all four threads have reached a check.
+
+          Parameters
+          ----------
+          value : dict
+            The record whose signature is checked.
+          **kwargs : dict
+            The other arguments of the plugin's check, passed on.
+
+          Returns
+          -------
+          object
+            What the fixture's signature check returns for the record.
+
+          Raises
+          ------
+          threading.BrokenBarrierError
+            When the four threads do not all reach a check within 5 s.
+
+          Examples
+          --------
+          >>> concurrent_verify(record, return_full_info=True).valid   # in each of the four threads at once
+          True
+          """
           # All misses must reach verification concurrently: the cache lock cannot cover crypto.
           barrier.wait()
+          # Then the fixture's answer.
           return verify(value, **kwargs)
 
+        # Every signature check now waits for the other three.
         plugin.bc.verify = concurrent_verify
+        # Four distinct new sequences, or the same new sequence four times.
         indices = [10000] * 4 if duplicates else list(range(10000, 10004))
+        # One thread per read.
         with ThreadPoolExecutor(max_workers=4) as executor:
+          # The four reads, started together.
           futures = [executor.submit(plugin._verify_operation_record, dict(record, sequence=index), "coordinator")
                      for index in indices]
+          # All four are accepted.
           self.assertEqual([future.result(timeout=10) for future in futures], [True] * 4)
+        # Read the size under the lock, as the checking cache requires.
         with cache.guard:
+          # Still full, never above it.
           self.assertEqual(len(cache), 10000)
+        # Count the checks from here on.
         plugin.bc.verify = Mock(wraps=verify)
         # Duplicate misses insert once; distinct misses evict exactly their number of old entries.
         for index in [len(set(indices)), 9999] + indices:
+          # The oldest that must remain, the newest of the first fill and the new records: all accepted.
           self.assertTrue(plugin._verify_operation_record(dict(record, sequence=index), "coordinator"))
+        # All from memory, so nothing was dropped beyond one entry per new record.
         plugin.bc.verify.assert_not_called()
+        # Sequence 0, the oldest, was dropped by the first new record.
         self.assertTrue(plugin._verify_operation_record(dict(record, sequence=0), "coordinator"))
+        # So it is checked in full again.
         plugin.bc.verify.assert_called_once()
+        # Read the size under the lock, as the checking cache requires.
         with cache.guard:
+          # Still full, never above it.
           self.assertEqual(len(cache), 10000)
+        # Every drop was counted under the lock: one per distinct new record, and one for the reread sequence 0.
+        self.assertEqual(plugin._verified_operation_records_dropped, len(set(indices)) + 1)
 
-  def test_completed_snapshot_is_resent_as_repair_for_ten_minutes(self):
+  def test_every_ten_thousand_dropped_fingerprints_log_one_red_line(self):
+    """Each 10,000th fingerprint dropped from the full cache logs one red line; the drops between log nothing."""
+    # A coordinator with an empty cache and no drops yet.
+    plugin = Coordinator()
+    # A valid coordinator record; each sequence number below makes a distinct fingerprint.
+    record = dict(coordinator="oracle", EE_SENDER="oracle", EE_SIGN="valid")
+    # The log lines, as (message, color).
+    lines = []
+    # Every log call lands there.
+    plugin.P = lambda message, color=None, **kw: lines.append((message, color))
+    # Fill the cache, then make 9,999 drops with as many new records: one short of a line.
+    for index in range(19999):
+      # Each one is valid, so each one is remembered.
+      self.assertTrue(plugin._verify_operation_record(dict(record, sequence=index), "coordinator"))
+    # 9,999 drops, nothing logged.
+    self.assertEqual((plugin._verified_operation_records_dropped, lines), (9999, []))
+    # The 10,000th drop.
+    self.assertTrue(plugin._verify_operation_record(dict(record, sequence=19999), "coordinator"))
+    # One red line, which says what was replaced and what a repeat on every pass means.
+    self.assertEqual(lines, [(
+      "Replaced 10,000 remembered Deeploy record fingerprints. If this line repeats on every pass, more than "
+      "10,000 valid records are alive and every record is checked again.", "r")])
+    # The next drop starts the count towards the next line and logs nothing.
+    self.assertTrue(plugin._verify_operation_record(dict(record, sequence=20000), "coordinator"))
+    # Still one line; the cache stays at its bound.
+    self.assertEqual((len(lines), len(plugin._verified_operation_records)), (1, 10000))
+
+  def test_completed_snapshot_is_resent_every_30_s_then_on_a_back_off_for_a_day(self):
+    """The final snapshot of a completed operation is re-sent every 30 s for 600 s, as before, then at the ages
+    600, 1,200, 2,400 and 4,800 s and every hour after that up to 84,000 s, and no more; always the same record."""
     # One confirmation is enough for a write, so an oracle can miss the final snapshot; nothing else sends it again.
     plugin = Coordinator()
+    # A completed update operation.
     operation = plugin.operation("update")
+    # Completed, with a failed outcome and a completed recovery.
     operation.update(phase="completed", outcome="failed", recovery="completed")
+    # The final snapshot, written and confirmed now: its update time is the completion.
     plugin._save_operation(operation)
+    # The store after the final write, and the (seconds after completion, namespace, key) of each re-send.
     stored, sent = dict(plugin.storage), []
+    # The fake store's own write.
     store = plugin.chainstore_hset
-    plugin.chainstore_hset = lambda namespace, key, value, **kw: sent.append((namespace, key)) or store(namespace, key, value, **kw)
-    plugin._reconcile_coordinator_operations()  # just confirmed: nothing to send
-    self.assertEqual(sent, [])
-    plugin.now += 31
-    plugin._reconcile_coordinator_operations()  # 30 s later: the same record once more
-    self.assertEqual(sent, [(OPERATIONS_HKEY, "{}|{}".format(operation["operation_id"], operation["sequence"] % 8))])
-    plugin.now += 600
-    plugin._reconcile_coordinator_operations()  # past the window: left alone
-    self.assertEqual(len(sent), 1)
+    # Record each write with its time after completion, keeping the fake store's behaviour.
+    plugin.chainstore_hset = lambda namespace, key, value, **kw: sent.append(
+      (plugin.now - operation["updated_at"], namespace, key)) or store(namespace, key, value, **kw)
+    # One worker pass every 2 s, from completion to 25 h: past 87,600 s, where one more hour would put a send.
+    for _ in range(90000 // 2 + 1):
+      # One pass.
+      plugin._reconcile_coordinator_operations()
+      # The worker's 2 s wait.
+      plugin.now += 2
+    # 19 re-sends 30 s apart in the first 600 s, then 600, 1,200, 2,400 and 4,800 s, then every hour up to 84,000 s.
+    self.assertEqual([age for age, _, _ in sent], REPAIR_SCHEDULE)
+    # 26 of them from 600 s on.
+    self.assertEqual(len([age for age, _, _ in sent if age >= 600]), 26)
+    # Every re-send wrote the final snapshot's own slot.
+    self.assertEqual({(namespace, key) for _, namespace, key in sent},
+                     {(OPERATIONS_HKEY, "{}|{}".format(operation["operation_id"], operation["sequence"] % 8))})
+    # And always the same record: the store is as the final write left it.
     self.assertEqual(plugin.storage, stored)
+
+  def test_a_late_pass_does_not_hold_back_a_send(self):
+    """A late pass holds no send of a completed operation back: a first pass 35 s after completion sends at once,
+    as before, and from 600 s on the sends fall on fixed ages after completion, not on the time since the last send:
+    a send made late for the age 1,200 s, 20 s before the age 2,400 s, is followed by the send of that age."""
+    # A coordinator with a completed operation.
+    plugin = Coordinator()
+    # A completed update operation.
+    operation = plugin.operation("update")
+    # Completed, with a failed outcome and a completed recovery.
+    operation.update(phase="completed", outcome="failed", recovery="completed")
+    # The final snapshot, written and confirmed now: its update time is the completion.
+    plugin._save_operation(operation)
+    # The seconds after completion of each write.
+    sent = []
+    # The fake store's own write.
+    store = plugin.chainstore_hset
+    # Record each write's time after completion, keeping the fake store's behaviour.
+    plugin.chainstore_hset = lambda namespace, key, value, **kw: sent.append(
+      plugin.now - operation["updated_at"]) or store(namespace, key, value, **kw)
+    # A pass at completion, the next one 35 s later, one 20 s before the age 2,400 s, and one at that age.
+    for age in (0, 35, 2380, 2400):
+      # The pass at this age.
+      plugin.now = operation["updated_at"] + age
+      # One pass.
+      plugin._reconcile_coordinator_operations()
+    # Sent at 35 s, at 2,380 s for the ages 600 and 1,200 s, and again at 2,400 s.
+    self.assertEqual(sent, [35, 2380, 2400])
+
+  def test_restarts_keep_each_operation_on_its_own_ages(self):
+    """A restart in an operation's first 600 s sends it at once and every 30 s from then, as before, and keeps its
+    age 600 s; restarts every 1,700 s after that, closer together than the later gaps, neither send at once nor
+    move the sends: two operations completed 1,000 s apart are each sent at their own ages after completion and
+    at no other time, and a restart more than 24 h after completion keeps no entry for them."""
+    # A coordinator.
+    plugin = Coordinator()
+    # The completion time of each operation, by its id.
+    completed = {}
+    # Two completed operations, the second 1,000 s after the first.
+    for suffix in ("-first", "-second"):
+      # A completed update operation, its id under this coordinator's prefix.
+      operation = plugin.operation("update")
+      # Its own id, completed, with a failed outcome and a completed recovery.
+      operation.update(operation_id=operation["operation_id"].replace("-test", suffix), phase="completed",
+                       outcome="failed", recovery="completed")
+      # The final snapshot, written and confirmed now.
+      plugin._save_operation(operation)
+      # Its update time is its completion.
+      completed[operation["operation_id"]] = plugin.now
+      # The next operation completes 1,000 s later.
+      plugin.now += 1000
+    # The ids of the first and the second operation, in completion order.
+    first, second = completed
+    # The (operation id, seconds after its completion) of each write.
+    sent = []
+    # The fake store's own write.
+    store = plugin.chainstore_hset
+    # Record each write with its operation and its age, keeping the fake store's behaviour.
+    plugin.chainstore_hset = lambda namespace, key, value, **kw: sent.append(
+      (value["operation_id"], plugin.now - completed[value["operation_id"]])) or store(namespace, key, value, **kw)
+    # One pass every 10 s from the second completion (the first pass sees both, as after a restart) to 87,500 s
+    # after the first completion; a restart 310 s after the second completion, and one every 1,700 s from 850 s
+    # after it, none on an age.
+    for now in range(completed[second], completed[first] + 87500, 10):
+      # The pass at this time.
+      plugin.now = now
+      # Seconds since the second completion.
+      since = now - completed[second]
+      if since == 310 or (since >= 850 and (since - 850) % 1700 == 0):
+        # A restart: the maps kept in process memory start empty, as _init_deployment_operations leaves them.
+        plugin._operations_confirmed, plugin._operations_repaired = {}, {}
+      # One pass.
+      plugin._reconcile_coordinator_operations()
+    # The first operation, 1,000 s old at the first pass, is sent at each later age of its schedule and only then.
+    self.assertEqual([age for operation_id, age in sent if operation_id == first],
+                     [age for age in REPAIR_SCHEDULE if age > 1000])
+    # The second, seen at its completion: every 30 s up to 300 s, at the restart 310 s and every 30 s from there,
+    # then at every age of its schedule from 600 s, and only then.
+    self.assertEqual([age for operation_id, age in sent if operation_id == second],
+                     list(range(30, 330, 30)) + list(range(310, 600, 30)) + REPAIR_SCHEDULE[19:])
+    # A restart more than 24 h after both completions.
+    plugin._operations_confirmed, plugin._operations_repaired = {}, {}
+    # One pass after it.
+    plugin._reconcile_coordinator_operations()
+    # Neither operation is kept in the schedule's map any more.
+    self.assertEqual(plugin._operations_repaired, {})
+
+  def test_a_final_snapshot_never_confirmed_is_logged_the_same_before_and_after_a_restart(self):
+    """A final snapshot that other oracles never confirmed is sent again on every pass in its first 600 s, as
+    before, then at each age of the schedule only, and each such send leaves one red line, the same before a
+    restart and after it, in the first 600 s and later."""
+    # A coordinator.
+    plugin = Coordinator()
+    # An update operation.
+    operation = plugin.operation("update")
+    # An earlier snapshot, written and confirmed.
+    plugin._save_operation(operation)
+    # Completed, with a failed outcome and a completed recovery.
+    operation.update(phase="completed", outcome="failed", recovery="completed")
+    # Other oracles do not confirm from now on.
+    plugin.replicate = False
+    # The final snapshot is stored here but not confirmed: the save raises.
+    with self.assertRaises(RuntimeError):
+      # The final write.
+      plugin._save_operation(operation)
+    # The completion time: the stored final snapshot's update time.
+    completion = plugin.now
+    # The seconds after completion of each write and of each red line.
+    sent, red = [], []
+    # The fake store's own write.
+    store = plugin.chainstore_hset
+    # Record each write's time after completion, keeping the fake store's behaviour.
+    plugin.chainstore_hset = lambda namespace, key, value, **kw: sent.append(plugin.now - completion) or store(
+      namespace, key, value, **kw)
+    # Record the time after completion of each red log line.
+    plugin.P = lambda message, color=None, **kw: red.append(plugin.now - completion) if color == "r" else None
+    # One pass every 2 s for 1,300 s after completion, with restarts 300 and 700 s after completion.
+    for now in range(completion, completion + 1300, 2):
+      # The pass at this time.
+      plugin.now = now
+      if now - completion in (300, 700):
+        # A restart: the maps kept in process memory start empty, as _init_deployment_operations leaves them.
+        plugin._operations_confirmed, plugin._operations_repaired = {}, {}
+      # One pass.
+      plugin._reconcile_coordinator_operations()
+    # Sent on every pass up to 598 s, across the restart at 300 s, then at the age 600 s and, after the restart at
+    # 700 s, at the age 1,200 s; each send is one red line.
+    self.assertEqual((sent, red), (list(range(0, 600, 2)) + [600, 1200],) * 2)
 
 
 if __name__ == "__main__":

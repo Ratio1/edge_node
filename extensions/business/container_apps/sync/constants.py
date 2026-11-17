@@ -8,6 +8,9 @@ version. Anything tunable belongs in the plugin's ``SYNC`` config block,
 not here.
 """
 
+# Regular expressions: the 64-hex pattern below checks a sync secret and a record MAC.
+import re
+
 # ---------------------------------------------------------------------------
 # System volume — non-configurable defaults
 # ---------------------------------------------------------------------------
@@ -40,6 +43,15 @@ CHAINSTORE_SYNC_HKEY = "CHAINSTORE_SYNC"
 MANIFEST_SCHEMA_VERSION = 1
 ARCHIVE_FORMAT = "tar.gz"
 ARCHIVE_ENCRYPTION = "r1fs-default"
+# Manifest tag of a set that has its own secret: R1FS encrypts the archive under that secret, not the default one.
+ARCHIVE_ENCRYPTION_SET = "r1fs-set-v1"
+
+# Name of the configured ENV variable that carries the set's secret; CAR removes it from the container's env.
+SYNC_SECRET_ENV = "R1EN_SYNC_SECRET"
+# Message of the HMAC-SHA256 that derives the record MAC subkey from the secret, so the MAC key is not the secret.
+SYNC_MAC_CONTEXT = b"r1en-volume-sync-record-v1"
+# A secret or a record MAC: 64 lowercase hex characters. Unanchored: use only with fullmatch, never match or search.
+HEX64_RE = re.compile(r"[0-9a-f]{64}")
 
 # Stages reported on failure (used in response.json + request.json.invalid)
 STAGE_VALIDATION = "validation"

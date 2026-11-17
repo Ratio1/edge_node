@@ -5,6 +5,8 @@ import threading
 import unittest
 from copy import deepcopy
 from pathlib import Path
+# Two gate tests give the manager a monotonic clock of their own.
+from unittest.mock import patch
 
 from ratio1.const.base import dAuth
 
@@ -179,6 +181,8 @@ def _load_dauth_manager_class():
 
 
 DauthManagerPlugin = _load_dauth_manager_class()
+# The loaded manager module's globals, where a test puts a monotonic clock of its own.
+_MANAGER_GLOBALS = DauthManagerPlugin._refresh_dauth_registry.__globals__
 
 
 class _FakeDauthConst:
@@ -983,8 +987,10 @@ class DauthServerRegistryGateTests(unittest.TestCase):
           self.assertIn("ValueError in reconcile_job_secrets > reconcile", plugin._messages[-1])
 
   def test_secret_endpoint_errors_echo_request_nonce(self):
+    """A failing secrets endpoint answers with the request's nonce and the error text, and logs one line per failure."""
     plugin = self._make_manager(dauth_oracle=True)
     plugin._dauth_server_enabled = True
+    # Each of the three request handlers fails with a text of its own.
     plugin.process_dauth_add_secrets_request = lambda body: (_ for _ in ()).throw(
       ValueError("add failed")
     )
@@ -994,6 +1000,7 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin.process_dauth_reveal_secret_request = lambda body: (_ for _ in ()).throw(
       ValueError("reveal failed")
     )
+    # A body with a nonce and nothing else: it names no sender and no job.
     body = {"nonce": REQUEST_NONCE}
 
     add_response = plugin.add_secrets(body)
@@ -1008,7 +1015,8 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     self.assertEqual(reveal_response["error"], "reveal failed")
     self.assertEqual(plugin._messages[-3:], [
       f"Error processing add_secrets request from {SOURCE_IP}: add failed",
-      f"Error processing get_secrets request from {SOURCE_IP}: get failed",
+      # The get_secrets line also says which sender and job the request names: none here.
+      f"Error processing get_secrets request from {SOURCE_IP} (sender None ETH None job None): get failed",
       f"Error processing reveal_job_secrets request from {SOURCE_IP}: reveal failed",
     ])
 
@@ -1211,6 +1219,121 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin._now += 1
     self.assertTrue(plugin.should_resume())
     self.assertEqual(plugin.bc.calls, 3)
+
+  def test_a_slow_failed_registry_read_is_tried_again_once_the_sdk_reads_the_registry_again(self):
+    """A refresh whose read hangs 20.5 s and fails pauses the server and is tried again three times that time after
+    the read ended (61.5 s, more than the 60 s retry interval), when the SDK's memory of the failure is over and it
+    reads the registry again; that retry resumes the server. Before, the retry came 60 s after the read's start,
+    inside that memory, and failed without a read."""
+    # A registered dAuth oracle, started.
+    plugin = self._make_manager(dauth_oracle=True)
+    # The start-up read lists it.
+    plugin.on_init()
+    # The manager times its reads on the monotonic clock; here that clock follows the plugin's clock.
+    self.enterContext(patch.dict(_MANAGER_GLOBALS, monotonic=lambda: plugin._now))
+
+    def hanging():
+      """
+      Stand in for a registry read that hangs 20.5 s on the plugin's clock and then fails.
+
+      Returns
+      -------
+      None
+        Nothing is returned: the call always raises.
+
+      Raises
+      ------
+      TimeoutError
+        Always, 20.5 s later on the plugin's clock.
+
+      Examples
+      --------
+      >>> hanging()
+      Traceback (most recent call last):
+      TimeoutError: read timed out
+      """
+      # The read's time passes.
+      plugin._now += 20.5
+      # It ends without an answer.
+      raise TimeoutError("read timed out")
+
+    # The registry's read hangs from now on.
+    plugin.bc.get_eth_dauth_oracles = hanging
+    # The hourly refresh.
+    plugin._now += 60 * 60
+    # Its read fails: the server pauses.
+    self.assertTrue(plugin.should_pause())
+    # The endpoint answers again right after: the registry is read as before and lists this node.
+    del plugin.bc.get_eth_dauth_oracles
+    # The registry reads made so far.
+    calls = plugin.bc.calls
+    # 61 s after the failed read ended: past the retry interval, still inside three times the read's time.
+    plugin._now += 61
+    # Still paused, and no read: the SDK would answer the failure from its memory.
+    self.assertEqual((plugin.should_resume(), plugin.bc.calls), (False, calls))
+    # Three times the read's time after it ended.
+    plugin._now += 0.5
+    # The registry is read and the server resumes.
+    self.assertEqual((plugin.should_resume(), plugin.bc.calls), (True, calls + 1))
+
+  def test_a_wall_clock_step_during_a_failed_registry_read_does_not_lengthen_the_retry(self):
+    """A refresh whose read fails after 0.13 s while the wall clock steps 600 s forward (an NTP step) is tried again
+    the retry interval (60 s) after the read ended, as without the step, and resumes the server: the read's time is
+    taken on the monotonic clock. Before, the read counted 600.13 s and the retry waited three times that, 1800 s."""
+    # A registered dAuth oracle, started.
+    plugin = self._make_manager(dauth_oracle=True)
+    # The start-up read lists it.
+    plugin.on_init()
+    # The monotonic clock of this test, which no wall clock step moves.
+    mono = [0.0]
+    # The manager reads it.
+    self.enterContext(patch.dict(_MANAGER_GLOBALS, monotonic=lambda: mono[0]))
+
+    def stepping():
+      """
+      Stand in for a registry read that fails after 0.13 s while the wall clock steps 600 s forward.
+
+      Returns
+      -------
+      None
+        Nothing is returned: the call always raises.
+
+      Raises
+      ------
+      TimeoutError
+        Always, 0.13 s later on the monotonic clock and 600.13 s later on the plugin's wall clock.
+
+      Examples
+      --------
+      >>> stepping()
+      Traceback (most recent call last):
+      TimeoutError: read timed out
+      """
+      # The read's time passes on the monotonic clock.
+      mono[0] += 0.13
+      # The wall clock passes the same time and steps 600 s forward.
+      plugin._now += 0.13 + 600
+      # It ends without an answer.
+      raise TimeoutError("read timed out")
+
+    # The registry's read fails, with the step, from now on.
+    plugin.bc.get_eth_dauth_oracles = stepping
+    # The hourly refresh.
+    plugin._now += 60 * 60
+    # Its read fails: the server pauses.
+    self.assertTrue(plugin.should_pause())
+    # The endpoint answers again right after: the registry is read as before and lists this node.
+    del plugin.bc.get_eth_dauth_oracles
+    # The registry reads made so far.
+    calls = plugin.bc.calls
+    # 59 s after the failed read ended: inside the retry interval.
+    plugin._now += 59
+    # Still paused, and no read.
+    self.assertEqual((plugin.should_resume(), plugin.bc.calls), (False, calls))
+    # The retry interval after the read ended.
+    plugin._now += 1
+    # The registry is read and the server resumes.
+    self.assertEqual((plugin.should_resume(), plugin.bc.calls), (True, calls + 1))
 
   def test_pause_tears_down_and_resume_restarts_only_request_monitor(self):
     plugin = self._make_manager(dauth_oracle=True)

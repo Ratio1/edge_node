@@ -12,6 +12,28 @@ POINTERS = "DEEPLOY_DEPLOYED_JOBS"
 AUTH_FIELDS = SIGNATURE_KEYS | {"EE_ETH_SENDER", "EE_ETH_SIGN"}
 
 
+class DeploymentSecretRecordTooLarge(ValueError):
+  """
+  The chain store refused a deployment's secret record for its size.
+
+  Raised by ``_prepare_deployment_secret_revisions`` when the write of a secret-revision record, the target copy
+  or the restoration copy, ends with the chain store's outcome word ``refused_too_large``. It is a
+  ``ValueError``, so it is final like the other refusals of a request: the chain store of every oracle of this
+  release has the same size cap, and no retry can store the record.
+
+  Notes
+  -----
+  The type is its own so that the dAuth endpoint can tell this one refusal from every other failure and name
+  it to the caller by a fixed reason code (see ``reconcile_job_secrets``). It carries no text: the endpoint
+  reads the type only, and the caller's client words the refusal itself.
+
+  Examples
+  --------
+  >>> issubclass(DeploymentSecretRecordTooLarge, ValueError)
+  True
+  """
+
+
 class _DauthDeploymentSecretsMixin:
   """Prepare immutable secrets and publish only at lifecycle finalization."""
 
@@ -138,7 +160,63 @@ class _DauthDeploymentSecretsMixin:
     return record
 
   def _prepare_deployment_secret_revisions(self, job_id, operation, plan, body):
-    """Reconcile target and restoration copies without changing the active CID."""
+    """
+    Reconcile target and restoration copies without changing the active CID.
+
+    Checks that the job's active pipeline is still the one the operation was built on and collects the secret
+    values the previous revision holds. It then builds one secret-revision record per attempt of the plan: the
+    restoration copy (``previous_configs``) and the target copy (``configs``). A record holds the job's secret
+    values and one pipeline configuration per target node, so it grows with the number of nodes and with the
+    size of the configurations. Both records are built and checked before either is written; each is then
+    written to the dAuth registry peers and must be confirmed.
+
+    Parameters
+    ----------
+    job_id : str
+      The normalized Deeploy job ID.
+    operation : dict
+      The authenticated operation from ``_deployment_secret_context``, in its "preparing" phase.
+    plan : dict
+      The operation's verified plan: ``configs`` and ``previous_configs``, each keyed by node.
+    body : dict
+      The verified request body. ``new_secrets`` and ``previous_new_secrets`` carry fresh secret values;
+      ``identity_aliases`` and ``node_aliases`` carry the renames of a scale-up and of a relink.
+
+    Returns
+    -------
+    None
+      The records are in the chain store, under ``DAUTH_JOB_SECRET_REVISIONS``.
+
+    Raises
+    ------
+    ValueError
+      When the active pipeline or the previous revision changed, a create would replace an active pipeline,
+      a staged revision would get other values, or the secret values cannot be completed. All are final: the
+      same request fails again.
+    DeploymentSecretRecordTooLarge
+      When the chain store refuses either record for its size: a ``ValueError`` too, and the one failure the
+      dAuth endpoint names to the caller.
+    RuntimeError
+      When the previous secret revision is not available, or a record's write failed for another reason,
+      such as no confirmation in time (retryable).
+
+    Notes
+    -----
+    The chain store refuses a record over its size cap and reports the outcome word ``refused_too_large``
+    through ``result_info``. That refusal is final, for either copy, so it gets its own error type, which
+    carries no text (so no value, key or node). ``reconcile_job_secrets`` answers every failure with one fixed
+    text and, for this type only, the reason code ``record_too_large``, from which the caller's client makes
+    its own text. The restoration copy is written first; when it is the one refused, nothing is stored. Every
+    other refusal of the store (``refused_too_deep`` and ``refused_unencodable`` among them) keeps the
+    "pending" error and gets no code.
+
+    Examples
+    --------
+    >>> self._prepare_deployment_secret_revisions("42", operation, plan, body)   # an update of job 42
+    >>> staged = self.chainstore_hgetall(hkey="DAUTH_JOB_SECRET_REVISIONS")
+    >>> sorted(key for key in staged if key.startswith("42|" + operation["operation_id"]))
+    ['42|<operation_id>:deploy', '42|<operation_id>:restore']
+    """
     prior_cid, prior_pipeline = self._load_dauth_job_pipeline_record(job_id)
     if prior_cid != operation.get("previous_pipeline_cid"):
       raise ValueError("The active pipeline changed before preparation.")
@@ -200,8 +278,18 @@ class _DauthDeploymentSecretsMixin:
     # Validate both copies before staging either. A partial replication can still
     # need recovery, but invalid target placeholders must not create an orphan.
     for reference, record in records:
+      # The dict the chain store fills with its word for how the write ended; read when the write failed.
+      info = {}
+      # The same write as before, now with the caller's dict, so a failure can be told by its cause.
       if not self.chainstore_hset(hkey=REVISIONS, key=job_id + "|" + reference, value=record,
-                                  **dauth_registry_write_kwargs(self)):
+                                  result_info=info, **dauth_registry_write_kwargs(self)):
+        if info["outcome"] == "refused_too_large":
+          # The record is over the chain store's size cap, here and on every other oracle: no retry can store
+          # it, so it is a final error that says what to change. Before, it ended in the retryable "pending"
+          # error below, like a write that was only not confirmed yet. A type of its own (before, a plain
+          # ValueError), so that the endpoint can give the caller the reason code of this one refusal. No text:
+          # the endpoint reads the type only and the client words the refusal, so a text here had no reader.
+          raise DeploymentSecretRecordTooLarge()
         raise RuntimeError("Deployment secret preparation is pending.")
 
   def _deployment_secrets_prepared(self, job_id, operation, plan):
