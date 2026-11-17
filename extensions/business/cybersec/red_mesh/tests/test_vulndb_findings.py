@@ -357,6 +357,11 @@ class PluginWiringTests(unittest.TestCase):
     self.assertEqual((status["vulndb_source"], status["vulndb_build_id"]), ("static", None))
     self.assertTrue(status["vulndb_load_error"])
 
+  def test_default_source_is_generated(self):
+    """RM-169 Phase 3 (owner, 2026-11-17): `generated` by default; `static` stays the rollback value."""
+    Plugin = api_fixtures.TestPhase3Archive()._get_plugin_class()
+    self.assertEqual(Plugin.CONFIG["VULNDB_SOURCE"], "generated")
+
 
 if __name__ == "__main__":
   unittest.main()
