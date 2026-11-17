@@ -124,6 +124,11 @@ class VulndbReader:
     vuln = self._vulns[row[0]]
     return Match(*row, *vuln, self._cvss.get(row[0], ()))
 
+  def kev(self, cve_id):
+    """KEV flag of `cve_id` in this build; None when the build has no `vuln` row for it."""
+    vuln = self._vulns.get(cve_id)
+    return None if vuln is None else bool(vuln[Match._fields.index("kev") - Match._fields.index("title")])
+
   def unsupported(self, product, version):
     """The `oldest_supported` text when `version` is older than it, else None (no `eol` row: None)."""
     entry = self._eol.get(product)

@@ -109,6 +109,15 @@ class FindingFieldTests(unittest.TestCase):
     self.assertEqual(finding.cwe, (79,))  # display classification from the database
     self.assertEqual(_finding_to_jsonable(finding)["vulndb_build_id"], "vulndb-aaaaaaaaaaaa")
 
+  def test_probe_confirmed_cve_names_build_and_kev(self):
+    """A CVE a probe proves itself (Heartbleed) is a CVE finding too: build and KEV come from the database."""
+    self.assertEqual(cve_db.probe_cve_fields(CVE), {"kev": None})  # static: KEV not evaluated
+    self.use()
+    self.assertEqual(cve_db.probe_cve_fields("CVE-2030-0011"), {"kev": True, "vulndb_build_id": "vulndb-aaaaaaaaaaaa"})
+    self.assertEqual(cve_db.probe_cve_fields(CVE), {"kev": False, "vulndb_build_id": "vulndb-aaaaaaaaaaaa"})
+    # No row in this build: the build is named, KEV stays not evaluated.
+    self.assertEqual(cve_db.probe_cve_fields("CVE-1999-0001"), {"kev": None, "vulndb_build_id": "vulndb-aaaaaaaaaaaa"})
+
   def test_static_ignores_the_inferred_span(self):
     plain = self.by_id("openssl", "1.0.1f")
     spanned = self.by_id("openssl", "1.0.1f", inferred_span=("1.0.1", "1.0.1f"))
