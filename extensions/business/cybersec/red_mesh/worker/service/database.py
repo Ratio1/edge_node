@@ -6,7 +6,7 @@ import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
-from ...cve_db import check_cves
+from ...cve_db import check_cves, probe_cve_fields
 from ...models.finding_schema import AUTHENTICATED_ACTION_NOT_APPLICABLE
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
@@ -403,6 +403,8 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
             severity=Severity.CRITICAL,
             cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
             title=f"MySQL authentication bypass confirmed (CVE-2012-2122)",
+            cve=("CVE-2012-2122",),
+            **probe_cve_fields("CVE-2012-2122"),
             description=f"MySQL {version_str} on {target}:{port} accepted login with a random password "
                         "due to CVE-2012-2122 memcmp truncation bug. Any attacker can gain root access.",
             evidence=f"Auth succeeded with random password on attempt (version {version_str})",
