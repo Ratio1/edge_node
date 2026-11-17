@@ -298,9 +298,10 @@ def _ssh_banner_verdict(product, kexinit):
 
   True: it does, or no rule exists (OpenSSH has no invariant its config cannot change, so it is verified by default).
   False: it contradicts the banner, so the service is an emulator or a proxy. None: no KEXINIT to judge by.
+  BANNER_NOT_ASSESSABLE: no KEXINIT and the product has no check (only dropbear has one), so its rows keep their confidence.
   """
   if kexinit is None:
-    return None, ""
+    return (None if product == "dropbear" else BANNER_NOT_ASSESSABLE), ""
   if product == "dropbear":
     kex = kexinit["kex"]
     if _DROPBEAR_KEXGUESS not in kex:

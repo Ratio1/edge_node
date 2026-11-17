@@ -142,6 +142,11 @@ class VerdictTests(unittest.TestCase):
     self.assertEqual(_ssh_banner_verdict("openssh", COWRIE), (True, ""))  # no unconfigurable OpenSSH invariant
     self.assertEqual(_ssh_banner_verdict("dropbear", None), (None, ""))
 
+  def test_products_without_a_check_stay_not_assessable_without_kexinit(self):
+    # Only dropbear has a banner check; a missing KEXINIT must not demote openssh or libssh rows.
+    for product in ("openssh", "libssh"):
+      self.assertEqual(_ssh_banner_verdict(product, None), (cve_db.BANNER_NOT_ASSESSABLE, ""))
+
   def test_mailoney_exim_is_unverified_real_exim_verified(self):
     verified, why = _smtp_banner_verdict("exim", MAILONEY_EHLO)
     self.assertIs(verified, False)
