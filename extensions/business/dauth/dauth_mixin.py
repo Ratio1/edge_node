@@ -1169,8 +1169,8 @@ class _DauthMixin(object):
     A protocol oracle (a node in the oracle registry that ``bc.get_oracles`` reads) also gets
     ``EE_SUPERVISOR=True`` and the supervisor keys; the dAuth-only keys go to it only when it is in
     the dAuth registry. When its request says that its client keeps memory-only secrets, and this node
-    holds one, the oracle also gets the oracle-only secret. Every other requester gets
-    ``EE_SUPERVISOR=False`` and none of these.
+    holds one, the oracle also gets the oracle-only secret, encrypted to its node key. Every other
+    requester gets ``EE_SUPERVISOR=False`` and none of these.
 
     Parameters
     ----------
@@ -1202,9 +1202,11 @@ class _DauthMixin(object):
     The oracle-only secret is read from this node's process memory (``BaseBlockEngine.oracle_secret``),
     not from its environment. A seed deleted it from its environment at start; any other dAuth server
     received it in its own start-up dAuth. A server that holds none sends no field at all, not None.
-    The field has no ``EE_`` prefix, so no client writes it to its environment. A client of an
-    earlier release does not send the flag and so never receives the field: some earlier clients
-    logged the whole answer.
+    The value is encrypted to the requester's node key, the key that signed the request, so only that
+    oracle can read it: a replayed request, the network path and a client that logs the answer see
+    ciphertext only. The field has no ``EE_`` prefix, so no client writes it to its environment. A
+    client of an earlier release does not send the flag and so never receives the field: some earlier
+    clients logged the whole answer.
 
     Examples
     --------
@@ -1325,8 +1327,9 @@ class _DauthMixin(object):
       # it there at start). Sent only when the requester's client keeps it in memory too and this node holds one.
       oracle_secret = BaseBlockEngine.oracle_secret()
       if requester_memory_secrets and oracle_secret is not None:
-        # A field without the EE_ prefix: no client writes it to its environment.
-        dauth_data[dAuth.DAUTH_ORACLE_SECRET] = oracle_secret
+        # Encrypted to the key that signed the request, so a replayed request or a copy of the answer gives no one
+        # else the value; under a field without the EE_ prefix, which no client writes to its environment.
+        dauth_data[dAuth.DAUTH_ORACLE_SECRET] = self.bc.encrypt_str(oracle_secret, requester_node_address)
     else:
       dauth_data["EE_SUPERVISOR"] = False
     # end set supervisor flag
@@ -1371,8 +1374,8 @@ class _DauthMixin(object):
     revoked and licensed). An allowed requester gets the dAuth settings; any other gets an
     answer with `error` and no settings. A served answer can carry a non-critical note in
     `error` too, such as a version warning. A protocol oracle whose signed request carries
-    ``sender_memory_secrets: true`` also gets the oracle-only secret this node holds in memory
-    (see `fill_dauth_data`).
+    ``sender_memory_secrets: true`` also gets the oracle-only secret this node holds in memory,
+    encrypted to the key that signed the request (see `fill_dauth_data`).
 
     Parameters
     ----------

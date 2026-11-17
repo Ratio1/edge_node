@@ -1,9 +1,25 @@
 """dAuth hands the oracle-only secret from process memory, only to oracles whose client keeps it in memory."""
+# Copies of a signed request and of an answer, as a third party or a log would keep them.
+import copy
+# The environment the oracle's client writes its dAuth keys to, restored after a test.
+import os
+# A folder of its own for the key files of the real engines.
+import tempfile
 # The test framework.
 import unittest
-# Replaces the process-wide holder of the secret for one test.
-from unittest.mock import patch
+# Replaces the process-wide holder of the secret, the HTTP call and module values for one test.
+from unittest.mock import Mock, patch
+# A new engine name per engine: engines are per-name multitons.
+from uuid import uuid4
 
+# The node's blockchain wrapper, whose encrypt_str dAuth calls.
+from naeural_core.utils.plugins_base.bc_wrapper import BCWrapper
+# The logger a real engine needs.
+from ratio1 import Logger
+# The engine class a node builds, with a real key.
+from ratio1.bc import DefaultBlockEngine
+# The SDK module whose VPN flag and version values a test sets.
+from ratio1.bc import base as bc_base
 # The SDK engine class that holds the secret.
 from ratio1.bc.base import BaseBlockEngine
 # The names of the variable and of the dAuth fields.
@@ -17,6 +33,10 @@ from extensions.business.dauth.test_dauth_revoked_nodes import ALLOWED, _auth_bo
 
 # An obvious fake: no real secret is ever used in a test.
 FAKE_SECRET = "fake-oracle-secret-for-tests-only"
+# What the stand-in's encrypt_str returns for any text.
+STAND_IN_CIPHERTEXT = "encrypted-secret-bundle"
+# A dAuth URL that no request reaches: the HTTP call is replaced.
+DAUTH_URL = "https://dauth.invalid/get_auth_data"
 
 
 def _hold(value):
@@ -98,13 +118,15 @@ class FillDauthDataOracleSecretTests(unittest.TestCase):
     )
 
   def test_an_oracle_whose_client_keeps_it_in_memory_gets_it(self):
-    """A protocol oracle that sent the flag gets the held value, under a field without the EE_ prefix."""
+    """A protocol oracle that sent the flag gets the held value encrypted to its address, under a field without the
+    EE_ prefix."""
     # The answer to an oracle that sent the flag.
     data = self._fill()
     # The requester is served as an oracle.
     self.assertTrue(data["EE_SUPERVISOR"])
-    # It gets the value this server holds.
-    self.assertEqual(data[dAuth.DAUTH_ORACLE_SECRET], FAKE_SECRET)
+    # The value this server holds was encrypted to the requester, and the field carries only that encryption.
+    self.assertEqual((self.plugin.bc.encrypt_calls, data[dAuth.DAUTH_ORACLE_SECRET]),
+                     ([(FAKE_SECRET, "node-oracle")], STAND_IN_CIPHERTEXT))
     # No client writes a field without the EE_ prefix to its environment.
     self.assertFalse(dAuth.DAUTH_ORACLE_SECRET.startswith(dAuth.DAUTH_ENV_KEYS_PREFIX))
 
@@ -116,8 +138,9 @@ class FillDauthDataOracleSecretTests(unittest.TestCase):
     data = self._fill()
     # The dAuth-only token is withheld, as before.
     self.assertNotIn("EE_CLOUDFLARE_TOKEN_DAUTH_MANAGER", data)
-    # The oracle-only secret is not: it goes to every protocol oracle.
-    self.assertEqual(data[dAuth.DAUTH_ORACLE_SECRET], FAKE_SECRET)
+    # The oracle-only secret is not: it goes to every protocol oracle, encrypted to it.
+    self.assertEqual((self.plugin.bc.encrypt_calls, data[dAuth.DAUTH_ORACLE_SECRET]),
+                     ([(FAKE_SECRET, "node-oracle")], STAND_IN_CIPHERTEXT))
 
   def test_an_oracle_without_the_flag_does_not_get_it(self):
     """A previous-release oracle sends no flag, so its answer is the same as before."""
@@ -201,12 +224,185 @@ class ProcessDauthRequestOracleSecretTests(unittest.TestCase):
     auth = self.plugin.process_dauth_request(
       _auth_body(ALLOWED, **{dAuth.DAUTH_SENDER_MEMORY_SECRETS: True})
     )[dAuth.DAUTH_SUBKEY]
-    # The answer carries it.
-    self.assertEqual(auth[dAuth.DAUTH_ORACLE_SECRET], FAKE_SECRET)
+    # The answer carries it, encrypted to the requester.
+    self.assertEqual((self.plugin.bc.encrypt_calls, auth[dAuth.DAUTH_ORACLE_SECRET]),
+                     ([(FAKE_SECRET, ALLOWED)], STAND_IN_CIPHERTEXT))
     # The success line was written, so the log path ran.
     self.assertTrue(any("success for" in str(line) for line in self.lines))
     # No line contains the value.
     self.assertFalse(any(FAKE_SECRET in str(line) for line in self.lines))
+
+
+def _engine(folder, name):
+  """
+  Engine: build a real SDK block engine, with a key of its own, whose log lines are kept.
+
+  Parameters
+  ----------
+  folder : str
+    The folder of its logger and key file.
+  name : str
+    The start of its engine name and the name of its key file.
+
+  Returns
+  -------
+  tuple
+    ``(engine, lines)``: the engine, and the list each of its log lines is added to.
+
+  Examples
+  --------
+  >>> oracle, lines = _engine(folder, "oracle")
+  >>> oracle.address.startswith("0xai_")
+  True
+  """
+  # The lines the engine logs.
+  lines = []
+  # A silent logger in the given folder.
+  log = Logger(lib_name=name, base_folder=folder, app_folder=name, silent=True)
+  # Each line kept instead of printed.
+  log.P = lambda text, *args, **kwargs: lines.append(str(text))
+  # A new engine name, so the multiton builds a new engine and its key.
+  return DefaultBlockEngine(name=name + uuid4().hex, log=log, config={"PEM_FILE": name + ".pem"}), lines
+
+
+class RealKeysTests(unittest.TestCase):
+  """With real keys: the oracle's own start-up dAuth gets the value, and a replay of its request gives no one else."""
+
+  def setUp(self):
+    """
+    Build an oracle, a dAuth server and a third party with real keys, and a server that uses the server's key.
+
+    The server stand-in serves the oracle as a licensed protocol oracle, checks request signatures with
+    the server engine, encrypts through the node's blockchain wrapper around that engine, and holds the
+    fake secret.
+
+    Returns
+    -------
+    None
+    """
+    # The server holds the fake secret in process memory for each test.
+    self.addCleanup(_hold(FAKE_SECRET).stop)
+    # A folder for the engines' key files.
+    folder = tempfile.TemporaryDirectory()
+    # Removed after the test.
+    self.addCleanup(folder.cleanup)
+    # The oracle (whose log lines are kept), the dAuth server and a third party, each with a key of its own.
+    (self.oracle, self.oracle_lines), (self.server, _), (self.other, _) = (
+      _engine(folder.name, name) for name in ("oracle", "server", "other"))
+    # The server stand-in, with its log lines kept.
+    self.plugin = _harness([])
+    # Request signatures checked by the server engine.
+    self.plugin.bc.verify = self.server.verify
+    # Encryption as on a node: the blockchain wrapper's encrypt_str around the server engine.
+    self.plugin.bc.encrypt_str = BCWrapper(self.server, owner=self.plugin).encrypt_str
+    # The oracle's ETH address, as the registry gives it.
+    self.plugin.bc.node_eth[self.oracle.address] = self.oracle.eth_address
+    # The oracle is a protocol oracle of this server.
+    self.plugin.bc.protocol_oracles = [self.oracle.address]
+    # The answers the server sent, as copies taken before the client reads them.
+    self.answers = []
+
+  def _serve(self, url, json, timeout):
+    """
+    Serve: answer one HTTP request of the oracle's client as the dAuth endpoint does.
+
+    The server stand-in processes the signed request, and the server engine signs the result, as the
+    endpoint's answer is signed. A copy of each answer is kept in ``self.answers``.
+
+    Parameters
+    ----------
+    url : str
+      The dAuth URL; not used.
+    json : dict
+      The request, ``{"body": <signed request>}``.
+    timeout : tuple
+      The request's timeouts; not used.
+
+    Returns
+    -------
+    unittest.mock.Mock
+      A status 200 response whose JSON is ``{"result": <signed answer>}``.
+
+    Examples
+    --------
+    >>> self._serve(DAUTH_URL, {"body": body}, (60, 120)).status_code
+    200
+    """
+    # The answer the request path builds, with the server's alias.
+    result = {**self.plugin.process_dauth_request(json["body"]), "server_alias": "server"}
+    # Signed by the server engine, as the endpoint's answer is.
+    self.server.sign(result)
+    # A copy, kept before the client pops fields out of it.
+    self.answers.append(copy.deepcopy(result))
+    # A status 200 response that carries it.
+    response = Mock(status_code=200)
+    # Its JSON.
+    response.json.return_value = {"result": result}
+    # What requests.post returns to the client.
+    return response
+
+  def _start_up_dauth(self):
+    """
+    Start-up dAuth: run the oracle's own client once against the server, on a debug network.
+
+    The client is the SDK's ``dauth_autocomplete`` of the oracle engine; its one HTTP request goes to
+    ``_serve``. The versions it declares are above every minimum, no VPN is assumed, and the keys it
+    writes to the environment are removed afterwards.
+
+    Returns
+    -------
+    dict
+      The signed request the client sent (its ``body``).
+
+    Examples
+    --------
+    >>> self._start_up_dauth()["sender_memory_secrets"]
+    True
+    """
+    # The HTTP call, the VPN flag, the declared versions and the environment, for this run only.
+    with patch("ratio1.bc.base.requests.post", side_effect=self._serve) as post, \
+         patch.object(bc_base, "EE_VPN_IMPL", False), patch.object(bc_base, "app_version", "2.10.730"), \
+         patch.object(bc_base, "core_version", "7.7.360"), patch.dict(os.environ):
+      # The start-up dAuth on devnet, where debug logging is forced on.
+      self.oracle.dauth_autocomplete(dauth_endp=DAUTH_URL, network="devnet", max_tries=1, sender_alias="oracle")
+    # The signed request of that one call.
+    return post.call_args.kwargs["json"]["body"]
+
+  def test_the_oracle_gets_the_value_through_its_own_start_up_dauth(self):
+    """The oracle's own client gets an answer whose field is not the value, decrypts it with its key, holds the
+    value, and logs neither the value nor its request's signature."""
+    # The oracle's start-up dAuth; the holder is the same class attribute, so the client's write replaces the server's.
+    body = self._start_up_dauth()
+    # The answer carried the field, and the value is in no part of it.
+    self.assertEqual(
+      [(dAuth.DAUTH_ORACLE_SECRET in answer["auth"], FAKE_SECRET in str(answer)) for answer in self.answers],
+      [(True, False)],
+    )
+    # The client decrypted the field into the holder: the fake value, not its encrypted form.
+    self.assertEqual(BaseBlockEngine.oracle_secret(), FAKE_SECRET)
+    # Its one line about it names the server.
+    self.assertEqual(
+      sum("kept in process memory" in line and self.server.address in line for line in self.oracle_lines), 1,
+    )
+    # No line of the oracle carries the value or the signature of its request.
+    self.assertFalse(any(FAKE_SECRET in line or body["EE_SIGN"] in line for line in self.oracle_lines))
+
+  def test_a_replayed_request_gives_no_one_else_the_value(self):
+    """A third party that sends the oracle's signed request again, three times, is served each time, but the field
+    is ciphertext that its key does not decrypt; only the oracle's key does."""
+    # The oracle's signed request, as anyone on its way to the server could copy it.
+    body = self._start_up_dauth()
+    # The server holds the fake value again: the oracle's client wrote to the same class-wide holder.
+    self.addCleanup(_hold(FAKE_SECRET).stop)
+    # The field of each of three replays of a copy of it.
+    fields = [self.plugin.process_dauth_request(copy.deepcopy(body))[dAuth.DAUTH_SUBKEY][dAuth.DAUTH_ORACLE_SECRET]
+              for _ in range(3)]
+    # Per replay: the value is not in the field, the third party cannot decrypt it, the oracle can.
+    self.assertEqual(
+      [(FAKE_SECRET in field, self.other.decrypt(field, self.server.address),
+        self.oracle.decrypt(field, self.server.address)) for field in fields],
+      [(False, None, FAKE_SECRET)] * 3,
+    )
 
 
 if __name__ == "__main__":
