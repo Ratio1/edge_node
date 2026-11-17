@@ -71,7 +71,7 @@ BASE_ENTRYPOINT = "/usr/local/bin/entrypoint.sh"
 DAEMON_START = "  env -u EE_ORACLE_R1FS_SECRET " + BASE_ENTRYPOINT + " true"
 
 # The file in which dockerd keeps the process number of the containerd it started, under dockerd's default
-# exec-root. A node container restarted in place keeps it; the script removes it before each try.
+# exec-root. A node container restarted in place keeps it; the script removes it before the first try.
 CONTAINERD_PID_FILE = "/var/run/docker/containerd/containerd.pid"
 
 # dockerd's default exec-root, the folder of that file, which the copy of the script moves into its own folder.
@@ -243,17 +243,18 @@ def run_entrypoint_script(base_exit_codes, command, lock_held=False, first_start
   the same places under it, between files that are not the store's; and dockerd's exec-root becomes a folder of
   the run, so the containerd pid file is there. Other tests pin the real paths.
 
-  The stand-in treats the containerd pid file as dockerd does after an in-place restart, where the number in it is
-  alive: when it finds the file it ends with 1 and leaves the file as it was. Otherwise it writes the file, as
-  dockerd does when it starts its containerd, and ends with its code from `base_exit_codes`. On each call it first
-  writes down its arguments, whether the store's lock is held, whether it found the pid file, whether the store is
-  there and the oracle-only secret it got.
+  The stand-in treats the containerd pid file as dockerd does: when the number in it is a live process (dockerd
+  looks for /proc/<number>), it ends with 1 and leaves the file as it was. Otherwise it writes its own number into
+  the file, as dockerd writes the number of the containerd it started, and ends with its code from
+  `base_exit_codes`; once it has ended that number is dead, as the containerd of a failed dockerd is. On each call
+  it first writes down its arguments, whether the store's lock is held, what it found in the pid file, whether the
+  store is there and the oracle-only secret it got.
 
   Parameters
   ----------
   base_exit_codes : list
-    What the stand-in ends with on its first, second, ... call when it finds no pid file: 0 stands for a daemon
-    that started. A call past the end of the list ends with the last code.
+    What the stand-in ends with on its first, second, ... call when the pid file names no live process: 0 stands
+    for a daemon that started. A call past the end of the list ends with the last code.
   command : list
     The node command the script is started with, as a container starts it with the image's `CMD`.
   lock_held : bool
@@ -265,15 +266,17 @@ def run_entrypoint_script(base_exit_codes, command, lock_held=False, first_start
   env : dict, optional
     Variables added to the environment the script is started with, as a container's environment; None adds none.
   leftover : bool
-    True: before the run the containerd pid file holds "earlier run", as in a node container restarted in place.
+    True: before the run the containerd pid file holds the number of a live process (the test's own), as in a node
+    container restarted in place.
 
   Returns
   -------
   dict
     `pid`: the process id the script was started with; `exit_code`, `stdout` and `stderr` of the run; `calls`:
     one dict per call of the stand-in, in order, empty when it was not run, with `arguments` (its arguments joined
-    by spaces), `lock` ("held", "free" or "missing": the store's lock file as it found it), `pid_file` ("found" or
-    "none"), `store` ("there" or "gone") and `secret` (the value of EE_ORACLE_R1FS_SECRET it got, "" when unset);
+    by spaces), `lock` ("held", "free" or "missing": the store's lock file as it found it), `pid_file` ("live",
+    "dead" or "none": the number in the pid file, or no file), `store` ("there" or "gone") and `secret` (the value
+    of EE_ORACLE_R1FS_SECRET it got, "" when unset);
     `pid_file_after`: the text of the containerd pid file after the run, None when there is none; `before` and
     `after`: every path under the stand-in cache folder, relative to it and sorted, before and after the run;
     `store` and `lock`: the store directory and the lock file, relative in the same way.
@@ -335,14 +338,14 @@ def run_entrypoint_script(base_exit_codes, command, lock_held=False, first_start
     if leftover:
       # Its folder first.
       pid_file.parent.mkdir(parents=True)
-      # Its text is what the test looks for after the run.
-      pid_file.write_text("earlier run")
+      # A number that is alive during the run, as the old number often is in the new run: this test's process.
+      pid_file.write_text(str(os.getpid()))
     # The stand-in base entrypoint. It counts its calls; tries the store's lock through an open file of its own (as a
-    # second container would; flock would create a missing file, so it looks first); looks for the pid file and the
-    # store; writes one line per call with those and its arguments and the oracle-only secret it got (empty when
-    # unset); ends with 1 when it found the pid file, as dockerd does; otherwise writes that file, as dockerd does
-    # when it starts its containerd, and ends with the code of this call. The doubled braces are format's escape
-    # for one brace.
+    # second container would; flock would create a missing file, so it looks first); looks at the number in the pid
+    # file and for the store; writes one line per call with those and its arguments and the oracle-only secret it got
+    # (empty when unset); ends with 1 when the number is a live process, as dockerd does; otherwise writes its own
+    # number into that file, as dockerd writes the number of the containerd it starts, and ends with the code of this
+    # call. The doubled braces are format's escape for one brace.
     base = root / "base_entrypoint"
     # A shell file, as the real one.
     base.write_text(
@@ -352,16 +355,16 @@ def run_entrypoint_script(base_exit_codes, command, lock_held=False, first_start
       'l="{}"; p="{}"; d="{}"\n'
       # The lock as another open file finds it.
       'if [ ! -e "$l" ]; then s=missing; elif flock -n "$l" true; then s=free; else s=held; fi\n'
-      # Whether the pid file is there.
-      'if [ -e "$p" ]; then f=found; else f=none; fi\n'
+      # No pid file, or one whose number is a live process (dockerd's test: /proc/<number> exists) or a dead one.
+      'if [ ! -e "$p" ]; then f=none; elif [ -d "/proc/$(cat "$p")" ]; then f=live; else f=dead; fi\n'
       # Whether the store is there.
       'if [ -e "$d" ]; then t=there; else t=gone; fi\n'
       # One line for this call, the secret last.
       'printf "%s|%s|%s|%s|%s\\n" "$*" "$s" "$f" "$t" "${{EE_ORACLE_R1FS_SECRET-}}" >> "$0.calls"\n'
-      # A pid file found: refused, the file left as it was.
-      'if [ "$f" = found ]; then exit 1; fi\n'
-      # Otherwise the file of the containerd this try started.
-      'mkdir -p "${{p%/*}}"; echo "this run" > "$p"\n'
+      # A live number: refused, the file left as it was.
+      'if [ "$f" = live ]; then exit 1; fi\n'
+      # Otherwise the file of the containerd this try started; its number is dead once this call has ended.
+      'mkdir -p "${{p%/*}}"; echo "$$" > "$p"\n'
       # The code of this call.
       'exit "$(sed -n "${{n}}p" "$0.codes")"\n'.format(lock, pid_file, store)
     )
@@ -591,8 +594,8 @@ class TestNodeImageEntrypoint(unittest.TestCase):
 
   def test_the_script_takes_the_lock_beside_the_store_before_the_daemon_and_removes_only_under_it(self):
     """The script's command lines, in order: the lock's folder, the lock file on an inherited descriptor, a lock
-    that does not wait and stops the start, a try that removes the containerd pid file and starts the daemon, two
-    such tries of which only a second failure removes the store, the node command."""
+    that does not wait and stops the start, the removal of the containerd pid file, a try that starts the daemon,
+    two such tries of which only a second failure removes the store, the node command."""
     # The directory the inner daemon keeps its store in.
     data_root = daemon_config()["data-root"]
     # The command lines of the script, without its comments and empty lines.
@@ -609,9 +612,9 @@ class TestNodeImageEntrypoint(unittest.TestCase):
     self.assertTrue(code[2].startswith("flock -n 9 || { echo ") and code[2].endswith(" >&2; exit 1; }"))
     # That step removes nothing.
     self.assertNotIn("rm ", code[2])
-    # One try, defined after the lock: the pid file of an earlier run goes, then the daemon starts without the
+    # After the lock, the pid file of an earlier run goes, once; then one try, which starts the daemon without the
     # oracle-only secret.
-    self.assertEqual(code[3:7], ["start_daemon() {", "  rm -f " + CONTAINERD_PID_FILE, DAEMON_START, "}"])
+    self.assertEqual(code[3:7], ["rm -f " + CONTAINERD_PID_FILE, "start_daemon() {", DAEMON_START, "}"])
     # The first try; when it fails, a line and the second try; when that fails too, a line, the store's removal and
     # a non-zero end.
     self.assertRegex(code[7], r'^start_daemon \|\| \{ echo "[^"]+" >&2; start_daemon; \} \|\| \{ echo "[^"]+" >&2; rm -rf '
@@ -677,7 +680,7 @@ class TestNodeImageEntrypoint(unittest.TestCase):
   def test_a_containerd_pid_file_of_an_earlier_run_does_not_cost_the_store(self):
     """A node container restarted in place finds the containerd pid file of its earlier run, which makes dockerd
     refuse to start: the script removes it before the start, so the first try starts and the store stays."""
-    # The file an earlier run left; the stand-in refuses to start while it is there, as dockerd does.
+    # The file an earlier run left, with a live number; the stand-in refuses to start on it, as dockerd does.
     result = run_entrypoint_script([0], ["/bin/sh", "-c", "echo the node command ran"], leftover=True)
     # One try, under the lock, without the file, on the store.
     self.assertEqual([(call["lock"], call["pid_file"], call["store"]) for call in result["calls"]], [("held", "none", "there")])
@@ -685,17 +688,19 @@ class TestNodeImageEntrypoint(unittest.TestCase):
     self.assertEqual((result["stdout"], result["exit_code"], result["stderr"]), ("the node command ran\n", 0, ""))
     # The store and everything else are as they were; the lock file is new beside the store.
     self.assertEqual(result["after"], sorted(result["before"] + [result["lock"]]))
-    # The file now is the one the started daemon wrote.
-    self.assertEqual(result["pid_file_after"], "this run")
+    # The file now holds the number the started daemon wrote, not the earlier run's.
+    self.assertNotIn(result["pid_file_after"], (None, str(os.getpid())))
 
   def test_a_failed_first_try_is_followed_by_a_second_that_keeps_the_store(self):
     """When the first try fails, the script says so in one line and tries once more, again under the lock and
-    without the pid file the first try left; a good second try keeps the store and runs the node command."""
+    without a removal: the pid file the first try left holds a dead number, which dockerd passes over. A good
+    second try keeps the store and runs the node command."""
     # The first try fails and leaves its pid file, the second starts.
     result = run_entrypoint_script([3, 0], ["/bin/sh", "-c", "echo the node command ran"])
-    # Two tries, both under the lock, without a pid file (the second only because the script removed the first
-    # one's), on the store.
-    self.assertEqual([(call["lock"], call["pid_file"], call["store"]) for call in result["calls"]], [("held", "none", "there")] * 2)
+    # Two tries, both under the lock and on the store; the first without a pid file, the second with the first
+    # one's file, whose number ended with it.
+    self.assertEqual([(call["lock"], call["pid_file"], call["store"]) for call in result["calls"]],
+                     [("held", "none", "there"), ("held", "dead", "there")])
     # The one line of the failed try.
     self.assertEqual(result["stderr"], "The inner Docker daemon did not start: trying once more.\n")
     # The node command ran and the container goes on.
@@ -708,10 +713,10 @@ class TestNodeImageEntrypoint(unittest.TestCase):
     and nothing else, and ends non-zero without the node command, also when a pid file of an earlier run was there."""
     # Both tries fail with a code that is not the script's own; the node command would print a line.
     result = run_entrypoint_script([3, 3], ["/bin/sh", "-c", "echo the node command ran"], leftover=True)
-    # Two tries in the same way as in a good start: under the lock, without the pid file, and the store still
-    # there at the second.
+    # Two tries in the same way as in a good start: under the lock, the first without the earlier run's pid file,
+    # the second with the dead number of the first, and the store still there at the second.
     self.assertEqual([(call["arguments"], call["lock"], call["pid_file"], call["store"]) for call in result["calls"]],
-                     [("true", "held", "none", "there")] * 2)
+                     [("true", "held", "none", "there"), ("true", "held", "dead", "there")])
     # One line per failed try, the second says what happens to the store.
     self.assertEqual(result["stderr"].splitlines(), [
       "The inner Docker daemon did not start: trying once more.",
@@ -743,8 +748,8 @@ class TestNodeImageEntrypoint(unittest.TestCase):
     self.assertEqual((result["calls"], result["stdout"]), ([], ""))
     # The store, the lock file and everything else are as they were.
     self.assertEqual(result["after"], result["before"])
-    # The pid file too.
-    self.assertEqual(result["pid_file_after"], "earlier run")
+    # The pid file too, with the earlier run's number.
+    self.assertEqual(result["pid_file_after"], str(os.getpid()))
 
   def test_the_lock_is_held_from_before_the_daemon_start_through_the_node_command(self):
     """The daemon starts with the lock already held, and the node command keeps the lock's descriptor across the exec: the lock lasts as long as the node."""

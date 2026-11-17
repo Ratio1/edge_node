@@ -432,11 +432,12 @@ because the disk API of plugin code refuses that folder (the core's `RESTRICTED_
 - **Rollback:** an image without `docker/daemon.json` does not see this store. It pulls every app image
   into the node container's own layer, as before, while the store stays on the host: for that time the host
   needs free space for the app images a second time.
-- **A daemon that does not start:** the node images start through `cmds/node_entrypoint`. Before each try it
-  removes `/var/run/docker/containerd/containerd.pid`, the file in which dockerd keeps the process number of
+- **A daemon that does not start:** the node images start through `cmds/node_entrypoint`. Before the first try
+  it removes `/var/run/docker/containerd/containerd.pid`, the file in which dockerd keeps the process number of
   its containerd: a node container restarted in place (`docker stop` and `start`, `docker restart`, a restart
   policy) keeps its `/var/run`, and in the new run that number often belongs to a live process, so dockerd
-  would refuse to start on a healthy store. It then runs the base image entrypoint. When that fails it logs
+  would refuse to start on a healthy store. (A failed first try leaves at most a number of a process that has
+  ended, which dockerd passes over.) It then runs the base image entrypoint. When that fails it logs
   "The inner Docker daemon did not start: trying once more." and tries once more. When the second try fails
   too it logs "The inner Docker daemon did not start a second time: removing its kept store.", removes the
   store directory and stops the container with exit code 1. The next start begins on an empty store, as

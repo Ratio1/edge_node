@@ -29,22 +29,23 @@ exec 9>>/edge_node/_local_cache/_bin/docker/29.lock
 # A missing flock or a file system that refuses the lock stops the start in the same way. The lock is taken with
 # EE_DD=0 too: one node container per cache folder, whether it runs a daemon or not.
 flock -n 9 || { echo "The kept Docker store is locked by another container on this cache folder, or could not be locked: not starting." >&2; exit 1; }
+# Remove the file in which dockerd keeps the process number of the containerd it started (under its default
+# exec-root, /var/run/docker; docker/daemon.json sets no other), once, before the first try: at its start dockerd
+# takes a live process of that number for its containerd. A node container restarted in place (docker stop and
+# start, docker restart, a restart policy) keeps /var/run, which is on its own layer, and the base entrypoint removes
+# only docker*.pid there. In the container's new pid namespace processes are numbered from 1 again, in nearly the
+# same order, so the old number is often alive at the next start, as the new containerd itself ("failed to save
+# daemon pid to disk: process with PID ... is still running") or as another process ("containerd is still running",
+# then "timeout waiting for containerd to start"), and dockerd exits 1 on a healthy store. Safe after the lock: no
+# other node container uses this store, and no process of an earlier run of this container outlives its pid
+# namespace. The second try below needs no removal: the containerd of a failed first try does not outlive its
+# dockerd (stopped by it, or killed with it when the entrypoint's timeout or the kernel ends dockerd), so the file
+# holds at most a dead number, which dockerd passes over, as the processes of the second try get higher numbers.
+# Nothing else in /var/run/docker needs removing: dockerd and containerd remove each of their sockets before they
+# listen on it, and containerd cleans up, at its start, its state of tasks whose shim is gone.
+rm -f /var/run/docker/containerd/containerd.pid
 # One try to start the daemon, the same for both tries below; it ends with the base entrypoint's exit code.
 start_daemon() {
-  # Remove the file in which dockerd keeps the process number of the containerd it started (under its default
-  # exec-root, /var/run/docker; docker/daemon.json sets no other): at its next start dockerd takes a live process
-  # of that number for its containerd. A node container restarted in place (docker stop and start, docker restart,
-  # a restart policy) keeps /var/run, which is on its own layer, and the base entrypoint removes only docker*.pid
-  # there. In the container's new pid namespace processes are numbered from 1 again, in nearly the same order, so
-  # the old number is often alive at the next start, as the new containerd itself ("failed to save daemon pid to
-  # disk: process with PID ... is still running") or as another process ("containerd is still running", then
-  # "timeout waiting for containerd to start"), and dockerd exits 1 on a healthy store. Safe after the lock: no
-  # other node container uses this store, and no process of an earlier run of this container outlives its pid
-  # namespace. A try that fails on such a file leaves it as it was, so it goes before each try (a dockerd that fails
-  # after it started its containerd stops it and removes the file itself). Nothing else in /var/run/docker needs
-  # removing: dockerd and containerd remove each of their sockets before they listen on it, and containerd cleans
-  # up, at its start, its state of tasks whose shim is gone.
-  rm -f /var/run/docker/containerd/containerd.pid
   # The base image entrypoint launches dockerd in the background, waits until it answers (at most
   # DOCKERD_READY_TIMEOUT, 120 s by default) and then runs the command it is given. That command is `true`, so the
   # entrypoint returns here and dockerd stays behind as a child of process 1. With EE_DD=0 it starts no daemon and
