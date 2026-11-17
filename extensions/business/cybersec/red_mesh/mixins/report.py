@@ -1085,7 +1085,8 @@ class _ReportMixin:
     if scan_type == "webapp":
       graybox_stats = self._extract_graybox_ui_stats(agg, latest)
 
-    # `total_findings` and `findings_count` below stay raw record counts (every CVE finding the pass holds);
+    # RM-200: `total_findings` and `findings_count` below exclude tentative CVE findings (an unconfirmed version
+    # match); they are counted once in `unconfirmed_version_matches`. The raw findings stay in the archive.
     # `latest_risk_breakdown.finding_counts` is the scored view (RM-169: rollups once, possible and closed out).
     # Every counter in this object uses the same predicate, or the object
     # contradicts itself: `total_findings` excluding coverage while the severity
@@ -1094,7 +1095,15 @@ class _ReportMixin:
     real_findings = [f for f in findings if not _is_coverage_result(f)]
 
     # Severity breakdown
-    findings_count = dict(Counter(f.get("severity", "INFO") for f in real_findings))
+    # One predicate for every counter, over the triage-stamped copies: a triage-confirmed CVE row reads certain.
+    stamped = apply_triage(real_findings, triage)
+
+    def _unconfirmed(f):
+      return bool(f.get("cve")) and f.get("confidence") == "tentative"
+
+    unconfirmed = [f for f in stamped if _unconfirmed(f)]
+    confirmed = [f for f in stamped if not _unconfirmed(f)]
+    findings_count = dict(Counter(f.get("severity", "INFO") for f in confirmed))
 
     # Top findings: CRITICAL + HIGH, sorted by severity then confidence, capped
     # at 10. An `inconclusive` scenario keeps its *declared* severity, so
@@ -1102,11 +1111,10 @@ class _ReportMixin:
     # customer-facing top-findings list as a HIGH.
     # Generated CVE findings: listed ones only (the rest are in a rollup or the possible section).
     # The stamped copies only rank; the triage record is not kept on what is stored in the archive.
-    stamped = apply_triage(real_findings, triage)
     crit_high = [
       {k: v for k, v in f.items() if k != "triage"} if triage and "triage" in f else f
       for f in drop_closed(filter_listed(stamped, triage=triage), triage)
-      if f.get("severity") in ("CRITICAL", "HIGH")
+      if f.get("severity") in ("CRITICAL", "HIGH") and not _unconfirmed(f)  # RM-200, static rows too
     ]
     crit_high.sort(key=lambda f: (
       self.SEVERITY_ORDER.get(f.get("severity"), 9),
@@ -1157,7 +1165,8 @@ class _ReportMixin:
       total_services=self._count_services(agg.get("service_info", {})),
       # Findings, not scenario results: a graybox scan emits one entry per
       # scenario whatever the outcome, so `len(findings)` counted the tests run.
-      total_findings=len(real_findings),
+      total_findings=len(confirmed),
+      unconfirmed_version_matches=len(unconfirmed),
       findings_count=findings_count if findings_count else None,
       top_findings=top_findings if top_findings else None,
       finding_timeline=finding_timeline if finding_timeline else None,

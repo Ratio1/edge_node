@@ -2014,7 +2014,9 @@ class TestCorrelationEngine(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.worker.service.common.paramiko.Transport",
       return_value=DummyTransport(),
     ):
-      findings, weak_labels = worker._ssh_check_ciphers("example.com", 22)
+      # RM-200: the algorithm lists are the server's KEXINIT, not paramiko's own options.
+      kexinit = {"kex": ["curve25519-sha256"], "host_key": ["ssh-rsa", "ssh-dss"], "enc_s2c": ["aes256-ctr"]}
+      findings, weak_labels = worker._ssh_check_ciphers("example.com", 22, kexinit)
     found = any("dsa" in f.title.lower() or "ssh-dss" in f.title.lower() for f in findings)
     self.assertTrue(found, f"Expected DSA key finding, got: {[f.title for f in findings]}")
 

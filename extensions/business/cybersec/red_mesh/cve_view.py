@@ -90,9 +90,19 @@ def apply_triage(findings, triage):
   return result
 
 
+# A tentative row with one of these reasons is not shown as KEV: the version is untrusted, or the CVE may not apply
+# to this host at all (RM-200). The `kev` field stays: it is reference data about the CVE.
+KEV_SUPPRESSING_REASONS = frozenset({"platform_dependent", "banner_unverified", "local_vector"})
+
+
+def effective_kev(f):
+  """True when `f` is a KEV CVE that this finding may raise."""
+  return bool(f.get("kev")) and not (f.get("confidence") == "tentative" and f.get("confidence_reason") in KEV_SUPPRESSING_REASONS)
+
+
 def _is_listed(f):
   """KEV, or one v3.x/v4.0 `cvss[]` entry with AV:N and PR:N scoring 9.0 or higher (v2.0 never counts)."""
-  if f.get("kev") is True:
+  if effective_kev(f):
     return True
   for entry in f.get("cvss") or ():
     vector = str(entry.get("vector") or "").split("/")
@@ -105,7 +115,7 @@ def _is_listed(f):
 def _rank(f):
   """Sort key: KEV first, then displayed score, then EPSS, then `cve_id`."""
   epss = f.get("epss_score")
-  return (f.get("kev") is not True, -_score(f), -(epss if isinstance(epss, (int, float)) else 0.0), f["cve"][0])
+  return (not effective_kev(f), -_score(f), -(epss if isinstance(epss, (int, float)) else 0.0), f["cve"][0])
 
 
 def _fix_version(product, members):
@@ -145,7 +155,7 @@ def _rollup(product, members):
     "max_cvss": {"score": score if score >= 0 else None,
                  "version": (top.get("cvss_version") or None) if score >= 0 else None,
                  "source": (top.get("cvss_source") or None) if score >= 0 else None},
-    "kev_count": sum(1 for f in members if f.get("kev") is True),
+    "kev_count": sum(1 for f in members if effective_kev(f)),
     "member_finding_ids": sorted(f["finding_id"] for f in members),
   }
 
@@ -198,7 +208,7 @@ def build_cve_view(findings, not_applicable=(), triage=None, now=None):
     candidates = [f for f in firm if _is_listed(f)]
     listed, overflow = candidates[:MAX_LISTED], candidates[MAX_LISTED:]
     rest = [f for f in firm if not _is_listed(f)] + overflow
-    kev_possible = sorted((f for f in tentative if f.get("kev") is True), key=_rank)
+    kev_possible = sorted((f for f in tentative if effective_kev(f)), key=_rank)
     services.append({
       "port": port,
       "product": product,

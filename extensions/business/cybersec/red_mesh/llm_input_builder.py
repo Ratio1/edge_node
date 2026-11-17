@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .credential_redaction import redact_credential_text
-from .cve_view import build_cve_view, drop_closed, filter_listed, summarize_view
+from .cve_view import build_cve_view, drop_closed, effective_kev, filter_listed, summarize_view
 from .models.finding_schema import is_coverage_result as _is_coverage_result
 
 
@@ -376,8 +376,9 @@ def _sanitize_finding(f: dict) -> dict:
     # fetch timestamp is `cvss_data_freshness`. Otherwise it is unknown, not
     # "not listed" (RM-090: the cache is not wired in production yet).
     # A generated finding carries its own tri-state (a local build has no freshness but did evaluate KEV).
-    "kev": (None if f.get("kev") is None else bool(f["kev"])) if f.get("vulndb_build_id")
-           else (bool(f.get("kev", False)) if f.get("cvss_data_freshness") else None),
+    # RM-200: a tentative row that is platform-only, unverified or local-only is not shown as KEV (`effective_kev`).
+    "kev": (None if f.get("kev") is None else effective_kev(f)) if f.get("vulndb_build_id")
+           else (effective_kev(f) if f.get("cvss_data_freshness") else None),
     "kev_evaluated": f.get("kev") is not None if f.get("vulndb_build_id") else bool(f.get("cvss_data_freshness")),
     "epss_score": _safe_float(f.get("epss_score")),
     "cve": _sanitize_list(f.get("cve"), MAX_REFERENCES_PER_FINDING, 32),
