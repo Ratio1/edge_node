@@ -12,7 +12,8 @@ from .test_tenant_administration import FakeAdministrationStore
 from .test_tenant_drafts import TENANCY_HKEY, ok, refused
 
 BRANDING_KEY = (TENANCY_HKEY, '["super_tenant_branding","deployment","deployment"]')
-EMPTY = {"theme": "dark", "logo": None}
+NAME_OFF = {"title": False, "header": False}
+EMPTY = {"theme": "dark", "logo": None, "display_name": "", "name_in": NAME_OFF}
 
 
 def png(width=300, height=80, size=2048):
@@ -83,7 +84,7 @@ class TestBrandingRecord(_BrandingCase):
         self.assertEqual(self.plugin.get_super_tenant_branding(actor)["status_code"], 404)
 
   def test_a_theme_is_written_attributed_audited_by_key_and_read_by_a_tenant_member(self):
-    self.assertEqual(ok(self, self.update({"theme": "navy"})), {"theme": "navy", "logo": None})
+    self.assertEqual(ok(self, self.update({"theme": "navy"})), {**EMPTY, "theme": "navy"})
     row = self.store.data[BRANDING_KEY]
     self.assertEqual((row["kind"], row["ids"], row["updated_by"]), ("super_tenant_branding", ["deployment"], "creator"))
     self.assertEqual(self.events, [("super_tenant_branding_updated", {"actor": "creator", "changed": ["theme"]})])
@@ -98,11 +99,60 @@ class TestBrandingRecord(_BrandingCase):
   def test_malformed_changes_are_refused_without_a_write_or_a_file(self):
     cases = {"not a dict": None, "empty": {}, "unknown key": {"color": "red"}, "unknown theme": {"theme": "pink"},
              "theme type": {"theme": 3}, "logo as a ref": {"logo": {"ref": "doc-1"}},
-             "logo string": {"logo": "x"}, "logo extra key": {"logo": {**upload(png()), "mime": "image/png"}}}
+             "logo string": {"logo": "x"}, "logo extra key": {"logo": {**upload(png()), "mime": "image/png"}},
+             "name type": {"display_name": 3}, "name none": {"display_name": None}, "name too long": {"display_name": "x" * 81},
+             "name newline": {"display_name": "a\nb"}, "name tab": {"display_name": "a\tb"}, "name nul": {"display_name": "a\x00"},
+             "name bidi override": {"display_name": "a\u202eb"}, "name zero width": {"display_name": "a\u200bb"},
+             "name bom": {"display_name": "a\ufeffb"}, "name surrogate": {"display_name": "a\ud800b"},
+             "name private use": {"display_name": "a\ue000b"}, "name line separator": {"display_name": "a\u2028b"},
+             "name paragraph separator": {"display_name": "a\u2029b"}, "name unassigned": {"display_name": "a\u0378b"},
+             "name marks only": {"display_name": "\u0301\u0302"},
+             "name_in not dict": {"name_in": True}, "name_in partial": {"name_in": {"title": True}},
+             "name_in extra": {"name_in": {"title": True, "header": True, "x": True}},
+             "name_in non-bool": {"name_in": {"title": 1, "header": False}}}
     for label, changes in cases.items():
       with self.subTest(label):
         refused(self, self.update(changes), 400, "invalid_request")
     self.assertEqual((self.store.writes, self.documents.puts, self.events), ([], [], []))
+
+
+class TestBrandingName(_BrandingCase):
+  def test_the_name_and_where_it_shows_are_written_stripped_audited_and_read_by_a_member(self):
+    where = {"title": True, "header": False}
+    data = ok(self, self.update({"display_name": "  Acme Cyber  ", "name_in": where}))
+    self.assertEqual(data, {**EMPTY, "display_name": "Acme Cyber", "name_in": where})
+    self.assertEqual(self.events, [("super_tenant_branding_updated", {"actor": "creator", "changed": ["display_name", "name_in"]})])
+    self.assertEqual(ok(self, self.get(self.member)), data)
+    self.assertEqual(ok(self, self.plugin.get_public_branding()), data)
+    # Same values again: nothing written or audited; the theme alone keeps the name.
+    writes = len(self.store.writes)
+    ok(self, self.update({"display_name": "Acme Cyber", "name_in": dict(where)}))
+    self.assertEqual((len(self.store.writes), len(self.events)), (writes, 1))
+    self.assertEqual(ok(self, self.update({"theme": "navy"}))["display_name"], "Acme Cyber")
+    # name_in is replaced whole, and a blank name clears it.
+    both = ok(self, self.update({"name_in": {"title": True, "header": True}}))
+    self.assertEqual(both["name_in"], {"title": True, "header": True})
+    self.assertEqual(ok(self, self.update({"display_name": "   "}))["display_name"], "")
+
+  def test_a_name_is_stored_in_nfc_and_the_limit_counts_the_normalized_form(self):
+    self.assertEqual(ok(self, self.update({"display_name": "Cafe\u0301"}))["display_name"], "Caf\u00e9")
+    self.assertEqual(self.store.data[BRANDING_KEY]["display_name"], "Caf\u00e9")
+    # 80 decomposed pairs are 160 code points but 80 after NFC.
+    self.assertEqual(len(ok(self, self.update({"display_name": "e\u0301" * 80}))["display_name"]), 80)
+    refused(self, self.update({"display_name": "e\u0301" * 81}), 400, "invalid_request")
+
+  def test_the_longest_name_is_accepted_and_the_limit_counts_after_the_strip(self):
+    self.assertEqual(ok(self, self.update({"display_name": " " + "x" * 80 + " "}))["display_name"], "x" * 80)
+
+  def test_a_row_stored_before_the_name_existed_reads_with_the_defaults_and_still_updates(self):
+    self.store.data[BRANDING_KEY] = {"schemaVersion": 1, "namespace": "deployment", "kind": "super_tenant_branding", "ids": ["deployment"], "theme": "navy", "logo": None,
+                                    "updated_by": "creator", "updated_at": "2026-10-13T00:00:00Z"}
+    self.assertEqual(ok(self, self.get(self.member)), {**EMPTY, "theme": "navy"})
+    self.assertEqual(ok(self, self.plugin.get_public_branding()), {**EMPTY, "theme": "navy"})
+    # An unchanged default name writes nothing; a theme change keeps the row valid.
+    ok(self, self.update({"display_name": "", "name_in": NAME_OFF}))
+    self.assertEqual(self.store.writes, [])
+    self.assertEqual(ok(self, self.update({"theme": "light"})), {**EMPTY, "theme": "light"})
 
 
 class TestBrandingLogo(_BrandingCase):
@@ -110,7 +160,7 @@ class TestBrandingLogo(_BrandingCase):
     raw = png(size=300 * 1024)
     data = ok(self, self.update({"logo": upload(raw), "theme": "navy"}))
     sha = hashlib.sha256(raw).hexdigest()
-    self.assertEqual(data, {"theme": "navy", "logo": {"sha256": sha, "mime": "image/png", "size_bytes": len(raw)}})
+    self.assertEqual(data, {**EMPTY, "theme": "navy", "logo": {"sha256": sha, "mime": "image/png", "size_bytes": len(raw)}})
     envelope = self.documents.puts[0]
     self.assertEqual((envelope["kind"], envelope["document_kind"]), ("redmesh_tenant_contract", "branding_logo"))
     self.assertNotIn("draft_id", envelope)
@@ -272,9 +322,16 @@ class TestBrandingStoredRow(unittest.TestCase):
             "size_bytes": 10, "uploaded_at": "2026-10-13T00:00:00Z", "uploaded_by": "creator"}
     good = {"theme": "navy", "logo": logo, "updated_by": "creator", "updated_at": "2026-10-13T00:00:00Z"}
     self.assertIs(validate_super_tenant_branding(good, ["deployment"]), good)
+    named = {**good, "display_name": "Acme", "name_in": {"title": True, "header": False}}
+    self.assertIs(validate_super_tenant_branding(named, ["deployment"]), named)
     bad = {"id": ({}, ["other"]), "theme": ({"theme": "pink"}, None), "mime": ({"logo": {**logo, "mime": "image/svg+xml"}}, None),
            "size": ({"logo": {**logo, "size_bytes": 2 * 1024 * 1024 + 1}}, None), "logo keys": ({"logo": {"ref": "doc-1"}}, None),
-           "attribution": ({"updated_by": ""}, None)}
+           "attribution": ({"updated_by": ""}, None),
+           "name type": ({"display_name": 3}, None), "name long": ({"display_name": "x" * 81}, None),
+           "name unstripped": ({"display_name": " Acme"}, None), "name control": ({"display_name": "a\nb"}, None),
+           "name bidi": ({"display_name": "a\u202eb"}, None), "name not nfc": ({"display_name": "Cafe\u0301"}, None),
+           "name marks only": ({"display_name": "\u0301"}, None), "name surrogate": ({"display_name": "a\ud800"}, None),
+           "name_in keys": ({"name_in": {"title": True}}, None), "name_in type": ({"name_in": {"title": 1, "header": 0}}, None)}
     for label, (change, ids) in bad.items():
       with self.subTest(label), self.assertRaises(ValueError):
         validate_super_tenant_branding({**good, **change}, ids or ["deployment"])
