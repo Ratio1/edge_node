@@ -14,7 +14,7 @@ from bisect import bisect_left, bisect_right
 from collections import namedtuple
 from pathlib import Path
 
-from ..cve_db import _compare_versions, _parse_version
+from ..cve_db import _compare_debian_revision, _compare_versions, _parse_version
 from .models import SUPPORTED_MODELS
 
 DB_PATH = Path(__file__).resolve().parent / "vulndb.sqlite"
@@ -74,16 +74,37 @@ def _lower_at_or_above(clauses, oldest):
   return any(_compare_versions(t, oldest) >= 0 for t in lowers)
 
 
+# Debian release by the `debNNuM` marker of a revision. bullseye maps to a name the table has no rows for (no tracker data).
+_DEBIAN_RELEASES = {"11": "bullseye", "12": "bookworm", "13": "trixie"}
+_DEB_MARK = re.compile(r"deb(\d+)u\d")
+# The meta key that proves the file carries rows of a distribution (schema 1.0.1); without it the table, if any, is not data.
+_DISTRO_SNAPSHOT = {"ubuntu": "snapshot_oval", "debian": "snapshot_debian"}
+
+
+def _split_version(full):
+  """`(upstream, revision)` of a Debian version `[epoch:]upstream[-revision]`."""
+  full = re.sub(r"^\d+:", "", full)
+  upstream, sep, revision = full.rpartition("-")
+  return (upstream, revision) if sep else (full, "")
+
+
+def _compare_full(a, b):
+  """-1, 0 or 1 for two `(upstream, revision)` pairs: the upstreams first, the revisions only when those are equal."""
+  return _compare_debian_revision(a[0], b[0]) or _compare_debian_revision(a[1], b[1])
+
+
 def _holds(op, cmp):
   return {"<": cmp < 0, "<=": cmp <= 0, ">": cmp > 0, ">=": cmp >= 0, "==": cmp == 0}[op]
 
 
 class VulndbReader:
-  def __init__(self, vulns, rows, build_id, schema, cvss=None, eol=None, built_at=None):
+  def __init__(self, vulns, rows, build_id, schema, cvss=None, eol=None, built_at=None, distro=None):
     """`vulns`: cve_id -> vuln fields (title .. cvss_source); `rows`: affected rows in `Match` order.
 
     `cvss`: cve_id -> tuple of `{version, vector, score, source}` sorted by `(version, source, vector)`;
     `eol`: product -> oldest supported version; `built_at`: pin `built_at`, None for a local build.
+    `distro`: `distro_fix` rows `(distro, release, product, package, cve_id, status, fixed_version, source)`; None or empty
+    means the file has no distribution data, which is not the same as "no fixes" (see `distro_status`).
     """
     self.build_id = build_id
     self.schema = schema
@@ -96,6 +117,12 @@ class VulndbReader:
     self._exact = {}   # (product, normalised numbers, tail) -> [affected row]
     self._ranges = {}  # product -> [(clauses, affected row)]
     self._exact_sorted = {}  # product -> [(key, affected row)] sorted by key, built on the first span query
+    self._distro = {}  # (distro, product) -> {cve_id: [(release, package, status, fixed_version, source)]}
+    self._distro_releases = {}  # (distro, product) -> {upstream: {release}}, from the rows that name a fixed version
+    for d, release, product, package, cve_id, status, fixed, source in distro or ():
+      self._distro.setdefault((d, product), {}).setdefault(cve_id, []).append((release, package, status, fixed, source))
+      if fixed:
+        self._distro_releases.setdefault((d, product), {}).setdefault(_split_version(fixed)[0], set()).add(release)
     rows_by_cve = {}   # (product, cve_id) -> [clauses or None (unparsed), affected row], for the end-of-life rules
     cache = {}
     for row in rows:
@@ -128,6 +155,66 @@ class VulndbReader:
     """KEV flag of `cve_id` in this build; None when the build has no `vuln` row for it."""
     vuln = self._vulns.get(cve_id)
     return None if vuln is None else bool(vuln[Match._fields.index("kev") - Match._fields.index("title")])
+
+  def _release(self, package, product):
+    """The release a node's package belongs to, or None (unknown, or more than one candidate)."""
+    mark = _DEB_MARK.search(package.revision) if package.distro == "debian" else None
+    if mark:
+      return _DEBIAN_RELEASES.get(mark.group(1))
+    releases = self._distro_releases.get((package.distro, product), {}).get(_split_version(package.upstream)[0], ())
+    return next(iter(releases)) if len(releases) == 1 else None
+
+  def distro_status(self, product, cve_id, package):
+    """The distribution's verdict for a CVE on the node's package: `(state, fixed_revision, release, source)`, or None.
+
+    `package` is the node's `DistroPackage`. `state`: `fixed` (package revision at or above the fix), `not_fixed` (below it, or
+    the distribution lists the CVE as open), `not_affected`. `fixed_revision` is the revision part of the
+    fixed version: None for an `open` row, "" for a native version or `not_affected`. The result is None when the file has no
+    distribution data, the release is not known, or the table has no row for the CVE; the caller then behaves as without a table.
+    """
+    if package is None:
+      return None
+    rows = self._distro.get((package.distro, product), {}).get(cve_id)
+    if not rows:
+      return None
+    release = self._release(package, product)
+    rows = [r for r in rows if r[0] == release]
+    if release is None or not rows:
+      return None
+    try:
+      by_package = {}
+      for r in rows:
+        by_package.setdefault(r[1], []).append(r)
+      verdicts = {self._verdict(group, package) for group in by_package.values()}
+      # The banner does not name the source package: packages that disagree leave the state unknown.
+      if len({v[0] for v in verdicts if v}) != 1 or None in verdicts:
+        return None
+      verdict = self._verdict(rows, package)
+    except ValueError:  # a revision dpkg-compare cannot read (an int-string limit hit): unknown, not an error
+      return None
+    return None if verdict is None else (verdict[0], verdict[1], release, verdict[2])
+
+  @staticmethod
+  def _verdict(rows, package):
+    """`(state, fixed revision, source)` of the rows of one CVE and release for the node's package, or None.
+
+    `open` wins; else the highest fixed version decides, compared as a whole `upstream-revision` (a backport can move the
+    upstream part too); else `not_affected`.
+    """
+    for r in rows:
+      if r[2] == "open":
+        return "not_fixed", None, r[4]  # no fixed revision at all: None, not the "" of a native version
+    fixed = [(_split_version(r[3]), r[4]) for r in rows if r[2] == "fixed" and r[3]]
+    if fixed:
+      (top, source) = fixed[0]
+      for cand, src in fixed[1:]:
+        if _compare_full(cand, top) > 0:
+          top, source = cand, src
+      state = "fixed" if _compare_full((package.upstream, package.revision), top) >= 0 else "not_fixed"
+      return state, top[1], source
+    if any(r[2] == "not_affected" for r in rows):
+      return "not_affected", "", rows[0][4]
+    return None
 
   def unsupported(self, product, version):
     """The `oldest_supported` text when `version` is older than it, else None (no `eol` row: None)."""
@@ -220,6 +307,8 @@ _AFFECTED = (
 )
 _CVSS = "SELECT cve_id, version, vector, score, source FROM cvss ORDER BY cve_id, version, source, vector"
 _EOL = "SELECT product, oldest_supported FROM eol"
+_DISTRO_FIX = ("SELECT distro, release, product, package, cve_id, status, fixed_version, source FROM distro_fix "
+               "ORDER BY distro, release, product, cve_id, package")
 
 
 def _optional(conn, sql):
@@ -274,8 +363,11 @@ def load_reader(db_path=DB_PATH, pin_path=PIN_PATH):
           {"version": version, "vector": vector, "score": score, "source": source})
       cvss = {k: tuple(v) for k, v in cvss.items()}
       eol = dict(_optional(conn, _EOL))
+      # A file without the snapshot key of a distribution, or without the table (schema 1.0.0), has no data for it.
+      distro = [r for r in _optional(conn, _DISTRO_FIX) if _DISTRO_SNAPSHOT.get(r[0]) in meta]
       origin = pin.get("origin")
-      reader = VulndbReader(vulns, rows, build_id, schema, cvss, eol, None if origin == "local" else pin.get("built_at"))
+      reader = VulndbReader(vulns, rows, build_id, schema, cvss, eol, None if origin == "local" else pin.get("built_at"),
+                            distro)
     finally:
       conn.close()
   except VulndbError:

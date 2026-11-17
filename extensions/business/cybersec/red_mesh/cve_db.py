@@ -485,6 +485,8 @@ BACKPORT_FIXES = {
 BACKPORT_FIXED = "fixed"
 BACKPORT_NOT_FIXED = "not_fixed"
 BACKPORT_UNKNOWN = "unknown"
+# `generated` only: the distribution's table says the package never carried the CVE.
+BACKPORT_NOT_AFFECTED = "not_affected"
 # The banner announced no distribution package at all, so there is nothing to
 # assess. Stated rather than left as "" so a report can always print a state.
 BACKPORT_UNKNOWN_NO_PACKAGE = "unknown_no_package"
@@ -501,16 +503,39 @@ def _backport_row(product: str, cve_id: str, package):
   return None
 
 
-def backport_status(product: str, cve_id: str, package) -> str:
-  """`fixed`, `not_fixed`, `unknown` or `unknown_no_package` for a CVE on a distribution package."""
+def _distro_verdict(product: str, cve_id: str, package):
+  """The `generated` distro table's `(state, fixed_revision, release, source)`, or None (`static`, or nothing for it)."""
+  lookup = getattr(_VULNDB_READER, "distro_status", None)
+  return lookup(product, cve_id, package) if lookup and package is not None else None
+
+
+_DISTRO_STATE = {"fixed": BACKPORT_FIXED, "not_fixed": BACKPORT_NOT_FIXED, "not_affected": BACKPORT_NOT_AFFECTED}
+
+
+def _backport_state(product: str, cve_id: str, package):
+  """`(status, distro verdict or None)`; the verdict is set only when the distro table decided (overlay rows win)."""
   if package is None:
-    return BACKPORT_UNKNOWN_NO_PACKAGE
+    return BACKPORT_UNKNOWN_NO_PACKAGE, None
   row = _backport_row(product, cve_id, package)
   if row is None:
-    return BACKPORT_UNKNOWN
-  if _compare_debian_revision(package.revision, row[1]) >= 0:
-    return BACKPORT_FIXED
-  return BACKPORT_NOT_FIXED
+    verdict = _distro_verdict(product, cve_id, package)
+    if verdict is None:
+      return BACKPORT_UNKNOWN, None
+    status = _DISTRO_STATE.get(verdict[0])
+    return (status, verdict) if status else (BACKPORT_UNKNOWN, None)  # an unexpected state is unknown
+  try:
+    fixed = _compare_debian_revision(package.revision, row[1]) >= 0
+  except ValueError:  # a revision with an absurd digit run (int-string limit): unknown, never an error out of a scan
+    return BACKPORT_UNKNOWN, None
+  return (BACKPORT_FIXED if fixed else BACKPORT_NOT_FIXED), None
+
+
+def backport_status(product: str, cve_id: str, package) -> str:
+  """`fixed`, `not_fixed`, `not_affected`, `unknown` or `unknown_no_package` for a CVE on a distribution package.
+
+  A `BACKPORT_FIXES` row wins; then, under `generated`, the distro table; then `unknown`. `static` never reads the table.
+  """
+  return _backport_state(product, cve_id, package)[0]
 
 
 # The `banner_verified` contract of `check_cves` and `_confidence_reason` (RM-200). Owner ruling 2026-11-17:
@@ -524,14 +549,16 @@ BANNER_NOT_ASSESSABLE = "not_assessable"
 # Why a CVE whose version range matched was still not reported.
 NOT_APPLICABLE_CLIENT_SIDE = "client_side"
 NOT_APPLICABLE_BACKPORT_FIXED = "backport_fixed"
+# The distribution's table lists the package as not affected by the CVE (`generated` only).
+NOT_APPLICABLE_DISTRO_NOT_AFFECTED = "distro_not_affected"
 # A probe read the service's own protocol behaviour and it clears the CVE (RM-200: Terrapin, from the KEXINIT).
 NOT_APPLICABLE_BEHAVIOUR_CLEARED = "behaviour_cleared"
 
 
-def _record_not_applicable(entry, product: str, version: str, package, reason: str) -> None:
+def _record_not_applicable(entry, product: str, version: str, package, reason: str, verdict=None) -> None:
   """Note a matched-but-skipped CVE in the scan-local collector, if one is set.
 
-  Only the three reasons a reader could dispute are recorded (client side, backport fixed, behaviour cleared). A version outside
+  Only the reasons a reader could dispute are recorded (client side, backport fixed, distro not affected, behaviour cleared). A version outside
   the CVE's range was never a candidate, so listing it would bury these rows
   under the whole catalog for the product.
   """
@@ -542,7 +569,11 @@ def _record_not_applicable(entry, product: str, version: str, package, reason: s
   key = f"{port if port is not None else ''}/{entry.cve_id}"
   if key in collector:
     return
-  row = _backport_row(product, entry.cve_id, package) if reason == NOT_APPLICABLE_BACKPORT_FIXED else None
+  row = None
+  if reason in (NOT_APPLICABLE_BACKPORT_FIXED, NOT_APPLICABLE_DISTRO_NOT_AFFECTED):
+    row = _backport_row(product, entry.cve_id, package)
+    if row is None and verdict:
+      row = (package.upstream, verdict[1] or "", verdict[3])  # advisory = the table's source
   collector[key] = {
     "cve_id": entry.cve_id,
     "title": entry.title,
@@ -578,7 +609,7 @@ def withdraw_not_applicable(cve_id: str) -> None:
     return
   port = current_probe_port()
   key = f"{port if port is not None else ''}/{cve_id}"
-  if (collector.get(key) or {}).get("reason") == NOT_APPLICABLE_BACKPORT_FIXED:
+  if (collector.get(key) or {}).get("reason") in (NOT_APPLICABLE_BACKPORT_FIXED, NOT_APPLICABLE_DISTRO_NOT_AFFECTED):
     del collector[key]
 
 
@@ -649,11 +680,15 @@ def check_cves(
         if match.client_side:
           _record_not_applicable(match, product, version, package, NOT_APPLICABLE_CLIENT_SIDE)
         continue
-      status = backport_status(product, match.cve_id, package)
-      if status == BACKPORT_FIXED:
-        _record_not_applicable(match, product, version, package, NOT_APPLICABLE_BACKPORT_FIXED)
+      status, verdict = _backport_state(product, match.cve_id, package)
+      # A banner proven false (an emulator) cannot vouch for a distribution's verdict: the table does not drop the row, it
+      # stays tentative `banner_unverified`. An overlay row (`verdict` None) keeps dropping, as before.
+      if status in (BACKPORT_FIXED, BACKPORT_NOT_AFFECTED) and not (verdict and banner_verified is False):
+        reason = NOT_APPLICABLE_BACKPORT_FIXED if status == BACKPORT_FIXED else NOT_APPLICABLE_DISTRO_NOT_AFFECTED
+        _record_not_applicable(match, product, version, package, reason, verdict)
         continue
-      findings.append(_build_finding(match, product, version, dynamic_cache, backport_status=status, reader=reader, banner_verified=banner_verified))
+      findings.append(_build_finding(match, product, version, dynamic_cache, backport_status=status, reader=reader,
+                                     banner_verified=banner_verified, distro=verdict))
     oldest = reader.unsupported(product, version) if applicability in ("", SERVER_APPLICABILITY) else None
     if oldest:
       findings.append(_unsupported_finding(product, version, oldest, reader))
@@ -787,7 +822,7 @@ def _confidence_reason(backport_status: str, match, product: str, banner_verifie
 
 
 def _build_finding(entry, product: str, version: str, dynamic_cache, backport_status: str = "", reader=None,
-                   banner_verified=BANNER_NOT_ASSESSABLE):
+                   banner_verified=BANNER_NOT_ASSESSABLE, distro=None):
   """Construct a Finding for a matched CveEntry, optionally enriched
   via the dynamic reference cache. With a `reader`, `entry` is a reader `Match` (`generated`)."""
   generated = reader is not None
@@ -874,7 +909,14 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
   # supports beyond the upstream version, so it is the one case that is not
   # `tentative`.
   confidence, confidence_reason = _confidence_reason(backport_status, entry if generated else None, product, banner_verified)
-  if backport_status == BACKPORT_NOT_FIXED:
+  if backport_status == BACKPORT_NOT_FIXED and distro and distro[1] is None:
+    backport_note = " The distribution lists this CVE as open: no fixed package is published for this release."
+  elif backport_status in (BACKPORT_FIXED, BACKPORT_NOT_AFFECTED):
+    backport_note = (
+      " The distribution's data says this package is fixed or not affected, but the banner could not be verified, "
+      "so the finding is tentative."
+    )
+  elif backport_status == BACKPORT_NOT_FIXED:
     backport_note = (
       " The distribution package is below the revision that carries the fix, "
       "so the backport does not apply."
