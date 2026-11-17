@@ -162,6 +162,11 @@ class TestCheckpointConfig(unittest.TestCase):
     self.assertEqual(cfg["GC_INTERVAL"], 600)
     self.assertEqual(cfg["MAX_AGE"], 172800)
 
+  def test_port_every_below_one_is_clamped(self):
+    owner = type("O", (), {})()
+    owner.cfg_worker_checkpoint = {"PORT_EVERY": 0.5}
+    self.assertEqual(ckpt.get_worker_checkpoint_config(owner)["PORT_EVERY"], 1)
+
 
 if __name__ == "__main__":
   unittest.main()

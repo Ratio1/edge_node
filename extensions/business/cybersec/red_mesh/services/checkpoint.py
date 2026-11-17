@@ -44,7 +44,7 @@ def get_worker_checkpoint_config(owner):
       if value is None or not isfinite(value) or value <= 0:
         out[key] = defaults[key]
       else:
-        out[key] = int(value) if key == "PORT_EVERY" else value
+        out[key] = max(1, int(value)) if key == "PORT_EVERY" else value
     return out
 
   return resolve_config_block(

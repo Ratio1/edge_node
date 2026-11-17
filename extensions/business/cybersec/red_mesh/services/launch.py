@@ -23,6 +23,7 @@ def _launch_network_jobs(
   nr_local_workers_override=None,
   target_ports=None,
   execution_identity=None,
+  checkpoint_context=None,
 ):
   exceptions = job_config.get("exceptions", [])
   if not isinstance(exceptions, list):
@@ -114,6 +115,7 @@ def _launch_network_jobs(
         comparison_ports=comparison_ports if index == 0 else None,
         execution_config=job_config,
         execution_identity=execution_identity,
+        **({"checkpoint_context": checkpoint_context} if checkpoint_context else {}),
       )
       batch_job.start()
       local_jobs[batch_job.local_worker_id] = batch_job
@@ -168,6 +170,7 @@ def launch_local_jobs(
   nr_local_workers_override=None,
   target_ports=None,
   execution_identity=None,
+  checkpoint_context=None,
 ):
   validate_effective_config(job_config, target=target)
   require_execution = getattr(owner, "_require_worker_execution", None)
@@ -201,4 +204,5 @@ def launch_local_jobs(
     nr_local_workers_override=nr_local_workers_override,
     target_ports=target_ports,
     execution_identity=execution_identity,
+    checkpoint_context=checkpoint_context,
   )
