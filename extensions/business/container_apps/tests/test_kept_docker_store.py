@@ -5,7 +5,8 @@ Before, the store of the node's inner Docker daemon was deleted with the node co
 started from a fresh pull and nothing was ever left behind. With the store kept (`docker/daemon.json`):
 - an app with AUTOUPDATE starts from the stored image, which its tag may have left, so the first update check must
   compare the registry's image with the image the container runs;
-- what earlier runs left in the store is removed once per node run (`_maybe_sweep_docker_store`);
+- what earlier runs left in the store is removed once per node run (`_maybe_sweep_docker_store`), and an image a
+  container uses keeps every tag;
 - a container the runner removes takes its anonymous volumes with it, so they do not pile up between two sweeps.
 """
 
@@ -13,6 +14,8 @@ started from a fresh pull and nothing was ever left behind. With the store kept 
 import importlib
 # The table of loaded modules, where the node's plugin loader forgets a module before loading it again.
 import sys
+# The images and containers the fake Docker store hands out.
+from types import SimpleNamespace
 # The test framework.
 import unittest
 # Stand-ins for Docker objects, and the expected Docker requests.
@@ -36,6 +39,221 @@ from extensions.business.container_apps.container_app_runner import ContainerSta
 NOW = 1_000_000_000.9
 # How long into a node run the runner waits before the sweep.
 DELAY = car_module._STORE_SWEEP_DELAY
+# The names of the Docker requests a sweep makes, old and new, as `mock_calls` names them.
+SWEEP_CALLS = ("containers.prune", "volumes.prune", "containers.list", "images.list", "images.remove", "images.prune")
+# The requests of one sweep of the store of the sweep tests: two prunes, two lists, three image removals.
+SWEEP_REQUESTS = 7
+
+
+class StoreConflict(Exception):
+  """A request the fake Docker store refuses, where dockerd answers 409 ("conflict")."""
+
+
+class FakeImageStore:
+  """
+  The images and containers of a node's Docker store, answering image requests as dockerd 29 does.
+
+  Only what the sweep and the runner's image lookups use. The answers are those a real dockerd 29.5.1 (graph driver
+  store) gave, unprivileged, to the same requests: a tag is removed without a look at the containers while its
+  image has another tag; the last tag of an image a container uses is refused, and so is an image with several tags
+  removed by id without force; with force an image is refused only while a running container uses it. Docker's prune
+  of tagged images (`filters={"dangling": False}`) removes every tag of every image in turn and passes over the
+  refusals, so an image in use keeps only its last tag.
+
+  Parameters
+  ----------
+  images : dict
+    Image id -> list of its tags, in the order the daemon tries them; an empty list for an untagged image.
+  containers : list
+    One `(image id, running)` pair per container of the store, running or not.
+
+  Examples
+  --------
+  >>> store = FakeImageStore({"sha256:a": ["a:1", "a:2"]}, [("sha256:a", True)])
+  >>> store.prune(filters={"dangling": False})["ImagesDeleted"]
+  [{'Untagged': 'a:1'}]
+  >>> store.images
+  {'sha256:a': ['a:2']}
+  """
+
+  def __init__(self, images, containers):
+    """
+    Keep the images and containers of the store.
+
+    Parameters
+    ----------
+    images : dict
+      Image id -> list of its tags.
+    containers : list
+      One `(image id, running)` pair per container.
+
+    Returns
+    -------
+    None
+    """
+    # A copy, so that the removals change this store only.
+    self.images = {image_id: list(tags) for image_id, tags in images.items()}
+    # The containers stay as they are: the sweep removes none through this store.
+    self.containers = list(containers)
+
+  def list_containers(self, all=False, sparse=False):
+    """
+    The containers, as `containers.list` gives them.
+
+    Parameters
+    ----------
+    all : bool
+      True: the stopped containers too; False: the running ones only, Docker's default.
+    sparse : bool
+      As docker-py takes it; the attributes are those of Docker's list request either way.
+
+    Returns
+    -------
+    list
+      One object per container, with `attrs["ImageID"]`: the id of the image it uses.
+
+    Examples
+    --------
+    >>> FakeImageStore({}, [("sha256:a", False)]).list_containers()
+    []
+    """
+    # As in Docker's list request; without `all`, stopped containers are left out.
+    return [SimpleNamespace(attrs={"ImageID": image_id}) for image_id, running in self.containers if all or running]
+
+  def list_images(self):
+    """
+    The images, as `images.list` gives them.
+
+    Returns
+    -------
+    list
+      One object per image, with `id` and `tags`.
+
+    Examples
+    --------
+    >>> [image.id for image in FakeImageStore({"sha256:a": []}, []).list_images()]
+    ['sha256:a']
+    """
+    # One object per image, in the store's order.
+    return [SimpleNamespace(id=image_id, tags=list(tags)) for image_id, tags in self.images.items()]
+
+  def get_image(self, name):
+    """
+    One image by its id or one of its tags, as `images.get` finds it.
+
+    Parameters
+    ----------
+    name : str
+      An image id or a tag.
+
+    Returns
+    -------
+    SimpleNamespace
+      The image, with `id` and `tags`.
+
+    Raises
+    ------
+    LookupError
+      When no image has that id or tag, where Docker answers 404.
+
+    Examples
+    --------
+    >>> FakeImageStore({"sha256:a": ["a:1"]}, []).get_image("a:1").id
+    'sha256:a'
+    """
+    # The first image with that id or tag.
+    for image_id, tags in self.images.items():
+      if name == image_id or name in tags:
+        # The image as docker-py describes it.
+        return SimpleNamespace(id=image_id, tags=list(tags))
+    # No such image: Docker's 404.
+    raise LookupError(name)
+
+  def remove_image(self, image, force=False):
+    """
+    Remove a tag or an image, as `images.remove` makes dockerd do it.
+
+    Parameters
+    ----------
+    image : str
+      An image id, or a tag.
+    force : bool
+      Docker's `force`: an image with several tags goes by its id, and a stopped container does not hold it.
+
+    Returns
+    -------
+    str
+      "untagged" when only the tag went, "deleted" when the image went with all its tags.
+
+    Raises
+    ------
+    StoreConflict
+      For each removal dockerd refuses (the class description lists them).
+    LookupError
+      When no image has that id or tag.
+
+    Examples
+    --------
+    >>> FakeImageStore({"sha256:a": ["a:1", "a:2"]}, [("sha256:a", True)]).remove_image("a:1")
+    'untagged'
+    """
+    # The image the name stands for, and its tags.
+    image_id = self.get_image(image).id
+    # The same list as in the store, so that a removed tag is gone there.
+    tags = self.images[image_id]
+    # Whether each container that uses it runs.
+    users = [running for used, running in self.containers if used == image_id]
+    if image != image_id and len(tags) > 1:
+      # A tag of an image with another tag: only the tag goes, whether a container uses the image or not.
+      tags.remove(image)
+      # Only the tag.
+      return "untagged"
+    if image == image_id and len(tags) > 1 and not force:
+      # By id, an image with several tags goes only with force.
+      raise StoreConflict("unable to delete {} (must be forced) - image is referenced in multiple repositories".format(image))
+    if any(users) or (users and not force):
+      # In use: by a running container always, by a stopped one unless with force.
+      raise StoreConflict("unable to delete {} - a container is using it".format(image))
+    # The image goes, with every tag it has.
+    del self.images[image_id]
+    # The whole image.
+    return "deleted"
+
+  def prune(self, filters=None):
+    """
+    Docker's prune of tagged images, as `images.prune(filters={"dangling": False})` makes dockerd do it.
+
+    Parameters
+    ----------
+    filters : dict, optional
+      Docker's prune filters; the store prunes tagged images whatever they are.
+
+    Returns
+    -------
+    dict
+      `ImagesDeleted`, one `{"Untagged": tag}` or `{"Deleted": name}` per removal, and `SpaceReclaimed` (0).
+
+    Examples
+    --------
+    >>> FakeImageStore({"sha256:a": ["a:1"]}, []).prune(filters={"dangling": False})["ImagesDeleted"]
+    [{'Deleted': 'a:1'}]
+    """
+    # One entry per removal Docker made.
+    removed = []
+    # Each image in turn, each of its tags in turn (by id when it has none).
+    for image_id, tags in list(self.images.items()):
+      # The tags as they were when the prune came to this image.
+      for name in list(tags) or [image_id]:
+        try:
+          # The removal Docker makes for this tag, without force.
+          done = self.remove_image(name)
+        except StoreConflict:
+          # Docker passes over a refusal and goes on.
+          continue
+        # What went.
+        removed.append({"Untagged" if done == "untagged" else "Deleted": name})
+    # Docker's answer; the stand-in images have no size.
+    return {"ImagesDeleted": removed, "SpaceReclaimed": 0}
 
 
 def make_image(digest):
@@ -173,7 +391,8 @@ class TestDockerStoreSweep(unittest.TestCase):
 
   def setUp(self):
     """
-    Give each test its own node: a running app, and nothing yet in the memory the node's plugins share.
+    Give each test its own node: a running app, a Docker store with images in use and unused ones, and nothing yet
+    in the memory the node's plugins share.
 
     Returns
     -------
@@ -187,8 +406,27 @@ class TestDockerStoreSweep(unittest.TestCase):
     self.client.containers.prune.return_value = {"ContainersDeleted": ["c1"], "SpaceReclaimed": 10}
     # What Docker answers to the request for volumes.
     self.client.volumes.prune.return_value = {"VolumesDeleted": ["v1"], "SpaceReclaimed": 200}
-    # What Docker answers to the request for images.
-    self.client.images.prune.return_value = {"ImagesDeleted": [{"Deleted": "sha256:x"}], "SpaceReclaimed": 3000}
+    # The images of the store and the containers left after the prune of the old ones.
+    self.store = FakeImageStore({
+      # The image of a running app: its container was made through app:1, another app is configured by app:configured.
+      "sha256:app": ["app:1", "app:configured"],
+      # The image of a container of this run that has exited.
+      "sha256:job": ["job:1"],
+      # The version a moved tag left behind, under two tags.
+      "sha256:old": ["old:1", "old:latest"],
+      # The image of an app no longer on this node.
+      "sha256:single": ["single:1"],
+      # An image without a tag.
+      "sha256:untagged": [],
+    }, [("sha256:app", True), ("sha256:job", False)])
+    # The container list as Docker gives it; a mock around it records the request.
+    self.client.containers.list = MagicMock(side_effect=self.store.list_containers)
+    # The image list in the same way.
+    self.client.images.list = MagicMock(side_effect=self.store.list_images)
+    # The removal of an image or a tag.
+    self.client.images.remove = MagicMock(side_effect=self.store.remove_image)
+    # Docker's prune of tagged images, which the sweep made before.
+    self.client.images.prune = MagicMock(side_effect=self.store.prune)
 
   def at(self, running_time, plugin=None):
     """
@@ -228,7 +466,7 @@ class TestDockerStoreSweep(unittest.TestCase):
     Returns
     -------
     list
-      The `mock.call` entries of the prune requests.
+      The `mock.call` entries of the requests a sweep makes (`SWEEP_CALLS`).
 
     Examples
     --------
@@ -237,8 +475,8 @@ class TestDockerStoreSweep(unittest.TestCase):
     """
     # The client of the app of setUp unless the test names another.
     client = client or self.client
-    # Only the prune requests, in the order they were made across the three collections.
-    return [one for one in client.mock_calls if one[0].endswith(".prune")]
+    # Only the requests of a sweep, in the order they were made across the collections.
+    return [one for one in client.mock_calls if one[0] in SWEEP_CALLS]
 
   def test_nothing_is_removed_before_the_delay_is_over(self):
     """In the first hour of a node run the apps are still starting: the store is left alone."""
@@ -248,25 +486,73 @@ class TestDockerStoreSweep(unittest.TestCase):
     self.assertEqual(self.swept(), [])
     # The sweep is still to come: the early lap must not have used it up.
     self.at(DELAY)
-    # All three requests of the sweep.
-    self.assertEqual(len(self.swept()), 3)
+    # All requests of the sweep.
+    self.assertEqual(len(self.swept()), SWEEP_REQUESTS)
 
   def test_the_sweep_removes_old_containers_then_free_volumes_then_unused_images(self):
-    """After the delay: the stopped containers of earlier runs, then anonymous volumes, then every image no container uses."""
+    """After the delay: the stopped containers of earlier runs, then anonymous volumes, then every image no remaining
+    container uses, each by its id with force; one log line with the bytes and the number of images."""
     # The node started 4000.5 s before NOW.
     self.at(4000.5)
-    # The three requests, in this order.
+    # The requests, in this order.
     self.assertEqual(self.swept(), [
       # Only containers created before this node run (NOW - 4000.5, whole seconds, rounded down): a container of
       # this run that exited stays.
       call.containers.prune(filters={"until": 999_996_000}),
       # Their anonymous volumes; a volume a container still holds is not touched by Docker.
       call.volumes.prune(),
-      # All unused images, tagged ones too ("dangling": False), after the containers that held some were removed.
-      call.images.prune(filters={"dangling": False}),
+      # The containers left, running or not, after those that held some images were removed.
+      call.containers.list(all=True, sparse=True),
+      # The images.
+      call.images.list(),
+      # Every image none of them uses, in the store's order, by id and with force: all its tags go with it. First
+      # the version a moved tag left, under two tags.
+      call.images.remove("sha256:old", force=True),
+      # The image of an app no longer here.
+      call.images.remove("sha256:single", force=True),
+      # The untagged image.
+      call.images.remove("sha256:untagged", force=True),
     ])
-    # The freed space of the three requests is logged once.
-    self.assertEqual(sum("3210 bytes" in line for line in self.plugin.logged_messages), 1)
+    # One line: the space the two prunes freed and the three images.
+    self.assertEqual(self.plugin.logged_messages.count(
+      "Docker store swept once for this node run: 210 bytes freed by containers and volumes, 3 unused images removed"), 1)
+
+  def test_an_image_a_container_uses_keeps_all_its_tags_and_every_other_image_goes(self):
+    """The images of a running and of an exited container stay with every tag; the others go with all of theirs.
+    Before, the running app's image lost all its tags but the last."""
+    # The lap that sweeps.
+    self.at(DELAY)
+    # What the store holds afterwards.
+    self.assertEqual(self.store.images, {"sha256:app": ["app:1", "app:configured"], "sha256:job": ["job:1"]})
+
+  def test_dockers_prune_of_tagged_images_leaves_an_image_in_use_its_last_tag_only(self):
+    """What Docker's own prune of tagged images, the sweep's earlier request, does to an image in use (dockerd
+    29.5.1, in the store stand-in): every tag but the last goes, so an app configured by such a tag loses its image."""
+    # The request the sweep made before.
+    self.client.images.prune(filters={"dangling": False})
+    # The running app's image kept its last tag only; the exited container's image its one tag.
+    self.assertEqual(self.store.images, {"sha256:app": ["app:configured"], "sha256:job": ["job:1"]})
+
+  def test_tracked_and_untracked_apps_find_their_image_after_the_sweep(self):
+    """After the sweep an untracked app finds its image by any of its tags, and a tracked app by its bound id."""
+    # The runner's lookups by id or tag go to the store.
+    self.client.images.get = MagicMock(side_effect=self.store.get_image)
+    # The lap that sweeps.
+    self.at(DELAY)
+    # The image each configured tag gives an untracked app, through the runner's own lookup.
+    found = []
+    # Both tags of the running app's image.
+    for tag in ("app:1", "app:configured"):
+      # An untracked app configured by that tag.
+      self.plugin.cfg_image = tag
+      # The runner's lookup in the local store.
+      image = self.plugin._get_local_image()
+      # Its id, or None when it was not found.
+      found.append(image.id if image else None)
+    # Both tags still name the image.
+    self.assertEqual(found, ["sha256:app", "sha256:app"])
+    # A tracked app bound to that image finds it by its id.
+    self.assertTrue(self.plugin._ensure_bound_image({"image_id": "sha256:app"}))
 
   def test_the_store_is_swept_once_per_node_run_for_all_apps(self):
     """All apps share one store: after one app swept it, neither that app nor another sweeps again in this run."""
@@ -280,8 +566,8 @@ class TestDockerStoreSweep(unittest.TestCase):
     self.at(DELAY + 5, plugin=other)
     # A much later lap of the first app.
     self.at(10 * DELAY)
-    # Three requests in all from the first app.
-    self.assertEqual(len(self.swept()), 3)
+    # The requests of one sweep in all, from the first app.
+    self.assertEqual(len(self.swept()), SWEEP_REQUESTS)
     # None from the other app.
     self.assertEqual(self.swept(other_client), [])
 
@@ -293,8 +579,8 @@ class TestDockerStoreSweep(unittest.TestCase):
     other, other_client = make_running_runner(make_image("sha256:other"))
     # Its lap after the delay.
     self.at(DELAY, plugin=other)
-    # It swept its own store.
-    other_client.images.prune.assert_called_once_with(filters={"dangling": False})
+    # It swept its own store: it asked for the images of that store.
+    other_client.images.list.assert_called_once_with()
 
   def test_an_app_of_a_module_copy_loaded_later_does_not_sweep_again(self):
     """The node loads the runner module again for every plugin instance: the marker of the sweep is not module state."""
@@ -340,7 +626,7 @@ class TestDockerStoreSweep(unittest.TestCase):
       # The lap that sweeps.
       self.at(DELAY)
     # Nothing after the failed request was sent.
-    self.client.images.prune.assert_not_called()
+    self.assertEqual(self.swept(), [call.containers.prune(filters={"until": int(NOW - DELAY)})])
     # Docker would answer now.
     self.client.containers.prune.side_effect = None
     # A following lap of this run.
@@ -363,7 +649,7 @@ class TestDockerStoreSweep(unittest.TestCase):
     # ... and failed: still no container, so the lap never reached the monitoring of a running app.
     self.assertIsNone(self.plugin.container)
     # The store was swept all the same; before, such a node kept a full store until someone cleaned its host.
-    self.assertEqual(len(self.swept()), 3)
+    self.assertEqual(len(self.swept()), SWEEP_REQUESTS)
 
   def test_a_paused_app_sweeps_the_store_in_its_lap(self):
     """A node whose apps are all stopped by hand still frees what the earlier run left."""
@@ -378,7 +664,7 @@ class TestDockerStoreSweep(unittest.TestCase):
     # No start was tried.
     self.client.containers.run.assert_not_called()
     # The store was swept.
-    self.assertEqual(len(self.swept()), 3)
+    self.assertEqual(len(self.swept()), SWEEP_REQUESTS)
 
   def test_a_lap_asks_for_the_sweep_once_and_first(self):
     """Every lap reaches the sweep exactly once, before the app's own container is looked at."""

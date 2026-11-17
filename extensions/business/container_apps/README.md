@@ -415,12 +415,15 @@ because the disk API of plugin code refuses that folder (the core's `RESTRICTED_
   must keep belongs in a configured app volume. (The clean-up of a deleted deployment removes the container
   without them; they stay until the next sweep.)
 - **Sweep:** one hour into each node run, one app removes from the store the stopped containers of earlier
-  runs, the anonymous volumes no container holds and every image no container uses. An app without a
-  container at that moment (stopped by hand, waiting for another app) pulls its image at its next start. An
-  image loaded by hand that no container uses at that moment is removed too. The sweep is the first step of
-  every app's lap, whatever state the app is in: apps that cannot start because the store filled the disk
-  still free it, one hour into the node run after a restart. A node without any container app does not
-  sweep and keeps what its last apps left, without adding to it.
+  runs, the anonymous volumes no container holds and every image no container uses, each image with all its
+  tags. An image a container uses, running or stopped, keeps all its tags, so an app configured by any of
+  them finds it at its next start. One log line gives the bytes the container and volume removals freed and
+  the number of images removed. An app without a container at that moment (stopped by hand, waiting for
+  another app) pulls its image at its next start. An image loaded by hand that no container uses at that
+  moment is removed too. The sweep is the first step of every app's lap, whatever state the app is in: apps
+  that cannot start because the store filled the disk still free it, one hour into the node run after a
+  restart. A node without any container app does not sweep and keeps what its last apps left, without
+  adding to it.
 - **Disk:** the images of the apps that have a container, plus what a run adds after its sweep (the previous
   image of each updated app, images and containers of apps removed since).
 - **Docker major:** the directory is named after the Docker major that writes it, and each image build stops
