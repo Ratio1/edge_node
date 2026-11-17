@@ -576,6 +576,8 @@ class _ServiceTlsMixin(_ServiceProbeBase):
           severity=Severity.LOW,
           cvss_vector=V.SSLV3_POODLE,
           title="Server accepts SSLv3 — vulnerable to POODLE (CVE-2014-3566)",
+          cve=("CVE-2014-3566",),
+          **probe_cve_fields("CVE-2014-3566"),
           description=f"TLS on {target}:{port} accepts SSLv3 connections. "
                       "The POODLE attack allows decrypting SSLv3 traffic using CBC cipher padding oracles.",
           evidence=f"Negotiated {negotiated} when SSLv3 was forced.",
@@ -608,6 +610,8 @@ class _ServiceTlsMixin(_ServiceProbeBase):
             severity=Severity.MEDIUM,
             cvss_vector=V.WEAK_TRANSPORT,
             title="TLS 1.0 with CBC cipher — BEAST risk (CVE-2011-3389)",
+            cve=("CVE-2011-3389",),
+            **probe_cve_fields("CVE-2011-3389"),
             description=f"TLS on {target}:{port} accepts TLS 1.0 with CBC-mode cipher '{cipher_name}'. "
                         "The BEAST attack exploits predictable IVs in TLS 1.0 CBC mode.",
             evidence=f"Negotiated {negotiated} with cipher {cipher_name}.",

@@ -11,7 +11,7 @@ import paramiko
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
-from ...cve_db import check_cves, parse_distro_package
+from ...cve_db import check_cves, parse_distro_package, probe_cve_fields
 from ...models.finding_schema import (
   AUTHENTICATED_ACTION_ATTEMPTED, AUTHENTICATED_ACTION_PERFORMED,
 )
@@ -1330,6 +1330,8 @@ class _ServiceCommonMixin(_ServiceProbeBase):
             severity=Severity.CRITICAL,
             cvss_vector=V.UNAUTHENTICATED_READ_WRITE,
             title="libssh auth bypass (CVE-2018-10933)",
+            cve=("CVE-2018-10933",),
+            **probe_cve_fields("CVE-2018-10933"),
             description="Server accepted SSH2_MSG_USERAUTH_SUCCESS from client, "
                         "bypassing authentication entirely. Full shell access possible.",
             evidence="Session channel opened after sending USERAUTH_SUCCESS.",

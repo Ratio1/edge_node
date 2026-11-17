@@ -4,7 +4,7 @@ import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
-from ...cve_db import check_cves
+from ...cve_db import check_cves, probe_cve_fields
 from ..probe_registry import register_probe, CATEGORY_WEB_TEST
 
 
@@ -770,6 +770,8 @@ class _WebDiscoveryMixin:
             severity=Severity.MEDIUM,
             cvss_vector=V.INFO_DISCLOSURE_MEDIUM,
             title="CVE-2023-23752: Joomla unauthenticated config disclosure",
+            cve=("CVE-2023-23752",),
+            **probe_cve_fields("CVE-2023-23752"),
             description="Joomla REST API exposes application configuration "
                         "including database credentials without authentication.",
             evidence=f"GET {base_url}/api/index.php/v1/config/application?public=true → 200",
@@ -833,6 +835,8 @@ class _WebDiscoveryMixin:
             severity=Severity.CRITICAL,
             cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
             title="CVE-2021-3129: Laravel Ignition RCE endpoint accessible",
+            cve=("CVE-2021-3129",),
+            **probe_cve_fields("CVE-2021-3129"),
             description="/_ignition/execute-solution accepts POST requests. "
                         "With Ignition < 2.5.2, this enables unauthenticated RCE "
                         "via file_put_contents abuse.",
@@ -1167,6 +1171,8 @@ class _WebDiscoveryMixin:
             severity=Severity.CRITICAL,
             cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
             title="CVE-2020-14882: WebLogic console auth bypass confirmed",
+            cve=("CVE-2020-14882",),
+            **probe_cve_fields("CVE-2020-14882"),
             description="WebLogic console authentication can be bypassed via "
                         "double-encoded path traversal, enabling unauthenticated "
                         "access to the admin console and RCE.",
