@@ -262,6 +262,46 @@ class TestTriageWrite(unittest.TestCase):
       triage.update_finding_triage(self.owner, "job-1", "f1", "remediated", actor="a", ledger=ledger)
     self.assertNotEqual(ledger.state, EffectState.PERSISTED)
 
+  def _audit(self):
+    return triage._job_repo(self.owner).get_host_triage_audit(TENANT_A, HOST, "f1")
+
+  def test_a_retry_completes_an_audit_entry_lost_after_the_state_write_exactly_once(self):
+    real = triage.JobStateRepository.append_host_triage_audit
+    with patch.object(triage.JobStateRepository, "append_host_triage_audit", side_effect=RuntimeError("down")):
+      with self.assertRaises(RuntimeError):
+        write(self.owner, ids="f1", note="why")
+    self.assertEqual(self.owner.hashes[self.hkey][f"{HOST}\x1ff1"]["status"], "false_positive")
+    self.assertEqual(self._audit(), [])
+    self.owner.now = 2000.0  # the retry comes later
+    with patch.object(triage.JobStateRepository, "append_host_triage_audit", autospec=True, side_effect=real) as spy:
+      retry, emit = write(self.owner, ids="f1", note="why")
+    self.assertEqual(spy.call_count, 1)
+    self.assertEqual([r["outcome"] for r in retry["results"]], ["updated"])
+    self.assertTrue(retry["complete"])
+    emit.assert_called_once()
+    (entry,) = self._audit()
+    self.assertEqual((entry["status"], entry["note"], entry["actor"], entry["timestamp"]),
+                     ("false_positive", "why", "analyst", 1000.0))  # the change as made, not the retry time
+    again, emit = write(self.owner, ids="f1", note="why")
+    self.assertEqual([r["outcome"] for r in again["results"]], ["unchanged"])
+    emit.assert_not_called()
+    self.assertEqual(len(self._audit()), 1)
+
+  def test_a_state_and_its_audit_entry_share_one_id(self):
+    write(self.owner, ids="f1")
+    stored = self.owner.hashes[self.hkey][f"{HOST}\x1ff1"]
+    (field,) = self.owner.hashes[f"inst:triage:audit:{TENANT_A}"]
+    self.assertTrue(field.endswith(f"\x1f{stored['audit_entry_id']}"))
+
+  def test_a_record_without_an_audit_id_is_left_alone_on_an_unchanged_write(self):
+    write(self.owner, ids="f1")
+    del self.owner.hashes[self.hkey][f"{HOST}\x1ff1"]["audit_entry_id"]  # written by an older node
+    self.owner.hashes[f"inst:triage:audit:{TENANT_A}"].clear()
+    again, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in again["results"]], ["unchanged"])
+    emit.assert_not_called()
+    self.assertEqual(self._audit(), [])
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -370,9 +370,20 @@ class JobStateRepository:
                for field in self._host_audit_fields(tenant_id, host, finding_id)[-self.HOST_AUDIT_KEEP:])
     return [entry for entry in entries if isinstance(entry, dict)]
 
-  def append_host_triage_audit(self, entry):
+  @staticmethod
+  def new_host_triage_audit_entry_id(timestamp):
+    """An entry id that sorts by time; the triage state stores it so a retry rewrites the same field."""
+    return f"{int((timestamp or 0) * 1000):015d}-{secrets.token_hex(4)}"
+
+  def has_host_triage_audit_entry(self, tenant_id, host, finding_id, entry_id):
+    return self.owner.chainstore_hget(
+      hkey=self.host_triage_audit_hkey(tenant_id),
+      key=f"{self.host_triage_audit_prefix(host, finding_id)}{entry_id}") is not None
+
+  def append_host_triage_audit(self, entry, entry_id=None):
     """Write one entry under its own field, then prune what fell out of the newest `HOST_AUDIT_KEEP`.
 
+    `entry_id` (from `new_host_triage_audit_entry_id`) makes a repeat append overwrite the same field.
     The prune is best effort: a concurrent writer may leave a few extra entries, never lose a recent one.
     Returns the stored entry.
     """
@@ -380,7 +391,7 @@ class JobStateRepository:
                else FindingTriageAuditEntry.from_dict(entry)).to_dict()
     tenant_id, host = payload.get("tenant_id"), payload.get("host")
     hkey = self.host_triage_audit_hkey(tenant_id)
-    entry_id = f"{int(payload.get('timestamp', 0) * 1000):015d}-{secrets.token_hex(4)}"
+    entry_id = entry_id or self.new_host_triage_audit_entry_id(payload.get("timestamp"))
     written = self.owner.chainstore_hset(
       hkey=hkey, key=f"{self.host_triage_audit_prefix(host, payload['finding_id'])}{entry_id}", value=payload)
     if written is not True:

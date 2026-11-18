@@ -296,28 +296,40 @@ def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, 
             and stored.get("review_at") == (review_at or None)
             and bool(stored.get("confirmed")) == bool(confirmed)
             and (not confirmed or stored.get("confirmed_by") == confirmed_by))
-    if same:
+    # An earlier attempt that wrote this state but lost its audit entry is finished now, under the stored entry
+    # id, so the entry is written once. A record without the id (an older node wrote it) is left as is.
+    heal = same and bool(stored.get("audit_entry_id")) and not repo.has_host_triage_audit_entry(
+      tenant_id, host, finding_id, stored["audit_entry_id"])
+    if same and not heal:
       results.append({"finding_id": finding_id, "outcome": "unchanged", "triage": deepcopy(stored)})
       continue
     if ledger is not None:
       ledger.checkpoint()
     try:
-      state_payload = repo.put_host_triage(FindingTriageState(
-        job_id=job_id, finding_id=finding_id, status=status, note=note or "", actor=actor or "", updated_at=now,
-        review_at=review_at or None, tenant_id=tenant_id, host=host,
-        confirmed=confirmed, confirmed_by=confirmed_by))
-      if ledger is not None:
-        ledger.record(EffectState.PERSISTED)
+      if heal:
+        state_payload = deepcopy(stored)
+      else:
+        state_payload = repo.put_host_triage(FindingTriageState(
+          job_id=job_id, finding_id=finding_id, status=status, note=note or "", actor=actor or "", updated_at=now,
+          review_at=review_at or None, tenant_id=tenant_id, host=host,
+          confirmed=confirmed, confirmed_by=confirmed_by,
+          audit_entry_id=repo.new_host_triage_audit_entry_id(now)))
+        if ledger is not None:
+          ledger.record(EffectState.PERSISTED)
       audit_payload = repo.append_host_triage_audit(FindingTriageAuditEntry(
-        job_id=job_id, finding_id=finding_id, status=status, note=note or "", actor=actor or "",
-        timestamp=owner.time(), tenant_id=tenant_id, host=host))
+        job_id=state_payload["job_id"], finding_id=finding_id, status=status, note=state_payload.get("note", ""),
+        actor=state_payload.get("actor", ""), timestamp=state_payload.get("updated_at", now), tenant_id=tenant_id,
+        host=host), entry_id=state_payload["audit_entry_id"])
+      if heal and ledger is not None:
+        ledger.record(EffectState.PERSISTED)
     except TriageStoreError:
       # The store did not confirm the write: report it, never a success; a retry finishes the member.
       results.append({"finding_id": finding_id, "outcome": "write_failed", "retryable": True})
       continue
     if hasattr(owner, "_log_audit_event"):
       owner._log_audit_event("finding_triage_updated", {
-        "job_id": job_id, "finding_id": finding_id, "status": status, "actor": actor or ""})
+        "job_id": state_payload["job_id"], "finding_id": finding_id, "status": status,
+        "actor": state_payload.get("actor", "")})
     finding_event = dict(archived)
     finding_event["triage_state"] = status
     emit_finding_event(owner, record, finding=finding_event, event_action="triaged")

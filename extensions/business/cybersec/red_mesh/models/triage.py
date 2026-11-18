@@ -57,6 +57,8 @@ class FindingTriageState:
   host: str = None
   confirmed: bool = None
   confirmed_by: str = None
+  # The id of the audit entry this change writes, so a retry can finish a lost entry exactly once.
+  audit_entry_id: str = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -78,6 +80,7 @@ class FindingTriageState:
       host=d.get("host"),
       confirmed=True if d.get("confirmed") is True else None,
       confirmed_by=d.get("confirmed_by"),
+      audit_entry_id=d.get("audit_entry_id"),
     )
 
 
