@@ -35,6 +35,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from ..constants import LLM_PROMPT_VERSION_EXEC_SUMMARY
+from ..cve_view import effective_kev
 from ..llm_input_builder import LlmInput, build_llm_input
 from ..models.llm_output import (
   LlmReportSections,
@@ -550,6 +551,7 @@ def generate_exec_summary(
   max_findings: int | None = None,
   temperature: float | None = None,
   now_fn: Callable[[], str] | None = None,
+  triage: dict | None = None,
 ) -> StructuredLlmResult:
   """Generate an executive-summary package conforming to LlmReportSections.
 
@@ -579,6 +581,7 @@ def generate_exec_summary(
       applied.
   max_tokens, temperature : passed through to llm_call.
   now_fn : injectable for tests.
+  triage : the live host triage map, passed to build_llm_input (None closes nothing).
   """
   if now_fn is None:
     now_fn = lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -602,6 +605,7 @@ def generate_exec_summary(
       aggregated_report=aggregated_report,
       engagement=engagement,
       max_findings=max_findings,
+      triage=triage,
     )
   elif isinstance(prepared_input, LlmInput):
     llm_input = prepared_input
@@ -975,7 +979,7 @@ def _compact_findings_for_structured_prompt(findings: list[dict]) -> list[dict]:
       "owasp_id": _compact_text(finding.get("owasp_id", ""), 32),
       "cwe_id": _compact_text(finding.get("cwe_id", ""), 32),
       "cvss_score": finding.get("cvss_score"),
-      "kev": bool(finding.get("kev")),
+      "kev": effective_kev(finding),
       "cve": _compact_list(finding.get("cve")),
       "tags": _compact_list(finding.get("tags")),
       "affected_assets": _compact_assets(finding.get("affected_assets")),

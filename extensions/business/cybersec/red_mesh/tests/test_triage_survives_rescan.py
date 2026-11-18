@@ -7,10 +7,10 @@ A new endpoint is a new finding and inherits nothing.
 
 The order follows production: triage is refused until the job has a `job_cid`,
 and only finalization sets that, so every pass is already in the archive when
-triage is written. Nothing carries triage from one job to the next; that is not
-claimed here. The public `update_finding_triage` endpoint currently returns 503
-pending its scoped workspace contract, so the write goes through the service
-function; the read is the path `get_job_archive` uses.
+triage is written. Triage is stored by (tenant, host, finding), so a later job of the host reads it;
+that cross-job read is covered in `test_triage_readers.py` and `test_triage_write.py`.
+Here the records are seeded straight into the host map (the write is `test_triage_write.py`'s);
+the read is the path `get_job_archive` uses.
 
 The identity unit tests in `test_finding_identity_contract.py` prove the key
 itself. This file proves the chain around it: real producers, the archive write
@@ -23,14 +23,15 @@ title (`models/finding_identity.py:dedup_key`), until RM-061 attaches locations.
 
 from copy import deepcopy
 import unittest
-from unittest.mock import patch
 
 from extensions.business.cybersec.red_mesh.findings import (
   AffectedAsset, Finding, Severity, probe_result,
 )
 from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
 from extensions.business.cybersec.red_mesh.mixins.risk import _RiskScoringMixin
-from extensions.business.cybersec.red_mesh.repositories import ArtifactRepository
+from extensions.business.cybersec.red_mesh.models import FindingTriageState
+from extensions.business.cybersec.red_mesh.repositories import ArtifactRepository, JobStateRepository
+from extensions.business.cybersec.red_mesh.tenancy.execution import triage_scope
 from extensions.business.cybersec.red_mesh.services import triage
 from .test_tenant_query_snapshots import QueryStore, archive_for, checked_job
 
@@ -52,6 +53,7 @@ class _Owner(QueryStore):
 
   def chainstore_hset(self, *, hkey, key, value):
     self.points[(hkey, key)] = value
+    return True
 
   def _get_job_from_cstore(self, job_id):
     return self.job if job_id == self.job["job_id"] else None
@@ -128,6 +130,7 @@ class TestTriageAppliesAcrossPasses(unittest.TestCase):
     self.job = checked_job()
     self.job.update(job_status="FINALIZED", launcher="node-a")
     self.owner = _Owner(self.job)
+    self.repo = JobStateRepository(self.owner)
     archive = archive_for(self.job)
     archive["passes"] = [
       {"pass_nr": 1, "findings": deepcopy(self.pass_1)},
@@ -136,16 +139,11 @@ class TestTriageAppliesAcrossPasses(unittest.TestCase):
     self.job["job_cid"] = ArtifactRepository(self.owner).put_archive(archive)
 
   def _triage_pass_1(self):
-    with patch.object(triage, "emit_finding_event") as emit:
-      for finding in self.pass_1:
-        result = triage.update_finding_triage(
-          self.owner, "job-1", finding["finding_id"], "accepted_risk",
-          note="reviewed in pass 1", actor="analyst",
-        )
-        self.assertNotIn("error", result, result)
-    self.assertEqual(emit.call_count, len(self.pass_1))
-    for call in emit.call_args_list:
-      self.assertEqual(call.kwargs["event_action"], "triaged")
+    tenant_id, host = triage_scope(self.job["execution_binding"])
+    for finding in self.pass_1:
+      self.repo.put_host_triage(FindingTriageState(
+        job_id="job-1", finding_id=finding["finding_id"], status="accepted_risk", note="reviewed in pass 1",
+        actor="analyst", tenant_id=tenant_id, host=host, review_at=4_000_000_000.0))
 
   def _read(self):
     result = triage.get_job_archive_with_triage(self.owner, "job-1", checked_job=self.job)

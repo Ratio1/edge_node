@@ -15,6 +15,7 @@ from typing import Optional
 
 from ..constants import RUN_MODE_SINGLEPASS
 from ..credential_redaction import redact_credential_text
+from ..cve_view import apply_triage, build_cve_view, drop_closed, filter_listed, summarize_view
 from ..models.finding_schema import is_coverage_result as _is_coverage_result
 from ..services.config import get_llm_agent_config
 from ..services.resilience import run_bounded_retry
@@ -560,7 +561,7 @@ class _RedMeshLlmAgentMixin(object):
         break
     return services, {"included_services": len(services), "total_services": total_services}
 
-  def _build_llm_top_findings(self, aggregated_report: dict, analysis_type: str) -> tuple[list[dict], dict]:
+  def _build_llm_top_findings(self, aggregated_report: dict, analysis_type: str, triage=None) -> tuple[list[dict], dict]:
     # Coverage results are dropped before ranking, not just before counting.
     # `_rank_findings` sorts by severity and an `inconclusive` scenario keeps its
     # *declared* severity, so a scenario that concluded nothing was ranked into
@@ -570,7 +571,10 @@ class _RedMeshLlmAgentMixin(object):
       if not _is_coverage_result(f)
     ]
     total_findings = len(findings)
-    deduped = self._deduplicate_findings(findings)
+    # Generated CVE findings: the listed ones only (rollup and possible rows are not sent one by one).
+    # The host triage map: a closed CVE finding is not sent, a confirmed possible one is certain.
+    deduped = drop_closed(
+      filter_listed(apply_triage(self._deduplicate_findings(findings), triage), triage=triage), triage)
     ranked = self._rank_findings(deduped)
     limits = self._get_llm_payload_limits(analysis_type)
     bucket_limits = _LLM_FINDING_BUCKETS.get(analysis_type, _LLM_FINDING_BUCKETS["security_assessment"])
@@ -606,23 +610,46 @@ class _RedMeshLlmAgentMixin(object):
         break
     return compact, {
       "total_findings": total_findings,
+      # Under generated this counts the listed CVE findings after dedup, not every CVE record.
       "deduplicated_findings": len(deduped),
       "included_findings": len(compact),
       "included_by_severity": included_by_severity,
       "truncated_findings_count": max(len(deduped) - len(compact), 0),
     }
 
-  def _build_llm_findings_summary(self, aggregated_report: dict) -> dict:
+  def _llm_cve_view(self, aggregated_report: dict, triage=None):
+    """The RM-169 CVE view of the deduplicated findings, or None (`static`: no generated CVE finding)."""
+    findings = [f for f in apply_triage(self._deduplicate_findings(self._extract_report_findings(aggregated_report)), triage)
+                if not _is_coverage_result(f)]
+    return build_cve_view(findings, (aggregated_report.get("cves_not_applicable") or {}).values(), triage)
+
+  def _llm_host_triage(self, job_id: str) -> dict:
+    """The host triage map of the job's own tenant and host (from its record's binding); `{}` when unreadable.
+
+    A host with no job store (or a record without a binding) reads none, which leaves every finding open: the
+    visible direction for a failed read.
+    """
+    try:
+      from ..repositories import JobStateRepository
+      return JobStateRepository(self).list_triage_for_record(self._get_job_from_cstore(job_id)) or {}
+    except Exception:
+      return {}
+
+  def _build_llm_findings_summary(self, aggregated_report: dict, triage=None) -> dict:
     findings = self._deduplicate_findings(self._extract_report_findings(aggregated_report))
     counts = {}
     real_findings = [f for f in findings if not _is_coverage_result(f)]
     for finding in real_findings:
       severity = str(finding.get("severity") or "UNKNOWN").upper()
       counts[severity] = counts.get(severity, 0) + 1
-    return {
+    summary = {
       "total_findings": len(real_findings),
-      "by_severity": counts,
+      "by_severity": counts,  # raw: every record; the view counts sit beside it under generated
     }
+    view = self._llm_cve_view(aggregated_report, triage)
+    if view:
+      summary["cve_view_counts"] = dict(view["counts"])
+    return summary
 
   def _build_llm_coverage_summary(self, aggregated_report: dict, analysis_type: str) -> dict:
     open_ports = aggregated_report.get("open_ports") or []
@@ -809,6 +836,7 @@ class _RedMeshLlmAgentMixin(object):
   def _build_llm_analysis_payload(self, job_id: str, aggregated_report: dict, job_config: dict, analysis_type: str) -> dict:
     scan_type = job_config.get("scan_type", "network")
     target = job_config.get("target_url") if scan_type == "webapp" else job_config.get("target", "unknown")
+    triage = self._llm_host_triage(job_id)
     # Sanitize abort_reason at the LLM boundary (defense in depth —
     # Phase 1's _abort docstring already prohibits target-controlled
     # text, but treat it as untrusted here regardless).
@@ -821,8 +849,9 @@ class _RedMeshLlmAgentMixin(object):
     )
     if scan_type != "webapp":
       services, service_meta = self._build_network_service_summary(aggregated_report, analysis_type)
-      top_findings, finding_meta = self._build_llm_top_findings(aggregated_report, analysis_type)
-      findings_summary = self._build_llm_findings_summary(aggregated_report)
+      top_findings, finding_meta = self._build_llm_top_findings(aggregated_report, analysis_type, triage)
+      findings_summary = self._build_llm_findings_summary(aggregated_report, triage)
+      cve_view = self._llm_cve_view(aggregated_report, triage)
       return {
         "metadata": self._build_llm_metadata(job_id, target, scan_type, job_config),
         "stats": {
@@ -836,6 +865,8 @@ class _RedMeshLlmAgentMixin(object):
         },
         "services": services,
         "top_findings": top_findings,
+        # RM-169, generated CVE findings only: counts, rollups and the possible summary; absent under `static`.
+        **({"cve_view": summarize_view(cve_view)} if cve_view else {}),
         "coverage": self._build_llm_coverage_summary(aggregated_report, analysis_type),
         "attack_surface": self._build_attack_surface_summary(services, findings_summary),
         "truncation": {
@@ -852,7 +883,7 @@ class _RedMeshLlmAgentMixin(object):
         ),
       }
 
-    top_findings, finding_meta = self._build_llm_top_findings(aggregated_report, analysis_type)
+    top_findings, finding_meta = self._build_llm_top_findings(aggregated_report, analysis_type, triage)
     findings_summary = self._build_webapp_findings_summary(aggregated_report)
     probe_summary = self._build_webapp_probe_summary(aggregated_report, analysis_type)
     coverage = self._build_webapp_coverage_summary(aggregated_report, job_config, analysis_type)
@@ -1261,6 +1292,7 @@ class _RedMeshLlmAgentMixin(object):
       aggregated_report: dict,
       engagement: dict | None = None,
       before_provider_call=None,
+      triage: dict | None = None,
   ) -> dict | None:
     """
     Run the Phase 4 structured-LLM call and return the dict form
@@ -1366,6 +1398,7 @@ class _RedMeshLlmAgentMixin(object):
         max_findings=llm_cfg.get("STRUCTURED_MAX_FINDINGS", 1),
         max_tokens=llm_cfg.get("STRUCTURED_MAX_TOKENS", 1024),
         temperature=llm_cfg.get("STRUCTURED_TEMPERATURE"),
+        triage=triage,
       )
     except Exception as exc:
       self.P(

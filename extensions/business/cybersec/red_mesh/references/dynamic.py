@@ -377,7 +377,9 @@ class DynamicReferenceCache:
     ):
       arr = metrics.get(key) or []
       if arr:
-        cvss = arr[0].get("cvssData", {}) or {}
+        # NVD's own (Primary) assessment first; a CNA (Secondary) entry may be listed before it.
+        pick = next((m for m in arr if isinstance(m, dict) and m.get("type") == "Primary"), arr[0])
+        cvss = pick.get("cvssData", {}) or {}
         return CvssRecord(
           cve_id=cve_id,
           vector=str(cvss.get("vectorString", "")),

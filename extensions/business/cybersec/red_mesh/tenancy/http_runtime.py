@@ -106,7 +106,6 @@ _READ_FIELDS = {
                            + _REQUESTER_FIELDS,
   "get_misp_export_config_status": (("request_actor", dict, None), ("tenant_id", str, None)),
   "llm_health": (("request_actor", dict, None),),
-  "update_finding_triage": (("request_actor", dict, None),),
   "export_misp_json": _JOB_FIELD + (("pass_nr", int, None),) + _REQUESTER_FIELDS,
   "export_stix_json": _JOB_FIELD + (("pass_nr", int, None),) + _REQUESTER_FIELDS,
   "export_siem_events_json": _JOB_FIELD + (("pass_nr", int, None),) + _REQUESTER_FIELDS,
@@ -165,6 +164,11 @@ _EFFECT_FIELDS = {
   # which matters here because a failed stop may already have cancelled the workers.
   "stop_monitoring": _JOB_FIELD + (("stop_type", str, "SOFT"), ("request_actor", dict, None),
                                    ("tenant_id", str, None)),
+  # RM-169 step 4a finding triage (`findings:triage`). `review_at` is whole epoch seconds: the guard
+  # checks exact types, so a float is a 400.
+  "update_finding_triage": _JOB_FIELD + (("finding_ids", list, _REQUIRED), ("status", str, _REQUIRED),
+                                         ("note", str, ""), ("review_at", int, 0), ("confirm", bool, False),
+                                         ("request_actor", dict, None), ("tenant_id", str, None)),
 }
 # "unknown" exists only for RAW responses, where the framework discards the state before the
 # guard sees it. It still tells the caller an effect may have landed.
@@ -205,6 +209,11 @@ _TYPED_READ_ERRORS = {
   # RM-139: a manual push waits while the automatic push for the job is in flight or queued.
   "/export_misp": {(409, "no_completed_passes"), (404, "pass_not_found"),
                    (409, "misp_auto_export_in_flight")},
+  # RM-169 step 4a: the typed refusals of a triage write (a pending review submission on a job of the host,
+  # a job that is not archived or not this node's, bad input), each one the caller can act on.
+  "/update_finding_triage": {(400, "validation_error"), (400, "model_test_not_supported"),
+                             (409, "not_available"), (409, "job_launcher_mismatch"),
+                             (409, "submission_in_progress"), (409, "triage_contention")},
 }
 _TYPED_READ_PAIRS = frozenset(pair for pairs in _TYPED_READ_ERRORS.values() for pair in pairs)
 READ_LIST_CAPSULE = "__redmesh_checked_job_list_v1"

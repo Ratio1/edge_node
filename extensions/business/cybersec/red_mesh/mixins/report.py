@@ -13,6 +13,7 @@ import struct as _struct
 from ..worker import PentestLocalWorker
 from .live_progress import _LiveProgressMixin
 from ..models import UiAggregate
+from ..cve_view import apply_triage, drop_closed, filter_listed
 from ..models.finding_identity import (
   worker_attribution_fields as _worker_attribution_fields,
   volatile_non_content_fields as _volatile_non_content_fields,
@@ -40,6 +41,9 @@ _DEDUP_EXCLUDE_FIELDS = frozenset(
   {"_source_worker_id", "_source_node_addr"}
   | set(_worker_attribution_fields())
   | set(_volatile_non_content_fields())
+  # RM-169: per database build, so one finding seen by two workers on different pins still collapses;
+  # `_reconcile_volatile_fields` gives the survivor the build of the newer freshness.
+  | {"vulndb_build_id"}
 )
 
 
@@ -196,6 +200,8 @@ def _reconcile_volatile_fields(survivor, dropped):
     # comparison for the same reason `finding_rank` demotes one.
     if current is None or str(incoming) > str(current):
       survivor[field] = incoming
+      if field == "cvss_data_freshness" and dropped.get("vulndb_build_id"):
+        survivor["vulndb_build_id"] = dropped["vulndb_build_id"]
 
 
 def _dedup_findings_in_aggregated(aggregated):
@@ -1047,7 +1053,7 @@ class _ReportMixin:
       })
     return comparison
 
-  def _compute_ui_aggregate(self, passes, latest_aggregated, job_config=None):
+  def _compute_ui_aggregate(self, passes, latest_aggregated, job_config=None, triage=None):
     """Compute pre-aggregated view for frontend from pass reports.
 
     Parameters
@@ -1056,6 +1062,9 @@ class _ReportMixin:
       List of pass report dicts (PassReport.to_dict()).
     latest_aggregated : dict
       AggregatedScanData dict for the latest pass.
+    triage : dict or None
+      The live host triage map. `top_findings` is built over stamped copies, so a confirmed possible CVE can
+      reach it and a closed finding takes no slot; stored findings stay unstamped. Empty: unchanged.
 
     Returns
     -------
@@ -1076,6 +1085,9 @@ class _ReportMixin:
     if scan_type == "webapp":
       graybox_stats = self._extract_graybox_ui_stats(agg, latest)
 
+    # RM-200: `total_findings` and `findings_count` below exclude tentative CVE findings (an unconfirmed version
+    # match); they are counted once in `unconfirmed_version_matches`. The raw findings stay in the archive.
+    # `latest_risk_breakdown.finding_counts` is the scored view (RM-169: rollups once, possible and closed out).
     # Every counter in this object uses the same predicate, or the object
     # contradicts itself: `total_findings` excluding coverage while the severity
     # chart counted it produced a header saying one finding above a chart
@@ -1083,13 +1095,27 @@ class _ReportMixin:
     real_findings = [f for f in findings if not _is_coverage_result(f)]
 
     # Severity breakdown
-    findings_count = dict(Counter(f.get("severity", "INFO") for f in real_findings))
+    # One predicate for every counter, over the triage-stamped copies: a triage-confirmed CVE row reads certain.
+    stamped = apply_triage(real_findings, triage)
+
+    def _unconfirmed(f):
+      return bool(f.get("cve")) and f.get("confidence") == "tentative"
+
+    unconfirmed = [f for f in stamped if _unconfirmed(f)]
+    confirmed = [f for f in stamped if not _unconfirmed(f)]
+    findings_count = dict(Counter(f.get("severity", "INFO") for f in confirmed))
 
     # Top findings: CRITICAL + HIGH, sorted by severity then confidence, capped
     # at 10. An `inconclusive` scenario keeps its *declared* severity, so
     # without the filter a scenario that concluded nothing was ranked into the
     # customer-facing top-findings list as a HIGH.
-    crit_high = [f for f in real_findings if f.get("severity") in ("CRITICAL", "HIGH")]
+    # Generated CVE findings: listed ones only (the rest are in a rollup or the possible section).
+    # The stamped copies only rank; the triage record is not kept on what is stored in the archive.
+    crit_high = [
+      {k: v for k, v in f.items() if k != "triage"} if triage and "triage" in f else f
+      for f in drop_closed(filter_listed(stamped, triage=triage), triage)
+      if f.get("severity") in ("CRITICAL", "HIGH") and not _unconfirmed(f)  # RM-200, static rows too
+    ]
     crit_high.sort(key=lambda f: (
       self.SEVERITY_ORDER.get(f.get("severity"), 9),
       self.CONFIDENCE_ORDER.get(f.get("confidence"), 9),
@@ -1139,7 +1165,8 @@ class _ReportMixin:
       total_services=self._count_services(agg.get("service_info", {})),
       # Findings, not scenario results: a graybox scan emits one entry per
       # scenario whatever the outcome, so `len(findings)` counted the tests run.
-      total_findings=len(real_findings),
+      total_findings=len(confirmed),
+      unconfirmed_version_matches=len(unconfirmed),
       findings_count=findings_count if findings_count else None,
       top_findings=top_findings if top_findings else None,
       finding_timeline=finding_timeline if finding_timeline else None,

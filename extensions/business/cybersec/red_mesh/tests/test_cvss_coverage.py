@@ -87,6 +87,7 @@ _CONSTANT_BANDS = {
 _NOT_A_WEAKNESS = {
   ("correlation.py", "_correlate_port_ratio", "Honeypot indicator"),
   ("correlation.py", "_correlate_os_consistency", "Honeypot indicator"),
+  ("correlation.py", "_correlate_banner_authenticity", "Honeypot indicator"),  # RM-200
   ("correlation.py", "_correlate_timezone_drift", "Timezone inconsistency"),
   ("pentest_worker.py", "_active_fingerprint_ports", "ICS device detected"),
   ("pentest_worker.py", "_gather_service_info", "ICS device detected"),
