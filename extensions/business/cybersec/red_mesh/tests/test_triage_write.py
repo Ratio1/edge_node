@@ -326,5 +326,159 @@ class TestTriageWrite(unittest.TestCase):
     self.assertEqual(self._audit(), [])
 
 
+  def _unconfirmed_writes_to(self, hkey):
+    """Writes to `hkey` land locally but return False, as CStore does when the peers do not confirm in time."""
+    real = self.owner.chainstore_hset
+    calls = []
+
+    def unconfirmed(**kwargs):
+      real(**kwargs)
+      calls.append(kwargs["hkey"])
+      return kwargs["hkey"] != hkey
+    self.owner.chainstore_hset = unconfirmed
+    return real, calls
+
+  def test_a_retry_after_an_unconfirmed_state_write_writes_it_again_before_reporting_success(self):
+    real, _ = self._unconfirmed_writes_to(self.hkey)
+    first, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in first["results"]], ["write_failed"])
+    emit.assert_not_called()
+    self.owner.chainstore_hset = real
+    _, calls = self._unconfirmed_writes_to(None)  # every write confirmed from here on
+    retry, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in retry["results"]], ["updated"])
+    self.assertTrue(retry["complete"])
+    self.assertIn(self.hkey, calls)  # the state is written again, and confirmed this time
+    emit.assert_called_once()
+    self.assertEqual(len(self._audit()), 1)
+    again, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in again["results"]], ["unchanged"])
+    emit.assert_not_called()
+
+  def test_a_retry_after_an_unconfirmed_audit_write_writes_it_again_and_emits_the_event(self):
+    audit_hkey = f"inst:triage:audit:{TENANT_A}"
+    real, _ = self._unconfirmed_writes_to(audit_hkey)
+    first, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in first["results"]], ["write_failed"])
+    self.assertEqual(len(self._audit()), 1)  # the entry is stored locally, but not confirmed
+    emit.assert_not_called()
+    self.owner.chainstore_hset = real
+    _, calls = self._unconfirmed_writes_to(None)
+    retry, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in retry["results"]], ["updated"])
+    self.assertTrue(retry["complete"])
+    self.assertIn(audit_hkey, calls)
+    emit.assert_called_once()
+    self.assertEqual(len(self._audit()), 1)
+
+  def test_a_new_status_finishes_the_missing_audit_entry_of_the_previous_one_first(self):
+    real = self.owner.chainstore_hset
+    self._refuse_writes_to(f"inst:triage:audit:{TENANT_A}")
+    write(self.owner, ids="f1", status="false_positive")
+    self.owner.chainstore_hset = real
+    self.owner.now = 2000.0
+    second, emit = write(self.owner, ids="f1", status="reopened")
+    self.assertEqual([r["outcome"] for r in second["results"]], ["updated"])
+    self.assertEqual(sorted((e["timestamp"], e["status"]) for e in self._audit()),
+                     [(1000.0, "false_positive"), (2000.0, "reopened")])
+    self.assertEqual([c.kwargs["finding"]["triage_state"] for c in emit.call_args_list], ["false_positive", "reopened"])
+    self.assertEqual(self.owner.hashes[self.hkey][f"{HOST}\x1ff1"]["status"], "reopened")
+
+  def test_after_a_restart_a_new_status_still_finishes_a_missing_audit_entry(self):
+    real = self.owner.chainstore_hset
+    self._refuse_writes_to(f"inst:triage:audit:{TENANT_A}")
+    write(self.owner, ids="f1", status="false_positive")
+    self.owner.chainstore_hset = real
+    self.owner.__dict__.pop("_triage_unfinished_writes", None)  # the launcher restarted
+    self.owner.now = 2000.0
+    write(self.owner, ids="f1", status="reopened")
+    self.assertEqual(sorted(e["status"] for e in self._audit()), ["false_positive", "reopened"])
+
+  def test_a_refused_state_write_is_not_finished_by_the_next_request(self):
+    real = self.owner.chainstore_hset
+    self._refuse_writes_to(self.hkey)
+    write(self.owner, ids="f1", status="false_positive")  # nothing stored
+    self.owner.chainstore_hset = real
+    second, emit = write(self.owner, ids="f1", status="remediated")
+    self.assertEqual([e["status"] for e in self._audit()], ["remediated"])
+    emit.assert_called_once()
+
+
+  def _record(self):
+    return self.owner.hashes[self.hkey][f"{HOST}\x1ff1"]
+
+  def _audit_field(self, entry_id):
+    return f"{HOST}\x1ff1\x1f{entry_id}"
+
+  def _logged_writes(self):
+    real = self.owner.chainstore_hset
+    calls = []
+
+    def logged(**kwargs):
+      calls.append((kwargs["hkey"], kwargs["key"]))
+      return real(**kwargs)
+    self.owner.chainstore_hset = logged
+    return calls
+
+  def test_a_new_status_rewrites_an_unconfirmed_audit_entry_before_replacing_the_record(self):
+    audit_hkey = f"inst:triage:audit:{TENANT_A}"
+    real, _ = self._unconfirmed_writes_to(audit_hkey)
+    write(self.owner, ids="f1", status="false_positive")
+    first_id = self._record()["audit_entry_id"]
+    self.owner.chainstore_hset = real
+    calls = self._logged_writes()
+    self.owner.now = 2000.0
+    second, emit = write(self.owner, ids="f1", status="reopened")
+    self.assertEqual([r["outcome"] for r in second["results"]], ["updated"])
+    self.assertLess(calls.index((audit_hkey, self._audit_field(first_id))), calls.index((self.hkey, f"{HOST}\x1ff1")))
+    self.assertEqual([c.kwargs["finding"]["triage_state"] for c in emit.call_args_list], ["false_positive", "reopened"])
+
+  def test_an_unconfirmed_audit_entry_is_written_again_after_another_launcher_replaced_the_record(self):
+    audit_hkey = f"inst:triage:audit:{TENANT_A}"
+    real, _ = self._unconfirmed_writes_to(audit_hkey)
+    write(self.owner, ids="f1", status="false_positive")
+    first_id = self._record()["audit_entry_id"]
+    self.owner.chainstore_hset = real
+    # a sibling job's launcher on another node set the same (tenant, host, finding) and its change replicated here
+    self.owner.hashes[self.hkey][f"{HOST}\x1ff1"] = dict(self._record(), status="remediated", audit_entry_id="other")
+    self.owner.hashes[audit_hkey][self._audit_field("other")] = {"status": "remediated"}
+    calls = self._logged_writes()
+    write(self.owner, ids="f1", status="reopened")
+    self.assertIn((audit_hkey, self._audit_field(first_id)), calls)
+    # the confirmed false_positive state is not written again over the newer record: one state write, for reopened
+    self.assertEqual(calls.count((self.hkey, f"{HOST}\x1ff1")), 1)
+    self.assertEqual(self._record()["status"], "reopened")
+
+  def test_a_state_write_that_stored_nothing_is_dropped_not_finished(self):
+    write(self.owner, ids="f1", status="false_positive")
+    real = self.owner.chainstore_hset
+    self._refuse_writes_to(self.hkey)
+    write(self.owner, ids="f1", status="remediated")  # refused: the record still holds false_positive
+    self.owner.chainstore_hset = real
+    third, emit = write(self.owner, ids="f1", status="reopened")
+    self.assertEqual([r["outcome"] for r in third["results"]], ["updated"])
+    self.assertEqual([c.kwargs["finding"]["triage_state"] for c in emit.call_args_list], ["reopened"])
+    self.assertEqual(sorted(e["status"] for e in self._audit()), ["false_positive", "reopened"])
+
+  def test_an_event_emitted_before_a_failed_write_persists_the_soc_status(self):
+    self.owner.hashes["inst"]["job-1"]["soc_event_status"] = {}
+    real, _ = self._unconfirmed_writes_to(f"inst:triage:audit:{TENANT_A}")
+    write(self.owner, ids="f1", status="false_positive")
+    self.owner.chainstore_hset = real
+    self._refuse_writes_to(self.hkey)
+    with patch.object(triage, "_write_job_record") as soc_write:
+      second, emit = write(self.owner, ids="f1", status="reopened")
+    self.assertEqual([r["outcome"] for r in second["results"]], ["write_failed"])
+    emit.assert_called_once()  # the finished false_positive change
+    soc_write.assert_called_once()
+
+  def test_a_malformed_record_with_a_missing_audit_entry_does_not_block_writes(self):
+    self.owner.hashes.setdefault(self.hkey, {})[f"{HOST}\x1ff1"] = {"finding_id": "f1", "status": "bogus",
+                                                                      "audit_entry_id": "x"}
+    result, emit = write(self.owner, ids="f1", status="remediated")
+    self.assertEqual([r["outcome"] for r in result["results"]], ["updated"])
+    self.assertEqual([e["status"] for e in self._audit()], ["remediated"])
+
+
 if __name__ == "__main__":
   unittest.main()
