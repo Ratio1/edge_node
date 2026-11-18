@@ -13,6 +13,7 @@ runs:
         pin=extensions/business/cybersec/red_mesh/vulndb/pin.json
         if [ ! -f "$pin" ]; then
           echo "No pin.json: skipping vulndb fetch (image falls back to static catalog)"
+          echo "::warning title=vulndb::No pin.json: this image uses the static CVE catalog"
           echo "present=false" >> "$GITHUB_OUTPUT"
           exit 0
         fi
