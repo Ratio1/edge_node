@@ -384,16 +384,21 @@ def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, 
     # node that sees the state before the audit field replicates finishes it too; the entry is the same field and
     # payload, but the finding event is emitted again.
     # A change whose writes were both confirmed but whose event was not emitted (the announce raised) is announced.
-    finish, phase = None, {}
+    # Both this launcher's change and the stored record's are reconciled: another launcher's change may have replaced
+    # this one's record and lost its own audit entry, and this request must not overwrite it unrecorded.
+    finishes = []  # (state, phase), oldest first
+    pending_id = pending["state"].get("audit_entry_id") if pending else None
     if pending and pending["state_confirmed"]:
-      finish = FindingTriageState.from_dict(pending["state"])
-      phase = {"write_state": False, "write_audit": not pending["audit_confirmed"], "audit_payload": pending.get("audit")}
-    elif pending and pending["state"].get("audit_entry_id") == stored_id:
-      finish = _stored_state(stored)
-    else:
+      finishes.append((FindingTriageState.from_dict(pending["state"]), {
+        "write_state": False, "write_audit": not pending["audit_confirmed"], "audit_payload": pending.get("audit")}))
+    elif not pending or pending_id != stored_id:
       unfinished.pop(key, None)
-      if stored_id and not repo.has_host_triage_audit_entry(tenant_id, host, finding_id, stored_id):
+    if stored_id and (stored_id != pending_id or not finishes):
+      own = stored_id == pending_id  # this launcher's unconfirmed state, still the record: both writes again
+      if own or not repo.has_host_triage_audit_entry(tenant_id, host, finding_id, stored_id):
         finish = _stored_state(stored)
+        if finish is not None:
+          finishes.append((finish, {}))
     # A write keeps an earlier confirmation unless it is a new one or the finding is dismissed as a false positive.
     kept = isinstance(stored, dict) and stored.get("confirmed") is True and status != "false_positive"
     confirmed = True if confirm or kept else None
@@ -402,13 +407,13 @@ def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, 
             and stored.get("review_at") == (review_at or None)
             and bool(stored.get("confirmed")) == bool(confirmed)
             and (not confirmed or stored.get("confirmed_by") == confirmed_by))
-    if same and finish is None:
+    if same and not finishes:
       results.append({"finding_id": finding_id, "outcome": "unchanged", "triage": deepcopy(stored)})
       continue
     state_payload = deepcopy(stored)
     announce = lambda payload, archived=archived: _announce_triage(owner, record, archived, payload)
     try:
-      if finish is not None:
+      for finish, phase in finishes:
         _, audit_payload = _commit_triage(owner, repo, key, finish, ledger, announce, **phase)
         announced = True
       if not same:

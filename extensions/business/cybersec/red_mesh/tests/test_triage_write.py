@@ -498,6 +498,35 @@ class TestTriageWrite(unittest.TestCase):
     self.assertEqual([r["outcome"] for r in retry["results"]], ["updated"])
     self.assertEqual(ledger.state, EffectState.PERSISTED)
 
+  def test_two_launchers_lose_no_status_from_the_audit(self):
+    # Launcher B runs a sibling job on the same host and shares the store with launcher A.
+    other = _Owner()
+    other.ee_addr, other.hashes, other.archives = "node-b", self.owner.hashes, self.owner.archives
+    other.add_job("job-2", launcher="node-b")
+    audit_hkey = f"inst:triage:audit:{TENANT_A}"
+
+    def refuse_audit_of(owner, refused):
+      real = owner.chainstore_hset
+
+      def refusing(**kwargs):
+        if kwargs["hkey"] == audit_hkey and kwargs["value"] and kwargs["value"].get("status") == refused:
+          return False
+        return real(**kwargs)
+      owner.chainstore_hset = refusing
+      return real
+    real_a = refuse_audit_of(self.owner, "false_positive")
+    write(self.owner, ids="f1", status="false_positive")  # A: state confirmed, audit entry not stored
+    real_b = refuse_audit_of(other, "remediated")
+    other.now = 2000.0
+    write(other, job_id="job-2", ids="f1", status="remediated")  # B finishes A's entry, its own is not stored
+    self.owner.chainstore_hset, other.chainstore_hset = real_a, real_b
+    self.owner.now = 3000.0
+    result, emit = write(self.owner, ids="f1", status="reopened")
+    self.assertEqual([r["outcome"] for r in result["results"]], ["updated"])
+    self.assertEqual(sorted((e["timestamp"], e["status"]) for e in self._audit()),
+                     [(1000.0, "false_positive"), (2000.0, "remediated"), (3000.0, "reopened")])
+    self.assertEqual(self._record()["status"], "reopened")
+
   def test_a_malformed_record_with_a_missing_audit_entry_does_not_block_writes(self):
     self.owner.hashes.setdefault(self.hkey, {})[f"{HOST}\x1ff1"] = {
       "finding_id": "f1", "tenant_id": TENANT_A, "host": HOST, "status": "bogus", "audit_entry_id": "x"}
