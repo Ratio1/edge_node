@@ -120,6 +120,15 @@ class TestThreadMerge(unittest.TestCase):
     report = host._get_aggregated_report(_per_thread([_thread(0, range(1, 11), [22]), bad]))
     self.assertEqual([f["title"] for f in report["correlation_findings"]], ["corr-0"])
 
+  def test_null_first_does_not_wrap_later_findings(self):
+    # First report null, second with findings: the merged value is the list,
+    # not [None, [...]] (which scoring would skip).
+    host = _Host()
+    first = _thread(0, range(1, 11), [22])
+    first["correlation_findings"] = None
+    report = host._get_aggregated_report(_per_thread([first, _thread(1, range(11, 21), [25])]))
+    self.assertEqual([f["title"] for f in report["correlation_findings"]], ["corr-1"])
+
   def test_type_mismatch_fails_instead_of_overwriting(self):
     host = _Host()
     bad = _thread(1, range(11, 21), [25])

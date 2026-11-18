@@ -377,6 +377,10 @@ def assert_pass_coverage(archive: dict) -> list[str]:
   failures += [f"{addr}: thread metrics but no node report" for addr in sorted(set(threads_by_node) - set(nodes))]
   assigned = set((archive.get("job_config") or {}).get("selected_peers") or [])  # a node missing from both maps
   failures += [f"{addr}: assigned but no node report" for addr in sorted(assigned - set(nodes) - set(threads_by_node))]
+  requested = (archive.get("job_config") or {}).get("nr_local_workers")  # a thread missing from both sides
+  if isinstance(requested, int):
+    failures += [f"{a}: {len(t)} thread metrics, {requested} threads requested"
+                 for a, t in sorted(threads_by_node.items()) if len(t) != requested]
   for addr, node in nodes.items():
     threads = threads_by_node.get(addr)
     if not threads:

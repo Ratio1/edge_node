@@ -586,7 +586,9 @@ class _ReportMixin:
             elif field in aggregation_fields:
               type_or_func = aggregation_fields[field]
               existing, new = dct_aggregated_report[field], local_job_status[field]
-              if isinstance(existing, (list, dict)):
+              if existing is None or new is None:  # null is "no data", as in merge_objects_deep
+                dct_aggregated_report[field] = new if existing is None else existing
+              elif isinstance(existing, (list, dict)):
                 merged = self.merge_objects_deep(existing, new)
                 if isinstance(merged, list):
                   try:

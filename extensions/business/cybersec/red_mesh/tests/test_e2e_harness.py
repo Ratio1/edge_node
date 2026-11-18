@@ -252,6 +252,7 @@ def _coverage_archive(**overrides):
   }
   archive = {"passes": [pass_report], "ui_aggregate": {"total_open_ports": [22, 25, 80]},
              "job_config": {"selected_peers": ["node-A", "node-B"]}}
+  archive["job_config"]["nr_local_workers"] = None
   for path, value in overrides.items():
     target = archive
     *parents, leaf = path.split("/")
@@ -306,6 +307,12 @@ def test_pass_coverage_flags_assigned_node_missing_everywhere():
     "ui_aggregate/total_open_ports": [22, 25],
   })
   assert assert_pass_coverage(archive) == ["node-B: assigned but no node report"]
+
+
+def test_pass_coverage_flags_missing_thread_against_requested_count():
+  archive = _coverage_archive(**{"job_config/nr_local_workers": 2})
+  failures = assert_pass_coverage(archive)
+  assert failures == ["node-B: 1 thread metrics, 2 threads requested"]
 
 
 def test_stopped_job_counts_as_failed():
