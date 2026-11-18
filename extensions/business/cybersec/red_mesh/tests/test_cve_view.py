@@ -314,6 +314,14 @@ class RiskAndConsumerTests(unittest.TestCase):
     self.assertEqual(summary["possible"][0]["port"], 90)
     self.assertEqual(summary["counts"]["possible"], 100)
 
+  def test_llm_view_summary_ranks_a_non_numeric_score_as_no_score(self):
+    # A worker-supplied numeric string ranks like a missing score, as the finding path's _safe_float reads it.
+    findings = [raw(1, confidence="tentative", reason="banner_only", port=22, score="7.5"),
+                raw(2, confidence="tentative", reason="banner_only", port=80, score=5.0)]
+    summary = build_llm_input(findings=findings, aggregated_report={}, max_findings=1).scan_summary["cve_view"]
+    self.assertEqual([p["port"] for p in summary["possible"]], [80, 22])
+    self.assertIsNone(summary["possible"][1]["top"][0]["score"])
+
   def test_llm_kev_follows_the_generated_tri_state(self):
     out = lambda **kw: _sanitize_finding(dict(raw(1), cvss_data_freshness="", **kw))
     self.assertIs(out(kev=1)["kev"], True)

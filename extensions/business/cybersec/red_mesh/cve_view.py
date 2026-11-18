@@ -171,7 +171,9 @@ def _possible(members):
   return {
     "count": len(members),
     "reasons": dict(sorted(reasons.items())),
-    "top": [{"finding_id": f["finding_id"], "cve_id": f["cve"][0], "score": f.get("cvss_score")} for f in top],
+    # A non-numeric score reads as none, as in `max_cvss` and the LLM finding path (`_safe_float`).
+    "top": [{"finding_id": f["finding_id"], "cve_id": f["cve"][0], "score": _score(f) if _score(f) >= 0 else None}
+            for f in top],
     "member_finding_ids": sorted(f["finding_id"] for f in members),
   }
 
