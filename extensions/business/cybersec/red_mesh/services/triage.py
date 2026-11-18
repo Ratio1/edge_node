@@ -299,7 +299,10 @@ def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, 
             and bool(stored.get("confirmed")) == bool(confirmed)
             and (not confirmed or stored.get("confirmed_by") == confirmed_by))
     # An earlier attempt that wrote this state but lost its audit entry is finished now, under the stored entry
-    # id, so the entry is written once. A record without the id (an older node wrote it) is left as is.
+    # id, so the entry is written once. A record without the id (an older node wrote it) is left as is. The audit
+    # entry records the original change (stored job, actor, time); the finding event goes to this request's job.
+    # Known limit: a node that sees the state before the audit field replicates heals too; the entry is the same
+    # field and payload, but the event is emitted again.
     heal = same and bool(stored.get("audit_entry_id")) and not repo.has_host_triage_audit_entry(
       tenant_id, host, finding_id, stored["audit_entry_id"])
     if same and not heal:

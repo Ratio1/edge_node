@@ -249,10 +249,33 @@ class TestTriageWrite(unittest.TestCase):
     self.assertNotIn(f"inst:triage:audit:{TENANT_A}", self.owner.hashes)
 
   def test_a_refused_audit_write_is_reported(self):
+    self.owner.hashes["inst"]["job-1"]["soc_event_status"] = {}
     self._refuse_writes_to(f"inst:triage:audit:{TENANT_A}")
-    result, emit = write(self.owner, ids="f1")
+    with patch.object(triage, "_write_job_record") as soc_write:
+      result, emit = write(self.owner, ids="f1")
     self.assertEqual([(r["outcome"], r.get("retryable")) for r in result["results"]], [("write_failed", True)])
     self.assertFalse(result["complete"])
+    emit.assert_not_called()
+    soc_write.assert_not_called()
+    self.assertEqual(self.owner.audit, [])
+
+  def test_a_retry_after_a_refused_audit_write_writes_the_entry_once(self):
+    real = self.owner.chainstore_hset
+    self._refuse_writes_to(f"inst:triage:audit:{TENANT_A}")
+    write(self.owner, ids="f1")
+    self.owner.chainstore_hset = real
+    retry, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in retry["results"]], ["updated"])
+    emit.assert_called_once()
+    self.assertEqual(len(self._audit()), 1)
+
+  def test_a_pruned_audit_entry_is_not_written_again(self):
+    write(self.owner, ids="f1")
+    audit_hkey = f"inst:triage:audit:{TENANT_A}"
+    (field,) = self.owner.hashes[audit_hkey]
+    self.owner.hashes[audit_hkey][field] = None  # a tombstone: hkeys lists it, hget reads None
+    again, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in again["results"]], ["unchanged"])
     emit.assert_not_called()
 
   def test_a_refused_write_leaves_the_ledger_unpersisted(self):

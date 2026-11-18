@@ -376,9 +376,9 @@ class JobStateRepository:
     return f"{int((timestamp or 0) * 1000):015d}-{secrets.token_hex(4)}"
 
   def has_host_triage_audit_entry(self, tenant_id, host, finding_id, entry_id):
-    return self.owner.chainstore_hget(
-      hkey=self.host_triage_audit_hkey(tenant_id),
-      key=f"{self.host_triage_audit_prefix(host, finding_id)}{entry_id}") is not None
+    """True when the entry was ever written: `chainstore_hkeys` lists tombstones, so a pruned entry is not lost."""
+    field = f"{self.host_triage_audit_prefix(host, finding_id)}{entry_id}"
+    return field in (self.owner.chainstore_hkeys(hkey=self.host_triage_audit_hkey(tenant_id)) or [])
 
   def append_host_triage_audit(self, entry, entry_id=None):
     """Write one entry under its own field, then prune what fell out of the newest `HOST_AUDIT_KEEP`.
