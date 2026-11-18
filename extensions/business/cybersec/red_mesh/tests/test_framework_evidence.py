@@ -104,7 +104,14 @@ class TestFrameworkEvidenceSuggestions(FrameworkAssessmentFixture):
              "status": "vulnerable"}
 
   def test_complete_responses_at_all_levels_match_pre_refactor_goldens(self):
-    expected = json.loads((Path(__file__).parent / 'fixtures/framework_evidence_dnsc.json').read_text())
+    fixture = json.loads((Path(__file__).parent / 'fixtures/framework_evidence_dnsc.json').read_text())
+    # Stored as an entry table plus per-control key lists; rebuild each full response, list order kept.
+    expected = {level: {**spec['meta'],
+                        'overriding': [{'control_id': c, **spec['overriding']['template']}
+                                       for c in spec['overriding']['control_ids']],
+                        'suggestions': {c: [fixture['entries'][k] for k in keys]
+                                        for c, keys in spec['suggestions'].items()}}
+                for level, spec in fixture['levels'].items()}
     self.job('job-open', findings=[self.HIGH_AUTH, self.LOW_TLS], soc={'last_status': 'sent'}, completed=1770000300)
     self.job('job-clean', completed=1770000600)
     self.job('job-other', findings=[self.HIGH_AUTH], completed=1770000000, target='https://other.test')

@@ -14,7 +14,6 @@
    "registration_id": "RO123"
   },
   "completionDate": "",
-  "computed": null,
   "currentPackActs": [
    "MO 712 bis/2026-08-27",
    "MO 792/2026-09-18 (Ordin 2/2026)"
@@ -36,7 +35,6 @@
   "persisted": true,
   "remediation": [],
   "reopenedFrom": null,
-  "scores": {},
   "sectoralRequirements": "",
   "stale": {
    "newerPackActs": false

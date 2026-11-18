@@ -18,6 +18,15 @@ class TestStatusScoring(unittest.TestCase):
   def normalise(self, entries):
     return status.normalise_patch(self.pack, self.rules, entries, actor="initial", now="2026-11-16T00:00:00Z")
 
+  @staticmethod
+  def expected_scores(inputs):
+    """Stored form of each input entry: status/rationale default to None/"", refs become linked refs,
+    and the actor and time are stamped by the normaliser."""
+    return {ref: {"status": entry.get("status"), "rationale": entry.get("rationale", ""),
+                  "evidence_refs": [{"ref": r, "review_state": "linked"} for r in entry.get("evidence_refs", [])],
+                  "updated_by": "initial", "updated_at": "2026-11-16T00:00:00Z"}
+            for ref, entry in inputs.items()}
+
   def test_goldens(self):
     fixture = json.loads((Path(__file__).parent / "fixtures/framework_status_goldens.json").read_text())
     for case in fixture:
@@ -25,7 +34,7 @@ class TestStatusScoring(unittest.TestCase):
         scores = {ref: copy.deepcopy(case["default_entry"]) for ref in self.ids} if case["default_entry"] else {}
         scores.update({self.ids[int(index)]: entry for index, entry in case["entries"].items()})
         normalized = self.normalise(scores)
-        self.assertEqual(normalized, case["scores"])
+        self.assertEqual(normalized, self.expected_scores(scores))
         self.assertEqual(status.compute(self.pack, None, normalized), case["computed"])
         errors, computed = status.validate_for_submit(self.pack, self.rules, None, {"scores": normalized})
         self.assertEqual([e["code"] for e in errors], case["submit_error_codes"])

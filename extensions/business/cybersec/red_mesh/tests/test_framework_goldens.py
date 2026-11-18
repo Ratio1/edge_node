@@ -70,6 +70,13 @@ def _record(name, row, pack, text):
          "pack_view_sha256": None}
   with_text = compliance.assessment_view(row, pack, can_manage=True, text=text, tenant=TENANT)
   out["pack_view_sha256"] = hashlib.sha256(json.dumps(with_text["pack"], sort_keys=True).encode()).hexdigest()
+  # view and snapshot repeat `computed` and `scores`: assert the repeats, store each value once
+  assert view["computed"] == computed and view["scores"] == row["scores"]
+  del view["computed"], view["scores"]
+  snapshot = (out["snapshot_envelope"] or {}).get("snapshot")
+  if snapshot:
+    assert snapshot["computed"] == computed and snapshot["scores"] == row["scores"]
+    del snapshot["computed"], snapshot["scores"]
   return out
 
 
@@ -77,8 +84,15 @@ class TestDnscGoldens(unittest.TestCase):
   def test_outputs_match_goldens(self):
     pack, text = load_framework_pack(PACK), load_framework_text(PACK)
     record = os.environ.get("REDMESH_RECORD_GOLDENS") == "1"
+    complete_computed = None
     for name, row in _scenarios(pack):
-      rendered = json.dumps(_record(name, row, pack, text), indent=1, sort_keys=True, ensure_ascii=False) + "\n"
+      out = _record(name, row, pack, text)
+      if name == "complete":
+        complete_computed = out["computed"]
+      if name == "submitted":  # same scenario as complete plus a submission: store a marker, assert the copy
+        self.assertEqual(out["computed"], complete_computed)
+        out["computed"] = {"same_as": "complete"}
+      rendered = json.dumps(out, indent=1, sort_keys=True, ensure_ascii=False) + "\n"
       path = GOLDENS / f"{name}.json"
       if record:
         path.write_text(rendered, encoding="utf-8")
