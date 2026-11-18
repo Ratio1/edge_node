@@ -585,25 +585,17 @@ class _ReportMixin:
               dct_aggregated_report[field] = local_job_status[field]
             elif field in aggregation_fields:
               type_or_func = aggregation_fields[field]
-              if field not in dct_aggregated_report:
-                field_type = type(local_job_status[field])
-                dct_aggregated_report[field] = field_type()
-              #endif
-              if isinstance(dct_aggregated_report[field], list):
-                existing = set(dct_aggregated_report[field])
-                merged = existing.union(local_job_status[field])
-                try:
-                  dct_aggregated_report[field] = sorted(merged)
-                except TypeError:
-                  dct_aggregated_report[field] = list(merged)
-              elif isinstance(dct_aggregated_report[field], dict):
-                dct_aggregated_report[field] = self.merge_objects_deep(
-                  dct_aggregated_report[field],
-                  local_job_status[field])
+              existing, new = dct_aggregated_report[field], local_job_status[field]
+              if isinstance(existing, (list, dict)):
+                merged = self.merge_objects_deep(existing, new)
+                if isinstance(merged, list):
+                  try:
+                    merged = sorted(merged)  # scalar lists (open_ports, completed_tests) stay sorted
+                  except TypeError:
+                    pass  # dict items keep merge order
+                dct_aggregated_report[field] = merged
               else:
-                _existing = dct_aggregated_report[field]
-                _new = local_job_status[field]
-                dct_aggregated_report[field] = type_or_func([_existing, _new])
+                dct_aggregated_report[field] = type_or_func([existing, new])
               # end if aggregation type
             # end if standard (one time) or aggregated fields
           # for each field in this local job
@@ -636,6 +628,7 @@ class _ReportMixin:
         ))
       else:
         self.P("Manual report aggregation failed", color='y')
+      dct_aggregated_report = {}  # all-or-nothing: never return a partial merge
     # Phase 0 dedup pass: collapse findings duplicated across workers
     # because each worker stamps its own _source_worker_id /
     # _source_node_addr before merge. The JSON-key fallback in

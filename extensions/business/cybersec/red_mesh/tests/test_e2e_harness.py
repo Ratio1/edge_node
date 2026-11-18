@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from extensions.business.cybersec.red_mesh.tests.e2e.run_e2e import (
   archive_passes,
+  assert_pass_coverage,
   fetch_archive,
   is_failed_job_status,
   is_terminal_job_status,
@@ -235,3 +236,57 @@ class ApiTop10StatusTests(unittest.TestCase):
       job_status_values(resp, "job-1"),
       ["completed", "network_tracked"],
     )
+
+
+def _coverage_archive(**overrides):
+  pass_report = {
+    "worker_reports": {
+      "node-A": {"ports_scanned": 20, "open_ports": [22, 25]},
+      "node-B": {"ports_scanned": 10, "open_ports": [80]},
+    },
+    "worker_scan_metrics": {
+      "node-A": {"threads": {"t0": {"ports_scanned": 10, "open_ports": [22]},
+                             "t1": {"ports_scanned": 10, "open_ports": [25]}}},
+      "node-B": {"threads": {"t0": {"ports_scanned": 10, "open_ports": [80]}}},
+    },
+  }
+  archive = {"passes": [pass_report], "ui_aggregate": {"total_open_ports": [22, 25, 80]}}
+  for path, value in overrides.items():
+    target = archive
+    *parents, leaf = path.split("/")
+    for key in parents:
+      target = target[int(key)] if isinstance(target, list) else target[key]
+    target[leaf] = value
+  return archive
+
+
+def test_pass_coverage_passes_on_consistent_archive():
+  assert assert_pass_coverage(_coverage_archive()) == []
+
+
+def test_pass_coverage_flags_node_ports_scanned_below_thread_sum():
+  failures = assert_pass_coverage(_coverage_archive(**{"passes/0/worker_reports/node-A/ports_scanned": 10}))
+  assert len(failures) == 1 and "node-A: ports_scanned 10 != thread sum 20" in failures[0]
+
+
+def test_pass_coverage_flags_node_open_ports_missing_a_thread():
+  failures = assert_pass_coverage(_coverage_archive(
+    **{"passes/0/worker_reports/node-A/open_ports": [22], "ui_aggregate/total_open_ports": [22, 80]}))
+  assert any("node-A: open_ports [22] != thread union [22, 25]" in f for f in failures)
+
+
+def test_pass_coverage_flags_ui_aggregate_missing_a_node():
+  failures = assert_pass_coverage(_coverage_archive(**{"ui_aggregate/total_open_ports": [22, 25]}))
+  assert len(failures) == 1 and "ui_aggregate.total_open_ports" in failures[0]
+
+
+def test_pass_coverage_accepts_graybox_list_ports_scanned():
+  archive = _coverage_archive(**{
+    "passes/0/worker_reports/node-B/ports_scanned": [80],
+    "passes/0/worker_scan_metrics/node-B/threads/t0/ports_scanned": [80],
+  })
+  assert assert_pass_coverage(archive) == []
+
+
+def test_stopped_job_counts_as_failed():
+  assert is_failed_job_status({"result": {"job_status": "STOPPED"}}, "job-1") is True
