@@ -497,6 +497,8 @@ class TestTriageWrite(unittest.TestCase):
     retry, emit = write(self.owner, ids="f1")
     self.assertEqual([r["outcome"] for r in retry["results"]], ["updated"])
     emit.assert_called_once()
+    entry_id = self.owner.hashes[self.hkey][f"{HOST}\x1ff1"]["audit_entry_id"]
+    self.assertEqual(emit.call_args.kwargs["finding"]["triage_entry_id"], entry_id)  # the same change, the same key
     self.assertEqual(len(self._audit()), 1)
     again, emit = write(self.owner, ids="f1")
     self.assertEqual([r["outcome"] for r in again["results"]], ["unchanged"])

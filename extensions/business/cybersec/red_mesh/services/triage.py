@@ -295,6 +295,11 @@ def _commit_triage(owner, repo, key, state, ledger, announce, write_state=True, 
   the finding repeats only what is left (`write_state`/`write_audit` False skip a confirmed write; same fields and
   payloads) before it reports. Each confirmed write is recorded on the ledger. The audit entry records the change
   as made (job, actor, time).
+
+  Known limits of the SOC retry: the map has one slot per finding, so a newer change that is written while an
+  older change's event still fails replaces it, and only the newer event is sent later. The event goes to the job
+  and pass of the request that sends it, which are part of its dedupe key, so a retry through another job of the
+  host, or after the pass advances, gets another key.
   """
   from ..tenancy.effects import EffectState
 
