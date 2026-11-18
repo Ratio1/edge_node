@@ -328,6 +328,7 @@ def _announce_triage(owner, record, archived, state_payload):
       "actor": state_payload.get("actor", "")})
   finding_event = dict(archived)
   finding_event["triage_state"] = state_payload["status"]
+  finding_event["triage_entry_id"] = state_payload.get("audit_entry_id")  # the event's dedupe key, per change
   emit_finding_event(owner, record, finding=finding_event, event_action="triaged")
 
 

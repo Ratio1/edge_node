@@ -87,6 +87,7 @@ class TestTriageWrite(unittest.TestCase):
                      ("false_positive", TENANT_A, HOST, "job-1", "analyst"))
     self.assertEqual(triage._job_repo(self.owner).get_host_triage_audit(TENANT_A, HOST, "f1")[0]["actor"], "analyst")
     self.assertEqual(emit.call_args.kwargs["event_action"], "triaged")
+    self.assertEqual(emit.call_args.kwargs["finding"]["triage_entry_id"], stored["audit_entry_id"])
     self.assertEqual(self.owner.audit[0][0], "finding_triage_updated")
     self.assertNotIn("inst:triage", self.owner.hashes)  # nothing under the legacy keys
 
