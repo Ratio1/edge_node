@@ -112,6 +112,15 @@ class TestThreadMerge(unittest.TestCase):
       report = host._get_aggregated_report(_per_thread(statuses))
     self.assertEqual(report, {})
 
+  def test_type_mismatch_fails_instead_of_overwriting(self):
+    # A peer report with `correlation_findings: null` must not erase the
+    # findings already merged: the merge fails as a whole.
+    host = _Host()
+    bad = _thread(1, range(11, 21), [25])
+    bad["correlation_findings"] = None
+    report = host._get_aggregated_report(_per_thread([_thread(0, range(1, 11), [22]), bad]))
+    self.assertEqual(report, {})
+
 
 def _graybox_status(idx):
   return {
@@ -277,3 +286,25 @@ class TestFinalizeOnMergeFailure(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestWarmupRepairOnMergeFailure(unittest.TestCase):
+
+  def test_failed_repair_keeps_the_stored_thread_reports(self):
+    from .test_api import TestPhase2PassFinalization  # local: a module import would collect it twice
+    Plugin = TestPhase2PassFinalization()._get_plugin_class()
+    plugin = MagicMock()
+    plugin.ee_addr = "node-A"
+    plugin.cfg_instance_id = "test-instance"
+    raw = _per_thread([_thread(0, range(1, 11), [22])])
+    raw["RM-0"]["local_worker_id"] = "RM-0"
+    spec = {"job_id": "job-1", "launcher": "node-A", "workers": {"node-A": {"result": deepcopy(raw)}}}
+    plugin.chainstore_hgetall.return_value = {"job-1": spec}
+    plugin._normalize_job_record = MagicMock(side_effect=lambda key, value: (key, value))
+    plugin._get_aggregated_report = MagicMock(return_value={})
+
+    with patch.object(Plugin, "_write_job_record") as write:
+      Plugin._PentesterApi01Plugin__post_init(plugin)
+
+    write.assert_not_called()
+    self.assertEqual(spec["workers"]["node-A"]["result"], raw)

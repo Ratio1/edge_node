@@ -587,6 +587,9 @@ class _ReportMixin:
               type_or_func = aggregation_fields[field]
               existing, new = dct_aggregated_report[field], local_job_status[field]
               if isinstance(existing, (list, dict)):
+                if type(new) is not type(existing):
+                  # merge_objects_deep keeps `new` on a type conflict, so a null field would erase the merged one
+                  raise TypeError(f"{field}: cannot merge {type(new).__name__} into {type(existing).__name__}")
                 merged = self.merge_objects_deep(existing, new)
                 if isinstance(merged, list):
                   try:

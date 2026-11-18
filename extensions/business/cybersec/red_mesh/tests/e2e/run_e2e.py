@@ -374,6 +374,7 @@ def assert_pass_coverage(archive: dict) -> list[str]:
   pr = passes[-1]
   nodes = pr.get("worker_reports") or {}
   threads_by_node = {a: (e or {}).get("threads") or {} for a, e in (pr.get("worker_scan_metrics") or {}).items()}
+  failures += [f"{addr}: thread metrics but no node report" for addr in sorted(set(threads_by_node) - set(nodes))]
   for addr, node in nodes.items():
     threads = threads_by_node.get(addr)
     if not threads:

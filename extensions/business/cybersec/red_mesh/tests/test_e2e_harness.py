@@ -288,5 +288,14 @@ def test_pass_coverage_accepts_graybox_list_ports_scanned():
   assert assert_pass_coverage(archive) == []
 
 
+def test_pass_coverage_flags_node_with_threads_but_no_report():
+  archive = _coverage_archive(**{
+    "passes/0/worker_reports": {"node-A": {"ports_scanned": 20, "open_ports": [22, 25]}},
+    "ui_aggregate/total_open_ports": [22, 25],
+  })
+  failures = assert_pass_coverage(archive)
+  assert failures == ["node-B: thread metrics but no node report"]
+
+
 def test_stopped_job_counts_as_failed():
   assert is_failed_job_status({"result": {"job_status": "STOPPED"}}, "job-1") is True
