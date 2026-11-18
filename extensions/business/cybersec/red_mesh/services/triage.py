@@ -121,8 +121,7 @@ def _checked_triage_map(owner, job, archive, finding_id=""):
       state = deepcopy(repo.get_host_triage(tenant_id, host, identifier))
       if state is None:
         continue
-      if (not isinstance(state, dict) or state.get("finding_id") != identifier
-          or state.get("tenant_id") != tenant_id or state.get("host") != host):
+      if not isinstance(state, dict) or not _names_key(state, tenant_id, host, identifier):
         raise ValueError("Invalid finding state identity")
       result[identifier] = FindingTriageState.from_dict(state).to_dict()
     return result
@@ -261,6 +260,12 @@ def update_finding_triage(owner, job_id: str, finding_ids, status: str, note: st
   return _error("triage_contention", "Jobs of this host are changing; retry.", job_id=job_id, retryable=True)
 
 
+def _names_key(state, tenant_id, host, finding_id):
+  """True when a stored record names the (tenant, host, finding) it is stored under."""
+  return (state.get("finding_id") == finding_id and state.get("tenant_id") == tenant_id
+          and state.get("host") == host)
+
+
 def _unfinished_writes(owner):
   """`(tenant, host, finding) -> {"state", "state_confirmed"}`: the triage changes this launcher started whose writes
   the store did not all confirm. In memory: a restart forgets it, and then only a missing audit entry marks a change
@@ -352,6 +357,11 @@ def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, 
       results.append({"finding_id": finding_id, "outcome": "not_tentative"})
       continue
     stored = repo.get_host_triage(tenant_id, host, finding_id)
+    if isinstance(stored, dict) and not _names_key(stored, tenant_id, host, finding_id):
+      # A broken store, as on the read side: never replayed (its body would choose the write's tenant and host),
+      # never replaced. Fails closed for this member.
+      results.append({"finding_id": finding_id, "outcome": "store_inconsistent"})
+      continue
     key = (tenant_id, host, finding_id)
     unfinished = _unfinished_writes(owner)
     pending = unfinished.get(key)

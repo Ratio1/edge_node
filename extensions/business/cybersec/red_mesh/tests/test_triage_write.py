@@ -473,11 +473,25 @@ class TestTriageWrite(unittest.TestCase):
     soc_write.assert_called_once()
 
   def test_a_malformed_record_with_a_missing_audit_entry_does_not_block_writes(self):
-    self.owner.hashes.setdefault(self.hkey, {})[f"{HOST}\x1ff1"] = {"finding_id": "f1", "status": "bogus",
-                                                                      "audit_entry_id": "x"}
+    self.owner.hashes.setdefault(self.hkey, {})[f"{HOST}\x1ff1"] = {
+      "finding_id": "f1", "tenant_id": TENANT_A, "host": HOST, "status": "bogus", "audit_entry_id": "x"}
     result, emit = write(self.owner, ids="f1", status="remediated")
     self.assertEqual([r["outcome"] for r in result["results"]], ["updated"])
     self.assertEqual([e["status"] for e in self._audit()], ["remediated"])
+
+  def test_a_record_naming_another_tenant_host_or_finding_is_never_replayed_or_replaced(self):
+    write(self.owner, ids="f1", status="false_positive")
+    good = deepcopy(self._record())
+    for foreign in ({"tenant_id": TENANT_B}, {"host": "198.51.100.7"}, {"finding_id": "f2"}, {"tenant_id": None}):
+      self.owner.hashes[self.hkey][f"{HOST}\x1ff1"] = dict(good, audit_entry_id="lost", **foreign)
+      calls = self._logged_writes()
+      with patch.object(triage, "emit_finding_event") as emit:
+        result = triage.update_finding_triage(self.owner, "job-1", "f1", "remediated", actor="analyst")
+      self.owner.chainstore_hset = self.owner.__class__.chainstore_hset.__get__(self.owner)
+      self.assertEqual(result["results"], [{"finding_id": "f1", "outcome": "store_inconsistent"}], foreign)
+      self.assertFalse(result["complete"])
+      self.assertEqual(calls, [], foreign)  # fail closed: no replay to the row's own tenant, no overwrite
+      emit.assert_not_called()
 
 
 if __name__ == "__main__":
