@@ -203,8 +203,10 @@ def update_finding_triage(owner, job_id: str, finding_ids, status: str, note: st
   Tenant and host come from the job's own execution binding; `actor` is the server-resolved account, never
   a body field. A pending rulebook submission on any job of the same tenant and host blocks the write: the
   locks of every such job are taken in sorted `(job_id, profile_id)` order, the order purge uses, so no two
-  takers can wait on each other. The locks are per process; the pending registry read below is what holds
-  across nodes. A set of findings (a dismissed rollup) is written one record each, because CStore has no
+  takers can wait on each other. The locks are per process. Across nodes only the pending registry read below
+  applies, and a read is not a lock: a submission that a sibling job's launcher on another node starts after
+  that read can still see this write land. Known limit, accepted for v1 (owner, 2026-11-18); CStore has no
+  cross-node lock. A set of findings (a dismissed rollup) is written one record each, because CStore has no
   cross-record transaction: the result lists each member and a retry skips the ones already written.
   """
   from .rulebook_assessment import _submission_lock, list_rulebook_profiles
