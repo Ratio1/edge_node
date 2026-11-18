@@ -13,6 +13,8 @@ from .models.finding_schema import is_coverage_result
 
 MAX_LISTED = 10
 MAX_POSSIBLE_TOP = 3
+# Rollup and possible rows the LLM summary carries across all services, each kind; the rest are counted, not sent.
+MAX_SUMMARY_ROWS = 20
 LISTED_CVSS = 9.0
 CLOSED_STATUSES = frozenset({"false_positive", "remediated"})
 
@@ -263,4 +265,9 @@ def summarize_view(view):
     if service["possible"]:
       p = service["possible"]
       possible.append({**where, "count": p["count"], "reasons": p["reasons"], "top": p["top"]})
-  return {"counts": dict(view["counts"]), "rollups": rollups, "possible": possible}
+  # Bounded across services, so a large scan cannot exhaust the model's input: KEV, then highest CVSS, first.
+  rollups.sort(key=lambda r: (-r["kev_count"], -(r["max_cvss"]["score"] or -1), -r["cve_count"]))
+  possible.sort(key=lambda p: (-max((t["score"] or -1 for t in p["top"]), default=-1), -p["count"]))
+  return {"counts": dict(view["counts"]),
+          "rollups": rollups[:MAX_SUMMARY_ROWS], "omitted_rollups": max(len(rollups) - MAX_SUMMARY_ROWS, 0),
+          "possible": possible[:MAX_SUMMARY_ROWS], "omitted_possible": max(len(possible) - MAX_SUMMARY_ROWS, 0)}
