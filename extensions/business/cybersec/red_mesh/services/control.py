@@ -728,7 +728,7 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
           errors.append({"job_id": "", "scope": hkey, "message": type(exc).__name__})
       if swept:
         # This launcher's unfinished triage changes of the tenant go too, or a retry would write them back.
-        for key in [key for key in unfinished if key[0] == tenant]:
+        for key in [key for key in list(unfinished) if key[0] == tenant]:  # a snapshot: other hosts' writes may add
           unfinished.pop(key, None)
 
   def _sweep_submission_hash():

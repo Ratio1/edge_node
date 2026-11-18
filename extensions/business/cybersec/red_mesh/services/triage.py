@@ -270,8 +270,8 @@ def _names_key(state, tenant_id, host, finding_id):
 
 
 def _unfinished_writes(owner):
-  """`(tenant, host, finding) -> {"state", "state_confirmed"}`: the triage changes this launcher started whose writes
-  the store did not all confirm. In memory: a restart forgets it, and then only a missing audit entry marks a change
+  """`(tenant, host, finding) -> {"state", "state_confirmed", "audit_confirmed", "audit"}`: the triage changes this
+  launcher started whose writes the store did not all confirm, or whose event was not emitted. In memory: a restart forgets it, and then only a missing audit entry marks a change
   unfinished."""
   unfinished = getattr(owner, "_triage_unfinished_writes", None)
   if not isinstance(unfinished, dict):
