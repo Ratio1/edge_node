@@ -168,7 +168,7 @@ class TestDataMaintenance(unittest.TestCase):
     self.put(COMPLIANCE, field, row)
     self.assertEqual(self.scan()[(COMPLIANCE, field)]["class"], "old")
 
-  def test_review_rows_classify_current_old_orphan_and_inventory_bytes(self):
+  def test_review_rows_classify_current_old_orphan_and_carry_the_stored_value_hash(self):
     def review(tenant, **extra):
       return {"schemaVersion": 1, "namespace": "deployment", "kind": "framework_assessment_review",
         "ids": [tenant, "ro.dnsc.o1-2026", "default", "1"], "tenant_id": tenant,
@@ -186,7 +186,7 @@ class TestDataMaintenance(unittest.TestCase):
       row = rows[(COMPLIANCE, fields[tenant])]
       self.assertEqual(row["class"], expected)
       self.assertIn("sha256", row)
-      self.assertGreater(len(json.dumps(row)), 200)
+      self.assertEqual(row["sha256"], data_maintenance.row_sha256(self.storage.data[(COMPLIANCE, fields[tenant])]))
 
   def test_assessment_rows_are_registered_and_classified_by_their_tenant(self):
     field = lambda tenant_id: json.dumps(["framework_assessment", "deployment", tenant_id, "ro.dnsc.o1-2026"], separators=(",", ":"))

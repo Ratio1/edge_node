@@ -29,24 +29,19 @@ class TestFrameworkSectors(unittest.TestCase):
     static_dir(self, edit=edit)
     self.assertEqual(packs.load_manifest()["packs"][0]["entries"][0]["sector_coverage"], "unknown")
 
-  def test_bad_coverage_and_taxonomy_refused(self):
-    for changes in ({"sectors": ["bad"]}, {"sector_coverage": "listed", "sectors": []},
-                    {"sector_coverage": "all"}, {"sectors": ["rm.nis2.energy"]},
-                    {"sector_taxonomy": {"id": "redmesh.nis2-sectors", "version": True}}):
-      with self.subTest(changes=changes):
+  def test_bad_coverage_taxonomy_and_duplicate_listed_codes_refused(self):
+    entry = lambda changes: lambda m: m["packs"][0]["entries"][0].update(changes)
+    taxonomy = lambda update: lambda m: update(m["sector_taxonomy"])
+    cases = [entry({"sectors": ["bad"]}), entry({"sector_coverage": "listed", "sectors": []}),
+             entry({"sector_coverage": "all"}), entry({"sectors": ["rm.nis2.energy"]}),
+             entry({"sector_taxonomy": {"id": "redmesh.nis2-sectors", "version": True}}),
+             taxonomy(lambda t: t.update(version=True)), taxonomy(lambda t: t["sectors"].clear()),
+             taxonomy(lambda t: t["sectors"][0].update(label="")),
+             taxonomy(lambda t: t["sectors"][0].update(code="official-code")),
+             taxonomy(lambda t: t["sectors"][1].update(code=t["sectors"][0]["code"])),
+             lambda m: m["packs"][1]["entries"][0].update(sectors=["rm.nis2.energy"] * 2)]
+    for number, edit in enumerate(cases):
+      with self.subTest(case=number):
         with self.assertRaises(FrameworkPackError):
-          static_dir(self, edit=lambda m: m["packs"][0]["entries"][0].update(changes))
+          static_dir(self, edit=edit)
           packs.load_manifest()
-
-  def test_malformed_taxonomy_and_duplicate_listed_codes_refused(self):
-    for update in (lambda t: t.update(version=True), lambda t: t["sectors"].clear(),
-                   lambda t: t["sectors"][0].update(label=""),
-                   lambda t: t["sectors"][0].update(code="official-code"),
-                   lambda t: t["sectors"][1].update(code=t["sectors"][0]["code"])):
-      with self.subTest(update=update):
-        with self.assertRaises(FrameworkPackError):
-          static_dir(self, edit=lambda m: update(m["sector_taxonomy"]))
-          packs.load_manifest()
-    with self.assertRaises(FrameworkPackError):
-      static_dir(self, edit=lambda m: m["packs"][1]["entries"][0].update(sectors=["rm.nis2.energy"] * 2))
-      packs.load_manifest()

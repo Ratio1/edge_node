@@ -91,50 +91,60 @@ class TestShippedManifest(unittest.TestCase):
         self.assertEqual(hash_mismatches(tmp, manifest), [expected])
         path.write_bytes(original)
 
+  def test_shipped_pack_and_text_hashes_match_an_independent_pin(self):
+    # A literal table, kept apart from the manifest: editing a pack or text file and its manifest hash
+    # together (same id and version) fails here until the pin is changed on purpose, with a version bump.
+    pinned = {
+      "pack:ro.dnsc.o1-2026@2": "0b9e8c60011be5fbc447f5a89933586db750273f6752771df0fafb94d88e6a62",
+      "text:ro.dnsc.o1-2026@2": "92fe6d9ed20ef5dfd63a32ad4dab375bcf3e991a749f4383d27bc74bbaeff8ec",
+      "pack:eu.ec.ir-2024-2690@2": "3ff9e6a1bf2790e74dd597710a0091654f31212707c3046f7e5a7bfbd8849e05",
+      "text:eu.ec.ir-2024-2690@2": "25c2012253fa19dde2495c1bea396876fec9fb03ff3bf852d760b1402254b9da",
+      "pack:us.nist.csf-2.0@2": "c8649acc218f1cc1ffdc5176c08bca96775112bea9eea54c235da793f4c10e92",
+      "text:us.nist.csf-2.0@2": "9d40c0cf5a3c849c97b41666d65d82f835555f8e3ae3068d23f0017f4a57e71d"}
+    actual = {}
+    for pack in packs.load_manifest()["packs"]:
+      pid, version = pack["pack_id"], pack["version"]
+      actual[f"pack:{pid}@{version}"] = sha(SHIPPED / f"framework-pack.{pid}.json")
+      actual[f"text:{pid}@{version}"] = sha(SHIPPED / f"framework-text.{pid}.json")
+    self.assertEqual(actual, pinned)
+
   def test_fixture_packs_match_their_manifest_hashes(self):
     self.assertEqual(hash_mismatches(FIXTURES, json.loads((FIXTURES / "framework-manifest.json").read_text())), [])
 
 
 class TestManifestSchema(unittest.TestCase):
-  def refused(self, edit):
-    static_dir(self, with_fixtures=False, edit=edit)
-    with self.assertRaises(FrameworkPackError):
-      packs.load_manifest()
-
-  def test_schema_id_version_and_duplicates_are_checked(self):
-    self.refused(lambda m: m.update(schema="redmesh.framework_manifest.v2"))
-    self.refused(lambda m: m.update(manifest_version="1"))
-    self.refused(lambda m: m["packs"].append(dict(m["packs"][0])))
-
-  def test_pack_fields_status_licence_and_rule_block_are_checked(self):
-    self.refused(lambda m: m["packs"][0].update(status="draft"))
-    self.refused(lambda m: m["packs"][0].update(version="1"))
-    self.refused(lambda m: m["packs"][0].pop("supersedes"))
+  def test_bad_manifest_edits_are_refused_and_each_error_names_the_offending_key(self):
+    entry = lambda m: m["packs"][0]["entries"][0]
+    cases = [  # (edit, key the error names; None when only the refusal is asserted)
+      (lambda m: m.update(schema="redmesh.framework_manifest.v2"), None),
+      (lambda m: m.update(manifest_version="1"), None),
+      (lambda m: m["packs"].append(dict(m["packs"][0])), None),
+      (lambda m: m["packs"][0].update(status="draft"), None),
+      (lambda m: m["packs"][0].update(version="1"), None),
+      (lambda m: m["packs"][0].pop("supersedes"), None),
+      (lambda m: m["packs"][0].pop("title"), None),
+      (lambda m: m["packs"][0]["licence"].pop("ship_text"), None),
+      (lambda m: m["packs"][0]["rules"].pop("entity_fields"), None),
+      (lambda m: m["packs"][0]["rules"].update(signoff_required="yes"), None),
+      (lambda m: entry(m).update(jurisdiction="EU"), None),  # an entry naming both country and jurisdiction
+      (lambda m: entry(m).update(country=None), None),  # neither
+      (lambda m: entry(m).update(country=None, jurisdiction="US"), None),
+      (lambda m: entry(m).pop("verified_by"), None),
+      (lambda m: m["packs"][0].update(pack_schema="x.v9"), "pack_schema"),
+      (lambda m: m["packs"][0].update(text_schema="x.v9"), "text_schema"),
+      (lambda m: m["packs"][0]["rules"].update(exports="json"), "rules.exports"),
+      (lambda m: m["packs"][0]["rules"].pop("signoff_required"), "rules.signoff_required"),
+      (lambda m: m["packs"][0]["rules"].update(entity_fields=["made_up"]), "rules.entity_fields"),
+      (lambda m: m["packs"][0]["licence"].pop("id"), "licence.id"),
+    ]
     for bad_title in (None, "", 5, "x" * 121):  # a display title of 1..120 characters
-      self.refused(lambda m, t=bad_title: m["packs"][0].update(title=t))
-    self.refused(lambda m: m["packs"][0].pop("title"))
-    self.refused(lambda m: m["packs"][0]["licence"].pop("ship_text"))
-    self.refused(lambda m: m["packs"][0]["rules"].pop("entity_fields"))
-    self.refused(lambda m: m["packs"][0]["rules"].update(signoff_required="yes"))
-
-  def test_each_error_names_the_offending_key_and_schema_ids_and_entity_fields_are_checked(self):
-    for edit, key in ((lambda m: m["packs"][0].update(pack_schema="x.v9"), "pack_schema"),
-                      (lambda m: m["packs"][0].update(text_schema="x.v9"), "text_schema"),
-                      (lambda m: m["packs"][0]["rules"].update(exports="json"), "rules.exports"),
-                      (lambda m: m["packs"][0]["rules"].pop("signoff_required"), "rules.signoff_required"),
-                      (lambda m: m["packs"][0]["rules"].update(entity_fields=["made_up"]), "rules.entity_fields"),
-                      (lambda m: m["packs"][0]["licence"].pop("id"), "licence.id")):
-      with self.subTest(key):
+      cases.append((lambda m, t=bad_title: m["packs"][0].update(title=t), None))
+    for number, (edit, key) in enumerate(cases):
+      with self.subTest(case=number, key=key):
         static_dir(self, with_fixtures=False, edit=edit)
-        with self.assertRaisesRegex(FrameworkPackError, f"bad or missing {key}"):
+        with self.assertRaisesRegex(FrameworkPackError, f"bad or missing {key}" if key else ""):
           packs.load_manifest()
         packs.reset_framework_caches()
-
-  def test_an_entry_names_a_country_or_the_eu_jurisdiction_and_nothing_else(self):
-    self.refused(lambda m: m["packs"][0]["entries"][0].update(jurisdiction="EU"))  # both
-    self.refused(lambda m: m["packs"][0]["entries"][0].update(country=None))  # neither
-    self.refused(lambda m: m["packs"][0]["entries"][0].update(country=None, jurisdiction="US"))
-    self.refused(lambda m: m["packs"][0]["entries"][0].pop("verified_by"))
 
   def test_an_unknown_pack_is_refused(self):
     static_dir(self, with_fixtures=False)

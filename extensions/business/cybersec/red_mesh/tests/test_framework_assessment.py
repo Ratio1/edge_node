@@ -683,13 +683,6 @@ class TestEntityFieldsAndSignoffNames(FrameworkAssessmentFixture):
     result = self.save({"dnsc_unique": "x"}, 1)
     self.refused(result, 400, "assessment_invalid")
 
-  def test_digest_is_unchanged_for_a_pre_upgrade_row_and_changes_with_a_new_field(self):
-    row = {**self.fixture_row(), "row_format": 2}
-    self.assertEqual(compliance.intent_digest(row), ROW_FORMAT_2_DIGEST)
-    self.assertNotEqual(compliance.intent_digest({**row, "dnsc_unique_id": "ID-1"}), ROW_FORMAT_2_DIGEST)
-    self.assertNotEqual(compliance.intent_digest({**row, "external_supplier": "S"}), ROW_FORMAT_2_DIGEST)
-    self.assertEqual(compliance.intent_digest({**row, "dnsc_unique_id": "", "external_supplier": ""}), ROW_FORMAT_2_DIGEST)
-
   def test_snapshot_and_reopen_carry_the_entity_fields(self):
     self.ok(self.save({"dnsc_unique_id": "ID-123", "external_supplier": "Furnizor SRL"}, 1))
     revision = self.ok(self.save({"assurance_level": "basic",
@@ -854,13 +847,16 @@ class TestSeveralAssessments(FrameworkAssessmentFixture):
     self.assertEqual(data["state"], "draft")
     self.assertNotIn("assessment_id", self.stored_row())
 
-  def test_golden_digest_of_a_legacy_row_with_9b_fields_unset(self):
+  def test_golden_digest_of_a_row_format_2_row_with_later_fields_unset_or_empty(self):
     row = {"tenant_id": "tn_x", "pack_id": "p", "pack_acts": ["a"], "assurance_level": "basic",
            "level_provenance": None, "sectoral_requirements": "s", "completion_date": "2026-10-06",
            "management_signoff": {"name": "Ana Pop", "role": "Director", "date": "2026-10-06"},
            "remediation": [], "scores": {}, "row_format": 2}
     self.assertEqual(compliance.intent_digest(row), ROW_FORMAT_2_DIGEST)
     self.assertEqual(compliance.intent_digest({**row, "name": "", "assessment_id": None}), ROW_FORMAT_2_DIGEST)
+    self.assertEqual(compliance.intent_digest({**row, "dnsc_unique_id": "", "external_supplier": ""}), ROW_FORMAT_2_DIGEST)
+    self.assertNotEqual(compliance.intent_digest({**row, "dnsc_unique_id": "ID-1"}), ROW_FORMAT_2_DIGEST)
+    self.assertNotEqual(compliance.intent_digest({**row, "external_supplier": "S"}), ROW_FORMAT_2_DIGEST)
     self.assertNotEqual(compliance.intent_digest({**row, "name": "A"}), ROW_FORMAT_2_DIGEST)
     self.assertNotEqual(compliance.intent_digest({**row, "country": "RO"}), ROW_FORMAT_2_DIGEST)
     self.assertNotEqual(compliance.intent_digest({k: v for k, v in row.items() if k != "row_format"}), ROW_FORMAT_2_DIGEST)

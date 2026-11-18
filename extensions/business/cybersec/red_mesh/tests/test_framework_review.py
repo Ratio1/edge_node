@@ -1,4 +1,5 @@
 """RM-183 review through plugin, service and real CStore adapter."""
+from contextlib import ExitStack
 from uuid import uuid4
 from .test_framework_assessment import FrameworkAssessmentFixture, PACK
 
@@ -23,16 +24,6 @@ class TestFrameworkReview(FrameworkAssessmentFixture):
     self.assertEqual(view['actor_names']['initial'], 'Reviewer Name')
     self.assertEqual(view['history'][-1]['actor'], 'initial')
     self.assertNotIn('private@example.com', str(view))
-
-  def test_submission_freezes_export_capabilities_from_rules(self):
-    from unittest.mock import patch
-    from ..tenancy import compliance as c
-    self.submitted()
-    context = self.ok(self.review())['historical_context']
-    self.assertIn('eval_mms', context['manifest']['exports'])
-    manifest = {**c.manifest_pack(PACK), 'rules': {**c.manifest_pack(PACK)['rules'], 'exports': ['json']}}
-    with patch.object(c, 'manifest_pack', return_value=manifest):
-      self.assertEqual(self.ok(self.review())['historical_context'], context)
 
   def test_sta_defaults_on_submit_history_and_comment_revision_is_independent(self):
     self.submitted()
@@ -176,17 +167,28 @@ class TestFrameworkReview(FrameworkAssessmentFixture):
       self.assertEqual(self.ok(self.get())['state'], 'submitted')
     self.assertEqual(self.storage.data[key], original)
 
-  def test_frozen_context_has_no_verification_identity_and_is_used_after_retirement(self):
+  def test_frozen_context_is_unchanged_while_the_current_manifest_or_text_changes(self):
     from unittest.mock import patch
     from extensions.business.cybersec.red_mesh.tenancy import compliance as c
     self.submitted()
-    view = self.ok(self.review())
-    context = view['historical_context']
+    context = self.ok(self.review())['historical_context']
+    self.assertIn('eval_mms', context['manifest']['exports'])
     self.assertNotIn('verified_by', str(context))
     self.assertIn('licence', context['manifest'])
-    with patch.object(c, 'load_framework_text', side_effect=AssertionError('current text accessed')):
-      view = self.ok(self.review())
-      self.assertEqual(view['historical_context'], context)
+    current = c.manifest_pack(PACK)
+    def text_refused():
+      return patch.object(c, 'load_framework_text', side_effect=AssertionError('current text accessed'))
+    def manifest(**changes):
+      return patch.object(c, 'manifest_pack', return_value={**current, **changes})
+    exports_changed = {'rules': {**current['rules'], 'exports': ['json']}}
+    cases = {'export rules changed': (manifest(**exports_changed),),
+             'current text unreadable': (text_refused(),),
+             'pack retired and retitled': (manifest(status='retired', title='Changed current title'), text_refused())}
+    for name, active in cases.items():
+      with self.subTest(name), ExitStack() as stack:
+        for item in active:
+          stack.enter_context(item)
+        self.assertEqual(self.ok(self.review())['historical_context'], context)
 
   def test_legacy_snapshot_missing_provenance_is_honest(self):
     self.submitted()
@@ -315,24 +317,30 @@ class TestFrameworkReview(FrameworkAssessmentFixture):
           history = self.ok(self.review())['history']
           self.assertEqual([e['action'] for e in history], ['submit'] if operation == 'submit' else ['submit', 'return'])
 
-  def test_comment_failure_and_noop_are_recoverable_without_duplicate_events(self):
-    from unittest.mock import patch
+  def test_a_noop_review_write_is_refused_as_unavailable(self):
     self.submitted()
-    for after in (False, True):
-      request = str(uuid4())
-      expected = self.ok(self.review())['review_revision']
-      self.storage.fail_write = len(self.storage.writes) + 1
-      self.storage.fail_after_write = after
-      self.refused(self.mutate('comment', expected, request=request,
-        control=next(iter(self.basic_scores())), comment='Durable'), 503, 'unavailable')
-      self.storage.fail_write = None
-      self.restart()
-      result = self.ok(self.mutate('comment', expected, request=request,
-        control=next(iter(self.basic_scores())), comment='Durable'))
-      self.assertEqual(sum(e['request_id'] == request for e in result['history']), 1)
     self.storage.noop = True
-    self.refused(self.mutate('approve', expected=result['review_revision']), 503, 'unavailable')
+    self.refused(self.mutate('approve', expected=self.ok(self.review())['review_revision']), 503, 'unavailable')
     self.storage.noop = False
+
+  def test_a_flagged_tenant_admin_can_return_the_submission(self):
+    self.submitted()
+    self.refused(self.mutate('return', actor=self.admin), 403, 'reviewer_not_designated')
+    self.ok(self.plugin.set_compliance_reviewer(self.creator, 'initial', True))
+    self.ok(self.mutate('return', actor=self.admin))
+    self.assertEqual(self.ok(self.get())['state'], 'draft')
+    self.assertEqual([e['action'] for e in self.ok(self.review())['history']], ['submit', 'return'])
+
+  def test_two_reviewer_comments_do_not_make_the_editor_stale(self):
+    self.submitted()
+    self.ok(self.plugin.set_compliance_reviewer(self.creator, 'initial', True))
+    revision = self.ok(self.get())['assessmentRevision']
+    control = next(iter(self.basic_scores()))
+    self.ok(self.mutate('comment', actor=self.creator, control=control, comment='First'))
+    self.ok(self.mutate('comment', expected=2, actor=self.admin, control=control, comment='Second'))
+    self.assertEqual(self.ok(self.get())['assessmentRevision'], revision)
+    reopened = self.ok(self.reopen(revision, str(uuid4())))  # editor acts at the revision it read
+    self.ok(self.save({'sectoral_requirements': 'Edited after review comments'}, reopened['assessmentRevision']))
 
   def test_concurrent_reviewers_leave_editor_revision_intact_and_return_reopen_race(self):
     from concurrent.futures import ThreadPoolExecutor
@@ -360,14 +368,8 @@ class TestFrameworkReview(FrameworkAssessmentFixture):
     self.assertEqual(self.ok(self.get())['state'], 'draft')
     self.assertFalse(self.ok(self.review())['can_review'])
 
-  def test_review_reads_survive_retired_pack_and_archiving_and_tenant_purge(self):
-    from unittest.mock import patch
-    from extensions.business.cybersec.red_mesh.tenancy import compliance as c
+  def test_review_reads_survive_archiving_and_tenant_purge(self):
     self.submitted()
-    context = self.ok(self.review())['historical_context']
-    manifest = {**c.manifest_pack(PACK), 'status': 'retired', 'title': 'Changed current title'}
-    with patch.object(c, 'manifest_pack', return_value=manifest), patch.object(c, 'load_framework_text', side_effect=AssertionError('current text')):
-      self.assertEqual(self.ok(self.review())['historical_context'], context)
     current = self.ok(self.get())
     self.ok(self.plugin.archive_framework_assessment(self.creator, self.tenant, PACK, '', True, current['assessmentRevision']))
     self.assertFalse(self.ok(self.review())['can_review'])
@@ -377,7 +379,7 @@ class TestFrameworkReview(FrameworkAssessmentFixture):
     self.ok(self.plugin.delete_tenant(self.creator, self.tenant))
     self.assertEqual([v for v in self.compliance_rows().values() if v is not None], [])
 
-  def test_frozen_context_is_pinned_at_preparation_across_retry(self):
+  def test_frozen_context_and_scorer_result_are_pinned_at_preparation_across_retry(self):
     from unittest.mock import patch
     from extensions.business.cybersec.red_mesh.tenancy import compliance as c
     revision = self.complete_basic_draft()
@@ -386,7 +388,8 @@ class TestFrameworkReview(FrameworkAssessmentFixture):
     self.refused(self.submit(revision, request), 503, 'unavailable')
     context = self.stored_row()['pending']['historical_context']
     self.documents.fail = False
-    with patch.object(c, 'load_framework_text', side_effect=AssertionError('retry loaded current text')):
+    with patch.object(c, 'load_framework_text', side_effect=AssertionError('retry loaded current text')), \
+         patch.object(c.scorer_for(self.pack), 'compute', side_effect=AssertionError('recomputed pending snapshot')):
       self.ok(self.submit(revision, request))
       self.assertEqual(self.ok(self.review())['historical_context'], context)
 
@@ -401,18 +404,6 @@ class TestFrameworkReview(FrameworkAssessmentFixture):
       with self.subTest(tail=tail), self.assertRaises(TenantStoreError):
         store.get(r.KIND, self.tenant, PACK, *tail)
     self.assertEqual(store.tenant_record_ids(r.KIND, 'other'), [])
-
-  def test_submission_retry_does_not_recompute_frozen_snapshot_with_current_scorer(self):
-    from unittest.mock import patch
-    from extensions.business.cybersec.red_mesh.tenancy import compliance as c
-    revision = self.complete_basic_draft()
-    request = str(uuid4())
-    self.documents.fail = True
-    self.refused(self.submit(revision, request), 503, 'unavailable')
-    self.documents.fail = False
-    with patch.object(c.scorer_for(self.pack), 'compute', side_effect=AssertionError('recomputed pending snapshot')):
-      result = self.submit(revision, request)
-      self.assertTrue(result['success'])
 
   def test_comment_and_approve_storage_failures_preserve_history_on_retry(self):
     self.submitted()

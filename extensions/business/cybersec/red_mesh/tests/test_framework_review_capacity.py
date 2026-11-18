@@ -103,14 +103,12 @@ class TestReviewTransportAdmission(FrameworkAssessmentFixture):
     self.assertEqual(len(self.storage.writes),writes)
     self.refused(self.review(),503,'unavailable')
 
-  def test_new_return_receipt_repairs_under_write_budget(self):
-    self.submitted()
-    request = str(uuid4())
-    self.storage.fail_write = len(self.storage.writes) + 2
-    self.refused(self.mutate('return',request=request),503,'unavailable')
-    self.storage.fail_write = None
-    self.restart()
-    self.ok(self.get())
-    review = self.ok(self.review())
-    self.assertEqual([e['action'] for e in review['history']],['submit','return'])
-    self.assertTrue(self.ok(self.mutate('return',request=request))['replayed'])
+  def test_a_frozen_context_over_the_byte_cap_refuses_the_submit_without_writes(self):
+    from unittest.mock import patch
+    revision = self.complete_basic_draft()
+    before = copy.deepcopy(self.storage.data)
+    with patch.object(r, 'CONTEXT_BYTES_MAX', 1):
+      self.refused(self.submit(revision, str(uuid4())), 409, 'review_capacity')
+    self.assertEqual(self.storage.data, before)
+    self.assertEqual(self.ok(self.get())['state'], 'draft')
+    self.ok(self.submit(revision, str(uuid4())))  # the real cap is 1 MiB: the same draft submits

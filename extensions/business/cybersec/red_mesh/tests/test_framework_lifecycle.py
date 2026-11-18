@@ -93,6 +93,10 @@ class TestPackList(LifecycleFixture):
       self.assertEqual(listed["packSha256"], packs.manifest_pack(pack_id)["pack_sha256"])
     self.assertEqual((dnsc["exports"], dnsc["licence"]["shipText"], dnsc["title"]),
                      (["json", "csv", "pdf", "eval_mms"], True, "DNSC Order 1/2026"))
+    for listed in data["packs"]:  # every listed pack shows its legal force, source and verification date
+      for entry in listed["entries"]:
+        for key in ("legal_force", "source_url", "verified_at"):
+          self.assertTrue(entry.get(key), (listed["packId"], key))
     for listed in data["packs"]:  # the display name is the manifest title; the catalogue string names the source framework
       self.assertEqual(listed["title"], packs.manifest_pack(listed["packId"])["title"])
       self.assertNotRegex(listed["title"], r"CyFun|Anexa 1")
@@ -116,6 +120,8 @@ class TestRetiredPackLifecycle(LifecycleFixture):
     made = self.ok(self.create(STATUS))
     self.retire(STATUS)
     self.assertNotIn(STATUS, [p["packId"] for p in self.ok(self.plugin.list_framework_packs(self.admin, self.tenant))["packs"]])
+    self.assertNotIn(STATUS, packs.list_framework_pack_ids())
+    self.assertIn(STATUS, packs.list_framework_pack_ids(include_retired=True))
     self.assertEqual(self.ok(self.plugin.get_framework_assessment(self.admin, self.tenant, STATUS, made["assessmentId"]))["packId"], STATUS)
     self.ok(self.save_to(STATUS, made["assessmentId"], {"sectoral_requirements": "still editable"}, made["assessmentRevision"]))
     self.assertEqual([r["assessmentId"] for r in self.listing(STATUS)], [made["assessmentId"]])

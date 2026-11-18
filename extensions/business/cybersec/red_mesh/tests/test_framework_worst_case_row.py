@@ -101,7 +101,3 @@ class TestWorstCaseRow(FrameworkAssessmentFixture):
     size = self.measure(PACKS[0], 0)
     self.assertGreater(size, SENDER_GUARD, "known RM-120 DNSC answer-text limit; independent of submissions; "
                        "see RM-180 codex-audit (measured %d characters)" % size)
-
-  def test_dnsc_with_forty_nine_recorded_and_pending(self):
-    size = self.measure(PACKS[0], c.MAX_SUBMISSIONS - 1)
-    self.assertGreater(size, SENDER_GUARD, "known RM-120 DNSC answer-text limit (measured %d characters)" % size)

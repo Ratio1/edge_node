@@ -3,7 +3,6 @@ on the real plugin endpoints with no pack-specific production code: a tier-less 
 test-only status scorer, and a CyFun-family pack on the two-axis scorer with its own levels,
 thresholds and rule switches. Also the null-level gates and `field_not_in_regime`.
 """
-import json
 from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
@@ -95,11 +94,6 @@ class TestTierlessStatusPack(GenericPackFixture):
     self.assertEqual(self.stored_row()["scores"]["ST-01"]["status"], "met")
     self.assertEqual(SCORERS["test_status.v1"].entry_schema(None)["fields"], ["status", "rationale"])
 
-  def test_a_level_provenance_is_refused_when_the_pack_has_no_levels(self):
-    self.refused(self.create(STATUS, provenance={"kind": "declared"}), 400, "assessment_invalid")
-    aid = self.ok(self.create(STATUS))["assessmentId"]
-    self.refused(self.save_to(STATUS, aid, {"level_provenance": {"kind": "declared"}}, 1), 400, "assessment_invalid")
-
   def test_the_suggest_endpoint_runs_for_a_levelless_pack_and_stops_at_no_level_for_dnsc(self):
     aid = self.ok(self.create(STATUS))["assessmentId"]
     data = self.ok(self.plugin.suggest_framework_assessment_evidence(self.admin, self.tenant, STATUS, aid))
@@ -113,9 +107,11 @@ class TestTierlessStatusPack(GenericPackFixture):
     self.assertEqual([c["refId"] for c in data["pack"]["controls"]], [f"ST-0{i}" for i in range(1, 5)])
     self.assertEqual((data["pack"]["controls"][0]["requirement"], data["pack"]["language"]), (None, "en"))
 
-  def test_a_level_is_refused_for_a_pack_with_no_levels(self):
+  def test_a_level_or_provenance_is_refused_for_a_pack_with_no_levels(self):
+    self.refused(self.create(STATUS, provenance={"kind": "declared"}), 400, "assessment_invalid")
     self.refused(self.create(STATUS, level="basic"), 400, "assessment_invalid")
     made = self.ok(self.create(STATUS))
+    self.refused(self.save_to(STATUS, made["assessmentId"], {"level_provenance": {"kind": "declared"}}, 1), 400, "assessment_invalid")
     self.refused(self.save_to(STATUS, made["assessmentId"], {"assurance_level": "basic"}, made["assessmentRevision"]),
                  400, "assessment_invalid")
 
@@ -204,17 +200,3 @@ class TestCyfunFamilyPack(GenericPackFixture):
     dnsc = self.ok(self.plugin.get_framework_assessment(self.admin, self.tenant, DNSC, "default"))
     self.assertEqual(dnsc["pack"]["rules"]["entity_fields"], ["dnsc_unique_id", "external_supplier"])
     self.assertEqual((dnsc["dnscUniqueId"], dnsc["externalSupplier"]), ("", ""))
-
-
-class TestRetiredPack(GenericPackFixture):
-  def test_a_retired_pack_still_opens_and_is_neither_listed_nor_unknown(self):
-    made = self.ok(self.create(STATUS))
-    manifest = json.loads((self.tmp / "framework-manifest.json").read_text())
-    next(p for p in manifest["packs"] if p["pack_id"] == STATUS)["status"] = "retired"
-    (self.tmp / "framework-manifest.json").write_text(json.dumps(manifest))
-    packs.reset_framework_caches()
-    self.assertNotIn(STATUS, packs.list_framework_pack_ids())
-    self.assertIn(STATUS, packs.list_framework_pack_ids(include_retired=True))
-    data = self.ok(self.plugin.get_framework_assessment(self.admin, self.tenant, STATUS, made["assessmentId"]))
-    self.assertEqual(data["assessmentId"], made["assessmentId"])
-    self.assertEqual(len(self.listing(STATUS)), 1)

@@ -6,6 +6,7 @@ from extensions.business.cybersec.red_mesh.references import framework_packs as 
 from extensions.business.cybersec.red_mesh.services import framework_csf_scoring as csf
 from extensions.business.cybersec.red_mesh.tenancy import compliance as c
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_compliance import CstoreComplianceStore
+from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
 from .test_framework_assessment import FrameworkAssessmentFixture
 
 PACK='us.nist.csf-2.0'
@@ -35,6 +36,13 @@ class TestCsfLifecycle(CsfLifecycleFixture):
     for pack,country in (('ro.dnsc.o1-2026','US'),('eu.ec.ir-2024-2690','GB')):
       with self.assertRaises(ValueError):c.resolve_country(pack,country)
     made=self.create_status();self.assertEqual(self.stored_row()['country'],'US')
+    for country in ('RO','DE','GB','JP',None):
+      made=self.create_status(country)
+      self.assertEqual(self.ok(self.plugin.get_framework_assessment(self.admin,self.tenant,PACK,made['assessmentId']))['packId'],PACK)
+    before=copy.deepcopy(self.storage.data)
+    for country in ('ZZ','us','USA'):
+      self.refused(self.plugin.create_framework_assessment(self.admin,self.tenant,PACK,str(uuid4()),'Invalid',None,None,country),400,'assessment_invalid')
+      self.assertEqual(self.storage.data,before)
     listed=self.ok(self.plugin.list_framework_packs(self.admin,self.tenant))
     entry=next(p for p in listed['packs'] if p['packId']==PACK)
     self.assertEqual(entry['entries'][0]['jurisdiction'],'WORLDWIDE')
@@ -75,7 +83,7 @@ class TestCsfLifecycle(CsfLifecycleFixture):
     made=self.create_status();aid=made['assessmentId'];row=copy.deepcopy(self.stored_row())
     adapter=CstoreComplianceStore(self.plugin,'deployment');ids=(self.tenant,PACK,aid)
     for value in (None,{'GV':{'target':1}},{'GV':{'current':True,'target':4}},{'XX':{}}):
-      with self.assertRaises(Exception):adapter.validate_record(dict(row,function_tiers=value),c.KIND,*ids)
+      with self.assertRaisesRegex(TenantStoreError,'Invalid framework assessment storage record'):adapter.validate_record(dict(row,function_tiers=value),c.KIND,*ids)
     original_get=self.storage.chainstore_hget
     original_set=self.storage.chainstore_hset
     written=[]
@@ -90,7 +98,7 @@ class TestCsfLifecycle(CsfLifecycleFixture):
       self.assertFalse(self.save_status(aid,{'function_tiers':self.full_tiers()},1)['success'])
     self.assertTrue(written)  # failure occurred after write, at the readback seam
 
-  def test_submit_fallbacks_freeze_return_reopen_archive(self):
+  def test_submit_fallbacks_freeze_return_reopen(self):
     made=self.create_status();aid=made['assessmentId'];tiers=self.full_tiers()
     saved=self.ok(self.save_status(aid,{'scores':self.full_scores(),'function_tiers':tiers},1))
     self.assertEqual(saved['submitErrors'],[])
@@ -133,12 +141,3 @@ class TestCsfLifecycle(CsfLifecycleFixture):
     self.ok(self.plugin.archive_framework_assessment(self.admin,self.tenant,PACK,aid,True,row['assessment_revision']))
     artifact=self.ok(self.plugin.get_framework_assessment_artifact(self.admin,self.tenant,PACK,1,aid))
     self.assertEqual(artifact['snapshot']['function_tiers'],self.full_tiers())
-
-  def test_worldwide_real_creation_and_invalid_codes_without_writes(self):
-    for country in ('RO','DE','GB','JP',None):
-      made=self.create_status(country)
-      self.assertEqual(self.ok(self.plugin.get_framework_assessment(self.admin,self.tenant,PACK,made['assessmentId']))['packId'],PACK)
-    before=copy.deepcopy(self.storage.data)
-    for country in ('ZZ','us','USA'):
-      self.refused(self.plugin.create_framework_assessment(self.admin,self.tenant,PACK,str(uuid4()),'Invalid',None,None,country),400,'assessment_invalid')
-      self.assertEqual(self.storage.data,before)

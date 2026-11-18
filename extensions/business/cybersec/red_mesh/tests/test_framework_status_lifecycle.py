@@ -25,7 +25,8 @@ class TestStatusLifecycle(StatusLifecycleFixture):
   def test_eu27_country_catalogue_and_non_eu_rejection(self):
     for country in sorted(EU27):
       self.assertEqual(compliance.resolve_country(PACK,country),country)
-    self.create_status()
+    self.create_status('DE')
+    self.assertEqual(self.stored_row()['country'],'DE')
     for country in ('US','GB','ZZ','de'):
       self.refused(self.plugin.create_framework_assessment(self.admin,self.tenant,PACK,str(uuid4()),'Annex '+str(country),None,None,country),400,'assessment_invalid')
     listed=self.ok(self.plugin.list_framework_packs(self.admin,self.tenant))
@@ -41,20 +42,14 @@ class TestStatusLifecycle(StatusLifecycleFixture):
     self.assertEqual(saved['computed']['counts']['unanswered'],161)
     self.refused(self.submit_status(aid,saved['assessmentRevision']),400,'assessment_invalid')
     for entry in ({'status':'na'},{'documentation':3},{'status':'wrong'}, {'evidence_refs':['job:foreign:1']}):
-      self.assertFalse(self.save_status(aid,{'scores':{ref:entry}},saved['assessmentRevision'])['success'])
+      self.refused(self.save_status(aid,{'scores':{ref:entry}},saved['assessmentRevision']),400,'assessment_invalid')
+    before=copy.deepcopy(self.storage.data)
+    for surrogate in ("\ud800","\udfff"):  # lone surrogate rationale: refused, storage untouched
+      self.refused(self.save_status(aid,{'scores':{ref:{'status':'partial','rationale':surrogate}}},saved['assessmentRevision']),400,'assessment_invalid')
+      self.assertEqual(self.storage.data,before)
     deleted=self.ok(self.save_status(aid,{'scores':{ref:None}},saved['assessmentRevision']))
     self.assertEqual(deleted['scores'],{})
     self.refused(self.save_status(aid,{'completion_date':'2026-02-30'},deleted['assessmentRevision']),400,'assessment_invalid')
-
-  def test_surrogate_rationale_refuses_without_storage_change(self):
-    made = self.create_status()
-    ref = next(iter(self.full_scores()))
-    before = copy.deepcopy(self.storage.data)
-    for surrogate in ("\ud800", "\udfff"):
-      result = self.save_status(made['assessmentId'],
-        {'scores':{ref:{'status':'partial','rationale':surrogate}}},made['assessmentRevision'])
-      self.refused(result,400,'assessment_invalid')
-      self.assertEqual(self.storage.data,before)
 
   def test_submit_freezes_then_review_return_and_resubmit(self):
     made=self.create_status();aid=made['assessmentId'];scores=self.full_scores();refs=list(scores)
@@ -86,15 +81,3 @@ class TestStatusLifecycle(StatusLifecycleFixture):
     self.assertIsNone(done['submissions'][1]['verdict']['passed'])
     self.ok(self.plugin.reopen_framework_assessment(self.admin,self.tenant,PACK,done['assessment_revision'],str(uuid4()),aid))
     self.assertEqual(self.stored_row()['state'],'draft')
-
-
-# Separate fixture per country: production cap is 20 assessments per tenant/pack, including archives.
-def _country_test(country):
-  def test(self):
-    made = self.create_status(country)
-    view = self.ok(self.plugin.get_framework_assessment(self.admin,self.tenant,PACK,made['assessmentId']))
-    self.assertEqual(self.stored_row()['country'],country)
-  return test
-
-for _country in sorted(EU27):
-  setattr(TestStatusLifecycle, 'test_create_country_' + _country, _country_test(_country))
