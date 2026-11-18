@@ -51,6 +51,14 @@ class FindingTriageState:
   actor: str = ""
   updated_at: float = 0.0
   review_at: float = None
+  # Host-scoped records (report-findings.md §Triage): the tenant and host of the writer's execution
+  # binding, `job_id` being the job that wrote it. None for a legacy job-keyed record.
+  tenant_id: str = None
+  host: str = None
+  confirmed: bool = None
+  confirmed_by: str = None
+  # The id of the audit entry this change writes, so a retry can finish a lost entry exactly once.
+  audit_entry_id: str = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -68,6 +76,11 @@ class FindingTriageState:
       actor=d.get("actor", ""),
       updated_at=float(d.get("updated_at", 0.0) or 0.0),
       review_at=d.get("review_at"),
+      tenant_id=d.get("tenant_id"),
+      host=d.get("host"),
+      confirmed=True if d.get("confirmed") is True else None,
+      confirmed_by=d.get("confirmed_by"),
+      audit_entry_id=d.get("audit_entry_id"),
     )
 
 
@@ -79,6 +92,8 @@ class FindingTriageAuditEntry:
   note: str = ""
   actor: str = ""
   timestamp: float = 0.0
+  tenant_id: str = None
+  host: str = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -95,4 +110,6 @@ class FindingTriageAuditEntry:
       note=d.get("note", ""),
       actor=d.get("actor", ""),
       timestamp=float(d.get("timestamp", 0.0) or 0.0),
+      tenant_id=d.get("tenant_id"),
+      host=d.get("host"),
     )

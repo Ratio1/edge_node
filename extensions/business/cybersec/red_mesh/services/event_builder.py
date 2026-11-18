@@ -462,8 +462,18 @@ def build_finding_event(
     environment=environment,
     hmac_secret=hmac_secret,
     redmesh_tenant_id=job_tenant_id(job_specs),
-    dedupe_fingerprint=finding_payload.get("fingerprint") or "",
+    dedupe_fingerprint=_finding_dedupe_fingerprint(finding_payload, finding, event_action),
   )
+
+
+def _finding_dedupe_fingerprint(finding_payload, finding, event_action):
+  """The finding fingerprint; a triage event adds its change's audit entry id, so a retry of one change keeps
+  its key and two changes (false_positive, then reopened) never share one."""
+  fingerprint = finding_payload.get("fingerprint") or ""
+  entry_id = finding.get("triage_entry_id")
+  if event_action == "triaged" and entry_id:
+    return f"{fingerprint}/{entry_id}"
+  return fingerprint
 
 
 def build_export_status_event(

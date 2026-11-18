@@ -1,15 +1,20 @@
+import time
 from copy import deepcopy
 from contextlib import ExitStack
 
+from ..cve_view import apply_triage, drop_closed, effective_status
 from ..model_testing.artifacts import ModelTestArchive
 from ..model_testing.constants import is_model_test_job
 from ..models import FindingTriageAuditEntry, FindingTriageState, JobArchive, VALID_TRIAGE_STATUSES
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..repositories.cstore import TriageStoreError
 from ..tenancy.administration import AdministrationDenied
 from ..tenancy.job_artifacts import (
   MAX_ARTIFACT_REFERENCES, TenantJobArtifacts, checked_job_snapshot, validate_snapshot_mode,
 )
+from ..tenancy.execution import triage_scope
 from ..tenancy.ports import TenantStoreError
+from ..tenancy.tenant_assets import NOTES_MAX
 from .event_hooks import emit_finding_event
 
 _UNSET = object()
@@ -51,6 +56,11 @@ def _find_archive_finding(archive: dict, finding_id: str):
   return None
 
 
+def _stamp(finding, triage):
+  # Embeds the record; a confirmed possible finding reads certain. The stored archive and its score are not rewritten.
+  finding.update(apply_triage([finding], {finding.get("finding_id"): triage})[0])
+
+
 def _merge_triage_into_archive_dict(archive: dict, triage_map: dict) -> dict:
   merged = deepcopy(archive)
   for pass_report in merged.get("passes", []) or []:
@@ -59,20 +69,27 @@ def _merge_triage_into_archive_dict(archive: dict, triage_map: dict) -> dict:
         continue
       triage = triage_map.get(finding.get("finding_id"))
       if triage:
-        finding["triage"] = triage
+        _stamp(finding, triage)
   ui = merged.get("ui_aggregate")
   if isinstance(ui, dict):
+    # A finding closed after the build leaves the stored top findings; the stored score is not recomputed.
+    if isinstance(ui.get("top_findings"), list):
+      ui["top_findings"] = drop_closed(ui["top_findings"], triage_map)
     for finding in ui.get("top_findings", []) or []:
       if not isinstance(finding, dict):
         continue
       triage = triage_map.get(finding.get("finding_id"))
       if triage:
-        finding["triage"] = triage
+        _stamp(finding, triage)
   return merged
 
 
-def _checked_triage_map(owner, job_id, archive, finding_id=""):
-  """Read state only for archive-owned findings; reports:view does not grant audit:view."""
+def _checked_triage_map(owner, job, archive, finding_id=""):
+  """Read state only for archive-owned findings; reports:view does not grant audit:view.
+
+  The map is the job's tenant and host, both from the job's own execution binding. A record that does
+  not name that tenant and host, or this finding, is a broken store, never a foreign row to skip.
+  """
   try:
     passes = archive.get("passes", [])
     if not isinstance(passes, list) or len(passes) > MAX_ARTIFACT_REFERENCES:
@@ -93,12 +110,18 @@ def _checked_triage_map(owner, job_id, archive, finding_id=""):
         finding_ids.add(identifier)
     if finding_id and finding_id not in finding_ids:
       raise AdministrationDenied(404, "not_found")
+    scope = triage_scope(job["execution_binding"])
+    if scope is None:
+      return {}
+    tenant_id, host = scope
+    repo = _job_repo(owner)
     result = {}
+    # Point reads of the archive's own findings, not an enumeration of the tenant's hkey.
     for identifier in ([finding_id] if finding_id else sorted(finding_ids)):
-      state = deepcopy(_job_repo(owner).get_finding_triage(job_id, identifier))
+      state = deepcopy(repo.get_host_triage(tenant_id, host, identifier))
       if state is None:
         continue
-      if not isinstance(state, dict) or state.get("job_id") != job_id or state.get("finding_id") != identifier:
+      if not isinstance(state, dict) or not _names_key(state, tenant_id, host, identifier):
         raise ValueError("Invalid finding state identity")
       result[identifier] = FindingTriageState.from_dict(state).to_dict()
     return result
@@ -106,6 +129,15 @@ def _checked_triage_map(owner, job_id, archive, finding_id=""):
     raise
   except Exception:
     raise TenantStoreError("Tenant finding state is unavailable") from None
+
+
+def _with_effective_status(owner, triage_map):
+  """Each record with `effective_status` beside the stored `status`: an `accepted_risk` past its `review_at`
+  reads `reopened`, so a reader does not re-implement the expiry. A read-time copy, never stored."""
+  clock = getattr(owner, "time", None)
+  now = clock() if callable(clock) else time.time()
+  return {finding_id: {**record, "effective_status": effective_status(record, now)}
+          for finding_id, record in triage_map.items()}
 
 
 def get_job_triage(owner, job_id: str, finding_id: str = "", *, checked_job=_UNSET, snapshot_mode="tenant_bound"):
@@ -120,7 +152,7 @@ def get_job_triage(owner, job_id: str, finding_id: str = "", *, checked_job=_UNS
         raise AdministrationDenied(404, "not_found")
       triage_map = {}
     else:
-      triage_map = _checked_triage_map(owner, job_id, archive, finding_id)
+      triage_map = _with_effective_status(owner, _checked_triage_map(owner, job, archive, finding_id))
     result = {"job_id": job_id}
     if snapshot_mode == "tenant_bound":
       result["execution_binding"] = job["execution_binding"]
@@ -130,105 +162,307 @@ def get_job_triage(owner, job_id: str, finding_id: str = "", *, checked_job=_UNS
     else:
       result["triage"] = triage_map
     return result
-  triage_map = _job_repo(owner).list_job_triage(job_id)
+  record = owner._get_job_from_cstore(job_id)
+  triage_map = _with_effective_status(owner, _job_repo(owner).list_triage_for_record(record))
   if finding_id:
     state = triage_map.get(finding_id)
-    audit = _job_repo(owner).get_finding_triage_audit(job_id, finding_id)
+    scope = triage_scope(record.get("execution_binding")) if isinstance(record, dict) and record.get("execution_binding") else None
+    audit = _job_repo(owner).get_host_triage_audit(*scope, finding_id) if scope else []
     if state is None:
       return {"job_id": job_id, "finding_id": finding_id, "found": False, "triage": None, "audit": audit}
     return {"job_id": job_id, "finding_id": finding_id, "found": True, "triage": state, "audit": audit}
   return {"job_id": job_id, "triage": triage_map}
 
 
-def update_finding_triage(owner, job_id: str, finding_id: str, status: str, note: str = "", actor: str = "", review_at: float = 0):
+MAX_TRIAGE_FINDINGS = 500
+_LOCK_ATTEMPTS = 3
+_CLOSING_STATUSES = frozenset({"false_positive", "remediated", "accepted_risk"})
+
+
+def _host_job_ids(owner, job, scope):
+  """Every job of the same deployment, tenant and host as `job`, itself included (from the bindings)."""
+  namespace = job["execution_binding"]["namespace"]
+  ids = {job["job_id"]}
+  for key, record in (_job_repo(owner).list_jobs() or {}).items():
+    binding = record.get("execution_binding") if isinstance(record, dict) else None
+    if (isinstance(key, str) and isinstance(binding, dict) and binding.get("namespace") == namespace
+        and triage_scope(binding) == scope):
+      ids.add(key)
+  return ids
+
+
+def _error(code, message, **extra):
+  return {"error": code, "message": message, **extra}
+
+
+def update_finding_triage(owner, job_id: str, finding_ids, status: str, note: str = "", actor: str = "",
+                          review_at: float = 0, confirm: bool = False, *, checked_job=_UNSET, ledger=None):
+  """Set the triage of one or many findings of a job, stored by (tenant, host, finding), not by job.
+
+  Tenant and host come from the job's own execution binding; `actor` is the server-resolved account, never
+  a body field. A pending rulebook submission on any job of the same tenant and host blocks the write: the
+  locks of every such job are taken in sorted `(job_id, profile_id)` order, the order purge uses, so no two
+  takers can wait on each other. The locks are per process. Across nodes only the pending registry read below
+  applies, and a read is not a lock: a submission that a sibling job's launcher on another node starts after
+  that read can still see this write land. Known limit, accepted for v1 (owner, 2026-11-18); CStore has no
+  cross-node lock. A set of findings (a dismissed rollup) is written one record each, because CStore has no
+  cross-record transaction: the result lists each member and a retry skips the ones already written.
+
+  A write the store did not confirm (CStore can store a field locally and then time out waiting for its peers)
+  reports `write_failed`. The launcher remembers it in memory, and the next request for that finding writes the
+  state and audit entry again, and emits the event, before it reports or replaces the record. A change whose writes
+  were confirmed but whose event failed is kept too; the next request emits only the event. After a launcher
+  restart only a missing audit entry marks a change unfinished: an audit entry stored locally but never
+  confirmed then reads as finished, and its finding event is not emitted. A purge drops the unfinished changes
+  of the tenants it sweeps on its own node; on another launcher a change is dropped when its record is found
+  deleted, unless another launcher wrote the finding again first. Known limits, accepted for v1
+  (owner, 2026-11-18).
+  """
   from .rulebook_assessment import _submission_lock, list_rulebook_profiles
 
-  with ExitStack() as stack:
-    profiles = sorted(list_rulebook_profiles(), key=lambda item: item["profile_id"])
-    for profile in profiles:
-      stack.enter_context(_submission_lock(owner, job_id, profile["profile_id"]))
-    repo = _job_repo(owner)
-    for profile in profiles:
-      registry = repo.get_rulebook_submission_registry(job_id, profile["profile_id"])
-      if isinstance(registry, dict) and registry.get("pending"):
-        return {
-          "error": "submission_in_progress",
-          "message": "Finding triage cannot change while a formal review submission is pending.",
-          "job_id": job_id,
-          "finding_id": finding_id,
-        }
-    return _update_finding_triage_locked(owner, job_id, finding_id, status, note, actor, review_at)
-
-
-def _update_finding_triage_locked(owner, job_id: str, finding_id: str, status: str, note: str = "", actor: str = "", review_at: float = 0):
+  ids = [finding_ids] if isinstance(finding_ids, str) else finding_ids
+  if (not isinstance(ids, (list, tuple)) or not ids or len(ids) > MAX_TRIAGE_FINDINGS
+      or any(not isinstance(item, str) or not item.strip() or "\x1f" in item for item in ids)):
+    return _error("validation_error", "finding_ids must be 1 to %d finding ids." % MAX_TRIAGE_FINDINGS)
+  if not isinstance(note, str) or len(note) > NOTES_MAX:
+    return _error("validation_error", "note must be text of at most %d characters." % NOTES_MAX)
   if status not in VALID_TRIAGE_STATUSES:
-    return {
-      "error": "validation_error",
-      "message": f"Unsupported triage status: {status}. Allowed: {sorted(VALID_TRIAGE_STATUSES)}",
-    }
-
-  job_specs = owner._get_job_from_cstore(job_id)
-  if not job_specs:
-    return {"error": "not_found", "message": f"Job {job_id} not found."}
-  if not job_specs.get("job_cid"):
-    return {"error": "not_available", "message": f"Job {job_id} is still running (triage requires archived findings)."}
-  launcher = job_specs.get("launcher")
-  if launcher and launcher != getattr(owner, "ee_addr", None):
-    return {
-      "error": "job_launcher_mismatch",
-      "message": "Finding triage must be handled by the job launcher.",
-      "status_code": 409,
-      "job_id": job_id,
-    }
-
-  archive = _artifact_repo(owner).get_archive(job_specs)
-  if not isinstance(archive, dict):
-    return {"error": "fetch_failed", "message": f"Failed to fetch archive for job {job_id}."}
-  archived_finding = _find_archive_finding(archive, finding_id)
-  if archived_finding is None:
-    return {"error": "not_found", "message": f"Finding {finding_id} not found in archived job {job_id}."}
-
-  triage_state = FindingTriageState(
-    job_id=job_id,
-    finding_id=finding_id,
-    status=status,
-    note=note or "",
-    actor=actor or "",
-    updated_at=owner.time(),
-    review_at=review_at or None,
-  )
+    return _error("validation_error",
+                  f"Unsupported triage status: {status}. Allowed: {sorted(VALID_TRIAGE_STATUSES)}")
+  if status == "accepted_risk":
+    if type(review_at) not in (int, float) or review_at <= owner.time():
+      return _error("validation_error", "accepted_risk requires review_at, a future time (epoch seconds).")
+  else:
+    review_at = 0
+  if confirm and status != "open":
+    return _error("validation_error", "A confirmation is recorded with status open.")
+  ids = list(dict.fromkeys(ids))
+  job = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
+  if not isinstance(job, dict) or not job:
+    return _error("not_found", f"Job {job_id} not found.")
+  binding = job.get("execution_binding")
+  scope = triage_scope(binding) if binding is not None else None
+  profiles = sorted(profile["profile_id"] for profile in list_rulebook_profiles())
   repo = _job_repo(owner)
-  state_payload = repo.put_finding_triage(triage_state)
-  audit_payload = repo.append_finding_triage_audit(FindingTriageAuditEntry(
-    job_id=job_id,
-    finding_id=finding_id,
-    status=status,
-    note=note or "",
-    actor=actor or "",
-    timestamp=owner.time(),
-  ))
+  for _attempt in range(_LOCK_ATTEMPTS):
+    hosted = sorted(_host_job_ids(owner, job, scope)) if scope else [job_id]
+    with ExitStack() as stack:
+      for target in sorted((member, profile) for member in hosted for profile in profiles):
+        stack.enter_context(_submission_lock(owner, *target))
+      if scope and not set(_host_job_ids(owner, job, scope)) <= set(hosted):
+        continue  # a sibling appeared before the locks were held: release everything and take the larger set
+      for member in hosted:
+        for profile in profiles:
+          registry = repo.get_rulebook_submission_registry(member, profile)
+          if isinstance(registry, dict) and registry.get("pending"):
+            return _error("submission_in_progress",
+                          "Finding triage cannot change while a formal review submission is pending.",
+                          job_id=job_id, finding_ids=ids)
+      return _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, actor, review_at,
+                                           confirm, checked_job is not _UNSET, ledger)
+  return _error("triage_contention", "Jobs of this host are changing; retry.", job_id=job_id, retryable=True)
+
+
+def _names_key(state, tenant_id, host, finding_id):
+  """True when a stored record names the (tenant, host, finding) it is stored under."""
+  return (state.get("finding_id") == finding_id and state.get("tenant_id") == tenant_id
+          and state.get("host") == host)
+
+
+def _unfinished_writes(owner):
+  """`(tenant, host, finding) -> {"state", "state_confirmed", "audit_confirmed", "audit"}`: the triage changes this
+  launcher started whose writes the store did not all confirm, or whose event was not emitted. In memory: a restart forgets it, and then only a missing audit entry marks a change
+  unfinished."""
+  unfinished = getattr(owner, "_triage_unfinished_writes", None)
+  if not isinstance(unfinished, dict):
+    unfinished = owner._triage_unfinished_writes = {}
+  return unfinished
+
+
+def _stored_state(stored):
+  """`stored` as a FindingTriageState, or None for a malformed record (left as is, like one without an entry id)."""
+  try:
+    return FindingTriageState.from_dict(stored)
+  except (KeyError, TypeError, ValueError):
+    return None
+
+
+def _commit_triage(owner, repo, key, state, ledger, announce, write_state=True, write_audit=True, audit_payload=None):
+  """Write `state` and its audit entry under `state.audit_entry_id`, each write confirmed, then `announce` it.
+
+  The unfinished map holds the change, with the phase it reached, until the event is delivered or skipped (a
+  retryable SOC delivery failure keeps it, and the third return value is True): the next request for
+  the finding repeats only what is left (`write_state`/`write_audit` False skip a confirmed write; same fields and
+  payloads) before it reports. Each confirmed write is recorded on the ledger. The audit entry records the change
+  as made (job, actor, time).
+
+  Known limits of the SOC retry: the map has one slot per finding, so a newer change that is written while an
+  older change's event still fails replaces it, and only the newer event is sent later. The event goes to the job
+  and pass of the request that sends it, which are part of its dedupe key, so a retry through another job of the
+  host, or after the pass advances, gets another key.
+  """
+  from ..tenancy.effects import EffectState
+
+  if ledger is not None:
+    ledger.checkpoint()
+  unfinished = _unfinished_writes(owner)
+  state_payload = state.to_dict()
+  if write_state:
+    unfinished[key] = {"state": state_payload, "state_confirmed": False, "audit_confirmed": False}
+    state_payload = repo.put_host_triage(state)
+    if ledger is not None:
+      ledger.record(EffectState.PERSISTED)
+  if write_audit:
+    unfinished[key] = {"state": state_payload, "state_confirmed": True, "audit_confirmed": False}
+    audit_payload = repo.append_host_triage_audit(FindingTriageAuditEntry(
+      job_id=state_payload["job_id"], finding_id=state_payload["finding_id"], status=state_payload["status"],
+      note=state_payload.get("note", ""), actor=state_payload.get("actor", ""), timestamp=state_payload["updated_at"],
+      tenant_id=state_payload["tenant_id"], host=state_payload["host"]), entry_id=state_payload["audit_entry_id"])
+    if ledger is not None:
+      ledger.record(EffectState.PERSISTED)
+  unfinished[key] = {"state": state_payload, "state_confirmed": True, "audit_confirmed": True, "audit": audit_payload}
+  soc_failed = _soc_delivery_failed(announce(state_payload))
+  if not soc_failed:  # a failed SIEM delivery keeps the change, so the next request for the finding sends it again
+    unfinished.pop(key, None)
+  return state_payload, audit_payload, soc_failed
+
+
+def _soc_delivery_failed(result):
+  """True when the SOC event was not delivered and a retry may deliver it: a transport error or a cooldown. A
+  skip (export disabled, no secret) or an event the adapter rejects (`invalid_event`) is final."""
+  return isinstance(result, dict) and result.get("status") == "error" and result.get("error") != "invalid_event"
+
+
+def _announce_triage(owner, record, archived, state_payload):
+  """The node audit log line and the finding event of a written change; the event goes to this request's job."""
   if hasattr(owner, "_log_audit_event"):
     owner._log_audit_event("finding_triage_updated", {
-      "job_id": job_id,
-      "finding_id": finding_id,
-      "status": status,
-      "actor": actor or "",
-    })
-  finding_event = dict(archived_finding)
-  finding_event["triage_state"] = status
-  emit_finding_event(
-    owner,
-    job_specs,
-    finding=finding_event,
-    event_action="triaged",
-  )
-  if isinstance(job_specs.get("soc_event_status"), dict):
-    _write_job_record(owner, job_id, job_specs, context="finding_triage_soc_event")
+      "job_id": state_payload["job_id"], "finding_id": state_payload["finding_id"], "status": state_payload["status"],
+      "actor": state_payload.get("actor", "")})
+  finding_event = dict(archived)
+  finding_event["triage_state"] = state_payload["status"]
+  finding_event["triage_entry_id"] = state_payload.get("audit_entry_id")  # the event's dedupe key, per change
+  return emit_finding_event(owner, record, finding=finding_event, event_action="triaged")
+
+
+def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, actor, review_at, confirm,
+                                  checked, ledger):
+  now = owner.time()
+  if is_model_test_job(job):
+    return _error("model_test_not_supported", "Model-test jobs have no finding triage.", job_id=job_id)
+  if scope is None:
+    return _error("not_available", f"Job {job_id} has no target to triage findings against.")
+  if not job.get("job_cid"):
+    return _error("not_available", f"Job {job_id} is still running (triage requires archived findings).")
+  launcher = job.get("launcher")
+  if launcher and launcher != getattr(owner, "ee_addr", None):
+    return _error("job_launcher_mismatch", "Finding triage must be handled by the job launcher.",
+                  status_code=409, job_id=job_id)
+  if checked:
+    archive = TenantJobArtifacts(job, _artifact_repo(owner).get_json, snapshot_mode="tenant_bound").archive()
+  else:
+    archive = _artifact_repo(owner).get_archive(job)
+  if not isinstance(archive, dict):
+    return _error("fetch_failed", f"Failed to fetch archive for job {job_id}.")
+
+  tenant_id, host = scope
+  repo = _job_repo(owner)
+  # The event and the SOC status go on the stored record, not on a detached admission snapshot.
+  record = (owner._get_job_from_cstore(job_id) if checked else job) or job
+  results = []
+  announced = False
+  for finding_id in ids:
+    archived = _find_archive_finding(archive, finding_id)
+    if archived is None:
+      results.append({"finding_id": finding_id, "outcome": "not_found"})
+      continue
+    if confirm and archived.get("confidence") != "tentative":
+      results.append({"finding_id": finding_id, "outcome": "not_tentative"})
+      continue
+    stored = repo.get_host_triage(tenant_id, host, finding_id)
+    if isinstance(stored, dict) and not _names_key(stored, tenant_id, host, finding_id):
+      # A broken store, as on the read side: never replayed (its body would choose the write's tenant and host),
+      # never replaced. Fails closed for this member.
+      results.append({"finding_id": finding_id, "outcome": "store_inconsistent"})
+      continue
+    key = (tenant_id, host, finding_id)
+    unfinished = _unfinished_writes(owner)
+    pending = unfinished.get(key)
+    stored_id = stored.get("audit_entry_id") if isinstance(stored, dict) else None
+    # An unfinished change is finished first, under its own entry id, so its audit entry is written once, before this
+    # request is reported or replaces the record:
+    # - this launcher wrote its state and the store confirmed it, but not its audit entry: the entry is written again,
+    #   whatever the record holds now (a sibling job's launcher may have replaced it since);
+    # - this launcher wrote its state but the store did not confirm it, and the record still holds it: both again;
+    # - otherwise the record's audit entry is missing (after a restart, or written by another node): both again.
+    # A state write that stored nothing, or that a newer change replaced before it was confirmed, was reported
+    # `write_failed` and is dropped. A record without the id (an older node wrote it) is left as is. Known limit: a
+    # node that sees the state before the audit field replicates finishes it too; the entry is the same field and
+    # payload, but the finding event is emitted again.
+    # A change whose writes were both confirmed but whose event was not emitted (the announce raised) is announced.
+    # Both this launcher's change and the stored record's are reconciled: another launcher's change may have replaced
+    # this one's record and lost its own audit entry, and this request must not overwrite it unrecorded.
+    finishes = []  # (state, phase), oldest first
+    pending_id = pending["state"].get("audit_entry_id") if pending else None
+    if pending and pending["state_confirmed"] and stored is None:
+      # The store confirmed this state, so a missing record was deleted (a purge, maybe on another node): dropped.
+      unfinished.pop(key, None)
+      pending = pending_id = None
+    if pending and pending["state_confirmed"]:
+      finishes.append((FindingTriageState.from_dict(pending["state"]), {
+        "write_state": False, "write_audit": not pending["audit_confirmed"], "audit_payload": pending.get("audit")}))
+    elif not pending or pending_id != stored_id:
+      unfinished.pop(key, None)
+    if stored_id and (stored_id != pending_id or not finishes):
+      own = stored_id == pending_id  # this launcher's unconfirmed state, still the record: both writes again
+      if own or not repo.has_host_triage_audit_entry(tenant_id, host, finding_id, stored_id):
+        finish = _stored_state(stored)
+        if finish is not None:
+          finishes.append((finish, {}))
+    # A write keeps an earlier confirmation unless it is a new one or the finding is dismissed as a false positive.
+    kept = isinstance(stored, dict) and stored.get("confirmed") is True and status != "false_positive"
+    confirmed = True if confirm or kept else None
+    confirmed_by = stored.get("confirmed_by") if kept else ((actor or "") if confirm else None)
+    same = (isinstance(stored, dict) and stored.get("status") == status and stored.get("note", "") == (note or "")
+            and stored.get("review_at") == (review_at or None)
+            and bool(stored.get("confirmed")) == bool(confirmed)
+            and (not confirmed or stored.get("confirmed_by") == confirmed_by))
+    if same and not finishes:
+      results.append({"finding_id": finding_id, "outcome": "unchanged", "triage": deepcopy(stored)})
+      continue
+    state_payload = deepcopy(stored)
+    announce = lambda payload, archived=archived: _announce_triage(owner, record, archived, payload)
+    soc_failed = False
+    try:
+      for finish, phase in finishes:
+        _, audit_payload, failed = _commit_triage(owner, repo, key, finish, ledger, announce, **phase)
+        soc_failed = soc_failed or failed
+        announced = True
+      if not same:
+        state_payload, audit_payload, failed = _commit_triage(owner, repo, key, FindingTriageState(
+          job_id=job_id, finding_id=finding_id, status=status, note=note or "", actor=actor or "", updated_at=now,
+          review_at=review_at or None, tenant_id=tenant_id, host=host,
+          confirmed=confirmed, confirmed_by=confirmed_by,
+          audit_entry_id=repo.new_host_triage_audit_entry_id(now)), ledger, announce)
+        soc_failed = soc_failed or failed
+        announced = True
+    except TriageStoreError:
+      # The store did not confirm a write: report it, never a success; a retry finishes the member.
+      results.append({"finding_id": finding_id, "outcome": "write_failed", "retryable": True})
+      continue
+    item = {"finding_id": finding_id, "outcome": "updated", "triage": state_payload, "audit": audit_payload}
+    if soc_failed:
+      item["soc_event"] = "error"  # stored and audited; the next request for the finding sends the event again
+    results.append(item)
+  # An emitted event changes the record's SOC status, also when a later write of the same member failed.
+  if announced and isinstance(record.get("soc_event_status"), dict):
+    _write_job_record(owner, job_id, record, context="finding_triage_soc_event")
   return {
     "job_id": job_id,
-    "finding_id": finding_id,
-    "triage": state_payload,
-    "audit": audit_payload,
+    "requested_status": status,
+    "results": results,
+    # a rollup counts as dismissed only when every member is written (now or on an earlier call)
+    "complete": all(item["outcome"] in ("updated", "unchanged") for item in results),
   }
 
 
@@ -245,7 +479,8 @@ def get_job_archive_with_triage(owner, job_id: str, *, checked_job=_UNSET, snaps
     try:
       model = ModelTestArchive if is_model_test_job(job) else JobArchive
       archive = model.from_dict(payload).to_dict()
-      triage_map = {} if is_model_test_job(job) else _checked_triage_map(owner, job_id, payload)
+      triage_map = {} if is_model_test_job(job) else _with_effective_status(
+        owner, _checked_triage_map(owner, job, payload))
       return {**result, "archive": _merge_triage_into_archive_dict(archive, triage_map), "triage": triage_map}
     except Exception:
       raise TenantStoreError("Tenant archive is unavailable") from None
@@ -300,6 +535,9 @@ def get_job_archive_with_triage(owner, job_id: str, *, checked_job=_UNSET, snaps
     )
     return {"error": "integrity_mismatch", "message": "Archive job_id does not match requested job_id."}
 
-  triage_map = _job_repo(owner).list_job_triage(job_id)
+  archived_ids = {finding.get("finding_id") for pass_report in archive.get("passes", []) or []
+                  for finding in pass_report.get("findings", []) or [] if isinstance(finding, dict)}
+  triage_map = _with_effective_status(owner, {
+    key: value for key, value in _job_repo(owner).list_triage_for_record(job_specs).items() if key in archived_ids})
   merged_archive = _merge_triage_into_archive_dict(archive, triage_map)
   return {"job_id": job_id, "archive": merged_archive, "triage": triage_map}

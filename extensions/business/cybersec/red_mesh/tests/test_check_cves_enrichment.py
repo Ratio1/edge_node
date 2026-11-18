@@ -341,13 +341,15 @@ class TestPackageVersionParsing(unittest.TestCase):
   def test_an_epoch_is_not_read_as_the_upstream_version(self):
     from extensions.business.cybersec.red_mesh.cve_db import _parse_version
     self.assertEqual(_parse_version("1:8.9p1-3ubuntu0.10"), _parse_version("8.9p1"))
-    self.assertEqual(_parse_version("2:1.2.3"), (1, 2, 3))
+    self.assertEqual(_parse_version("2:1.2.3"), ([1, 2, 3], (0, 0, 0)))
 
   def test_ordinary_version_strings_are_unaffected(self):
     from extensions.business.cybersec.red_mesh.cve_db import _parse_version
-    self.assertEqual(_parse_version("OpenSSH_8.9p1"), (8, 9, 16, 1))
-    self.assertEqual(_parse_version("1.4.3-beta"), (1, 4, 3))
-    self.assertEqual(_parse_version("Apache/2.4.57 (Ubuntu)"), (2, 4, 57))
+    self.assertEqual(_parse_version("OpenSSH_8.9p1"), ([8, 9], (1, 16, 1)))
+    # A pre-release is no longer the release: `1.4.3-beta` sorts before `1.4.3`.
+    self.assertEqual(_parse_version("1.4.3-beta"), ([1, 4, 3], (-1, 2, 0)))
+    self.assertLess(_parse_version("1.4.3-beta"), _parse_version("1.4.3"))
+    self.assertEqual(_parse_version("Apache/2.4.57 (Ubuntu)"), ([2, 4, 57], (0, 0, 0)))
 
   def test_an_epoch_prefixed_package_no_longer_matches_1_x_cves(self):
     fired = {
@@ -413,6 +415,22 @@ class TestClientSideApplicabilityAcrossProducts(unittest.TestCase):
       and e.cve_id != "CVE-2016-7406"
     ]
     self.assertEqual(wrong, [], "titles naming a client component must resolve to client applicability")
+
+
+
+class TestEximRanges(unittest.TestCase):
+  """Upstream fix versions per NVD (RM-103 iteration 2)."""
+
+  def _ids(self, version):
+    return {f.title.split(":")[0] for f in check_cves("exim", version)}
+
+  def test_cve_2023_42115_is_fixed_in_4_96_1(self):
+    self.assertIn("CVE-2023-42115", self._ids("4.96"))
+    self.assertNotIn("CVE-2023-42115", self._ids("4.96.1"))
+    self.assertNotIn("CVE-2023-42115", self._ids("4.97"))
+
+  def test_cve_2024_39929_still_matches_4_97(self):
+    self.assertIn("CVE-2024-39929", self._ids("4.97"))
 
 
 if __name__ == "__main__":

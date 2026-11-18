@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import ipaddress
 import json
 import math
 import re
@@ -263,7 +264,22 @@ def _target_values(job_config, job_specs=None):
   return [value for value in dict.fromkeys(values) if value]
 
 
-def _safe_text(value, *, hmac_secret, redaction_values=None, max_len=1000):
+def _is_private_ipv4(text):
+  try:
+    return ipaddress.IPv4Address(text).is_private
+  except ValueError:
+    return False
+
+
+def _safe_text(value, *, hmac_secret, redaction_values=None, max_len=1000, keep_private_ips=False):
+  """Redact `value` for the rulebook evidence surface.
+
+  `keep_private_ips` leaves RFC1918/loopback/link-local IPv4 literals readable
+  (finding titles only): a private address in a title such as "FTP PASV leaks
+  internal IP: 192.168.48.2" is the finding's subject, not a credential, and the
+  finding card prints it. Target addresses are still pseudonymised first via
+  `redaction_values`; public addresses and every credential rule are unchanged.
+  """
   if value is None:
     return ""
   if isinstance(value, (dict, list)):
@@ -284,6 +300,8 @@ def _safe_text(value, *, hmac_secret, redaction_values=None, max_len=1000):
     return f"{match.group(1)}=<redacted>"
 
   def _replace_ip(match):
+    if keep_private_ips and _is_private_ipv4(match.group(0)):
+      return match.group(0)
     return stable_hmac_pseudonym(match.group(0), hmac_secret, prefix="ip")
 
   text = _PEM_PRIVATE_KEY_RE.sub("<redacted-private-key>", text)
@@ -420,7 +438,7 @@ def _safe_finding_ref(finding, *, hmac_secret, redaction_values, triage_map):
     "type": "finding",
     "finding_id": _safe_text(_finding_id(finding), hmac_secret=hmac_secret, redaction_values=redaction_values, max_len=160),
     "severity": _severity(finding),
-    "title": _safe_text(finding.get("title") or "Untitled finding", hmac_secret=hmac_secret, redaction_values=redaction_values, max_len=240),
+    "title": _safe_text(finding.get("title") or "Untitled finding", hmac_secret=hmac_secret, redaction_values=redaction_values, max_len=240, keep_private_ips=True),
     "category": _safe_text(finding.get("category") or "", hmac_secret=hmac_secret, redaction_values=redaction_values, max_len=120),
     "probe": _safe_text(finding.get("probe") or "", hmac_secret=hmac_secret, redaction_values=redaction_values, max_len=160),
     "cwe_id": _safe_text(finding.get("cwe_id") or "", hmac_secret=hmac_secret, redaction_values=redaction_values, max_len=80),
@@ -735,7 +753,7 @@ def build_rulebook_assessment(
   redaction_values = _target_values(ctx["job_config"], job_specs)
   target_value = (redaction_values or [job_id or "unknown"])[0]
   target_pseudonym = stable_hmac_pseudonym(target_value, hmac_secret, prefix="target")
-  triage_map = _job_repo(owner).list_job_triage(job_id)
+  triage_map = _job_repo(owner).list_triage_for_record(job_specs)
   review = _job_repo(owner).get_rulebook_review_model(job_id, profile["profile_id"]) if include_review else None
 
   checks = []

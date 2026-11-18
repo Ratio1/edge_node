@@ -384,9 +384,9 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self._launch(plugin)
     from extensions.business.cybersec.red_mesh.models import JobConfig
     config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
-    self.assertEqual(config_dict["redmesh_release"], {"backend": "0.13.2"})
+    self.assertEqual(config_dict["redmesh_release"], {"backend": "0.14.3"})
     restored = JobConfig.from_dict(config_dict).to_dict()
-    self.assertEqual(restored["redmesh_release"], {"backend": "0.13.2"})
+    self.assertEqual(restored["redmesh_release"], {"backend": "0.14.3"})
 
   def test_launch_records_the_console_and_report_pipeline_it_was_sent(self):
     """RM-103 item 12: the release names all three deployables. Only the
@@ -3402,8 +3402,8 @@ class TestPhase4UiAggregate(unittest.TestCase):
     plugin._extract_graybox_ui_stats = lambda aggregated, latest_pass=None: Plugin._extract_graybox_ui_stats(
       plugin, aggregated, latest_pass
     )
-    plugin._compute_ui_aggregate = lambda passes, agg, job_config=None: Plugin._compute_ui_aggregate(
-      plugin, passes, agg, job_config=job_config
+    plugin._compute_ui_aggregate = lambda passes, agg, job_config=None, triage=None: Plugin._compute_ui_aggregate(
+      plugin, passes, agg, job_config=job_config, triage=triage
     )
     plugin.SEVERITY_ORDER = Plugin.SEVERITY_ORDER
     plugin.CONFIDENCE_ORDER = Plugin.CONFIDENCE_ORDER
@@ -3781,8 +3781,8 @@ class TestPhase3Archive(unittest.TestCase):
 
     # Bind real methods for archive building
     Plugin = self._get_plugin_class()
-    plugin._compute_ui_aggregate = lambda passes, agg, job_config=None: Plugin._compute_ui_aggregate(
-      plugin, passes, agg, job_config=job_config
+    plugin._compute_ui_aggregate = lambda passes, agg, job_config=None, triage=None: Plugin._compute_ui_aggregate(
+      plugin, passes, agg, job_config=job_config, triage=triage
     )
     plugin._count_services = lambda si: Plugin._count_services(plugin, si)
     plugin._dedupe_items = lambda items: Plugin._dedupe_items(items)
@@ -3811,6 +3811,19 @@ class TestPhase3Archive(unittest.TestCase):
     self.assertEqual(len(archive_dict["passes"]), 1)
     self.assertIn("ui_aggregate", archive_dict)
     self.assertIn("total_open_ports", archive_dict["ui_aggregate"])
+
+  def test_archive_top_findings_read_the_live_host_triage_map(self):
+    """RM-169 4a: a closed finding takes no top_findings slot; the stored pass stays unstamped."""
+    from extensions.business.cybersec.red_mesh.repositories.cstore import JobStateRepository
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin()
+    with patch.object(JobStateRepository, "list_triage_for_record",
+                      return_value={"f1a": {"status": "false_positive"}}) as read:
+      Plugin._build_job_archive(plugin, "test-job", job_specs)
+    read.assert_called_once()
+    archive_dict = plugin.r1fs.add_json.call_args[0][0]
+    self.assertNotIn("top_findings", archive_dict["ui_aggregate"])  # the only HIGH was closed
+    self.assertEqual([f["finding_id"] for f in archive_dict["passes"][0]["findings"]], ["f1a", "f1b"])
 
   def test_duplicate_archive_finalization_reuses_existing_cid(self):
     """Retrying finalization after prune is harmless and writes no artifact."""
@@ -4229,8 +4242,9 @@ class TestPhase5Endpoints(unittest.TestCase):
     }
     plugin.r1fs.get_json.return_value = archive_data
     plugin.chainstore_hget.side_effect = lambda hkey, key: (
-      {"job_id": "fin-job", "finding_id": "f-1", "status": "accepted_risk", "note": "documented"}
-      if hkey == "test-instance:triage" and key == "fin-job:f-1" else None)
+      {"job_id": "fin-job", "finding_id": "f-1", "status": "accepted_risk", "note": "documented",
+       "tenant_id": self._tenant_id, "host": "192.0.2.10"}
+      if hkey == f"test-instance:triage:t:{self._tenant_id}" and key == "192.0.2.10\x1ff-1" else None)
 
     result = Plugin.get_job_archive(plugin, job_id="fin-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
     self.assertEqual(result["job_id"], "fin-job")
@@ -5361,45 +5375,27 @@ class TestPhase5Endpoints(unittest.TestCase):
     }
     plugin.time.return_value = 123.0
     plugin._log_audit_event = MagicMock()
-    triage_store = {}
-    triage_audit_store = {}
+    binding = binding_payload()
+    stub["execution_binding"] = binding
+    stub["launcher"] = plugin.ee_addr
+    plugin.r1fs.get_json.return_value["job_config"] = {"execution_binding": binding}
+    rows = {}
 
-    def _chainstore_hget(hkey, key):
-      if hkey.endswith(":triage"):
-        return triage_store.get(key)
-      if hkey.endswith(":triage:audit"):
-        return triage_audit_store.get(key)
-      return {"fin-job": stub}.get(key)
+    plugin.chainstore_hget.side_effect = lambda hkey, key: (
+      {"fin-job": stub}.get(key) if hkey == "test-instance" else rows.get((hkey, key)))
+    plugin.chainstore_hgetall.side_effect = lambda hkey: (
+      {"fin-job": stub} if hkey == "test-instance" else {k: v for (h, k), v in rows.items() if h == hkey})
+    plugin.chainstore_hset.side_effect = lambda hkey, key, value: rows.__setitem__((hkey, key), value) or True
+    plugin.chainstore_hkeys.side_effect = lambda hkey: [k for (h, k) in rows if h == hkey]
 
-    def _chainstore_hgetall(hkey):
-      if hkey.endswith(":triage"):
-        return dict(triage_store)
-      if hkey.endswith(":triage:audit"):
-        return dict(triage_audit_store)
-      return {"fin-job": stub}
+    result = update_finding_triage(plugin, "fin-job", "f-1", "accepted_risk", note="Approved by analyst",
+                                   actor="alice", review_at=456.0)
 
-    def _chainstore_hset(hkey, key, value):
-      if hkey.endswith(":triage"):
-        triage_store[key] = value
-      elif hkey.endswith(":triage:audit"):
-        triage_audit_store[key] = value
-
-    plugin.chainstore_hget.side_effect = _chainstore_hget
-    plugin.chainstore_hgetall.side_effect = _chainstore_hgetall
-    plugin.chainstore_hset.side_effect = _chainstore_hset
-
-    result = update_finding_triage(plugin,
-      job_id="fin-job",
-      finding_id="f-1",
-      status="accepted_risk",
-      note="Approved by analyst",
-      actor="alice",
-      review_at=456.0,
-    )
-
-    self.assertEqual(result["triage"]["status"], "accepted_risk")
-    self.assertEqual(result["audit"][-1]["actor"], "alice")
-    self.assertEqual(triage_store["fin-job:f-1"]["review_at"], 456.0)
+    member = result["results"][0]
+    self.assertEqual(member["triage"]["status"], "accepted_risk")
+    self.assertEqual(member["audit"]["actor"], "alice")
+    hkey = f"test-instance:triage:t:{binding['tenant_id']}"
+    self.assertEqual(rows[(hkey, "192.0.2.10\x1ff-1")]["review_at"], 456.0)
     plugin._log_audit_event.assert_called_once()
 
   def test_get_job_triage_not_found(self):

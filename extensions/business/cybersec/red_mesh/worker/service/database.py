@@ -6,7 +6,7 @@ import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
-from ...cve_db import check_cves
+from ...cve_db import check_cves, probe_cve_fields
 from ...models.finding_schema import AUTHENTICATED_ACTION_NOT_APPLICABLE
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
@@ -120,8 +120,10 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           except Exception:
             pass
 
-          # CVE check
-          findings += check_cves("mysql", version)
+          # CVE check — MariaDB speaks the MySQL protocol and its 10.x banner
+          # leads with `5.5.5-`; route it to its own product key.
+          cve_product, cve_version = self._mysql_cve_target(version)
+          findings += check_cves(cve_product, cve_version)
         else:
           raw["protocol_byte"] = pkt_payload[0] if pkt_payload else None
           findings.append(Finding(
@@ -265,7 +267,8 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       ))
 
     # --- CVE-2012-2122 auth bypass test ---
-    # Affected: MySQL 5.1.x < 5.1.63, 5.5.x < 5.5.25, MariaDB < 5.5.23
+    # Affected (as the catalog rows): MySQL 5.1.x < 5.1.63, 5.5.x < 5.5.24, 5.6.x < 5.6.6. MariaDB is not probed:
+    # its 5.x banners are skipped below, and 10.x is not affected.
     # Bug: memcmp return value truncation means ~1/256 chance of auth bypass
     cve_bypass = self._mysql_test_cve_2012_2122(target, port)
     if cve_bypass:
@@ -274,10 +277,25 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
     return probe_result(raw_data=raw, findings=findings)
 
+  @staticmethod
+  def _mysql_cve_target(banner):
+    """Return ``(cve_db product, version)`` for a MySQL-protocol server banner.
+
+    MariaDB 10.x announces itself as ``5.5.5-10.11.6-MariaDB`` (the fake
+    ``5.5.5-`` prefix keeps old clients working); that prefix is not the server
+    version. ``*-MariaDB`` goes to the ``mariadb`` key, everything else to
+    ``mysql``.
+    """
+    stripped = _re.sub(r'^5\.5\.5-(?=\d)', '', banner or '')
+    if 'mariadb' in stripped.lower():
+      return "mariadb", stripped
+    return "mysql", stripped
+
   # Affected version ranges for CVE-2012-2122
   _MYSQL_CVE_2012_2122_RANGES = [
     ((5, 1, 0), (5, 1, 63)),   # MySQL 5.1.x < 5.1.63
-    ((5, 5, 0), (5, 5, 25)),   # MySQL 5.5.x < 5.5.25
+    ((5, 5, 0), (5, 5, 24)),   # MySQL 5.5.x < 5.5.24
+    ((5, 6, 0), (5, 6, 6)),    # MySQL 5.6.x < 5.6.6
   ]
 
   def _mysql_test_cve_2012_2122(self, target, port):
@@ -312,6 +330,12 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       return None
 
     version_str = pkt_payload[1:].split(b'\x00')[0].decode('utf-8', errors='ignore')
+    # Gate on a real MySQL banner. MariaDB 10.x reports `5.5.5-10.x-MariaDB`,
+    # which read as MySQL 5.5.5 is in range and drew 300 auth attempts. The gate
+    # also skips MariaDB 5.x below 5.5.23, a true positive that is given up.
+    cve_product, version_str = self._mysql_cve_target(version_str)
+    if cve_product != "mysql":
+      return None
     version_tuple = tuple(int(x) for x in _re.findall(r'\d+', version_str)[:3])
     if len(version_tuple) < 3:
       return None
@@ -379,6 +403,8 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
             severity=Severity.CRITICAL,
             cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
             title=f"MySQL authentication bypass confirmed (CVE-2012-2122)",
+            cve=("CVE-2012-2122",),
+            **probe_cve_fields("CVE-2012-2122"),
             description=f"MySQL {version_str} on {target}:{port} accepted login with a random password "
                         "due to CVE-2012-2122 memcmp truncation bug. Any attacker can gain root access.",
             evidence=f"Auth succeeded with random password on attempt (version {version_str})",

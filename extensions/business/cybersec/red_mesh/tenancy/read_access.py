@@ -16,6 +16,7 @@ _TENANT_OPERATIONS = frozenset({
   "reports:export",  # the JSON exports and export/publish effects
   "tasks:stop",  # stop_monitoring (RM-026 MVP; its own operation since 2026-09-30)
   "reports:review",  # approve/reject and the rulebook review mutations (2026-09-30)
+  "findings:triage",  # finding triage writes (RM-193, 2026-11-14); reads stay reports:view
   "evidence:read"})  # get_raw_model_test_evidence (RM-084 P2)
 
 

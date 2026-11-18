@@ -113,6 +113,15 @@ class TestRedMeshEventSchema(unittest.TestCase):
     self.assertEqual(event["finding"]["severity"], "INFO")
     self.assertEqual(event["finding"]["evidence"], {"safe": "summary"})
 
+  def test_triage_events_share_a_dedupe_key_only_for_the_same_change(self):
+    def key(status, entry_id):
+      finding = {"finding_id": "f1", "severity": "LOW", "triage_state": status, "triage_entry_id": entry_id}
+      return build_finding_event(self.job, finding=finding, event_action="triaged",
+                                 hmac_secret=self.secret)["dedupe_key"]
+
+    self.assertNotEqual(key("false_positive", "e1"), key("reopened", "e2"))
+    self.assertEqual(key("false_positive", "e1"), key("false_positive", "e1"))  # a retry of one change
+
   def test_export_status_event_uses_destination_without_secrets(self):
     event = build_export_status_event(
       self.job,
