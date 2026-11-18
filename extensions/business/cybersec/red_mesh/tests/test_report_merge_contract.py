@@ -121,6 +121,20 @@ class TestThreadMerge(unittest.TestCase):
     report = host._get_aggregated_report(_per_thread([_thread(0, range(1, 11), [22]), bad]))
     self.assertEqual(report, {})
 
+  def test_merge_failure_log_carries_no_report_content(self):
+    # Thread reports are merged before credential redaction, so the failure
+    # log names the field and types only, never report bodies.
+    host = _Host()
+    good = _thread(0, range(1, 11), [22])
+    good["accepted_credentials"] = ["admin:hunter2-secret"]
+    bad = _thread(1, range(11, 21), [25])
+    bad["correlation_findings"] = None
+    host._get_aggregated_report(_per_thread([good, bad]))
+    logged = " ".join(str(c) for c in host.P.call_args_list)
+    self.assertIn("correlation_findings", logged)
+    self.assertNotIn("hunter2-secret", logged)
+    self.assertNotIn("svc-0-22", logged)
+
 
 def _graybox_status(idx):
   return {
@@ -308,3 +322,31 @@ class TestWarmupRepairOnMergeFailure(unittest.TestCase):
 
     write.assert_not_called()
     self.assertEqual(spec["workers"]["node-A"]["result"], raw)
+
+  def _warmup_logs(self, spec, normalize=None):
+    from .test_api import TestPhase2PassFinalization  # local: a module import would collect it twice
+    Plugin = TestPhase2PassFinalization()._get_plugin_class()
+    plugin = MagicMock()
+    plugin.ee_addr = "node-A"
+    plugin.cfg_instance_id = "test-instance"
+    plugin.json_dumps = lambda obj, indent=None: json.dumps(obj, default=str, indent=indent)
+    plugin.trace_info.return_value = ""
+    plugin.chainstore_hgetall.return_value = {"job-1": spec}
+    plugin._normalize_job_record = normalize or MagicMock(side_effect=lambda key, value: (key, value))
+    plugin._get_aggregated_report = MagicMock(return_value={})
+    with patch.object(Plugin, "_write_job_record"):
+      Plugin._PentesterApi01Plugin__post_init(plugin)
+    return " ".join(str(c) for c in plugin.P.call_args_list)
+
+  def test_warmup_log_carries_no_job_record_content(self):
+    raw = {"RM-0": {"local_worker_id": "RM-0", "accepted_credentials": ["admin:hunter2-secret"]}}
+    spec = {"job_id": "job-1", "launcher": "node-A", "workers": {"node-A": {"result": raw}}}
+    logged = self._warmup_logs(spec)
+    self.assertIn("job-1", logged)
+    self.assertNotIn("hunter2-secret", logged)
+
+  def test_warmup_error_log_carries_no_job_record_content(self):
+    spec = {"job_id": "job-1", "workers": {"node-A": {"result": {"accepted_credentials": ["admin:hunter2-secret"]}}}}
+    logged = self._warmup_logs(spec, normalize=MagicMock(side_effect=RuntimeError("bad record")))
+    self.assertIn("bad record", logged)
+    self.assertNotIn("hunter2-secret", logged)

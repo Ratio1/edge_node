@@ -624,10 +624,9 @@ class _ReportMixin:
       # endif we have local jobs
     except Exception as exc:
       if log_details:
-        self.P("Error during report aggregation: {}:\n{}\n{}\ntype_or_func={}, field={}".format(
-          exc, self.trace_info(),
-          self.json_dumps(dct_aggregated_report, indent=2),
-          type_or_func, field
+        # No report bodies: thread reports are not credential-redacted yet.
+        self.P("Error during report aggregation: {}:\n{}\ntype_or_func={}, field={}".format(
+          exc, self.trace_info(), type_or_func, field
         ))
       else:
         self.P("Manual report aggregation failed", color='y')
