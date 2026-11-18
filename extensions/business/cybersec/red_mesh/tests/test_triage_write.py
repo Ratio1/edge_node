@@ -225,6 +225,43 @@ class TestTriageWrite(unittest.TestCase):
     retry, _ = write(self.owner, ids=["f1", "f2"], status="remediated")
     self.assertEqual([r["outcome"] for r in retry["results"]], ["unchanged", "updated"])
 
+  def _refuse_writes_to(self, hkey):
+    """The store refuses (returns False) every write to `hkey`, as CStore does when it cannot store a key."""
+    real = self.owner.chainstore_hset
+
+    def refusing(**kwargs):
+      if kwargs["hkey"] == hkey:
+        return False
+      return real(**kwargs)
+    self.owner.chainstore_hset = refusing
+
+  def test_a_refused_state_write_is_reported_and_nothing_follows_it(self):
+    self.owner.hashes["inst"]["job-1"]["soc_event_status"] = {}
+    self._refuse_writes_to(self.hkey)
+    with patch.object(triage, "_write_job_record") as soc_write:
+      result, emit = write(self.owner, ids=["f1", "f2"])
+    self.assertEqual([(r["finding_id"], r["outcome"], r.get("retryable")) for r in result["results"]],
+                     [("f1", "write_failed", True), ("f2", "write_failed", True)])
+    self.assertFalse(result["complete"])
+    emit.assert_not_called()
+    soc_write.assert_not_called()
+    self.assertEqual(self.owner.audit, [])
+    self.assertNotIn(f"inst:triage:audit:{TENANT_A}", self.owner.hashes)
+
+  def test_a_refused_audit_write_is_reported(self):
+    self._refuse_writes_to(f"inst:triage:audit:{TENANT_A}")
+    result, emit = write(self.owner, ids="f1")
+    self.assertEqual([(r["outcome"], r.get("retryable")) for r in result["results"]], [("write_failed", True)])
+    self.assertFalse(result["complete"])
+    emit.assert_not_called()
+
+  def test_a_refused_write_leaves_the_ledger_unpersisted(self):
+    self._refuse_writes_to(self.hkey)
+    ledger = EffectLedger()
+    with patch.object(triage, "emit_finding_event"):
+      triage.update_finding_triage(self.owner, "job-1", "f1", "remediated", actor="a", ledger=ledger)
+    self.assertNotEqual(ledger.state, EffectState.PERSISTED)
+
 
 if __name__ == "__main__":
   unittest.main()

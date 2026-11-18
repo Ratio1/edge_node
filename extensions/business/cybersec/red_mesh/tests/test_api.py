@@ -5385,7 +5385,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       {"fin-job": stub}.get(key) if hkey == "test-instance" else rows.get((hkey, key)))
     plugin.chainstore_hgetall.side_effect = lambda hkey: (
       {"fin-job": stub} if hkey == "test-instance" else {k: v for (h, k), v in rows.items() if h == hkey})
-    plugin.chainstore_hset.side_effect = lambda hkey, key, value: rows.__setitem__((hkey, key), value)
+    plugin.chainstore_hset.side_effect = lambda hkey, key, value: rows.__setitem__((hkey, key), value) or True
     plugin.chainstore_hkeys.side_effect = lambda hkey: [k for (h, k) in rows if h == hkey]
 
     result = update_finding_triage(plugin, "fin-job", "f-1", "accepted_risk", note="Approved by analyst",

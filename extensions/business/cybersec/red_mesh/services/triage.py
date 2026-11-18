@@ -7,6 +7,7 @@ from ..model_testing.artifacts import ModelTestArchive
 from ..model_testing.constants import is_model_test_job
 from ..models import FindingTriageAuditEntry, FindingTriageState, JobArchive, VALID_TRIAGE_STATUSES
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..repositories.cstore import TriageStoreError
 from ..tenancy.administration import AdministrationDenied
 from ..tenancy.job_artifacts import (
   MAX_ARTIFACT_REFERENCES, TenantJobArtifacts, checked_job_snapshot, validate_snapshot_mode,
@@ -300,15 +301,20 @@ def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, 
       continue
     if ledger is not None:
       ledger.checkpoint()
-    state_payload = repo.put_host_triage(FindingTriageState(
-      job_id=job_id, finding_id=finding_id, status=status, note=note or "", actor=actor or "", updated_at=now,
-      review_at=review_at or None, tenant_id=tenant_id, host=host,
-      confirmed=confirmed, confirmed_by=confirmed_by))
-    if ledger is not None:
-      ledger.record(EffectState.PERSISTED)
-    audit_payload = repo.append_host_triage_audit(FindingTriageAuditEntry(
-      job_id=job_id, finding_id=finding_id, status=status, note=note or "", actor=actor or "",
-      timestamp=owner.time(), tenant_id=tenant_id, host=host))
+    try:
+      state_payload = repo.put_host_triage(FindingTriageState(
+        job_id=job_id, finding_id=finding_id, status=status, note=note or "", actor=actor or "", updated_at=now,
+        review_at=review_at or None, tenant_id=tenant_id, host=host,
+        confirmed=confirmed, confirmed_by=confirmed_by))
+      if ledger is not None:
+        ledger.record(EffectState.PERSISTED)
+      audit_payload = repo.append_host_triage_audit(FindingTriageAuditEntry(
+        job_id=job_id, finding_id=finding_id, status=status, note=note or "", actor=actor or "",
+        timestamp=owner.time(), tenant_id=tenant_id, host=host))
+    except TriageStoreError:
+      # The store did not confirm the write: report it, never a success; a retry finishes the member.
+      results.append({"finding_id": finding_id, "outcome": "write_failed", "retryable": True})
+      continue
     if hasattr(owner, "_log_audit_event"):
       owner._log_audit_event("finding_triage_updated", {
         "job_id": job_id, "finding_id": finding_id, "status": status, "actor": actor or ""})

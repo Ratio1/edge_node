@@ -24,6 +24,7 @@ class _Store:
       self.hashes.get(hkey, {}).pop(key, None)
     else:
       self.hashes.setdefault(hkey, {})[key] = value
+    return True
 
   def chainstore_hget(self, hkey, key):
     return self.hashes.get(hkey, {}).get(key)
@@ -90,7 +91,7 @@ class TestHostTriageStore(unittest.TestCase):
     (field,) = self.owner.hashes[f"inst:triage:audit:{TENANT_A}"]
     writes = []
     real = self.owner.chainstore_hset
-    self.owner.chainstore_hset = lambda hkey, key, value: (writes.append(key), real(hkey, key, value))
+    self.owner.chainstore_hset = lambda hkey, key, value: (writes.append(key), real(hkey, key, value))[1]
     self.repo.append_host_triage_audit(FindingTriageAuditEntry(
       job_id="job-2", finding_id="f1", status="remediated", timestamp=2.0, tenant_id=TENANT_A, host="h"))
     self.assertEqual(len(writes), 1)

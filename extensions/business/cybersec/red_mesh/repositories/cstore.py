@@ -15,6 +15,10 @@ from ..models import (
 from ..tenancy.execution import triage_scope
 
 
+class TriageStoreError(RuntimeError):
+  """CStore did not confirm a triage state or audit write (`chainstore_hset` returned other than True)."""
+
+
 RUNNING_JOB_REQUIRED_FIELDS = {
   "job_id",
   "job_status",
@@ -332,11 +336,13 @@ class JobStateRepository:
   def put_host_triage(self, triage):
     """Store a state that names its tenant and host; returns the stored payload."""
     payload = (triage if isinstance(triage, FindingTriageState) else FindingTriageState.from_dict(triage)).to_dict()
-    self.owner.chainstore_hset(
+    written = self.owner.chainstore_hset(
       hkey=self.host_triage_hkey(payload.get("tenant_id")),
       key=self.host_triage_key(payload.get("host"), payload["finding_id"]),
       value=payload,
     )
+    if written is not True:
+      raise TriageStoreError("Triage state write was not confirmed")
     return payload
 
   # The audit is append-only: one field per entry, so nodes writing the same (tenant, host, finding) never
@@ -375,8 +381,10 @@ class JobStateRepository:
     tenant_id, host = payload.get("tenant_id"), payload.get("host")
     hkey = self.host_triage_audit_hkey(tenant_id)
     entry_id = f"{int(payload.get('timestamp', 0) * 1000):015d}-{secrets.token_hex(4)}"
-    self.owner.chainstore_hset(
+    written = self.owner.chainstore_hset(
       hkey=hkey, key=f"{self.host_triage_audit_prefix(host, payload['finding_id'])}{entry_id}", value=payload)
+    if written is not True:
+      raise TriageStoreError("Triage audit write was not confirmed")
     try:
       old = self._host_audit_fields(tenant_id, host, payload["finding_id"])[:-self.HOST_AUDIT_KEEP]
       for field in old[-self._HOST_AUDIT_HEAL:]:
