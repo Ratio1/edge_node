@@ -587,9 +587,6 @@ class _ReportMixin:
               type_or_func = aggregation_fields[field]
               existing, new = dct_aggregated_report[field], local_job_status[field]
               if isinstance(existing, (list, dict)):
-                if type(new) is not type(existing):
-                  # merge_objects_deep keeps `new` on a type conflict, so a null field would erase the merged one
-                  raise TypeError(f"{field}: cannot merge {type(new).__name__} into {type(existing).__name__}")
                 merged = self.merge_objects_deep(existing, new)
                 if isinstance(merged, list):
                   try:
@@ -680,8 +677,13 @@ class _ReportMixin:
         return merged
     elif isinstance(obj_a, set) and isinstance(obj_b, set):
       return obj_a.union(obj_b)
+    elif obj_b is None or obj_a is None:
+      return obj_a if obj_b is None else obj_b  # null is "no data": never erases the other side
+    elif isinstance(obj_a, (dict, list, set)) or isinstance(obj_b, (dict, list, set)):
+      # A container against another type would erase one side: fail the merge.
+      raise TypeError(f"cannot merge {type(obj_b).__name__} into {type(obj_a).__name__}")
     else:
-      return obj_b  # Prefer obj_b in case of conflict
+      return obj_b  # Prefer obj_b in case of a scalar conflict
 
   def _redact_report(self, report):
     """

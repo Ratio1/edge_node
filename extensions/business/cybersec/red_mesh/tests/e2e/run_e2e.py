@@ -375,6 +375,8 @@ def assert_pass_coverage(archive: dict) -> list[str]:
   nodes = pr.get("worker_reports") or {}
   threads_by_node = {a: (e or {}).get("threads") or {} for a, e in (pr.get("worker_scan_metrics") or {}).items()}
   failures += [f"{addr}: thread metrics but no node report" for addr in sorted(set(threads_by_node) - set(nodes))]
+  assigned = set((archive.get("job_config") or {}).get("selected_peers") or [])  # a node missing from both maps
+  failures += [f"{addr}: assigned but no node report" for addr in sorted(assigned - set(nodes) - set(threads_by_node))]
   for addr, node in nodes.items():
     threads = threads_by_node.get(addr)
     if not threads:
@@ -468,7 +470,7 @@ def main() -> int:
                       help="Per-scenario bounded wait for scan/report finalization.")
   parser.add_argument("--poll-timeout", type=int, default=15,
                       help="Per-request timeout for control-plane polling.")
-  parser.add_argument("--threads", type=int, default=1,
+  parser.add_argument("--threads", type=int, default=4,  # >1 so the thread merge is exercised
                       help="Local scan threads per node (nr_local_workers) for the blackbox scenario.")
   args = parser.parse_args()
 

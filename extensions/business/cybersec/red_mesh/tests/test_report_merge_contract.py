@@ -112,13 +112,37 @@ class TestThreadMerge(unittest.TestCase):
       report = host._get_aggregated_report(_per_thread(statuses))
     self.assertEqual(report, {})
 
-  def test_type_mismatch_fails_instead_of_overwriting(self):
-    # A peer report with `correlation_findings: null` must not erase the
-    # findings already merged: the merge fails as a whole.
+  def test_null_field_does_not_erase_merged_findings(self):
+    # A peer report with `correlation_findings: null` has no data for the field.
     host = _Host()
     bad = _thread(1, range(11, 21), [25])
     bad["correlation_findings"] = None
     report = host._get_aggregated_report(_per_thread([_thread(0, range(1, 11), [22]), bad]))
+    self.assertEqual([f["title"] for f in report["correlation_findings"]], ["corr-0"])
+
+  def test_type_mismatch_fails_instead_of_overwriting(self):
+    host = _Host()
+    bad = _thread(1, range(11, 21), [25])
+    bad["correlation_findings"] = "not-a-list"
+    report = host._get_aggregated_report(_per_thread([_thread(0, range(1, 11), [22]), bad]))
+    self.assertEqual(report, {})
+
+  def test_nested_null_does_not_erase_findings(self):
+    # Same port and probe in two threads (MIRROR), the second with `findings: null`.
+    host = _Host()
+    a = _thread(0, range(1, 11), [22])
+    b = _thread(1, range(11, 21), [])
+    b["service_info"] = {"22": {"_service_info_x": {"findings": None}}}
+    report = host._get_aggregated_report(_per_thread([a, b]))
+    titles = [f["title"] for f in report["service_info"]["22"]["_service_info_x"]["findings"]]
+    self.assertEqual(titles, ["svc-0-22"])
+
+  def test_nested_type_mismatch_fails_instead_of_overwriting(self):
+    host = _Host()
+    a = _thread(0, range(1, 11), [22])
+    b = _thread(1, range(11, 21), [])
+    b["service_info"] = {"22": {"_service_info_x": {"findings": "oops"}}}
+    report = host._get_aggregated_report(_per_thread([a, b]))
     self.assertEqual(report, {})
 
   def test_merge_failure_log_carries_no_report_content(self):
@@ -128,7 +152,7 @@ class TestThreadMerge(unittest.TestCase):
     good = _thread(0, range(1, 11), [22])
     good["accepted_credentials"] = ["admin:hunter2-secret"]
     bad = _thread(1, range(11, 21), [25])
-    bad["correlation_findings"] = None
+    bad["correlation_findings"] = "not-a-list"
     host._get_aggregated_report(_per_thread([good, bad]))
     logged = " ".join(str(c) for c in host.P.call_args_list)
     self.assertIn("correlation_findings", logged)
@@ -345,8 +369,80 @@ class TestWarmupRepairOnMergeFailure(unittest.TestCase):
     self.assertIn("job-1", logged)
     self.assertNotIn("hunter2-secret", logged)
 
+  def test_warmup_invalid_record_log_carries_no_job_record_content(self):
+    # The real normalizer rejects a record without a launcher: (None, None).
+    from .test_api import TestPhase2PassFinalization  # local: a module import would collect it twice
+    Plugin = TestPhase2PassFinalization()._get_plugin_class()
+    spec = {"job_id": "job-1", "workers": {"node-A": {"result": {"accepted_credentials": ["admin:hunter2-secret"]}}}}
+    plugin_normalize = lambda key, value: Plugin._normalize_job_record(MagicMock(), key, value)
+    self.assertEqual(plugin_normalize("job-1", spec), (None, None))
+    logged = self._warmup_logs(spec, normalize=MagicMock(side_effect=plugin_normalize))
+    self.assertIn("job-1", logged)
+    self.assertNotIn("hunter2-secret", logged)
+
   def test_warmup_error_log_carries_no_job_record_content(self):
     spec = {"job_id": "job-1", "workers": {"node-A": {"result": {"accepted_credentials": ["admin:hunter2-secret"]}}}}
     logged = self._warmup_logs(spec, normalize=MagicMock(side_effect=RuntimeError("bad record")))
     self.assertIn("bad record", logged)
+    self.assertNotIn("hunter2-secret", logged)
+
+
+class TestRuntimeLogsCarryNoReportContent(unittest.TestCase):
+  """Thread reports are unredacted until `_close_job` persists them, and job
+  records can hold raw legacy results: runtime logs carry identifiers only."""
+
+  def _plugin(self):
+    from .test_api import TestPhase2PassFinalization  # local: a module import would collect it twice
+    Plugin = TestPhase2PassFinalization()._get_plugin_class()
+    plugin = MagicMock()
+    plugin.ee_addr = "node-A"
+    plugin.cfg_instance_id = "test-instance"
+    plugin.global_shmem = {}
+    plugin.json_dumps = lambda obj, indent=None: json.dumps(obj, default=str, indent=indent)
+    plugin.trace_info.return_value = ""
+    return Plugin, plugin
+
+  def _logged(self, plugin):
+    return " ".join(str(c) for c in plugin.P.call_args_list + plugin.Pd.call_args_list)
+
+  def test_close_job_log_omits_job_record(self):
+    Plugin, plugin = self._plugin()
+    plugin._normalize_job_record = MagicMock(side_effect=lambda job_id, raw: (job_id, raw))
+    plugin._count_all_findings = MagicMock(return_value=0)
+    plugin._get_aggregated_report = MagicMock(return_value={})
+    w = MagicMock()
+    w.get_status.return_value = {"local_worker_id": "RM-0"}
+    plugin.scan_jobs = {"job-1": {"RM-0": w}}
+    job_specs = {"job_id": "job-1", "target": "example.com", "workers": {
+      "node-A": {"start_port": 1, "end_port": 20},
+      "node-B": {"result": {"accepted_credentials": ["admin:hunter2-secret"]}},
+    }}
+    plugin._get_job_state_repository.return_value.get_job.return_value = job_specs
+    plugin.chainstore_hget.return_value = job_specs
+    with patch.object(Plugin, "_mark_worker_terminal_error"):
+      Plugin._close_job(plugin, "job-1")
+    logged = self._logged(plugin)
+    self.assertIn("job-1", logged)
+    self.assertNotIn("hunter2-secret", logged)
+
+  def test_finished_thread_log_omits_thread_report(self):
+    Plugin, plugin = self._plugin()
+    w = MagicMock()
+    w.thread.is_alive.return_value = False
+    w.get_status.return_value = {"target": "example.com", "accepted_credentials": ["admin:hunter2-secret"]}
+    plugin.scan_jobs = {"job-1": {"RM-0": w}}
+    plugin.completed_jobs_reports = {}
+    plugin.lst_completed_jobs = []
+    Plugin._maybe_close_jobs(plugin)
+    logged = self._logged(plugin)
+    self.assertIn("RM-0", logged)
+    self.assertNotIn("hunter2-secret", logged)
+
+  def test_foreign_job_debug_log_omits_worker_entries(self):
+    Plugin, plugin = self._plugin()
+    plugin._foreign_jobs_logged = set()
+    spec = {"workers": {"node-B": {"result": {"accepted_credentials": ["admin:hunter2-secret"]}}}}
+    Plugin._get_worker_entry(plugin, "job-1", spec)
+    logged = self._logged(plugin)
+    self.assertIn("job-1", logged)
     self.assertNotIn("hunter2-secret", logged)
