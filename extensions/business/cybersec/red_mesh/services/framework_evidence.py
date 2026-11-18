@@ -90,13 +90,15 @@ def suggest(owner, tenant_id, pack_id, pack, level, assessment_revision, jobs, *
   """Suggestions for one draft from the tenant's most recent finalized scans; cached briefly."""
   now = time.time() if now is None else now
   selected = _finalized(jobs)[:MAX_JOBS]
+  # Read before the cache lookup and keyed on, so a triage change shows at once, not after the TTL.
+  triage = {job_id: _host_triage(owner, record) for job_id, record in selected}
   key = (getattr(owner, "cfg_tenancy_namespace", None), tenant_id, pack_id,
-         _digest(level, assessment_revision, selected))
+         _digest(level, assessment_revision, selected, triage))
   with _cache_lock:
     hit = _cache.get(key)
     if hit is not None and hit[0] > now:
       return deepcopy(hit[1])
-  data = _compute(owner, pack_id, pack, level, selected, now)
+  data = _compute(owner, pack_id, pack, level, selected, triage, now)
   data["jobsAvailable"] = len(_finalized(jobs))
   with _cache_lock:
     if len(_cache) >= CACHE_MAX:
@@ -126,14 +128,23 @@ def _iso(epoch):
     return None
 
 
-def _digest(level, assessment_revision, selected):
+def _host_triage(owner, record):
+  """The host triage map of the job's own tenant and host; `{}` when it cannot be read."""
+  try:
+    return _job_repo(owner).list_triage_for_record(record) or {}
+  except Exception:
+    return {}
+
+
+def _digest(level, assessment_revision, selected, triage):
   material = json.dumps([level, assessment_revision,
-                         [(job_id, record.get("date_completed"), record.get("job_cid")) for job_id, record in selected]],
+                         [(job_id, record.get("date_completed"), record.get("job_cid")) for job_id, record in selected],
+                         sorted(triage.items())],
                         sort_keys=True, default=str)
   return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
-def _compute(owner, pack_id, pack, level, selected, now):
+def _compute(owner, pack_id, pack, level, selected, triage, now):
   mapped = mapped_controls(pack_id, controls_for_level(pack, level))
   candidate = candidate_presentation(pack_id)
   kinds = sorted(set(mapped.values()))
@@ -147,10 +158,7 @@ def _compute(owner, pack_id, pack, level, selected, now):
       skipped += 1
       continue
     considered += 1
-    try:
-      triage_map = _job_repo(owner).list_job_triage(job_id) or {}
-    except Exception:
-      triage_map = {}
+    triage_map = triage.get(job_id) or {}
     pass_data = ctx["pass_data"]
     pass_nr = pass_data.get("pass_nr") if type(pass_data.get("pass_nr")) is int else 1
     findings = actionable_findings(pass_data.get("findings"), triage_map)

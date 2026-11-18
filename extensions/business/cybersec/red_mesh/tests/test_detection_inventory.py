@@ -31,6 +31,15 @@ class TestDetectionInventory(unittest.TestCase):
     self.assertGreaterEqual(counts["graybox"], 103)
     self.assertGreaterEqual(counts["cves"], 200)
 
+  def test_cves_without_a_probe_are_counted_apart(self):
+    """Dead product keys keep their rows and their count, and are reported as not probe-reachable."""
+    inventory = build_detection_inventory()
+    self.assertEqual(inventory.counts()["cves_not_probe_reachable"], len(inventory.not_probe_reachable))
+    self.assertGreater(len(inventory.not_probe_reachable), 0)
+    self.assertLessEqual(inventory.not_probe_reachable, inventory.cves)
+    self.assertIn("CVE:CVE-2017-5638", inventory.not_probe_reachable)  # struts2
+    self.assertNotIn("CVE:CVE-2021-41773", inventory.not_probe_reachable)  # apache
+
   def test_detection_ids_are_unique(self):
     inventory = build_detection_inventory()
     self.assertEqual(len(inventory.cves), inventory.counts()["cves"])

@@ -464,6 +464,27 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       return None
     return {"system": system, "findings": walk_findings}
 
+  # version.bind answer -> cve_db product key. First match wins; the plain
+  # BIND shape (`9.18.24-S1`, `9.10.3-P4-Debian`, `BIND 9.16.1`) comes last.
+  _DNS_PRODUCT_PATTERNS = [
+    (_re.compile(r'dnsmasq[-/\s]*(\d+\.\d+(?:\.\d+)*)', _re.IGNORECASE), "dnsmasq"),
+    (_re.compile(r'(?:pdns|powerdns)[^\d]*(\d+\.\d+(?:\.\d+)*)', _re.IGNORECASE), "powerdns"),
+    (_re.compile(r'unbound[-/\s]*(\d+\.\d+(?:\.\d+)*)', _re.IGNORECASE), "unbound"),
+    (_re.compile(r'^\s*(?:BIND\s+)?(9\.\d+(?:\.\d+)*(?:-[SP]\d+)?)', _re.IGNORECASE), "bind"),
+  ]
+
+  def _dns_identify_product(self, txt):
+    """Map a version.bind answer to ``(product, version)``, or ``(None, None)``.
+
+    Only a BIND-shaped answer yields ``bind``; the BIND edition tag (`-S1`) and
+    patch level (`-P4`) are kept because they are different builds.
+    """
+    for pattern, product in self._DNS_PRODUCT_PATTERNS:
+      m = pattern.search(txt)
+      if m:
+        return product, m.group(1)
+    return None, None
+
   @register_probe(
     display_name="DNS service detection",
     description=(
@@ -541,10 +562,12 @@ class _ServiceInfraMixin(_ServiceProbeBase):
                     confidence="certain",
                   ))
                   parsed = True
-                  # CVE check — version.bind is BIND-specific
-                  _bind_m = _re.search(r'(\d+\.\d+(?:\.\d+)*)', txt)
-                  if _bind_m:
-                    findings += check_cves("bind", _bind_m.group(1))
+                  # CVE check — only for the product the answer names. Any
+                  # server answers version.bind; dnsmasq, PowerDNS and Unbound
+                  # must not be matched against BIND CVEs.
+                  _dns_product, _dns_version = self._dns_identify_product(txt)
+                  if _dns_product and _dns_version:
+                    findings += check_cves(_dns_product, _dns_version)
 
       # Fallback: check raw data for version keywords
       if not parsed:

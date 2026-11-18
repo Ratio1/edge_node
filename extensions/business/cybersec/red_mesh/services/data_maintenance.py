@@ -45,6 +45,8 @@ _TERMINAL = (JOB_STATUS_FINALIZED, JOB_STATUS_STOPPED, JOB_STATUS_FAILED)
 _CID = re.compile(r"(?:Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{58,})\Z")
 _FILENAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}\Z")
 _TENANT_STATUS_HKEY = re.compile(r":integrations:(tn_[0-9a-f-]{36})\Z")
+# RM-169 step 4a: host-scoped finding triage and its audit log, one hkey per tenant (not per job).
+_TENANT_TRIAGE_HKEY = re.compile(r":triage:(t|audit):(tn_[0-9a-f-]{36})\Z")
 # Keys that hold a file reference. `ref` is a tenant document; `cid` a rulebook submission.
 _REFERENCE_KEYS = frozenset({"cid", "ref", "secret_ref", "model_provider_secret_ref", "authorization_ref"})
 # Per-job hkeys: suffix, the stored value type, and whether the field is `<job_id>:<rest>`.
@@ -236,6 +238,8 @@ class Inventory:
     names = [self._instance] + [self._instance + suffix for suffix, _, _ in _PER_JOB]
     names.append(f"{self._instance}:integrations")
     names.extend(f"{self._instance}:integrations:{tenant}" for tenant in self.tenant_ids())
+    for tenant in self.tenant_ids():
+      names.extend([f"{self._instance}:triage:t:{tenant}", f"{self._instance}:triage:audit:{tenant}"])
     # RM-127: each node's self-published public IP, keyed by the node's address.
     names.append(f"{self._instance}:node_info")
     names.extend([self._tenancy_hkey, self._compliance_hkey, self._account_hkey])
@@ -247,7 +251,8 @@ class Inventory:
       return False
     prefix = f"{self._instance}:integrations:"
     return (hkey in self.hkeys()
-            or hkey.startswith(prefix) and _TENANT_STATUS_HKEY.match(hkey[len(self._instance):]) is not None)
+            or hkey.startswith(prefix) and _TENANT_STATUS_HKEY.match(hkey[len(self._instance):]) is not None
+            or self._triage_tenant(hkey) is not None)
 
   def is_account_hkey(self, hkey):
     return hkey == self._account_hkey
@@ -395,6 +400,37 @@ class Inventory:
       return OLD, "unrecognized"
     return CURRENT, ""
 
+  def _triage_tenant(self, hkey):
+    """`(kind, tenant_id)` of a host-triage hkey of this instance (`t` rows, `audit` rows), else None."""
+    if not isinstance(hkey, str) or not hkey.startswith(self._instance):
+      return None
+    match = _TENANT_TRIAGE_HKEY.fullmatch(hkey[len(self._instance):])
+    return (match.group(1), match.group(2)) if match else None
+
+  def _triage_class(self, kind, tenant_id, field, value):
+    """A row is current while its tenant is live, its field names a host and finding, and the value has the
+    shape and identity the writer stores; with the tenant gone it is an orphan (or old when the tenant row is
+    stored but not current), as an integration status row is."""
+    if tenant_id not in self._live_tenants():
+      stored = any(k == "tenant" and ids == [tenant_id] and row is not None
+                   for _, k, ids, row in self._tenancy_fields())
+      return (OLD, "old_tenant") if stored else (ORPHAN, "tenant_gone")
+    return (CURRENT, "") if self._triage_identity_ok(kind, tenant_id, field, value) else (OLD, "unrecognized")
+
+  @staticmethod
+  def _triage_identity_ok(kind, tenant_id, field, value):
+    """A `t` row is `host, finding`; an audit entry is `host, finding, entry id`; the value must name the same
+    tenant, host and finding, as the writer stores it (a restored row is read by unchecked readers)."""
+    parts = field.split("\x1f") if isinstance(field, str) else []
+    return (len(parts) == (2 if kind == "t" else 3) and all(parts) and isinstance(value, dict)
+            and value.get("tenant_id") == tenant_id and value.get("host") == parts[0]
+            and value.get("finding_id") == parts[1])
+
+  def is_mismatched_triage(self, hkey, field, value):
+    """A host-triage row whose field or value does not match its hkey: a restore never writes it."""
+    triage = self._triage_tenant(hkey)
+    return triage is not None and not self._triage_identity_ok(*triage, field, value)
+
   def is_status_hkey(self, hkey):
     return isinstance(hkey, str) and hkey.startswith(f"{self._instance}:integrations")
 
@@ -419,6 +455,9 @@ class Inventory:
       return self._compliance_class(field, value)
     if self.is_status_hkey(hkey):
       return self._status_class(hkey, field, value)
+    triage = self._triage_tenant(hkey)
+    if triage:
+      return self._triage_class(*triage, field, value)
     if hkey == f"{self._instance}:node_info":
       return (CURRENT, "") if isinstance(value, dict) and set(value) == {"ip", "published_at"} else (OLD, "unrecognized")
     raise MaintenanceError(400, "invalid_request")
@@ -793,6 +832,17 @@ def _clean_row(owner, inventory, target, delete_file, job_id=None):
   return result
 
 
+def _is_pruned_triage_audit(owner, inventory, listed, hkey, field):
+  """A triage audit entry the prune tombstoned: the field is listed but reads None. A backup taken before the
+  prune must not bring it back outside the kept window."""
+  triage = inventory._triage_tenant(hkey)
+  if triage is None or triage[0] != "audit":
+    return False
+  if hkey not in listed:
+    listed[hkey] = set(owner.chainstore_hkeys(hkey=hkey) or [])
+  return field in listed[hkey] and owner.chainstore_hget(hkey=hkey, key=field) is None
+
+
 def restore_records(owner, inventory, rows):
   if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_TARGETS:
     raise MaintenanceError(400, "invalid_request")
@@ -802,11 +852,14 @@ def restore_records(owner, inventory, rows):
         or not isinstance(row["hkey"], str) or not isinstance(row["field"], str)
         or not row["field"] or row["value"] is None):
       raise MaintenanceError(400, "invalid_request")
+  tombstoned = {}  # audit hkey -> its fields as listed: a listed field that reads None was pruned
   for row in rows:
     hkey, field, value = row["hkey"], row["field"], row["value"]
     outcome = "written"
     if (not inventory.accepts(hkey) or inventory.is_retired_field(hkey, field)
-        or inventory.is_unreadable_override(hkey, field, value)):
+        or inventory.is_unreadable_override(hkey, field, value)
+        or inventory.is_mismatched_triage(hkey, field, value)
+        or _is_pruned_triage_audit(owner, inventory, tombstoned, hkey, field)):
       outcome = "refused"
     else:
       stored = owner.chainstore_hget(hkey=hkey, key=field)

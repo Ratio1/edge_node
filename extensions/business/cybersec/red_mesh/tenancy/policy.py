@@ -20,6 +20,9 @@ _ROLE_OPERATIONS = {
     # Owner, 2026-09-30: stopping a job and approving/rejecting its report belong to whoever may
     # launch, under the same Allow Pentester rule (below). Both used to ride on reports:export.
     "tasks:stop", "reports:review",
+    # RM-193 (owner, 2026-11-14): finding triage writes are held by exactly the roles that hold
+    # reports:review, with the same Allow Pentester binding and no reviewer designation; reads stay reports:view.
+    "findings:triage",
     # RM-078. analysis:run is an operator action; allow_pentester binds it below as it binds launch;
     # engagement:delete and jobs:purge are administrative and do not.
     "analysis:run", "engagement:delete", "jobs:purge",
@@ -40,7 +43,7 @@ _ROLE_OPERATIONS = {
   "super_pentester": frozenset({
     "allow_pentester:update", "tasks:launch", "tasks:update",
     "reports:view", "reports:export", "evidence:read", "analysis:run", "authorization:upload",
-    "tasks:stop", "reports:review",
+    "tasks:stop", "reports:review", "findings:triage",
     # Reads an engagement's documents (owner Q5); creating, revoking and uploading are STA only.
     "engagements:documents",
   }),
@@ -51,18 +54,18 @@ _ROLE_OPERATIONS = {
     "compliance_assessments:view", "compliance_assessments:manage", "compliance_assessments:review",
     # RM-155 (owner, 2026-11-03): a Tenant Admin may review under the same conditions as the others:
     # the Super-Tenant Admin's designation and the tenant's Allow Pentester switch.
-    "reports:review",
+    "reports:review", "findings:triage",
   }),
   "tenant_pentester": frozenset({"tasks:launch", "tasks:update", "reports:view", "reports:export",
                                  "analysis:run", "authorization:upload", "tasks:stop",
-                                 "reports:review"}),
+                                 "reports:review", "findings:triage"}),
   "tenant_user": frozenset({"reports:view", "compliance_assessments:view"}),
 }
 _PLATFORM_ROLES = frozenset({"super_tenant_admin", "super_pentester"})
 # Operations Allow Pentester binds the way it binds launch: the tenant roles need the switch on, the
 # platform roles are exempt. RM-078 analysis and the 2026-09-30 stop/review split (owner).
 _LAUNCH_BOUND_OPERATIONS = frozenset({
-  "tasks:launch", "tasks:update", "analysis:run", "tasks:stop", "reports:review"})
+  "tasks:launch", "tasks:update", "analysis:run", "tasks:stop", "reports:review", "findings:triage"})
 # The role vocabularies other modules validate against, derived from the matrix so they cannot drift.
 PLATFORM_ROLES = _PLATFORM_ROLES
 TENANT_LOCAL_ROLES = frozenset(_ROLE_OPERATIONS) - _PLATFORM_ROLES

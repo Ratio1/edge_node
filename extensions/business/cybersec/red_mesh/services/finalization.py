@@ -544,11 +544,19 @@ def maybe_finalize_pass(owner):
 
       risk_score = 0
       flat_findings = []
+      host_triage = {}
       risk_result = None
       abort_state = _pass_abort_state(aggregated, node_reports)
       empty_abort = bool(abort_state and abort_state["empty"])
       if aggregated:
-        risk_result, flat_findings = owner._compute_risk_and_findings(aggregated)
+        # The host triage map (report-findings.md §Triage): a closed finding leaves this pass's score and a
+        # confirmed possible one is scored certain. A failed read scores as if nothing were triaged.
+        try:
+          host_triage = _job_repo(owner).list_triage_for_record(job_specs)
+        except Exception as exc:
+          owner.P(f"[FINALIZE] {job_id} host triage unavailable: {type(exc).__name__}", color='y')
+          host_triage = {}
+        risk_result, flat_findings = owner._compute_risk_and_findings(aggregated, host_triage)
         risk_score = risk_result["score"]
         if empty_abort:
           # Nothing was tested, so there is nothing to score. The flat findings
@@ -602,6 +610,7 @@ def maybe_finalize_pass(owner):
               owner._run_structured_report_sections,
               job_id=job_id,
               findings=flat_findings,
+              triage=host_triage,  # the live host map: closes and confirms findings for the analysis only
               aggregated_report=aggregated,
               engagement=(
                 job_config.get("engagement")

@@ -99,6 +99,7 @@ class _CorrelationMixin:
     if meta:
       findings += self._correlate_port_ratio()
       findings += self._correlate_os_consistency()
+      findings += self._correlate_banner_authenticity()
       findings += self._correlate_infrastructure_leak()
       findings += self._correlate_tls_consistency()
       findings += self._correlate_timezone_drift()
@@ -187,6 +188,37 @@ class _CorrelationMixin:
         cwe_id="CWE-345",
         confidence="firm",
       ))
+    return findings
+
+  @register_probe(
+    display_name="Honeypot indicator (banner authenticity)",
+    description=(
+      "Flag services whose announced implementation contradicts their protocol "
+      "behaviour (SSH KEXINIT, SMTP EHLO): an emulator announcing a real version."
+    ),
+    category=CATEGORY_CORRELATION,
+    default_cwe=(345,),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N",
+  )
+  def _correlate_banner_authenticity(self):
+    """Flag honeypot if one or more services were marked `banner_unverified` by their probe (RM-200)."""
+    findings = []
+    meta = self.state.get("scan_metadata", {})
+    unverified = meta.get("banner_unverified", {})
+    if not unverified:
+      return findings
+    findings.append(Finding(
+      severity=Severity.HIGH,
+      title="Honeypot indicator: service banner contradicted by protocol behaviour",
+      description="One or more services announce an implementation and version that their own protocol "
+                  "behaviour contradicts. Emulators and proxies do this; the announced versions cannot be "
+                  "trusted, so CVEs matched on them are reported as unconfirmed.",
+      evidence="; ".join(f"{source}: {why}" for source, why in sorted(unverified.items())),
+      remediation="Verify this is a legitimate host before relying on scan results.",
+      cwe_id="CWE-345",
+      confidence="firm",
+    ))
     return findings
 
   @register_probe(
