@@ -16,7 +16,6 @@ from unittest.mock import MagicMock, patch
 from extensions.business.cybersec.red_mesh.graybox.worker import GrayboxLocalWorker
 from extensions.business.cybersec.red_mesh.worker import PentestLocalWorker
 
-from .test_api import TestPhase2PassFinalization
 from .test_finalization_aggregation import _Host
 
 
@@ -203,6 +202,7 @@ class TestFieldMapContract(unittest.TestCase):
 class TestWorkerCloseOnMergeFailure(unittest.TestCase):
 
   def test_close_job_publishes_report_unavailable(self):
+    from .test_api import TestPhase2PassFinalization  # local: a module import would collect it twice
     helper = TestPhase2PassFinalization()
     Plugin = helper._get_plugin_class()
     plugin = MagicMock()
@@ -248,6 +248,7 @@ class TestWorkerCloseOnMergeFailure(unittest.TestCase):
 class TestFinalizeOnMergeFailure(unittest.TestCase):
 
   def test_empty_merge_with_node_reports_fails_job(self):
+    from .test_api import TestPhase2PassFinalization  # local: a module import would collect it twice
     helper = TestPhase2PassFinalization()
     Plugin = helper._get_plugin_class()
     plugin, job_specs = helper._build_finalize_plugin()

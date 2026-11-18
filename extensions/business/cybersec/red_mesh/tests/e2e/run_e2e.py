@@ -367,8 +367,11 @@ def assert_legacy_finding_fields(aggregated: dict) -> list[str]:
 def assert_pass_coverage(archive: dict) -> list[str]:
   """RM-214 invariant on the last pass: each node report covers what its
   threads covered, and the UI aggregate lists every node's open ports."""
+  passes = archive_passes(archive)
+  if not passes:
+    return ["archive has no passes"]
   failures: list[str] = []
-  pr = archive_passes(archive)[-1]
+  pr = passes[-1]
   nodes = pr.get("worker_reports") or {}
   threads_by_node = {a: (e or {}).get("threads") or {} for a, e in (pr.get("worker_scan_metrics") or {}).items()}
   for addr, node in nodes.items():
