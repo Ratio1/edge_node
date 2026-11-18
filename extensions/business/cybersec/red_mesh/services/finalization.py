@@ -17,7 +17,6 @@ from ..constants import (
   RUN_MODE_SINGLEPASS,
 )
 from ..credential_redaction import redact_credential_text
-from ..cve_view import apply_triage
 from ..models import (
   AggregatedScanData,
   PassReport,
@@ -610,7 +609,8 @@ def maybe_finalize_pass(owner):
             future = executor.submit(
               owner._run_structured_report_sections,
               job_id=job_id,
-              findings=apply_triage(flat_findings, host_triage),  # stamped for the analysis only
+              findings=flat_findings,
+              triage=host_triage,  # the live host map: closes and confirms findings for the analysis only
               aggregated_report=aggregated,
               engagement=(
                 job_config.get("engagement")

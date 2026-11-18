@@ -1292,6 +1292,7 @@ class _RedMeshLlmAgentMixin(object):
       aggregated_report: dict,
       engagement: dict | None = None,
       before_provider_call=None,
+      triage: dict | None = None,
   ) -> dict | None:
     """
     Run the Phase 4 structured-LLM call and return the dict form
@@ -1397,6 +1398,7 @@ class _RedMeshLlmAgentMixin(object):
         max_findings=llm_cfg.get("STRUCTURED_MAX_FINDINGS", 1),
         max_tokens=llm_cfg.get("STRUCTURED_MAX_TOKENS", 1024),
         temperature=llm_cfg.get("STRUCTURED_TEMPERATURE"),
+        triage=triage,
       )
     except Exception as exc:
       self.P(

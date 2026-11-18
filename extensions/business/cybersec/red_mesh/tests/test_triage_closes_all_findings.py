@@ -74,9 +74,11 @@ class TestClosedNonCveFindings(unittest.TestCase):
     self.assertEqual(len(none), 2)
 
   def test_llm_input_builder_drops_a_closed_webapp_finding(self):
-    findings = [dict(WEB, finding_id="a", triage={"status": "false_positive"}), dict(OTHER, finding_id="b")]
-    out = build_llm_input(findings=findings, aggregated_report={})
+    findings = [dict(WEB, finding_id="a"), dict(OTHER, finding_id="b")]
+    out = build_llm_input(findings=findings, aggregated_report={}, triage={"a": {"status": "false_positive"}})
     self.assertEqual([f["title"] for f in out.findings], [OTHER["title"]])
+    embedded = [dict(WEB, finding_id="a", triage={"status": "false_positive"}), dict(OTHER, finding_id="b")]
+    self.assertEqual(len(build_llm_input(findings=embedded, aggregated_report={}).findings), 2)
     open_both = [dict(WEB, finding_id="a"), dict(OTHER, finding_id="b")]
     self.assertEqual(len(build_llm_input(findings=open_both, aggregated_report={}).findings), 2)
 

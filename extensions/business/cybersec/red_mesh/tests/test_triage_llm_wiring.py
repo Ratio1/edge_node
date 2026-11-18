@@ -93,9 +93,19 @@ class TestStructuredInputReadsStampedFindings(unittest.TestCase):
     findings = [finding(1, "CRITICAL", kev=True), finding(2, "HIGH", kev=True)]
     triage = {"id0002": {"status": "remediated"}}
     _, flat = compute(findings, triage)
-    out = build_llm_input(findings=apply_triage(flat, triage), aggregated_report={})
+    out = build_llm_input(findings=flat, aggregated_report={}, triage=triage)
     self.assertEqual(out.to_dict()["scan_summary"]["cve_view"]["counts"]["closed"], 1)
     self.assertEqual(len(out.to_dict()["findings"]), 1)
+
+  def test_a_worker_supplied_triage_field_closes_nothing(self):
+    # Only the live host map closes a finding: a `triage` field a worker put on its finding is dropped at
+    # normalization, and the builder never reads an embedded one.
+    findings = [finding(1, "CRITICAL", kev=True), dict(finding(2, "HIGH", kev=True), triage={"status": "false_positive"})]
+    _, flat = compute(findings, {})
+    self.assertFalse(any("triage" in f for f in flat))
+    out = build_llm_input(findings=apply_triage(findings, {}), aggregated_report={})
+    self.assertEqual(out.to_dict()["scan_summary"]["cve_view"]["counts"]["closed"], 0)
+    self.assertEqual(len(out.to_dict()["findings"]), 2)
 
 
 if __name__ == "__main__":

@@ -551,6 +551,7 @@ def generate_exec_summary(
   max_findings: int | None = None,
   temperature: float | None = None,
   now_fn: Callable[[], str] | None = None,
+  triage: dict | None = None,
 ) -> StructuredLlmResult:
   """Generate an executive-summary package conforming to LlmReportSections.
 
@@ -580,6 +581,7 @@ def generate_exec_summary(
       applied.
   max_tokens, temperature : passed through to llm_call.
   now_fn : injectable for tests.
+  triage : the live host triage map, passed to build_llm_input (None closes nothing).
   """
   if now_fn is None:
     now_fn = lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -603,6 +605,7 @@ def generate_exec_summary(
       aggregated_report=aggregated_report,
       engagement=engagement,
       max_findings=max_findings,
+      triage=triage,
     )
   elif isinstance(prepared_input, LlmInput):
     llm_input = prepared_input
