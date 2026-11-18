@@ -7,7 +7,7 @@ from extensions.business.cybersec.red_mesh.models import FindingTriageAuditEntry
 from extensions.business.cybersec.red_mesh.repositories.cstore import JobStateRepository
 from extensions.business.cybersec.red_mesh.services import control, triage
 from .test_triage_store import TENANT_A, TENANT_B
-from .test_triage_write import HOST, _Owner, _Repo
+from .test_triage_write import HOST, _Owner, _Repo, write
 
 
 class _PurgeRepo(_Repo):
@@ -90,6 +90,32 @@ class TestTriageSurvivesPurge(unittest.TestCase):
     self.assertNotEqual(result["status"], "success")
     self.assertEqual(set(self.host_rows(TENANT_A)), {f"{HOST}\x1ff1"})
     self.assertEqual(set(self.host_rows(TENANT_B)), {f"{HOST}\x1ff1"})
+
+  def _interrupted_audit(self, tenant, job_id="job-1"):
+    """A triage change of `tenant`'s f1 whose state is confirmed but whose audit append is refused."""
+    real = self.owner.chainstore_hset
+    audit_hkey = f"inst:triage:audit:{tenant}"
+    self.owner.chainstore_hset = lambda **kw: False if kw["hkey"] == audit_hkey else real(**kw)
+    result, _ = write(self.owner, job_id=job_id, ids="f1", status="false_positive", note="old note")
+    self.assertEqual([r["outcome"] for r in result["results"]], ["write_failed"])
+    self.owner.chainstore_hset = real
+
+  def test_a_whole_purge_drops_unfinished_triage_changes_so_none_comes_back(self):
+    self._interrupted_audit(TENANT_A)
+    self.assertEqual(control.purge_all_jobs(self.owner)["status"], "success")
+    self.assertEqual(self.owner.hashes[f"inst:triage:audit:{TENANT_A}"], {})
+    self.owner.add_job("job-2")
+    write(self.owner, job_id="job-2", ids="f1", status="remediated", note="new")
+    audit = triage._job_repo(self.owner).get_host_triage_audit(TENANT_A, HOST, "f1")
+    self.assertEqual([(e["job_id"], e["note"]) for e in audit], [("job-2", "new")])
+
+  def test_a_tenant_scoped_purge_keeps_the_other_tenants_unfinished_changes(self):
+    self._interrupted_audit(TENANT_A)
+    self._interrupted_audit(TENANT_B, job_id="job-b")
+    jobs = {"job-1": deepcopy(self.owner.hashes["inst"]["job-1"])}
+    self.assertEqual(control.purge_all_jobs(self.owner, checked_jobs=jobs, snapshot_mode="tenant_bound")["status"],
+                     "success")
+    self.assertEqual([key[0] for key in self.owner._triage_unfinished_writes], [TENANT_B])
 
 
 if __name__ == "__main__":

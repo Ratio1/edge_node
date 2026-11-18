@@ -707,12 +707,16 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
     """
     if jobs_failed or cids_failed:
       return
+    from .triage import _unfinished_writes
+
     repo = _job_repo(owner)
+    unfinished = _unfinished_writes(owner)
     for tenant in sorted(_host_triage_tenants()):
       try:
         hkeys = (repo.host_triage_hkey(tenant), repo.host_triage_audit_hkey(tenant))
       except ValueError:
         continue
+      swept = True
       for hkey in hkeys:
         try:
           rows = owner.chainstore_hgetall(hkey=hkey)
@@ -720,7 +724,12 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
             if value is not None:
               owner.chainstore_hset(hkey=hkey, key=key, value=None)
         except Exception as exc:
+          swept = False
           errors.append({"job_id": "", "scope": hkey, "message": type(exc).__name__})
+      if swept:
+        # This launcher's unfinished triage changes of the tenant go too, or a retry would write them back.
+        for key in [key for key in unfinished if key[0] == tenant]:
+          unfinished.pop(key, None)
 
   def _sweep_submission_hash():
     nonlocal cids_deleted, cids_failed

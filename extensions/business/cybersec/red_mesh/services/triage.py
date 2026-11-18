@@ -213,7 +213,9 @@ def update_finding_triage(owner, job_id: str, finding_ids, status: str, note: st
   state and audit entry again, and emits the event, before it reports or replaces the record. A change whose writes
   were confirmed but whose event failed is kept too; the next request emits only the event. After a launcher
   restart only a missing audit entry marks a change unfinished: an audit entry stored locally but never
-  confirmed then reads as finished, and its finding event is not emitted. Known limit, accepted for v1
+  confirmed then reads as finished, and its finding event is not emitted. A purge drops the unfinished changes
+  of the tenants it sweeps on its own node; on another launcher a change is dropped when its record is found
+  deleted, unless another launcher wrote the finding again first. Known limits, accepted for v1
   (owner, 2026-11-18).
   """
   from .rulebook_assessment import _submission_lock, list_rulebook_profiles
@@ -388,6 +390,10 @@ def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, 
     # this one's record and lost its own audit entry, and this request must not overwrite it unrecorded.
     finishes = []  # (state, phase), oldest first
     pending_id = pending["state"].get("audit_entry_id") if pending else None
+    if pending and pending["state_confirmed"] and stored is None:
+      # The store confirmed this state, so a missing record was deleted (a purge, maybe on another node): dropped.
+      unfinished.pop(key, None)
+      pending = pending_id = None
     if pending and pending["state_confirmed"]:
       finishes.append((FindingTriageState.from_dict(pending["state"]), {
         "write_state": False, "write_audit": not pending["audit_confirmed"], "audit_payload": pending.get("audit")}))

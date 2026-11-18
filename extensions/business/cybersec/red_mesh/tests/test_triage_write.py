@@ -527,6 +527,19 @@ class TestTriageWrite(unittest.TestCase):
                      [(1000.0, "false_positive"), (2000.0, "remediated"), (3000.0, "reopened")])
     self.assertEqual(self._record()["status"], "reopened")
 
+  def test_an_unfinished_change_whose_record_was_deleted_elsewhere_does_not_come_back(self):
+    real = self.owner.chainstore_hset
+    self._refuse_writes_to(f"inst:triage:audit:{TENANT_A}")
+    write(self.owner, ids="f1", status="false_positive", note="old note")
+    self.owner.chainstore_hset = real
+    # a purge on another node deleted the record (and the audit): this launcher's map was not cleared
+    self.owner.hashes[self.hkey].clear()
+    self.owner.add_job("job-2")
+    result, emit = write(self.owner, job_id="job-2", ids="f1", status="remediated", note="new")
+    self.assertEqual([r["outcome"] for r in result["results"]], ["updated"])
+    self.assertEqual([(e["job_id"], e["note"]) for e in self._audit()], [("job-2", "new")])
+    emit.assert_called_once()
+
   def test_a_malformed_record_with_a_missing_audit_entry_does_not_block_writes(self):
     self.owner.hashes.setdefault(self.hkey, {})[f"{HOST}\x1ff1"] = {
       "finding_id": "f1", "tenant_id": TENANT_A, "host": HOST, "status": "bogus", "audit_entry_id": "x"}
