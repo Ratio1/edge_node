@@ -210,7 +210,8 @@ def update_finding_triage(owner, job_id: str, finding_ids, status: str, note: st
 
   A write the store did not confirm (CStore can store a field locally and then time out waiting for its peers)
   reports `write_failed`. The launcher remembers it in memory, and the next request for that finding writes the
-  state and audit entry again, and emits the event, before it reports or replaces the record. After a launcher
+  state and audit entry again, and emits the event, before it reports or replaces the record. A change whose writes
+  were confirmed but whose event failed is kept too; the next request emits only the event. After a launcher
   restart only a missing audit entry marks a change unfinished: an audit entry stored locally but never
   confirmed then reads as finished, and its finding event is not emitted. Known limit, accepted for v1
   (owner, 2026-11-18).
@@ -284,12 +285,13 @@ def _stored_state(stored):
     return None
 
 
-def _commit_triage(owner, repo, key, state, ledger, write_state=True):
-  """Write `state` (unless `write_state` is False) and its audit entry under `state.audit_entry_id`; each write must
-  be confirmed.
+def _commit_triage(owner, repo, key, state, ledger, announce, write_state=True, write_audit=True, audit_payload=None):
+  """Write `state` and its audit entry under `state.audit_entry_id`, each write confirmed, then `announce` it.
 
-  The change stays in the unfinished map until both are, so the next request for the finding writes them again
-  (same fields and payloads) before it reports. The audit entry records the change as made (job, actor, time).
+  The unfinished map holds the change, with the phase it reached, until the announce returns: the next request for
+  the finding repeats only what is left (`write_state`/`write_audit` False skip a confirmed write; same fields and
+  payloads) before it reports. Each confirmed write is recorded on the ledger. The audit entry records the change
+  as made (job, actor, time).
   """
   from ..tenancy.effects import EffectState
 
@@ -298,15 +300,20 @@ def _commit_triage(owner, repo, key, state, ledger, write_state=True):
   unfinished = _unfinished_writes(owner)
   state_payload = state.to_dict()
   if write_state:
-    unfinished[key] = {"state": state_payload, "state_confirmed": False}
+    unfinished[key] = {"state": state_payload, "state_confirmed": False, "audit_confirmed": False}
     state_payload = repo.put_host_triage(state)
     if ledger is not None:
       ledger.record(EffectState.PERSISTED)
-  unfinished[key] = {"state": state_payload, "state_confirmed": True}
-  audit_payload = repo.append_host_triage_audit(FindingTriageAuditEntry(
-    job_id=state_payload["job_id"], finding_id=state_payload["finding_id"], status=state_payload["status"],
-    note=state_payload.get("note", ""), actor=state_payload.get("actor", ""), timestamp=state_payload["updated_at"],
-    tenant_id=state_payload["tenant_id"], host=state_payload["host"]), entry_id=state_payload["audit_entry_id"])
+  if write_audit:
+    unfinished[key] = {"state": state_payload, "state_confirmed": True, "audit_confirmed": False}
+    audit_payload = repo.append_host_triage_audit(FindingTriageAuditEntry(
+      job_id=state_payload["job_id"], finding_id=state_payload["finding_id"], status=state_payload["status"],
+      note=state_payload.get("note", ""), actor=state_payload.get("actor", ""), timestamp=state_payload["updated_at"],
+      tenant_id=state_payload["tenant_id"], host=state_payload["host"]), entry_id=state_payload["audit_entry_id"])
+    if ledger is not None:
+      ledger.record(EffectState.PERSISTED)
+  unfinished[key] = {"state": state_payload, "state_confirmed": True, "audit_confirmed": True, "audit": audit_payload}
+  announce(state_payload)
   unfinished.pop(key, None)
   return state_payload, audit_payload
 
@@ -376,9 +383,11 @@ def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, 
     # `write_failed` and is dropped. A record without the id (an older node wrote it) is left as is. Known limit: a
     # node that sees the state before the audit field replicates finishes it too; the entry is the same field and
     # payload, but the finding event is emitted again.
-    finish, rewrite = None, True
+    # A change whose writes were both confirmed but whose event was not emitted (the announce raised) is announced.
+    finish, phase = None, {}
     if pending and pending["state_confirmed"]:
-      finish, rewrite = FindingTriageState.from_dict(pending["state"]), False
+      finish = FindingTriageState.from_dict(pending["state"])
+      phase = {"write_state": False, "write_audit": not pending["audit_confirmed"], "audit_payload": pending.get("audit")}
     elif pending and pending["state"].get("audit_entry_id") == stored_id:
       finish = _stored_state(stored)
     else:
@@ -397,18 +406,17 @@ def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, 
       results.append({"finding_id": finding_id, "outcome": "unchanged", "triage": deepcopy(stored)})
       continue
     state_payload = deepcopy(stored)
+    announce = lambda payload, archived=archived: _announce_triage(owner, record, archived, payload)
     try:
       if finish is not None:
-        finished, audit_payload = _commit_triage(owner, repo, key, finish, ledger, write_state=rewrite)
-        _announce_triage(owner, record, archived, finished)
+        _, audit_payload = _commit_triage(owner, repo, key, finish, ledger, announce, **phase)
         announced = True
       if not same:
         state_payload, audit_payload = _commit_triage(owner, repo, key, FindingTriageState(
           job_id=job_id, finding_id=finding_id, status=status, note=note or "", actor=actor or "", updated_at=now,
           review_at=review_at or None, tenant_id=tenant_id, host=host,
           confirmed=confirmed, confirmed_by=confirmed_by,
-          audit_entry_id=repo.new_host_triage_audit_entry_id(now)), ledger)
-        _announce_triage(owner, record, archived, state_payload)
+          audit_entry_id=repo.new_host_triage_audit_entry_id(now)), ledger, announce)
         announced = True
     except TriageStoreError:
       # The store did not confirm a write: report it, never a success; a retry finishes the member.

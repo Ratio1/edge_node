@@ -472,6 +472,32 @@ class TestTriageWrite(unittest.TestCase):
     emit.assert_called_once()  # the finished false_positive change
     soc_write.assert_called_once()
 
+  def test_an_event_that_failed_after_a_confirmed_audit_entry_is_emitted_by_the_retry(self):
+    with patch.object(triage, "emit_finding_event", side_effect=RuntimeError("event bus down")):
+      with self.assertRaises(RuntimeError):
+        triage.update_finding_triage(self.owner, "job-1", "f1", "false_positive", actor="analyst")
+    self.assertEqual(len(self._audit()), 1)  # state and audit entry confirmed, the event not emitted
+    calls = self._logged_writes()
+    retry, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in retry["results"]], ["updated"])
+    emit.assert_called_once()
+    self.assertEqual(calls, [])  # both writes were confirmed: the retry only emits
+    self.assertEqual(len(self._audit()), 1)
+    again, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in again["results"]], ["unchanged"])
+    emit.assert_not_called()
+
+  def test_an_audit_only_finish_records_the_write_on_the_ledger(self):
+    real, _ = self._unconfirmed_writes_to(f"inst:triage:audit:{TENANT_A}")
+    write(self.owner, ids="f1")
+    self.owner.chainstore_hset = real
+    ledger = EffectLedger()
+    with patch.object(triage, "emit_finding_event"):
+      retry = triage.update_finding_triage(self.owner, "job-1", "f1", "false_positive", actor="analyst",
+                                           ledger=ledger)
+    self.assertEqual([r["outcome"] for r in retry["results"]], ["updated"])
+    self.assertEqual(ledger.state, EffectState.PERSISTED)
+
   def test_a_malformed_record_with_a_missing_audit_entry_does_not_block_writes(self):
     self.owner.hashes.setdefault(self.hkey, {})[f"{HOST}\x1ff1"] = {
       "finding_id": "f1", "tenant_id": TENANT_A, "host": HOST, "status": "bogus", "audit_entry_id": "x"}
