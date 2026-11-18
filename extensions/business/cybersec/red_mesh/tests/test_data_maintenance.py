@@ -613,6 +613,20 @@ class TestDataMaintenance(unittest.TestCase):
     self.storage.data[(TENANCY, field)]["theme"] = "pink"
     self.assertEqual(self.scan()[(TENANCY, field)]["reason"], "unrecognized")
 
+  def test_the_branding_row_with_a_name_is_current_and_a_bad_name_is_unrecognized(self):
+    # RM-192: a row stored before the name keys existed stays current; a row with them is validated too.
+    updated = self.plugin.update_super_tenant_branding(
+      self.actor, {"display_name": "Acme", "name_in": {"title": True, "header": False}})
+    self.assertTrue(updated["success"], updated)
+    field = json.dumps(["super_tenant_branding", "deployment", "deployment"], separators=(",", ":"))
+    self.assertEqual(self.scan()[(TENANCY, field)]["class"], "current")
+    old = self.storage.data[(TENANCY, field)]
+    del old["display_name"], old["name_in"]
+    row = self.scan()[(TENANCY, field)]
+    self.assertEqual((row["class"], row["reason"]), ("current", ""))
+    old.update(display_name="x" * 81, name_in={"title": True, "header": False})
+    self.assertEqual(self.scan()[(TENANCY, field)]["reason"], "unrecognized")
+
   def test_a_retired_tenant_integration_is_old_and_the_deployment_override_is_current(self):
     # RM-139: the tenant `integration` kind is retired; the STA override has no tenant and stays
     # current once every tenant is gone, as the profile does.

@@ -117,13 +117,38 @@ def _ssh_authenticated_action(client, timeout):
 
   `timeout` comes from the caller's `_target_timeout(...)` so the wait is
   profiled like every other network wait in `worker/`.
+
+  The session is opened here rather than with `client.exec_command`: some
+  servers (cowrie) run the command and close the channel before they answer
+  the exec request. `exec_command` then raises "Channel closed" although the
+  output already arrived; the channel still holds it, so it is read anyway.
   """
   try:
-    _stdin, stdout, _stderr = client.exec_command("id", timeout=timeout)
-    output = stdout.read(256).decode("utf-8", errors="replace").strip()
+    chan = client.get_transport().open_session(timeout=timeout)
+    chan.settimeout(timeout)
   except Exception:
     return None
-  return f"exec id -> {output}" if output else None
+  output = b""
+  try:
+    try:
+      chan.exec_command("id")
+    except paramiko.SSHException:
+      if not chan.closed:
+        return None  # the server refused the command
+    while len(output) < 256:
+      chunk = chan.recv(256 - len(output))
+      if not chunk:
+        break
+      output += chunk
+  except Exception:
+    pass  # a timeout keeps what arrived
+  finally:
+    try:
+      chan.close()
+    except Exception:
+      pass
+  text = output.decode("utf-8", errors="replace").strip()
+  return f"exec id -> {text}" if text else None
 
 
 def _ftp_authenticated_action(ftp):

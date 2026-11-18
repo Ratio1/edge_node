@@ -17,7 +17,7 @@ import unittest
 from extensions.business.cybersec.red_mesh.cve_cvss_vectors import CVE_CVSS_VECTORS, CVE_WITHOUT_V3
 from extensions.business.cybersec.red_mesh.cve_db import CVE_DATABASE, _build_finding, check_cves
 from extensions.business.cybersec.red_mesh.cvss import cvss31_base_score, severity_band
-from extensions.business.cybersec.red_mesh.findings import enrich_finding_for_probe
+from extensions.business.cybersec.red_mesh.findings import Finding, Severity, _finding_to_jsonable, enrich_finding_for_probe
 
 def _catalog_labels():
   """cve_id -> set of catalog labels (a CVE listed per range may repeat)."""
@@ -78,6 +78,22 @@ class TestCveFindingCarriesTheVector(unittest.TestCase):
     self.assertEqual(f.cvss_score, cvss31_base_score(f.cvss_vector))
     self.assertEqual(f.cvss_data_freshness, "")  # static, not fetched at scan time
     self.assertEqual(enrich_finding_for_probe(f, "_service_info_http").severity_source, "cvss")
+
+  def test_nvd_only_v30_vector_is_labelled_as_nvds(self):
+    """NVD publishes only v3.0 for these; the vector stays v3.0 and says whose it is."""
+    for product, version, cve_id in (
+      ("dropbear", "2018.75", "CVE-2018-15599"),
+      ("exim", "4.96", "CVE-2023-42115"),
+    ):
+      with self.subTest(cve_id=cve_id):
+        f = self._finding(product, version, cve_id)
+        self.assertTrue(f.cvss_vector.startswith("CVSS:3.0/"))
+        self.assertEqual(f.cvss_version, "3.0")
+        self.assertEqual(f.cvss_source, "nvd")
+        self.assertEqual(_finding_to_jsonable(f)["cvss_source"], "nvd")
+
+  def test_a_finding_without_a_vector_has_no_cvss_source(self):
+    self.assertEqual(Finding(severity=Severity.INFO, title="t", description="d").cvss_source, "")
 
   def test_every_catalog_cve_with_a_v3_record_gets_its_vector(self):
     for entry in CVE_DATABASE:
