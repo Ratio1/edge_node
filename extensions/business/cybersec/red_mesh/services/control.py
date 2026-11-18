@@ -498,7 +498,7 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
   return cids_deleted, cids_failed
 
 
-def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None):
+def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None, tenant_id=None):
   """
   Purge every RedMesh job on this edge node: stop running jobs, delete all
   R1FS artifacts, tombstone CStore records, and sweep orphan rows in the
@@ -512,6 +512,9 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
   Preserves the single-job partial-failure contract for parseable records:
   any job whose purge returned ``partial`` keeps its CStore rows intact so
   the operator can retry artifact deletion later.
+
+  `tenant_id`: the tenant the purge was admitted for. Its host triage is deleted even when it has no job
+  left (a single-job purge keeps host triage, so the last job can be gone while the records stay).
   """
   # The admitted enumeration when one was supplied (RM-026 I1b B9). This is what scopes a
   # Super-Tenant Admin's "purge everything" to their own tenant rather than the whole node.
@@ -539,6 +542,7 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
   jobs_force_purged = 0
   cids_deleted = 0
   cids_failed = 0
+  host_triage_failed = False
   failed_job_ids = set()
   errors = []
   # RM-026 I1b B9, owner decision: a mixed batch reports the partial, and the per-item outcome is
@@ -676,7 +680,7 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
   def _host_triage_tenants():
     """Tenants whose host triage this call may delete: those of the admitted jobs' bindings and, for a
     whole-node purge only, every tenant the tenancy store names (their jobs may be gone while the records stay)."""
-    tenants = set()
+    tenants = {tenant_id} if isinstance(tenant_id, str) and tenant_id.strip() else set()
     for payload in raw_jobs.values():
       binding = payload.get("execution_binding") if isinstance(payload, dict) else None
       tenant = binding.get("tenant_id") if isinstance(binding, dict) else None
@@ -705,6 +709,7 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
 
     Skipped while any job failed to purge, as the integration status sweep is, so a retry finds them intact.
     """
+    nonlocal host_triage_failed
     if jobs_failed or cids_failed:
       return
     from .triage import _unfinished_writes
@@ -720,13 +725,17 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
       for hkey in hkeys:
         try:
           rows = owner.chainstore_hgetall(hkey=hkey)
-          for key, value in list((rows or {}).items()):
-            if value is not None:
-              owner.chainstore_hset(hkey=hkey, key=key, value=None)
+          refused = [key for key, value in list((rows or {}).items())
+                     if value is not None and owner.chainstore_hset(hkey=hkey, key=key, value=None) is not True]
+          if refused:  # the store did not confirm the delete: the rows may still be readable
+            swept = False
+            errors.append({"job_id": "", "scope": hkey, "message": "delete_not_confirmed"})
         except Exception as exc:
           swept = False
           errors.append({"job_id": "", "scope": hkey, "message": type(exc).__name__})
-      if swept:
+      if not swept:
+        host_triage_failed = True
+      else:
         # This launcher's unfinished triage changes of the tenant go too, or a retry would write them back.
         for key in [key for key in list(unfinished) if key[0] == tenant]:  # a snapshot: other hosts' writes may add
           unfinished.pop(key, None)
@@ -892,7 +901,7 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
         owner.P(f"[PURGE_ALL] failed to tombstone job record {key}: {exc}", color='r')
         errors.append({"job_id": key, "scope": cfg_instance_id, "message": type(exc).__name__})
 
-  status = "success" if jobs_failed == 0 and cids_failed == 0 else "partial"
+  status = "success" if jobs_failed == 0 and cids_failed == 0 and not host_triage_failed else "partial"
 
   owner._log_audit_event("all_data_purged", {
     "jobs_total": jobs_total,

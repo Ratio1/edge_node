@@ -117,6 +117,26 @@ class TestTriageSurvivesPurge(unittest.TestCase):
                      "success")
     self.assertEqual([key[0] for key in self.owner._triage_unfinished_writes], [TENANT_B])
 
+  def test_a_tenant_purge_with_no_jobs_left_still_deletes_its_host_triage(self):
+    # the last job went in a single-job purge, which keeps host triage; the tenant-wide purge now sees no job
+    result = control.purge_all_jobs(self.owner, checked_jobs={}, snapshot_mode="tenant_bound", tenant_id=TENANT_A)
+    self.assertEqual(result["status"], "success", result)
+    self.assertEqual(self.host_rows(TENANT_A), {})
+    self.assertEqual(self.owner.hashes[f"inst:triage:audit:{TENANT_A}"], {})
+    self.assertEqual(set(self.host_rows(TENANT_B)), {f"{HOST}\x1ff1"})
+
+  def test_a_refused_triage_delete_reports_partial_and_keeps_the_unfinished_change(self):
+    self._interrupted_audit(TENANT_A)
+    real = self.owner.chainstore_hset
+    host_hkeys = {f"inst:triage:t:{TENANT_A}", f"inst:triage:audit:{TENANT_A}"}
+    self.owner.chainstore_hset = lambda **kw: False if kw["hkey"] in host_hkeys else real(**kw)
+    result = control.purge_all_jobs(self.owner)
+    self.assertEqual(result["status"], "partial", result)
+    self.assertIn(f"inst:triage:t:{TENANT_A}", [e["scope"] for e in result["errors"]])
+    self.assertEqual(set(self.host_rows(TENANT_A)), {f"{HOST}\x1ff1"})
+    self.assertEqual([key[0] for key in self.owner._triage_unfinished_writes], [TENANT_A])
+    self.assertEqual(self.host_rows(TENANT_B), {})  # the other tenant's sweep still ran
+
 
 if __name__ == "__main__":
   unittest.main()
