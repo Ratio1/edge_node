@@ -2,10 +2,10 @@
 import copy
 from unittest.mock import patch
 from uuid import uuid4
-from ..references import framework_packs as packs
-from ..services import framework_csf_scoring as csf
-from ..tenancy import compliance as c
-from ..tenancy.adapters.cstore_compliance import CstoreComplianceStore
+from extensions.business.cybersec.red_mesh.references import framework_packs as packs
+from extensions.business.cybersec.red_mesh.services import framework_csf_scoring as csf
+from extensions.business.cybersec.red_mesh.tenancy import compliance as c
+from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_compliance import CstoreComplianceStore
 from .test_framework_assessment import FrameworkAssessmentFixture
 
 PACK='us.nist.csf-2.0'

@@ -6,8 +6,8 @@ from uuid import uuid4
 
 from .test_framework_assessment import FrameworkAssessmentFixture
 from . import test_framework_evidence as fixtures
-from ..references.framework_packs import load_framework_pack
-from ..services import framework_evidence as evidence
+from extensions.business.cybersec.red_mesh.references.framework_packs import load_framework_pack
+from extensions.business.cybersec.red_mesh.services import framework_evidence as evidence
 
 CSF = 'us.nist.csf-2.0'
 
@@ -30,7 +30,7 @@ class TestCsfEvidence(FrameworkAssessmentFixture):
     return self.ok(self.plugin.suggest_framework_assessment_evidence(self.admin, self.tenant, CSF, self.aid))
 
   def test_selected_controls_and_explicit_translation_strategies(self):
-    from ..services.framework_evidence_mapping import resolve, PACK_STRATEGIES
+    from extensions.business.cybersec.red_mesh.services.framework_evidence_mapping import resolve, PACK_STRATEGIES
     selected = [{'ref_id': 'ID.RA-01'}, {'ref_id': 'GV.OC-01'}]
     self.assertEqual(evidence.mapped_controls(CSF, selected), {'ID.RA-01': 'vulnerability_management'})
     with patch.dict(PACK_STRATEGIES, {'test': {'strategy': 'identity'}}):

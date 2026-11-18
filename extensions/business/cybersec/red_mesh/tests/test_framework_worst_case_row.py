@@ -9,9 +9,9 @@ Every save and submit goes through the real plugin paths and must succeed.
 import json
 from uuid import uuid4
 
-from ..references import framework_packs as packs
-from ..services import framework_csf_scoring as csf
-from ..tenancy import compliance as c
+from extensions.business.cybersec.red_mesh.references import framework_packs as packs
+from extensions.business.cybersec.red_mesh.services import framework_csf_scoring as csf
+from extensions.business.cybersec.red_mesh.tenancy import compliance as c
 from .test_framework_assessment import FrameworkAssessmentFixture
 
 SENDER_GUARD = 2097152

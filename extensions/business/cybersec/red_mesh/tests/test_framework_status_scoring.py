@@ -3,9 +3,9 @@ import copy
 import json
 import unittest
 from pathlib import Path
-from ..services import framework_status_scoring as status
-from ..services.framework_scoring import AssessmentInvalid, scorer_for
-from ..references.framework_packs import load_framework_pack, pack_rules
+from extensions.business.cybersec.red_mesh.services import framework_status_scoring as status
+from extensions.business.cybersec.red_mesh.services.framework_scoring import AssessmentInvalid, scorer_for
+from extensions.business.cybersec.red_mesh.references.framework_packs import load_framework_pack, pack_rules
 
 PACK = "eu.ec.ir-2024-2690"
 

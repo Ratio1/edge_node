@@ -1,8 +1,8 @@
 """NIS2 production pack through actual endpoint, adapter, snapshot and review seams."""
 import copy
 from uuid import uuid4
-from ..references import framework_packs as packs
-from ..tenancy import compliance
+from extensions.business.cybersec.red_mesh.references import framework_packs as packs
+from extensions.business.cybersec.red_mesh.tenancy import compliance
 from .test_framework_assessment import FrameworkAssessmentFixture
 
 PACK = 'eu.ec.ir-2024-2690'

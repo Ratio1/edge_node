@@ -45,6 +45,23 @@ class TestFrameworkReview(FrameworkAssessmentFixture):
     self.assertEqual(self.ok(self.get())['assessmentRevision'], before)
     self.assertEqual([e['action'] for e in view['history']], ['submit', 'comment'])
 
+  def test_review_decisions_and_refusals_are_audited_once(self):
+    # RM-180 merge review: a return reopens the assessment, so review decisions reach the audit log.
+    self.submitted()
+    self.refused(self.mutate('approve', actor=self.viewer), 403, 'forbidden')
+    request = str(uuid4())
+    control = next(iter(self.basic_scores()))
+    self.ok(self.mutate('comment', control=control, comment='Checked', request=request))
+    self.ok(self.mutate('comment', control=control, comment='Checked', request=request))  # replay, not logged again
+    self.ok(self.mutate('return', expected=2))
+    review = [(event, details) for event, details in self.events
+              if event.startswith('framework_assessment_review_') or details.get('operation') == 'review']
+    self.assertEqual([event for event, _ in review], ['framework_assessment_refused',
+      'framework_assessment_review_comment', 'framework_assessment_review_return'])
+    self.assertEqual((review[0][1]['status_code'], review[0][1]['action'], review[0][1]['revision']), (403, 'approve', 1))
+    self.assertEqual([details['review_revision'] for _, details in review[1:]], [2, 3])
+    self.assertTrue(all(details['tenant_id'] == self.tenant and details['revision'] == 1 for _, details in review[1:]))
+
   def test_denied_roles_designation_defaults_and_self_approval(self):
     self.submitted()
     self.refused(self.mutate('approve', actor=self.admin), 403, 'reviewer_not_designated')

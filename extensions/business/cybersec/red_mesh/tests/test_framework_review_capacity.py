@@ -1,7 +1,7 @@
 """Review transport admission: one row cap, durable receipts."""
 import copy
 from uuid import uuid4
-from ..tenancy import compliance_review as r
+from extensions.business.cybersec.red_mesh.tenancy import compliance_review as r
 from .test_framework_assessment import FrameworkAssessmentFixture, PACK
 from . import test_framework_review as existing
 
@@ -73,7 +73,7 @@ class TestReviewTransportAdmission(FrameworkAssessmentFixture):
 
   def test_dnsc_row_with_fifty_submissions_stays_far_under_the_sender_guard(self):
     import json
-    from ..tenancy import compliance as c
+    from extensions.business.cybersec.red_mesh.tenancy import compliance as c
     revision = self.complete_basic_draft()
     for _ in range(c.MAX_SUBMISSIONS):
       revision = self.ok(self.submit(revision, str(uuid4())))['assessmentRevision']

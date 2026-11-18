@@ -3,9 +3,9 @@ import copy
 import json
 from pathlib import Path
 import unittest
-from ..references.framework_packs import load_framework_pack, load_framework_text
-from ..services import framework_csf_scoring as csf
-from ..services.framework_entry_validation import AssessmentInvalid
+from extensions.business.cybersec.red_mesh.references.framework_packs import load_framework_pack, load_framework_text
+from extensions.business.cybersec.red_mesh.services import framework_csf_scoring as csf
+from extensions.business.cybersec.red_mesh.services.framework_entry_validation import AssessmentInvalid
 
 PACK='us.nist.csf-2.0'
 
@@ -84,7 +84,7 @@ class TestCsfScoring(unittest.TestCase):
         self.assertEqual(result['verdict'],{'passed':None})
 
   def test_existing_scorers_ignore_context_with_identical_results(self):
-    from ..services.framework_scoring import scorer_for
+    from extensions.business.cybersec.red_mesh.services.framework_scoring import scorer_for
     for pid,level in (('ro.dnsc.o1-2026','basic'),('eu.ec.ir-2024-2690',None)):
       pack=load_framework_pack(pid);scorer=scorer_for(pack)
       self.assertEqual(scorer.compute(pack,level,{}),scorer.compute(pack,level,{},context={'function_tiers':{'GV':{'current':1,'target':4}}}))
