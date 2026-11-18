@@ -488,6 +488,32 @@ class TestTriageWrite(unittest.TestCase):
     self.assertEqual([r["outcome"] for r in again["results"]], ["unchanged"])
     emit.assert_not_called()
 
+  def test_a_failed_soc_delivery_is_reported_and_sent_again_by_the_next_request(self):
+    failed = {"status": "error", "integration_id": "wazuh", "error": "ConnectionError"}
+    with patch.object(triage, "emit_finding_event", return_value=failed):
+      first = triage.update_finding_triage(self.owner, "job-1", "f1", "false_positive", actor="analyst")
+    self.assertEqual([(r["outcome"], r.get("soc_event")) for r in first["results"]], [("updated", "error")])
+    self.assertTrue(first["complete"])  # state and audit are stored; only the SIEM copy is late
+    retry, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in retry["results"]], ["updated"])
+    emit.assert_called_once()
+    self.assertEqual(len(self._audit()), 1)
+    again, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in again["results"]], ["unchanged"])
+    emit.assert_not_called()
+
+  def test_a_skipped_or_invalid_soc_event_is_not_sent_again(self):
+    for result in ({"status": "skipped", "error": "event_export_disabled"},
+                   {"status": "error", "integration_id": "wazuh", "error": "invalid_event"}):
+      owner = _Owner()
+      owner.add_job("job-1")
+      with patch.object(triage, "emit_finding_event", return_value=result):
+        first = triage.update_finding_triage(owner, "job-1", "f1", "false_positive", actor="analyst")
+      self.assertNotIn("soc_event", first["results"][0])
+      again, emit = write(owner, ids="f1")
+      self.assertEqual([r["outcome"] for r in again["results"]], ["unchanged"])
+      emit.assert_not_called()
+
   def test_an_audit_only_finish_records_the_write_on_the_ledger(self):
     real, _ = self._unconfirmed_writes_to(f"inst:triage:audit:{TENANT_A}")
     write(self.owner, ids="f1")

@@ -290,7 +290,8 @@ def _stored_state(stored):
 def _commit_triage(owner, repo, key, state, ledger, announce, write_state=True, write_audit=True, audit_payload=None):
   """Write `state` and its audit entry under `state.audit_entry_id`, each write confirmed, then `announce` it.
 
-  The unfinished map holds the change, with the phase it reached, until the announce returns: the next request for
+  The unfinished map holds the change, with the phase it reached, until the event is delivered or skipped (a
+  retryable SOC delivery failure keeps it, and the third return value is True): the next request for
   the finding repeats only what is left (`write_state`/`write_audit` False skip a confirmed write; same fields and
   payloads) before it reports. Each confirmed write is recorded on the ledger. The audit entry records the change
   as made (job, actor, time).
@@ -315,9 +316,16 @@ def _commit_triage(owner, repo, key, state, ledger, announce, write_state=True, 
     if ledger is not None:
       ledger.record(EffectState.PERSISTED)
   unfinished[key] = {"state": state_payload, "state_confirmed": True, "audit_confirmed": True, "audit": audit_payload}
-  announce(state_payload)
-  unfinished.pop(key, None)
-  return state_payload, audit_payload
+  soc_failed = _soc_delivery_failed(announce(state_payload))
+  if not soc_failed:  # a failed SIEM delivery keeps the change, so the next request for the finding sends it again
+    unfinished.pop(key, None)
+  return state_payload, audit_payload, soc_failed
+
+
+def _soc_delivery_failed(result):
+  """True when the SOC event was not delivered and a retry may deliver it: a transport error or a cooldown. A
+  skip (export disabled, no secret) or an event the adapter rejects (`invalid_event`) is final."""
+  return isinstance(result, dict) and result.get("status") == "error" and result.get("error") != "invalid_event"
 
 
 def _announce_triage(owner, record, archived, state_payload):
@@ -329,7 +337,7 @@ def _announce_triage(owner, record, archived, state_payload):
   finding_event = dict(archived)
   finding_event["triage_state"] = state_payload["status"]
   finding_event["triage_entry_id"] = state_payload.get("audit_entry_id")  # the event's dedupe key, per change
-  emit_finding_event(owner, record, finding=finding_event, event_action="triaged")
+  return emit_finding_event(owner, record, finding=finding_event, event_action="triaged")
 
 
 def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, actor, review_at, confirm,
@@ -419,23 +427,28 @@ def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, 
       continue
     state_payload = deepcopy(stored)
     announce = lambda payload, archived=archived: _announce_triage(owner, record, archived, payload)
+    soc_failed = False
     try:
       for finish, phase in finishes:
-        _, audit_payload = _commit_triage(owner, repo, key, finish, ledger, announce, **phase)
+        _, audit_payload, failed = _commit_triage(owner, repo, key, finish, ledger, announce, **phase)
+        soc_failed = soc_failed or failed
         announced = True
       if not same:
-        state_payload, audit_payload = _commit_triage(owner, repo, key, FindingTriageState(
+        state_payload, audit_payload, failed = _commit_triage(owner, repo, key, FindingTriageState(
           job_id=job_id, finding_id=finding_id, status=status, note=note or "", actor=actor or "", updated_at=now,
           review_at=review_at or None, tenant_id=tenant_id, host=host,
           confirmed=confirmed, confirmed_by=confirmed_by,
           audit_entry_id=repo.new_host_triage_audit_entry_id(now)), ledger, announce)
+        soc_failed = soc_failed or failed
         announced = True
     except TriageStoreError:
       # The store did not confirm a write: report it, never a success; a retry finishes the member.
       results.append({"finding_id": finding_id, "outcome": "write_failed", "retryable": True})
       continue
-    results.append({"finding_id": finding_id, "outcome": "updated", "triage": state_payload,
-                    "audit": audit_payload})
+    item = {"finding_id": finding_id, "outcome": "updated", "triage": state_payload, "audit": audit_payload}
+    if soc_failed:
+      item["soc_event"] = "error"  # stored and audited; the next request for the finding sends the event again
+    results.append(item)
   # An emitted event changes the record's SOC status, also when a later write of the same member failed.
   if announced and isinstance(record.get("soc_event_status"), dict):
     _write_job_record(owner, job_id, record, context="finding_triage_soc_event")
