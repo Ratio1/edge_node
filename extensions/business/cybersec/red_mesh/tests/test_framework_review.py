@@ -254,6 +254,29 @@ class TestFrameworkReview(FrameworkAssessmentFixture):
           self.assertTrue(view['replayed'])
           self.assertEqual([e['action'] for e in view['history']], ['submit', 'return'])
 
+  def test_return_repaired_after_a_failed_review_write_is_audited_once(self):
+    # RM-180 merge review: the assessment write of a return landed, the review write did not.
+    self.submitted()
+    request = str(uuid4())
+    self.storage.fail_write = len(self.storage.writes) + 2
+    self.refused(self.mutate('return', request=request), 503, 'unavailable')
+    self.storage.fail_write = None
+    self.restart()
+    self.events.clear()
+    self.assertEqual([e['action'] for e in self.ok(self.review())['history']], ['submit', 'return'])
+    self.assertTrue(self.ok(self.mutate('return', request=request))['replayed'])
+    self.ok(self.review())
+    returns = [details for event, details in self.events if event == 'framework_assessment_review_return']
+    self.assertEqual(len(returns), 1)
+    self.assertEqual((returns[0]['repaired'], returns[0]['revision'], returns[0]['actor']), (True, 1, 'creator'))
+
+  def test_artifact_refusal_is_audited_once(self):
+    self.submitted()
+    self.events.clear()
+    self.refused(self.mutate('approve', revision=9), 404, 'assessment_not_found')
+    self.assertEqual([details['operation'] for event, details in self.events if event == 'framework_assessment_refused'],
+                     ['artifact'])
+
   def test_forged_self_approved_metadata_is_refused(self):
     from extensions.business.cybersec.red_mesh.tenancy import compliance_review as r
     self.submitted()

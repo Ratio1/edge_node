@@ -81,10 +81,11 @@ def _append(review, entry):
   return updated
 
 
-def reconcile(service, row, sub):
+def reconcile(service, row, sub, repaired=None):
   """Submission itself is the durable receipt; return receipt lives inside that same submission.
 
   Never infer actor/time from the retry. Persisted events are compared in full, not merely by id.
+  A return receipt appended here is added to `repaired` (when given), so the caller can audit it.
   """
   store, ids = c._store(service), _ids(row, sub)
   current = store.get(KIND, *ids)
@@ -104,6 +105,8 @@ def reconcile(service, row, sub):
       raise TenantStoreError("Review return receipt mismatch")
     if prior is None:
       current = store.put(KIND, *ids, record=_append(current, receipt))
+      if repaired is not None:
+        repaired.append(copy.deepcopy(receipt))
   return current
 
 
@@ -124,10 +127,11 @@ def _bound(service, actor, tenant_id, pack_id, revision, snapshot, assessment_id
   context = snapshot.get("historical_context")  # the row keeps its digest; the snapshot document keeps the context
   if (c.context_digest(context) if context is not None else None) != sub.get("context_sha256"):
     raise c._denied(409, "document_integrity")
-  return tenant, account, row, sub, reconcile(service, row, sub)
+  repaired = []
+  return tenant, account, row, sub, reconcile(service, row, sub, repaired), repaired
 
 
-def _view(service, tenant, account, row, review, snapshot, replayed=False):
+def _view(service, tenant, account, row, review, snapshot, replayed=False, repaired=()):
   names = c.name_resolver(service)
   decisions = [e for e in review["history"] if e["action"] in ("approve", "return")]
   decision = decisions[-1] if decisions else None
@@ -144,18 +148,22 @@ def _view(service, tenant, account, row, review, snapshot, replayed=False):
       compliance_reviewer=service._compliance_reviewer(account)).allowed,
     "historical_context": copy.deepcopy(snapshot.get("historical_context")),
     "missing_historical_provenance": "historical_context" not in snapshot,
-    "replayed": replayed}
+    "replayed": replayed,
+    # RM-180 merge review: a return whose review event was written late, here, so the plugin audits it once.
+    "repaired_return": repaired[0] if repaired else None}
 
 
 def read(service, actor, tenant_id, pack_id, revision, snapshot, assessment_id=c.DEFAULT_ID):
-  tenant, account, row, sub, review = _bound(service, actor, tenant_id, pack_id, revision, snapshot, assessment_id, c.VIEW)
-  return _view(service, tenant, account, row, review, snapshot)
+  tenant, account, row, sub, review, repaired = _bound(service, actor, tenant_id, pack_id, revision, snapshot,
+                                                      assessment_id, c.VIEW)
+  return _view(service, tenant, account, row, review, snapshot, repaired=repaired)
 
 
 def mutate(service, actor, tenant_id, pack_id, revision, snapshot, action, expected_review_revision, request_id,
            control_id=None, comment=None, assessment_id=c.DEFAULT_ID):
   from .administration import _request_id
-  tenant, account, row, sub, review = _bound(service, actor, tenant_id, pack_id, revision, snapshot, assessment_id, REVIEW)
+  tenant, account, row, sub, review, repaired = _bound(service, actor, tenant_id, pack_id, revision, snapshot,
+                                                      assessment_id, REVIEW)
   request_id = _request_id(request_id)
   if action not in ("comment", "approve", "return"):
     raise c._denied(400, "invalid_request")
@@ -174,7 +182,7 @@ def mutate(service, actor, tenant_id, pack_id, revision, snapshot, action, expec
   if prior is not None:
     if {k: v for k, v in prior.items() if k != "time"} != {k: v for k, v in entry.items() if k != "time"}:
       raise c._denied(409, "conflict")
-    return _view(service, tenant, account, row, review, snapshot, replayed=True)
+    return _view(service, tenant, account, row, review, snapshot, replayed=True, repaired=repaired)
   c._not_archived(row)
   if row["state"] != "submitted" or c.latest_revision(row) != revision:
     raise c._denied(409, "review_not_current")
@@ -187,4 +195,4 @@ def mutate(service, actor, tenant_id, pack_id, revision, snapshot, action, expec
       "management_signoff": None, "completion_date": "", "assessment_revision": row["assessment_revision"] + 1,
       "submissions": submissions}, account.account_id))
   stored = c._store(service).put(KIND, *_ids(row, sub), record=updated)
-  return _view(service, tenant, account, row, stored, snapshot)
+  return _view(service, tenant, account, row, stored, snapshot, repaired=repaired)
