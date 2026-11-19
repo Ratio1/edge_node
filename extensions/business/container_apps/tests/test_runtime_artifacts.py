@@ -427,9 +427,146 @@ class RuntimeArtifactTests(unittest.TestCase):
     self.assertEqual(state, bound(image_ref=REF))
     # Even the first check can see a replacement. It compares against the image this container runs.
     client.images.get_registry_data.return_value.id = "sha256:" + "e" * 64
+    replacement_ref = "test/image@sha256:" + "e" * 64
+    replacement_id = "sha256:" + "c" * 64
+    client.images.pull.return_value = image(replacement_id, replacement_ref)
     plugin._restart_container = MagicMock()
     plugin._check_image_updates(plugin._last_image_check + plugin.cfg_autoupdate_interval)
-    plugin._restart_container.assert_called_once_with(StopReason.IMAGE_UPDATE)
+    plugin._restart_container.assert_called_once_with(
+      StopReason.IMAGE_UPDATE, prepared_image={"image_ref": replacement_ref, "image_id": replacement_id},
+    )
+
+  def test_failed_update_pull_keeps_the_ready_container_and_respects_backoff(self):
+    plugin, client, old, _ = self.runner()
+    plugin._deployment_source_mode = "following"
+    clock = [1000]
+    plugin.time = lambda: clock[0]
+    client.images.get_registry_data.return_value.id = REF.split("@")[1]
+    client.images.pull.return_value = old.image = image(IMAGE_ID, REF)
+    plugin._handle_initial_launch()
+    plugin._confirm_app_readiness()
+    plugin.report_deployment_status.reset_mock()
+    client.images.pull.reset_mock()
+    client.images.get_registry_data.reset_mock()
+
+    # The manifest resolves to a new digest, but the registry cannot serve its layers yet.
+    digest = "sha256:" + "e" * 64
+    reference = "test/image@" + digest
+    client.images.get_registry_data.return_value.id = digest
+    client.images.pull.side_effect = OSError("Layer unavailable")
+    clock[0] += plugin.cfg_autoupdate_interval
+    plugin.process()
+    old.stop.assert_not_called()
+    old.remove.assert_not_called()
+    self.assertIs(plugin.container, old)
+    self.assertTrue(plugin._app_ready)
+    self.assertEqual(plugin.get_deployment_runtime_artifacts()["image_ref"], REF)
+    self.assertEqual(plugin.current_image_hash, REF)
+    plugin.report_deployment_status.assert_not_called()
+    client.images.pull.assert_called_once_with(reference)
+
+    clock[0] += plugin.cfg_autoupdate_interval
+    self.assertLess(clock[0], plugin._next_image_pull_time)
+    plugin.process()
+    client.images.get_registry_data.assert_called_once()
+    client.images.pull.assert_called_once()
+
+    events = []
+    replacement = make_mock_container()
+    replacement_id = "sha256:" + "c" * 64
+    replacement.image = image(replacement_id, reference)
+    old.stop.side_effect = lambda **_: events.append("stop")
+    client.images.pull.side_effect = lambda ref: events.append(ref) or replacement.image
+    client.containers.run.side_effect = lambda id, **_: events.append(id) or replacement
+    clock[0] = max(plugin._next_image_pull_time, clock[0] + plugin.cfg_autoupdate_interval)
+    with patch.object(docker, "from_env", return_value=client):
+      plugin.process()
+    # Pull, stop, then start by ID. Startup must not resolve the tag or pull again.
+    self.assertEqual(events, [reference, "stop", replacement_id])
+    self.assertEqual(client.images.get_registry_data.call_count, 2)
+    self.assertIs(plugin.container, replacement)
+    self.assertEqual(plugin.get_deployment_runtime_artifacts()["image_ref"], reference)
+    self.assertEqual(plugin._image_pull_failures, 0)
+
+  def test_prepared_update_survives_semaphore_wait_and_tag_movement(self):
+    plugin, client, old, _ = self.runner()
+    plugin._deployment_source_mode = "following"
+    clock = [1000]
+    plugin.time = lambda: clock[0]
+    plugin.cfg_semaphored_keys = ["provider"]
+    plugin._wait_for_semaphores = MagicMock(return_value=True)
+    client.images.get_registry_data.return_value.id = REF.split("@")[1]
+    client.images.pull.return_value = old.image = image(IMAGE_ID, REF)
+    plugin._handle_initial_launch()
+    replacement = make_mock_container()
+    digest = "sha256:" + "e" * 64
+    replacement_id = "sha256:" + "c" * 64
+    reference = "test/image@" + digest
+    replacement.image = image(replacement_id, reference)
+    client.images.get_registry_data.return_value.id = digest
+    client.images.pull.return_value = replacement.image
+    client.containers.run.return_value = replacement
+
+    plugin._wait_for_semaphores.return_value = False
+    clock[0] += plugin.cfg_autoupdate_interval
+    with patch.object(docker, "from_env", return_value=client):
+      plugin._check_image_updates(clock[0])
+    old.stop.assert_called_once()
+    self.assertIsNone(plugin.container)
+    self.assertEqual(plugin.get_deployment_runtime_artifacts(), {})
+
+    # While launch is deferred the tag moves again. The reserved image still owns this update.
+    client.images.get_registry_data.return_value.id = "sha256:" + "f" * 64
+    client.images.get_registry_data.reset_mock()
+    client.images.pull.reset_mock()
+    clock[0] += plugin.cfg_autoupdate_interval
+    plugin.process()
+    self.assertIsNone(plugin.container)
+    plugin._wait_for_semaphores.return_value = True
+    plugin.process()
+    client.images.get_registry_data.assert_not_called()
+    client.images.pull.assert_not_called()
+    self.assertEqual(client.containers.run.call_args.args, (replacement_id,))
+    self.assertEqual(plugin.get_deployment_runtime_artifacts()["image_ref"], reference)
+    self.assertIsNone(plugin._prepared_update_image)
+
+  def test_prepared_update_survives_retrying_partial_cleanup(self):
+    plugin, client, old, _ = self.runner()
+    plugin._deployment_source_mode = "following"
+    clock = [1000]
+    plugin.time = lambda: clock[0]
+    client.images.get_registry_data.return_value.id = REF.split("@")[1]
+    client.images.pull.return_value = old.image = image(IMAGE_ID, REF)
+    plugin._handle_initial_launch()
+    replacement = make_mock_container()
+    digest = "sha256:" + "e" * 64
+    replacement_id = "sha256:" + "c" * 64
+    reference = "test/image@" + digest
+    replacement.image = image(replacement_id, reference)
+    client.images.get_registry_data.return_value.id = digest
+    client.images.pull.return_value = replacement.image
+    client.containers.run.return_value = replacement
+
+    # Docker removes the old runtime, but unmounting its storage fails once.
+    plugin._cleanup_fixed_size_volumes = MagicMock(side_effect=[False, True])
+    clock[0] += plugin.cfg_autoupdate_interval
+    plugin._check_image_updates(clock[0])
+    self.assertTrue(plugin._cleanup_failed)
+    self.assertIsNone(plugin.container)
+    self.assertEqual(plugin.get_deployment_runtime_artifacts(), {})
+    plugin.report_deployment_status.assert_called_with("starting")
+
+    # Recover cleanup even if the registry became unreachable since the successful pull.
+    client.images.get_registry_data.reset_mock()
+    client.images.pull.reset_mock()
+    clock[0] = plugin._next_restart_time + 1
+    with patch.object(docker, "from_env", return_value=client):
+      plugin.process()
+    client.images.get_registry_data.assert_not_called()
+    client.images.pull.assert_not_called()
+    self.assertIs(plugin.container, replacement)
+    self.assertEqual(client.containers.run.call_args.args, (replacement_id,))
+    self.assertEqual(plugin.get_deployment_runtime_artifacts()["image_ref"], reference)
 
   def test_source_poll_restarts_after_retries_are_exhausted_or_disallowed(self):
     for policy in ("no", "always"):

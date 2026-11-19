@@ -711,6 +711,7 @@ class ContainerAppRunnerPlugin(
     # Image update tracking
     self.current_image_hash = None
     self._launch_image = {}  # Exact image resolved for this start, independent of mutable local tags.
+    self._prepared_update_image = None  # Handed off from a live tag update to its next launch only.
 
     # Image pull backoff tracking
     self._image_pull_failures = 0
@@ -3938,52 +3939,61 @@ class ContainerAppRunnerPlugin(
     return latest_hash != self.current_image_hash
 
 
-  def _handle_image_update(self, new_hash):
+  def _handle_image_update(self, new_hash, prepared_image=None):
     """
-    Handle detected image update by updating hash and restarting container.
+    Restart the workload for a detected image update.
 
     Parameters
     ----------
     new_hash : str
         New image hash detected
+    prepared_image : dict, optional
+        Immutable image already pulled while the previous container was running.
 
     Returns
     -------
     None
+
+    Examples
+    --------
+    >>> runner._handle_image_update(new_digest, prepared_image)
     """
     self.P(f"New image version detected ({new_hash} != {self.current_image_hash}). Restarting container...")
 
-    # Update current_image_hash BEFORE restart
-    # This prevents infinite retry loops if restart fails
-    old_hash = self.current_image_hash
-    self.current_image_hash = new_hash
+    if prepared_image is None:
+      # Legacy updates and stopped apps remember the candidate before starting another attempt.
+      self.current_image_hash = new_hash
 
     try:
-      self._restart_container(StopReason.IMAGE_UPDATE)
+      if prepared_image is None:
+        self._restart_container(StopReason.IMAGE_UPDATE)
+      else:
+        self._restart_container(StopReason.IMAGE_UPDATE, prepared_image=prepared_image)
     except Exception as e:
       self.P(f"Container restart failed after image update: {e}", color='r')
-      # Hash already updated, won't retry this version
-      self.P(f"Image hash updated from {old_hash} to {new_hash}, but container restart failed", color='r')
 
 
-  def _check_image_updates(self, current_time=None):
+  def _check_image_updates(self, current_time=None, *, stopped=False):
     """
-    Periodic check for image updates when AUTOUPDATE is enabled.
+    Check for a newer image at the configured update interval.
 
-    This method:
-    1. Checks if update check is due (based on interval)
-    2. Pulls latest image and gets its hash
-    3. Compares with current hash
-    4. Triggers restart if changed
+    A live source-following app pulls the replacement before starting its restart.
 
     Parameters
     ----------
     current_time : float, optional
         Current timestamp (for interval checking)
+    stopped : bool, optional
+        Whether the caller is looking for a replacement for a stopped or failed workload.
 
     Returns
     -------
-    None
+    bool or None
+        True after handling a source change.
+
+    Examples
+    --------
+    >>> runner._check_image_updates(runner.time())
     """
     if not self.cfg_autoupdate:
       return
@@ -3998,10 +4008,13 @@ class ContainerAppRunnerPlugin(
     if current_time - self._last_image_check < self.cfg_autoupdate_interval:
       return
 
+    follows_image = self._follows_image()
+    if follows_image and not stopped and self._is_image_pull_backoff_active():
+      return  # Resume checking as soon as the replacement's pull backoff expires.
     self._last_image_check = current_time
 
     # Get latest image hash
-    if self._follows_image():
+    if follows_image:
       try:
         latest_hash = self._source_image_ref()
       except Exception:
@@ -4016,9 +4029,14 @@ class ContainerAppRunnerPlugin(
 
     # Check if update is needed
     if self._has_image_hash_changed(latest_hash):
-      if self._follows_image():
+      prepared_image = None
+      if follows_image:
+        if not stopped:
+          prepared_image = self._pull_source_image(latest_hash, report_progress=False)
+          if prepared_image is None:
+            return  # Preserve the running image and its readiness on pull failure.
         self._consecutive_failures = 0  # A new image gets its own restart budget.
-      self._handle_image_update(latest_hash)
+      self._handle_image_update(latest_hash, prepared_image)
       return True
     else:
       self.Pd(f"Image up to date: {self.current_image_hash}")
@@ -4056,7 +4074,7 @@ class ContainerAppRunnerPlugin(
     self._maybe_execute_build_and_run()
 
 
-  def _restart_container(self, stop_reason=None, cleanup_first=True):
+  def _restart_container(self, stop_reason=None, cleanup_first=True, *, prepared_image=None):
     """
     Restart the container from scratch.
 
@@ -4067,12 +4085,18 @@ class ContainerAppRunnerPlugin(
     cleanup_first : bool, optional
         If True, stop the existing runtime before resetting state. Set to False
         when the caller already performed cleanup and checked its result.
+    prepared_image : dict, optional
+        Image already pulled by a live tag update, including its local ID and registry reference.
 
     Returns
     -------
     bool
         True when restart setup succeeded or was deferred waiting for
         semaphores, False when cleanup or start failed.
+
+    Examples
+    --------
+    >>> runner._restart_container(StopReason.IMAGE_UPDATE, prepared_image=image)
     """
     if self._fixed_volume_setup_pending:
       self.P("Container initialization is waiting for its image; restart deferred.")
@@ -4086,9 +4110,17 @@ class ContainerAppRunnerPlugin(
     preserved_last_image_check = self._last_image_check
     preserved_current_hash = self.current_image_hash
 
+    if not cleanup_first and stop_reason == StopReason.IMAGE_UPDATE:
+      # Cleanup just recovered from a partial stop. Launch the image already downloaded for it.
+      prepared_image = self._prepared_update_image
     if cleanup_first:
       cleanup_ok = self._stop_container_and_save_logs_to_disk()
       if not cleanup_ok:
+        self._prepared_update_image = prepared_image  # The follow-up cleanup owns the same replacement.
+        if prepared_image is not None and self.container is None:
+          # Docker stopped the workload even though part of cleanup still needs a retry.
+          self._deployment_runtime_artifacts = {}
+          self.report_deployment_status("starting")
         self.P("Restart aborted because previous runtime cleanup failed.", color='r')
         self._set_container_state(ContainerState.FAILED, stop_reason or StopReason.UNKNOWN)
         self._record_restart_failure()
@@ -4106,6 +4138,11 @@ class ContainerAppRunnerPlugin(
     self._last_successful_start = preserved_last_success
     self._last_image_check = preserved_last_image_check
     self.current_image_hash = preserved_current_hash
+    self._prepared_update_image = prepared_image  # Keep it across deferred semaphore waits.
+    if prepared_image is not None:
+      # The previous container is gone. Report the replacement only after it starts.
+      self._deployment_runtime_artifacts = {}
+      self.report_deployment_status("starting")
 
     # Set state after reset
     self._set_container_state(ContainerState.RESTARTING, stop_reason or StopReason.UNKNOWN)
@@ -4305,20 +4342,42 @@ class ContainerAppRunnerPlugin(
       raise ValueError("Missing or invalid registry digest")
     return f"{self._image_repository()}@{digest}"
 
-  def _pull_source_image(self):
+  def _pull_source_image(self, reference=None, *, report_progress=True):
+    """Pull an immutable image for launch or prepare a background replacement.
+
+    Parameters
+    ----------
+    reference : str, optional
+        An immutable registry reference already resolved during the update check.
+    report_progress : bool, optional
+        Publish startup progress when the pull is part of launching a workload.
+
+    Returns
+    -------
+    dict or None
+        The registry reference and its local Docker image ID, or None while the pull is unavailable.
+
+    Examples
+    --------
+    >>> runner._pull_source_image(next_reference, report_progress=False)
+    """
     # An available local tag cannot prove what the registry serves now.
     if self._is_image_pull_backoff_active():
       return None
-    self.report_deployment_status("pulling_image")
+    if report_progress:
+      self.report_deployment_status("pulling_image")
     try:
       if not self._login_to_registry():
         raise RuntimeError("Registry authentication failed")
-      reference = self._source_image_ref()
+      reference = reference or self._source_image_ref()
       image = self.docker_client.images.pull(reference)
       if not re.fullmatch(r"sha256:[0-9a-f]{64}", image.id):
         raise ValueError("Pulled image identity is unavailable")
     except Exception:
-      self.report_deployment_status("failed", error_code="IMAGE_PULL_FAILED")
+      if report_progress:
+        self.report_deployment_status("failed", error_code="IMAGE_PULL_FAILED")
+      else:
+        self.P("Could not pull the replacement image. The current container stays running.", color='y')
       self._record_image_pull_failure(max_backoff=3600)
       return None
     self._record_image_pull_success()
@@ -4491,7 +4550,9 @@ class ContainerAppRunnerPlugin(
     ...   return   # nothing to start yet; the next lap tries again
     """
     if self._follows_image():
-      self._launch_image = self._pull_source_image() or {}
+      prepared_image = self._prepared_update_image
+      self._prepared_update_image = None  # Consume it once. Later restarts resolve the registry again.
+      self._launch_image = prepared_image or self._pull_source_image() or {}
       if self._launch_image:
         # Remember the attempted image even when Docker cannot create the container.
         self.current_image_hash = self._launch_image["image_ref"]
@@ -4675,8 +4736,8 @@ class ContainerAppRunnerPlugin(
 
   def _check_stopped_source(self):
     # Poll only when an image has been attempted. Initial pull failures have their own retry timer.
-    if self.current_image_hash and self._follows_image():
-      return self._check_image_updates(self.time())
+    if self.current_image_hash and self._follows_image() and self._prepared_update_image is None:
+      return self._check_image_updates(self.time(), stopped=True)
     return False
 
   def _perform_periodic_monitoring(self):
@@ -4693,7 +4754,8 @@ class ContainerAppRunnerPlugin(
     current_time = self.time()
 
     if self.cfg_autoupdate:
-      self._check_image_updates(current_time)
+      if self._check_image_updates(current_time) and self._follows_image():
+        return  # Let this restart finish before running other lifecycle checks.
 
     # Check extra tunnel health
     if self.extra_tunnel_processes:
