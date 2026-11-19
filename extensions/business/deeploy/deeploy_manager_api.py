@@ -3,6 +3,7 @@
 Needs configuration based on injected `EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER`
 
 """
+import re
 import threading
 
 from naeural_core.main.net_mon import NetMonCt
@@ -1430,7 +1431,7 @@ class DeeployManagerApiPlugin(
     Parameters
     ----------
     request : dict
-      Versioned wallet envelope binding a job ID and the original coordinator.
+      Versioned wallet envelope binding a fresh nonce, job ID and original coordinator.
 
     Returns
     -------
@@ -1443,6 +1444,11 @@ class DeeployManagerApiPlugin(
     """
     try:
       job_id, coordinator = request.get("job_id"), request.get("coordinator")
+      nonce = request.get("nonce")
+      if not isinstance(nonce, str) or not nonce.strip():
+        raise ValueError("A nonce is required for the repair preview.")
+      if not re.fullmatch(r"0x[0-9a-fA-F]{1,16}", nonce):
+        raise ValueError("The repair preview nonce must be a hexadecimal timestamp.")
       if not request.get("EE_HASH") or type(job_id) is not int or job_id <= 0 or not isinstance(coordinator, str) or not coordinator:
         raise ValueError("The repair preview requires a signed job ID and coordinator.")
       sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type="get job repair preview")

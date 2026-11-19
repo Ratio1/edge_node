@@ -4,6 +4,11 @@ import copy
 import unittest
 from types import SimpleNamespace
 
+from eth_account import Account
+from eth_account.messages import encode_defunct
+from naeural_core.utils.plugins_base.plugin_base_utils import NestedDotDict
+from web3 import Web3
+
 from extensions.business.deeploy.tests import test_update_requests as updates
 from extensions.business.deeploy.tests import test_job_repair as lifecycle
 from extensions.business.deeploy.tests.support import make_inputs
@@ -136,4 +141,41 @@ class JobRepairHttpTests(unittest.TestCase):
       self.assertIn("Invalid payload hash", blocked["reason"])
     unsigned = {key: value for key, value in valid.items() if key != "EE_HASH"}
     self.assertEqual(self.api.get_job_repair_preview(unsigned)["status"], "blocked")
+    self.assertEqual(self.replay.c.commands, [])
+
+  def test_dapp_preview_payload_passes_real_wallet_authorization_and_nonce_validation(self):
+    # Stub the chain, but keep the endpoint, production v3 verification and nonce/escrow authorization.
+    account = Account.create()
+    check_time = 1795096800
+    self.api.time = lambda: check_time
+    self.api.time_to_str = str
+    self.api.NestedDotDict = NestedDotDict
+    del self.api.deeploy_verify_and_get_inputs, self.api.deeploy_get_auth_result
+    self.api.bc.is_valid_eth_address = Web3.is_address
+    self.api.bc.get_user_escrow_details = lambda address: dict(isActive=True, escrowOwner=address, escrowAddress=address)
+    self.api.bc.eth_verify_text_signature = lambda text, signature, **kwargs: Account.recover_message(
+      encode_defunct(text=text), signature=signature)
+    self.api._assess_job_repair = lambda job_id, owner, coordinator: (
+      {"job_id": job_id, "coordinator": coordinator, "owner": owner},
+    )
+
+    def sign(payload):
+      digest = self.api._deeploy_payload_hash(payload)
+      message = self.api._deeploy_wrapper_message("get job repair preview", payload, digest)
+      signature = account.sign_message(encode_defunct(text=message)).signature.to_0x_hex()
+      return dict(payload, EE_HASH=digest, EE_ETH_SIGN=signature, EE_ETH_SENDER=account.address)
+
+    # EditJobPage signs exactly these three fields.
+    payload = dict(job_id=31, coordinator="oracle", nonce=hex(check_time * 1000 - 1))
+    request = sign(payload)
+    result = self.api.get_job_repair_preview(request)
+    self.assertEqual(result, {"status": "reviewable", "proposal": {
+      "job_id": 31, "coordinator": "oracle", "owner": account.address,
+    }})
+    missing = self.api.get_job_repair_preview(sign({"job_id": 31, "coordinator": "oracle"}))
+    self.assertIn("nonce is required", missing["reason"])
+    stale = sign(dict(payload, nonce=hex((check_time - 12 * 3600 - 1) * 1000)))
+    self.assertIn("expired", self.api.get_job_repair_preview(stale)["reason"])
+    tampered = dict(request, nonce=hex(check_time * 1000 - 2))
+    self.assertIn("Invalid payload hash", self.api.get_job_repair_preview(tampered)["reason"])
     self.assertEqual(self.replay.c.commands, [])
