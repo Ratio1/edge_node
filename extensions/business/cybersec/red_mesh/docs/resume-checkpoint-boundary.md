@@ -76,7 +76,9 @@ A network (blackbox) worker may resume execution inside a pass from a checkpoint
   resume path, which deletes it. If `plugin_data/redmesh_ckpt` or a job folder is a symlink, no helper
   reads, writes or deletes through it.
 - Stop paths: a HARD `stop_monitoring` and `stop_and_delete_job` delete all of the job's checkpoints,
-  marker included. A soft stop keeps them, since the pass continues. A worker whose stop event is
+  marker included, on the node that handles the request. Another node learns of the stop from
+  CStore, closes its worker as usual and may write a final marker; it never resumes (the job is
+  STOPPED) and GC removes it at the next tick. A soft stop keeps them, since the pass continues. A worker whose stop event is
   set starts no new save. A save already running when the stop lands can still write its file after
   the delete; it is never resumed (the worker is `finished`) and GC removes it.
 - Graybox workers still restart from the beginning of the pass.
