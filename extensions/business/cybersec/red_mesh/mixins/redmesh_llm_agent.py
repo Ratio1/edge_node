@@ -31,7 +31,6 @@ from ..services.llm_structured import (
 
 _NON_RETRYABLE_HTTP_STATUSES = {400, 401, 403, 404, 409, 410, 413, 422}
 _NON_RETRYABLE_PROVIDER_STATUSES = _NON_RETRYABLE_HTTP_STATUSES
-_LOCAL_STRUCTURED_CHUNK_TIMEOUT_SECONDS = 120
 _LLM_EVIDENCE_MAX_CHARS = 240
 _LLM_BANNER_MAX_CHARS = 120
 
@@ -1351,10 +1350,7 @@ class _RedMeshLlmAgentMixin(object):
     self._last_structured_llm_provider_path = profile.provider_path
     structured_timeout = None
     if profile.provider_path == PROVIDER_PATH_LOCAL:
-      structured_timeout = min(
-        int(llm_cfg.get("TIMEOUT") or _LOCAL_STRUCTURED_CHUNK_TIMEOUT_SECONDS),
-        _LOCAL_STRUCTURED_CHUNK_TIMEOUT_SECONDS,
-      )
+      structured_timeout = llm_cfg["LOCAL_STRUCTURED_CHUNK_TIMEOUT"]
 
     def raw_chat_call(messages: list, max_tokens: int, temperature: float) -> str:
       """Adapter — turns the LLM Agent /chat HTTP response into the

@@ -77,6 +77,72 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.assertEqual(self.state.secrets['DAUTH_JOB_SECRETS', '7']['EE_SENDER'], 'dauth')
     self.assertEqual(self.state.public['DEEPLOY_DEPLOYED_JOBS', '7']['EE_SENDER'], 'oracle')
 
+  def test_legacy_reordered_workers_reject_before_custody(self):
+    # Synthetic job 31 shape: both identities changed; the same two workers report
+    # reversed commands, peers and placement. The original NetMon snapshots were not retained.
+    stored = pipeline()
+    stored['DEEPLOY_SPECS'] = {'job_id': 31, 'current_target_nodes': ['old-A', 'old-B']}
+    plugin = stored['PLUGINS'][0]
+    plugin['SIGNATURE'] = 'WORKER_APP_RUNNER'
+    plugin['INSTANCES'][0].update(BUILD_AND_RUN_COMMANDS=['build', 'install'], CHAINSTORE_PEERS=['P', 'Q'])
+    pointer_key = ('DEEPLOY_DEPLOYED_JOBS', '31')
+    cid = self.state.public[pointer_key] = self.state.blobs.add_json(stored)
+    running = copy.deepcopy(stored)
+    running['DEEPLOY_SPECS']['current_target_nodes'].reverse()
+    instance = running['PLUGINS'][0]['INSTANCES'][0]
+    instance['BUILD_AND_RUN_COMMANDS'].reverse()
+    instance['CHAINSTORE_PEERS'].reverse()
+    reports = {node: [running] for node in ('new-A', 'new-B')}
+    # The submitted configuration names the current identities; it is distinct from rollback content.
+    desired = copy.deepcopy(running)
+    desired['DEEPLOY_SPECS']['current_target_nodes'] = list(reports)
+    for later_reports in (reports, {}):
+      with self.subTest(later_observation_empty=not later_reports):
+        self.coordinator.netmon.network_known_pipelines = Mock(side_effect=[reports, later_reports])
+        with self.assertRaisesRegex(ValueError, 'repair the stored job first'):
+          self.coordinator._admit_prepared_deployment(
+            request={'job_id': 31, 'expected_revision': 0, 'request_id': 'legacy-update'},
+            auth_result={'escrow_owner': 'owner'}, app_id=stored['NAME'],
+            configs={node: copy.deepcopy(desired) for node in reports}, prior_pipeline=stored, is_create=False,
+          )
+        # A rejected update must leave the old job running and its canonical pointer intact.
+        self.assertEqual(self.state.public, {pointer_key: cid})
+        self.assertEqual(self.state.writes, [])
+        self.assertEqual(self.coordinator.commands, [])
+        self.http.assert_not_called()
+
+  def test_waiting_create_and_update_publish_secrets_and_allow_job_commands_and_delete(self):
+    previous = None
+    operations = []
+    for revision in (1, 2):
+      cfg = pipeline(secret='token-' + str(revision))
+      cfg['PLUGINS'][0]['SIGNATURE'] = 'WORKER_APP_RUNNER'
+      accepted = self.coordinator._admit_prepared_deployment(
+        request={'request_id': 'source-' + str(revision), 'job_id': 7, 'expected_revision': revision - 1},
+        auth_result={'escrow_owner': 'owner'}, app_id='app', configs={'A': cfg},
+        prior_pipeline=previous, is_create=previous is None)
+      operation = self.coordinator._operation_records()[accepted['operation_id']]
+      self.coordinator._advance_deployment_operation(operation)
+      if previous:
+        report(self.state, operation, 'retire', 'stopped')
+        self.coordinator._advance_deployment_operation(operation)
+      report(self.state, operation, 'deploy', 'failed', mode='following', error='WORKLOAD_START_FAILED')
+      self.coordinator._advance_deployment_operation(operation)
+      self.coordinator._advance_deployment_operation(operation)
+      previous = self.active()
+      self.assertEqual((operation['outcome'], operation['recovery']), ('waiting_for_source', None))
+      self.assertEqual(previous['DEEPLOY_SPECS']['revision'], revision)
+      self.assertEqual(self.token(self.state.secrets['DAUTH_JOB_SECRETS', '7']), 'token-' + str(revision))
+      self.coordinator._assert_no_active_deployment(job_id=7, app_id='app')  # Same guard as restart.
+      self.running(operation)
+      operations.append(operation)
+    ref = '7|' + operations[0]['operation_id'] + ':deploy'
+    self.assertIn('revoked', self.state.secrets['DAUTH_JOB_SECRET_REVISIONS', ref])
+    self.assertNotIn('stop', [cmd['DEEPLOY_OPERATION']['action'] for _, cmd in self.coordinator.commands])
+    deleted = self.coordinator._admit_delete_operation(
+      {'request_id': 'delete', 'job_id': 7, 'expected_revision': 2}, {'escrow_owner': 'owner'})
+    self.assertEqual(deleted['status_code'], 202)
+
   def test_custody_reads_do_not_pin_so_their_timeout_bounds_them(self):
     previous, _ = self.legacy()
     self.dauth.r1fs = Mock(wraps=self.state.blobs)
@@ -327,15 +393,22 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
   def test_node_relink_moves_job_and_per_node_secret_without_the_old_node(self):
     config = pipeline()
     instance = config['PLUGINS'][0]['INSTANCES'][0]
-    instance.update(CHAINSTORE_PEERS=['A'], SECRET_PATHS=[['PER_NODE_CONFIG', 'byNode', 'A', 'ENV', 'NODE_KEY']],
-                    PER_NODE_CONFIG={'byNode': {'A': {'ENV': {'NODE_KEY': 'node-secret'}}}})
+    instance.update(CHAINSTORE_PEERS=['A'], BUILD_AND_RUN_COMMANDS=['A', 'serve'],
+                    SECRET_PATHS=[['PER_NODE_CONFIG', 'byNode', 'A', 'ENV', field] for field in ('A', 'NODE_KEY')],
+                    PER_NODE_CONFIG={'byNode': {'A': {'ENV': {'A': 'A', 'NODE_KEY': 'node-secret'}}}})
+    instance['APP_SETTINGS'] = {'A': {'CHAINSTORE_PEERS': ['A']}}  # Customer-owned keys can match node addresses.
     self.coordinator._admit_prepared_deployment(
       request={'job_id': 7, 'request_id': 'request', 'expected_revision': 0},
       auth_result={'escrow_owner': 'owner'}, app_id='app', configs={'A': config},
       prior_pipeline=None, is_create=True,
     )
     self.finalize(self.operation())
-    self.coordinator.known = {}  # A is gone and N is new hardware: nothing reports the job
+    self.coordinator.known = {}  # New hardware with no observed workload cannot account for the old one.
+    writes = len(self.state.writes)
+    with self.assertRaisesRegex(ValueError, 'previous target'):
+      self.coordinator._admit_node_relink_operation(7, 'A', 'N')
+    self.assertEqual(len(self.state.writes), writes)
+    self.coordinator.known = {'N': [self.active()]}  # Continue the existing custody test with an observed worker.
     accepted = self.coordinator._admit_node_relink_operation(7, 'A', 'N')
     operation = self.coordinator._operation_records()[accepted['operation_id']]
     self.assertEqual((operation['nodes'], operation['previous_nodes']), (['N'], ['N']))
@@ -345,10 +418,15 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     active = self.active()['PLUGINS'][0]['INSTANCES'][0]
     self.assertEqual(self.active()['DEEPLOY_SPECS']['current_target_nodes'], ['N'])
     self.assertEqual((active['CHAINSTORE_PEERS'], list(active['PER_NODE_CONFIG']['byNode'])), (['N'], ['N']))
+    self.assertEqual(active['BUILD_AND_RUN_COMMANDS'], ['A', 'serve'])
+    self.assertEqual(active['APP_SETTINGS'], {'A': {'CHAINSTORE_PEERS': ['A']}})
+    self.assertIn(['PER_NODE_CONFIG', 'byNode', 'N', 'ENV', 'A'], active['SECRET_PATHS'])
+    self.assertEqual(active['PER_NODE_CONFIG']['byNode']['N']['ENV']['A'], dAuth.DAUTH_SECRET_PLACEHOLDER)
     reference = operation['operation_id'] + ':deploy'
     requested = self.dauth._load_revision_runner_secret_bundle('7', reference, 'N')
     self.assertEqual(self.token(requested), 'fresh-token')
     node_env = requested['job_secrets']['PLUGINS'][0]['INSTANCES'][0]['PER_NODE_CONFIG']['byNode']['N']['ENV']
+    self.assertEqual(node_env['A'], 'A')  # The recipient changed; the secret name and plaintext stayed intact.
     self.assertEqual(node_env['NODE_KEY'], 'node-secret')
     with self.assertRaises(ValueError):
       self.dauth._load_revision_runner_secret_bundle('7', reference, 'A')
@@ -414,15 +492,19 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
       self.finalize(operation)
       self.assertEqual(operation['outcome'], 'succeeded')
 
-  def test_update_removing_an_offline_node_skips_it(self):
+  def test_update_waits_for_a_missing_departing_node_before_stopping_any_node(self):
     self.two_node_job()
-    del self.coordinator.known['A']  # A is offline
+    report_a = self.coordinator.known.pop('A')
+    writes, commands = len(self.state.writes), len(self.coordinator.commands)
+    with self.assertRaisesRegex(ValueError, 'previous target'):
+      self.move(['B', 'C'])
+    self.assertEqual((len(self.state.writes), len(self.coordinator.commands)), (writes, commands))
+    # The same update can proceed with complete retirement and rollback once A reports again.
+    self.coordinator.known['A'] = report_a
     operation = self.move(['B', 'C'])
-    self.assertEqual(operation['previous_nodes'], ['B'])
-    sent = len(self.coordinator.commands)
+    self.assertEqual(operation['previous_nodes'], ['A', 'B'])
     self.finalize(operation)
     self.assertEqual(operation['outcome'], 'succeeded')
-    self.assertNotIn('A', [node for node, _ in self.coordinator.commands[sent:]])
     self.assertEqual(sorted(self.active()['DEEPLOY_SPECS']['current_target_nodes']), ['B', 'C'])
     with self.assertRaises(ValueError):
       self.dauth._load_revision_runner_secret_bundle('7', self.active()['DEEPLOY_SPECS']['secret_revision'], 'A')
@@ -437,26 +519,19 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.assertEqual(set(restore), {'A', 'B'})
     self.assertNotIn('forged-image', str(restore))
 
-  def test_failed_move_off_only_offline_nodes_keeps_the_stored_job(self):
+  def test_move_off_only_unobserved_nodes_preserves_the_running_revision(self):
     self.admit()
     self.finalize(self.operation())
     before = self.active()
     self.coordinator.known = {}  # the job's only node is offline
-    operation = self.move(['C'])
-    self.assertEqual(operation['previous_nodes'], [])
-    self.coordinator._advance_deployment_operation(operation)
-    self.coordinator._advance_deployment_operation(operation)
-    report(self.state, operation, 'deploy', 'failed')
-    self.coordinator._advance_deployment_operation(operation)
-    report(self.state, operation, 'deploy', 'stopped')
-    self.coordinator._advance_deployment_operation(operation)
-    self.assertEqual((operation['phase'], operation['outcome']), ('completed', 'failed'))
+    with self.assertRaisesRegex(ValueError, 'previous target'):
+      self.move(['C'])
     self.assertEqual(self.active(), before)
     self.dauth._load_revision_runner_secret_bundle('7', before['DEEPLOY_SPECS']['secret_revision'], 'A')
 
   def test_unversioned_node_relink_keeps_secrets(self):
-    self.legacy()
-    self.coordinator.known = {}
+    previous, _ = self.legacy()
+    self.coordinator.known = {'N': [previous]}
     accepted = self.coordinator._admit_node_relink_operation(7, 'A', 'N')
     operation = self.coordinator._operation_records()[accepted['operation_id']]
     self.finalize(operation)
@@ -464,6 +539,29 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.assertEqual(self.active()['DEEPLOY_SPECS']['current_target_nodes'], ['N'])
     requested = self.dauth._load_revision_runner_secret_bundle('7', operation['operation_id'] + ':deploy', 'N')
     self.assertEqual(self.token(requested), 'old-token')
+
+  def test_partial_relink_waits_for_the_other_previous_worker(self):
+    # Job 31's automatic relink planned one successor and retained the other old address.
+    previous = pipeline()
+    previous['DEEPLOY_SPECS']['current_target_nodes'] = ['A', 'B']
+    pointer_key = ('DEEPLOY_DEPLOYED_JOBS', '7')
+    cid = self.state.public[pointer_key] = self.state.blobs.add_json(previous)
+    self.coordinator.known = {'N': [previous], 'M': [previous]}  # Both successors report; retained B is unaccounted for.
+    with self.assertRaisesRegex(ValueError, 'previous target'):
+      self.coordinator._admit_node_relink_operation(7, 'A', 'N')
+    self.assertEqual(self.state.public, {pointer_key: cid})
+    self.assertEqual(self.state.writes, [])
+    self.assertEqual(self.coordinator.commands, [])
+    self.http.assert_not_called()
+
+  def test_relink_to_empty_replacement_rejects_before_any_stop_or_custody_write(self):
+    previous, cid = self.legacy()
+    self.coordinator.known = {'A': [previous], 'N': []}  # The new hardware has no previous workload.
+    with self.assertRaisesRegex(ValueError, 'current address'):
+      self.coordinator._admit_node_relink_operation(7, 'A', 'N')
+    self.assertEqual(self.coordinator._get_pipeline_from_cstore('7'), cid)
+    self.assertEqual(self.coordinator.commands, [])
+    self.http.assert_not_called()
 
   def test_partial_publication_replays_before_old_cid_cleanup(self):
     previous, cid = self.legacy()
