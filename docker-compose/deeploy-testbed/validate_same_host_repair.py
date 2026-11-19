@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import time
 from types import SimpleNamespace
+from unittest.mock import patch
 import uuid
 
 from naeural_core import Logger
@@ -291,6 +292,8 @@ def scenario(folder, key_folder, fail):
         assert op["parent_operation_id"] == initial["operation_id"]
         receive_start_or_stop(node, config)
         assert workers[node].dct_config_streams["app"][OPERATION_KEY]["attempt"] == attempt
+        if attempt == "restore":
+          assert "CAP_RESOLUTION" not in workers[node].dct_config_streams["app"]
         token_revision = config["DEEPLOY_SPECS"]["secret_revision"]
         private = fixture.dauth._load_revision_runner_secret_bundle("31", token_revision, node)
         worker_secret = private["job_secrets"]["PLUGINS"][0]["INSTANCES"][0]
@@ -324,8 +327,26 @@ def scenario(folder, key_folder, fail):
           status = "ready"
       else:
         assert action == "stop"
-        receive_start_or_stop(node, config)
-        remove(node)
+        if fail and node == "newA":
+          # Simulate a crash after the real STOP handler saves the journal and just before it removes the config.
+          with patch.object(workers[node], "delete_config_stream", side_effect=InterruptedError("fixture crash")):
+            try:
+              receive_start_or_stop(node, config)
+            except InterruptedError:
+              pass
+            else:
+              raise AssertionError("STOP did not reach the simulated crash")
+          workers[node] = worker_config_manager(Path(key_folder), node)
+          stale = workers[node].dct_config_streams["app"]
+          lifecycle = workers[node].shmem[SERVICE_KEY]
+          assert stale["CAP_RESOLUTION"] == 30 and not lifecycle.allowed(stale)
+          remove(node)
+          lifecycle._cleanup = lambda *_: command(["docker", "inspect", container(node)], check=False).returncode != 0
+          lifecycle.publish(lambda *a, **kw: True, lambda *a, **kw: None)
+          assert lifecycle.stopped(stale)  # The old file still exists, but the exact attempt reached STOP.
+        else:
+          receive_start_or_stop(node, config)
+          remove(node)
         status = "stopped"
       serial += 1
       item = fixture.receipt(op, node, attempt, status, pin, **fields)
@@ -358,6 +379,7 @@ def scenario(folder, key_folder, fail):
                    repair=dict(proposal=proposal, same_host=True, rotate_main_tunnel=True))
     repair = c._prepare_job_repair(request, "owner")
     desired = copy.deepcopy(corrected)
+    desired["CAP_RESOLUTION"] = 30  # This field only exists on the failed update, never in the prior plan.
     desired["DEEPLOY_SPECS"]["current_target_nodes"] = addresses
     worker(desired).update(BUILD_AND_RUN_COMMANDS=[SETUP, EDITED_SERVE], CHAINSTORE_PEERS=addresses,
                           CLOUDFLARE_TOKEN=new_token, EXPOSED_PORTS={"8080": {"is_main_port": True, "token": new_token}})

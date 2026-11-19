@@ -172,6 +172,8 @@ class _JobRepairMixin:
         or str(pipeline["DEEPLOY_SPECS"]["job_id"]) != str(job_id) or pipeline["DEEPLOY_SPECS"].get("revision", 0) != 0
         or pipeline["DEEPLOY_SPECS"].get("secret_revision")):
       raise ValueError("The original published worker revision cannot be verified.")
+    if worker(pipeline).get("SETUP_REPO", True) is not True:
+      raise ValueError("Repair requires the previous worker to clone its Git checkout for rollback.")
     fields = order_fields(pipeline)
     aliases, licenses = self._repair_aliases(fields["targets"], job)
     receipts = self._node_operation_reports(parent, "retire")
@@ -225,7 +227,7 @@ class _JobRepairMixin:
                     placements=[dict(previous=old, current=aliases[old]) for old in live["targets"]])
     return proposal, corrected, parent, stopped, licenses
 
-  def _inspect_repair_workers(self, parent, config, seals, stopped):
+  def _inspect_repair_workers(self, parent, config, proposal, fingerprint, licenses, stopped):
     """Check every paid worker's compatibility and prior state before retiring any.
 
     Parameters
@@ -234,19 +236,45 @@ class _JobRepairMixin:
       Coordinator-signed original relink.
     config : dict
       Reviewed previous revision before the address substitutions.
-    seals, stopped : dict
-      Encrypted expectations for running workers and verified historical receipts for stopped workers.
+    proposal, licenses, stopped : dict
+      Reverified signed proposal, current license bindings and historical receipts.
+    fingerprint : str
+      Local digest of the exact previous worker configuration.
 
     Returns
     -------
-    dict
-      Fresh observations for the running workers. Each stopped worker must reconfirm its recorded commit.
+    tuple
+      Fresh running-worker observations and their original encrypted expectations.
 
     Examples
     --------
-    >>> witnesses = plugin._inspect_repair_workers(parent, corrected, seals, stopped)  # doctest: +SKIP
+    >>> witnesses, seals = plugin._inspect_repair_workers(parent, corrected, proposal, fingerprint, licenses, stopped)  # doctest: +SKIP
     """
-    pending = {node: self._request_worker_inspection(parent, node, config, seals.get(node)) for node in (*seals, *stopped)}
+    parent_id = parent["operation_id"]
+    # Bind reuse to the complete prior state and license authority. Desired edits need no new observation of that state.
+    scope = hashlib.sha256(json.dumps([proposal, fingerprint, licenses, stopped], sort_keys=True).encode()).hexdigest()
+    with HANDOFF_LOCK:
+      now = self.time()
+      cache = self._repair_inspections
+      for key, (_, challenges) in list(cache.items()):
+        if any(meta["expires_at"] <= now for meta in challenges.values()):
+          del cache[key]
+      entry = cache.get(parent_id)
+      if entry is None or entry[0] != scope:
+        targets = [row["current"] for row in proposal["placements"]]
+        seals = {node: self.bc.encrypt_str(fingerprint, node) for node in targets if node not in stopped}
+        if any(not isinstance(seal, str) or not seal for seal in seals.values()):
+          raise ValueError("Could not bind the prior configuration to its current worker.")
+        # Bound the cache even if many approved jobs request inspection at once.
+        if parent_id not in cache and len(cache) >= 64:
+          del cache[next(iter(cache))]
+        entry = (scope, {node: self._request_worker_inspection(parent, node, config, seals.get(node)) for node in targets})
+        cache[parent_id] = entry
+        retry = False
+      else:
+        retry = True
+    pending = dict(entry[1])
+    seals = {node: meta["config_seal"] for node, meta in pending.items() if node not in stopped}
     fields = order_fields(config)
     ordered = [fields[key] for key in ("targets", "commands", "peers")]
     digest = hashlib.sha256(json.dumps(ordered, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
@@ -256,6 +284,9 @@ class _JobRepairMixin:
       for node, meta in list(pending.items()):
         result = self._read_worker_inspection(parent, meta, digest)
         if not result:
+          if retry:
+            # Retry the existing challenge once. A late valid response still satisfies this request.
+            self._send_worker_inspection(parent, config, meta)
           continue
         if node in stopped:
           original_pin = stopped[node]["instances"][0]["runtime_artifacts"]["git_commit"]
@@ -265,9 +296,10 @@ class _JobRepairMixin:
           observations[node] = result  # These observations authorize a later conditional retirement.
         del pending[node]
       if not pending:
-        return observations
+        return observations, seals
+      retry = False
       time.sleep(0.25)
-    raise DeploymentConflictError("A paid worker did not confirm repair support and its previous state. Refresh and retry recovery.")
+    raise DeploymentConflictError("A paid worker did not confirm repair support and its previous state. Retry the update to check again.")
 
   def _request_worker_inspection(self, parent, node, config, seal):
     """Issue one bounded read to the selected current worker.
@@ -298,9 +330,28 @@ class _JobRepairMixin:
       meta["confirm_prior_stop"] = True  # Ask the upgraded worker to reconfirm its old receipt without starting it.
     else:
       meta["config_seal"] = seal
-    self.cmdapi_start_pipeline(config={"NAME": parent["app_id"], "TYPE": config["TYPE"], "DEEPLOY_OPERATION": meta},
-                               node_address=node)
+    self._send_worker_inspection(parent, config, meta)
     return meta
+
+  def _send_worker_inspection(self, parent, config, meta):
+    """Send an existing scoped worker inspection challenge.
+
+    Parameters
+    ----------
+    parent, config, meta : dict
+      Original operation, prior pipeline and immutable challenge envelope.
+
+    Returns
+    -------
+    None
+      Queues the inspection for its named worker.
+
+    Examples
+    --------
+    >>> plugin._send_worker_inspection(parent, corrected, challenge)  # doctest: +SKIP
+    """
+    self.cmdapi_start_pipeline(config={"NAME": parent["app_id"], "TYPE": config["TYPE"], "DEEPLOY_OPERATION": meta},
+                               node_address=meta["node_addr"])
 
   def _read_worker_inspection(self, parent, meta, digest):
     """Read and verify one challenge from the local signed-report replica.
@@ -321,6 +372,8 @@ class _JobRepairMixin:
     --------
     >>> result = plugin._read_worker_inspection(parent, challenge, digest)  # doctest: +SKIP
     """
+    if self.time() >= meta["expires_at"]:
+      return None  # A retry can request a fresh challenge after expiry.
     key = parent["operation_id"] + "|inspect|" + meta["node_addr"]
     result = self.chainstore_hget(NODE_OPERATIONS_HKEY, key)
     if not result or result.get("challenge") != meta["challenge"] or not self._verify_operation_record(result, "node_addr"):
@@ -329,7 +382,7 @@ class _JobRepairMixin:
     if (any(result.get(key) != meta[key] for key in ("operation_id", "attempt", "coordinator", "node_addr",
                                                       "job_id", "revision", "expires_at"))
         or type(result.get("revision")) is not int or type(result.get("job_id")) is not int
-        or self.time() >= meta["expires_at"] or result.get("app_id") != parent["app_id"] or result.get("status") != "observed"
+        or result.get("app_id") != parent["app_id"] or result.get("status") != "observed"
         or len(items) != 1 or not isinstance(items[0], dict)
         or items[0].get("instance_id") != meta["instance_id"] or items[0].get("status") != "observed"
         or items[0].get("signature") != WORKER_APP_RUNNER_SIGNATURE
@@ -418,10 +471,7 @@ class _JobRepairMixin:
     from naeural_core.business.deployment_lifecycle import repair_config_fingerprint
     # Only the intended worker can open this full-config comparison, which may depend on protected values.
     fingerprint = repair_config_fingerprint(corrected)
-    seals = {node: self.bc.encrypt_str(fingerprint, node) for node in aliases.values() if node not in stopped}
-    if any(not isinstance(seal, str) or not seal for seal in seals.values()):
-      raise ValueError("Could not bind the prior configuration to its current worker.")
-    inspections = self._inspect_repair_workers(parent, corrected, seals, stopped)
+    inspections, seals = self._inspect_repair_workers(parent, corrected, proposal, fingerprint, licenses, stopped)
     commits = [r["instances"][0]["runtime_artifacts"]["git_commit"] for r in (*inspections.values(), *stopped.values())]
     self._verify_repair_source(corrected, commits)
     return dict(proposal=proposal, prior=corrected, stopped=stopped, inspections=inspections, seals=seals, aliases=aliases,
@@ -558,6 +608,7 @@ class _JobRepairMixin:
     reports = self._node_operation_reports(child, "retire")
     runtime = {}
     if self._get_pipeline_from_cstore(child["job_id"]) != child["previous_pipeline_cid"]:
+      self._record_repair_block(child, "REPAIR_PLACEMENT_UNCONFIRMED", "The published job changed during repair.")
       raise DeploymentConflictError("The published job changed before recovery retirement.")
     for node, config in plan["previous_configs"].items():
       # Preserve and re-verify the original signer rather than moving a STOP to a different address or operation ID.
@@ -604,7 +655,8 @@ class _JobRepairMixin:
         if not observation:
           continue  # No synchronous wait on the shared deployment worker.
         if observation["instances"][0]["runtime_artifacts"]["git_commit"] != pin:
-          raise ValueError("The worker changed since the CSP approved recovery.")
+          self._record_repair_block(child, "REPAIR_SOURCE_CHANGED", "A worker's Git commit changed. Review its retirement before proceeding.")
+          raise DeploymentConflictError("The worker changed since the CSP approved recovery.")
         child.setdefault("repair_observations", {})[node] = observation
         del child["pending_inspections"][node]
       meta = self._operation_metadata(child, "retire", "retire_worker_v1")
@@ -625,6 +677,30 @@ class _JobRepairMixin:
       child["retired_runtime"] = runtime
       child.update(error=None, recovery=None, deadline=self.time() + self.cfg_deployment_readiness_timeout)
       self._save_operation(child, "waiting_for_readiness", "All previous workers accounted for on the approved hosts.")
+
+  def _record_repair_block(self, child, code, message):
+    """Publish a stable reason for a repair that must wait for evidence.
+
+    Parameters
+    ----------
+    child : dict
+      Coordinator-owned repair operation.
+    code, message : str
+      Static public reason without request or credential data.
+
+    Returns
+    -------
+    None
+      Saves one snapshot when the reason changes.
+
+    Examples
+    --------
+    >>> plugin._record_repair_block(child, "REPAIR_PLACEMENT_UNCONFIRMED", "Placement changed.")  # doctest: +SKIP
+    """
+    block = dict(code=code, message=message, retryable=True)
+    if child.get("repair_block") != block:
+      child["repair_block"] = block
+      self._save_operation(child)
 
   def _recheck_repair_placement(self, child, finalizing=False):
     """Verify chain authority immediately before sending a repair command.
@@ -652,6 +728,7 @@ class _JobRepairMixin:
           or pointer.get("coordinator") != self.bc.address or pointer.get("plan_cid") != child["plan_cid"]
           or pointer.get("revision") != child["target_revision"] or pointer.get("deleted") is not False
           or not self._verify_operation_record(pointer, "coordinator")):
+        self._record_repair_block(child, "REPAIR_PLACEMENT_UNCONFIRMED", "The published job changed during repair.")
         raise DeploymentConflictError("The published job changed during recovery.")
     try:
       job = self.bc.get_job_details(job_id=child["job_id"])
@@ -659,6 +736,10 @@ class _JobRepairMixin:
                and self._repair_aliases(list(aliases), job) == (aliases, child["repair_licenses"]))
     except Exception as exc:
       # A failed registry read must also hold dispatch and back off the shared reconciler.
+      self._record_repair_block(child, "REPAIR_PLACEMENT_UNCONFIRMED", "The current licensed placement could not be verified.")
       raise DeploymentConflictError("The current licensed placement could not be verified.") from exc
     if not valid:
+      self._record_repair_block(child, "REPAIR_PLACEMENT_UNCONFIRMED", "The job owner or licensed placement changed during repair.")
       raise DeploymentConflictError("The job, its owner or its licensed placement changed during recovery.")
+    if child.pop("repair_block", None):
+      self._save_operation(child)  # Dispatch only after fresh placement and worker evidence let recovery proceed.

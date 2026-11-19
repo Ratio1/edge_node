@@ -4,8 +4,9 @@ import copy
 import hashlib
 import json
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+from extensions.business.deeploy import job_repair
 from extensions.business.deeploy.job_repair import _JobRepairMixin, MUTATION, order_fields, worker
 from extensions.business.deeploy.deployment_operations import NODE_OPERATIONS_HKEY, DeploymentConflictError
 from extensions.business.deeploy.tests.lifecycle_custody_support import Coordinator, Custodian, Engine, State, connect, report
@@ -137,13 +138,87 @@ class RepairTests(unittest.TestCase):
     for node, cfg in restores:
       self.assertEqual(worker(cfg)["BUILD_AND_RUN_COMMANDS"], ["setup", "serve"])
       self.assertEqual(worker(cfg)["DEEPLOY_RUNTIME_ARTIFACTS"]["git_commit"], ("a" if node == "newA" else "b")*40)
-    report(self.state, child, "restore", "ready")
+    report(self.state, child, "restore", "ready")  # Readiness without a commit cannot finalize repair rollback.
+    self.c._advance_deployment_operation(child)
+    self.assertEqual((child["phase"], child["recovery"]), ("repair_v1_restoring_previous", "blocked"))
+    for node, pin in (("newA", "a"*40), ("newB", "b"*40)):
+      item = self.state.public[NODE_OPERATIONS_HKEY, node + "|restore"]
+      item["instances"][0]["runtime_artifacts"] = {"git_commit": pin}
+      Engine(node).sign(item)
+    self.c._advance_deployment_operation(child)
+    self.assertEqual(child["phase"], "repair_v1_finalizing_recovery")
+    # A newer contradictory receipt arriving after the readiness barrier must also block publication.
+    item = self.state.public[NODE_OPERATIONS_HKEY, "newB|restore"]
+    item["instances"][0]["runtime_artifacts"]["git_commit"] = "c"*40
+    item["sequence"] += 1
+    Engine("newB").sign(item)
+    self.c._advance_deployment_operation(child)
+    self.assertEqual(child["phase"], "repair_v1_restoring_previous")
+    self.assertEqual(self.c._get_pipeline_from_cstore(31), self.cid)
+    item["instances"][0]["runtime_artifacts"]["git_commit"] = "b"*40
+    item["sequence"] += 1
+    Engine("newB").sign(item)
     self.c._advance_deployment_operation(child)
     self.c._advance_deployment_operation(child)
     self.assertEqual((child["phase"], child["outcome"], child["recovery"]), ("completed", "failed", "completed"))
     self.c._advance_serialized_operation(self.c._operation_records()[self.oid])
     self.assertEqual(self.c._operation_records()[self.oid]["outcome"], "superseded")
     self.assertTrue(all(node in ("newA", "newB") for node, _ in previous_commands + self.c.commands))
+
+  def test_externally_managed_prior_checkout_fails_before_worker_commands(self):
+    for config in (self.stored, self.live):
+      worker(config)["SETUP_REPO"] = False
+    self.cid = self.state.blobs.add_json(self.stored)
+    self.state.public["DEEPLOY_DEPLOYED_JOBS", "31"] = self.cid
+    self.parent["previous_pipeline_cid"] = self.cid
+    self.c._save_operation(self.parent)
+    with self.assertRaisesRegex(ValueError, "clone its Git checkout"):
+      self.c._assess_job_repair(31, "owner")
+    self.assertEqual(self.c.commands, [])
+    self.http.assert_not_called()
+
+  def test_late_inspections_are_reused_until_they_expire(self):
+    proposal, *_ = self.c._assess_job_repair(31, "owner")
+    signed = dict(job_id=31, app_id="app", expected_revision=0, target_nodes=[row["current"] for row in proposal["placements"]],
+                  repair=dict(proposal=proposal, same_host=True, rotate_main_tunnel=False))
+    received = []
+    queued = []
+    self.c.bc.encrypt_str = Mock(side_effect=["first-scope-seal", "fresh-scope-seal", "expired-scope-seal"])
+
+    def delayed(config, node_address):
+      received.append(config["DEEPLOY_OPERATION"])
+      queued.append((self.state.now + 15, config, node_address))
+
+    def advance(seconds):
+      self.state.now += seconds
+      while queued and queued[0][0] <= self.state.now:
+        _, wire, node = queued.pop(0)
+        self.transport(wire, node)
+
+    self.c.cmdapi_start_pipeline = delayed
+    with patch.object(job_repair.time, "monotonic", side_effect=lambda: self.state.now), patch.object(job_repair.time, "sleep", side_effect=advance):
+      with self.assertRaisesRegex(DeploymentConflictError, "Retry the update"):
+        self.c._prepare_job_repair(signed, "owner")
+      self.assertEqual(len(received), 2)
+      advance(1)  # Retry before the original reports arrive, while their challenges are still fresh.
+      repair = self.c._prepare_job_repair(signed, "owner")
+      self.assertEqual(len(received), 4)
+      self.assertEqual(received[:2], received[2:])
+      self.assertEqual(repair["seals"], {"newA": "first-scope-seal"})
+      original = next(meta for meta in received if meta["node_addr"] == "newA")
+      self.assertEqual(repair["inspections"]["newA"]["challenge"], original["challenge"])
+      self.c.plugins_shmem["CHAIN_DIST_CONFIRMED_RELINKS"]["0xoldA"] = ("0xnewA", 99, "changed-license-owner")
+      self.c.bc.get_node_license_info = lambda node_address_eth, **kw: dict(
+        nodeAddress=node_address_eth, licenseId=99 if node_address_eth == "0xnewA" else 2,
+        owner="changed-license-owner" if node_address_eth == "0xnewA" else "license-owner", isValid=True,
+      )
+      with self.assertRaisesRegex(DeploymentConflictError, "Retry the update"):
+        self.c._prepare_job_repair(signed, "owner")
+      self.assertEqual(len(received), 6)  # The same addresses under a different license may not reuse old proof.
+      advance(120)
+      with self.assertRaisesRegex(DeploymentConflictError, "Retry the update"):
+        self.c._prepare_job_repair(signed, "owner")
+      self.assertEqual(len({meta["challenge"] for meta in received}), 6)
 
   def test_expired_repair_without_dispatched_retirement_releases_parent(self):
     child = self.admit()
@@ -170,6 +245,34 @@ class RepairTests(unittest.TestCase):
     self.assertEqual(self.c._operation_records()[self.oid]["phase"], "holding_for_repair")
     self.http.assert_not_called()
 
+  def test_renewed_inspection_with_a_changed_commit_shows_why_repair_is_held(self):
+    child = self.admit()
+    self.c._advance_deployment_operation(child)
+    retire_key = (NODE_OPERATIONS_HKEY, child["operation_id"] + "|retire|newA")
+    self.state.public.pop(retire_key)  # No signed evidence establishes what happened to the dispatched STOP.
+    inspection = self.c._load_operation_plan(child)["repair_evidence"]["inspections"]["newA"]
+    self.state.now = max(child["deadline"], inspection["expires_at"]) + 1
+
+    def changed_checkout(config, node_address):
+      self.transport(config, node_address)
+      meta = config["DEEPLOY_OPERATION"]
+      self.assertEqual(meta["action"], "inspect_worker_v1")
+      item = self.state.public[NODE_OPERATIONS_HKEY, self.oid + "|inspect|newA"]
+      item["instances"][0]["runtime_artifacts"]["git_commit"] = "c"*40
+      Engine(node_address).sign(item)
+
+    self.c.cmdapi_start_pipeline = changed_checkout
+    self.c._advance_deployment_operation(child)
+    self.state.now += 11
+    with self.assertRaisesRegex(DeploymentConflictError, "worker changed"):
+      self.c._advance_deployment_operation(child)
+    self.c.deeploy_verify_and_get_inputs = lambda *args, **kwargs: ("owner", {})
+    self.c.deeploy_get_auth_result = lambda inputs: {"escrow_owner": "owner"}
+    progress = self.c._deployment_status({"operation_id": child["operation_id"]})
+    self.assertEqual((progress["recovery"], progress["error"]["code"]), ("blocked", "REPAIR_SOURCE_CHANGED"))
+    self.assertEqual(self.c._operation_records()[self.oid]["phase"], "holding_for_repair")
+    self.assertNotIn(retire_key, self.state.public)
+
   def test_success_only_publishes_after_both_current_workers_report_ready(self):
     child = self.admit()
     for _ in range(3):
@@ -192,8 +295,13 @@ class RepairTests(unittest.TestCase):
     with self.assertRaises(DeploymentConflictError):
       self.c._advance_deployment_operation(child)
     self.assertEqual(len(self.c.commands), count)
+    self.c.deeploy_verify_and_get_inputs = lambda *args, **kwargs: ("owner", {})
+    self.c.deeploy_get_auth_result = lambda inputs: {"escrow_owner": "owner"}
+    progress = self.c._deployment_status({"operation_id": child["operation_id"]})
+    self.assertEqual((progress["recovery"], progress["error"]["code"]), ("blocked", "REPAIR_PLACEMENT_UNCONFIRMED"))
     self.job["escrowOwner"] = "owner"
     self.c._advance_deployment_operation(child)
+    self.assertNotIn("repair_block", self.c._operation_records()[child["operation_id"]])
     report(self.state, child, "deploy", "failed")
     self.c._advance_deployment_operation(child)
     report(self.state, child, "deploy", "stopped")

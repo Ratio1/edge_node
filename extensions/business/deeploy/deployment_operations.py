@@ -105,13 +105,14 @@ def report_confirms_retirement(report, expected):
   return len(identities) == len(items) and identities == {tuple(pair) for pair in expected}
 
 
-def report_is_ready(report, config, pins=None):
+def report_is_ready(report, config, pins=None, restore_bindings=None):
   """Require an explicit ready report for every planned plugin instance.
 
   Nodes publish on changes in status or version. Callers pair the latest
   report with NetMon liveness because a healthy workload can stay unchanged.
   """
-  return node_rollout_state(config, report, online=True, deadline=False, pins=pins) == "ready"
+  return node_rollout_state(config, report, online=True, deadline=False, pins=pins,
+                            restore_bindings=restore_bindings) == "ready"
 
 
 def pinned_sources(config):
@@ -229,7 +230,7 @@ def validate_source_pins(configs):
           raise ValueError("A plugin instance must use the same source pin on every node.")
 
 
-def node_rollout_state(config, report, online, deadline, pins=None, allow_waiting_for_source=True):
+def node_rollout_state(config, report, online, deadline, pins=None, allow_waiting_for_source=True, restore_bindings=None):
   """Decide whether one node permits a revision to take effect.
 
   Each planned instance needs its own evidence. A lifecycle error always wins
@@ -245,6 +246,8 @@ def node_rollout_state(config, report, online, deadline, pins=None, allow_waitin
     Signed projection of the plan when status polling has only the planned instance identities.
   allow_waiting_for_source : bool, optional
     Whether a source-following deployment can take effect before it becomes ready.
+  restore_bindings : dict or None, optional
+    The exact signed stop artifacts for this worker during a repair restore.
 
   Returns
   -------
@@ -285,6 +288,13 @@ def node_rollout_state(config, report, online, deadline, pins=None, allow_waitin
     following = allow_waiting_for_source and mode == reported_mode == "following"
     status = item.get("status")
     legacy = mode in ("following", "pinned") and reported_mode is None
+    if restore_bindings is not None and instance is not None and status == "ready":
+      # A repair restore binds each worker to its own stop, even if the configured branch is shared.
+      commit = (restore_bindings.get(pin_key) or {}).get("git_commit")
+      artifacts = item.get("runtime_artifacts")
+      if (not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)
+          or not isinstance(artifacts, dict) or artifacts.get("git_commit") != commit):
+        return "failed"
     if mode == "pinned" and status == "ready":
       if legacy:
         return "legacy_failed"  # Older nodes bind their first start, which may differ from the request.
@@ -395,6 +405,7 @@ class _DeploymentOperationsMixin:
     # Operation id -> (failures in a row, time of the last one, seconds to wait) after a failed dAuth custody
     # call: the worker waits that long before it calls the same dAuth server again, instead of every 2 s.
     self._custody_retry = {}
+    self._repair_inspections = {}  # Short-lived admission challenges keyed by the original operation.
     self._deployment_plan_cache_lock = threading.Lock()
     self._deployment_operations_event = threading.Event()
     self._deployment_operations_stop = threading.Event()
@@ -1043,9 +1054,10 @@ class _DeploymentOperationsMixin:
         self._deployment_plans[cid] = plan
     return copy.deepcopy(plan)
 
-  def _node_is_ready(self, node, report, config, pins=None):
+  def _node_is_ready(self, node, report, config, pins=None, restore_bindings=None):
     """Pair the attempt's one-time ready report with current NetMon liveness."""
-    return report_is_ready(report, config, pins=pins) and self._netmon_node_is_online_for_control(node)
+    return (report_is_ready(report, config, pins=pins, restore_bindings=restore_bindings)
+            and self._netmon_node_is_online_for_control(node))
 
   def _node_operation_reports(self, operation, attempt):
     """Read newest signed reports from the planned nodes for this attempt."""
@@ -1162,11 +1174,13 @@ class _DeploymentOperationsMixin:
     3
     """
     check_placement = action == "start" and operation.get("mutation") == "same_host_repair_v1"
+    repair_restore = check_placement and attempt == "restore"
     for node, config in configs.items():
       report = reports.get(node, {})
       if action in ("stop", "retire") and report.get("status") == "stopped":
         continue
-      if action == "start" and report_is_ready(report, config):
+      restore_bindings = operation.get("retired_runtime", {}).get(node, {}) if repair_restore else None
+      if action == "start" and report_is_ready(report, config, restore_bindings=restore_bindings):
         continue
       # Resend throttle in process memory, not in the signed snapshot; nodes de-duplicate by operation_id|attempt.
       sent_at = self._operations_sent_at
@@ -1297,8 +1311,9 @@ class _DeploymentOperationsMixin:
           for plugin in config.get("PLUGINS", []) for instance in plugin.get("INSTANCES", [])
         )
         online = self._netmon_node_is_online_for_control(node) if recheck else True
+        restore_bindings = operation.get("retired_runtime", {}).get(node, {}) if repair and restoring else None
         state = node_rollout_state(config, active_reports.get(node), online, expired, pins=pins,
-                                   allow_waiting_for_source=not repair)
+                                   allow_waiting_for_source=not repair, restore_bindings=restore_bindings)
         if state in ("failed", "legacy_failed") or (recheck and state not in ("ready", "kept")):
           # Once the revision is published, its remaining secret/metadata writes must still finish.
           pointer = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(operation["job_id"]))
@@ -1351,7 +1366,8 @@ class _DeploymentOperationsMixin:
       previous_reports = self._node_operation_reports(operation, "restore")
       expired = self.time() >= operation["restore_deadline"]
       states = {node: node_rollout_state(config, previous_reports.get(node), self._netmon_node_is_online_for_control(node), expired,
-                                         allow_waiting_for_source=not repair)
+                                         allow_waiting_for_source=not repair,
+                                         restore_bindings=operation.get("retired_runtime", {}).get(node, {}) if repair else None)
                 for node, config in previous_configs.items()}
       if all(state in ("ready", "kept") for state in states.values()):
         message = "Previous revision restored and waiting for source." if "kept" in states.values() else "Previous revision is ready on all required nodes."
@@ -1714,6 +1730,7 @@ class _DeploymentOperationsMixin:
     configs = {node: {"PLUGINS": [{"SIGNATURE": signature, "INSTANCES": [{"INSTANCE_ID": instance}]} for signature, instance in values]}
                for node, values in identities.items()}
     pins = operation.get("pinned_sources", {}).get(attempt, {})  # Polling never downloads the private plan.
+    repair_restore = attempt == "restore" and operation.get("mutation") == "same_host_repair_v1"
     now = self.time()
     nodes = []
     for node in dict.fromkeys(operation["nodes"] + operation["previous_nodes"]):
@@ -1737,7 +1754,10 @@ class _DeploymentOperationsMixin:
           action = "stop_report_unavailable"  # A replica can lack a report its coordinator already has.
       nodes.append(dict(
         node_id=node, observed_revision=report.get("revision"),
-        ready=node in configs and self._node_is_ready(node, report, configs[node], pins.get(node)),
+        ready=node in configs and self._node_is_ready(
+          node, report, configs[node], pins.get(node),
+          restore_bindings=operation.get("retired_runtime", {}).get(node, {}) if repair_restore else None,
+        ),
         # Replicas can learn later node snapshots after the operation itself has completed.
         report_attempt=report.get("attempt"), report_sequence=report.get("sequence"),
         workload_state=report.get("status", "unknown"),
@@ -1753,6 +1773,9 @@ class _DeploymentOperationsMixin:
     if operation.get("mutation") == "same_host_repair_v1":
       # The prior address remains available for audit; its successor alone occupies the paid slot.
       result["relinked_nodes"] = [{"previous": old, "current": current} for old, current in operation["repair_aliases"]]
+      if phase != "completed" and operation.get("repair_block"):
+        # Expose the current hold without overwriting the original rollout failure in the operation.
+        result.update(recovery="blocked", error=copy.deepcopy(operation["repair_block"]))
     if operation.get("repair_child"):
       result["repair_child_operation_id"] = operation["repair_child"]["operation_id"]
     limit = request.get("events_limit", 64)
