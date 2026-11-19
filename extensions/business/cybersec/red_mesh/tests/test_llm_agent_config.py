@@ -87,6 +87,41 @@ class LlmAgentConfigTests(unittest.TestCase):
     self.assertEqual(config["PROVIDER"], "local")
     self.assertEqual(config["MODEL"], "deepseek-chat")
 
+  def test_local_structured_chunk_timeout_defaults_to_270(self):
+    owner = MagicMock()
+    owner.cfg_llm_agent = None
+    owner.CONFIG = {}
+
+    config = _config.get_llm_agent_config(owner)
+
+    self.assertEqual(config["LOCAL_STRUCTURED_CHUNK_TIMEOUT"], 270)
+
+  def test_local_structured_chunk_timeout_override_is_preserved(self):
+    owner = MagicMock()
+    owner.cfg_llm_agent = {"ENABLED": True, "LOCAL_STRUCTURED_CHUNK_TIMEOUT": "400"}
+
+    config = _config.get_llm_agent_config(owner)
+
+    self.assertEqual(config["LOCAL_STRUCTURED_CHUNK_TIMEOUT"], 400)
+
+  def test_invalid_local_structured_chunk_timeout_falls_back_to_default(self):
+    for value in ("soon", None, 0, -5, "nan", "inf"):
+      with self.subTest(value=value):
+        owner = MagicMock()
+        owner.cfg_llm_agent = {"ENABLED": True, "LOCAL_STRUCTURED_CHUNK_TIMEOUT": value}
+
+        config = _config.get_llm_agent_config(owner)
+
+        self.assertEqual(config["LOCAL_STRUCTURED_CHUNK_TIMEOUT"], 270)
+
+  def test_local_structured_chunk_timeout_is_capped(self):
+    owner = MagicMock()
+    owner.cfg_llm_agent = {"ENABLED": True, "LOCAL_STRUCTURED_CHUNK_TIMEOUT": 99999}
+
+    config = _config.get_llm_agent_config(owner)
+
+    self.assertEqual(config["LOCAL_STRUCTURED_CHUNK_TIMEOUT"], 1800)
+
 
 if __name__ == "__main__":
   unittest.main()
