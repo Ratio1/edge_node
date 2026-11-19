@@ -2,6 +2,7 @@ import random
 import re as _re
 import socket
 import struct
+import time
 import ftplib
 import requests
 import ssl
@@ -11,7 +12,10 @@ import paramiko
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
-from ...cve_db import check_cves, parse_distro_package
+from ...cve_db import (
+  BANNER_NOT_ASSESSABLE, NOT_APPLICABLE_BEHAVIOUR_CLEARED, check_cves, clear_cve, confirm_cve, parse_distro_package, probe_cve_fields,
+  withdraw_not_applicable,
+)
 from ...models.finding_schema import (
   AUTHENTICATED_ACTION_ATTEMPTED, AUTHENTICATED_ACTION_PERFORMED,
 )
@@ -196,6 +200,155 @@ _HTTP_SERVER_RE = _re.compile(
     r'(Apache|nginx)[/ ]+(\d+(?:\.\d+)+)', _re.IGNORECASE,
 )
 _HTTP_PRODUCT_MAP = {'apache': 'apache', 'nginx': 'nginx'}
+
+
+# --- SSH KEXINIT: the server's own algorithm offer (RM-200) ---------------------------------------
+# paramiko's `get_security_options()` is the client's preference list, so it says nothing about the server.
+# The server's SSH_MSG_KEXINIT (RFC 4253 section 7.1) is sent before any authentication and needs no keys.
+_KEXINIT_FIELDS = ("kex", "host_key", "enc_c2s", "enc_s2c", "mac_c2s", "mac_s2c",
+                   "comp_c2s", "comp_s2c", "lang_c2s", "lang_s2c")
+_KEXINIT_MAX_PACKET = 35000  # RFC 4253 section 6.1: a receiver must accept 35000 bytes
+_KEXINIT_MAX_NAME = 64
+_KEXINIT_MAX_NAMES = 64
+_KEXINIT_DEADLINE_FACTOR = 5   # overall read budget = this many per-recv timeouts ...
+_KEXINIT_DEADLINE_CAP = 15.0   # ... capped, so a server dripping one byte per timeout cannot hold the probe
+_SSH_STRICT_KEX = "kex-strict-s-v00@openssh.com"
+_SSH_CHACHA = "chacha20-poly1305@openssh.com"
+# Real Dropbear always offers the first (since 2013.57) and has never implemented the second.
+_DROPBEAR_KEXGUESS = "kexguess2@matt.ucc.asn.au"
+_DROPBEAR_NO_PREFIX = "diffie-hellman-group-exchange-"
+
+
+def _parse_ssh_kexinit(body):
+  """The 10 name-lists of an unencrypted SSH_MSG_KEXINIT packet body, or None.
+
+  `body` is the binary packet after its length field: padding length, payload, padding.
+  """
+  try:
+    pad = body[0]
+    payload = body[1:len(body) - pad]
+    if not payload or payload[0] != 20:
+      return None
+    pos = 17  # message type + 16-byte cookie
+    lists = {}
+    for field in _KEXINIT_FIELDS:
+      (size,) = struct.unpack(">I", payload[pos:pos + 4])
+      pos += 4
+      if size > len(payload) - pos:
+        return None
+      text = payload[pos:pos + size].decode("latin-1")
+      # RFC 4251 section 6: a name is printable ASCII 0x21-0x7e, 64 characters at most. Others are dropped, not cut.
+      names = [n for n in text.split(",") if 0 < len(n) <= _KEXINIT_MAX_NAME and all("!" <= c <= "~" for c in n)]
+      lists[field] = names[:_KEXINIT_MAX_NAMES]
+      pos += size
+    return lists
+  except (IndexError, struct.error):
+    return None
+
+
+def _ssh_read_kexinit(target, port, timeout):
+  """The server's KEXINIT name-lists as a dict, or None on any error. No authentication, bounded reads."""
+  sock = None
+  deadline = time.monotonic() + min(timeout * _KEXINIT_DEADLINE_FACTOR, _KEXINIT_DEADLINE_CAP)
+  try:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    sock.connect((target, port))
+    sock.sendall(b"SSH-2.0-RedMesh_Probe\r\n")
+    buf = b""
+
+    def take(n):
+      nonlocal buf
+      while len(buf) < n:
+        if time.monotonic() > deadline:
+          raise TimeoutError("KEXINIT read deadline")
+        chunk = sock.recv(4096)
+        if not chunk:
+          raise EOFError
+        buf += chunk
+      out, buf = buf[:n], buf[n:]
+      return out
+
+    for _ in range(20):  # a server may send text lines before its identification line
+      line = b""
+      while not line.endswith(b"\n"):
+        line += take(1)
+        if len(line) > 255:
+          return None
+      if line.startswith(b"SSH-"):
+        break
+    else:
+      return None
+    (length,) = struct.unpack(">I", take(4))
+    if length < 2 or length > _KEXINIT_MAX_PACKET:
+      return None
+    return _parse_ssh_kexinit(take(length))
+  except Exception:
+    return None
+  finally:
+    if sock is not None:
+      try:
+        sock.close()
+      except Exception:
+        pass
+
+
+def _ssh_banner_verdict(product, kexinit):
+  """`(verified, why)`: does the KEXINIT fit the implementation the banner names?
+
+  True: it does, or no rule exists (OpenSSH has no invariant its config cannot change, so it is verified by default).
+  False: it contradicts the banner, so the service is an emulator or a proxy. None: no KEXINIT to judge by.
+  BANNER_NOT_ASSESSABLE: no KEXINIT and the product has no check (only dropbear has one), so its rows keep their confidence.
+  """
+  if kexinit is None:
+    return (None if product == "dropbear" else BANNER_NOT_ASSESSABLE), ""
+  if product == "dropbear":
+    kex = kexinit["kex"]
+    if _DROPBEAR_KEXGUESS not in kex:
+      return False, f"banner names dropbear but the KEXINIT lacks {_DROPBEAR_KEXGUESS}, which every Dropbear offers"
+    group_exchange = sorted(k for k in kex if k.startswith(_DROPBEAR_NO_PREFIX))
+    if group_exchange:
+      return False, f"banner names dropbear but the KEXINIT offers {', '.join(group_exchange)}, which Dropbear never implements"
+  return True, ""
+
+
+def _ssh_terrapin(kexinit):
+  """`(vulnerable, evidence)` for CVE-2023-48795 from the server's KEXINIT; `(None, "")` without one.
+
+  Vulnerable: chacha20-poly1305, or a CBC cipher with an -etm MAC, is offered and strict KEX is not.
+  """
+  if kexinit is None:
+    return None, ""
+  ciphers = set(kexinit["enc_c2s"]) | set(kexinit["enc_s2c"])
+  macs = set(kexinit["mac_c2s"]) | set(kexinit["mac_s2c"])
+  modes = []
+  if _SSH_CHACHA in ciphers:
+    modes.append(_SSH_CHACHA)
+  cbc = sorted(c for c in ciphers if c.endswith("-cbc"))
+  etm = sorted(m for m in macs if m.endswith("-etm@openssh.com"))
+  if cbc and etm:
+    modes.append(f"{cbc[0]} with {etm[0]}")
+  strict = _SSH_STRICT_KEX in kexinit["kex"]
+  if modes and not strict:
+    return True, f"KEXINIT offers {' and '.join(modes)} and no {_SSH_STRICT_KEX}"
+  if strict:
+    return False, f"KEXINIT offers {_SSH_STRICT_KEX}"
+  return False, "KEXINIT offers neither chacha20-poly1305 nor a CBC cipher with an -etm MAC"
+
+
+def _smtp_banner_verdict(mta, ehlo_features):
+  """`(verified, why)` for an SMTP banner from the EHLO reply lines. Only judged when an EHLO 250 reply was read.
+
+  Exim always ends its EHLO reply with HELP; mailoney's reply has none. Other MTAs have no check: not assessable,
+  even when EHLO was refused (a scanner identity that is not a domain gets 501 from OpenSMTPD).
+  """
+  if mta != "exim":
+    return BANNER_NOT_ASSESSABLE, ""
+  if not ehlo_features:
+    return None, ""
+  if not any(f.strip().upper() == "HELP" for f in ehlo_features):
+    return False, "banner names Exim but the EHLO reply has no HELP line, which Exim always sends"
+  return True, ""
 
 
 class _ServiceCommonMixin(_ServiceProbeBase):
@@ -751,7 +904,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
 
     # FTP server version CVE check
     _ftp_m = _re.search(
-      r'(ProFTPD|vsftpd)[/ ]+(\d+(?:\.\d+)+)',
+      r'(ProFTPD|vsftpd)[/ ]+(\d+(?:\.\d+)+(?:[a-z](?![a-z]))?)',
       result["banner"], _re.IGNORECASE,
     )
     if _ftp_m:
@@ -1138,12 +1291,14 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         "SSH", accepted_creds, control=control, proofs=proofs,
       )
 
-    # --- 5. Cipher/KEX audit ---
-    cipher_findings, weak_labels = self._ssh_check_ciphers(target, port)
+    # --- 5. Cipher/KEX audit, from the server's own KEXINIT ---
+    kexinit = _ssh_read_kexinit(target, port, self._target_timeout(3))
+    cipher_findings, weak_labels = self._ssh_check_ciphers(target, port, kexinit)
     findings += cipher_findings
     result["weak_algorithms"] = weak_labels
 
     # --- 6. CVE check on banner version ---
+    ssh_lib = ssh_version = package = verified = None
     if result["banner"]:
       ssh_lib, ssh_version = self._ssh_identify_library(result["banner"])
       if ssh_lib and ssh_version:
@@ -1156,7 +1311,11 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         package = parse_distro_package(result["banner"])
         if package is not None:
           result["ssh_package"] = f"{package.upstream} {package.distro}-{package.revision}"
-        findings += check_cves(ssh_lib, ssh_version, package=package)
+        # Does the KEXINIT fit the implementation the banner names? An emulator announces a real
+        # version and offers its own algorithms (RM-200).
+        verified, why = _ssh_banner_verdict(ssh_lib, kexinit)
+        self._record_banner_verdict(result, f"ssh:{port}", verified, why)
+        findings += check_cves(ssh_lib, ssh_version, package=package, banner_verified=verified)
 
         # --- 7. libssh auth bypass (CVE-2018-10933) ---
         if ssh_lib == "libssh":
@@ -1164,7 +1323,58 @@ class _ServiceCommonMixin(_ServiceProbeBase):
           if bypass:
             findings.append(bypass)
 
+    # --- 8. Terrapin (CVE-2023-48795), from the KEXINIT and not the banner ---
+    findings = self._ssh_apply_terrapin(findings, kexinit, ssh_lib or "", ssh_version or "", package, verified)
+
     return probe_result(raw_data=result, findings=findings)
+
+  def _record_banner_verdict(self, result, source, verified, why):
+    """Put a banner verdict in the probe result and hand an unverified one to the honeypot correlation."""
+    if verified is None or verified == BANNER_NOT_ASSESSABLE:
+      return
+    result["banner_verified"] = verified
+    if verified is False:
+      result["banner_unverified_reason"] = why
+      meta = self.state.get("scan_metadata")
+      if meta is not None:
+        # `pentest_worker.py` declares the other buckets; this one is added here, outside that file's reach.
+        meta.setdefault("banner_unverified", {})
+      self._emit_metadata("banner_unverified", source, why)
+
+  def _ssh_apply_terrapin(self, findings, kexinit, product, version, package, banner_verified=None):
+    """Confirm or clear CVE-2023-48795 from the KEXINIT, whatever the banner row says.
+
+    Not vulnerable: the banner row, if any, leaves the list and is recorded as not applicable.
+    Vulnerable: the banner row becomes certain with the KEXINIT evidence; with no row, a certain finding is added.
+    On a banner proven false (`banner_verified is False`) the finding keeps the evidence but stays tentative
+    `banner_unverified`: the service is an emulator, so its KEXINIT says nothing about a real server.
+    If the row had been dropped as `backport_fixed`, the behaviour wins and that record is withdrawn.
+    """
+    vulnerable, evidence = _ssh_terrapin(kexinit)
+    if vulnerable is None:
+      return findings
+    cve_id = "CVE-2023-48795"
+    if not vulnerable:
+      return clear_cve(findings, cve_id, product, version, package, NOT_APPLICABLE_BEHAVIOUR_CLEARED)
+    withdraw_not_applicable(cve_id)
+    unverified = banner_verified is False
+    if any(cve_id in (f.cve or ()) for f in findings):
+      return [confirm_cve(f, product, version, evidence, unverified=unverified) if cve_id in (f.cve or ()) else f
+              for f in findings]
+    return findings + [Finding(
+      severity=Severity.MEDIUM,
+      cvss_vector=V.WEAK_TRANSPORT,
+      title=f"{cve_id}: SSH Terrapin prefix truncation attack",
+      description="The SSH server offers an encryption mode affected by the Terrapin attack and does not offer strict key exchange.",
+      evidence=evidence,
+      remediation="Upgrade the SSH server to a release with strict key exchange, or disable chacha20-poly1305 and CBC-with-ETM modes.",
+      owasp_id="A02:2021",
+      cwe_id="CWE-354",
+      confidence="tentative" if unverified else "certain",
+      confidence_reason="banner_unverified" if unverified else "behaviour_confirmed",
+      cve=(cve_id,),
+      **probe_cve_fields(cve_id),
+    )]
 
   # Patterns: (regex, product_name_for_cve_db)
   _SSH_LIBRARY_PATTERNS = [
@@ -1189,8 +1399,11 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         return product, m.group(1)
     return None, None
 
-  def _ssh_check_ciphers(self, target, port):
-    """Audit SSH ciphers, KEX, and MACs via paramiko Transport.
+  def _ssh_check_ciphers(self, target, port, kexinit=None):
+    """Audit SSH ciphers, KEX and host-key types from the server's KEXINIT; the RSA key size via paramiko.
+
+    ``kexinit`` is `_ssh_read_kexinit`'s result. None: no cipher, KEX or DSA finding (paramiko's own preference
+    list is never a fallback: it describes the client).
 
     Returns
     -------
@@ -1205,18 +1418,23 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     _WEAK_KEX = {"diffie-hellman-group1-sha1", "diffie-hellman-group14-sha1",
                  "diffie-hellman-group-exchange-sha1"}
 
-    try:
-      transport = paramiko.Transport((target, port))
-      transport.connect()
-      sec_opts = transport.get_security_options()
+    ciphers = set(kexinit["enc_s2c"]) if kexinit else set()
+    kex = set(kexinit["kex"]) if kexinit else set()
+    key_types = set(kexinit["host_key"]) if kexinit else set()
 
-      ciphers = set(sec_opts.ciphers) if sec_opts.ciphers else set()
-      kex = set(sec_opts.kex) if sec_opts.kex else set()
-      key_types = set(sec_opts.key_types) if sec_opts.key_types else set()
+    try:
+      # The paramiko session only supplies the RSA host key; the algorithm lists above do not need it.
+      transport = None
+      try:
+        transport = paramiko.Transport((target, port))
+        transport.connect()
+      except Exception as e:
+        self.P(f"SSH host key read failed on {target}:{port}: {e}", color='y')
+        transport = None
 
       # RSA key size check — must be done before transport.close()
       try:
-        remote_key = transport.get_remote_server_key()
+        remote_key = transport.get_remote_server_key() if transport is not None else None
         if remote_key is not None and remote_key.get_name() == "ssh-rsa":
           key_bits = remote_key.get_bits()
           if key_bits < 2048:
@@ -1248,7 +1466,8 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       except Exception:
         pass
 
-      transport.close()
+      if transport is not None:
+        transport.close()
 
       # DSA key detection
       if "ssh-dss" in key_types:
@@ -1330,6 +1549,8 @@ class _ServiceCommonMixin(_ServiceProbeBase):
             severity=Severity.CRITICAL,
             cvss_vector=V.UNAUTHENTICATED_READ_WRITE,
             title="libssh auth bypass (CVE-2018-10933)",
+            cve=("CVE-2018-10933",),
+            **probe_cve_fields("CVE-2018-10933"),
             description="Server accepted SSH2_MSG_USERAUTH_SUCCESS from client, "
                         "bypassing authentication entirely. Full shell access possible.",
             evidence="Session channel opened after sending USERAUTH_SUCCESS.",
@@ -1478,7 +1699,10 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     if _mta_name and _mta_version:
       _cve_product = _smtp_product_map.get(_mta_name)
       if _cve_product:
-        findings += check_cves(_cve_product, _mta_version)
+        # Mailoney announces Exim and answers EHLO like nothing Exim sends (RM-200).
+        verified, why = _smtp_banner_verdict(_mta_name, ehlo_features)
+        self._record_banner_verdict(result, f"smtp:{port}", verified, why)
+        findings += check_cves(_cve_product, _mta_version, banner_verified=verified)
 
     if result["server_hostname"]:
       # Check if hostname reveals container/internal info

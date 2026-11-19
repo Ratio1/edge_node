@@ -118,6 +118,31 @@ class TestHeartbleedFindingHasCveField(unittest.TestCase):
       "raw-fallback Heartbleed Finding must populate the structured cve field",
     )
 
+  def test_both_paths_take_kev_and_build_from_the_vulndb_source(self):
+    """RM-169: KEV is never False when unknown. Under `static` nothing evaluated it."""
+    probe = self._make_probe()
+    fields = {"kev": True, "vulndb_build_id": "vulndb-aaaaaaaaaaaa"}
+    fake_sock = MagicMock()
+    fake_sock.recv.return_value = _build_leak_response()
+    fake_raw_after = MagicMock()
+    fake_raw_after.recv.return_value = _build_leak_response()
+    fake_tls_sock = MagicMock()
+    fake_tls_sock.unwrap.return_value = fake_raw_after
+    fake_ctx = MagicMock()
+    fake_ctx.wrap_socket.return_value = fake_tls_sock
+    tls = "extensions.business.cybersec.red_mesh.worker.service.tls"
+    with patch(tls + ".socket.socket", return_value=fake_sock):
+      self.assertIsNone(probe._tls_heartbleed_raw("10.0.0.1", 8443, b"\x03\x03").kev)
+    with patch(tls + ".socket.socket", return_value=fake_sock), \
+         patch(tls + ".probe_cve_fields", return_value=fields) as lookup:
+      raw_path = probe._tls_heartbleed_raw("10.0.0.1", 8443, b"\x03\x03")
+    lookup.assert_called_once_with("CVE-2014-0160")
+    with patch(tls + ".ssl.SSLContext", return_value=fake_ctx), patch(tls + ".socket.socket", return_value=MagicMock()), \
+         patch(tls + ".probe_cve_fields", return_value=fields):
+      main_path = probe._tls_check_heartbleed("10.0.0.1", 8443)
+    for finding in (raw_path, main_path):
+      self.assertEqual((finding.kev, finding.vulndb_build_id), (True, "vulndb-aaaaaaaaaaaa"))
+
 
 class TestHeartbleedTriggersOpenSslCveInference(unittest.TestCase):
   """When Heartbleed fires positive, the OpenSSL package version is

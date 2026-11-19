@@ -5,6 +5,7 @@ import requests
 from urllib.parse import quote
 
 from ...findings import Evidence, Finding, Severity, probe_result, probe_error
+from ...cve_db import probe_cve_fields
 from ..response_fingerprint import sanitize_excerpt
 from ... import cvss_vectors as V
 from ..probe_registry import register_probe, CATEGORY_WEB_TEST
@@ -605,6 +606,8 @@ class _WebInjectionMixin(_InjectionTestBase):
           findings_list.append(Finding(
             severity=Severity.CRITICAL,
             title=f"CVE-2014-6271: Shellshock RCE via {cgi_path}",
+            cve=("CVE-2014-6271",),
+            **probe_cve_fields("CVE-2014-6271"),
             description="Bash function injection via HTTP headers is evaluated "
                         "by the CGI handler, enabling unauthenticated Remote "
                         "Code Execution.",
@@ -703,6 +706,8 @@ class _WebInjectionMixin(_InjectionTestBase):
           findings_list.append(Finding(
             severity=Severity.CRITICAL,
             title="CVE-2024-4577: PHP-CGI argument injection RCE",
+            cve=("CVE-2024-4577",),
+            **probe_cve_fields("CVE-2024-4577"),
             description="PHP-CGI accepts soft-hyphen (%AD) as argument separator, "
                         "allowing injection of -d flags to override configuration "
                         "and execute arbitrary PHP code.",
@@ -725,6 +730,8 @@ class _WebInjectionMixin(_InjectionTestBase):
             severity=Severity.HIGH,
             cvss_vector=V.SENSITIVE_DATA_EXPOSED,
             title="CVE-2024-4577: PHP-CGI source code disclosure",
+            cve=("CVE-2024-4577",),
+            **probe_cve_fields("CVE-2024-4577"),
             description="PHP-CGI -s flag can be injected via %AD soft-hyphen, "
                         "exposing PHP source code.",
             evidence=f"GET {base_url}/?%ADs returned PHP source code.",
@@ -811,6 +818,8 @@ class _WebInjectionMixin(_InjectionTestBase):
           findings_list.append(Finding(
             severity=Severity.CRITICAL,
             title=f"CVE-2017-5638: Struts2 S2-045 OGNL injection RCE via {path}",
+            cve=("CVE-2017-5638",),
+            **probe_cve_fields("CVE-2017-5638"),
             description="Apache Struts2 evaluates OGNL expressions injected via "
                         "the Content-Type header, enabling unauthenticated RCE.",
             evidence=f"GET {url} with OGNL payload in Content-Type "
@@ -1106,6 +1115,8 @@ class _WebInjectionMixin(_InjectionTestBase):
         findings_list.append(Finding(
           severity=Severity.CRITICAL,
           title="CVE-2022-22963: Spring Cloud Function SpEL injection RCE",
+          cve=("CVE-2022-22963",),
+          **probe_cve_fields("CVE-2022-22963"),
           description="Spring Cloud Function evaluates SpEL expressions from the "
                       "spring.cloud.function.routing-expression header, enabling RCE.",
           evidence=f"POST {base_url}/functionRouter with SpEL header → "
@@ -1160,6 +1171,8 @@ class _WebInjectionMixin(_InjectionTestBase):
             severity=Severity.HIGH,
             cvss_vector=V.RCE_UNCONFIRMED,
             title="Spring4Shell (CVE-2022-22965) parameter binding indicator",
+            cve=("CVE-2022-22965",),
+            **probe_cve_fields("CVE-2022-22965"),
             description="Spring MVC processes class.module.classLoader parameter "
                         "binding (type error on URLs[0] vs ignored control), "
                         "confirming Spring4Shell attack surface.",
@@ -1183,6 +1196,8 @@ class _WebInjectionMixin(_InjectionTestBase):
             severity=Severity.HIGH,
             cvss_vector=V.RCE_UNCONFIRMED,
             title="Spring4Shell (CVE-2022-22965) parameter binding indicator",
+            cve=("CVE-2022-22965",),
+            **probe_cve_fields("CVE-2022-22965"),
             description="Spring MVC accepts class.module.classLoader parameter "
                         "binding, which is the attack surface for Spring4Shell RCE.",
             evidence=f"GET with class.module.classLoader parameter → 200, "
@@ -1199,6 +1214,8 @@ class _WebInjectionMixin(_InjectionTestBase):
             severity=Severity.HIGH,
             cvss_vector=V.RCE_UNCONFIRMED,
             title="Spring4Shell (CVE-2022-22965) parameter binding indicator",
+            cve=("CVE-2022-22965",),
+            **probe_cve_fields("CVE-2022-22965"),
             description="Spring MVC processes class.module.classLoader parameter "
                         "binding (type error on URLs[0]), confirming Spring4Shell "
                         "attack surface.",

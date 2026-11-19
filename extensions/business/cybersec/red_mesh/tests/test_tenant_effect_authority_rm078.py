@@ -381,7 +381,9 @@ class TestNoEndpointBecameTenantReachable(unittest.TestCase):
                   "publish_to_taxii", "correlate_suricata_eve", "generate_rulebook_assessment",
                   "save_rulebook_review_draft", "submit_rulebook_review", "reopen_rulebook_review",
                   "update_rulebook_review", "delete_job_engagement",
-                  "approve_report", "reject_report"}
+                  "approve_report", "reject_report",
+                  # RM-169 step 4a: `findings:triage`, tenant required, only the caller's own selector forwarded.
+                  "update_finding_triage"}
     enclosing = {}
     for node in ast.walk(tree):
       if isinstance(node, ast.FunctionDef):

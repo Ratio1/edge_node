@@ -181,3 +181,25 @@ def checked_archive_config(config, original_binding):
   if observed != original_binding:
     raise ValueError("Archive execution binding changed")
   return result
+
+
+_URL_AUTHORITY = re.compile(r"https?://(\[[^\]]+\]|[^/:]+)", re.IGNORECASE)
+
+
+def triage_scope(binding):
+  """`(tenant_id, host)` a finding-triage record is keyed by, or None when the job has no triage.
+
+  Both come from the job's own binding, never from a caller. The host is the network address, or the host
+  of a webapp URL (no scheme, port or path). A model target, or a missing or malformed binding, has none.
+  """
+  try:
+    facts = (binding if isinstance(binding, ExecutionBinding) else ExecutionBinding(binding)).to_dict()
+  except (TypeError, ValueError):
+    return None
+  target = facts["asset_target"]
+  if target["kind"] == "network":
+    return facts["tenant_id"], target["address"]
+  if target["kind"] == "webapp":
+    match = _URL_AUTHORITY.match(target["url"])
+    return (facts["tenant_id"], match[1].lower()) if match else None
+  return None

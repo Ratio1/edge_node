@@ -42,6 +42,7 @@ from extensions.business.cybersec.red_mesh.services.rulebook_assessment import (
   update_rulebook_review,
 )
 from extensions.business.cybersec.red_mesh.services.triage import update_finding_triage
+from .test_execution_binding_models import binding_payload
 
 
 def _sample_findings():
@@ -468,12 +469,17 @@ class TestRulebookAssessment(unittest.TestCase):
       owner, "job-1", expected_review_revision=saved["review_revision"], expected_pass_nr=3,
       expected_profile_version="1.0.0", idempotency_key="submission-triage", actor="alice",
     )
-    owner.records[(f"{owner.cfg_instance_id}:triage", "job-1:finding-auth-1")] = {
+    # Triage is the job's tenant and host's (RM-169 step 4a), read through the job record's binding.
+    binding = binding_payload()
+    owner.job_specs["execution_binding"] = binding
+    owner.records[(f"{owner.cfg_instance_id}:triage:t:{binding['tenant_id']}", "192.0.2.10\x1ffinding-auth-1")] = {
       "job_id": "job-1",
       "finding_id": "finding-auth-1",
       "status": "false_positive",
       "actor": "analyst",
       "updated_at": owner.time(),
+      "tenant_id": binding["tenant_id"],
+      "host": "192.0.2.10",
     }
 
     replay = submit_rulebook_review(

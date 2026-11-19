@@ -753,7 +753,7 @@ def build_rulebook_assessment(
   redaction_values = _target_values(ctx["job_config"], job_specs)
   target_value = (redaction_values or [job_id or "unknown"])[0]
   target_pseudonym = stable_hmac_pseudonym(target_value, hmac_secret, prefix="target")
-  triage_map = _job_repo(owner).list_job_triage(job_id)
+  triage_map = _job_repo(owner).list_triage_for_record(job_specs)
   review = _job_repo(owner).get_rulebook_review_model(job_id, profile["profile_id"]) if include_review else None
 
   checks = []
