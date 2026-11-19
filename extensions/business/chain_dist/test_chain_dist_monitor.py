@@ -304,6 +304,19 @@ class ChainDistMonitorTests(unittest.TestCase):
     self.assertEqual(self.bc.submissions, [(5, ['0xnew', '0xother'])])
     self.assertEqual(self.handed_to_deeploy(), {})
 
+  def test_two_confirmed_relinks_are_kept_for_one_review_without_a_partial_automatic_update(self):
+    for old, new, license_id in (('oldA', 'newA', 31), ('oldB', 'newB', 71)):
+      self.bc.link_events.extend([self.link_event('UnlinkNode', old, license_id=license_id),
+                                  self.link_event('LinkNode', new, license_id=license_id)])
+    self.bc.jobs[5] = self.job(job_id=5, start=2000, nodes=['0xoldA', '0xoldB'])
+    self.placements[5] = ['oldA', 'oldB']
+    self.run_relink_check()
+    self.assertEqual(self.monitor.plugins_shmem['CHAIN_DIST_CONFIRMED_RELINKS'], {
+      '0xoldA': ('0xnewA', 31, '0xOwner'), '0xoldB': ('0xnewB', 71, '0xOwner'),
+    })
+    self.assertEqual(self.handed_to_deeploy(), {})
+    self.assertEqual(self.bc.submissions, [])
+
   def test_relink_in_two_transactions_is_matched_across_checks(self):
     self.bc.link_events = [self.link_event('UnlinkNode', 'old', block_number=49_000)]
     self.bc.jobs[5] = self.job(job_id=5, start=2000, nodes=['0xold'])

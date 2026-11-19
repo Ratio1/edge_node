@@ -284,6 +284,10 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin, _DeeployJobMixin):
     )
     self._update_nd_links()
     successors = self._get_relink_successors()
+    # Repair reads all confirmed links for the selected job, including a second relink in the same block range.
+    self.plugins_shmem['CHAIN_DIST_CONFIRMED_RELINKS'] = {
+      node: (new_node, *self.relink_state['unlinked'][node]) for node, new_node in successors.items()
+    }
     relinks = {}
     if successors:
       # Pending jobs are voted by check_all_jobs; closable ones are closed by check_closable_jobs.
@@ -296,6 +300,7 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin, _DeeployJobMixin):
         pipeline = self.get_job_pipeline_from_cstore(job_id, timeout=10, pin=False)
         placement = (pipeline or {}).get('DEEPLOY_SPECS', {}).get('current_target_nodes', [])
         nodes = []
+        pending_relinks = []
         for node in active_nodes:
           new_node = successors.get(node)
           if new_node and new_node not in active_nodes and new_node not in nodes:
@@ -303,8 +308,11 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin, _DeeployJobMixin):
             if new in placement and old not in placement:
               node = new_node
             elif old in placement and new not in placement:
-              relinks[job_id] = (old, new)
+              pending_relinks.append((old, new))
           nodes.append(node)
+        # The automatic single-license mutation cannot represent two changes in one rollback plan.
+        if len(pending_relinks) == 1:
+          relinks[job_id] = pending_relinks[0]
         if nodes != active_nodes:
           nodes = sorted(nodes)
           self.P(f"Job {job_id}: moving relinked node(s) {sorted(set(active_nodes) - set(nodes))} to {nodes}")

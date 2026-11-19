@@ -12,6 +12,7 @@ This plugin:
 
 import shlex
 import re
+import subprocess
 
 import requests
 from urllib.parse import urlsplit
@@ -256,6 +257,41 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       # and avoids accidentally running code from a different branch.
       return f"git clone --branch {branch} --single-branch {repo_url} {repo_path}"
     return f"git clone {repo_url} {repo_path}"
+
+  def read_deployment_git_commit(self):
+    """Inspect the live checkout with a bounded local Docker request.
+
+    This one-shot repair challenge does not change the runner's readiness or
+    cached artifacts. The Docker client deadline also bounds daemon failures.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    str or None
+      The full Git commit ID when the running container can attest to it.
+
+    Examples
+    --------
+    >>> commit = runner.read_deployment_git_commit()
+    """
+    container_id = self.container.id
+    if not isinstance(container_id, str) or not re.fullmatch(r"[0-9a-f]{64}", container_id):
+      return None  # Only the actual Docker object held by this runner may be inspected.
+    try:
+      result = subprocess.run(
+        ["docker", "exec", container_id, "timeout", "-k", "1", "5", "git", "-C", REPO_CLONE_PATH,
+         "rev-parse", "--verify", "HEAD^{commit}"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=7, check=False,
+      )  # The probe has fixed arguments and output, even when the Git process or daemon stalls.
+      if getattr(self.container, "id", None) != container_id:
+        return None  # A concurrent runner restart replaced the inspected Docker container.
+      commit = result.stdout.decode("ascii").strip()
+      return commit if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", commit) else None
+    except (OSError, UnicodeError, subprocess.TimeoutExpired):
+      return None  # No executable observation can be made while Docker or the checkout is unavailable.
 
   def _confirm_app_readiness(self):
     if getattr(self, "_deployment_git_captured", False):

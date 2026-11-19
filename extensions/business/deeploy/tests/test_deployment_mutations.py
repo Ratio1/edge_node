@@ -195,7 +195,7 @@ class DeploymentMutationTests(unittest.TestCase):
       plugin._admit_owner_transfer_operation(7, "owner", "new-owner", None)
     self.assertIsNone(plugin.captured_scale)
 
-  def test_node_relink_renames_the_old_node_everywhere_and_keeps_its_settings(self):
+  def test_node_relink_moves_placement_and_preserves_application_settings(self):
     plugin = Mutations()
     plugin.current["A"]["PLUGINS"][0]["INSTANCES"][0].update(CHAINSTORE_PEERS=["A", "B"])
     result = plugin._admit_node_relink_operation(7, "A", "N")
@@ -206,7 +206,7 @@ class DeploymentMutationTests(unittest.TestCase):
     self.assertEqual(admitted["prior_pipeline"]["DEEPLOY_SPECS"]["current_target_nodes"], ["A", "B"])
     self.assertEqual(set(admitted["configs"]), {"N", "B"})
     moved = admitted["configs"]["N"]["PLUGINS"][0]["INSTANCES"][0]
-    self.assertEqual((moved["INSTANCE_ID"], moved["ENV"]["NODE_VALUE"]), ("instance-A", "N"))
+    self.assertEqual((moved["INSTANCE_ID"], moved["ENV"]["NODE_VALUE"]), ("instance-A", "A"))
     self.assertEqual(moved["CHAINSTORE_PEERS"], ["N", "B"])
     self.assertEqual(moved["VOLUMES"], {"data": "/preserved-A"})
 
@@ -217,10 +217,31 @@ class DeploymentMutationTests(unittest.TestCase):
         plugin._admit_node_relink_operation(7, old_node, new_node)
     self.assertIsNone(plugin.captured_scale)
 
-  def test_node_relink_to_new_hardware_needs_no_report_from_either_node(self):
+  def test_relink_keeps_fixed_database_replica_positions_and_credentials(self):
+    from extensions.business.deeploy.relink_placement import relink_pipeline
+    allocation = dict(service="cockroachdb", version=1, nodeOrder=["B", "A", "D"],
+                      internalTunnels=[dict(index=i, nodeAddress=n, token="A") for i, n in enumerate(["B", "A", "D"], 1)])
+    config = {"DEEPLOY_SPECS": {"job_config": {"pipeline_params": {"deeploy_cockroachdb": allocation}},
+                               "initial_target_nodes": ["B", "A", "D"], "chainstore_response_keys": {"A": ["A"]}},
+              "PLUGINS": [{"INSTANCES": [{"PER_NODE_CONFIG": {"byIndex": {"1": {"ENV": {"A": "A"}}},
+                                                              "byNode": {"A": {"ENV": {"A": "A"}}}},
+                                          "SECRET_PATHS": [["PER_NODE_CONFIG", "byNode", "A", "ENV", "A"]]}]}]}
+    moved = relink_pipeline(config, {"A": "N"})
+    specs = moved["DEEPLOY_SPECS"]
+    positions = specs["job_config"]["pipeline_params"]["deeploy_cockroachdb"]
+    self.assertEqual(positions["nodeOrder"], ["B", "N", "D"])
+    self.assertEqual([(t["index"], t["nodeAddress"], t["token"]) for t in positions["internalTunnels"]],
+                     [(1, "B", "A"), (2, "N", "A"), (3, "D", "A")])
+    self.assertEqual((specs["initial_target_nodes"], specs["chainstore_response_keys"]), (["B", "A", "D"], {"N": ["A"]}))
+    instance = moved["PLUGINS"][0]["INSTANCES"][0]
+    self.assertEqual(instance["PER_NODE_CONFIG"], {"byIndex": {"1": {"ENV": {"A": "A"}}}, "byNode": {"N": {"ENV": {"A": "A"}}}})
+    self.assertEqual(instance["SECRET_PATHS"], [["PER_NODE_CONFIG", "byNode", "N", "ENV", "A"]])
+    self.assertEqual(allocation["nodeOrder"], ["B", "A", "D"])
+
+  def test_relink_planner_takes_instance_and_volume_from_the_stored_plan(self):
     plugin = Mutations()
-    plugin.reports = {}  # the old node is gone and the new one runs nothing yet
-    self.assertEqual(plugin._admit_node_relink_operation(7, "A", "N")["status_code"], 202)
+    plugin.reports = {}  # This fixture captures the proposed configs before the real admission check.
+    plugin._admit_node_relink_operation(7, "A", "N")
     moved = plugin.captured_scale["configs"]["N"]["PLUGINS"][0]["INSTANCES"][0]
     self.assertEqual((moved["INSTANCE_ID"], moved["VOLUMES"]), ("instance-A", {"data": "/preserved-A"}))
 

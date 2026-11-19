@@ -6,7 +6,8 @@ import uuid
 from .deeploy_const import DEEPLOY_KEYS
 from .deeploy_mixin import COCKROACHDB_CERT_ENV_KEYS, COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS
 from .deeploy_job_mixin import DEEPLOY_JOBS_CSTORE_HKEY
-from .deployment_operations import request_digest, replace_nodes, required_instances
+from .deployment_operations import request_digest, required_instances
+from .relink_placement import relink_configs
 
 # ChainDist publishes {job_id: (old_node, new_node)} here for jobs whose stored placement
 # still names a node whose license its owner relinked to another node.
@@ -227,7 +228,7 @@ class _DeploymentMutationsMixin:
     self._assert_no_active_deployment(job_id=job_id)
     node_aliases = {old_node: new_node}
     prior, configs = self._mutation_baseline(request, owner)
-    configs = replace_nodes(configs, node_aliases)
+    configs = relink_configs(configs, node_aliases)
     for config in configs.values():
       config["DEEPLOY_SPECS"]["date_updated"] = self.time()
       config.pop("DEEPLOY_OPERATION", None)

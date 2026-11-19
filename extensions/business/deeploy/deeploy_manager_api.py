@@ -13,6 +13,7 @@ from .deployment_operations import (
 )
 
 from .deployment_mutations import _DeploymentMutationsMixin
+from .job_repair import _JobRepairMixin, MUTATION as SAME_HOST_REPAIR
 from .deeploy_mixin import _DeeployMixin
 from .selected_secrets import compile_request_selections
 from .deeploy_chainstore_response_mixin import _DeeployChainstoreResponseMixin
@@ -79,6 +80,7 @@ class DeeployManagerApiPlugin(
   _DeeployJobMixin,
   _DeploymentOperationsMixin,
   _DeploymentMutationsMixin,
+  _JobRepairMixin,
   _RequestTrackingMixin,
   ):
   """
@@ -709,6 +711,7 @@ class DeeployManagerApiPlugin(
     self,
     request: dict,
     is_create: bool = True,
+    repair_update: bool = False,
   ):
     """
     Common logic for processing pipeline create/update requests.
@@ -734,6 +737,12 @@ class DeeployManagerApiPlugin(
     try:
       self.__ensure_eth_balance()
       request_type = "create pipeline" if is_create else "update pipeline"
+      if repair_update:
+        if not request.get("EE_HASH") or not isinstance(request.get("repair"), dict):
+          raise ValueError("The repair requires a versioned signed wallet update.")
+        request_type = "repair update pipeline"
+      elif "repair" in request:
+        raise ValueError("Send a reviewed recovery only to the signed repair endpoint.")
       sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type=request_type)
       normalized_request = self._normalize_plugins_input(
         self.deepcopy(request),
@@ -757,10 +766,16 @@ class DeeployManagerApiPlugin(
         job_app_type = submitted_job_app_type
       auth_result = self.deeploy_get_auth_result(inputs)
       job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
-      existing_operation = self._find_request_operation(
-        request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
-        "create" if is_create else "update",
-      )
+      repair = None
+      if repair_update:
+        proposal = request["repair"].get("proposal") or {}
+        if sender.lower() != auth_result[DEEPLOY_KEYS.ESCROW_OWNER].lower() or proposal.get("coordinator") != self.bc.address:
+          raise DeploymentConflictError("The CSP must submit recovery to the original coordinator.")
+        existing_operation = self._find_request_operation(request, sender, "update",
+                                                          repair_parent=(proposal.get("parent") or {}).get("operation_id"))
+      else:
+        existing_operation = self._find_request_operation(
+          request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], "create" if is_create else "update")
       if existing_operation:
         return self._accepted_operation_response(existing_operation)
       # Readiness is always reported by the node lifecycle service.
@@ -1094,10 +1109,13 @@ class DeeployManagerApiPlugin(
       prior_pipeline = None if is_create else self.get_job_pipeline_from_cstore(
         job_id, timeout=30, pin=False, raise_on_error=False, show_logs=False,
       )
+      if repair_update:
+        # All ordinary payment, plugin, resource and availability checks have succeeded before inspecting any worker.
+        repair = self._prepare_job_repair(request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER])
       return self._admit_prepared_deployment(
         request=request, auth_result=auth_result, app_id=app_id,
         configs=prepared_pipeline_configs, prior_pipeline=prior_pipeline,
-        is_create=is_create,
+        is_create=is_create, **({"repair": repair, "mutation": SAME_HOST_REPAIR} if repair_update else {}),
       )
     except DeploymentConflictError as exc:
       result = {"status_code": 409, "status": "error",
@@ -1340,6 +1358,59 @@ class DeeployManagerApiPlugin(
       )
     )
     return self._process_pipeline_request(request, is_create=False)
+
+  @BasePlugin.endpoint(method="post")
+  def get_job_repair_preview(self, request: dict):
+    """Assess an owner-selected job without sending worker commands or changing custody.
+
+    Parameters
+    ----------
+    request : dict
+      Existing wallet read envelope, job ID and optional pinned coordinator.
+
+    Returns
+    -------
+    dict
+      Reviewable correction or reason the current observation blocks recovery.
+
+    Examples
+    --------
+    >>> preview = oracle.get_job_repair_preview(request)  # doctest: +SKIP
+    """
+    try:
+      envelope = {key: request.get(key) for key in ("nonce", "EE_ETH_SIGN", "EE_ETH_SENDER")}
+      sender, inputs = self.deeploy_verify_and_get_inputs(envelope, request_type="get deployment status")
+      owner = self.deeploy_get_auth_result(inputs)[DEEPLOY_KEYS.ESCROW_OWNER]
+      if sender.lower() != owner.lower():
+        raise ValueError("Only the job's CSP can approve a same-host recovery.")
+      if request.get("coordinator") and request["coordinator"] != self.bc.address:
+        raise DeploymentConflictError("This receiver is not the original coordinator. Check the pinned repair endpoint.")
+      proposal = self._assess_job_repair(request.get("job_id"), owner, request.get("coordinator"))[0]
+      return self._get_response(dict(status="reviewable", proposal=proposal))
+    except ValueError as exc:
+      return self._get_response(dict(status="blocked", reason=str(exc)))
+    except Exception:
+      return self._get_response(dict(status="blocked", reason="The current job, license or worker evidence is unavailable."))
+
+  @BasePlugin.endpoint(method="post")
+  def repair_update_pipeline(self, request: dict):
+    """Accept a CSP-signed legacy correction and update on its original coordinator.
+
+    Parameters
+    ----------
+    request : dict
+      Versioned fix, placement and ordinary edit under a dedicated wallet signature.
+
+    Returns
+    -------
+    dict
+      Existing deployment acceptance or structured admission error.
+
+    Examples
+    --------
+    >>> result = oracle.repair_update_pipeline(wallet_request)  # doctest: +SKIP
+    """
+    return self._process_pipeline_request(request, is_create=False, repair_update=True)
 
   @BasePlugin.endpoint(method="post")
   def get_deployment_status(self, request: dict):

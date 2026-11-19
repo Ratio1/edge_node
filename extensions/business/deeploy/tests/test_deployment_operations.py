@@ -11,7 +11,7 @@ from ratio1.const.base import BCct
 
 from extensions.business.deeploy.deployment_operations import (
   _DeploymentOperationsMixin, OPERATIONS_HKEY, NODE_OPERATIONS_HKEY,
-  SECRET_REVISIONS_HKEY, DeploymentCustodyError, request_digest, report_is_ready,
+  SECRET_REVISIONS_HKEY, DeploymentConflictError, DeploymentCustodyError, request_digest, report_is_ready,
 )
 from extensions.business.deeploy.tests.support import LifecycleCustodyDouble
 
@@ -109,6 +109,26 @@ class DeploymentStatusTests(unittest.TestCase):
     plugin.get_job_pipeline_from_cstore = lambda *args, **kw: {"DEEPLOY_SPECS": {"job_id": 1}}
     plugin.bc.get_job_details = Mock(return_value={"escrowOwner": "owner"})
     return plugin
+
+  def test_retirement_status_distinguishes_previous_workers_from_new_targets(self):
+    plugin = self.prepare()
+    operation = plugin.operation("update")
+    operation.update(phase="retiring_previous", mutation="node_relink", recovery="blocked")
+    plugin._save_operation(operation)
+    plugin.report(operation, "B", "stopped", attempt="retire")
+    # A different attempt on A cannot satisfy its outstanding retirement.
+    plugin.report(operation, "A", "stopped", attempt="deploy")
+    result = plugin._deployment_status({"job_id": 1})
+    self.assertEqual({row["node_id"]: row["action"] for row in result["nodes"]}, {
+      "A": "awaiting_stop_report", "B": "stop_reported", "C": "waiting_to_start",
+    })
+    # Replication of operation snapshots and worker reports can occur independently.
+    plugin.bc.address = "other"
+    replica = plugin._deployment_status({"job_id": 1})
+    self.assertEqual({row["node_id"]: row["action"] for row in replica["nodes"]}, {
+      "A": "stop_report_unavailable", "B": "stop_reported", "C": "waiting_to_start",
+    })
+    self.assertEqual(plugin.commands, [])
 
   def test_revision_zero_lookup_checks_owner_without_submission_resource_validation(self):
     plugin = self.prepare()
@@ -483,6 +503,45 @@ class DeploymentOperationTests(unittest.TestCase):
     plugin._advance_deployment_operation(operation)
     self.assertEqual(operation["error"]["code"], "READINESS_DEADLINE_EXCEEDED")
     self.assertIsNone(operation["outcome"])
+
+  def test_restart_with_one_previous_stop_keeps_the_relink_blocked(self):
+    # A coordinator can restart after one worker confirmed retirement and the other never answered.
+    before = Coordinator()
+    operation = before.operation("update")
+    operation.update(mutation="node_relink", phase="retiring_previous")
+    before._save_operation(operation)
+    before.report(operation, "B", "stopped", attempt="retire")
+    restarted = Coordinator()
+    restarted.storage, restarted.plan = before.storage, before.plan  # Only durable state survives.
+    restarted.now = operation["deadline"] + 1
+    restarted._reconcile_coordinator_operations()
+    saved = restarted._operation_records()[operation["operation_id"]]
+    self.assertEqual((saved["phase"], saved["recovery"], saved["error"]["code"]),
+                     ("retiring_previous", "blocked", "PREVIOUS_STOP_UNCONFIRMED"))
+    self.assertEqual([(node, config["DEEPLOY_OPERATION"]["action"]) for node, config in restarted.commands],
+                     [("A", "retire")])
+    with self.assertRaises(DeploymentConflictError):
+      restarted._assert_no_active_deployment(job_id=operation["job_id"])
+
+  def test_relink_requires_a_stop_for_every_exact_previous_instance(self):
+    worker = {"signature": "RUNNER", "instance_id": "worker", "status": "stopped"}
+    for instances in ([], [dict(worker, status="starting")], [dict(worker, instance_id="other")],
+                      [worker, worker], [worker, dict(worker, instance_id="extra")], [None]):
+      with self.subTest(instances=instances):
+        plugin = Coordinator()
+        operation = plugin.operation("update")
+        operation.update(mutation="node_relink", phase="retiring_previous")
+        plugin._save_operation(operation)
+        plugin.report(operation, "B", "stopped", attempt="retire")
+        # Preserve the signed stop from B while A's aggregate conflicts with its instance evidence.
+        plugin.report(operation, "A", "stopped", attempt="retire")["instances"] = instances
+        plugin._advance_deployment_operation(operation)
+        self.assertEqual(operation["phase"], "retiring_previous")
+        self.assertEqual([node for node, _ in plugin.commands], ["A"])
+        # A later complete receipt unblocks this exact barrier without repeating retirement on B.
+        plugin.report(operation, "A", "stopped", attempt="retire", sequence=2)
+        plugin._advance_deployment_operation(operation)
+        self.assertEqual(operation["phase"], "waiting_for_readiness")
 
   def test_update_retirement_and_restoration_are_both_barriers(self):
     plugin = Coordinator()
