@@ -111,6 +111,38 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
         self.assertEqual(self.coordinator.commands, [])
         self.http.assert_not_called()
 
+  def test_waiting_create_and_update_publish_secrets_and_allow_job_commands_and_delete(self):
+    previous = None
+    operations = []
+    for revision in (1, 2):
+      cfg = pipeline(secret='token-' + str(revision))
+      cfg['PLUGINS'][0]['SIGNATURE'] = 'WORKER_APP_RUNNER'
+      accepted = self.coordinator._admit_prepared_deployment(
+        request={'request_id': 'source-' + str(revision), 'job_id': 7, 'expected_revision': revision - 1},
+        auth_result={'escrow_owner': 'owner'}, app_id='app', configs={'A': cfg},
+        prior_pipeline=previous, is_create=previous is None)
+      operation = self.coordinator._operation_records()[accepted['operation_id']]
+      self.coordinator._advance_deployment_operation(operation)
+      if previous:
+        report(self.state, operation, 'retire', 'stopped')
+        self.coordinator._advance_deployment_operation(operation)
+      report(self.state, operation, 'deploy', 'failed', mode='following', error='WORKLOAD_START_FAILED')
+      self.coordinator._advance_deployment_operation(operation)
+      self.coordinator._advance_deployment_operation(operation)
+      previous = self.active()
+      self.assertEqual((operation['outcome'], operation['recovery']), ('waiting_for_source', None))
+      self.assertEqual(previous['DEEPLOY_SPECS']['revision'], revision)
+      self.assertEqual(self.token(self.state.secrets['DAUTH_JOB_SECRETS', '7']), 'token-' + str(revision))
+      self.coordinator._assert_no_active_deployment(job_id=7, app_id='app')  # Same guard as restart.
+      self.running(operation)
+      operations.append(operation)
+    ref = '7|' + operations[0]['operation_id'] + ':deploy'
+    self.assertIn('revoked', self.state.secrets['DAUTH_JOB_SECRET_REVISIONS', ref])
+    self.assertNotIn('stop', [cmd['DEEPLOY_OPERATION']['action'] for _, cmd in self.coordinator.commands])
+    deleted = self.coordinator._admit_delete_operation(
+      {'request_id': 'delete', 'job_id': 7, 'expected_revision': 2}, {'escrow_owner': 'owner'})
+    self.assertEqual(deleted['status_code'], 202)
+
   def test_custody_reads_do_not_pin_so_their_timeout_bounds_them(self):
     previous, _ = self.legacy()
     self.dauth.r1fs = Mock(wraps=self.state.blobs)

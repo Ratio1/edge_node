@@ -19,7 +19,9 @@ from types import SimpleNamespace
 import uuid
 
 from naeural_core import Logger
-from naeural_core.business.deployment_lifecycle import DeploymentLifecycle, OPERATION_KEY, SERVICE_KEY, repair_config_fingerprint
+from naeural_core.business.deployment_lifecycle import (
+  DeploymentLifecycle, OPERATION_KEY, SERVICE_KEY, deployment_source_mode, repair_config_fingerprint,
+)
 from naeural_core.business.mixins_base.cmdapi import _CmdAPIMixin
 from naeural_core.config.config_manager import ConfigManager
 from naeural_core.config.runtime_secret_resolution import DAUTH_SECRET_PLACEHOLDER
@@ -295,7 +297,17 @@ def scenario(folder, key_folder, fail):
         assert worker_secret["CLOUDFLARE_TOKEN"] == new_token
         if attempt == "deploy":
           assert worker_secret["EXPOSED_PORTS"]["8080"]["token"] == new_token
-        pin = worker(config).get("DEEPLOY_RUNTIME_ARTIFACTS", {}).get("git_commit", commits["edited"])
+        instance = worker(config)
+        source_mode = deployment_source_mode("WORKER_APP_RUNNER", config, instance)
+        # Use the same pin selection as the runner, including when ordinary jobs follow their source.
+        runner = SimpleNamespace(_deployment_source_mode=source_mode, _deployment_pins_image=lambda: False,
+                                 cfg_deeploy_runtime_artifacts=instance.get("DEEPLOY_RUNTIME_ARTIFACTS"))
+        runner._get_pinned_deployment_artifacts = lambda: WorkerAppRunnerPlugin._get_pinned_deployment_artifacts(runner)
+        pin = WorkerAppRunnerPlugin._deployment_git_pin(runner) or commits["edited"]
+        if attempt == "restore":
+          assert pin == commits[node]
+        if source_mode is not None:
+          fields["source_mode"] = source_mode
         inject = fail and node == "newB" and attempt == "deploy"
         run_worker(node, pin, worker(config)["BUILD_AND_RUN_COMMANDS"], worker_secret["CLOUDFLARE_TOKEN"], inject)
         page = fetch(node, 8081)
@@ -304,6 +316,7 @@ def scenario(folder, key_folder, fail):
           exit_code = command(["docker", "wait", container(node)]).stdout.strip()
           assert exit_code == "1", exit_code  # Confirm a real command failure, including a container still shutting down.
           status = "failed"
+          fields["error"] = {"code": "WORKLOAD_START_FAILED"}
         else:
           assert page and page.endswith(f" on {node}</html>"), (node, attempt, page)
           assert commit(node) == pin, (node, attempt, "checkout differs")
@@ -316,6 +329,9 @@ def scenario(folder, key_folder, fail):
         status = "stopped"
       serial += 1
       item = fixture.receipt(op, node, attempt, status, pin, **fields)
+      for field in ("source_mode", "error"):
+        if field in fields:
+          item["instances"][0][field] = item.pop(field)  # Report the failure and source policy per instance.
       item.update(sequence=serial, revision=op["revision"])
       Engine(node).sign(item)
       if action == "retire_worker_v1":
