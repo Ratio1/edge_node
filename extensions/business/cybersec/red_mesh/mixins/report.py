@@ -588,8 +588,8 @@ class _ReportMixin:
               existing, new = dct_aggregated_report[field], local_job_status[field]
               if existing is None or new is None:  # null is "no data", as in merge_objects_deep
                 dct_aggregated_report[field] = new if existing is None else existing
-              elif isinstance(existing, (list, dict)):
-                merged = self.merge_objects_deep(existing, new)
+              elif isinstance(existing, (list, dict)) or isinstance(new, (list, dict)):
+                merged = self.merge_objects_deep(existing, new)  # raises on a container/scalar mismatch, either order
                 if isinstance(merged, list):
                   try:
                     merged = sorted(merged)  # scalar lists (open_ports, completed_tests) stay sorted

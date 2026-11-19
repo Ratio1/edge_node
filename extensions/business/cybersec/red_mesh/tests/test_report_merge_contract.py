@@ -136,6 +136,15 @@ class TestThreadMerge(unittest.TestCase):
     report = host._get_aggregated_report(_per_thread([_thread(0, range(1, 11), [22]), bad]))
     self.assertEqual(report, {})
 
+  def test_type_mismatch_first_fails_instead_of_wrapping(self):
+    # String first, list second: wrapping both as [str, [...]] would hide the
+    # valid findings from scoring, so the merge fails as in the reverse order.
+    host = _Host()
+    bad = _thread(0, range(1, 11), [22])
+    bad["correlation_findings"] = "not-a-list"
+    report = host._get_aggregated_report(_per_thread([bad, _thread(1, range(11, 21), [25])]))
+    self.assertEqual(report, {})
+
   def test_nested_null_does_not_erase_findings(self):
     # Same port and probe in two threads (MIRROR), the second with `findings: null`.
     host = _Host()

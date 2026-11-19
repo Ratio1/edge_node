@@ -312,7 +312,28 @@ def test_pass_coverage_flags_assigned_node_missing_everywhere():
 def test_pass_coverage_flags_missing_thread_against_requested_count():
   archive = _coverage_archive(**{"job_config/nr_local_workers": 2})
   failures = assert_pass_coverage(archive)
-  assert failures == ["node-B: 1 thread metrics, 2 threads requested"]
+  assert failures == ["node-B: 1 thread metrics, 2 threads expected"]
+
+
+def test_pass_coverage_caps_expected_threads_at_node_port_count():
+  # The launcher caps threads at the node's port count: one port, one thread.
+  archive = _coverage_archive(**{
+    "job_config/nr_local_workers": 4,
+    "passes/0/worker_reports/node-A": {"ports_scanned": 1, "open_ports": [22]},
+    "passes/0/worker_scan_metrics/node-A/threads": {"t0": {"ports_scanned": 1, "open_ports": [22]}},
+    "passes/0/worker_reports/node-B": {"ports_scanned": 4, "open_ports": [80]},
+    "passes/0/worker_scan_metrics/node-B/threads": {
+      f"t{i}": {"ports_scanned": 1, "open_ports": [80] if i == 0 else []} for i in range(4)},
+    "ui_aggregate/total_open_ports": [22, 80],
+  })
+  assert assert_pass_coverage(archive) == []
+
+
+def test_pass_coverage_flags_report_without_thread_metrics():
+  archive = _coverage_archive(**{"job_config/nr_local_workers": 1})
+  del archive["passes"][0]["worker_scan_metrics"]["node-B"]
+  failures = assert_pass_coverage(archive)
+  assert failures == ["node-A: 2 thread metrics, 1 threads expected", "node-B: node report but no thread metrics"]
 
 
 def test_stopped_job_counts_as_failed():

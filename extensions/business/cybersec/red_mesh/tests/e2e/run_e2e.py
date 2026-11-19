@@ -379,10 +379,17 @@ def assert_pass_coverage(archive: dict) -> list[str]:
   failures += [f"{addr}: assigned but no node report" for addr in sorted(assigned - set(nodes) - set(threads_by_node))]
   requested = (archive.get("job_config") or {}).get("nr_local_workers")  # a thread missing from both sides
   if isinstance(requested, int):
-    failures += [f"{a}: {len(t)} thread metrics, {requested} threads requested"
-                 for a, t in sorted(threads_by_node.items()) if len(t) != requested]
-  for addr, node in nodes.items():
+    for a, t in sorted(threads_by_node.items()):
+      ports = (nodes.get(a) or {}).get("ports_scanned")
+      nr_ports = len(ports) if isinstance(ports, list) else ports
+      expected = min(requested, nr_ports) if isinstance(nr_ports, int) and nr_ports > 0 else requested  # launch caps threads at ports
+      if len(t) != expected:
+        failures.append(f"{a}: {len(t)} thread metrics, {expected} threads expected")
+  for addr, node in sorted(nodes.items()):
     threads = threads_by_node.get(addr)
+    if not threads and isinstance(requested, int):
+      failures.append(f"{addr}: node report but no thread metrics")
+      continue
     if not threads:
       print(f"  coverage: {addr} has no thread metrics, thread check skipped", flush=True)
       continue
