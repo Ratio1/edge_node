@@ -222,8 +222,15 @@ class RepairTests(unittest.TestCase):
 
   def test_expired_repair_without_dispatched_retirement_releases_parent(self):
     child = self.admit()
-    self.state.now = max(child["preparation_deadline"], child["deadline"]) + 1
+    self.job["escrowOwner"] = "new-owner"
     self.c.commands.clear()
+    with self.assertRaises(DeploymentConflictError):
+      self.c._advance_deployment_operation(child)
+    held = self.c._operation_records()[child["operation_id"]]
+    self.assertEqual(held["repair_block"]["code"], "REPAIR_PLACEMENT_UNCONFIRMED")
+    self.assertFalse(held.get("retire_challenges"))  # A persisted hold must not imply that a STOP left the coordinator.
+    self.assertEqual(self.c.commands, [])
+    self.state.now = max(child["preparation_deadline"], child["deadline"]) + 1
     self.c._advance_deployment_operation(child)
     self.assertEqual((child["phase"], child["error"]["code"]), ("completed", "ADMISSION_PREPARATION_FAILED"))
     self.assertEqual(self.c.commands, [])

@@ -382,7 +382,7 @@ class _JobRepairMixin:
     if (any(result.get(key) != meta[key] for key in ("operation_id", "attempt", "coordinator", "node_addr",
                                                       "job_id", "revision", "expires_at"))
         or type(result.get("revision")) is not int or type(result.get("job_id")) is not int
-        or result.get("app_id") != parent["app_id"] or result.get("status") != "observed"
+        or self.time() >= meta["expires_at"] or result.get("app_id") != parent["app_id"] or result.get("status") != "observed"
         or len(items) != 1 or not isinstance(items[0], dict)
         or items[0].get("instance_id") != meta["instance_id"] or items[0].get("status") != "observed"
         or items[0].get("signature") != WORKER_APP_RUNNER_SIGNATURE
@@ -663,12 +663,13 @@ class _JobRepairMixin:
       meta.update(parent_operation_id=parent["operation_id"], node_addr=node, instance_id=source["instance_id"],
                   challenge=observation["challenge"], expires_at=observation["expires_at"],
                   order_digest=original["order_digest"], git_commit=pin, config_seal=seal)
+      # A failed placement check saves its reason and must not imply that a STOP was attempted.
+      self._recheck_repair_placement(child)
       sent = child.setdefault("retire_challenges", {}).setdefault(node, [])
       if observation["challenge"] not in sent:
         if len(sent) >= 64:
           raise ValueError("The worker has exhausted its retirement challenges. Review its outstanding commands.")
         sent.append(observation["challenge"])  # A delayed genuine STOP remains valid after challenge renewal.
-      self._recheck_repair_placement(child)
       self._save_operation(child)  # Crash recovery must recognize the challenge before the stop leaves the coordinator.
       self.cmdapi_start_pipeline(config={"NAME": child["app_id"], "TYPE": config["TYPE"], "DEEPLOY_OPERATION": meta},
                                  node_address=node)
