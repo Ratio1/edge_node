@@ -15,13 +15,20 @@ from pathlib import Path
 import subprocess
 import tempfile
 import time
+from types import SimpleNamespace
 import uuid
 
 from naeural_core import Logger
-from naeural_core.business.deployment_lifecycle import repair_config_fingerprint
+from naeural_core.business.deployment_lifecycle import DeploymentLifecycle, OPERATION_KEY, SERVICE_KEY, repair_config_fingerprint
+from naeural_core.business.mixins_base.cmdapi import _CmdAPIMixin
+from naeural_core.config.config_manager import ConfigManager
+from naeural_core.config.runtime_secret_resolution import DAUTH_SECRET_PLACEHOLDER
+from naeural_core.main.command_handlers import ExecutionEngineCommandHandlers
 from naeural_core.utils.plugins_base.bc_wrapper import BCWrapper
 from ratio1.bc import DefaultBlockEngine
 
+from extensions.business.container_apps.worker_app_runner import WorkerAppRunnerPlugin
+from extensions.business.deeploy.deeploy_mixin import DEEPLOY_PLUGIN_DATA, _DeeployMixin
 from extensions.business.deeploy.job_repair import MUTATION, order_fields, worker
 from extensions.business.deeploy.tests.lifecycle_custody_support import Engine
 from extensions.business.deeploy.tests.test_job_repair import RepairCoordinator, RepairTests
@@ -80,6 +87,39 @@ def command(args, *, check=True):
   0
   """
   return subprocess.run(args, check=check, capture_output=True, text=True, timeout=30)
+
+
+def worker_config_manager(folder, node):
+  """Open a disposable worker's real config handler and lifecycle journal.
+
+  Parameters
+  ----------
+  folder : Path
+    Private test directory outside the workload mounts.
+  node : str
+    Test worker identity.
+
+  Returns
+  -------
+  ConfigManager
+    A handler using local JSON files and fixture notifications.
+
+  Examples
+  --------
+  >>> worker_config_manager(Path("/tmp/disposable"), "newA")  # doctest: +SKIP
+  """
+  path = folder / (node + "-stream.json")
+  manager = object.__new__(ConfigManager)  # The transport and plugin discovery are fixture boundaries.
+  manager.shmem = {SERVICE_KEY: DeploymentLifecycle(str(folder / (node + "-journal.json")), node)}
+  manager.dct_config_streams = {"app": json.loads(path.read_text())} if path.exists() else {}
+  manager.admin_pipeline_name = "admin"
+  manager.P = lambda *args, **kwargs: None
+  manager._create_notification = lambda **kwargs: None
+  manager._check_duplicate_last = lambda **kwargs: False
+  manager.keep_good_stream = lambda config: config
+  manager._save_stream_config = lambda config: path.write_text(json.dumps(config))
+  manager.delete_config_stream = lambda name, *args, **kwargs: (manager.dct_config_streams.pop(name), path.unlink())
+  return manager
 
 
 def scenario(folder, key_folder, fail):
@@ -178,11 +218,24 @@ def scenario(folder, key_folder, fail):
 
   fixture = RepairTests()
   fixture.setUp()
+  workers = {node: worker_config_manager(Path(key_folder), node) for node in ("newA", "newB")}
   c = fixture.c
   initial = fixture.parent
   serial = 1
   observed = []
   prior_rows = {}
+
+  def record_stop(node, report):
+    # The transport fixture supplies historical receipts from real container stops.
+    lifecycle = workers[node].shmem[SERVICE_KEY]
+    lifecycle.records[lifecycle.key(report)] = dict(report, active=False, aborted=True)
+    lifecycle._save()
+
+  def receive_start_or_stop(node, config):
+    # Reuse the production worker admission and config-delta handling after transport authorization.
+    envelope = dict(copy.deepcopy(config), EE_SENDER="oracle", VALIDATED=True, INITIATOR_ID="oracle-id")
+    workers[node].update_config_stream(envelope, "oracle-id", "session")
+
   try:
     for node in ("newA", "newB"):
       run_worker(node, commits[node], [SETUP, SERVE], old_token)
@@ -201,7 +254,7 @@ def scenario(folder, key_folder, fail):
     fixture.state.public["DEEPLOY_DEPLOYED_JOBS", "31"] = fixture.cid
     initial.update(previous_pipeline_cid=fixture.cid, sequence=3)
     c._save_operation(initial)
-    fixture.receipt(initial, "newB", "retire", "stopped", stopped_pin)
+    record_stop("newB", fixture.receipt(initial, "newB", "retire", "stopped", stopped_pin))
     current_config = {"newA": fixture.live}
     def transport(config, node_address):
       nonlocal serial
@@ -234,6 +287,8 @@ def scenario(folder, key_folder, fail):
           status = "stopped"
       elif action == "start_repaired_worker_v1":
         assert op["parent_operation_id"] == initial["operation_id"]
+        receive_start_or_stop(node, config)
+        assert workers[node].dct_config_streams["app"][OPERATION_KEY]["attempt"] == attempt
         token_revision = config["DEEPLOY_SPECS"]["secret_revision"]
         private = fixture.dauth._load_revision_runner_secret_bundle("31", token_revision, node)
         worker_secret = private["job_secrets"]["PLUGINS"][0]["INSTANCES"][0]
@@ -256,12 +311,15 @@ def scenario(folder, key_folder, fail):
           status = "ready"
       else:
         assert action == "stop"
+        receive_start_or_stop(node, config)
         remove(node)
         status = "stopped"
       serial += 1
       item = fixture.receipt(op, node, attempt, status, pin, **fields)
       item.update(sequence=serial, revision=op["revision"])
       Engine(node).sign(item)
+      if action == "retire_worker_v1":
+        record_stop(node, item)
       observed.append((node, action, attempt, status))
 
     def configure(coordinator):
@@ -311,6 +369,59 @@ def scenario(folder, key_folder, fail):
       assert page == (prior_rows[node] if fail else f"<html>updated on {node}</html>")
       rows[node] = dict(html=page, git_commit=commit(node), commands=inside(node, "cat", "/tmp/run-order").stdout.splitlines())
       assert rows[node]["git_commit"] == commits[node if fail else "edited"]
+
+    # Reload both workers from disk and dispatch the same instance envelopes Deeploy uses after a completed update.
+    workers = {node: worker_config_manager(Path(key_folder), node) for node in addresses}
+
+    class InstanceCommands(_DeeployMixin, _CmdAPIMixin):
+      """Route production instance commands over the test transport."""
+
+    sender = InstanceCommands()
+    sender.Pd = lambda *args, **kwargs: None
+    sender.json_dumps = json.dumps
+    sender._discover_plugin_instances = lambda **kwargs: [{
+      DEEPLOY_PLUGIN_DATA.APP_ID: "app", DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "WORKER_APP_RUNNER",
+      DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "worker", DEEPLOY_PLUGIN_DATA.NODE: node,
+    } for node in addresses]
+
+    def deliver(node_address, command_type, command_content, **kwargs):
+      # An authorized batch has no per-item validation fields, matching the normal comms handoff.
+      envelope = copy.deepcopy(command_content)
+      if isinstance(envelope, dict):
+        envelope.update(EE_SENDER="oracle", VALIDATED=True)
+      receiver = ExecutionEngineCommandHandlers()
+      receiver.P = lambda *args, **kwargs: None
+      receiver._config_manager = workers[node_address]
+      getattr(receiver, "cmd_handler_" + command_type.lower())(envelope, "oracle-id", "session")
+
+    sender.cmdapi_register_command = deliver
+    for node in addresses:
+      local = workers[node].dct_config_streams["app"]
+      assert worker(local)["CLOUDFLARE_TOKEN"] == DAUTH_SECRET_PLACEHOLDER
+      sender.cmdapi_update_instance_config("app", "WORKER_APP_RUNNER", "worker", {"PROCESS_DELAY": 1}, node)
+      assert worker(local)["PROCESS_DELAY"] == 1
+      sender.cmdapi_batch_update_instance_config([dict(NAME="app", SIGNATURE="WORKER_APP_RUNNER", INSTANCE_ID="worker",
+                                                      INSTANCE_CONFIG={"PROCESS_DELAY": 2})], node)
+      assert worker(local)["PROCESS_DELAY"] == 2
+      assert worker(local)["CLOUDFLARE_TOKEN"] == DAUTH_SECRET_PLACEHOLDER
+      receive_start_or_stop(node, dict(NAME="app", PLUGINS=[]))  # An obsolete whole-pipeline update still fails.
+      assert worker(local)["PROCESS_DELAY"] == 2 and local[OPERATION_KEY]["attempt"] == ("restore" if fail else "deploy")
+
+    c._assert_no_active_deployment(job_id=31, app_id="app")  # Deeploy refuses instance commands during the rollout.
+    sender.send_instance_command_to_nodes(SimpleNamespace(app_id="app", target_nodes=addresses,
+      plugin_signature="WORKER_APP_RUNNER", instance_id="worker", instance_command="STOP"), "owner")
+    for node in addresses:
+      # Read through the runtime config manager since the repair validator rejects pending commands.
+      instance = workers[node]._get_plugin_instance("app", "WORKER_APP_RUNNER", "worker")
+      received = instance.get("INSTANCE_COMMAND")
+      assert received == "STOP"
+      # Run the actual worker hook. Only its Docker bookkeeping adapter is supplied by this fixture.
+      runtime = SimpleNamespace(P=lambda *args, **kwargs: None, _set_container_state=lambda *args: None,
+        _save_persistent_state=lambda **kwargs: None,
+        _stop_container_and_save_logs_to_disk=lambda: command(["docker", "stop", "--time", "1", container(node)]).returncode == 0)
+      WorkerAppRunnerPlugin.on_command(runtime, received)
+      assert command(["docker", "inspect", "--format", "{{.State.Status}}", container(node)]).stdout.strip() == "exited"
+      rows[node]["instance_command"] = "STOP verified"
     print(json.dumps(dict(scenario="forced_failure" if fail else "success", outcome=child["outcome"],
                           recovery=child["recovery"], pinned=rows, requests=observed)), flush=True)
   finally:
