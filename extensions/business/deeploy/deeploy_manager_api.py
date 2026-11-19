@@ -14,6 +14,7 @@ from .deployment_operations import (
 
 from .deployment_mutations import _DeploymentMutationsMixin
 from .deeploy_mixin import _DeeployMixin
+from .delegate_aliases import _DelegateAliasesMixin  # Optional metadata stays separate from deployment behavior.
 from .selected_secrets import compile_request_selections
 from .deeploy_chainstore_response_mixin import _DeeployChainstoreResponseMixin
 from .deeploy_target_nodes_mixin import _DeeployTargetNodesMixin
@@ -73,6 +74,7 @@ _CONFIG = {
 class DeeployManagerApiPlugin(
   BasePlugin,
   _DeeployMixin,
+  _DelegateAliasesMixin,  # Share alias validation and CStore persistence across both endpoints.
   _DeeployChainstoreResponseMixin,
   _DeeployTargetNodesMixin,
   _NodeTagsMixin,
@@ -385,6 +387,68 @@ class DeeployManagerApiPlugin(
       result[DEEPLOY_KEYS.TRACE] = lines[-20:-1]
     return result
     
+
+  @BasePlugin.endpoint(method="post")
+  def get_delegate_aliases(self, request: dict):
+    """
+    Read optional aliases for active delegates of the authenticated CSP.
+
+    Parameters
+    ----------
+    request : dict
+        Signed Deeploy payload with ``delegate_addresses`` (at most 10).
+
+    Returns
+    -------
+    dict
+        Standard Deeploy response with ``aliases`` on success or ``error``
+        on failure. Missing aliases are omitted.
+
+    Examples
+    --------
+    >>> plugin.get_delegate_aliases(signed_request)['aliases']
+    {}
+    """
+    try:
+      _, inputs = self.deeploy_verify_and_get_inputs(request, request_type="get delegate aliases")  # Authenticate the complete read payload and active CSP membership.
+      auth_result = self.deeploy_get_auth_result(inputs)  # Reuse the established escrow resolution contract.
+      aliases = self.deeploy_load_delegate_aliases(auth_result, inputs.get("delegate_addresses"))  # Verify targets and read only this CSP's metadata.
+      result = {DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS, "aliases": aliases}
+    except Exception as exc:
+      result = self.__handle_error(exc, request)  # Preserve the existing API failure envelope.
+    return self._get_response(result)  # Keep response signing and server metadata unchanged.
+
+  @BasePlugin.endpoint(method="post")
+  def set_delegate_alias(self, request: dict):
+    """
+    Set or clear one optional delegate alias as the escrow owner.
+
+    Parameters
+    ----------
+    request : dict
+        Signed Deeploy payload with ``delegate_address`` and string ``alias``.
+        A blank alias clears the label without touching permissions.
+
+    Returns
+    -------
+    dict
+        Standard Deeploy response with normalized ``delegate_address`` and
+        ``alias`` on success, or ``error`` on failure.
+
+    Examples
+    --------
+    >>> plugin.set_delegate_alias(signed_clear_request)['alias']
+    ''
+    """
+    try:
+      sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type="set delegate alias")  # Verify the signature before using any caller-supplied fields.
+      auth_result = self.deeploy_get_auth_result(inputs)  # Resolve scope from the signer, not request parameters.
+      saved = self.deeploy_set_delegate_alias(sender, auth_result, inputs.get("delegate_address"), inputs.get("alias"))  # Owner and membership checks precede the per-address write.
+      result = {DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS, **saved}
+    except Exception as exc:
+      result = self.__handle_error(exc, request)  # Storage, validation, and auth failures use the standard envelope.
+    return self._get_response(result)  # Preserve the established response wrapper.
+
 
   @BasePlugin.endpoint(method="post")
   # /get_apps
