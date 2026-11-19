@@ -649,7 +649,8 @@ class _DauthMixin(object):
     job_id = self._normalize_dauth_job_id(body.get("job_id"))
     if not isinstance(body.get("job_secrets"), dict):
       raise ValueError("job_secrets must be a dictionary.")
-    pipeline_cid = self._load_dauth_pipeline_cid(job_id)
+    pointer = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=job_id)
+    pipeline_cid = pointer.get("pipeline_cid") if isinstance(pointer, dict) else pointer
     if not pipeline_cid:
       raise ValueError(f"No persisted pipeline found for job {job_id}.")
     secret_bundle = self._build_secret_bundle_from_request(
@@ -657,6 +658,12 @@ class _DauthMixin(object):
       job_id,
       pipeline_cid,
     )
+    # Core already rejects unversioned overwrites of a signed canonical bundle. Its pointer may arrive first.
+    if ((isinstance(pointer, dict) and type(pointer.get("revision")) is int)
+        or self.chainstore_hget(hkey=DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, key=job_id + "|repair_hold|" + pipeline_cid)):
+      raise ValueError("This job requires lifecycle secret reconciliation.")
+    if self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=job_id) != pointer:
+      raise ValueError("The job changed during secret reconciliation.")
     self._save_dauth_job_secret_bundle(job_id, secret_bundle)
     self.Pd(f"dAuth stored secret bundle for job {job_id} from oracle {requester}.")
     return {
@@ -709,6 +716,11 @@ class _DauthMixin(object):
     )
     if self._get_pipeline_from_cstore(job_id) != pipeline_cid:
       raise ValueError("Persisted pipeline changed during secret reconciliation.")
+    # An old-style writer can be on a dAuth replica that has never seen the coordinator's repair.
+    # Its authoritative old placement must still be licensed immediately before publication.
+    if (self.chainstore_hget(hkey=DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, key=job_id + "|repair_hold|" + pipeline_cid)
+        or any(self.bc.is_node_licensed(node_address=node) is not True for node in self._pipeline_runner_nodes(prior_pipeline))):
+      raise ValueError("The previous placement requires a versioned deployment operation.")
     state = self.stage_job_pipeline_and_secrets(
       pipeline=next(iter(configs.values())), job_id=job_id, secret_bundle=bundle,
     )
@@ -838,7 +850,9 @@ class _DauthMixin(object):
       raise ValueError("Invalid dAuth secret revision record.")
     if secret_bundle.get("job_id") != job_id or secret_bundle.get("revision") != revision:
       raise ValueError("dAuth secret bundle revision identity mismatch.")
-    pipelines = secret_bundle.get("pipelines")
+    repair = ":repair_v1:" in revision
+    placements = "repair_pipelines" if repair else "pipelines"
+    pipelines = secret_bundle.get(placements)
     if not isinstance(pipelines, dict):
       raise ValueError("dAuth secret revision has no authorized pipeline plan.")
     normalized_requester = self._normalize_node_address_for_compare(requester)
@@ -846,7 +860,16 @@ class _DauthMixin(object):
       self._normalize_node_address_for_compare(node) for node in pipelines
     ]:
       raise ValueError("Sender is not authorized for the requested job revision.")
-    return {key: value for key, value in secret_bundle.items() if key != "pipelines"}
+    if repair:
+      # A previously staged replica must not release a renewed credential after another license or job transfer.
+      grant = secret_bundle.get("repair_grant") or {}
+      eth = self.bc.node_address_to_eth_address(requester)
+      prior = grant.get("slots", {}).get(eth.lower())
+      if (not prior or (prior.lower() != eth.lower() and self.bc.is_node_licensed(node_address_eth=prior) is not False)
+          or self._current_repair_license(eth) != grant.get("licenses", {}).get(eth.lower())):
+        raise ValueError("The recipient no longer owns the reviewed repair license.")
+      self._check_repair_paid_job(job_id, grant["owner"], grant["slots"])
+    return {key: value for key, value in secret_bundle.items() if key not in (placements, "repair_grant", "repair_plan_cid")}
 
   def process_dauth_reveal_secret_request(self, body):
     requester, requester_eth = self._verify_signed_dauth_body(body, endpoint="reveal_job_secrets")
