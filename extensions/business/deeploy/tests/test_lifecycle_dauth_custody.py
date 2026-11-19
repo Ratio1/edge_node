@@ -514,7 +514,7 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     previous['DEEPLOY_SPECS']['current_target_nodes'] = ['A', 'B']
     pointer_key = ('DEEPLOY_DEPLOYED_JOBS', '7')
     cid = self.state.public[pointer_key] = self.state.blobs.add_json(previous)
-    self.coordinator.known = {'N': [previous]}  # A's successor reports the app; B is unaccounted for.
+    self.coordinator.known = {'N': [previous], 'M': [previous]}  # Both successors report; retained B is unaccounted for.
     with self.assertRaisesRegex(ValueError, 'previous target'):
       self.coordinator._admit_node_relink_operation(7, 'A', 'N')
     self.assertEqual(self.state.public, {pointer_key: cid})
