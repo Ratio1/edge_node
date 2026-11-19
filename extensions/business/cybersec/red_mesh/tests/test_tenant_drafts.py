@@ -72,7 +72,7 @@ class _DraftCase(unittest.TestCase):
     self.store.account("scoped-sta", memberships=[{"role": "super_tenant_admin", "tenant_id": "tn_" + str(uuid4())}])
     self.documents = FakeDocumentStore()
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenancy_namespace = "deployment"
+    self.plugin._stream_id = "deployment"
     self.plugin.P = lambda *args, **kwargs: None
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hkeys", "chainstore_hset"):
       setattr(self.plugin, name, getattr(self.store, name))
@@ -260,7 +260,7 @@ class TestDraftRoles(_DraftCase):
     self.assertEqual(self.events, [])
 
   def test_no_namespace_means_unavailable_before_any_storage_access(self):
-    self.plugin.cfg_tenancy_namespace = None
+    self.plugin._stream_id = None
     for name in ("create_tenant_draft", "update_tenant_draft", "get_tenant_draft", "list_tenant_drafts",
                  "delete_tenant_draft", "upload_tenant_draft_document", "download_tenant_draft_document",
                  "store_generated_document"):

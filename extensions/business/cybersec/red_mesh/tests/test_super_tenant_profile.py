@@ -36,7 +36,7 @@ class _ProfileCase(unittest.TestCase):
     self.store.account("pentester", memberships=[{"role": "super_pentester", "tenant_id": None}])
     self.store.account("scoped-sta", memberships=[{"role": "super_tenant_admin", "tenant_id": "tn_" + str(uuid4())}])
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenancy_namespace = "deployment"
+    self.plugin._stream_id = "deployment"
     self.plugin.P = lambda *args, **kwargs: None
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
       setattr(self.plugin, name, getattr(self.store, name))
@@ -188,7 +188,7 @@ class TestProfileRoles(_ProfileCase):
     self.assertEqual(self.events, events)
 
   def test_no_namespace_means_unavailable_before_any_storage_access(self):
-    self.plugin.cfg_tenancy_namespace = None
+    self.plugin._stream_id = None
     for name in ("get_super_tenant_profile", "update_super_tenant_profile", "get_super_tenant_provider"):
       with self.subTest(name):
         self.assertEqual(getattr(self.Plugin, name).__http_method__, "post")

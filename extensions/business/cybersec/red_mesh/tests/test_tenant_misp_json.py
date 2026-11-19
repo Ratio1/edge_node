@@ -73,7 +73,7 @@ def test_plugin_reads_the_tenant_display_name_for_the_tenant_tag():
     assert fixture.Plugin._get_tenant_display_name(fixture.owner, fixture.tenant_id) == display
     assert fixture.Plugin._get_tenant_display_name(
       fixture.owner, "tn_00000000-0000-4000-8000-000000000000") is None
-    fixture.owner.cfg_tenancy_namespace = ""
+    fixture.owner._stream_id = ""
     assert fixture.Plugin._get_tenant_display_name(fixture.owner, fixture.tenant_id) is None
 
 

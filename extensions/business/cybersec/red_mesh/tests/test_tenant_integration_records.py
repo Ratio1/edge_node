@@ -143,7 +143,7 @@ class TestPluginStartCleanup(RetirementCase):
   def setUp(self):
     super().setUp()
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenancy_namespace = "deployment"
+    self.plugin._stream_id = "deployment"
     self.logs = []
     self.plugin.P = lambda *args, **kwargs: self.logs.append(" ".join(str(arg) for arg in args))
     self.enumerations = 0
@@ -189,7 +189,7 @@ class TestPluginStartCleanup(RetirementCase):
     self.assertEqual(self.enumerations, enumerations)
 
   def test_a_node_without_a_tenancy_namespace_has_nothing_to_clean(self):
-    self.plugin.cfg_tenancy_namespace = None
+    self.plugin._stream_id = None
     self.run_cleanup()
     self.assertEqual(self.enumerations, 0)
     self.assertEqual(len(self.live_rows()), 3)

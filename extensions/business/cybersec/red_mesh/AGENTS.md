@@ -666,3 +666,15 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
   `test_engagement_drafts.py` (the generated pack now comes from the real endpoint),
   `test_tenant_administration.py`, `test_tenant_delete.py`, `test_tenancy_administration_store.py`,
   `test_data_maintenance.py`, `test_authz_surface.py` (110 endpoints).
+
+### 2026-11-19 — RM-222: the tenancy namespace is derived, never configured
+
+- The `TENANCY_NAMESPACE` config key is removed. The CStore partition for tenant data
+  (`["redmesh","tenancy",1,<ns>]`, `["redmesh","tenancy-compliance",1,<ns>]`) is the pipeline stream id
+  (deeploy `app_id`), read through `tenancy.tenancy_namespace(owner)`. No config, env var or request can
+  choose it; a pipeline that still carries the key has no effect. This supersedes the 2026-09-21 note that
+  `TENANCY_NAMESPACE` is the tenancy precondition: an empty stream id now answers `unavailable` (503).
+- A fresh deeploy job has a new `app_id`, so it starts with an empty tenant partition. Existing data is
+  migrated by hand (hub task RM-222 §Migration); there is no compatibility path.
+- Tests set `_stream_id` on the plugin or owner stub instead of `cfg_tenancy_namespace`;
+  `tests/test_tenancy_namespace.py` pins the accessor and `test_plugin_config.py` pins that the key is gone.

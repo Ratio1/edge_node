@@ -75,7 +75,7 @@ class TestDataMaintenance(unittest.TestCase):
     self.storage = FakeAdministrationStore()
     self.storage.account("pentester", memberships=[{"role": "super_pentester", "tenant_id": None}])
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenancy_namespace = "deployment"
+    self.plugin._stream_id = "deployment"
     self.plugin.cfg_instance_id = JOBS
     self.plugin.P = lambda *args, **kwargs: None
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hkeys", "chainstore_hset"):

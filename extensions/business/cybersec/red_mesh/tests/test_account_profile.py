@@ -45,7 +45,7 @@ class _ProfileCase(unittest.TestCase):
     self.store = FakeAdministrationStore()
     self.documents = FakeDocumentStore()
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenancy_namespace = "deployment"
+    self.plugin._stream_id = "deployment"
     self.plugin.cfg_chainstore_peers = []
     self.plugin.P = lambda *args, **kwargs: None
     self.plugin._document_store = lambda: self.documents

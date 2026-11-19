@@ -193,7 +193,7 @@ class TestDeploymentNodesPlugin(unittest.TestCase):
     self.addCleanup(environment.stop)
     self.storage = FakeAdministrationStore()
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenancy_namespace = "deployment"
+    self.plugin._stream_id = "deployment"
     self.plugin.cfg_chainstore_peers = ["0xai_rm3", "0xai_rm4"]
     self.plugin.cfg_instance_id = "pentester-api-01"
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):

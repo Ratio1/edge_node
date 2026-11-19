@@ -14,6 +14,7 @@ from ..model_testing.constants import (
   selected_model_test_worker_addr,
 )
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..tenancy import tenancy_namespace
 from ..tenancy.effects import EffectState
 from . import checkpoint
 from .event_hooks import emit_lifecycle_event
@@ -696,8 +697,8 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None,
       tenant = binding.get("tenant_id") if isinstance(binding, dict) else None
       if isinstance(tenant, str) and tenant.strip():
         tenants.add(tenant)
-    namespace = getattr(owner, "cfg_tenancy_namespace", None)
-    if swept_ids is None and isinstance(namespace, str) and namespace.strip():
+    namespace = tenancy_namespace(owner)
+    if swept_ids is None and namespace is not None:
       tenancy_hkey = json.dumps(["redmesh", "tenancy", 1, namespace], separators=(",", ":"))
       try:
         rows = owner.chainstore_hgetall(hkey=tenancy_hkey)

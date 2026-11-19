@@ -34,9 +34,9 @@ def install_tenant_read_store(case, owner, Plugin, *, jobs=None, role="super_ten
   environment.start()
   case.addCleanup(environment.stop)
   store = FakeAdministrationStore()
-  owner.cfg_tenancy_namespace = "deployment"
+  owner._stream_id = "deployment"
   owner.cfg_chainstore_peers = []
-  tenant_store = CstoreTenantAdministrationStore(store, owner.cfg_tenancy_namespace)
+  tenant_store = CstoreTenantAdministrationStore(store, owner._stream_id)
   administration = TenantAdministrationService(CstoreAuthAccountReader(store), tenant_store)
   request_id = str(uuid4())
   prepared = administration.prepare_tenant({"account_id": "creator"}, request_id,
@@ -145,7 +145,7 @@ def read_endpoint_fixture(*, bound=True, archived=True, role="tenant_admin"):
       if isinstance(value, Exception):
         raise value
       return value
-    owner = SimpleNamespace(cfg_instance_id=store.cfg_instance_id, cfg_tenancy_namespace="deployment",
+    owner = SimpleNamespace(cfg_instance_id=store.cfg_instance_id, _stream_id="deployment",
       cfg_chainstore_peers=[],
       chainstore_hget=store.chainstore_hget, chainstore_hgetall=store.chainstore_hgetall,
       chainstore_hkeys=store.chainstore_hkeys, chainstore_hset=store.chainstore_hset,

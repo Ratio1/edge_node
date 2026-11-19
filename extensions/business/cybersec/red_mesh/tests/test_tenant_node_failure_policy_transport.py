@@ -25,7 +25,7 @@ class TestNodeFailurePolicyTransport(unittest.TestCase):
     self.addCleanup(env.stop)
     self.store = FakeAdministrationStore()
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenancy_namespace = "policy-transport"
+    self.plugin._stream_id = "policy-transport"
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
       setattr(self.plugin, name, getattr(self.store, name))
     self.creator = {"account_id": "creator"}
@@ -81,7 +81,7 @@ class TestNodeFailurePolicyTransport(unittest.TestCase):
       setattr(self.plugin, name, forbidden_storage)
     for namespace in (None, " "):
       with self.subTest(namespace=namespace):
-        self.plugin.cfg_tenancy_namespace = namespace
+        self.plugin._stream_id = namespace
         result = self.plugin.update_tenant_node_failure_policy(
           actor=self.creator, tenant_id=self.tenant_id, node_failure_policy="continue")
         self.assertEqual(result["status_code"], 503)

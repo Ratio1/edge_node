@@ -27,7 +27,7 @@ class TestTenantDelete(unittest.TestCase):
     self.addCleanup(environment.stop)
     self.storage = FakeAdministrationStore()
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenancy_namespace = "deployment"
+    self.plugin._stream_id = "deployment"
     self.plugin.cfg_instance_id = "jobs"
     self.plugin.P = lambda *args, **kwargs: None
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hkeys", "chainstore_hset"):

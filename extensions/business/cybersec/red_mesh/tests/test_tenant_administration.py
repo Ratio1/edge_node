@@ -669,7 +669,7 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
 
     store = FakeAdministrationStore()
     plugin = object.__new__(self.Plugin)
-    plugin.cfg_tenancy_namespace = "deployment"
+    plugin._stream_id = "deployment"
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
       setattr(plugin, name, getattr(store, name))
     # The core's FastAPI template copies these real signature fields into a Pydantic model.
@@ -708,7 +708,7 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
       for name in methods:
         with self.subTest(namespace=namespace, method=name):
           plugin = object.__new__(self.Plugin)
-          plugin.cfg_tenancy_namespace = namespace
+          plugin._stream_id = namespace
           plugin.chainstore_hget = MagicMock(side_effect=AssertionError("No storage access"))
           plugin.chainstore_hset = MagicMock(side_effect=AssertionError("No storage write"))
           result = getattr(plugin, name)(actor={"account_id": "creator"})
@@ -720,7 +720,7 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
   def test_enabled_real_plugin_creation_and_read_use_server_configuration(self):
     store = FakeAdministrationStore()
     plugin = object.__new__(self.Plugin)
-    plugin.cfg_tenancy_namespace = "deployment"
+    plugin._stream_id = "deployment"
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
       setattr(plugin, name, getattr(store, name))
     actor = {"account_id": "creator", "namespace": "browser-ignored"}
