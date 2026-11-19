@@ -36,13 +36,17 @@ A network (blackbox) worker may resume execution inside a pass from a checkpoint
   are throttled (a port save every `PORT_EVERY` ports, a save after each method, and any save other
   than worker start or phase end at most once per `MIN_INTERVAL`), so
   ports scanned and methods finished after the last save run again after a restart. A method cut off by
-  the restart may run again.
+  the restart may run again. A phase whose completion marker was saved (correlation included) is
+  skipped on resume; its saved results are kept. A resumed worker saves once at start.
 - Validity rules (applied on load, Phase 3). A file is used only when all hold: `version` equals the
   current version; `job_id`, `pass_nr`, `ee_addr`, `scan_type`, `config_cid`, `target_ports` and the
   port range match the current assignment; the file is younger than `MAX_AGE`; the worker is not
-  `finished` in CStore; the job is not terminal. A file that fails a rule is deleted.
+  `finished` in CStore; the job is not terminal. The load also checks that each payload's `job_id`
+  and worker prefix match its file, that worker ids are well formed and unique, and that saved ports
+  are unique integers inside the slice. When any file fails a rule, the whole pass is deleted and
+  the pass restarts.
 - Coverage is all-or-nothing: the union of the restored `initial_ports` must equal the worker's
-  slice, otherwise the whole pass checkpoint is discarded and the pass restarts.
+  slice minus its `exceptions`, otherwise the whole pass checkpoint is discarded and the pass restarts.
 - Finished but not merged: after `_close_job` publishes the terminal `:live` row, the node writes a
   final marker `final_<pass_nr>.pkl` and deletes the pass files. The marker holds plain types only:
   `version`, `job_id`, `pass_nr`, `ee_addr`, `report_cid`, `done`, `saved_at` and the live-row summary
@@ -73,7 +77,8 @@ A network (blackbox) worker may resume execution inside a pass from a checkpoint
   reads, writes or deletes through it.
 - Stop paths: a HARD `stop_monitoring` and `stop_and_delete_job` delete all of the job's checkpoints,
   marker included. A soft stop keeps them, since the pass continues. A worker whose stop event is
-  set saves nothing more, so a save in flight cannot recreate a deleted checkpoint.
+  set starts no new save. A save already running when the stop lands can still write its file after
+  the delete; it is never resumed (the worker is `finished`) and GC removes it.
 - Graybox workers still restart from the beginning of the pass.
 - The checkpoint is local to the node. It is not a CStore or R1FS record.
 - Accepted limits:

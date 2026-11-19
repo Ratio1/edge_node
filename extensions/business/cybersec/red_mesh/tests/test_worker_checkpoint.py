@@ -218,8 +218,8 @@ class TestWorkerCheckpoint(unittest.TestCase):
     self.assertEqual(w.state["service_info"][3306]["_service_info_mysql"]["accepted"], ["admin:1234"])
 
   def test_no_save_after_stop(self):
-    # A HARD stop deletes the job's checkpoints right after job.stop(); a save still in
-    # flight on the worker thread must not write the file again.
+    # A HARD stop deletes the job's checkpoints right after job.stop(); a stopped worker must
+    # start no new save. A save already past the check can still land; GC removes it.
     w = _worker(self.owner)
     w.stop_event = threading.Event()
     w.stop_event.set()
