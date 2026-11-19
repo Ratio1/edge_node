@@ -59,6 +59,16 @@ def _make_plugin(**overrides):
 
 
 class RedMeshLlmAgentProviderTests(unittest.TestCase):
+  def test_agent_timeouts_outlast_local_chunk_timeout(self):
+    # RM-217: the HTTP front (REQUEST_TIMEOUT, else naeural_core's 120 s) and the model call
+    # must both outlast the Pentester API's local chunk call, or a 768-token chunk gets a 504.
+    from extensions.business.cybersec.red_mesh.services.config import DEFAULT_LLM_AGENT_CONFIG
+    chunk_timeout = DEFAULT_LLM_AGENT_CONFIG["LOCAL_STRUCTURED_CHUNK_TIMEOUT"]
+    config = RedMeshLlmAgentApiPlugin.CONFIG
+
+    self.assertGreater(config["REQUEST_TIMEOUT"], chunk_timeout)
+    self.assertGreater(config["REQUEST_TIMEOUT_SECONDS"], chunk_timeout)
+
   def test_public_config_uses_generic_remote_keys(self):
     config = RedMeshLlmAgentApiPlugin.CONFIG
 

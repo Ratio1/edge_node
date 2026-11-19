@@ -103,6 +103,8 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin, _DeeployJobMixin):
     self.relink_state = self.cacheapi_load_pickle(default=None, verbose=False) or {
       'cursor': 0, 'unlinked': {}, 'links': {},
     }
+    # The persisted scan already contains confirmed links. Make them available before the first RPC poll.
+    self._publish_confirmed_relinks(self._get_relink_successors())
     self.chainstore_hset(
       hkey='chain_dist_monitor',
       key=self.node_addr,
@@ -284,6 +286,7 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin, _DeeployJobMixin):
     )
     self._update_nd_links()
     successors = self._get_relink_successors()
+    self._publish_confirmed_relinks(successors)
     relinks = {}
     if successors:
       # Pending jobs are voted by check_all_jobs; closable ones are closed by check_closable_jobs.
@@ -296,6 +299,7 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin, _DeeployJobMixin):
         pipeline = self.get_job_pipeline_from_cstore(job_id, timeout=10, pin=False)
         placement = (pipeline or {}).get('DEEPLOY_SPECS', {}).get('current_target_nodes', [])
         nodes = []
+        pending_relinks = []
         for node in active_nodes:
           new_node = successors.get(node)
           if new_node and new_node not in active_nodes and new_node not in nodes:
@@ -303,14 +307,37 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin, _DeeployJobMixin):
             if new in placement and old not in placement:
               node = new_node
             elif old in placement and new not in placement:
-              relinks[job_id] = (old, new)
+              pending_relinks.append((old, new))
           nodes.append(node)
+        # Hand off one mutation at a time. A later pass can take the next pending slot after publication.
+        if pending_relinks:
+          relinks[job_id] = pending_relinks[0]
         if nodes != active_nodes:
           nodes = sorted(nodes)
           self.P(f"Job {job_id}: moving relinked node(s) {sorted(set(active_nodes) - set(nodes))} to {nodes}")
           self.bc.submit_node_update(job_id=job_id, nodes=nodes)
     self.plugins_shmem[NODE_RELINKS_SHMEM_KEY] = relinks
     return
+
+  def _publish_confirmed_relinks(self, successors):
+    """Share all confirmed relinks from the persisted event scan.
+
+    Parameters
+    ----------
+    successors : dict
+      Previous address to current address for each confirmed relink.
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> monitor._publish_confirmed_relinks({})  # doctest: +SKIP
+    """
+    self.plugins_shmem['CHAIN_DIST_CONFIRMED_RELINKS'] = {
+      node: (new_node, *self.relink_state['unlinked'][node]) for node, new_node in successors.items()
+    }
 
 
   def maybe_distribute_rewards(self):
