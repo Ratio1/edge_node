@@ -7,6 +7,7 @@ from extensions.business.cybersec.red_mesh.tests.e2e.run_e2e import (
   fetch_archive,
   is_failed_job_status,
   is_terminal_job_status,
+  launch_blackbox,
   job_status_values as generic_job_status_values,
   wait_for_finalize,
 )
@@ -338,3 +339,17 @@ def test_pass_coverage_flags_report_without_thread_metrics():
 
 def test_stopped_job_counts_as_failed():
   assert is_failed_job_status({"result": {"job_status": "STOPPED"}}, "job-1") is True
+
+
+def test_launch_blackbox_sends_every_confirmation_launch_requires():
+  from extensions.business.cybersec.red_mesh.services.launch_api import required_unsafe_confirmation_ids
+  for threads in (1, 4, 16):
+    with patch("extensions.business.cybersec.red_mesh.tests.e2e.run_e2e.http_post",
+               return_value={"result": {"job_specs": {"job_id": "j"}}}) as post:
+      launch_blackbox("http://rm", "10.0.0.1", threads=threads)
+    payload = post.call_args.args[1]
+    required = required_unsafe_confirmation_ids(
+      scan_type="network", options=payload, redact_credentials=payload["redact_credentials"],
+      ics_safe_mode=payload["ics_safe_mode"], verify_tls=True, allow_stateful_probes=False,
+    )
+    assert required <= set(payload["unsafe_launch_confirmations"]), (threads, required)

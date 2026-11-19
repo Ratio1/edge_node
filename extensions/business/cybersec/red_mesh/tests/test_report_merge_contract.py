@@ -117,8 +117,9 @@ class TestThreadMerge(unittest.TestCase):
     host = _Host()
     bad = _thread(1, range(11, 21), [25])
     bad["correlation_findings"] = None
-    report = host._get_aggregated_report(_per_thread([_thread(0, range(1, 11), [22]), bad]))
+    report = self._merge([_thread(0, range(1, 11), [22]), bad])  # fails on a swallowed merge error
     self.assertEqual([f["title"] for f in report["correlation_findings"]], ["corr-0"])
+    self.assertEqual(report["open_ports"], [22, 25])
 
   def test_null_first_does_not_wrap_later_findings(self):
     # First report null, second with findings: the merged value is the list,
@@ -340,9 +341,6 @@ class TestFinalizeOnMergeFailure(unittest.TestCase):
     plugin._compute_risk_and_findings.assert_not_called()
 
 
-if __name__ == "__main__":
-  unittest.main()
-
 
 class TestWarmupRepairOnMergeFailure(unittest.TestCase):
 
@@ -440,6 +438,9 @@ class TestRuntimeLogsCarryNoReportContent(unittest.TestCase):
     with patch.object(Plugin, "_mark_worker_terminal_error"):
       Plugin._close_job(plugin, "job-1")
     logged = self._logged(plugin)
+    self.assertIn("terminal_reason=report_unavailable", logged)
+    audit = plugin._log_audit_event.call_args.args
+    self.assertEqual((audit[0], audit[1]["terminal_reason"]), ("scan_completed", "report_unavailable"))
     self.assertIn("job-1", logged)
     self.assertNotIn("hunter2-secret", logged)
 
@@ -464,3 +465,7 @@ class TestRuntimeLogsCarryNoReportContent(unittest.TestCase):
     logged = self._logged(plugin)
     self.assertIn("job-1", logged)
     self.assertNotIn("hunter2-secret", logged)
+
+
+if __name__ == "__main__":
+  unittest.main()

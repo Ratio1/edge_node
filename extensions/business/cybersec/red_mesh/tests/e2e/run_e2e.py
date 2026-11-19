@@ -62,6 +62,9 @@ def launch_blackbox(rm: str, target: str, task_name: str = "e2e-blackbox", threa
     "scanner_identity": "redmesh", "scanner_user_agent": "RedMesh/e2e",
     "authorized": True, "created_by_name": "e2e", "created_by_id": "e2e",
     "nr_local_workers": threads, "target_confirmation": target,
+    # Delay 0 and ICS safe mode off need confirming; so do threads above the production default (1).
+    "unsafe_launch_confirmations": ["dune-delay-below-production", "ics-safe-mode-off"]
+                                   + (["threads-per-node-raised"] if threads > 1 else []),
   })
   job_id = resp.get("result", {}).get("job_specs", {}).get("job_id")
   if not job_id:
