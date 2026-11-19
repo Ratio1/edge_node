@@ -8,6 +8,7 @@ other oracles only aggregate replicated observations for polling.
 import copy
 import hashlib
 import json
+import re
 import threading
 # The call path of an error that stops an operation is logged (function names only).
 import traceback
@@ -15,7 +16,10 @@ import uuid
 # The verified-fingerprint cache keeps insertion order, so its oldest entry can be dropped first.
 from collections import OrderedDict
 
+from naeural_core.business.deployment_lifecycle import SOURCE_FAILURES, deployment_source_mode
 from ratio1.const.base import BCct, dAuth
+from extensions.business.container_apps.container_utils import configured_image_ref, image_repository
+from extensions.utils.per_node_config import iter_overlays, normalize_config, PER_NODE_CONFIG_KEYS
 from .selected_secrets import inherit_selections
 
 from extensions.business.dauth.dauth_registry import get_dauth_registry_internal_peers
@@ -64,20 +68,217 @@ def required_instances(config):
   ]
 
 
-def report_is_ready(report, config):
+def report_is_ready(report, config, pins=None):
   """Require an explicit ready report for every planned plugin instance.
 
-  Nodes publish a ready report once per attempt and never refresh it, so its
-  age is not a liveness signal; callers pair it with NetMon liveness.
+  Nodes publish on changes in status or version. Callers pair the latest
+  report with NetMon liveness because a healthy workload can stay unchanged.
   """
-  if not report or report.get("status") != "ready":
-    return False
-  actual = {
-    (item.get("signature"), item.get("instance_id")): item.get("status")
-    for item in report.get("instances", [])
-  }
-  expected = required_instances(config)
-  return bool(expected) and all(actual.get(identity) == "ready" for identity in expected)
+  return node_rollout_state(config, report, online=True, deadline=False, pins=pins) == "ready"
+
+
+def pinned_sources(config):
+  """Project required content identities for local readiness checks.
+
+  Parameters
+  ----------
+  config : dict
+    The coordinator's stored pipeline for one node.
+
+  Returns
+  -------
+  dict
+    SHA-256 of the required commit or repository@digest for each pinned instance. Hashing
+    keeps source names out of the signed public operation. Invalid legacy values never match.
+
+  Examples
+  --------
+  >>> pinned_sources({"PLUGINS": []})
+  {}
+  """
+  pins = {}
+  for group in config.get("PLUGINS", []):
+    signature = group["SIGNATURE"]
+    for instance in group.get("INSTANCES", []):
+      if deployment_source_mode(signature, config, instance) != "pinned":
+        continue
+      expected = None
+      if signature.upper() == WORKER_APP_RUNNER_SIGNATURE:
+        commit = (instance.get("VCS_DATA") or {}).get("COMMIT")
+        if isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit):
+          expected = commit
+      else:
+        image, digest = instance.get("IMAGE"), instance.get("IMAGE_DIGEST")
+        if isinstance(image, str) and image and isinstance(digest, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+          server = (instance.get("CR_DATA") or {}).get("SERVER")
+          expected = image_repository(configured_image_ref(image, server)) + "@" + digest
+      pins[signature + "|" + instance["INSTANCE_ID"]] = hashlib.sha256(expected.encode()).hexdigest() if expected else ""
+  return pins
+
+
+def validate_saved_overlays(config):
+  """Recheck stored per-node overlays before dispatching to a mixed-version placement.
+
+  Parameters
+  ----------
+  config : dict
+    Pipeline from a previously admitted revision or a resumed operation.
+
+  Returns
+  -------
+  None
+    Raises ValueError if a stored override would replace a system-managed field.
+
+  Examples
+  --------
+  >>> validate_saved_overlays({"PLUGINS": []})
+  """
+  for plugin in config.get("PLUGINS", []):
+    for instance in plugin.get("INSTANCES", []):
+      for key in PER_NODE_CONFIG_KEYS:
+        if key in instance:
+          normalize_config(instance[key])  # Check all selectors, including ones for another node.
+
+
+def validate_source_pins(configs):
+  """Validate source pins before staging the revision.
+
+  Parameters
+  ----------
+  configs : dict
+    Final per-node pipelines, including their runtime overlays.
+
+  Returns
+  -------
+  None
+    Raises ValueError for conflicting, misplaced or malformed pins.
+
+  Examples
+  --------
+  >>> validate_source_pins({})
+  """
+  pins = {}
+  for config in configs.values():
+    for plugin in config.get("PLUGINS", []):
+      signature = plugin["SIGNATURE"].upper()
+      for instance in plugin.get("INSTANCES", []):
+        mode = deployment_source_mode(signature, config, instance)
+        if mode is None and (config.get("DEEPLOY_SPECS") or {}).get("job_app_type") != "service":
+          continue  # Other plugins own their own configuration schema.
+        vcs = instance.get("VCS_DATA") or {}
+        has_commit = isinstance(vcs, dict) and "COMMIT" in vcs
+        pinned = instance.get("PINNED_VERSION", False)
+        has_digest = "IMAGE_DIGEST" in instance
+        for key in PER_NODE_CONFIG_KEYS:
+          for overlay in iter_overlays(instance.get(key)):
+            overlay_vcs = overlay.get("VCS_DATA", {})
+            if ("PINNED_VERSION" in overlay or "IMAGE_DIGEST" in overlay
+                or (isinstance(overlay_vcs, dict) and "COMMIT" in overlay_vcs)
+                or (has_commit and not isinstance(overlay_vcs, dict))):
+              raise ValueError("A per-node override cannot change a source pin.")
+        if mode in (None, "service") and ("PINNED_VERSION" in instance or has_digest or has_commit):
+          raise ValueError("Catalogue services do not accept source pins.")
+        if type(pinned) is not bool:
+          raise ValueError("PINNED_VERSION must be a boolean.")
+        worker = signature == WORKER_APP_RUNNER_SIGNATURE
+        if has_commit != (pinned and worker) or has_digest != (pinned and not worker):
+          raise ValueError("A source pin requires exactly the hash for its runner.")
+        version = vcs["COMMIT"] if has_commit else instance.get("IMAGE_DIGEST")
+        if pinned and (not isinstance(version, str) or not re.fullmatch(
+            r"[0-9a-f]{40}" if worker else r"sha256:[0-9a-f]{64}", version)):
+          raise ValueError("Invalid pinned Git commit or registry digest.")
+        identity = (signature, instance["INSTANCE_ID"])
+        if pins.setdefault(identity, (mode, version)) != (mode, version):
+          raise ValueError("A plugin instance must use the same source pin on every node.")
+
+
+def node_rollout_state(config, report, online, deadline, pins=None):
+  """Decide whether one node permits a revision to take effect.
+
+  Each planned instance needs its own evidence. A lifecycle error always wins
+  over a source failure in another instance on the same node.
+
+  Parameters
+  ----------
+  config, report : dict
+    Stored pipeline and its latest authenticated attempt report.
+  online, deadline : bool
+    Current node liveness and whether the readiness deadline has passed.
+  pins : dict, optional
+    Signed projection of the plan when status polling has only the planned instance identities.
+
+  Returns
+  -------
+  str
+    ready, kept, pending, failed, legacy_failed or legacy_timeout.
+
+  Examples
+  --------
+  >>> node_rollout_state({}, {}, False, True)
+  'pending'
+  """
+  if not report:
+    return "pending"
+  if report.get("error"):
+    return "failed"  # Pipeline-level errors (such as rejected config) cannot be kept.
+  planned = {(p["SIGNATURE"], i["INSTANCE_ID"]): i
+             for p in config.get("PLUGINS", []) for i in p.get("INSTANCES", [])}
+  if pins is None:
+    pins = pinned_sources(config)  # Execution always takes its requirements directly from the durable plan.
+  seen = set()
+  kept = False
+  pending = False
+  kept_failure = False
+  old_node = False
+  instances = report.get("instances", [])
+  if not isinstance(instances, list):
+    return "failed"  # A malformed signed report cannot establish readiness.
+  for item in instances:
+    if not isinstance(item, dict):
+      return "failed"
+    identity = (item.get("signature"), item.get("instance_id"))
+    instance = planned.get(identity)
+    mode = deployment_source_mode(identity[0], config, instance) if instance is not None else None
+    pin_key = "|".join(identity) if instance is not None else None
+    if pin_key in pins:
+      mode = "pinned"  # The local-only polling projection is signed by the coordinator.
+    reported_mode = item.get("source_mode")
+    following = mode == reported_mode == "following"
+    status = item.get("status")
+    legacy = mode in ("following", "pinned") and reported_mode is None
+    if mode == "pinned" and status == "ready":
+      if legacy:
+        return "legacy_failed"  # Older nodes bind their first start, which may differ from the request.
+      artifacts = item.get("runtime_artifacts")
+      field = "git_commit" if identity[0].upper() == WORKER_APP_RUNNER_SIGNATURE else "image_ref"
+      version = artifacts.get(field) if isinstance(artifacts, dict) else None
+      if (reported_mode != "pinned" or not isinstance(version, str)
+          or hashlib.sha256(version.encode()).hexdigest() != pins.get(pin_key)):
+        return "failed"  # A signed ready state alone cannot establish the requested revision.
+    if status == "failed":
+      error = item.get("error")
+      if not following or not isinstance(error, dict) or error.get("code") not in SOURCE_FAILURES:
+        return "legacy_failed" if legacy else "failed"
+      kept_failure = True
+      # A previously reported source failure cannot stand in for an offline node.
+      kept |= online
+      pending |= not online
+    elif identity in planned and (status != "ready" or not online):
+      if following and online and deadline:
+        kept = True
+      else:
+        pending = True
+        old_node |= legacy
+    seen.add(identity)
+  if report.get("status") == "failed" and not kept_failure:
+    return "failed"  # No instance evidence explains the pipeline failure.
+  if deadline and old_node:
+    return "legacy_timeout"
+  if pending or not planned or not planned.keys() <= seen:
+    return "pending"
+  if kept:
+    return "kept"
+  return "ready" if report.get("status") == "ready" and online else "pending"
 
 
 def replace_nodes(value, node_aliases):
@@ -647,6 +848,7 @@ class _DeploymentOperationsMixin:
     dict
       Signed HTTP acceptance response.
     """
+    validate_source_pins(configs)  # Refuse invalid revisions before staging any secrets or plans.
     owner = auth_result[DEEPLOY_KEYS.ESCROW_OWNER]
     job_id = request["job_id"]
     previous_revision = 0 if is_create else (prior_pipeline or {}).get(
@@ -703,6 +905,7 @@ class _DeploymentOperationsMixin:
       ):
         raise ValueError("The previous revision does not contain the exact complete placement.")
       for old_config in previous_configs.values():
+        validate_saved_overlays(old_config)  # Refuse an unsafe recovery plan before retiring the live placement.
         old_config.pop("DEEPLOY_OPERATION", None)
         if restore_owner is not None:
           old_config["OWNER"] = restore_owner
@@ -733,6 +936,11 @@ class _DeploymentOperationsMixin:
       sequence=0, events=[], sent_at={},
       error=None,
     )
+    # Polling reads only signed local replicas and needs the same pin checks as execution, including restores.
+    for attempt, placement in (("deploy", configs), ("restore", previous_configs)):
+      requirements = {node: pins for node, config in placement.items() if (pins := pinned_sources(config))}
+      if requirements:
+        operation.setdefault("pinned_sources", {})[attempt] = requirements
     # The recovery owner must exist before any plaintext revision is staged.
     # If admission stops here, the worker either confirms complete preparation
     # or revokes its staged references without touching the running revision.
@@ -773,9 +981,9 @@ class _DeploymentOperationsMixin:
         self._deployment_plans[cid] = plan
     return copy.deepcopy(plan)
 
-  def _node_is_ready(self, node, report, config):
+  def _node_is_ready(self, node, report, config, pins=None):
     """Pair the attempt's one-time ready report with current NetMon liveness."""
-    return report_is_ready(report, config) and self._netmon_node_is_online_for_control(node)
+    return report_is_ready(report, config, pins=pins) and self._netmon_node_is_online_for_control(node)
 
   def _node_operation_reports(self, operation, attempt):
     """Read newest signed reports from the planned nodes for this attempt."""
@@ -818,8 +1026,8 @@ class _DeploymentOperationsMixin:
     (stopped for "stop" and "retire", ready for "start"), sends a pipeline
     command at most once per 10 s. Before each command the operation is saved
     so the durable record leads the side effect; a restore or owner-transfer
-    start also binds each container instance to the runtime artifacts the
-    retired revision reported. Each command carries the operation metadata
+    start also binds each pinned or catalogue instance to the runtime artifacts
+    the retired revision reported. Each command carries the operation metadata
     (`DEEPLOY_OPERATION`) that nodes use to de-duplicate it.
 
     The 10 s resend throttle is kept in process memory
@@ -895,6 +1103,8 @@ class _DeploymentOperationsMixin:
       key = "{}|{}|{}|{}".format(operation["operation_id"], attempt, action, node)
       if 0 <= self.time() - sent_at.get(key, 0) < 10:
         continue
+      if action == "start":
+        validate_saved_overlays(config)  # Resumed plans may predate the reserved restoration field.
       # Record the send time in memory only: the save below then finds nothing changed and writes no new
       # snapshot for a mere retry.
       sent_at[key] = self.time()
@@ -908,6 +1118,9 @@ class _DeploymentOperationsMixin:
           if plugin["SIGNATURE"].upper() not in CONTAINERIZED_APPS_SIGNATURES:
             continue
           for instance in plugin.get("INSTANCES", []):
+            if deployment_source_mode(plugin["SIGNATURE"], payload, instance) == "following":
+              instance.pop("DEEPLOY_RUNTIME_ARTIFACTS", None)  # Older restored configs can carry a stale binding.
+              continue
             identity = plugin["SIGNATURE"] + "|" + instance["INSTANCE_ID"]
             artifacts = bindings.get(identity)
             # What the instance cannot be restored without: a worker is rebuilt from its Git commit on a
@@ -972,23 +1185,49 @@ class _DeploymentOperationsMixin:
           operation["recovery"] = "blocked"
         self._send_operation_commands(operation, plan["previous_configs"], "retire", "retire", retired)
       return
-    if phase == "waiting_for_readiness":
-      failed = any(report.get("status") == "failed" or any(
-        instance.get("status") == "failed" for instance in report.get("instances", [])
-      ) for report in reports.values())
-      if failed or self.time() >= operation["deadline"]:
-        operation["error"] = dict(
-          code="INSTANCE_FAILED" if failed else "READINESS_DEADLINE_EXCEEDED",
-          message="A required instance failed." if failed else "Not all target nodes confirmed readiness in time.",
-          retryable=False,
+    if phase in ("finalizing", "finalizing_recovery"):
+      restoring = phase == "finalizing_recovery"
+      active_reports = self._node_operation_reports(operation, "restore") if restoring else reports
+      active_configs = plan["previous_configs"] if restoring else configs
+      expired = self.time() >= operation.get("restore_deadline" if restoring else "deadline", operation["deadline"])
+      for node, config in active_configs.items():
+        pins = pinned_sources(config)
+        # A node may go offline between the readiness barrier and publication of the revision.
+        recheck = bool(pins) or any(
+          deployment_source_mode(plugin["SIGNATURE"], config, instance) == "following"
+          for plugin in config.get("PLUGINS", []) for instance in plugin.get("INSTANCES", [])
         )
+        online = self._netmon_node_is_online_for_control(node) if recheck else True
+        state = node_rollout_state(config, active_reports.get(node), online, expired, pins=pins)
+        if state in ("failed", "legacy_failed") or (recheck and state not in ("ready", "kept")):
+          # Once the revision is published, its remaining secret/metadata writes must still finish.
+          pointer = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(operation["job_id"]))
+          if not isinstance(pointer, dict) or pointer.get("operation_id") != operation["operation_id"]:
+            phase = "restoring_previous" if restoring else "waiting_for_readiness"
+            self._save_operation(operation, phase, "Rechecking node evidence before revision publication.")
+          break
+    if phase == "waiting_for_readiness":
+      expired = self.time() >= operation["deadline"]
+      states = {node: node_rollout_state(config, reports.get(node), self._netmon_node_is_online_for_control(node), expired)
+                for node, config in configs.items()}
+      failed = any(state in ("failed", "legacy_failed") for state in states.values())
+      if failed or (expired and any(state in ("pending", "legacy_timeout") for state in states.values())):
+        message = "A required instance failed." if failed else "Not all target nodes confirmed readiness in time."
+        if any(state in ("legacy_failed", "legacy_timeout") for state in states.values()):
+          # Stop snapshots replace failure snapshots; keep upgrade guidance on the operation.
+          message += " Update the node to support the requested source mode."
+        operation["error"] = dict(code="INSTANCE_FAILED" if failed else "READINESS_DEADLINE_EXCEEDED",
+                                  message=message, retryable=False)
         operation["recovery"] = "in_progress"
         operation["recovery_started_at"] = self.time()
         self._save_operation(operation, "stopping_failed_rollout", "Stopping the failed rollout on all targets.")
-      elif all(self._node_is_ready(node, reports.get(node), config) for node, config in configs.items()):
-        self._save_operation(operation, "finalizing", "All required instances are ready.")
+      elif "pending" not in states.values():
+        operation["waiting_for_source"] = "kept" in states.values()  # Persist the barrier decision across restarts.
+        self._save_operation(operation, "finalizing", "Revision applied; waiting for source." if operation["waiting_for_source"]
+                             else "All required instances are ready.")
       else:
-        self._send_operation_commands(operation, configs, "deploy", "start", reports)
+        pending = {node: configs[node] for node, state in states.items() if state == "pending"}
+        self._send_operation_commands(operation, pending, "deploy", "start", reports)
       return
     if phase == "stopping_failed_rollout":
       # Requiring all stop acknowledgments provides the stateful restoration barrier.
@@ -1008,21 +1247,25 @@ class _DeploymentOperationsMixin:
     if phase == "restoring_previous":
       previous_configs = plan["previous_configs"]
       previous_reports = self._node_operation_reports(operation, "restore")
-      if all(self._node_is_ready(node, previous_reports.get(node), config) for node, config in previous_configs.items()):
-        self._save_operation(operation, "finalizing_recovery", "Previous revision is ready on all required nodes.")
+      expired = self.time() >= operation["restore_deadline"]
+      states = {node: node_rollout_state(config, previous_reports.get(node), self._netmon_node_is_online_for_control(node), expired)
+                for node, config in previous_configs.items()}
+      if all(state in ("ready", "kept") for state in states.values()):
+        message = "Previous revision restored and waiting for source." if "kept" in states.values() else "Previous revision is ready on all required nodes."
+        self._save_operation(operation, "finalizing_recovery", message)
       else:
-        if self.time() >= operation["restore_deadline"] or any(
-          report.get("status") == "failed" for report in previous_reports.values()
-        ):
+        if expired or any(state in ("failed", "legacy_failed") for state in states.values()):
           operation["recovery"] = "blocked"
-        self._send_operation_commands(operation, previous_configs, "restore", "start", previous_reports)
+        unresolved = {node: previous_configs[node] for node, state in states.items() if state not in ("ready", "kept")}
+        self._send_operation_commands(operation, unresolved, "restore", "start", previous_reports)
       return
     if phase in ("finalizing", "finalizing_recovery"):
       restored = phase == "finalizing_recovery"
       active_configs = plan["previous_configs"] if restored else configs
       self._commit_operation_revision(operation, active_configs)
       self._release_unused_secret_revisions(operation, plan, active_attempt="restore" if restored else "deploy")
-      operation.update(outcome="failed" if restored else "succeeded",
+      applied_outcome = "waiting_for_source" if operation.get("waiting_for_source") else "succeeded"
+      operation.update(outcome="failed" if restored else applied_outcome,
                        recovery="completed" if restored else None)
       self._save_operation(operation, "completed",
                            "Previous revision restored." if restored else "Deployment completed.")
@@ -1352,6 +1595,7 @@ class _DeploymentOperationsMixin:
     identities = operation["previous_instances"] if attempt != "deploy" else operation["instances"]
     configs = {node: {"PLUGINS": [{"SIGNATURE": signature, "INSTANCES": [{"INSTANCE_ID": instance}]} for signature, instance in values]}
                for node, values in identities.items()}
+    pins = operation.get("pinned_sources", {}).get(attempt, {})  # Polling never downloads the private plan.
     now = self.time()
     nodes = []
     for node in dict.fromkeys(operation["nodes"] + operation["previous_nodes"]):
@@ -1364,6 +1608,9 @@ class _DeploymentOperationsMixin:
                      for signature, instance_id in planned]
       nodes.append(dict(
         node_id=node, observed_revision=report.get("revision"),
+        ready=node in configs and self._node_is_ready(node, report, configs[node], pins.get(node)),
+        # Replicas can learn later node snapshots after the operation itself has completed.
+        report_attempt=report.get("attempt"), report_sequence=report.get("sequence"),
         workload_state=report.get("status", "unknown"),
         updated_at=updated_at, stale=report.get("status") != "stopped" and (
           updated_at is None or not self._netmon_node_is_online_for_control(node)),
@@ -1383,7 +1630,7 @@ class _DeploymentOperationsMixin:
     events = [event for event in operation["events"] if event["sequence"] > after]
     result.update(
       status=operation["phase"], nodes=nodes, target_nodes=len(configs),
-      ready_nodes=sum(self._node_is_ready(node, reports.get(node), config) for node, config in configs.items()),
+      ready_nodes=sum(node["ready"] for node in nodes),
       # Snapshots now change only with state: an old one is stale only while its coordinator is away.
       observation_stale=operation["phase"] != "completed" and now - operation["updated_at"] > 30
         # With the coordinator online, an old snapshot only means nothing durable changed during a long
@@ -1391,6 +1638,6 @@ class _DeploymentOperationsMixin:
         and not self._netmon_node_is_online_for_control(operation["coordinator"]),
       poll_after_ms=2000, events=events[:limit],
       next_event_cursor=events[limit - 1]["sequence"] if len(events) > limit else None,
-      revision=operation["target_revision"] if operation["outcome"] == "succeeded" else operation["previous_revision"] or 0,
+      revision=operation["target_revision"] if operation["outcome"] in ("succeeded", "waiting_for_source") else operation["previous_revision"] or 0,
     )
     return result

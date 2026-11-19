@@ -31,6 +31,7 @@ PER_NODE_CONFIG_SYSTEM_KEYS = {
   "CLOUDFLARE_TOKEN",
   "CR",
   "CR_DATA",
+  "DEEPLOY_RUNTIME_ARTIFACTS",  # Only the coordinator can supply the node-local restoration binding.
   "ENV_OVERRIDES",
   "FIXED_SIZE_VOLUMES",
   "IMAGE",

@@ -14,7 +14,7 @@ import shlex
 import re
 
 import requests
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from extensions.business.container_apps.container_app_runner import (
   ContainerAppRunnerPlugin,
@@ -100,6 +100,7 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     """
     super()._after_reset()
     self.current_commit = None
+    self._deployment_source_error = None
     self._deployment_git_captured = False
     self.branch = None
     self.repo_url = None
@@ -220,10 +221,9 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     A worker is never bound to the image it was started with.
 
     Its image (for example `node:22`) is only the base on which the repository is cloned and built;
-    the application is the source code. What a tracked worker must restore exactly is its Git commit,
-    which stays pinned. The id of the base image exists only in the Docker store that pulled it: when
-    the node's own container is replaced that store can be empty, and a worker that insisted on the
-    old id would never start again. So the base image follows `IMAGE_PULL_POLICY` like that of an
+    the application is the source code. A pinned worker restores its requested Git commit. The base
+    image id exists only in the Docker store that pulled it. Replacing the node's own container can
+    empty that store and make the old id unavailable. So the base image follows `IMAGE_PULL_POLICY` like that of an
     untracked worker, and its id is recorded for information only.
 
     Returns
@@ -241,10 +241,18 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     # The base image is pulled again when it is missing; the pinned Git commit is what is restored.
     return False
 
+  def _deployment_git_pin(self):
+    if self._deployment_source_mode == "pinned":
+      commit = self.cfg_vcs_data.get("COMMIT")
+      if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("Pinned workers require a complete Git commit")
+      return commit
+    return self._get_pinned_deployment_artifacts().get("git_commit")
+
   def _build_git_clone_command(self, repo_path):
     repo_url = shlex.quote(self.repo_url)
     repo_path = shlex.quote(repo_path)
-    commit = self._get_pinned_deployment_artifacts().get("git_commit")
+    commit = self._deployment_git_pin()
     if commit:
       # A moved branch must never change the source restored for this revision.
       return (f"git clone --no-checkout {repo_url} {repo_path} && "
@@ -257,15 +265,19 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       return f"git clone --branch {branch} --single-branch {repo_url} {repo_path}"
     return f"git clone {repo_url} {repo_path}"
 
-  def _confirm_app_readiness(self):
+  def _capture_checkout(self):
     if getattr(self, "_deployment_git_captured", False):
-      return super()._confirm_app_readiness()
+      return True
     try:
       result = self.container.exec_run(
         ["timeout", "5", "git", "-C", REPO_CLONE_PATH, "rev-parse", "HEAD"],
         stdout=True, stderr=True,
       )
       if result.exit_code != 0:
+        if self._deployment_source_mode == "following" and not self.cfg_setup_repo:
+          # Pre-baked or mounted source may lack .git. There is no commit to report.
+          self._deployment_git_captured = True
+          return True
         # The clone/build command may still be running when a permissive generic
         # health mode first reports readiness. Keep waiting for the source proof.
         self._app_ready = False
@@ -274,19 +286,59 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise RuntimeError("The running source revision is unavailable")
       artifacts = self._get_pinned_deployment_artifacts()
-      if artifacts.get("git_commit") and artifacts["git_commit"] != commit:
+      requested = self._deployment_git_pin()
+      if requested and requested != commit:
         raise RuntimeError("The running source does not match its immutable binding")
       artifacts.update(self.get_deployment_runtime_artifacts())
       artifacts["git_commit"] = commit
       self._save_deployment_artifacts(artifacts)
+      self.current_commit = commit  # Subsequent checks compare with the actual checkout.
       self._deployment_git_captured = True
-      return super()._confirm_app_readiness()
+      return True
     except Exception:
       self._app_ready = False
       self.set_plugin_ready(False)
       if self._deployment_tracks_runtime():
         self.report_deployment_status("failed", error_code="WORKLOAD_START_FAILED")
       return False
+
+  def _stream_deployment_exec(self, execution_id, output, stop_event):
+    # The clone is a separate Docker exec. No user build command can race observation of its HEAD.
+    succeeded = super()._stream_deployment_exec(execution_id, output, stop_event)
+    if (succeeded and self._deployment_source_mode in ("following", "pinned")
+        and not self._deployment_git_captured and not stop_event.is_set()):
+      if self._capture_checkout():
+        self._commands_started = False  # Let the plugin thread issue the build on its next tick.
+      else:
+        self._report_exec_failure()
+
+  def _confirm_app_readiness(self):
+    if not self._capture_checkout():
+      return False
+    return super()._confirm_app_readiness()
+
+  def _is_app_ready(self):
+    if self._deployment_source_mode in ("following", "pinned") and (
+        not getattr(self, "_build_dispatched", False) or getattr(self, "_commands_failed", False)):
+      # A completed clone, or a failed build, cannot satisfy even a delay-only health check.
+      return False
+    return super()._is_app_ready()
+
+  def start_container(self):
+    # Starts after a volume sync/reset also need a fresh Git observation.
+    self._deployment_git_captured = False
+    self._build_dispatched = False
+    return super().start_container()
+
+  def _check_stopped_source(self):
+    if not self._repo_configured:
+      self._ensure_repo_state()
+      return False
+    if self._check_git_updates(self.time()):
+      self._restart_container(StopReason.EXTERNAL_UPDATE)
+      return True
+    # A failed build retains its checkout even if its container exits or the restart budget is unlimited.
+    return getattr(self, "_commands_failed", False) or super()._check_stopped_source()
 
   def _collect_exec_commands(self):
     """
@@ -313,15 +365,18 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       return []
 
     repo_path = REPO_CLONE_PATH
-    commands = [
-      self._build_git_bootstrap_command()
-    ]
+    source_mode = self._deployment_source_mode
+    build = [f"cd {repo_path} && {cmd}" for cmd in base_commands]
+    if source_mode in ("following", "pinned") and self._deployment_git_captured:
+      self._build_dispatched = True
+      return build
+    commands = [self._build_git_bootstrap_command()]
+    # With an externally prepared checkout, the bootstrap still enables HEAD validation.
     if self.cfg_setup_repo:
       commands.append(f"rm -rf {repo_path}")
       commands.append(self._build_git_clone_command(repo_path))
-    # endif
-    # last_commit = commit
-    commands.extend([f"cd {repo_path} && {cmd}" for cmd in base_commands])
+    if source_mode not in ("following", "pinned"):
+      commands.extend(build)  # Catalogue and legacy workers retain their existing single exec.
     return commands
 
   # --- Monitoring ------------------------------------------------------------
@@ -357,7 +412,11 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       StopReason.EXTERNAL_UPDATE if a new commit was detected and restart is required,
       None otherwise.
     """
-    if self._deployment_tracks_runtime():
+    mode = self._deployment_source_mode
+    if mode == "pinned" or (mode in ("service", None) and self._deployment_tracks_runtime()):
+      return None
+    if mode == "following" and not self.cfg_setup_repo:
+      # Restarting on a branch change cannot update a checkout managed outside the runner.
       return None
     if not current_time:
       current_time = self.time()
@@ -368,14 +427,21 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
 
     self._last_git_check = current_time
     previous_commit = self.current_commit
-    latest_commit = self._get_latest_commit()
+    if mode == "following" and not self.branch:
+      self._set_default_branch()  # The repository metadata may have been unavailable during startup.
+    latest_commit = self._get_latest_commit() if self.branch else None
 
+    if mode == "following":
+      # Failure to read the branch is independent of workload health. Check it again next interval.
+      self._deployment_source_error = None if latest_commit else "SOURCE_UNREACHABLE"
     if not latest_commit:
       return None
 
-    if previous_commit and latest_commit != previous_commit:
+    if (previous_commit and latest_commit != previous_commit) or (
+        not previous_commit and getattr(self, "_commands_failed", False)):
+      # When both the first lookup and the clone failed, the first readable commit permits a retry.
       self.P(
-        f"New commit detected ({latest_commit[:7]} != {previous_commit[:7]}). Restart required.",
+        f"New branch head {latest_commit[:7]}. Restart required.",
         color='y',
       )
       return StopReason.EXTERNAL_UPDATE  # Git update triggers external update restart
@@ -422,14 +488,20 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
 
     self._configure_repo_url()
     artifacts = self._get_pinned_deployment_artifacts()
-    if artifacts.get("git_commit"):
+    if self._deployment_git_pin():
       self._repo_configured = True
       return
-    if getattr(self, "cfg_deeploy_runtime_artifacts", None) is not None:
+    following = self._deployment_source_mode == "following"
+    if following and not self.cfg_setup_repo:
+      # The existing /app tree is authoritative when Git setup is disabled.
+      self.branch = self.cfg_vcs_data.get("BRANCH") or self.branch
+      self._repo_configured = True
+      return
+    if not following and getattr(self, "cfg_deeploy_runtime_artifacts", None) is not None:
       raise ValueError("Restoring a worker requires its exact previous Git commit")
     self._set_default_branch()
 
-    latest_commit = self._get_latest_commit()
+    latest_commit = self._get_latest_commit() if self.branch else None
     self._last_git_check = self.time()
 
     if latest_commit:
@@ -437,7 +509,10 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     else:
       self.P("Unable to determine latest commit during initialization", color='y')
 
-    if self._deployment_tracks_runtime():
+    if following:
+      self.current_commit = latest_commit  # Baseline for a failed clone until its actual checkout is available.
+      self._deployment_source_error = None if latest_commit else "SOURCE_UNREACHABLE"
+    elif self._deployment_tracks_runtime():
       if not isinstance(latest_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", latest_commit):
         raise ValueError("The deployment Git commit could not be resolved")
       artifacts["git_commit"] = latest_commit
@@ -513,19 +588,20 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
 
     self.branch = repo_branch or self.branch
 
-    if repo_owner and repo_name and repo_branch is None:
+    if repo_owner and repo_name and not self.branch:
       try:
         _, data = self._get_latest_commit(return_data=True)
         if data is not None:
-          default_branch = data.get('default_branch') or data.get('name')
+          default_branch = data.get('default_branch')  # On a repository response, 'name' names the repo.
           if default_branch:
             self.branch = default_branch
             self.P(f"Default branch for {repo_owner}/{repo_name} is '{self.branch}'", color='y')
       except Exception as exc:
         self.P(f"[WARN] Could not determine default branch: {exc}")
 
-    if not self.branch:
+    if not self.branch and self._deployment_source_mode != "following":
       self.branch = repo_branch or "main"
+    # Following workers leave an unknown branch unset: Git clones the remote default, even when it is not main.
     return
 
   def _get_latest_commit(self, return_data=False):
@@ -541,7 +617,7 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     if self.branch is None:
       api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}"
     else:
-      api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/branches/{self.branch}"
+      api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/branches/{quote(self.branch, safe='')}"
 
     headers = {"Authorization": f"token {token}"} if token else {}
 
@@ -555,7 +631,10 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       if resp.status_code == 200:
         data = resp.json()
         latest_sha = data.get("commit", {}).get("sha", None)
-        if latest_sha:
+        if self._deployment_source_mode == "following" and (
+            not isinstance(latest_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", latest_sha)):
+          latest_sha = None  # An incomplete GitHub response gives no evidence that the branch moved.
+        if latest_sha and self._deployment_source_mode != "following":
           self.current_commit = latest_sha
         if return_data:
           return latest_sha, data

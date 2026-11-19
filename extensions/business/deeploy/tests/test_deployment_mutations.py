@@ -133,6 +133,20 @@ class DeploymentMutationTests(unittest.TestCase):
     self.assertEqual(plugin.current["B"]["PLUGINS"][0]["INSTANCES"][0]["ENV"], {"SECRET": "__R1_DAUTH_SECRET__", "NODE_VALUE": "B"})
     self.assertEqual(plugin.commands, [])
 
+  def test_scale_up_preserves_source_selection_for_new_instance_ids(self):
+    for pin in ({}, {"PINNED_VERSION": True, "IMAGE_DIGEST": "sha256:" + "a" * 64}):
+      plugin = Mutations()
+      for config in [plugin.pipeline, *plugin.current.values()]:
+        runner = config["PLUGINS"][0]
+        runner["SIGNATURE"] = "CONTAINER_APP_RUNNER"
+        runner["INSTANCES"][0].update(pin, DEEPLOY_RUNTIME_ARTIFACTS={"image_id": "old"})
+      plugin._admit_scale_up_operation({"request_id": "scale", "job_id": 7, "expected_revision": 4},
+                                      {"escrow_owner": "owner"}, ["C"])
+      for config in plugin.captured_scale["configs"].values():
+        instance = config["PLUGINS"][0]["INSTANCES"][0]
+        self.assertEqual({key: instance[key] for key in ("PINNED_VERSION", "IMAGE_DIGEST") if key in instance}, pin)
+        self.assertNotIn("DEEPLOY_RUNTIME_ARTIFACTS", instance)
+
   def test_real_managed_scale_preparation_shares_one_new_ca_across_all_nodes(self):
     from extensions.business.deeploy.tests.support import make_deeploy_plugin
     plugin = Mutations()
