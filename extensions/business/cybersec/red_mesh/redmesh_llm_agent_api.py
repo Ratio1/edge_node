@@ -104,8 +104,11 @@ _CONFIG = {
   "DEFAULT_MAX_TOKENS": 1024,
   "DEFAULT_TOP_P": 1.0,
 
-  # HTTP timeouts
-  "REQUEST_TIMEOUT_SECONDS": 120,
+  # HTTP timeouts. RM-217: both stay above the Pentester API's LOCAL_STRUCTURED_CHUNK_TIMEOUT
+  # (270 s), or this API gives up before the chunk call does. REQUEST_TIMEOUT is the HTTP front
+  # (504 after it; naeural_core default 120), REQUEST_TIMEOUT_SECONDS the call to the model.
+  "REQUEST_TIMEOUT": 300,
+  "REQUEST_TIMEOUT_SECONDS": 300,
 
   # Debug/logging
   "REDMESH_VERBOSE": 10,
