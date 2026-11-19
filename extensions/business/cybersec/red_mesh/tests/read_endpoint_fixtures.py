@@ -148,7 +148,8 @@ def read_endpoint_fixture(*, bound=True, archived=True, role="tenant_admin"):
     owner = SimpleNamespace(cfg_instance_id=store.cfg_instance_id, cfg_tenancy_namespace="deployment",
       cfg_chainstore_peers=[],
       chainstore_hget=store.chainstore_hget, chainstore_hgetall=store.chainstore_hgetall,
-      chainstore_hset=store.chainstore_hset, r1fs=SimpleNamespace(get_json=get_json),
+      chainstore_hkeys=store.chainstore_hkeys, chainstore_hset=store.chainstore_hset,
+      r1fs=SimpleNamespace(get_json=get_json),
       scan_jobs={"job-1": {}}, model_test_jobs={}, time=lambda: 100.0,
       _audit_log=deque([{"job_id": "foreign", "event": "private"}, {"job_id": "job-1", "event": "visible"}]))
     owner._normalize_job_record = lambda key, record, **kwargs: Plugin._normalize_job_record(owner, key, record, **kwargs)
