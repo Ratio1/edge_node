@@ -21,6 +21,7 @@ from ratio1.const.base import BCct, dAuth
 from extensions.business.container_apps.container_utils import configured_image_ref, image_repository
 from extensions.utils.per_node_config import iter_overlays, normalize_config, PER_NODE_CONFIG_KEYS
 from .selected_secrets import inherit_selections
+from .relink_placement import relink_configs, relink_pipeline
 
 from extensions.business.dauth.dauth_registry import get_dauth_registry_internal_peers
 # The worker signature tells the restoration gate which runtime binding an instance needs.
@@ -68,13 +69,50 @@ def required_instances(config):
   ]
 
 
-def report_is_ready(report, config, pins=None):
+def report_confirms_retirement(report, expected):
+  """Check the worker's stop evidence against the planned instance identities.
+
+  A worker can acknowledge an absent pipeline with an empty aggregate report.
+  A relink needs evidence for each previously deployed instance.
+
+  Parameters
+  ----------
+  report : dict
+    Authenticated node report for the retirement attempt.
+  expected : list
+    Signature and instance ID pairs from the coordinator's signed operation.
+
+  Returns
+  -------
+  bool
+    True when the complete set of expected instances individually stopped.
+
+  Examples
+  --------
+  >>> report_confirms_retirement({"status": "stopped", "instances": []}, [("APP", "one")])
+  False
+  """
+  items = report.get("instances")
+  if report.get("status") != "stopped" or not expected or not isinstance(items, list) or len(items) != len(expected):
+    return False  # An empty or partial report cannot account for the prior placement.
+  identities = set()
+  for item in items:
+    if not isinstance(item, dict) or item.get("status") != "stopped":
+      return False  # The aggregate cannot override an individual instance.
+    if not isinstance(item.get("signature"), str) or not isinstance(item.get("instance_id"), str):
+      return False  # Reject malformed signed observations before accessing their identity.
+    identities.add((item["signature"], item["instance_id"]))
+  return len(identities) == len(items) and identities == {tuple(pair) for pair in expected}
+
+
+def report_is_ready(report, config, pins=None, restore_bindings=None):
   """Require an explicit ready report for every planned plugin instance.
 
   Nodes publish on changes in status or version. Callers pair the latest
   report with NetMon liveness because a healthy workload can stay unchanged.
   """
-  return node_rollout_state(config, report, online=True, deadline=False, pins=pins) == "ready"
+  return node_rollout_state(config, report, online=True, deadline=False, pins=pins,
+                            restore_bindings=restore_bindings) == "ready"
 
 
 def pinned_sources(config):
@@ -192,7 +230,7 @@ def validate_source_pins(configs):
           raise ValueError("A plugin instance must use the same source pin on every node.")
 
 
-def node_rollout_state(config, report, online, deadline, pins=None):
+def node_rollout_state(config, report, online, deadline, pins=None, allow_waiting_for_source=True, restore_bindings=None):
   """Decide whether one node permits a revision to take effect.
 
   Each planned instance needs its own evidence. A lifecycle error always wins
@@ -206,6 +244,10 @@ def node_rollout_state(config, report, online, deadline, pins=None):
     Current node liveness and whether the readiness deadline has passed.
   pins : dict, optional
     Signed projection of the plan when status polling has only the planned instance identities.
+  allow_waiting_for_source : bool, optional
+    Whether a source-following deployment can take effect before it becomes ready.
+  restore_bindings : dict or None, optional
+    The exact signed stop artifacts for this worker during a repair restore.
 
   Returns
   -------
@@ -243,9 +285,16 @@ def node_rollout_state(config, report, online, deadline, pins=None):
     if pin_key in pins:
       mode = "pinned"  # The local-only polling projection is signed by the coordinator.
     reported_mode = item.get("source_mode")
-    following = mode == reported_mode == "following"
+    following = allow_waiting_for_source and mode == reported_mode == "following"
     status = item.get("status")
     legacy = mode in ("following", "pinned") and reported_mode is None
+    if restore_bindings is not None and instance is not None and status == "ready":
+      # A repair restore binds each worker to its own stop, even if the configured branch is shared.
+      commit = (restore_bindings.get(pin_key) or {}).get("git_commit")
+      artifacts = item.get("runtime_artifacts")
+      if (not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)
+          or not isinstance(artifacts, dict) or artifacts.get("git_commit") != commit):
+        return "failed"
     if mode == "pinned" and status == "ready":
       if legacy:
         return "legacy_failed"  # Older nodes bind their first start, which may differ from the request.
@@ -279,21 +328,6 @@ def node_rollout_state(config, report, online, deadline, pins=None):
   if kept:
     return "kept"
   return "ready" if report.get("status") == "ready" and online else "pending"
-
-
-def replace_nodes(value, node_aliases):
-  """Rename node addresses used as dict keys or whole string values.
-
-  A relinked node keeps its job, so everything naming the old address
-  (placement, peers, per-node settings and their secret paths) moves to the new one.
-  """
-  if isinstance(value, dict):
-    return {node_aliases.get(key, key): replace_nodes(item, node_aliases) for key, item in value.items()}
-  if isinstance(value, list):
-    return [replace_nodes(item, node_aliases) for item in value]
-  if isinstance(value, str):
-    return node_aliases.get(value, value)
-  return value
 
 
 def list_order_differs(stored, running):
@@ -371,6 +405,7 @@ class _DeploymentOperationsMixin:
     # Operation id -> (failures in a row, time of the last one, seconds to wait) after a failed dAuth custody
     # call: the worker waits that long before it calls the same dAuth server again, instead of every 2 s.
     self._custody_retry = {}
+    self._repair_inspections = {}  # Short-lived admission challenges keyed by the original operation.
     self._deployment_plan_cache_lock = threading.Lock()
     self._deployment_operations_event = threading.Event()
     self._deployment_operations_stop = threading.Event()
@@ -554,6 +589,8 @@ class _DeploymentOperationsMixin:
     >>> plugin._save_operation(operation)["sequence"]  # nothing changed: no write
     1
     """
+    if operation.get("mutation") == "same_host_repair_v1" and phase not in (None, "completed"):
+      phase = "repair_v1_" + phase.removeprefix("repair_v1_")  # Older coordinators cannot dispatch this phase.
     if operation["coordinator"] != self.bc.address:
       raise ValueError("Only the accepting oracle can advance this operation.")
     # Same phase, no new event, same content as the stored snapshot: nothing durable changed.
@@ -659,7 +696,7 @@ class _DeploymentOperationsMixin:
            for record in self._operation_records().values()):
       raise DeploymentConflictError("Deployment or recovery is active; wait before changing this job.")
 
-  def _find_request_operation(self, request, owner, kind):
+  def _find_request_operation(self, request, owner, kind, repair_parent=None):
     """Resolve already observed idempotent requests and known job conflicts."""
     request_id = request.get("request_id")
     if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
@@ -674,7 +711,7 @@ class _DeploymentOperationsMixin:
         if record["request_hash"] != digest:
           raise DeploymentConflictError("request_id was already used for different deployment input.")
         return record
-    if any(record["phase"] != "completed" for record in records):
+    if any(record["phase"] != "completed" and (not repair_parent or record["operation_id"] != repair_parent) for record in records):
       raise DeploymentConflictError("A deployment operation or recovery is already active for this job.")
     return None
 
@@ -739,10 +776,14 @@ class _DeploymentOperationsMixin:
     """
     try:
       # The signed custody call, unchanged; only its RuntimeError is given a type of its own below.
-      return self.bc.reconcile_dauth_job_secrets(dict(
+      result = self.bc.reconcile_dauth_job_secrets(dict(
         job_id=str(operation["job_id"]), operation=copy.deepcopy(operation),
         action=action, **payload,
       ))
+      if operation.get("mutation") == "same_host_repair_v1" and (
+          type(result.get("repair_protocol")) is not int or result["repair_protocol"] != 1):
+        raise DeploymentCustodyError("The custodian did not confirm same-host repair support.")
+      return result
     except RuntimeError as exc:
       # The SDK raises RuntimeError when the request could not be signed, when the call failed or timed out
       # (dAuth may still have received it), when dAuth answered with an HTTP error or refused it (for any
@@ -761,7 +802,7 @@ class _DeploymentOperationsMixin:
       fragments = self._merge_deeploy_dauth_secret_fragments(fragments, values, reject_conflicts=True)
     return redacted, fragments
 
-  def _previous_deployment_configs(self, pipeline):
+  def _previous_deployment_configs(self, pipeline, reports=None):
     """Load each target node's exact config of the stored revision from R1FS.
 
     A revision committed by a deployment operation names its plan in the job's
@@ -776,6 +817,8 @@ class _DeploymentOperationsMixin:
     ----------
     pipeline : dict
       The job's stored copy in R1FS, with its original node names.
+    reports : dict, optional
+      Job reports already observed for this admission. An empty observation is valid.
     """
     specs = pipeline["DEEPLOY_SPECS"]
     nodes = specs.get("current_target_nodes", [])
@@ -787,8 +830,10 @@ class _DeploymentOperationsMixin:
       if not isinstance(configs, dict) or set(configs) != set(nodes):
         raise ValueError("The stored deployment plan is unavailable.")
     else:
+      if reports is None:  # Standalone mutation planning has no placement observation yet.
+        reports = self._job_reports(pipeline)
       if any(required_instances(config) != required_instances(pipeline) or list_order_differs(pipeline, config)
-             for reports in self._job_reports(pipeline).values() for config in reports):
+             for node_configs in reports.values() for config in node_configs):
         raise ValueError("A node runs this job differently from its stored copy; repair the stored job first.")
       configs = {node: pipeline for node in nodes}
     configs = {node: copy.deepcopy(configs[node]) for node in nodes}
@@ -821,7 +866,7 @@ class _DeploymentOperationsMixin:
 
   def _admit_prepared_deployment(self, request, auth_result, app_id, configs,
                                  prior_pipeline, is_create, mutation=None,
-                                 restore_owner=None, identity_aliases=None, node_aliases=None):
+                                 restore_owner=None, identity_aliases=None, node_aliases=None, repair=None):
     """Save exact redacted plans and secret revisions before accepting work.
 
     Parameters
@@ -858,11 +903,22 @@ class _DeploymentOperationsMixin:
         raise ValueError("An update requires a recoverable previous configuration.")
       if type(request.get("expected_revision")) is not int or request["expected_revision"] != previous_revision:
         raise DeploymentConflictError("The deployment revision changed; refresh before updating.")
+    if repair is not None:
+      from .job_repair import worker
+      approved_id = repair["proposal"]["instance_id"]
+      if (set(configs) != set(repair["aliases"].values()) or any(
+          worker(config)["INSTANCE_ID"] != approved_id or config.get("NAME") != app_id
+          or config.get("DEEPLOY_SPECS", {}).get("current_target_nodes") != list(repair["aliases"].values())
+          for config in configs.values())):
+        raise ValueError("The prepared update changed the approved worker identity or placement.")
+      prior_pipeline = repair["prior"]  # Canonical content plus only the reviewed permutations.
+      node_aliases = repair["aliases"]
     stored_pipeline = prior_pipeline
-    prior_pipeline = replace_nodes(prior_pipeline, node_aliases or {})
+    prior_pipeline = relink_pipeline(prior_pipeline, node_aliases or {})
     operation_id = hashlib.sha256(self.bc.address.encode()).hexdigest()[:16] + "-" + uuid.uuid4().hex
     revision = self._next_deployment_revision(job_id, previous_revision)
-    secret_revision = operation_id + ":deploy"
+    revision_prefix = operation_id + (":repair_v1" if repair else "")
+    secret_revision = revision_prefix + ":deploy"
     configs, new_secrets = self._prepare_deployment_secret_configs(configs, prior_pipeline, identity_aliases)
     for config in configs.values():
       config.setdefault("DEEPLOY_SPECS", {}).update(
@@ -880,23 +936,27 @@ class _DeploymentOperationsMixin:
       previous_nodes = prior_pipeline.get("DEEPLOY_SPECS", {}).get("current_target_nodes", [])
       if not previous_nodes:
         raise ValueError("The previous revision has no recoverable node placement.")
-      previous_secret_revision = operation_id + ":restore"
+      previous_secret_revision = revision_prefix + ":restore"
       prior_secret_revision = prior_pipeline.get("DEEPLOY_SPECS", {}).get("secret_revision")
       previous_secret_revision_to_release = prior_secret_revision
       previous_operation_id = prior_secret_revision.split(":", 1)[0] if prior_secret_revision else None
-      # A node leaving the placement that no longer reports the job (e.g. offline)
-      # is skipped: there is nothing to stop or restore on it.
-      reports = self._job_reports(prior_pipeline)
-      skipped = {node for node in set(previous_nodes) - set(configs) if not reports.get(node)}
-      previous_configs = {
-        node: config for node, config in
-        replace_nodes(self._previous_deployment_configs(stored_pipeline), node_aliases or {}).items()
-        if node not in skipped
-      }
+      if repair:
+        # One common legacy configuration; per-node overlays and multiple instances were excluded by assessment.
+        previous_configs = {node: copy.deepcopy(prior_pipeline) for node in previous_nodes}
+      else:
+        reports = self._job_reports(stored_pipeline)  # Placement and legacy order validation share one observation.
+        previous_configs = relink_configs(self._previous_deployment_configs(stored_pipeline, reports), node_aliases or {})
+        # A relink also retires the workers it retains. One missing peer can strand the whole job after a partial stop.
+        must_report = previous_nodes if mutation == "node_relink" else set(previous_nodes) - set(configs)
+        if any(not reports.get(node) for node in must_report):
+          if mutation == "node_relink":
+            raise ValueError("A previous target does not report its workload at the current address. "
+                             "Automatic relink requires an observed workload on every previous target.")
+          raise ValueError("A previous target no longer reports this job. Restore connectivity or resolve its relink before updating.")
       previous_configs, previous_new_secrets = self._prepare_deployment_secret_configs(
         previous_configs, prior_pipeline,
       )
-      if set(previous_configs) != set(previous_nodes) - skipped or any(
+      if set(previous_configs) != set(previous_nodes) or any(
         config.get("NAME") != app_id or
         str(config.get("DEEPLOY_SPECS", {}).get("job_id")) != str(job_id) or
         config.get("DEEPLOY_SPECS", {}).get("revision", 0) != previous_revision or
@@ -913,6 +973,9 @@ class _DeploymentOperationsMixin:
           revision=previous_revision, secret_revision=previous_secret_revision,
         )
     plan = dict(configs=configs, previous_configs=previous_configs)
+    if repair:
+      # Keep signed historic and fresh receipts in the immutable plan under their actual signer.
+      plan["repair_evidence"] = dict(stopped=repair["stopped"], inspections=repair["inspections"], seals=repair["seals"])
     plan_cid = self.r1fs.add_json(plan, nonce=42, fn="deployment-plan.json", show_logs=False)
     if not plan_cid:
       raise RuntimeError("Could not persist deployment execution plan.")
@@ -944,10 +1007,20 @@ class _DeploymentOperationsMixin:
     # The recovery owner must exist before any plaintext revision is staged.
     # If admission stops here, the worker either confirms complete preparation
     # or revokes its staged references without touching the running revision.
+    if repair:
+      operation.update(phase="repair_v1_preparing", repair_parent=repair["proposal"]["parent"],
+                       previous_pipeline_cid=repair["proposal"]["pipeline_cid"],
+                       repair_aliases=list(map(list, repair["aliases"].items())), repair_licenses=repair["licenses"],
+                       rotate_main_tunnel=repair["rotate_main_tunnel"])
     finished = threading.Event()
     self._deployment_preparations[operation_id] = finished
     try:
-      self._save_operation(operation, message="Preparing durable deployment data.")
+      if repair:
+        existing = self._hold_repair_parent(operation, repair)
+        if existing:
+          return self._accepted_operation_response(existing)
+      else:
+        self._save_operation(operation, message="Preparing durable deployment data.")
       self._deployment_secret_request(
         "prepare", operation, new_secrets=new_secrets,
         previous_new_secrets=previous_new_secrets if previous_configs else None,
@@ -981,9 +1054,10 @@ class _DeploymentOperationsMixin:
         self._deployment_plans[cid] = plan
     return copy.deepcopy(plan)
 
-  def _node_is_ready(self, node, report, config, pins=None):
+  def _node_is_ready(self, node, report, config, pins=None, restore_bindings=None):
     """Pair the attempt's one-time ready report with current NetMon liveness."""
-    return report_is_ready(report, config, pins=pins) and self._netmon_node_is_online_for_control(node)
+    return (report_is_ready(report, config, pins=pins, restore_bindings=restore_bindings)
+            and self._netmon_node_is_online_for_control(node))
 
   def _node_operation_reports(self, operation, attempt):
     """Read newest signed reports from the planned nodes for this attempt."""
@@ -995,7 +1069,7 @@ class _DeploymentOperationsMixin:
         continue
       if report.get("app_id") != operation["app_id"]:
         continue
-      if report.get("attempt") != attempt or report.get("revision") != revision:
+      if report.get("attempt") != attempt or type(report.get("revision")) is not int or report["revision"] != revision:
         continue
       node = report.get("node_addr")
       if node not in nodes or report.get("coordinator") != operation["coordinator"]:
@@ -1007,17 +1081,26 @@ class _DeploymentOperationsMixin:
         continue
       if node not in reports or reports[node]["sequence"] < sequence:
         reports[node] = report
+    if attempt == "retire" and operation.get("mutation") in ("node_relink", "same_host_repair_v1"):
+      # Filter after selecting the newest signature so an older stop cannot hide later contradictory evidence.
+      reports = {node: report for node, report in reports.items() if report.get("status") != "stopped"
+                 or report_confirms_retirement(report, operation["previous_instances"].get(node))}
     return reports
 
   def _operation_metadata(self, operation, attempt, action):
     """Bind a node command to its coordinator, attempt, and content revision."""
-    return dict(
+    metadata = dict(
       operation_id=operation["operation_id"], attempt=attempt, action=action,
       revision=operation["target_revision"] if attempt == "deploy" else operation["previous_revision"],
       coordinator=operation["coordinator"], peers=self._operation_peers(),
       job_id=operation["job_id"],
       expected_previous_operation_id=operation.get("previous_operation_id") if attempt == "retire" else None,
     )
+    if action == "start" and operation.get("mutation") == "same_host_repair_v1":
+      # Both workers must fence legacy writes, including one stopped by the original coordinator operation.
+      metadata.update(action="start_repaired_worker_v1", parent_operation_id=operation["repair_parent"]["operation_id"],
+                      previous_revision=operation["previous_revision"])
+    return metadata
 
   def _send_operation_commands(self, operation, configs, attempt, action, reports):
     """Retry scoped commands while recording intent before transport dispatch.
@@ -1090,11 +1173,14 @@ class _DeploymentOperationsMixin:
     >>> len(plugin.commands)  # nothing was sent again
     3
     """
+    check_placement = action == "start" and operation.get("mutation") == "same_host_repair_v1"
+    repair_restore = check_placement and attempt == "restore"
     for node, config in configs.items():
       report = reports.get(node, {})
       if action in ("stop", "retire") and report.get("status") == "stopped":
         continue
-      if action == "start" and report_is_ready(report, config):
+      restore_bindings = operation.get("retired_runtime", {}).get(node, {}) if repair_restore else None
+      if action == "start" and report_is_ready(report, config, restore_bindings=restore_bindings):
         continue
       # Resend throttle in process memory, not in the signed snapshot; nodes de-duplicate by operation_id|attempt.
       sent_at = self._operations_sent_at
@@ -1103,6 +1189,10 @@ class _DeploymentOperationsMixin:
       key = "{}|{}|{}|{}".format(operation["operation_id"], attempt, action, node)
       if 0 <= self.time() - sent_at.get(key, 0) < 10:
         continue
+      if check_placement:
+        # One fresh read covers this batch, including starts retried after a coordinator restart.
+        self._recheck_repair_placement(operation)
+        check_placement = False
       if action == "start":
         validate_saved_overlays(config)  # Resumed plans may predate the reserved restoration field.
       # Record the send time in memory only: the save below then finds nothing changed and writes no new
@@ -1140,30 +1230,53 @@ class _DeploymentOperationsMixin:
         return
       self.cmdapi_start_pipeline(config=payload, node_address=node)
 
+  def _advance_serialized_operation(self, operation):
+    """Advance a signed snapshot, fencing superseded retirement at the owning coordinator."""
+    if operation["coordinator"] != self.bc.address or operation["phase"] == "completed":
+      return
+    if operation.get("mutation") == "node_relink" and hasattr(self, "_reconcile_repair_parent"):
+      from .job_repair import HANDOFF_LOCK
+      with HANDOFF_LOCK:
+        current = self._operation_records().get(operation["operation_id"])
+        if not current or current["sequence"] != operation["sequence"] or self._reconcile_repair_parent(current):
+          return  # An HTTP reservation may have completed after this worker took its snapshot.
+        return self._advance_deployment_operation(operation)
+    return self._advance_deployment_operation(operation)
+
   def _advance_deployment_operation(self, operation):
-    """Advance one operation using explicit node evidence and safe recovery."""
+    """Run the existing state machine for the latest eligible operation."""
     if operation["coordinator"] != self.bc.address or operation["phase"] == "completed":
       return
     if operation["kind"] == "delete":
       return self._advance_delete_operation(operation)
-    if operation["phase"] == "preparing" and self.time() >= operation["preparation_deadline"]:
+    repair = operation.get("mutation") == "same_host_repair_v1"
+    if repair and not self._repair_parent_is_held(operation):
+      return  # A crash between reservation writes is repaired from the parent pass.
+    phase = operation["phase"].removeprefix("repair_v1_")
+    if phase == "preparing" and self.time() >= operation["preparation_deadline"]:
+      self._expire_deployment_preparation(operation)
+    elif (repair and phase in ("accepted", "retiring_previous") and not operation.get("retire_challenges")
+          and self.time() >= max(operation["deadline"], operation["preparation_deadline"])):
+      # A repair can safely release its parent only before any STOP challenge was durably recorded.
       self._expire_deployment_preparation(operation)
     self._replicate_operation(operation)
-    if operation["phase"] == "cleaning_up_preparation":
+    if operation["phase"].removeprefix("repair_v1_") == "cleaning_up_preparation":
       self._deployment_secret_request("revoke", operation, active_attempt=None)
       operation["recovery"] = "completed"
       self._save_operation(operation, "completed", "Incomplete deployment preparation cleaned up.")
       return
-    if operation["phase"] == "preparing":
+    if operation["phase"].removeprefix("repair_v1_") == "preparing":
       return self._finish_deployment_preparation(operation)
     plan = self._load_operation_plan(operation)
     configs = plan["configs"]
     reports = self._node_operation_reports(operation, "deploy")
-    phase = operation["phase"]
+    phase = operation["phase"].removeprefix("repair_v1_")
     if phase == "accepted":
       next_phase = "retiring_previous" if operation["kind"] == "update" else "waiting_for_readiness"
       self._save_operation(operation, next_phase, "Preparing target nodes.")
-      phase = operation["phase"]
+      phase = operation["phase"].removeprefix("repair_v1_")
+    if phase == "retiring_previous" and repair:
+      return self._retire_repair_workers(operation, plan)
     if phase == "retiring_previous":
       retired = self._node_operation_reports(operation, "retire")
       if all(retired.get(node, {}).get("status") == "stopped" for node in plan["previous_configs"]):
@@ -1193,12 +1306,14 @@ class _DeploymentOperationsMixin:
       for node, config in active_configs.items():
         pins = pinned_sources(config)
         # A node may go offline between the readiness barrier and publication of the revision.
-        recheck = bool(pins) or any(
+        recheck = repair or bool(pins) or any(
           deployment_source_mode(plugin["SIGNATURE"], config, instance) == "following"
           for plugin in config.get("PLUGINS", []) for instance in plugin.get("INSTANCES", [])
         )
         online = self._netmon_node_is_online_for_control(node) if recheck else True
-        state = node_rollout_state(config, active_reports.get(node), online, expired, pins=pins)
+        restore_bindings = operation.get("retired_runtime", {}).get(node, {}) if repair and restoring else None
+        state = node_rollout_state(config, active_reports.get(node), online, expired, pins=pins,
+                                   allow_waiting_for_source=not repair, restore_bindings=restore_bindings)
         if state in ("failed", "legacy_failed") or (recheck and state not in ("ready", "kept")):
           # Once the revision is published, its remaining secret/metadata writes must still finish.
           pointer = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(operation["job_id"]))
@@ -1208,7 +1323,9 @@ class _DeploymentOperationsMixin:
           break
     if phase == "waiting_for_readiness":
       expired = self.time() >= operation["deadline"]
-      states = {node: node_rollout_state(config, reports.get(node), self._netmon_node_is_online_for_control(node), expired)
+      # Repair keeps the existing all-workers-ready barrier, including for source-following apps.
+      states = {node: node_rollout_state(config, reports.get(node), self._netmon_node_is_online_for_control(node), expired,
+                                         allow_waiting_for_source=not repair)
                 for node, config in configs.items()}
       failed = any(state in ("failed", "legacy_failed") for state in states.values())
       if failed or (expired and any(state in ("pending", "legacy_timeout") for state in states.values())):
@@ -1248,7 +1365,9 @@ class _DeploymentOperationsMixin:
       previous_configs = plan["previous_configs"]
       previous_reports = self._node_operation_reports(operation, "restore")
       expired = self.time() >= operation["restore_deadline"]
-      states = {node: node_rollout_state(config, previous_reports.get(node), self._netmon_node_is_online_for_control(node), expired)
+      states = {node: node_rollout_state(config, previous_reports.get(node), self._netmon_node_is_online_for_control(node), expired,
+                                         allow_waiting_for_source=not repair,
+                                         restore_bindings=operation.get("retired_runtime", {}).get(node, {}) if repair else None)
                 for node, config in previous_configs.items()}
       if all(state in ("ready", "kept") for state in states.values()):
         message = "Previous revision restored and waiting for source." if "kept" in states.values() else "Previous revision is ready on all required nodes."
@@ -1262,6 +1381,8 @@ class _DeploymentOperationsMixin:
     if phase in ("finalizing", "finalizing_recovery"):
       restored = phase == "finalizing_recovery"
       active_configs = plan["previous_configs"] if restored else configs
+      if repair:
+        self._recheck_repair_placement(operation, finalizing=True)  # A placement can change after readiness.
       self._commit_operation_revision(operation, active_configs)
       self._release_unused_secret_revisions(operation, plan, active_attempt="restore" if restored else "deploy")
       applied_outcome = "waiting_for_source" if operation.get("waiting_for_source") else "succeeded"
@@ -1410,7 +1531,10 @@ class _DeploymentOperationsMixin:
         if operation["phase"] != "completed":
           # Unfinished operations are advanced as before; completed ones are no longer skipped outright but
           # get the repair re-send below.
-          self._advance_deployment_operation(operation)
+          if operation.get("mutation") == "node_relink" and hasattr(self, "_reconcile_repair_parent"):
+            self._advance_serialized_operation(operation)
+          else:
+            self._advance_deployment_operation(operation)
         # For 600 s after completion, oracles that missed the final snapshot get it too.
         elif self.time() - operation["updated_at"] < 600:
           # Re-send the final snapshot as repair, throttled to once per 30 s; peers that hold it store nothing,
@@ -1430,16 +1554,17 @@ class _DeploymentOperationsMixin:
         # A preparing operation is not paced: it asks dAuth on every pass until its preparation deadline (created
         # + 120 s), as before, so a dAuth that recovers in the last seconds still gets the deployment accepted.
         # At the deadline it moves to cleanup, which has no deadline; the phase is read after the failed step.
-        if isinstance(exc, DeploymentCustodyError) and operation["phase"] != "preparing":
+        repair_conflict = operation.get("mutation") == "same_host_repair_v1" and isinstance(exc, DeploymentConflictError)
+        if (isinstance(exc, DeploymentCustodyError) or repair_conflict) and operation["phase"].removeprefix("repair_v1_") != "preparing":
           # Custody calls that failed in a row; a pass without an error resets the count (see above).
           failures = pause[0] + 1 if pause else 1
           # Wait 10 s after the first failure and double the wait after each further one, up to 300 s. Before,
           # the same dAuth server was called again on every 2 s pass and its request thread was kept busy.
-          delay = min(10 * 2 ** (failures - 1), 300)
+          delay = min(10 * 2 ** min(failures - 1, 5), 300)
           # Kept in process memory only: after a restart the operation calls dAuth on the first pass.
           self._custody_retry[operation["operation_id"]] = (failures, self.time(), delay)
           # The red line says how many custody calls failed in a row and when the next one is made.
-          retry = " (custody failure {}, next try in {} s)".format(failures, delay)
+          retry = " ({} failure {}, next try in {} s)".format("repair placement" if repair_conflict else "custody", failures, delay)
         self.P("Deployment operation {} (job {}, phase {}) was not advanced and is tried again: {} in {}{}".format(
           operation["operation_id"], operation["job_id"], operation["phase"], type(exc).__name__, path, retry), color="r")
 
@@ -1556,7 +1681,8 @@ class _DeploymentOperationsMixin:
     if not selector and request.get("job_id") is None:
       raise ValueError("operation_id, request_id, or job_id is required.")
     matches = []
-    for record in self._operation_records().values():
+    records = self._operation_records()
+    for record in records.values():
       if record.get("owner", "").lower() != owner.lower():
         continue
       if request.get("operation_id") and record["operation_id"] != request["operation_id"]:
@@ -1585,17 +1711,26 @@ class _DeploymentOperationsMixin:
       return {"status": "synchronizing", "job_id": request.get("job_id"),
               "revision": 0, "observation_stale": True, "poll_after_ms": 2000}
     operation = max(matches, key=lambda record: (record["target_revision"], record["created_at"], record["sequence"]))
-    restoring = operation["phase"] in ("restoring_previous", "finalizing_recovery") or (
+    phase = operation["phase"].removeprefix("repair_v1_")
+    restoring = phase in ("restoring_previous", "finalizing_recovery") or (
       operation["outcome"] == "failed" and operation["kind"] == "update"
       and (operation.get("error") or {}).get("code") != "ADMISSION_PREPARATION_FAILED"
     )
-    attempt = "retire" if operation["kind"] == "delete" or operation["phase"] == "retiring_previous" else "restore" if restoring else "deploy"
+    attempt = "retire" if operation["kind"] == "delete" or phase == "retiring_previous" else "restore" if restoring else "deploy"
     reports = self._node_operation_reports(operation, attempt)
+    if attempt == "retire" and operation.get("mutation") == "same_host_repair_v1":
+      # An already stopped worker owes no second STOP. Display the original signed receipt at its actual signer.
+      parent = records.get(operation["repair_parent"]["operation_id"], {})
+      if (parent.get("repair_child") or {}).get("operation_id") == operation["operation_id"]:
+        for node, receipt in self._node_operation_reports(parent, "retire").items():
+          if report_confirms_retirement(receipt, operation["previous_instances"].get(node)):
+            reports.setdefault(node, receipt)
     deployed_reports = self._node_operation_reports(operation, "deploy") if restoring else reports
     identities = operation["previous_instances"] if attempt != "deploy" else operation["instances"]
     configs = {node: {"PLUGINS": [{"SIGNATURE": signature, "INSTANCES": [{"INSTANCE_ID": instance}]} for signature, instance in values]}
                for node, values in identities.items()}
     pins = operation.get("pinned_sources", {}).get(attempt, {})  # Polling never downloads the private plan.
+    repair_restore = attempt == "restore" and operation.get("mutation") == "same_host_repair_v1"
     now = self.time()
     nodes = []
     for node in dict.fromkeys(operation["nodes"] + operation["previous_nodes"]):
@@ -1606,21 +1741,43 @@ class _DeploymentOperationsMixin:
       if not instances:
         instances = [{"signature": signature, "instance_id": instance_id, "status": "pending"}
                      for signature, instance_id in planned]
+      action = phase
+      if operation["kind"] == "update" and action == "retiring_previous":
+        # Only previous workers owe a retire report. A new target is waiting for that barrier.
+        if node not in identities:
+          action = "waiting_to_start"
+        elif report.get("status") == "stopped":
+          action = "stop_reported"  # Verified for this worker, revision and retirement attempt above.
+        elif operation["coordinator"] == self.bc.address:
+          action = "awaiting_stop_report"
+        else:
+          action = "stop_report_unavailable"  # A replica can lack a report its coordinator already has.
       nodes.append(dict(
         node_id=node, observed_revision=report.get("revision"),
-        ready=node in configs and self._node_is_ready(node, report, configs[node], pins.get(node)),
+        ready=node in configs and self._node_is_ready(
+          node, report, configs[node], pins.get(node),
+          restore_bindings=operation.get("retired_runtime", {}).get(node, {}) if repair_restore else None,
+        ),
         # Replicas can learn later node snapshots after the operation itself has completed.
         report_attempt=report.get("attempt"), report_sequence=report.get("sequence"),
         workload_state=report.get("status", "unknown"),
         updated_at=updated_at, stale=report.get("status") != "stopped" and (
           updated_at is None or not self._netmon_node_is_online_for_control(node)),
         instances=instances, error=copy.deepcopy(report.get("error")),
-        action=operation["phase"],
+        action=action,
       ))
     fields = ("operation_id", "request_id", "job_id", "app_id", "kind", "mutation", "sequence",
               "target_revision", "previous_revision", "phase", "outcome", "recovery",
               "coordinator", "created_at", "updated_at", "error")
     result = {key: copy.deepcopy(operation.get(key)) for key in fields}
+    if operation.get("mutation") == "same_host_repair_v1":
+      # The prior address remains available for audit; its successor alone occupies the paid slot.
+      result["relinked_nodes"] = [{"previous": old, "current": current} for old, current in operation["repair_aliases"]]
+      if phase != "completed" and operation.get("repair_block"):
+        # Expose the current hold without overwriting the original rollout failure in the operation.
+        result.update(recovery="blocked", error=copy.deepcopy(operation["repair_block"]))
+    if operation.get("repair_child"):
+      result["repair_child_operation_id"] = operation["repair_child"]["operation_id"]
     limit = request.get("events_limit", 64)
     if type(limit) is not int or not 1 <= limit <= 128:
       raise ValueError("events_limit must be between 1 and 128.")
@@ -1629,7 +1786,7 @@ class _DeploymentOperationsMixin:
       raise ValueError("after_event_cursor must be a non-negative integer.")
     events = [event for event in operation["events"] if event["sequence"] > after]
     result.update(
-      status=operation["phase"], nodes=nodes, target_nodes=len(configs),
+      phase=phase, status=phase, nodes=nodes, target_nodes=len(configs),
       ready_nodes=sum(node["ready"] for node in nodes),
       # Snapshots now change only with state: an old one is stale only while its coordinator is away.
       observation_stale=operation["phase"] != "completed" and now - operation["updated_at"] > 30

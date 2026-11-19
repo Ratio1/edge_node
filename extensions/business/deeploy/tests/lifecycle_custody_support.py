@@ -179,6 +179,7 @@ class Node:
     # The operations worker's custody waits, as _init_deployment_operations creates them; without it a pass of
     # _reconcile_coordinator_operations would fail on the missing field instead of pacing a failed custody call.
     self._custody_retry = {}
+    self._repair_inspections = {}
     self._deployment_operations_event = threading.Event()
     self._deployment_operations_stop = threading.Event()
     self._get_response = lambda value: value

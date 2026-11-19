@@ -148,6 +148,28 @@ A duplicate can return the same operation with its current status. Transport suc
 
 Rejected admissions create no accepted deployment and trigger no workload commands. After admission, preparation and execution failures are recorded on the operation and visible through polling.
 
+### Same-host recovery of a blocked legacy relink
+
+The CSP uses **Edit → Review → Update job** on the original coordinator. Version 1 covers a legacy untracked Git worker with one instance, common previous settings and no persistent volumes, sync, per-node overrides or pending one-shot command. The prior worker must configure its Git checkout so rollback can select the verified commit. A signed partially retired relink, confirmed license links, a paid slot for each placement, at least one surviving worker and a verifiable prior stop are required. Each historical address remains visible separately from its paid successor.
+
+| Entry point | Contract |
+| --- | --- |
+| `POST /get_job_repair_preview` | A v3 wallet signature in the **get job repair preview** domain covers the positive integer `job_id`, original `coordinator` and hexadecimal epoch-milliseconds `nonce`. The normal 12-hour wallet nonce expiry applies. The current escrow owner receives `status=reviewable` and a proposal, or `status=blocked` and a reason. Preview reads local worker observations, the canonical CID and current chain registrations. It sends no worker command. |
+| `POST /repair_update_pipeline` | A v3 wallet-signed **repair update pipeline** request with the ordinary edit fields, stable request ID, expected revision, and `repair={proposal,same_host:true,rotate_main_tunnel:boolean}`. The signed proposal includes version, network, job, coordinator, parent identity/sequence/plan CID, published pipeline CID, instance ID, ordered old/current pairs and index permutations for commands, peers and targets. Reordering moves only the reviewed elements. The receiver checks the entire proposal again and runs normal escrow, payment, resource and request validation. |
+| `POST /get_deployment_status` | The existing poll returns the linked operation. During the handoff the parent shows `holding_for_repair` and its `repair_child_operation_id`. After the child finishes, the parent shows `completed/superseded`. The child's `relinked_nodes` lists the previous/current pairs. Existing ready counts refer to its paid workers. Retry an uncertain signed submission on the original endpoint. |
+
+Admission sends one targeted inspection per current worker. A survivor must sign its actual Git HEAD and the reviewed full configuration, including the three ordered lists. The coordinator encrypts the expected fingerprint to that worker. An already stopped worker confirms its own journaled stop, matching Git commit and empty local workload. An unavailable worker, incompatible version or changed configuration stops admission before the survivor is retired. The coordinator also checks that every previous Git commit is retrievable from the configured public repository.
+
+The signed child reserves the original operation before secret preparation. The coordinator stages independent deployment and restoration grants with dAuth. Explicit rotation of the existing main tunnel uses the new credential at its connector paths for both outcomes. The receiver rechecks license ownership, paid placement and the canonical pointer before a conditional retirement, start or publication. The worker verifies the original instance again before retiring it. The old addresses receive no grant. Restarts reuse the signed reservation and receipts. A failed rollout stops the new attempt on both hosts before restoring each original Git pin and the approved command order.
+
+ChainDist reloads confirmed relinks from its persisted event scan after startup and offers ordinary relinks to Deeploy one at a time. Ordinary relink requires an observation of the previous workload at every address that will receive a retirement command. An empty replacement machine cannot supply that evidence. If several addresses already changed and each workload reports only under its successor, the first ordinary relink is held because the retained address lacks an observation. Recoveries in this profile require a publicly verifiable GitHub source for each previous commit. Admission waits up to 12 seconds for worker observations before checking GitHub with bounded unauthenticated requests. A retry on the same coordinator for the same verified proposal can use a late report while its challenge is still valid. The coordinator requests fresh observations after expiry, a scope change, or restart.
+
+If a repair expires before recording any retirement challenge, the coordinator revokes its staged grants and releases the original reservation. After a retirement command might have been sent, the coordinator retains the operation and its grants until it has exact stop evidence. An operator must resolve contradictory or missing evidence before work can resume. dAuth checks the current job and license registration on each repair revision grant read. An ordinary committed update replaces the repair grant with the normal revision format.
+
+The repaired deployment or restoration completes after every worker reports ready. A failed repair rollout restores each worker's verified Git commit from its stop report. The coordinator checks those commits against the signed ready reports before finalizing. If placement or the reviewed source changes, the existing progress endpoint exposes a blocked reason. The hold remains in place until the coordinator can verify that proceeding is safe.
+
+Publish the repair-capable Core package (candidate 7.7.362) before building the Edge image (candidate 2.10.744), which requires that Core version or later. Upgrade the serving dAuth instances, the original coordinator and both workers before enabling the frontend route. Configure a trusted HTTPS endpoint for that coordinator in `NEXT_PUBLIC_DEEPLOY_REPAIR_COORDINATORS` for the correct network, or verify equivalent routing at the existing ingress. Keep the worker lifecycle journals and coordinator operation data across the upgrade. Verify CSP-authenticated preview and worker reachability, then observe both app responses and the existing hostname through the rotated tunnel during the CSP's canary. Keep the recovery-capable coordinator and custodians available until the operation finishes.
+
 ## Single polling endpoint
 
 Add `POST /get_deployment_status`, using the existing authenticated Deeploy request envelope conventions. POST keeps signed/scoped lookups consistent with the current API style. This replaces the earlier proposal for multiple GET endpoints.
@@ -171,6 +193,13 @@ A response must contain:
 - Structured errors with code, safe message, scope, failed phase, retryability, attempt count, and next retry time where applicable.
 - Cleanup/restoration state for each affected node; metadata state.
 - Bounded recent events and continuation information.
+
+During an update in `retiring_previous`, the coordinator returns a per-node `action` of
+`awaiting_stop_report`, `stop_reported`, or `waiting_to_start`. A previous worker is marked `stop_reported`
+when the responding oracle has its signed `stopped` report for the retirement attempt.
+A replica missing that report returns `stop_report_unavailable`.
+A desired-only worker owes no retirement report. These observations describe the operation.
+Paid capacity comes from the job contract.
 
 Illustrative result body during failure recovery:
 

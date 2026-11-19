@@ -7023,6 +7023,7 @@ class _DeeployMixin:
       result[str(job_id)] = {
         DEEPLOY_KEYS.JOB_ID: job_id,
         DEEPLOY_KEYS.PIPELINE: pipeline,
+        DEEPLOY_KEYS.PIPELINE_CID: pipeline_cid,
         DEEPLOY_KEYS.ONLINE: online_apps,
         DEEPLOY_KEYS.CHAIN_JOB: chain_job,
       }

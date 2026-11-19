@@ -1,5 +1,6 @@
 """Pinned and catalogue deployments restore exact content while generic deployments follow their source."""
 import copy
+import subprocess
 import threading
 import tempfile
 import unittest
@@ -355,6 +356,19 @@ class RuntimeArtifactTests(unittest.TestCase):
     plugin._get_latest_commit.assert_not_called()
     plugin._set_default_branch.assert_not_called()
     self.assertIsNone(plugin._check_git_updates(100))
+
+  def test_repair_reads_the_running_container_without_changing_readiness(self):
+    runner = WorkerAppRunnerPlugin.__new__(WorkerAppRunnerPlugin)
+    runner.container = SimpleNamespace(id="c" * 64)
+    runner._deployment_runtime_artifacts = {"git_commit": "d" * 40}
+    with patch("extensions.business.container_apps.worker_app_runner.subprocess.run") as run:
+      run.return_value = SimpleNamespace(returncode=0, stdout=(COMMIT + "\n").encode())
+      self.assertEqual(runner.read_deployment_git_commit(), COMMIT)
+      self.assertEqual(run.call_args.args[0][2], runner.container.id)
+      self.assertEqual(run.call_args.kwargs["timeout"], 7)
+      self.assertEqual(runner.get_deployment_runtime_artifacts()["git_commit"], "d" * 40)
+      run.side_effect = subprocess.TimeoutExpired("docker", 7)
+      self.assertIsNone(runner.read_deployment_git_commit())
 
   def test_worker_records_actual_head_before_publishing_readiness(self):
     plugin = WorkerAppRunnerPlugin.__new__(WorkerAppRunnerPlugin)

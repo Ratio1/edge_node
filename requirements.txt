@@ -3,8 +3,8 @@ kmonitor
 # after the get, so the caller's timeout bounds the network fetch. A lower floor would let an image build
 # without them.
 ratio1>=3.5.71
-# Core 7.7.361 adds continuous version and readiness reports for Deeploy-tracked runners.
-naeural_core>=7.7.361
+# Core provides source status reports and the versioned repair inspection, stop and start protocol.
+naeural_core>=7.7.362
 decentra-vision
 python-telegram-bot[rate-limiter]
 protobuf
