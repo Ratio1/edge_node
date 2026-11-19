@@ -163,7 +163,7 @@ def validate_source_pins(configs):
       signature = plugin["SIGNATURE"].upper()
       for instance in plugin.get("INSTANCES", []):
         mode = deployment_source_mode(signature, config, instance)
-        if mode is None and config.get("DEEPLOY_SPECS", {}).get("job_app_type") != "service":
+        if mode is None and (config.get("DEEPLOY_SPECS") or {}).get("job_app_type") != "service":
           continue  # Other plugins own their own configuration schema.
         vcs = instance.get("VCS_DATA") or {}
         has_commit = isinstance(vcs, dict) and "COMMIT" in vcs
@@ -260,9 +260,11 @@ def node_rollout_state(config, report, online, deadline, pins=None):
       if not following or not isinstance(error, dict) or error.get("code") not in SOURCE_FAILURES:
         return "legacy_failed" if legacy else "failed"
       kept_failure = True
-      kept = True
+      # A previously reported source failure cannot stand in for an offline node.
+      kept |= online
+      pending |= not online
     elif identity in planned and (status != "ready" or not online):
-      if following and deadline:
+      if following and online and deadline:
         kept = True
       else:
         pending = True
@@ -1190,10 +1192,14 @@ class _DeploymentOperationsMixin:
       expired = self.time() >= operation.get("restore_deadline" if restoring else "deadline", operation["deadline"])
       for node, config in active_configs.items():
         pins = pinned_sources(config)
-        # A persisted finalizing phase can outlive the private plan's last verified pinned report.
-        online = self._netmon_node_is_online_for_control(node) if pins else True
+        # A node may go offline between the readiness barrier and publication of the revision.
+        recheck = bool(pins) or any(
+          deployment_source_mode(plugin["SIGNATURE"], config, instance) == "following"
+          for plugin in config.get("PLUGINS", []) for instance in plugin.get("INSTANCES", [])
+        )
+        online = self._netmon_node_is_online_for_control(node) if recheck else True
         state = node_rollout_state(config, active_reports.get(node), online, expired, pins=pins)
-        if state in ("failed", "legacy_failed") or (pins and state not in ("ready", "kept")):
+        if state in ("failed", "legacy_failed") or (recheck and state not in ("ready", "kept")):
           # Once the revision is published, its remaining secret/metadata writes must still finish.
           pointer = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(operation["job_id"]))
           if not isinstance(pointer, dict) or pointer.get("operation_id") != operation["operation_id"]:

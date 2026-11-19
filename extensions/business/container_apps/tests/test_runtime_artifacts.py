@@ -58,6 +58,18 @@ class RuntimeArtifactTests(unittest.TestCase):
     restarted._pull_image_with_fallback.assert_not_called()
     restarted_client.images.pull.assert_not_called()
 
+  def test_untracked_local_image_uses_existing_pull_policy(self):
+    for policy in ("never", "if-not-present"):
+      with self.subTest(policy=policy):
+        plugin, client, _ = make_lifecycle_runner()
+        plugin.cfg_autoupdate = False
+        plugin.cfg_image_pull_policy = policy
+        client.images.get.return_value = image(IMAGE_ID, REF)
+        self.assertTrue(plugin._ensure_image_available())
+        # A locally built image has no digest that can be looked up in a registry.
+        client.images.get_registry_data.assert_not_called()
+        client.images.pull.assert_not_called()
+
   def test_a_lost_image_is_pulled_back_by_its_exact_registry_reference(self):
     # The node's own container was replaced: the saved state survived, the nested Docker store did not.
     plugin, client, _, _ = self.runner(bound(image_ref=REF))
@@ -510,6 +522,41 @@ class RuntimeArtifactTests(unittest.TestCase):
       worker.current_commit = None
       self.assertEqual(worker._check_git_updates(1240), StopReason.EXTERNAL_UPDATE)
 
+  def test_worker_preserves_an_externally_managed_checkout(self):
+    for mode in ("following", "pinned"):
+      with self.subTest(mode=mode):
+        base, _, container, _ = self.runner()
+        worker = WorkerAppRunnerPlugin.__new__(WorkerAppRunnerPlugin)
+        worker.__dict__.update(base.__dict__)
+        worker._after_reset()
+        worker._deployment_source_mode = mode
+        worker.cfg_setup_repo = False
+        worker.repo_url = "https://github.com/acme/app.git"
+        worker._ensure_repo_state = MagicMock()
+        worker._get_latest_commit = MagicMock(return_value="b" * 40)
+        worker._build_commands = ["true"]
+        worker.time = lambda: 1000
+        self.assertEqual(worker._collect_exec_commands(), [worker._build_git_bootstrap_command()])
+        worker.container = container
+        container.exec_run.return_value = SimpleNamespace(exit_code=0, output=COMMIT.encode())
+        self.assertTrue(worker._capture_checkout())
+        self.assertEqual(worker._collect_exec_commands(), ["cd /app && true"])
+        self.assertIsNone(worker._check_git_updates(1060))
+        worker._get_latest_commit.assert_not_called()
+
+  def test_externally_managed_tree_without_git_can_run_but_cannot_prove_a_pin(self):
+    base, _, container, _ = self.runner()
+    worker = WorkerAppRunnerPlugin.__new__(WorkerAppRunnerPlugin)
+    worker.__dict__.update(base.__dict__)
+    worker._after_reset()
+    worker.cfg_setup_repo = False
+    worker.container = container
+    container.exec_run.return_value = SimpleNamespace(exit_code=128, output=b"not a git repository")
+    self.assertFalse(worker._capture_checkout())  # A pin requires a verified checkout.
+    worker._deployment_source_mode = "following"
+    self.assertTrue(worker._capture_checkout())
+    self.assertNotIn("git_commit", worker.get_deployment_runtime_artifacts())
+
   def test_live_container_with_failed_build_honors_restart_backoff(self):
     plugin, client, container, _ = self.runner()
     plugin._deployment_source_mode = "following"
@@ -535,6 +582,7 @@ class RuntimeArtifactTests(unittest.TestCase):
     worker.__dict__.update(base.__dict__)
     worker._after_reset()
     worker._deployment_source_mode = "following"
+    worker.cfg_setup_repo = True
     worker.cfg_vcs_data = {"REPO_OWNER": "acme", "REPO_NAME": "app"}
     worker.time = lambda: 1000
     with patch("extensions.business.container_apps.worker_app_runner.requests.get") as lookup:

@@ -703,6 +703,40 @@ class DeploymentOperationTests(unittest.TestCase):
     self.assertEqual(operation["phase"], "stopping_failed_rollout")
     plugin._commit_operation_revision.assert_not_called()
 
+  def test_offline_following_node_cannot_cross_the_readiness_deadline(self):
+    # An authenticated report is insufficient when its node is no longer reachable.
+    for status, code in (("starting", None), ("ready", None), ("failed", "WORKLOAD_START_FAILED")):
+      with self.subTest(status=status):
+        plugin = Coordinator()
+        operation = plugin.source_operation("update")
+        plugin._save_operation(operation, "waiting_for_readiness")
+        for node in ("A", "B"):
+          plugin.report(operation, node, "ready", mode="following")
+        plugin.report(operation, "C", status, mode="following", code=code)
+        plugin.offline.add("C")
+        plugin._advance_deployment_operation(operation)
+        self.assertEqual(operation["phase"], "waiting_for_readiness")
+        plugin.now = operation["deadline"]
+        plugin._advance_deployment_operation(operation)
+        self.assertEqual(operation["phase"], "stopping_failed_rollout")
+        self.assertEqual(operation["error"]["code"], "READINESS_DEADLINE_EXCEEDED")
+        plugin._commit_operation_revision.assert_not_called()
+
+  def test_following_node_going_offline_after_barrier_blocks_publication(self):
+    plugin = Coordinator()
+    operation = plugin.source_operation("update")
+    plugin._save_operation(operation, "waiting_for_readiness")
+    for node in ("A", "B"):
+      plugin.report(operation, node, "ready", mode="following")
+    plugin.report(operation, "C", "failed", mode="following", code="WORKLOAD_START_FAILED")
+    plugin._advance_deployment_operation(operation)
+    self.assertEqual(operation["phase"], "finalizing")
+    plugin.offline.add("C")
+    plugin.now = operation["deadline"]
+    plugin._advance_deployment_operation(operation)
+    self.assertEqual(operation["phase"], "stopping_failed_rollout")
+    plugin._commit_operation_revision.assert_not_called()
+
   def test_following_owner_transfer_omits_retired_artifacts(self):
     plugin = Coordinator()
     operation = plugin.source_operation("update")

@@ -274,6 +274,10 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
         stdout=True, stderr=True,
       )
       if result.exit_code != 0:
+        if self._deployment_source_mode == "following" and not self.cfg_setup_repo:
+          # Pre-baked or mounted source may lack .git. There is no commit to report.
+          self._deployment_git_captured = True
+          return True
         # The clone/build command may still be running when a permissive generic
         # health mode first reports readiness. Keep waiting for the source proof.
         self._app_ready = False
@@ -367,7 +371,8 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       self._build_dispatched = True
       return build
     commands = [self._build_git_bootstrap_command()]
-    if self.cfg_setup_repo or source_mode in ("following", "pinned"):
+    # With an externally prepared checkout, the bootstrap still enables HEAD validation.
+    if self.cfg_setup_repo:
       commands.append(f"rm -rf {repo_path}")
       commands.append(self._build_git_clone_command(repo_path))
     if source_mode not in ("following", "pinned"):
@@ -409,6 +414,9 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     """
     mode = self._deployment_source_mode
     if mode == "pinned" or (mode in ("service", None) and self._deployment_tracks_runtime()):
+      return None
+    if mode == "following" and not self.cfg_setup_repo:
+      # Restarting on a branch change cannot update a checkout managed outside the runner.
       return None
     if not current_time:
       current_time = self.time()
@@ -484,6 +492,11 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       self._repo_configured = True
       return
     following = self._deployment_source_mode == "following"
+    if following and not self.cfg_setup_repo:
+      # The existing /app tree is authoritative when Git setup is disabled.
+      self.branch = self.cfg_vcs_data.get("BRANCH") or self.branch
+      self._repo_configured = True
+      return
     if not following and getattr(self, "cfg_deeploy_runtime_artifacts", None) is not None:
       raise ValueError("Restoring a worker requires its exact previous Git commit")
     self._set_default_branch()
