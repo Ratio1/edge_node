@@ -396,7 +396,7 @@ class DeeployManagerApiPlugin(
     Parameters
     ----------
     request : dict
-        Signed Deeploy payload with ``delegate_addresses`` (at most 100).
+        Signed Deeploy payload with ``delegate_addresses`` (at most 10).
 
     Returns
     -------

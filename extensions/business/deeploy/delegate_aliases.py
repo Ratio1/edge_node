@@ -7,7 +7,7 @@ from .deeploy_const import DEEPLOY_KEYS
 
 DELEGATE_ALIASES_HKEY = "deeploy_delegate_aliases_v1"
 DELEGATE_ALIAS_MAX_LENGTH = 80
-DELEGATE_ALIASES_MAX_COUNT = 100
+DELEGATE_ALIASES_MAX_COUNT = 10
 ETH_ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 
@@ -127,13 +127,13 @@ class _DelegateAliasesMixin:
     auth_result : dict
         Existing Deeploy authentication result for an owner or active delegate.
     addresses : list[str]
-        At most 100 addresses from the client's delegate list.
+        At most 10 addresses from the client's delegate list.
 
     Returns
     -------
     dict[str, str]
         Nonempty aliases keyed by lowercase addresses. Missing/revoked entries
-        are omitted; a malformed stored value fails the request.
+        are omitted; malformed records are skipped with a count-only warning.
 
     Examples
     --------
@@ -141,18 +141,25 @@ class _DelegateAliasesMixin:
     {}
     """
     if not isinstance(addresses, list) or len(addresses) > DELEGATE_ALIASES_MAX_COUNT:  # Bound per-request chain and storage reads.
-      raise ValueError("'delegate_addresses' must be a list of at most 100 addresses.")
+      raise ValueError("'delegate_addresses' must be a list of at most 10 addresses.")
     normalized = list(dict.fromkeys(self._delegate_alias_address(value) for value in addresses))  # Validate all input before external reads and deduplicate it.
     network, escrow, owner = self._delegate_alias_scope(auth_result)  # Derive the tenant exclusively from authenticated state.
     aliases = {}
+    invalid_count = 0  # Aggregate corrupt metadata into one bounded warning per request.
     for address in normalized:
-      if not self._delegate_alias_is_member(address, escrow, owner):  # A stale UI list must not expose labels for revoked delegates.
+      if address == owner:  # Owners are not delegate entries and require no metadata read.
         continue
       value = self.chainstore_hget(hkey=DELEGATE_ALIASES_HKEY, key=f"{network}:{escrow}:{address}")  # Individual keys avoid unrelated-write conflicts.
       if value is not None:  # Existing delegates need no migration or default record.
-        alias = self._normalize_delegate_alias(value)  # Treat persisted content as an external boundary too.
-        if alias:
-          aliases[address] = alias  # Empty strings are tombstones for cleared labels.
+        try:
+          alias = self._normalize_delegate_alias(value)  # Validate each persisted record independently.
+        except ValueError:
+          invalid_count += 1  # A corrupt optional label must not hide valid neighboring entries.
+          continue
+        if alias and self._delegate_alias_is_member(address, escrow, owner):  # Probe only valid nonempty records; stale delegates still cannot expose labels.
+          aliases[address] = alias  # Empty tombstones and missing/corrupt records need no target RPC.
+    if invalid_count:
+      self.P(f"Skipped {invalid_count} invalid delegate alias record(s).", color='y')  # Never log untrusted alias content, storage keys, or exception details.
     return aliases
 
   def deeploy_set_delegate_alias(self, sender, auth_result, address, alias):

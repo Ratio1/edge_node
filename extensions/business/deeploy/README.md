@@ -154,11 +154,13 @@ The signature covers the complete payload. Existing nonce validation and active
 escrow authentication apply. For v3 signatures, the request types are
 `get delegate aliases` and `set delegate alias` respectively.
 
-- `/get_delegate_aliases`: add `delegate_addresses`, a list of at most 100 Ethereum
+- `/get_delegate_aliases`: add `delegate_addresses`, a list of at most 10 Ethereum
   addresses. An authenticated CSP owner or active delegate can read. Success
   returns `result: {status: "success", aliases: {"0x<lowercase address>": "CI bot"}}`
   in the usual server response envelope. Missing, cleared, owner, unrelated, and
   revoked delegate entries are omitted; an empty request list returns `{}`.
+  Corrupt stored labels are skipped without hiding valid entries, with one bounded
+  warning per request containing only the count (never the untrusted label).
 - `/set_delegate_alias`: add `delegate_address` and string `alias`. Only the
   authenticated escrow owner may write, and the target must currently be an active
   delegate of that escrow. Success returns
@@ -169,6 +171,13 @@ escrow authentication apply. For v3 signatures, the request types are
 - Failures use the existing `result: {status: "fail", error: "..."}` envelope.
   Clients must check `status`, keep addresses usable when metadata reads fail, and
   not report a successful rename when CStore rejects a write.
+
+Each read accepts at most 10 addresses, validates the whole list before per-target
+work, and checks membership only for valid, nonempty stored labels. This bounds
+one request to 10 target membership RPCs plus the existing signer-authentication
+RPC. Missing, cleared, or corrupt labels require no target membership RPC. Clients
+with longer lists must request sequential batches; loading all labeled addresses
+can still require N target RPCs in total. No membership cache is introduced.
 
 CStore hash `deeploy_delegate_aliases_v1` uses one key per
 `<server EVM network>:<lowercase escrow>:<lowercase delegate>`. This avoids overwriting
@@ -181,6 +190,13 @@ The feature inherits CStore persistence and replication semantics; a successful
 write is not a guarantee of immediate visibility on every oracle. Concurrent edits
 to the same address use CStore's existing conflict resolution. This patch does not
 change CStore retention or provide archival guarantees.
+
+Aliases deliberately use the same mutable CStore trust model as Preferred Nodes.
+CStore `readonly=True` restricts subsequent changes to the **writing node identity**,
+not the CSP wallet that signed the API request. Enabling it would prevent another
+Deeploy oracle from servicing that CSP's rename or clear. Owner authorization is
+therefore enforced at the signed API boundary; this feature does not claim that
+CStore independently enforces CSP wallet permissions against trusted node writers.
 
 Focused Docker verification (Python 3.11 with `eth-account` installed):
 
