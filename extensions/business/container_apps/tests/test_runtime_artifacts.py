@@ -530,9 +530,12 @@ class RuntimeArtifactTests(unittest.TestCase):
     self.assertEqual(plugin.get_deployment_runtime_artifacts()["image_ref"], reference)
     self.assertIsNone(plugin._prepared_update_image)
 
-  def test_prepared_update_survives_retrying_partial_cleanup(self):
+  def test_prepared_update_survives_partial_cleanup_and_disabled_restarts(self):
     plugin, client, old, _ = self.runner()
     plugin._deployment_source_mode = "following"
+    plugin.cfg_restart_policy = "no"
+    plugin.cfg_semaphored_keys = ["provider"]
+    plugin._wait_for_semaphores = MagicMock(return_value=True)
     clock = [1000]
     plugin.time = lambda: clock[0]
     client.images.get_registry_data.return_value.id = REF.split("@")[1]
@@ -549,6 +552,7 @@ class RuntimeArtifactTests(unittest.TestCase):
 
     # Docker removes the old runtime, but unmounting its storage fails once.
     plugin._cleanup_fixed_size_volumes = MagicMock(side_effect=[False, True])
+    plugin._wait_for_semaphores.return_value = False
     clock[0] += plugin.cfg_autoupdate_interval
     plugin._check_image_updates(clock[0])
     self.assertTrue(plugin._cleanup_failed)
@@ -562,6 +566,12 @@ class RuntimeArtifactTests(unittest.TestCase):
     clock[0] = plugin._next_restart_time + 1
     with patch.object(docker, "from_env", return_value=client):
       plugin.process()
+    self.assertIsNone(plugin.container)
+    self.assertGreater(plugin._consecutive_failures, 0)
+    plugin.process()  # Cleanup is complete, but the semaphore still isn't ready.
+    self.assertIsNone(plugin.container)
+    plugin._wait_for_semaphores.return_value = True
+    plugin.process()
     client.images.get_registry_data.assert_not_called()
     client.images.pull.assert_not_called()
     self.assertIs(plugin.container, replacement)

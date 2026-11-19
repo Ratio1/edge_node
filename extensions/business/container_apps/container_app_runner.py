@@ -4945,7 +4945,8 @@ class ContainerAppRunnerPlugin(
       if self._deployment_source_mode == "following":
         if self._check_stopped_source():
           return
-        if not self._image_pull_failures and self._consecutive_failures and (
+        # A prepared tag update gets one launch even if its cleanup retry spent the automatic budget.
+        if self._prepared_update_image is None and not self._image_pull_failures and self._consecutive_failures and (
             not self._should_restart_container() or self._has_exceeded_max_retries()):
           return
       # Check if we're in backoff period
