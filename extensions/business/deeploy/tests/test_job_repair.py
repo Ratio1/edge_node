@@ -157,6 +157,19 @@ class RepairTests(unittest.TestCase):
     self.assertEqual(parent["phase"], "retiring_previous")
     self.assertNotIn("repair_child", parent)
 
+  def test_retirement_uncertainty_keeps_the_reservation_and_grants_after_deadline(self):
+    child = self.admit()
+    self.c.cmdapi_start_pipeline = Mock()  # The coordinator sends STOP, but receives no receipt.
+    self.c._advance_deployment_operation(child)
+    self.assertTrue(child["retire_challenges"])
+    self.state.now = max(child["preparation_deadline"], child["deadline"]) + 1
+    self.http.reset_mock()
+    self.c._advance_deployment_operation(child)
+    self.assertEqual((child["phase"], child["error"]["code"]),
+                     ("repair_v1_retiring_previous", "PREVIOUS_STOP_UNCONFIRMED"))
+    self.assertEqual(self.c._operation_records()[self.oid]["phase"], "holding_for_repair")
+    self.http.assert_not_called()
+
   def test_success_only_publishes_after_both_current_workers_report_ready(self):
     child = self.admit()
     for _ in range(3):
