@@ -9,6 +9,7 @@ Container application plugins for running Docker containers with Cloudflare tunn
 - [Features](#features)
   - [Health Check Configuration](#health-check-configuration)
 - [Configuration Reference](#configuration-reference)
+  - [Source updates](#source-updates)
   - [Local Env Overrides](#local-env-overrides)
   - [Reset](#reset)
   - [Volume Sync](#volume-sync)
@@ -151,6 +152,21 @@ The plugin uses a consolidated `HEALTH_CHECK` configuration dict to determine wh
 ## Configuration Reference
 
 See `ContainerAppRunnerPlugin.CONFIG` for full configuration options.
+
+### Source updates
+
+A generic worker clones the head of its branch on every start. It checks for new commits at
+`VCS_DATA.POLL_INTERVAL` (60 seconds by default, 15 seconds minimum). If the build fails, the
+runner keeps the checkout and waits for a new commit or a restart command.
+
+A generic container app resolves its tag on every start. With `AUTOUPDATE` enabled, it checks
+the registry every `AUTOUPDATE_INTERVAL` (100 seconds by default), including after its restart
+budget is exhausted. A new image starts a fresh attempt. Registry errors use exponential backoff
+with a maximum wait of one hour.
+
+Use `PINNED_VERSION: true` with `VCS_DATA.COMMIT` (a complete Git commit) or `IMAGE_DIGEST`
+(a registry manifest or index digest) to keep a revision fixed. Worker base images retain their
+own pull policy. Catalogue services retain their existing lifecycle.
 
 ### Exposed Ports
 

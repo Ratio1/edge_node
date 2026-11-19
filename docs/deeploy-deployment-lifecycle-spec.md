@@ -2,9 +2,15 @@
 
 Date: 2026-10-14. Status: implemented on coordinated review branches; final validation and PR references are recorded below.
 
-Deeploy will accept deployment requests asynchronously, persist their execution independently of HTTP connections, and expose one polling endpoint that reports progress across all target nodes. Node-owned reporting will expose explicit failures even when a plugin cannot initialize. Failed creates will stop the attempted deployment; failed updates will stop the failed rollout and restore the previous revision.
+Deeploy will accept deployment requests asynchronously, persist their execution independently of HTTP connections, and expose one polling endpoint that reports progress across all target nodes. Node-owned reporting will expose explicit failures even when a plugin cannot initialize. Generic worker and container apps follow their configured source by default. Workload failures leave these jobs deployed. Pinned apps, catalogue services and infrastructure failures use the stop and restoration rules below.
 
 This is the durable reference for implementation across independent Ratio1 repositories and for resuming work after chat compaction. The confirmed decisions below supersede earlier proposals in the conversation, particularly proposals to keep partially successful deployments running or to preserve legacy API behavior.
+
+## Upgrade notice for app owners
+
+On the first node restart after this upgrade, existing generic worker apps rebuild from the current head of their branch. Generic container apps pull the current image of their tag. A branch or tag may have moved since deployment. An app whose current source fails stays deployed and may be unavailable until a working version arrives. During an update the previous revision stops before the new one starts.
+
+Notify app owners before rollout. Upgrade nodes (Core and runners), then coordinators, then the web app, with no active operation at the switch. An older node that omits the source mode retains its existing failure handling. Catalogue services keep their current version and recovery policy.
 
 ## Confirmed product decisions
 
@@ -13,8 +19,8 @@ This is the durable reference for implementation across independent Ratio1 repos
 3. Make both `create_pipeline` and `update_pipeline` asynchronous at the HTTP contract level. Acceptance is separate from deployment completion.
 4. Add exactly one public polling endpoint. It returns progress, per-node and per-plugin state, errors, recent events, and recovery status together. Do not add separate status, history, event-stream, or discovery endpoints.
 5. Show deployment progress across every target node in Deeploy, including errors, cleanup, and restoration progress. Polling is sufficient; SSE and WebSockets are outside this scope.
-6. A create succeeds only when every required instance on every planned target node is ready. If the attempt fails, stop its pipeline on nodes where it started and prevent pending starts from completing afterward.
-7. A failed update must stop the failed rollout and restore the previous revision. The user explicitly chose restoration rather than stopping the entire application permanently.
+6. A create succeeds only when every required instance on every planned target node is ready. If a source-following workload is kept, commit the revision with outcome `waiting_for_source`. On a terminal failure, stop its pipeline on nodes where it started and prevent pending starts from completing afterward.
+7. A terminal update failure stops the rollout and restores the previous configuration. A kept workload failure commits the new revision and releases the previous revision's secrets.
 8. All affected components will be deployed together. No legacy deployment response handling, opt-in asynchronous flags, dual deployment protocols, or migration scripts are required. Decision 14 defines the narrow exception for existing pipelines resolving secrets after restart.
 9. Implementation and pull requests are authorized from current `develop` (Edge/frontend) and `main` (Core). Live deployments, chain writes, remote configuration changes, and production data changes remain outside scope.
 10. **2026-10-14 implementation clarification:** the coordinator is the oracle receiving each create/update request. Do not implement distributed locking, consensus, stable coordinator assignment, or automatic failover. Polling remains available through any oracle. Concurrent submissions through different oracles are not globally serialized; the client must reuse a request ID and discover an existing operation before deliberate retries.
@@ -65,11 +71,11 @@ The following invariants are release requirements:
 - An HTTP disconnect or polling error does not fail, cancel, or duplicate deployment.
 - Retries reuse a discoverable existing operation by request ID. There is no atomic cross-oracle admission guarantee for simultaneous submissions before replication, per the confirmed receiving-oracle coordinator design.
 - Only the recorded receiving oracle executes a given operation. A different oracle never takes it over. Detect known active operations and conflicting revisions; do not claim distributed serialization of simultaneous admissions.
-- All required plugin instances on all selected nodes must satisfy the readiness contract before a rollout is successful. No silent substitution of nodes or reduction of the target count.
+- Reserve `succeeded` for a rollout with every required instance ready. Both `succeeded` and `waiting_for_source` make the target revision current. No silent substitution of nodes or reduction of the target count.
 - A received command, running plugin object, or non-null CStore entry is not sufficient evidence of application readiness.
 - Once an attempt is aborted, late success reports cannot revive its operation. Nodes that have enforced the abort must reject delayed starts; nodes that have not yet learned/enforced it remain unresolved cleanup obligations.
 - Cleanup completion requires positive evidence that the scoped workloads stopped. A missing heartbeat is not that evidence.
-- A failed update is not considered recovered until the previous configuration and placement have been restored and verified under their readiness contract.
+- Recovery requires restoration of the previous configuration and placement. A previous source-following workload may be waiting for its source when restoration completes.
 - Keep every secret/configuration revision that may still be needed by a live, unreachable, or restoring instance.
 - Never roll back application data or delete persistent volumes as an implicit deployment cleanup action.
 - Runtime execution, recovery and metadata determine the deployment outcome. Blockchain transactions are outside this lifecycle.
@@ -183,9 +189,9 @@ Illustrative result body during failure recovery:
   "observation_stale": false,
   "poll_after_ms": 2000,
   "nodes": [
-    {"node_id": "A", "observed_revision": 3, "workload_state": "ready", "action": "stop_requested"},
-    {"node_id": "B", "observed_revision": 3, "workload_state": "ready", "action": "stop_requested"},
-    {"node_id": "C", "observed_revision": null, "workload_state": "failed", "action": "abort_requested",
+    {"node_id": "A", "ready": true, "observed_revision": 3, "workload_state": "ready", "action": "stop_requested"},
+    {"node_id": "B", "ready": true, "observed_revision": 3, "workload_state": "ready", "action": "stop_requested"},
+    {"node_id": "C", "ready": false, "observed_revision": null, "workload_state": "failed", "action": "abort_requested",
      "error": {"code": "IMAGE_PULL_DENIED", "message": "Registry authentication rejected", "retryable": false}}
   ],
   "events": [],
@@ -194,6 +200,8 @@ Illustrative result body during failure recovery:
 ```
 
 The example omits the instance detail and additional freshness fields for brevity; those are required by the implemented schema. The response should be a coherent aggregation with provenance, not an assertion that asynchronously observed nodes were sampled at one instant.
+
+Each node's `ready` is true when it belongs to the placement for the displayed attempt, is online, and its signed report confirms readiness for every required instance. For each pinned runner, the report must also declare pinned mode and identify the configured Git commit or the registry digest in the configured image repository. `ready_nodes` counts the nodes whose `ready` flag is true. A node shown only for its prior placement has `ready: false`.
 
 Polling reads local replicas without namespace repair and has no deployment side effects. Opening or closing the UI must not start, stop, or advance an operation. A local miss returns synchronizing/unavailable until the service can establish absence under the coordination contract. Return an explicit no-operation result for an authorized existing job with no tracked operation; do not manufacture migration history.
 
@@ -224,8 +232,9 @@ Keep execution phase, outcome, recovery state, and current workload health separ
 | Path | Required progression |
 | --- | --- |
 | Normal create/update | accepted → preparing → dispatching → waiting_for_readiness → finalizing → completed; outcome `succeeded`. |
-| Failed create | failure detected → aborting → stopping_failed_rollout → finalizing_cleanup → completed; outcome `failed`, recovery `completed`, workloads confirmed stopped. |
-| Failed update | failure detected → aborting → stopping_failed_rollout → restoring_previous → verifying_previous → finalizing_recovery → completed; outcome `failed`, recovery `completed`, previous revision healthy. |
+| Kept create/update | Every planned instance is ready or kept. Commit the target revision and complete with outcome `waiting_for_source` and no recovery. |
+| Terminal create failure | failure detected → aborting → stopping_failed_rollout → finalizing_cleanup → completed; outcome `failed`, recovery `completed`, workloads confirmed stopped. |
+| Terminal update failure | failure detected → aborting → stopping_failed_rollout → restoring_previous → verifying_previous → finalizing_recovery → completed; outcome `failed`, recovery `completed`, previous configuration in effect. |
 | Incomplete cleanup/restoration | Remain in the applicable recovery phase with `recovery=blocked` or `in_progress`; preserve unresolved nodes, errors, retained secrets, and retry schedule. Do not claim completion. |
 
 An operation can have an explicit failure reason while recovery is still active. Restoring the old revision does not turn the requested update into a success. A later runtime crash after an already completed successful operation changes current health; it does not rewrite historical rollout success or automatically trigger a new rollout policy.
@@ -236,13 +245,14 @@ Distinguish HTTP request timeout, node observation freshness, rollout readiness 
 
 - A transient failure may be retried within a bounded startup budget before declaring the attempt failed.
 - A definitive failure of any required instance triggers abort immediately; do not wait for other nodes to time out.
-- If a required node never confirms before the rollout deadline, abort with a reason such as `READINESS_DEADLINE_EXCEEDED`. This proves policy failure, not that the node never started.
+- A source-following instance that reports a workload start, health, image pull or source-access failure stays deployed. At the deadline a reporting source-following instance can also be kept while it is starting. Use the stored plan to determine eligibility and require a matching mode from the node. Infrastructure and bound-instance failures abort the whole operation.
+- If a required node never reports before the rollout deadline, abort with a reason such as `READINESS_DEADLINE_EXCEEDED`. This proves policy failure, not that the node never started.
 - Once aborted, no further forward-deployment retries are allowed for that attempt. Recovery commands take precedence over delayed readiness success.
 - If recovery exceeds its budget, expose the unresolved state and required action. Continue scheduled reconciliation where safe; do not discard the operation or declare unreachable workloads stopped.
 
-Implemented defaults: preparation deadline 120 seconds; deployment/restoration readiness deadline 900 seconds (15 minutes; `DEPLOYMENT_READINESS_TIMEOUT`); worker wake-up 2 seconds using local operation/report replicas without namespace repair; CStore write timeout 5 seconds with one retry; nodes publish signed reports only on state change (15-second confirmation wait, retried until confirmed) and stop after a confirmed ready report; readiness pairs that one-time ready report with NetMon command/control liveness instead of report age. Cleanup deadlines expose blocked recovery and keep reconciliation running; they never substitute for stop evidence. Operation events retain 128 entries and each signed record uses eight sequence slots. Abort/history identities have no automatic expiry.
+Implemented defaults: preparation deadline 120 seconds; deployment/restoration readiness deadline 900 seconds (15 minutes; `DEPLOYMENT_READINESS_TIMEOUT`); worker wake-up 2 seconds using local operation/report replicas without namespace repair; CStore write timeout 5 seconds with one retry; nodes publish signed reports only on state change (15-second confirmation wait, retried until confirmed) and continue to report source-following status and version changes after readiness. The node replays its latest signed current field to an intended oracle that missed the observation or whose restart NetMon detected, preserving its sequence and timestamp. Bound instances stop reporting after confirmed readiness. Readiness pairs the latest ready report with NetMon command/control liveness instead of report age. Cleanup deadlines expose blocked recovery and keep reconciliation running; they never substitute for stop evidence. Operation events retain 128 entries and each signed record uses eight sequence slots. Abort/history identities have no automatic expiry.
 
-### Failed create cleanup
+### Terminal create failure cleanup
 
 1. Durably commit the abort decision and invalidate further start authority for the attempt.
 2. Send idempotent, scoped stop/abort commands to every node to which work could have been dispatched, including those still starting or unreachable. Do not limit cleanup to nodes that acknowledged success.
@@ -262,7 +272,7 @@ Before dispatch, retain the previous successful revision, its exact materialized
 3. Enforce a restoration safety barrier: where coexistence is unsafe, require positive stop evidence or proven workload-level fencing before starting restored instances, especially on another target. An unreachable old writer must block restoration unless fencing proves it cannot continue writing. Controller ownership fencing alone is not proof that an application process has stopped.
 4. Restore the prior configuration and original placement; stop newly added targets that did not belong to that placement.
 5. Use a new command/control generation for restoration even though the content is the previous revision. A stale-revision guard must not reject an authorized restore or allow delayed failed-update commands to overtake it.
-6. Verify previous-version readiness on all required previous targets, then restore canonical desired/active metadata consistently with the observed result.
+6. Verify each restored instance is ready or qualifies to stay deployed waiting for its source. Restore canonical metadata to the previous revision even when its branch head or image tag has moved.
 7. Mark the update failed and recovered only after restoration is confirmed. Show `Previous revision restored` in the UI.
 
 If restoration itself fails or a node is unreachable, show `Update failed; restoration incomplete` with per-node details. Do not recursively roll back the rollback or release secrets needed by either version.
@@ -377,7 +387,7 @@ Exit: missing code, constructor failure, startup error, stalled execution, stop 
 - Coordinate stop/delete/scale with known active operations; prevent obsolete commands within an operation. Do not add cross-oracle consensus.
 - Replace timeout-triggered metadata rollback with evidence-based lifecycle finalization.
 
-Exit: three-node success/failure/deadline scenarios converge to either all-ready, confirmed stopped, confirmed restored, or an honest unresolved recovery state.
+Exit: three-node success/failure/deadline scenarios converge to all-ready, deployed and waiting for source, confirmed stopped, confirmed restored, or a stated unresolved recovery.
 
 ### Work package 5 API and direct clients
 
@@ -420,13 +430,13 @@ Exit: all acceptance criteria below pass or the feature remains incomplete. An A
 | Coordinator unavailable | Other oracles continue replicated polling with freshness information; no takeover or new executor for that operation. |
 | Stale peer snapshot and reordered observations | No status regression or resurrection; authority/sequence rules decide applicability. |
 | Plugin cannot load or initialize | Explicit instance failure before the deployment deadline; recovery begins. |
-| Two nodes ready and third rejects image | Failed create stops both ready nodes and aborts pending work on the third. |
+| Two nodes ready and the third cannot pull its image | A following container stays deployed and the operation completes with `waiting_for_source`. A bound container failure stops the rollout on all targets. |
 | Third node never responds | Deadline aborts the attempt; missing node remains unresolved until it acknowledges abort/stop. |
 | Start delivered before abort while a node is disconnected | Distinguish requested versus enforced abort; any late execution is stopped/fenced and remains unresolved until confirmed. |
 | Delayed startup after node has enforced abort | Node rejects it; late ready report cannot revive the operation. |
 | Duplicate stop/restore commands or lost acknowledgments | Safe repeated reconciliation with scoped, idempotent effects. |
-| Failed update on one node | Failed revision stopped; exact prior configuration/placement restored and verified everywhere required. |
-| Prior revision restoration fails | Update remains failed with incomplete recovery; retain required secrets and show the failing node/reason. |
+| Terminal update failure on one node | Stop the failed revision and restore the previous configuration on its original placement. |
+| Prior revision restoration fails | A kept source failure completes recovery with the previous revision in effect. An infrastructure or bound-workload failure keeps recovery pending with its secrets and reason. |
 | Unreachable failed-revision writer during restoration | No unsafe overlapping restored writer; wait for confirmed stop or proven workload-level fencing. |
 | Node disappears during cleanup | Recovery not marked complete; no speculative secret deletion. |
 | Attempted and previous revisions need different secrets | Both remain retrievable under correct authorization until confirmed retirement. |
@@ -461,7 +471,7 @@ To resume after compaction:
 4. Recheck the source map against current code; use exact function behavior over stale prose.
 5. Keep this document updated with completed work packages, chosen persistence/reporting settings, exact tests and results, affected commits, remaining blockers, and the next concrete step. Do not mark a package complete on code shape alone.
 6. Follow the user's delegation rule for substantial frontend implementation: Claude owns the agreed UI file scope while Codex remains responsible for architecture, integration, and verification. Documentation-only planning does not require UI delegation.
-7. Do not create compatibility shims beyond decision 14, a second polling/event endpoint, or a new external storage dependency. Do not reinterpret failed-update recovery as leaving the partial new rollout running.
+7. Do not create compatibility shims beyond decision 14, a second polling/event endpoint, or a new external storage dependency. Use the terminal and kept failure rules in the state machine above.
 
 ## Implementation checkpoints
 
@@ -477,7 +487,7 @@ To resume after compaction:
 - dAuth stores immutable per-revision secrets with exact authorized node/instance configurations. Revocation is a separate durable marker followed by plaintext erasure. Previous secrets remain available until stop/restoration evidence allows retirement. Non-dAuth coordinators prepare and publish revisions through the SDK reconciliation API. dAuth retains all prior and merged bundles; coordinators load only redacted plans and sign public pointers. Polling from any oracle remains supported.
 - Container readiness reports actual health and build/pull failures. Cleanup verifies Docker absence and preserves volumes. Managed CockroachDB additionally verifies planned certificate fingerprints and authenticated verify-full SQL before readiness. Its isolated real-binary old/new/old certificate recovery test passed with data preservation; see the linked recovery document for the exact offline command and limitations.
 - Canonical pointers and current dAuth bundles carry signed monotonic storage generations. A restored runtime retains its previous content revision while its metadata commit advances the storage generation; later creates/updates/deletes advance beyond it. Delete tombstones reject stale repair, and explicit higher generations permit paid job reuse. Every new attempt also advances beyond all verified observed attempts for the job, including failed preparation/create attempts, so clock skew cannot hide a retry in job-only polling. The receiving oracle also coordinates existing CSP owner transfer through the revision lifecycle; rollback preserves the newly authorized owner.
-- Tracked containers pin local Docker image IDs before launch and retain them across restart. Worker sources pin and verify Git commits. Automatic image/source polling is disabled for tracked revisions; restoration uses captured node artifacts and never runs what a mutable tag points to unless it is the pinned image. Missing historical bindings block restoration. Since 2.10.712 a tracked container app also records where a registry serves its image (`repository@sha256:...`), and a restoration may bring back only a reference in the repository the app is configured with; when the local image is lost it is pulled again, by that reference and then by the configured one, and accepted only with the pinned image ID. While the registry does not serve that image the app stays stopped and the pull is retried at most an hour apart. A tracked worker pins only its Git commit: its base image follows `IMAGE_PULL_POLICY` and the image ID it records is informational. Arbitrary build commands can still depend on mutable external downloads; deterministic application dependencies remain an application build responsibility.
+- A generic worker or container app follows its branch or image tag unless its instance has `PINNED_VERSION: true`. A pinned worker takes `VCS_DATA.COMMIT` (40 lowercase hex digits). A pinned container takes `IMAGE_DIGEST` (a registry digest beginning with `sha256:` and 64 lowercase hex digits). Both fields name content in the configured repository. The worker's base image follows its own pull policy. Catalogue services keep their existing runtime bindings.
 - Deployment transaction tracking and consensus gates were removed per the completion clarification. Existing blockchain monitor and SDK transaction submission behavior remain unchanged; no deployment nonce reservation, cancellation or prepared-transaction API is introduced.
 - Frontend implementation initially delegated to Claude; Codex completed final retry work after the specialist session limit. Persisted request identity, uncertain acceptance lookup, refresh/account/oracle-scoped polling, node/instance/recovery progress, and create/update/delete integration are implemented. Scale-up uses the update lifecycle. Unknown update acceptance blocks new payments/allocations; an exact signed resend is held in memory only. Missing replica state or elapsed time cannot authorize discarding an unresolved submission. Escrow node count is refreshed before another node-extension payment. These safeguards do not provide cross-tab or cross-oracle consensus.
 - Offline verification: Container Apps 484 tests passed; Worker 17 passed; dAuth/reveal 63 passed; SDK direct-client 6 and secret-client 19 passed; transaction-specific additions and their tests were removed. Core focused lifecycle/CStore/secrets checks after transaction removal: 95 passed (lifecycle module now 45 tests). HSync 9 passed. Before removal, Core broad discovery ran 467 tests with eight errors and one skip; an isolated base-HEAD run (415 tests) reproduced the identical eight errors and skip. Failures: five node-oracle fixtures missing `evm_network`, one shutdown fixture missing `config_data`, absent structured training pipeline module, and Torch stub missing `dtype`. These remain outside this change. Final full Deeploy suite after transaction decoupling: 371 tests passed, including retry-generation ordering under clock skew.
@@ -665,7 +675,7 @@ a coordinator signature on public pointers. Equal-generation retries ignore
 signature metadata only; altered semantic contents and revoked revisions fail
 closed. These changes require SDK 3.5.59 and Core 7.7.334 (7.7.333 was released separately before this stack). Edge ships as 2.10.511.
 
-Release order: SDK, Core, then Edge together with the lifecycle dApp. Retain the
+The original lifecycle release shipped SDK, Core, then Edge together with the lifecycle dApp. Retain the
 existing journal/secret storage and coordinated rollback requirements above.
 This integration was checked offline with physically separated public/protected
 stores, the real SDK client and Core wrapper; no live node or wallet was changed.

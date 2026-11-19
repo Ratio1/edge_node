@@ -1,8 +1,10 @@
 """Mixin: provision and teardown fallocate-backed fixed-size volumes."""
+import os
 from pathlib import Path
 
 from extensions.business.container_apps import fixed_volume
 from extensions.business.container_apps.fixed_volume import safe_path_component
+from extensions.business.container_apps.sync.constants import SYSTEM_VOLUME_NAME
 
 
 class _FixedSizeVolumesMixin:
@@ -20,30 +22,34 @@ class _FixedSizeVolumesMixin:
     - self._get_full_image_ref()           (plugin)
   """
 
-  def _resolve_image_owner(self):
-    """
-    Resolve the image's runtime USER to numeric (uid, gid) for volume chown,
-    WITHOUT executing the user-supplied image.
+  def _resolve_image_owner(self, *, require_image=False):
+    """Read numeric volume ownership from Docker image metadata.
 
-    Returns:
-      (None, None) when the image has no USER, runs as root, or uses a
-      symbolic name (e.g. "appuser") that can't be resolved without running
-      the image. Caller keeps the root-owned default in those cases.
+    Symbolic users can select explicit OWNER_UID and OWNER_GID in their volume configuration.
+    The node only inspects image metadata.
 
-      (uid, gid) for numeric USER directives: "1000", "1000:2000".
+    Parameters
+    ----------
+    require_image : bool
+      Propagate inspection failure when preparing mounts for an already selected launch image.
 
-    Previously this ran a throwaway container from the target image to read
-    /etc/passwd. That expanded the execution surface of volume provisioning
-    to user-supplied images before the main runtime start path. We now
-    inspect image metadata only. Users with symbolic-USER images and
-    non-root ownership needs must set OWNER_UID/OWNER_GID explicitly in
-    FIXED_SIZE_VOLUMES.
+    Returns
+    -------
+    tuple
+      Numeric uid and gid, or (None, None) for the root-owned default.
+
+    Examples
+    --------
+    >>> runner._resolve_image_owner()  # Image declares USER 1000:2000.
+    (1000, 2000)
     """
     try:
       image_ref = self._get_full_image_ref()
       image = self.docker_client.images.get(image_ref)
       raw = (image.attrs.get("Config") or {}).get("User", "") or ""
     except Exception as exc:
+      if require_image:
+        raise  # Starting on a guessed owner can make a previously writable mount inaccessible.
       self.P(f"[FixedVolume] Could not inspect image for USER: {exc}", color='y')
       return (None, None)
 
@@ -85,6 +91,18 @@ class _FixedSizeVolumesMixin:
       color='y',
     )
     return (None, None)
+
+  def _apply_launch_volume_owners(self):
+    # Only automatically managed data roots follow the image user. Cleanup removes their descriptors
+    # from _fixed_volumes, so sync/reset restarts see exactly the mounts they still own.
+    mounts = [vol.mount_path for vol in self._fixed_volumes if vol.name != SYSTEM_VOLUME_NAME
+              and vol.owner_uid is None and vol.owner_gid is None]
+    if mounts:
+      uid, gid = self._resolve_image_owner(require_image=True)
+      for mount_path in mounts:
+        # Reused filesystems retain their old inode ownership. Restore the documented root default
+        # for empty or symbolic USER as well, leaving all existing files beneath the root untouched.
+        os.chown(mount_path, uid or 0, gid or 0, follow_symlinks=False)
 
   def _configure_fixed_size_volumes(self):
     """
@@ -185,7 +203,8 @@ class _FixedSizeVolumesMixin:
         # the historical root-owned behavior.
         # NOTE: mount_volume() re-chowns on every mount, so this also corrects
         # ownership on reused volumes (FORCE_RECREATE not required).
-        if owner_uid is None and owner_gid is None:
+        automatic_owner = owner_uid is None and owner_gid is None
+        if automatic_owner and not self._follows_image():
           owner_uid, owner_gid = self._resolve_image_owner()
 
         safe_name = safe_path_component(logical_name)

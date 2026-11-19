@@ -322,7 +322,7 @@ def connect(test, state, custodian):
   return mocked
 
 
-def report(state, operation, attempt, status):
+def report(state, operation, attempt, status, mode=None, error=None):
   nodes = operation['nodes'] if attempt == 'deploy' else operation['previous_nodes']
   for node in nodes:
     revision = operation['target_revision'] if attempt == 'deploy' else operation['previous_revision']
@@ -331,5 +331,10 @@ def report(state, operation, attempt, status):
                 status=status, updated_at=state.now, sequence=int(state.now),
                 instances=[dict(signature=signature, instance_id=instance, status=status)
                            for signature, instance in operation['instances' if attempt == 'deploy' else 'previous_instances'][node]])
+    for instance in item['instances']:
+      if mode:
+        instance['source_mode'] = mode
+      if error:
+        instance['error'] = {'code': error}
     Engine(node).sign(item)
     state.public[NODE_OPERATIONS_HKEY, node + '|' + attempt] = item

@@ -81,7 +81,7 @@ from docker.types import DeviceRequest
 
 from naeural_core.business.base.web_app.base_tunnel_engine_plugin import BaseTunnelEnginePlugin as BasePlugin
 
-from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
+from .container_utils import _ContainerUtilsMixin, image_repository
 from .fixed_volume import safe_path_component
 from .cockroachdb_readiness import is_cockroachdb_service, probe_cockroachdb_readiness
 from .mixins import (
@@ -310,6 +310,8 @@ _CONFIG = {
     "ports": []        # dict of host_port: container_port mappings (e.g. {8080: 8081}) or list of container ports (e.g. [8080, 9000])
   },
   "RESTART_POLICY": "always",  # "always", "on-failure", "unless-stopped", "no"
+  "PINNED_VERSION": False,  # Pin requests include a commit or a registry digest.
+  "IMAGE_DIGEST": None,
   "IMAGE_PULL_POLICY": "always",  # "always" will always pull the image
   "DEEPLOY_RUNTIME_ARTIFACTS": None,  # Immutable node-local bindings for restoration
   "AUTOUPDATE" : True, # If True, will check for image updates and pull them if available
@@ -479,6 +481,7 @@ class ContainerAppRunnerPlugin(
 
   # Docker can outlive the Python plugin and must have independent stop proof.
   _deployment_external_workload = True
+  _deployment_source_mode = None  # Core sets this from the canonical pipeline before startup.
 
   @classmethod
   def cleanup_deployment_instance(cls, app_id, instance_id):
@@ -707,6 +710,7 @@ class ContainerAppRunnerPlugin(
 
     # Image update tracking
     self.current_image_hash = None
+    self._launch_image = {}  # Exact image resolved for this start, independent of mutable local tags.
 
     # Image pull backoff tracking
     self._image_pull_failures = 0
@@ -715,6 +719,8 @@ class ContainerAppRunnerPlugin(
 
     # Command execution state
     self._commands_started = False
+    self._workload_failure_counted = False
+    self._commands_failed = False
 
     # App readiness tracking (for tunnel startup gating)
     self._app_ready = False
@@ -790,19 +796,16 @@ class ContainerAppRunnerPlugin(
     return bool(getattr(self, "_deployment_operation_key", None) or
                 getattr(self, "cfg_deeploy_runtime_artifacts", None))
 
+  def _follows_image(self):
+    # Workers set _deployment_pins_image to False: their source is Git, regardless of the base image.
+    return self._deployment_source_mode == "following" and self._deployment_pins_image()
+
   def _deployment_pins_image(self):
     """
-    Whether a tracked deployment of this runner may only ever run the exact image it started with.
+    Whether a pinned revision identifies its workload by Docker image.
 
-    A tracked deployment (one that belongs to a Deeploy operation) records the id of the image it
-    started, so that a restart or a restoration runs the same content and not whatever a tag points
-    to by then. For a container app that is right: the image is the application.
-
-    That id is the image's identity inside one Docker store. When the node's own container is
-    replaced, that store can be empty while the plugin's saved state survives. A runner whose image
-    is not the application (a worker, which clones and builds source code on a base image) overrides
-    this to return False: it pulls its image again by the normal pull policy and is not stopped by
-    an id that no longer exists.
+    Container apps run the requested image. Workers override this because their payload is a Git
+    checkout and their base image has its own pull policy.
 
     Returns
     -------
@@ -817,7 +820,7 @@ class ContainerAppRunnerPlugin(
     >>> WorkerAppRunnerPlugin._deployment_pins_image(worker)
     False
     """
-    # A container app is its image: once tracked, it is bound to the image it was deployed with.
+    # When a container app is pinned, the pin selects its Docker image.
     return True
 
   def _get_pinned_deployment_artifacts(self):
@@ -862,6 +865,9 @@ class ContainerAppRunnerPlugin(
     Traceback (most recent call last):
     ValueError: Invalid immutable deployment image binding
     """
+    if self._deployment_source_mode == "following":
+      # Old deployments can have both a retired binding and a saved binding. Neither governs a new start.
+      return {}
     explicit = getattr(self, "cfg_deeploy_runtime_artifacts", None)
     if explicit is not None:
       if not isinstance(explicit, dict):
@@ -902,7 +908,8 @@ class ContainerAppRunnerPlugin(
       return artifacts
     operation_key = getattr(self, "_deployment_operation_key", None)
     if not operation_key:
-      return {}
+      # A directly configured pin still starts by immutable id after the requested digest was pulled.
+      return self.get_deployment_runtime_artifacts() if self._deployment_source_mode == "pinned" else {}
     saved = self._load_persistent_state().get("deployment_runtime_artifacts", {})
     if saved.get("operation_key") == operation_key:
       return dict(saved.get("artifacts", {}))
@@ -910,7 +917,7 @@ class ContainerAppRunnerPlugin(
 
   def _save_deployment_artifacts(self, artifacts):
     self._deployment_runtime_artifacts = dict(artifacts)
-    if getattr(self, "_deployment_operation_key", None):
+    if getattr(self, "_deployment_operation_key", None) and self._deployment_source_mode != "following":
       binding = {
         "operation_key": self._deployment_operation_key, "artifacts": dict(artifacts),
       }
@@ -963,9 +970,18 @@ class ContainerAppRunnerPlugin(
       return
     # Only a runner bound to its image must run exactly the saved one. A worker's base image may be a
     # newer pull of the same tag: its id is recorded below, replacing the one that was lost.
+    if self._deployment_source_mode == "pinned" and getattr(self, "_launch_image", None):
+      artifacts = dict(self._launch_image)
     if self._deployment_pins_image() and artifacts.get("image_id") and artifacts["image_id"] != image_id:
       raise RuntimeError("Running container does not match the immutable image binding")
     artifacts["image_id"] = image_id
+    if self._follows_image():
+      # Use the registry digest resolved for this launch: RepoDigests can include several tags' digests.
+      launched = getattr(self, "_launch_image", {})
+      if launched.get("image_id") != image_id:
+        raise RuntimeError("Running container does not match the image resolved for launch")
+      artifacts.update(launched)
+      self.current_image_hash = launched["image_ref"]
     if self._deployment_tracks_runtime() and self._deployment_pins_image() and not artifacts.get("image_ref"):
       # A binding without a registry reference: add it now that the container is known to run the
       # bound image, so the next loss of the Docker store can be repaired by an exact pull.
@@ -999,6 +1015,9 @@ class ContainerAppRunnerPlugin(
     if not self._deployment_pins_image():
       # Not bound to an image: the configured reference is the only thing a registry can serve.
       return super()._get_full_image_ref()
+    if self._deployment_source_mode in ("pinned", "following") and getattr(self, "_launch_image", None):
+      # Also inspect this id when provisioning fixed volumes: pulling by digest need not update a local tag.
+      return self._launch_image["image_id"]
     artifacts = self._get_pinned_deployment_artifacts()
     return artifacts.get("image_id") or super()._get_full_image_ref()
 
@@ -1154,6 +1173,13 @@ class ContainerAppRunnerPlugin(
     if stop_reason:
       self.stop_reason = stop_reason
     # end if
+
+    if new_state == ContainerState.PAUSED and self._deployment_source_mode == "following":
+      # An owner stop keeps the pipeline but removes the workload. Keep the last failed checkout
+      # for failed builds only; there is no running artifact for a confirmed manual pause.
+      self._deployment_runtime_artifacts = {}
+      self._deployment_source_error = None  # A paused worker has also stopped polling its branch.
+      self.report_deployment_status("stopped")
 
     self.Pd(f"Container state: {old_state.value} -> {new_state.value}", score=0)
     return
@@ -1525,7 +1551,7 @@ class ContainerAppRunnerPlugin(
       # the local store, and when it is not, the recovery logs in again before every registry
       # attempt. Raising here ended the plugin for good when the registry or the credentials were
       # unavailable at the moment of start, which is the moment after a node's container is replaced.
-      if not (self._deployment_tracks_runtime() and self._deployment_pins_image()
+      if not self._follows_image() and not (self._deployment_tracks_runtime() and self._deployment_pins_image()
               and self._get_pinned_deployment_artifacts().get("image_id")):
         # Not bound yet (a first start, a worker, an app outside Deeploy): fail at once, as before.
         raise RuntimeError("Failed to login to container registry. Cannot proceed without authentication.")
@@ -1534,11 +1560,9 @@ class ContainerAppRunnerPlugin(
 
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
 
-    # Ensure image is available locally BEFORE configuring volumes so
-    # FIXED_SIZE_VOLUMES can introspect the image's USER directive to
-    # auto-detect OWNER_UID/OWNER_GID. _ensure_image_available is
-    # idempotent; the second call inside start_container will be a cache hit.
-    if not self._ensure_image_available():
+    # Bound images and worker base images supply volume ownership during setup. A following
+    # container resolves its tag after any semaphore wait, immediately before it starts.
+    if not self._follows_image() and not self._ensure_image_available():
       self._fixed_volume_setup_pending = True
       self.P(
         f"Image '{self.cfg_image}' not available; deferring fixed-volume setup."
@@ -2714,6 +2738,13 @@ class ContainerAppRunnerPlugin(
     Updates container state to RUNNING on success or FAILED on error.
     Records restart success/failure for backoff tracking.
     """
+    if self._deployment_source_mode == "following":
+      self._deployment_runtime_artifacts = {}  # The previous checkout/image is no longer running.
+    if self._follows_image() and not self._ensure_image_available():
+      # Also resolve the tag for starts performed directly by volume sync or reset.
+      return None
+    self._commands_failed = False  # A fresh container gets a fresh build attempt.
+    self._workload_failure_counted = False
     self._set_container_state(ContainerState.STARTING)
 
     log_str = f"Launching container with image '{self.cfg_image}'...\n"
@@ -2784,8 +2815,11 @@ class ContainerAppRunnerPlugin(
 
       # Guardrail: remove any stale container with the same name (crash recovery)
       self._ensure_no_stale_container()
+      if self._follows_image():
+        self._apply_launch_volume_owners()  # Inspect the immutable id selected after the semaphore wait.
 
       self.container = self.docker_client.containers.run(
+        # Starting by id prevents another deployment's tag pull from racing this launch.
         self._get_full_image_ref(),
         **run_kwargs,
       )
@@ -3028,7 +3062,7 @@ class ContainerAppRunnerPlugin(
       self.exec_threads.append(thread)
     except Exception as exc:
       self.P(f"Container exec command failed: {exc}", color='r')
-      self.report_deployment_status("failed", error_code="WORKLOAD_START_FAILED")
+      self._report_exec_failure()
       self._commands_started = False
     return
 
@@ -3040,10 +3074,16 @@ class ContainerAppRunnerPlugin(
       return
     try:
       execution = self.docker_client.api.exec_inspect(execution_id)
-      if execution.get("ExitCode") not in (None, 0):
-        self.report_deployment_status("failed", error_code="WORKLOAD_START_FAILED")
+      if execution.get("ExitCode") == 0:
+        return True
+      if execution.get("ExitCode") is not None:
+        self._report_exec_failure()
     except Exception:
-      self.report_deployment_status("failed", error_code="WORKLOAD_START_FAILED")
+      self._report_exec_failure()
+
+  def _report_exec_failure(self):
+    self._commands_failed = True  # Survives health and Docker exit observations for this container.
+    self.report_deployment_status("failed", error_code="WORKLOAD_START_FAILED")
 
   def _maybe_execute_build_and_run(self):
     """
@@ -3053,7 +3093,10 @@ class ContainerAppRunnerPlugin(
     -------
     None
     """
-    if self._commands_started:
+    if self._commands_started or (
+        self._deployment_source_mode == "following"
+        and getattr(self, "_commands_failed", False)):
+      # A following worker waits for a changed commit. A container retries through its policy.
       return
 
     if not self.container:
@@ -3228,6 +3271,9 @@ class ContainerAppRunnerPlugin(
     bool
         True if app is ready, False otherwise
     """
+    if self._deployment_source_mode == "following" and getattr(self, "_deployment_error_code", None):
+      # A permissive delay/disabled probe cannot make a failed command ready again.
+      return False
     if self._app_ready:
       return True
 
@@ -3939,7 +3985,13 @@ class ContainerAppRunnerPlugin(
     -------
     None
     """
-    if self._deployment_tracks_runtime() or not self.cfg_autoupdate:
+    if not self.cfg_autoupdate:
+      return
+    mode = self._deployment_source_mode
+    if mode == "following" and not self._deployment_pins_image() and getattr(self, "_commands_failed", False):
+      return  # A failed worker build is retried when its branch changes.
+    if (mode == "pinned" and self._deployment_pins_image()
+        or mode in ("service", None) and self._deployment_tracks_runtime()):
       return
 
     # Check if update check is due
@@ -3949,14 +4001,25 @@ class ContainerAppRunnerPlugin(
     self._last_image_check = current_time
 
     # Get latest image hash
-    latest_hash = self._get_latest_image_hash()
+    if self._follows_image():
+      try:
+        latest_hash = self._source_image_ref()
+      except Exception:
+        # The running workload and its readiness survive a failed background registry check.
+        self.P("Could not resolve the image tag. Will check again at the next interval.", color='y')
+        return
+    else:
+      latest_hash = self._get_latest_image_hash()
     if not latest_hash:
       self.P("Failed to check for image updates (pull failed). Container continues running.")
       return
 
     # Check if update is needed
     if self._has_image_hash_changed(latest_hash):
+      if self._follows_image():
+        self._consecutive_failures = 0  # A new image gets its own restart budget.
       self._handle_image_update(latest_hash)
+      return True
     else:
       self.Pd(f"Image up to date: {self.current_image_hash}")
 
@@ -4089,7 +4152,7 @@ class ContainerAppRunnerPlugin(
     self._validate_runner_config()
 
     # Ensure image is available (respecting AUTOUPDATE and IMAGE_PULL_POLICY)
-    if not self._ensure_image_available():
+    if not self._follows_image() and not self._ensure_image_available():
       self.P("Failed to ensure image availability during restart, cannot start container", color='r')
       self._set_container_state(ContainerState.FAILED, StopReason.CRASH)
       self._record_restart_failure()
@@ -4226,18 +4289,40 @@ class ContainerAppRunnerPlugin(
     >>> self._is_configured_registry_ref("other-registry:5000/acme/shop@sha256:4f1c...")
     False
     """
-    # The configured reference without a digest: "ghcr.io/acme/shop:stable@sha256:..." -> "ghcr.io/acme/shop:stable";
-    # the tag is cut on the next line.
-    configured = super()._get_full_image_ref().split("@")[0]
-    # A ":" after the last "/" starts a tag; one before it belongs to a registry port.
-    repository = configured.rsplit(":", 1)[0] if ":" in configured.rsplit("/", 1)[-1] else configured
-    # Docker lists a Docker Hub image without these: "docker.io/library/nginx" is "nginx" there.
-    for prefix in ("index.docker.io/", "docker.io/", "library/"):
-      # Compare the configured repository in the form Docker lists it.
-      repository = repository.removeprefix(prefix)
-    # The shape first: it raises for a non-string, so a malformed command fails loudly; then the repository, as written.
+    repository = self._image_repository()
     return bool(re.fullmatch(r"(?:[\w.\-]+(?::\d+)?/)?[\w.\-/]+@sha256:[0-9a-f]{64}", reference, re.ASCII)) \
       and reference.split("@")[0] == repository
+
+  def _image_repository(self):
+    return image_repository(super()._get_full_image_ref())
+
+  def _source_image_ref(self):
+    # Docker's distribution inspect returns the registry manifest/index digest without downloading layers.
+    digest = self.cfg_image_digest if self._deployment_source_mode == "pinned" else (
+      self.docker_client.images.get_registry_data(super()._get_full_image_ref()).id
+    )
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+      raise ValueError("Missing or invalid registry digest")
+    return f"{self._image_repository()}@{digest}"
+
+  def _pull_source_image(self):
+    # An available local tag cannot prove what the registry serves now.
+    if self._is_image_pull_backoff_active():
+      return None
+    self.report_deployment_status("pulling_image")
+    try:
+      if not self._login_to_registry():
+        raise RuntimeError("Registry authentication failed")
+      reference = self._source_image_ref()
+      image = self.docker_client.images.pull(reference)
+      if not re.fullmatch(r"sha256:[0-9a-f]{64}", image.id):
+        raise ValueError("Pulled image identity is unavailable")
+    except Exception:
+      self.report_deployment_status("failed", error_code="IMAGE_PULL_FAILED")
+      self._record_image_pull_failure(max_backoff=3600)
+      return None
+    self._record_image_pull_success()
+    return {"image_id": image.id, "image_ref": reference}
 
   def _recover_bound_image(self, artifacts):
     """
@@ -4282,7 +4367,10 @@ class ContainerAppRunnerPlugin(
     # Whether any pull raised: then the outcome says nothing final about the registry's content.
     failed = False
     # The exact reference first; the configured one once, also when both are the same text.
-    for reference in dict.fromkeys(filter(None, (artifacts.get("image_ref"), super()._get_full_image_ref()))):
+    references = (artifacts.get("image_ref"), super()._get_full_image_ref())
+    if self._deployment_source_mode == "pinned":
+      references = (self._source_image_ref(),)  # The deployment request authorizes only this digest.
+    for reference in dict.fromkeys(filter(None, references)):
       try:
         self.P("Fetching the bound image {} from '{}'...".format(artifacts["image_id"], reference))
         # Pull exactly this reference; the id check below decides whether it is the bound image.
@@ -4386,7 +4474,7 @@ class ContainerAppRunnerPlugin(
     - IMAGE_PULL_POLICY='always': Always pull (no tracking)
     - IMAGE_PULL_POLICY='if-not-present' or default: Pull only if missing locally
 
-    A runner bound to its image (a tracked container app) resolves its tag once, saves the image id
+    A catalogue deployment resolves its tag once, saves the image id
     and from then on accepts only that image. When that image is not in the local Docker store it is
     fetched again from the registry and accepted only with the same id (see `_ensure_bound_image`).
     A tracked worker is not bound to its image and takes the strategies above, so a base image that
@@ -4402,6 +4490,25 @@ class ContainerAppRunnerPlugin(
     >>> if not self._ensure_image_available():
     ...   return   # nothing to start yet; the next lap tries again
     """
+    if self._follows_image():
+      self._launch_image = self._pull_source_image() or {}
+      if self._launch_image:
+        # Remember the attempted image even when Docker cannot create the container.
+        self.current_image_hash = self._launch_image["image_ref"]
+      return bool(self._launch_image)
+    if self._deployment_source_mode == "pinned" and self._deployment_pins_image():
+      artifacts = self._get_pinned_deployment_artifacts()
+      if artifacts.get("image_ref") and artifacts["image_ref"] != self._source_image_ref():
+        raise ValueError("Image binding differs from requested registry digest")
+      if artifacts.get("image_ref") and artifacts.get("image_id"):
+        self._launch_image = artifacts
+        return self._ensure_bound_image(artifacts)
+      # A local image id on its own cannot identify the registry digest requested by the owner.
+      artifacts = self._pull_source_image()
+      if artifacts:
+        self._launch_image = artifacts
+        self._save_deployment_artifacts(artifacts)
+      return bool(artifacts)
     if self._deployment_tracks_runtime() and self._deployment_pins_image():
       artifacts = self._get_pinned_deployment_artifacts()
       if artifacts.get("image_id"):
@@ -4542,7 +4649,7 @@ class ContainerAppRunnerPlugin(
       self.P("Initial container launch...")
 
       # Ensure image is available before starting container
-      if not self._ensure_image_available():
+      if not self._follows_image() and not self._ensure_image_available():
         if not self._is_image_pull_backoff_active():
           self.P("Failed to ensure image availability, cannot start container", color='r')
         return
@@ -4565,6 +4672,12 @@ class ContainerAppRunnerPlugin(
     # end try
     return
 
+
+  def _check_stopped_source(self):
+    # Poll only when an image has been attempted. Initial pull failures have their own retry timer.
+    if self.current_image_hash and self._follows_image():
+      return self._check_image_updates(self.time())
+    return False
 
   def _perform_periodic_monitoring(self):
     """
@@ -4747,6 +4860,8 @@ class ContainerAppRunnerPlugin(
 
     if self._fixed_volume_setup_pending:
       if not self._ensure_image_available():
+        if self._deployment_source_mode == "following":
+          self._check_stopped_source()  # Workers keep checking the branch while waiting for their base image.
         return
       self._configure_initial_volume_state()
       self._fixed_volume_setup_pending = False
@@ -4765,6 +4880,12 @@ class ContainerAppRunnerPlugin(
           "after inspecting response.json."
         )
         return
+      if self._deployment_source_mode == "following":
+        if self._check_stopped_source():
+          return
+        if not self._image_pull_failures and self._consecutive_failures and (
+            not self._should_restart_container() or self._has_exceeded_max_retries()):
+          return
       # Check if we're in backoff period
       if self._is_restart_backoff_active():
         self.Pd("Container initial launch delayed due to active backoff period")
@@ -4807,9 +4928,19 @@ class ContainerAppRunnerPlugin(
     # Container Status Check and Restart Logic
     # ============================================================================
     container_is_running = self._check_container_status()
+    if container_is_running and self._follows_image() and getattr(self, "_deployment_error_code", None) in (
+        "WORKLOAD_START_FAILED", "WORKLOAD_UNHEALTHY"):
+      # The container can be alive after its build fails or its application fails a readiness probe.
+      if not getattr(self, "_workload_failure_counted", False):
+        self._record_restart_failure()
+        self._workload_failure_counted = True
+      self.stop_reason = StopReason.HEALTH_CHECK_FAILED
+      container_is_running = False
 
     if not container_is_running:
       # Container has stopped - decide if we should restart based on policy
+      if self._deployment_source_mode == "following" and self._check_stopped_source():
+        return
       policy = self._normalize_restart_policy(self.cfg_restart_policy)
 
       # Check if restart policy allows restart

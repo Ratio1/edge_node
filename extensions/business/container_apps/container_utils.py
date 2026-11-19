@@ -15,6 +15,57 @@ CONTAINER_VOLUMES_PATH = "/edge_node/_local_cache/_data/container_volumes"
 ALLOWED_TUNNEL_PROTOCOLS = ("http", "https", "tcp", "ssh", "rdp", "smb")
 
 
+def configured_image_ref(image, registry):
+  """Qualify the configured image with its registry.
+
+  Parameters
+  ----------
+  image, registry : str
+    Image field and registry server from the instance config.
+
+  Returns
+  -------
+  str
+    The same reference the runner passes to Docker.
+
+  Examples
+  --------
+  >>> configured_image_ref("acme/api:v1", "registry:5000")
+  'registry:5000/acme/api:v1'
+  """
+  if not image or not registry or registry.lower() in ("docker.io", "registry.hub.docker.com"):
+    return image
+  if image.lower().startswith(registry.lower() + "/"):
+    return image  # An already qualified image keeps its spelling.
+  return f"{registry}/{image}"
+
+
+def image_repository(image_ref):
+  """Return the configured repository as Docker spells it in RepoDigests.
+
+  Parameters
+  ----------
+  image_ref : str
+    Qualified image with an optional tag or digest.
+
+  Returns
+  -------
+  str
+    Repository without its tag, digest or Docker Hub prefixes.
+
+  Examples
+  --------
+  >>> image_repository("registry:5000/shop/api:dev")
+  'registry:5000/shop/api'
+  """
+  configured = image_ref.split("@")[0]
+  # A colon in the registry host is its port; one in the last segment starts the tag.
+  repository = configured.rsplit(":", 1)[0] if ":" in configured.rsplit("/", 1)[-1] else configured
+  for prefix in ("index.docker.io/", "docker.io/", "library/"):
+    repository = repository.removeprefix(prefix)
+  return repository
+
+
 def validate_exposed_ports_origin_tls_options(exposed_ports, main_port=None):
   """Validate the narrow origin-TLS exception before runtime side effects."""
   if not isinstance(exposed_ports, dict):
@@ -101,18 +152,10 @@ class _ContainerUtilsMixin:
     Returns:
         str: Full image reference (e.g. 'ghcr.io/misp/misp-docker/misp-core:latest')
     """
-    image = self.cfg_image
-    if not image:
-      return image
+    if not self.cfg_image:
+      return self.cfg_image
     cr_server, _, _ = self._get_cr_data()
-    if not cr_server or cr_server.lower() in ('docker.io', 'registry.hub.docker.com'):
-      return image
-    # end if
-    # Avoid double-prefixing if user already included the registry in image name
-    if image.lower().startswith(cr_server.lower() + '/'):
-      return image
-    # end if
-    return f"{cr_server}/{image}"
+    return configured_image_ref(self.cfg_image, cr_server)
 
   def _login_to_registry(self):
     """

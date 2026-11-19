@@ -1978,6 +1978,16 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "IMAGE"):
       plugin._materialize_plugins_for_node(prepared, "0xai_node_a", 0)
 
+  def test_create_refuses_per_node_runtime_artifacts_before_materialization(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(plugins=[make_plugin_entry(
+      "CONTAINER_APP_RUNNER", plugin_name="app", IMAGE="repo/app:latest",
+      PINNED_VERSION=True, IMAGE_DIGEST="sha256:" + "a" * 64,
+      perNodeConfig={"byNode": {"0xai_node_a": {"deeploy_runtime_artifacts": {"image_id": "sha256:" + "b" * 64}}}})])
+    prepared = plugin.deeploy_prepare_plugins(inputs)
+    with self.assertRaisesRegex(ValueError, "system-managed"):
+      plugin._materialize_plugins_for_node(prepared, "0xai_node_a", 0)
+
   def test_per_node_config_rejects_unmatched_selectors(self):
     plugin = make_deeploy_plugin()
     inputs = make_inputs(

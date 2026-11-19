@@ -11,7 +11,7 @@ from ratio1.const.base import BCct
 
 from extensions.business.deeploy.deployment_operations import (
   _DeploymentOperationsMixin, OPERATIONS_HKEY, NODE_OPERATIONS_HKEY,
-  SECRET_REVISIONS_HKEY, DeploymentCustodyError, request_digest, report_is_ready,
+  SECRET_REVISIONS_HKEY, DeploymentCustodyError, request_digest, report_is_ready, validate_source_pins, pinned_sources,
 )
 from extensions.business.deeploy.tests.support import LifecycleCustodyDouble
 
@@ -90,13 +90,30 @@ class Coordinator(_DeploymentOperationsMixin):
                 instances={n: [("RUNNER", "worker")] for n in ["A", "B", "C"]},
                 previous_instances={n: [("RUNNER", "worker")] for n in previous})
 
-  def report(self, operation, node, status, attempt="deploy", sequence=1):
+  def source_operation(self, kind="create", pinned=False, previous_pinned=False):
+    operation = self.operation(kind)
+    for field, flag, identities in (("configs", pinned, "instances"), ("previous_configs", previous_pinned, "previous_instances")):
+      for node, config in self.plan[field].items():
+        runner = config["PLUGINS"][0]
+        runner["SIGNATURE"] = "WORKER_APP_RUNNER"
+        if flag:
+          runner["INSTANCES"][0].update(PINNED_VERSION=True, VCS_DATA={"COMMIT": "a" * 40})
+        operation[identities][node] = [(runner["SIGNATURE"], "worker")]
+    return operation
+
+  def report(self, operation, node, status, attempt="deploy", sequence=1, mode=None, code=None):
     report = dict(operation_id=operation["operation_id"], coordinator="oracle", app_id="app",
                   node_addr=node, attempt=attempt,
                   revision=1 if attempt == "deploy" else 0,
                   status=status, sequence=sequence, updated_at=self.now,
-                  instances=[dict(signature="RUNNER", instance_id="worker", status=status)],
+                  instances=[dict(signature=signature, instance_id=instance_id, status=status)
+                             for signature, instance_id in operation["instances" if attempt == "deploy" else "previous_instances"][node]],
                   EE_SIGN="valid", EE_SENDER=node)
+    for instance in report["instances"]:
+      if mode:
+        instance["source_mode"] = mode
+      if code:
+        instance["error"] = {"code": code}
     self.storage[NODE_OPERATIONS_HKEY, node + attempt] = report
     return report
 
@@ -151,6 +168,40 @@ class DeploymentStatusTests(unittest.TestCase):
     self.assertFalse(result["observation_stale"])
     plugin.offline.add("oracle")
     self.assertTrue(plugin._deployment_status({"operation_id": operation["operation_id"]})["observation_stale"])
+
+  def test_completed_waiting_operation_returns_applied_revision_and_latest_instance_report(self):
+    plugin = self.prepare()
+    operation = plugin.source_operation()
+    operation.update(phase="completed", outcome="waiting_for_source")
+    plugin._save_operation(operation)
+    for node in operation["nodes"]:
+      plugin.report(operation, node, "failed", mode="following", code="WORKLOAD_START_FAILED")
+    first = plugin._deployment_status({"job_id": 1})
+    self.assertEqual((first["revision"], first["ready_nodes"]), (operation["target_revision"], 0))
+    recovered = plugin.report(operation, "B", "ready", sequence=2, mode="following")
+    recovered["instances"][0]["runtime_artifacts"] = {"git_commit": "b" * 40}
+    latest = plugin._deployment_status({"job_id": 1})
+    node = next(node for node in latest["nodes"] if node["node_id"] == "B")
+    self.assertEqual((node["report_attempt"], node["report_sequence"]), ("deploy", 2))
+    instance = node["instances"][0]
+    self.assertEqual((latest["ready_nodes"], instance["source_mode"], instance["runtime_artifacts"]["git_commit"]),
+                     (1, "following", "b" * 40))
+
+  def test_polling_checks_source_plan_evidence_for_each_active_node(self):
+    plugin = self.prepare()
+    op = plugin.source_operation(pinned=True)
+    # The signed operation contains the pin projection; another oracle can poll without fetching its plan.
+    op["pinned_sources"] = {"deploy": {node: pinned_sources(config) for node, config in plugin.plan["configs"].items()}}
+    op["previous_nodes"] = ["retired"]
+    plugin._save_operation(op)
+    for node, mode, commit in (("A", "pinned", "a"), ("B", "pinned", "b"), ("C", None, "a")):
+      report = plugin.report(op, node, "ready", mode=mode)
+      report["instances"][0]["runtime_artifacts"] = {"git_commit": commit * 40}
+    plugin.r1fs.get_json = Mock(side_effect=AssertionError("Polling must read only local replica records"))
+    status = plugin._deployment_status({"operation_id": op["operation_id"]})
+    self.assertEqual({node["node_id"]: node["ready"] for node in status["nodes"]},
+                     {"A": True, "B": False, "C": False, "retired": False})
+    self.assertEqual(status["ready_nodes"], 1)
 
   def test_preparation_failure_does_not_project_a_restoration(self):
     plugin = self.prepare()
@@ -453,12 +504,12 @@ class DeploymentOperationTests(unittest.TestCase):
 
   def test_one_failed_node_stops_all_targets_and_waits_for_unreachable(self):
     plugin = Coordinator()
-    operation = plugin.operation()
+    operation = plugin.source_operation(pinned=True)
     plugin._save_operation(operation)
     plugin._advance_deployment_operation(operation)
     plugin.report(operation, "A", "ready")
     plugin.report(operation, "B", "ready")
-    plugin.report(operation, "C", "failed")
+    plugin.report(operation, "C", "failed", mode="pinned", code="WORKLOAD_START_FAILED")
     plugin._advance_deployment_operation(operation)
     self.assertEqual(operation["phase"], "stopping_failed_rollout")
     plugin._advance_deployment_operation(operation)
@@ -486,16 +537,17 @@ class DeploymentOperationTests(unittest.TestCase):
 
   def test_update_retirement_and_restoration_are_both_barriers(self):
     plugin = Coordinator()
-    operation = plugin.operation("update")
+    operation = plugin.source_operation("update", pinned=True, previous_pinned=True)
     plugin._save_operation(operation)
     plugin._advance_deployment_operation(operation)
     self.assertEqual(operation["phase"], "retiring_previous")
     self.assertTrue(all(config["DEEPLOY_OPERATION"]["action"] == "retire" for _, config in plugin.commands))
     for node in operation["previous_nodes"]:
-      plugin.report(operation, node, "stopped", attempt="retire")
+      retired = plugin.report(operation, node, "stopped", attempt="retire", mode="pinned")
+      retired["instances"][0]["runtime_artifacts"] = {"git_commit": "a" * 40}
     plugin._advance_deployment_operation(operation)
     self.assertEqual(operation["phase"], "waiting_for_readiness")
-    plugin.report(operation, "C", "failed")
+    plugin.report(operation, "C", "failed", mode="pinned", code="WORKLOAD_START_FAILED")
     plugin._advance_deployment_operation(operation)
     for node in operation["nodes"]:
       plugin.report(operation, node, "stopped", sequence=2)
@@ -505,11 +557,227 @@ class DeploymentOperationTests(unittest.TestCase):
     restores = [(node, config) for node, config in plugin.commands if config["DEEPLOY_OPERATION"]["attempt"] == "restore"]
     self.assertEqual([node for node, _ in restores], ["A", "B"])
     for node in operation["previous_nodes"]:
-      plugin.report(operation, node, "ready", attempt="restore")
+      restored = plugin.report(operation, node, "ready", attempt="restore", mode="pinned")
+      restored["instances"][0]["runtime_artifacts"] = {"git_commit": "a" * 40}
     plugin._advance_deployment_operation(operation)
     self.assertEqual(operation["phase"], "finalizing_recovery")
     plugin._advance_deployment_operation(operation)
     self.assertEqual((operation["phase"], operation["outcome"], operation["recovery"]), ("completed", "failed", "completed"))
+
+  def test_pinned_ready_requires_requested_worker_commit_on_every_target(self):
+    for mode, commit in ((None, "b" * 40), (None, "a" * 40), ("following", "a" * 40),
+                         ("pinned", "b" * 40), ("pinned", None), ("pinned", "a" * 40)):
+      with self.subTest(mode=mode, commit=commit):
+        plugin = Coordinator()
+        op = plugin.source_operation(pinned=True)
+        plugin._save_operation(op)
+        for node in op["nodes"]:
+          observed = plugin.report(op, node, "ready", mode=mode if node == "B" else "pinned")
+          observed["instances"][0]["runtime_artifacts"] = {"git_commit": commit if node == "B" else "a" * 40}
+        reports = plugin._node_operation_reports(op, "deploy")
+        accepted = mode == "pinned" and commit == "a" * 40
+        self.assertEqual(report_is_ready(reports["B"], plugin.plan["configs"]["B"]), accepted)
+        # The early-return dispatch guard must not skip an unverified pinned target.
+        plugin._send_operation_commands(op, plugin.plan["configs"], "deploy", "start", reports)
+        self.assertEqual([node for node, _ in plugin.commands], [] if accepted else ["B"])
+        plugin._advance_deployment_operation(op)
+        self.assertEqual(op["phase"], "finalizing" if accepted else "stopping_failed_rollout")
+        if mode is None:
+          self.assertIn("Update the node", op["error"]["message"])
+        plugin._commit_operation_revision.assert_not_called()
+
+  def test_pinned_container_requires_registry_digest_in_its_configured_repository(self):
+    digest = "sha256:" + "1" * 64
+    for image, server, expected in (
+      ("shop/app:v1", "registry.test:5000", "registry.test:5000/shop/app"),
+      ("registry.test:5000/shop/app:tag", "registry.test:5000", "registry.test:5000/shop/app"),
+      ("docker.io/library/redis:latest", "docker.io", "redis"),
+      ("library/redis", "index.docker.io", "redis"),
+    ):
+      config = {"PLUGINS": [{"SIGNATURE": "CONTAINER_APP_RUNNER", "INSTANCES": [
+        {"INSTANCE_ID": "c", "PINNED_VERSION": True, "IMAGE": image, "IMAGE_DIGEST": digest, "CR_DATA": {"SERVER": server}}]}]}
+      for artifacts, valid in (({"image_ref": expected + "@" + digest}, True),
+                               ({"image_id": digest}, False),
+                               ({"image_ref": "wrong.example/shop/app@" + digest}, False),
+                               ({"image_ref": expected + "@sha256:" + "2" * 64}, False)):
+        with self.subTest(image=image, server=server, artifacts=artifacts):
+          report = {"status": "ready", "instances": [{"signature": "CONTAINER_APP_RUNNER", "instance_id": "c",
+                    "status": "ready", "source_mode": "pinned", "runtime_artifacts": artifacts}]}
+          self.assertEqual(report_is_ready(report, config), valid)
+
+  def test_resumed_finalizing_waits_for_missing_pinned_evidence_before_publication(self):
+    plugin = Coordinator()
+    op = plugin.source_operation(pinned=True)
+    plugin._save_operation(op, "finalizing")
+    for node in ("A", "B"):
+      report = plugin.report(op, node, "ready", mode="pinned")
+      report["instances"][0]["runtime_artifacts"] = {"git_commit": "a" * 40}
+    # A replica may lack the latest report when the coordinator restarts.
+    plugin._advance_deployment_operation(op)
+    self.assertEqual(op["phase"], "waiting_for_readiness")
+    self.assertEqual([node for node, _ in plugin.commands], ["C"])
+    plugin._commit_operation_revision.assert_not_called()
+    report = plugin.report(op, "C", "ready", mode="pinned")
+    report["instances"][0]["runtime_artifacts"] = {"git_commit": "a" * 40}
+    plugin._advance_deployment_operation(op)
+    plugin._advance_deployment_operation(op)
+    self.assertEqual(op["outcome"], "succeeded")
+
+  def test_restoration_checks_the_previous_pin_before_committing(self):
+    plugin = Coordinator()
+    operation = plugin.source_operation("update", pinned=False, previous_pinned=True)
+    operation["restore_deadline"] = operation["deadline"]
+    plugin._save_operation(operation, "finalizing_recovery")
+    for node in operation["previous_nodes"]:
+      report = plugin.report(operation, node, "ready", attempt="restore", mode="pinned")
+      report["instances"][0]["runtime_artifacts"] = {"git_commit": "b" * 40}
+    operation["retired_runtime"] = {node: {"WORKER_APP_RUNNER|worker": {"git_commit": "a" * 40}} for node in operation["previous_nodes"]}
+    plugin._advance_deployment_operation(operation)
+    self.assertEqual((operation["phase"], operation["recovery"]), ("restoring_previous", "blocked"))
+    plugin._commit_operation_revision.assert_not_called()
+
+  def test_following_failure_waits_for_all_nodes_and_commits_target(self):
+    plugin = Coordinator()
+    operation = plugin.source_operation()
+    plugin._save_operation(operation)
+    plugin.report(operation, "A", "failed", mode="following", code="WORKLOAD_START_FAILED")
+    plugin.report(operation, "B", "ready", mode="following")
+    plugin._advance_deployment_operation(operation)
+    self.assertEqual(operation["phase"], "waiting_for_readiness")
+    self.assertEqual([node for node, _ in plugin.commands], ["C"])
+    plugin.report(operation, "C", "ready", mode="following")
+    plugin._advance_deployment_operation(operation)
+    plugin._advance_deployment_operation(operation)
+    self.assertEqual((operation["phase"], operation["outcome"], operation["recovery"]),
+                     ("completed", "waiting_for_source", None))
+    plugin._commit_operation_revision.assert_called_once_with(operation, plugin.plan["configs"])
+    plugin._assert_no_active_deployment(job_id=1, app_id="app")
+
+  def test_deadline_keeps_only_reported_following_instances(self):
+    for mode, status, code, expired, phase in (
+      ("following", "pulling_image", None, True, "finalizing"),
+      ("following", "starting", None, True, "finalizing"),
+      (None, None, None, True, "stopping_failed_rollout"),
+      (None, "starting", None, True, "stopping_failed_rollout"),
+      (None, "failed", "WORKLOAD_START_FAILED", False, "stopping_failed_rollout"),
+      ("following", "failed", "PLUGIN_INIT_FAILED", False, "stopping_failed_rollout"),
+    ):
+      with self.subTest(mode=mode, status=status, code=code):
+        plugin = Coordinator()
+        operation = plugin.source_operation()
+        plugin._save_operation(operation)
+        plugin.report(operation, "A", "failed", mode="following", code="IMAGE_PULL_FAILED")
+        plugin.report(operation, "B", "ready", mode="following")
+        if status:
+          plugin.report(operation, "C", status, mode=mode, code=code)
+        if expired:
+          plugin.now = operation["deadline"]
+        plugin._advance_deployment_operation(operation)
+        self.assertEqual(operation["phase"], phase)
+        if status and not mode:
+          self.assertIn("Update the node", operation["error"]["message"])
+
+  def test_reported_mode_cannot_override_a_stored_pin_in_a_mixed_stack(self):
+    plugin = Coordinator()
+    operation = plugin.source_operation()
+    for config in plugin.plan["configs"].values():
+      config["PLUGINS"][0]["INSTANCES"].append(
+        {"INSTANCE_ID": "other", "PINNED_VERSION": True, "VCS_DATA": {"COMMIT": "b" * 40}})
+    plugin._save_operation(operation)
+    report = plugin.report(operation, "A", "failed", mode="following", code="WORKLOAD_START_FAILED")
+    report["instances"].append(dict(report["instances"][0], instance_id="other"))
+    plugin._advance_deployment_operation(operation)
+    self.assertEqual(operation["phase"], "stopping_failed_rollout")
+
+  def test_hard_failure_before_commit_overrides_a_kept_source_failure(self):
+    plugin = Coordinator()
+    operation = plugin.source_operation()
+    plugin._save_operation(operation)
+    for node in operation["nodes"]:
+      plugin.report(operation, node, "ready", mode="following")
+    plugin.report(operation, "B", "failed", mode="following", code="WORKLOAD_UNHEALTHY")
+    plugin._advance_deployment_operation(operation)
+    self.assertEqual(operation["phase"], "finalizing")
+    plugin.report(operation, "A", "failed", sequence=2, mode="following", code="PLUGIN_EXECUTION_FAILED")
+    plugin._advance_deployment_operation(operation)
+    self.assertEqual(operation["phase"], "stopping_failed_rollout")
+    plugin._commit_operation_revision.assert_not_called()
+
+  def test_following_owner_transfer_omits_retired_artifacts(self):
+    plugin = Coordinator()
+    operation = plugin.source_operation("update")
+    operation["mutation"] = "owner_transfer"
+    for config in plugin.plan["configs"].values():
+      config["PLUGINS"][0]["INSTANCES"][0]["DEEPLOY_RUNTIME_ARTIFACTS"] = {"git_commit": "a" * 40}
+    plugin._save_operation(operation)
+    plugin._send_operation_commands(operation, plugin.plan["configs"], "deploy", "start", {})
+    self.assertEqual(len(plugin.commands), len(operation["nodes"]))
+    for _, cmd in plugin.commands:
+      self.assertNotIn("DEEPLOY_RUNTIME_ARTIFACTS", cmd["PLUGINS"][0]["INSTANCES"][0])
+
+  def test_pinned_update_can_restore_a_following_failure_without_a_retired_binding(self):
+    plugin = Coordinator()
+    operation = plugin.source_operation("update", pinned=True)
+    plugin._save_operation(operation)
+    for node in operation["previous_nodes"]:
+      plugin.report(operation, node, "stopped", attempt="retire")
+    plugin._advance_deployment_operation(operation)
+    plugin.report(operation, "A", "failed", mode="pinned", code="WORKLOAD_START_FAILED")
+    plugin._advance_deployment_operation(operation)
+    for node in operation["nodes"]:
+      plugin.report(operation, node, "stopped", sequence=2)
+    plugin._advance_deployment_operation(operation)
+    plugin._advance_deployment_operation(operation)
+    self.assertEqual(len(plugin.commands), len(operation["previous_nodes"]))
+    for _, command in plugin.commands:
+      self.assertNotIn("DEEPLOY_RUNTIME_ARTIFACTS", command["PLUGINS"][0]["INSTANCES"][0])
+    for node in operation["previous_nodes"]:
+      plugin.report(operation, node, "failed", attempt="restore", mode="following", code="WORKLOAD_START_FAILED")
+    plugin._advance_deployment_operation(operation)
+    plugin._advance_deployment_operation(operation)
+    self.assertEqual((operation["phase"], operation["outcome"], operation["recovery"]), ("completed", "failed", "completed"))
+    plugin._assert_no_active_deployment(job_id=1, app_id="app")
+
+  def test_source_pin_validation_uses_the_final_config_of_each_node(self):
+    plugin = Coordinator()
+    plugin.source_operation(pinned=True)
+    validate_source_pins(plugin.plan["configs"])
+    for extra in ({"VCS_DATA": {}}, {"VCS_DATA": {"COMMIT": "A" * 40}},
+                  {"VCS_DATA": {"COMMIT": "b" * 40}}, {"PINNED_VERSION": False},
+                  {"PINNED_VERSION": 1}, {"IMAGE_DIGEST": "sha256:" + "b" * 64},
+                  {"PER_NODE_CONFIG": {"default": {"pinned_version": True}}},
+                  {"PER_NODE_CONFIG": {"byIndex": {"1": {"VCS_DATA": {"COMMIT": "a" * 40}}}}}):
+      configs = copy.deepcopy(plugin.plan["configs"])
+      configs["C"]["PLUGINS"][0]["INSTANCES"][0].update(extra)
+      with self.subTest(extra=extra), self.assertRaises(ValueError):
+        validate_source_pins(configs)
+    for config in plugin.plan["configs"].values():
+      config["DEEPLOY_SPECS"]["job_app_type"] = "service"
+    with self.assertRaisesRegex(ValueError, "Catalogue"):
+      validate_source_pins(plugin.plan["configs"])
+
+  def test_admission_and_resumed_restoration_reject_overlay_runtime_bindings(self):
+    plugin = Coordinator()
+    op = plugin.source_operation("update", previous_pinned=True)
+    config = plugin.plan["previous_configs"]["A"]
+    instance = config["PLUGINS"][0]["INSTANCES"][0]
+    op["retired_runtime"] = {"A": {"WORKER_APP_RUNNER|worker": {"git_commit": "a" * 40}}}
+    for field, override in (("perNodeConfig", {"default": {"DEEPLOY_RUNTIME_ARTIFACTS": {}}}),
+                            ("PER_NODE_CONFIG", {"byIndex": {"1": {"Deeploy_Runtime_Artifacts": {}}}}),
+                            ("PER_NODE_CONFIG", {"byNode": {"B": {"deeploy_runtime_artifacts": {}}}})):
+      with self.subTest(field=field, override=override):
+        instance[field] = override
+        with self.assertRaisesRegex(ValueError, "system-managed"):
+          validate_source_pins({"A": config})
+        # Restore of a saved plan has no fresh API request to validate.
+        with self.assertRaisesRegex(ValueError, "system-managed"):
+          plugin._send_operation_commands(op, {"A": config}, "restore", "start", {})
+        self.assertFalse(plugin.commands)
+        instance.pop(field)
+    instance["PER_NODE_CONFIG"] = {"byNode": {"A": {"ENV": {"ROLE": "replica"}}}}
+    plugin._send_operation_commands(op, {"A": config}, "restore", "start", {})
+    restored = plugin.commands[0][1]["PLUGINS"][0]["INSTANCES"][0]
+    self.assertEqual(restored["DEEPLOY_RUNTIME_ARTIFACTS"], {"git_commit": "a" * 40})
 
   def test_snapshot_storage_bounded_per_operation(self):
     plugin = Coordinator()
@@ -569,7 +837,7 @@ class RuntimeCompletionTests(unittest.TestCase):
       plugin = Coordinator()
       operation = plugin._save_operation(plugin.operation("update"), "restoring_previous", "Restoring.")
       operation["retired_runtime"] = {"A": {signature + "|worker": artifacts}}
-      config = {"NAME": "app", "TYPE": "Void", "PLUGINS": [{"SIGNATURE": signature, "INSTANCES": [{"INSTANCE_ID": "worker"}]}]}
+      config = {"NAME": "app", "TYPE": "Void", "DEEPLOY_SPECS": {"job_app_type": "service"}, "PLUGINS": [{"SIGNATURE": signature, "INSTANCES": [{"INSTANCE_ID": "worker"}]}]}
       plugin._send_operation_commands(operation, {"A": config}, "restore", "start", reports={})
       return plugin.commands[-1][1]["PLUGINS"][0]["INSTANCES"][0]["DEEPLOY_RUNTIME_ARTIFACTS"]
     commit, image = "b" * 40, "sha256:" + "a" * 64
@@ -589,7 +857,7 @@ class RuntimeCompletionTests(unittest.TestCase):
       plugin = Coordinator()
       operation = plugin._save_operation(plugin.operation("update"), "restoring_previous", "Restoring.")
       operation["retired_runtime"] = {"A": {}}
-      config = {"NAME": "app", "TYPE": "Void", "PLUGINS": [{"SIGNATURE": signature, "INSTANCES": [{"INSTANCE_ID": "worker"}]}]}
+      config = {"NAME": "app", "TYPE": "Void", "DEEPLOY_SPECS": {"job_app_type": "service"}, "PLUGINS": [{"SIGNATURE": signature, "INSTANCES": [{"INSTANCE_ID": "worker"}]}]}
       with self.assertRaises(RuntimeError):
         plugin._send_operation_commands(operation, {"A": config}, "restore", "start", reports={})
       saved = plugin._operation_records()[operation["operation_id"]]
