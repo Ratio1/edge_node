@@ -41,7 +41,7 @@ class TestAccountRecordFixture(unittest.TestCase):
         parsed = parse_account_record(case["value"], case["field"])
         if case["expect"] == "valid":
           self.assertIsNotNone(parsed, "a valid record must parse")
-          state, generation, memberships = parsed
+          state, generation, memberships, _created_at = parsed
           view = case["view"]
           self.assertEqual(state, view["state"])
           self.assertEqual(state == "active", view["active"])

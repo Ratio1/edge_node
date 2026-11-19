@@ -722,3 +722,58 @@ class TestAggregatedScanDataRetainsGrayboxResults(unittest.TestCase):
     out = AggregatedScanData.from_dict(bare).to_dict()
     self.assertNotIn("graybox_results", out)
     self.assertEqual(out["open_ports"], [443])
+
+
+class TestAggregatedCountsAndCoverage(unittest.TestCase):
+  """RM-154: `nr_open_ports` and `scan_metrics` must describe the merged report.
+
+  Job e2eba7e5 (10 workers) and local job 83bb552d (2 workers) both carried
+  `nr_open_ports: 0` next to `open_ports [22, 80, 443]`, and an aggregate
+  coverage of one worker's slice while the pass record had the full range.
+  """
+
+  @staticmethod
+  def _worker(worker_id, start, end, open_ports):
+    span = end - start + 1
+    return {
+      "job_id": "j1", "scan_type": "network", "local_worker_id": worker_id,
+      "start_port": start, "end_port": end, "ports_scanned": span,
+      "open_ports": open_ports, "nr_open_ports": len(open_ports),
+      "completed_tests": [],
+      "scan_metrics": {
+        "connection_outcomes": {"connected": len(open_ports), "error": span - len(open_ports)},
+        "coverage": {
+          "ports_in_range": span, "ports_scanned": span, "ports_skipped": 0,
+          "coverage_pct": 100.0, "open_ports_count": len(open_ports),
+        },
+      },
+    }
+
+  def _aggregate(self, *workers):
+    return _Host()._get_aggregated_report({w["local_worker_id"]: w for w in workers})
+
+  def test_nr_open_ports_counts_the_merged_open_ports(self):
+    # First worker found nothing: the first-wins merge used to keep its 0.
+    agg = self._aggregate(
+      self._worker("RM-2-bbbb", 513, 1024, []),
+      self._worker("RM-1-aaaa", 1, 512, [22, 80, 443]),
+    )
+    self.assertEqual(agg["open_ports"], [22, 80, 443])
+    self.assertEqual(agg["nr_open_ports"], 3)
+
+  def test_scan_metrics_are_summed_not_one_slice(self):
+    agg = self._aggregate(
+      self._worker("RM-1-aaaa", 1, 512, [22, 80, 443]),
+      self._worker("RM-2-bbbb", 513, 1024, []),
+    )
+    coverage = agg["scan_metrics"]["coverage"]
+    self.assertEqual(coverage["ports_in_range"], 1024)
+    self.assertEqual(coverage["ports_scanned"], 1024)
+    self.assertEqual(coverage["open_ports_count"], 3)
+    self.assertEqual(agg["scan_metrics"]["connection_outcomes"], {"connected": 3, "error": 1021})
+
+  def test_single_worker_metrics_unchanged(self):
+    worker = self._worker("RM-1-aaaa", 1, 512, [22])
+    agg = self._aggregate(worker)
+    self.assertEqual(agg["nr_open_ports"], 1)
+    self.assertEqual(agg["scan_metrics"], worker["scan_metrics"])

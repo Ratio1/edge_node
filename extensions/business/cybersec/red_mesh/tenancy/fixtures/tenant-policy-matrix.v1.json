@@ -17,6 +17,7 @@
       "authorization:upload",
       "engagements:documents",
       "evidence:read",
+      "findings:triage",
       "reports:export",
       "reports:review",
       "reports:view",
@@ -31,11 +32,14 @@
       "attestation_keys:manage",
       "audit:view",
       "authorization:upload",
+      "compliance_assessments:manage",
+      "compliance_assessments:view",
       "engagement:delete",
       "engagements:create",
       "engagements:documents",
       "engagements:revoke",
       "evidence:read",
+      "findings:triage",
       "jobs:purge",
       "node_assignments:manage",
       "node_failure_policy:update",
@@ -52,14 +56,19 @@
     "tenant_admin": [
       "attestation_keys:manage",
       "audit:view",
+      "compliance_assessments:manage",
+      "compliance_assessments:view",
+      "findings:triage",
       "node_failure_policy:update",
       "reports:export",
+      "reports:review",
       "reports:view",
       "tenant_users:manage"
     ],
     "tenant_pentester": [
       "analysis:run",
       "authorization:upload",
+      "findings:triage",
       "reports:export",
       "reports:review",
       "reports:view",
@@ -68,6 +77,7 @@
       "tasks:update"
     ],
     "tenant_user": [
+      "compliance_assessments:view",
       "reports:view"
     ]
   }

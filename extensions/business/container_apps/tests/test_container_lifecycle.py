@@ -164,6 +164,23 @@ class TestLifecycleInit(unittest.TestCase):
     self._assert_volume_setup_order(setup)
     self.assertFalse(plugin._fixed_volume_setup_pending)
 
+  def test_a_failed_registry_login_ends_the_start_only_of_an_app_not_bound_to_an_image_yet(self):
+    plugin, _ = self._make_initializing_runner([True])
+    plugin._login_to_registry = MagicMock(return_value=False)
+    with self.assertRaisesRegex(RuntimeError, "login to container registry"):
+      plugin.on_init()  # a first start with credentials that do not work fails at once, as before
+    # Already bound (its node's container was replaced while the registry was down): it goes on. The
+    # image may be in the local store, and the recovery logs in again before every registry attempt.
+    plugin, _ = self._make_initializing_runner([False])
+    plugin._login_to_registry = MagicMock(return_value=False)
+    plugin._deployment_operation_key = "operation|deploy"
+    plugin._load_persistent_state = lambda: {"deployment_runtime_artifacts": {
+      "operation_key": "operation|deploy", "artifacts": {"image_id": "sha256:" + "a" * 64},
+    }}
+    plugin.on_init()
+    plugin._ensure_image_available.assert_called_once_with()
+    self.assertTrue(plugin._fixed_volume_setup_pending)  # process() asks for the image again on every lap
+
   def test_initial_image_pull_failure_is_retried_before_volume_setup(self):
     plugin, setup = self._make_initializing_runner([False, False, True])
 

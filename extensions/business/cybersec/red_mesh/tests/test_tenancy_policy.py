@@ -56,6 +56,9 @@ class TestTenantPolicy(unittest.TestCase):
       ("reports:export",          (True, True, True, True, False)),
       ("evidence:read",           (True, True, False, False, False)),
       ("audit:view",              (True, False, True, False, False)),
+      # RM-120 (owner, 2026-10-06): pentesters never see a self-assessment.
+      ("compliance_assessments:view",   (True, False, True, False, True)),
+      ("compliance_assessments:manage", (True, False, True, False, False)),
       # RM-125: only the Super-Tenant Admin registers assets.
       ("assets:manage",           (True, False, False, False, False)),
     )
@@ -244,7 +247,7 @@ class TestNoAccountRole(unittest.TestCase):
   def test_the_resolved_identity_carries_no_account_role(self):
     from dataclasses import fields
     self.assertEqual({field.name for field in fields(AccountView)},
-                     {"account_id", "active", "state", "tenant_memberships", "account_generation"})
+                     {"account_id", "active", "state", "tenant_memberships", "account_generation", "created_at"})
 
   def test_record_role_vocabulary_is_the_matrix(self):
     from extensions.business.cybersec.red_mesh.tenancy.account_record import MEMBERSHIP_ROLES

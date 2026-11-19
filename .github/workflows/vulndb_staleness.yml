@@ -1,0 +1,59 @@
+name: vulndb staleness alarm
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    name: Check latest vulndb release
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VULNDB_REPO: Ratio1/redmesh-vulndb
+    steps:
+      - name: Compare latest release age with 8 days
+        run: |
+          set -euo pipefail
+          latest=$(gh release list --repo "$VULNDB_REPO" --exclude-drafts --exclude-pre-releases \
+            --json tagName,publishedAt \
+            --jq '[.[] | select(.tagName | startswith("vulndb-"))] | sort_by(.publishedAt) | last // empty | "\(.tagName) \(.publishedAt)"')
+          now=$(date +%s)
+          if [ -z "$latest" ]; then
+            summary="No published vulndb release found."
+            stale=true
+          else
+            tag=${latest%% *}
+            published=${latest##* }
+            age=$(( now - $(date -d "$published" +%s) ))
+            age_days=$(( age / 86400 ))
+            summary="Latest release ${tag}, published ${published} (${age_days} days ago)."
+            stale=false
+            if [ "$age" -gt $(( 8 * 86400 )) ]; then stale=true; fi
+          fi
+          echo "$summary"
+          last_commit=$(gh api "repos/${VULNDB_REPO}/commits/main" --jq '.commit.committer.date')
+          commit_days=$(( (now - $(date -d "$last_commit" +%s)) / 86400 ))
+          schedule_note="Last commit on ${VULNDB_REPO} main: ${last_commit} (${commit_days} days ago)."
+          if [ "$commit_days" -gt 50 ]; then
+            schedule_note="${schedule_note} Older than 50 days: GitHub disables schedules after 60 days without commits, so the weekly build is about to stop."
+            stale=true
+          fi
+          echo "$schedule_note"
+          [ "$stale" = true ] || exit 0
+          body="${summary}"$'\n\n'"${schedule_note}"$'\n\n'"No vulndb build was published for more than 8 days, or the build schedule is about to be disabled."
+          gh label create vulndb-stale --repo "$GITHUB_REPOSITORY" --color B60205 \
+            --description "vulndb build is stale" 2>/dev/null || true
+          open=$(gh issue list --repo "$GITHUB_REPOSITORY" --label vulndb-stale --state open \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --label vulndb-stale \
+              --title "vulndb build is stale" --body "$body"
+          fi

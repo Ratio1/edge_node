@@ -141,10 +141,14 @@ class Finding:
 
   # Risk scoring extensions
   cvss_version: str = "3.1"
+  # Who scored `cvss_vector`: "nvd" for a vector taken from NVD (live record or
+  # the static catalog table), "" for a probe or registry-template vector. With
+  # `cvss_version` it lets a report label an NVD-only v3.0 vector as NVD's.
+  cvss_source: str = ""
   cvss_score_env: float | None = None    # Environmental score
   cvss_vector_env: str = ""              # Environmental vector
   cvss_data_freshness: str = ""          # ISO 8601 — when CVSS was fetched from NVD
-  kev: bool = False                      # CISA Known Exploited Vulnerabilities
+  kev: bool | None = False              # CISA Known Exploited Vulnerabilities; None = not evaluated (CVE findings)
   epss_score: float | None = None        # FIRST EPSS score 0.0-1.0
 
   # Classification (modern)
@@ -184,6 +188,12 @@ class Finding:
   # (`models.finding_schema.AUTHENTICATED_ACTIONS`); "" otherwise. Not identity
   # and not content: `finding_identity` reads neither (RM-118).
   authenticated_action: str = ""
+
+  # RM-169, CVE findings: the one reason behind `confidence`, the database build, every CVSS score.
+  # Not content fields: they do not move `finding_signature`.
+  confidence_reason: str = ""
+  vulndb_build_id: str | None = None
+  cvss: tuple = ()
 
   # Metadata
   ai_generated: bool = False             # P12 invariant — must stay False for finding data
@@ -335,7 +345,7 @@ def _revive_finding_dict(data: dict) -> dict:
   if isinstance(out.get("remediation_structured"), dict):
     out["remediation_structured"] = Remediation(**out["remediation_structured"])
   # tuples stored as lists in JSON
-  for k in ("cwe", "cve", "owasp_top10", "references", "steps_to_reproduce", "tags"):
+  for k in ("cwe", "cve", "owasp_top10", "references", "steps_to_reproduce", "tags", "cvss"):
     if isinstance(out.get(k), list):
       out[k] = tuple(out[k])
   return out
@@ -584,9 +594,13 @@ def _finding_to_jsonable(f: Finding) -> dict:
   d["severity"] = f.severity.value if isinstance(f.severity, Severity) else str(f.severity)
   # Normalize tuples → lists so json.dumps doesn't trip on them later
   for k in ("cwe", "cve", "owasp_top10", "references", "steps_to_reproduce", "tags",
-            "affected_assets", "evidence_items"):
+            "affected_assets", "evidence_items", "cvss"):
     if isinstance(d.get(k), tuple):
       d[k] = list(d[k])
+  # Absent unless set, so a finding with no CVE keeps its shape (report-findings.md, Per-finding fields).
+  for k in ("confidence_reason", "vulndb_build_id", "cvss"):
+    if not d.get(k):
+      d.pop(k, None)
   return d
 
 

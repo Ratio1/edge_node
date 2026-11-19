@@ -30,7 +30,7 @@ class TestTenantDelete(unittest.TestCase):
     self.plugin.cfg_tenancy_namespace = "deployment"
     self.plugin.cfg_instance_id = "jobs"
     self.plugin.P = lambda *args, **kwargs: None
-    for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
+    for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hkeys", "chainstore_hset"):
       setattr(self.plugin, name, getattr(self.storage, name))
     self.events = []
     self.plugin._log_audit_event = lambda event, details: self.events.append((event, details))
@@ -99,6 +99,7 @@ class TestTenantDelete(unittest.TestCase):
     # RM-133: the answer also counts the contract drafts that went with the tenant.
     self.assertEqual(result["data"], {"tenantId": self.tenant, "deleted": True, "engagements": 1,
                                       "integrations": 0, "assets": 2, "nodeAssignments": 0, "contractDrafts": 0,
+                                      "assessments": 0,
                                       "documents": 3})
     self.assertEqual(sorted(self.documents.deleted), sorted(["doc-fixture", *self.engagement_refs]))
     rows = self.tenancy_rows()
@@ -113,7 +114,7 @@ class TestTenantDelete(unittest.TestCase):
                                             **install_contract(self.plugin)), 409, "domain_conflict")
     self.assertEqual(self.events, [("tenant_deleted", {
       "tenant_id": self.tenant, "actor": "creator", "engagements": 1, "integrations": 0, "assets": 2,
-      "nodeAssignments": 0, "documents": 3})])
+      "nodeAssignments": 0, "assessments": 0, "documents": 3})])
     self.refused(self.plugin.delete_tenant(self.actor, self.tenant), 404, "not_found")
 
   def test_a_retired_integration_row_is_left_to_the_start_up_cleanup_and_the_count_stays_zero(self):

@@ -13,6 +13,7 @@ from .test_execution_binding_models import binding_payload
 from .test_tenant_administration import FakeAdministrationStore
 
 TENANCY = '["redmesh","tenancy",1,"deployment"]'
+COMPLIANCE = '["redmesh","tenancy-compliance",1,"deployment"]'
 JOBS = "jobs"
 
 
@@ -77,7 +78,7 @@ class TestDataMaintenance(unittest.TestCase):
     self.plugin.cfg_tenancy_namespace = "deployment"
     self.plugin.cfg_instance_id = JOBS
     self.plugin.P = lambda *args, **kwargs: None
-    for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
+    for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hkeys", "chainstore_hset"):
       setattr(self.plugin, name, getattr(self.storage, name))
     self.events = []
     self.plugin._log_audit_event = lambda event, details: self.events.append((event, details))
@@ -127,6 +128,46 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertTrue(done["success"], done)
     return done["data"]["outcomes"]
 
+  # -- RM-120: framework assessment rows in their own hkey ---------------------------------------
+
+  def assessment_row(self, tenant_id):
+    return {"schemaVersion": 1, "namespace": "deployment", "kind": "framework_assessment", "ids": [tenant_id, "ro.dnsc.o1-2026"],
+            "tenant_id": tenant_id, "pack_id": "ro.dnsc.o1-2026", "pack_acts": [], "assurance_level": None,
+            "level_provenance": None, "sectoral_requirements": "", "completion_date": "", "management_signoff": None,
+            "remediation": [], "state": "draft", "assessment_revision": 1, "reopened_from": None, "pending": None,
+            "scores": {}, "submissions": [], "created_by": "initial", "created_at": "t", "updated_by": "initial", "updated_at": "t"}
+
+  def test_assessment_rows_are_registered_and_classified_by_their_tenant(self):
+    field = lambda tenant_id: json.dumps(["framework_assessment", "deployment", tenant_id, "ro.dnsc.o1-2026"], separators=(",", ":"))
+    self.put(COMPLIANCE, field(self.tenant), self.assessment_row(self.tenant))
+    self.put(COMPLIANCE, field("tn_gone"), self.assessment_row("tn_gone"))
+    self.put(COMPLIANCE, field("tn_bad"), {**self.assessment_row("tn_bad"), "state": "lost"})
+    rows = self.scan()
+    self.assertEqual(rows[(COMPLIANCE, field(self.tenant))]["class"], "current")
+    self.assertEqual((rows[(COMPLIANCE, field("tn_gone"))]["class"], rows[(COMPLIANCE, field("tn_gone"))]["reason"]), ("orphan", "tenant_gone"))
+    self.assertEqual((rows[(COMPLIANCE, field("tn_bad"))]["class"], rows[(COMPLIANCE, field("tn_bad"))]["reason"]), ("old", "unrecognized"))
+    # The tenancy rows stay what they were: the compliance hkey is read on its own.
+    tenancy = [row for (hkey, _), row in rows.items() if hkey == TENANCY]
+    self.assertEqual({row["class"] for row in tenancy}, {"current"})
+
+  def test_five_element_assessment_rows_are_classified_like_the_four_element_row(self):
+    fa = "fa_11111111-1111-4111-8111-111111111111"
+    field = lambda tenant_id, *tail: json.dumps(["framework_assessment", "deployment", tenant_id, "ro.dnsc.o1-2026", *tail],
+                                               separators=(",", ":"))
+    row = lambda tenant_id, **extra: {**self.assessment_row(tenant_id), "assessment_id": fa, **extra,
+                                      "ids": [tenant_id, "ro.dnsc.o1-2026", fa]}
+    self.put(COMPLIANCE, field(self.tenant, fa), row(self.tenant))
+    self.put(COMPLIANCE, field("tn_gone", fa), row("tn_gone"))
+    self.put(COMPLIANCE, field("tn_bad", fa), row("tn_bad", state="lost"))
+    self.put(COMPLIANCE, field(self.tenant, "fa_bad"), row(self.tenant))
+    self.put(COMPLIANCE, field(self.tenant, fa, "x"), row(self.tenant))  # six elements
+    rows = self.scan()
+    self.assertEqual(rows[(COMPLIANCE, field(self.tenant, fa))]["class"], "current")
+    gone = rows[(COMPLIANCE, field("tn_gone", fa))]
+    self.assertEqual((gone["class"], gone["reason"]), ("orphan", "tenant_gone"))
+    for key in (field("tn_bad", fa), field(self.tenant, "fa_bad"), field(self.tenant, fa, "x")):
+      self.assertEqual((rows[(COMPLIANCE, key)]["class"], rows[(COMPLIANCE, key)]["reason"]), ("old", "unrecognized"), key)
+
   # -- authorization ----------------------------------------------------------------------------
 
   def test_only_a_full_portfolio_super_tenant_admin_calls_any_of_the_five(self):
@@ -174,11 +215,76 @@ class TestDataMaintenance(unittest.TestCase):
       text = path.read_text(encoding="utf-8")
       built.update(re.findall(r"""cfg_instance_id[^"'\n]*\}((?::[a-z_]+)+)[:"']""", text))
     self.assertTrue(built)
+    # `:triage:t:{tenant}` is a per-tenant family like `:integrations:{tenant}`: the tenant names are asserted below.
+    self.assertIn(":triage:t", built)
+    built.discard(":triage:t")
     hkeys = self.plugin.export_redmesh_records(self.actor, 0, 0, 1)["data"]["hkeys"]
     names = {item["hkey"] for item in hkeys}
     self.assertEqual({JOBS + suffix for suffix in built} - names, set())
-    self.assertLessEqual({JOBS, TENANCY, "auth", f"{JOBS}:integrations:{self.tenant}"}, names)
+    self.assertLessEqual({JOBS, TENANCY, COMPLIANCE, "auth", f"{JOBS}:integrations:{self.tenant}",
+                          f"{JOBS}:triage:t:{self.tenant}", f"{JOBS}:triage:audit:{self.tenant}"}, names)
     self.assertEqual([item["hkey"] for item in hkeys if item["account"]], ["auth"])
+
+  def test_host_triage_rows_are_registered_classified_and_restorable(self):
+    # RM-169 step 4a: one hkey per tenant, field `host\x1ffinding_id`; no job owns a row.
+    gone = "tn_" + str(uuid4())
+    other = "tn_" + str(uuid4())
+    host = "192.0.2.10"
+    field = f"{host}\x1ff1"
+    entry_field = f"{field}\x1f000000000001000-ab12cd34"
+    t_hkey, a_hkey = f"{JOBS}:triage:t:{self.tenant}", f"{JOBS}:triage:audit:{self.tenant}"
+    row = {"job_id": "new1", "finding_id": "f1", "status": "open", "tenant_id": self.tenant, "host": host}
+    self.put(t_hkey, field, row)
+    self.put(t_hkey, "no-separator", {"status": "open"})
+    self.put(a_hkey, entry_field, row)
+    self.put(a_hkey, f"{host}\x1ff2\x1fx", {"not": "an entry"})
+    self.put(a_hkey, field, [row])  # one field per entry now: a list under the two-part field is not one
+    # identity: the value must name the hkey's tenant and the field's host and finding
+    self.put(t_hkey, f"{host}\x1ff3", {**row, "finding_id": "f3", "tenant_id": other})
+    self.put(t_hkey, f"{host}\x1ff4", {**row, "finding_id": "f9"})
+    self.put(t_hkey, f"198.51.100.1\x1ff5", {**row, "finding_id": "f5"})
+    self.put(a_hkey, f"{host}\x1ff6\x1fy", {**row, "finding_id": "f6", "tenant_id": other})
+    rows = self.scan()
+    found = {key: (row["class"], row["reason"]) for key, row in rows.items()
+             if key[0].startswith(f"{JOBS}:triage:") and key[0] not in (f"{JOBS}:triage", f"{JOBS}:triage:audit")}
+    old = ("old", "unrecognized")
+    self.assertEqual(found, {
+      (t_hkey, field): ("current", ""),
+      (t_hkey, "no-separator"): old,
+      (a_hkey, entry_field): ("current", ""),
+      (a_hkey, f"{host}\x1ff2\x1fx"): old,
+      (a_hkey, field): old,
+      (t_hkey, f"{host}\x1ff3"): old,
+      (t_hkey, f"{host}\x1ff4"): old,
+      (t_hkey, "198.51.100.1\x1ff5"): old,
+      (a_hkey, f"{host}\x1ff6\x1fy"): old,
+    })
+    # A backup row of a tenant that no longer exists is still accepted, as an integration status row is; the legacy
+    # audit hkey and a lookalike are not.
+    mine = lambda tenant, **kw: {**row, "tenant_id": tenant, **kw}
+    backup = [{"hkey": f"{JOBS}:triage:t:{gone}", "field": field, "value": mine(gone)},
+              {"hkey": f"{JOBS}:triage:audit:{gone}", "field": entry_field, "value": mine(gone)},
+              {"hkey": f"{JOBS}:triage:t:audit", "field": field, "value": mine("audit")},
+              {"hkey": f"{JOBS}:triage:t:{gone}x", "field": field, "value": mine(gone + "x")},
+              # a row naming another tenant, host or finding than its hkey and field is not restored
+              {"hkey": f"{JOBS}:triage:t:{gone}", "field": f"{host}\x1fg2", "value": mine(other, finding_id="g2")},
+              {"hkey": f"{JOBS}:triage:t:{gone}", "field": f"{host}\x1fg3", "value": mine(gone, finding_id="x")},
+              {"hkey": f"{JOBS}:triage:audit:{gone}", "field": f"{host}\x1fg4\x1fz", "value": mine(gone, host="h")},
+              {"hkey": f"{JOBS}:triage:audit:{gone}", "field": field, "value": [mine(gone)]}]
+    done = self.plugin.restore_redmesh_records(self.actor, backup)
+    self.assertEqual([item["outcome"] for item in done["data"]["outcomes"]],
+                     ["written", "written"] + ["refused"] * 6)
+
+  def test_restore_skips_a_triage_audit_entry_the_prune_tombstoned(self):
+    host = "192.0.2.10"
+    a_hkey = f"{JOBS}:triage:audit:{self.tenant}"
+    row = {"job_id": "new1", "finding_id": "f1", "status": "open", "tenant_id": self.tenant, "host": host}
+    pruned, fresh = f"{host}\x1ff1\x1f000000000001000-aa", f"{host}\x1ff1\x1f000000000002000-bb"
+    self.put(a_hkey, pruned, None)  # listed by hkeys, reads None
+    done = self.plugin.restore_redmesh_records(self.actor, [
+      {"hkey": a_hkey, "field": pruned, "value": row}, {"hkey": a_hkey, "field": fresh, "value": row}])
+    self.assertEqual([item["outcome"] for item in done["data"]["outcomes"]], ["refused", "written"])
+    self.assertIsNone(self.storage.data[(a_hkey, pruned)])
 
   def test_a_job_lists_the_files_its_record_config_and_archive_name(self):
     row = self.scan()[(JOBS, "old1")]
@@ -446,6 +552,38 @@ class TestDataMaintenance(unittest.TestCase):
     self.storage.data[(TENANCY, field)]["legal_name"] = 7
     self.assertEqual(self.scan()[(TENANCY, field)]["reason"], "unrecognized")
 
+  def test_an_account_profile_is_current_with_its_certificate_ref_and_cleanup_keeps_it(self):
+    # RM-155: one row per account, no tenant; its certificate's `ref` is a file the row names.
+    from .contract_fixture import FakeDocumentStore
+    from .test_account_profile import PNG, b64
+
+    class CidDocuments(FakeDocumentStore):
+      def put(self, envelope):
+        ref = super().put(envelope)
+        address = cid(90 + int(ref[4:]))
+        self.envelopes[address] = self.envelopes.pop(ref)
+        return address
+    documents = CidDocuments()
+    self.plugin._document_store = lambda: documents
+    self.assertTrue(self.plugin.update_account_profile(self.actor, "initial", {
+      "full_name": "Una User", "qualifications": [{"name": "OSCP"}]})["success"])
+    uploaded = self.plugin.upload_account_certificate(self.actor, "initial", "q1", "a.png", b64(PNG))
+    self.assertTrue(uploaded["success"], uploaded)
+    self.events.clear()
+    field = json.dumps(["account_profile", "deployment", "initial"], separators=(",", ":"))
+    row = self.scan()[(TENANCY, field)]
+    self.assertEqual((row["class"], row["reason"]), ("current", ""))
+    self.assertEqual([(file["cid"], file["role"]) for file in row["cids"]],
+                     [(cid(91), "qualifications[0].certificate.ref")])
+    self.assertEqual(self.clean(row)[0]["outcome"], "not_old")
+    self.assertIsNotNone(self.storage.data[(TENANCY, field)])
+    # Still current once every tenant is gone; malformed, old/unrecognized as every refused row.
+    tenant = json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":"))
+    del self.storage.data[(TENANCY, tenant)]
+    self.assertEqual(self.scan()[(TENANCY, field)]["class"], "current")
+    self.storage.data[(TENANCY, field)]["report_reviewer"] = "yes"
+    self.assertEqual(self.scan()[(TENANCY, field)]["reason"], "unrecognized")
+
   def test_the_super_tenant_branding_is_current_with_its_logo_and_cleanup_keeps_it(self):
     # RM-134: one row per deployment, as the profile; its logo's ref is a file the row names.
     from .contract_fixture import FakeDocumentStore
@@ -471,6 +609,20 @@ class TestDataMaintenance(unittest.TestCase):
     del self.storage.data[(TENANCY, tenant)]
     self.assertEqual(self.scan()[(TENANCY, field)]["class"], "current")
     self.storage.data[(TENANCY, field)]["theme"] = "pink"
+    self.assertEqual(self.scan()[(TENANCY, field)]["reason"], "unrecognized")
+
+  def test_the_branding_row_with_a_name_is_current_and_a_bad_name_is_unrecognized(self):
+    # RM-192: a row stored before the name keys existed stays current; a row with them is validated too.
+    updated = self.plugin.update_super_tenant_branding(
+      self.actor, {"display_name": "Acme", "name_in": {"title": True, "header": False}})
+    self.assertTrue(updated["success"], updated)
+    field = json.dumps(["super_tenant_branding", "deployment", "deployment"], separators=(",", ":"))
+    self.assertEqual(self.scan()[(TENANCY, field)]["class"], "current")
+    old = self.storage.data[(TENANCY, field)]
+    del old["display_name"], old["name_in"]
+    row = self.scan()[(TENANCY, field)]
+    self.assertEqual((row["class"], row["reason"]), ("current", ""))
+    old.update(display_name="x" * 81, name_in={"title": True, "header": False})
     self.assertEqual(self.scan()[(TENANCY, field)]["reason"], "unrecognized")
 
   def test_a_retired_tenant_integration_is_old_and_the_deployment_override_is_current(self):

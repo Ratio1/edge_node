@@ -421,6 +421,7 @@ class UiAggregate:
   worker_activity: list = None      # [ { id, start_port, end_port, open_ports, country } ]
   country_breakdown: list = None    # [ { code, count } ] origin countries the pass ran from
   node_comparison: list = None      # per-node vantage-point comparison (comparison_mode only); see report.py
+  unconfirmed_version_matches: int = 0  # RM-200: tentative CVE findings, outside total_findings and findings_count
   # ── graybox-aware ──
   scan_type: str = "network"
   total_routes_discovered: int = 0          # webapp: discovered routes
@@ -446,6 +447,7 @@ class UiAggregate:
       worker_activity=d.get("worker_activity"),
       country_breakdown=d.get("country_breakdown"),
       node_comparison=d.get("node_comparison"),
+      unconfirmed_version_matches=d.get("unconfirmed_version_matches", 0),
       scan_type=d.get("scan_type", "network"),
       total_routes_discovered=d.get("total_routes_discovered", 0),
       total_forms_discovered=d.get("total_forms_discovered", 0),

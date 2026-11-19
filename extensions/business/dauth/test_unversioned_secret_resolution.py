@@ -1,6 +1,9 @@
 """Existing persisted pipelines survive restart without weakening revision auth."""
 import json
+import os
 import tempfile
+import threading
+import time
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -126,6 +129,60 @@ class ExistingPipelineSecretTests(unittest.TestCase):
         plugin.chainstore_hsync.assert_not_called()
         self.assertEqual(plugin.bc.encrypt_calls, [])
 
+  def test_slow_pipeline_read_runs_off_the_request_thread_once_per_cid(self):
+    plugin = existing_job()
+    released, calls, folders = threading.Event(), [], []
+    def get_json(cid, local_folder=None, timeout=None, pin=True, show_logs=False):
+      calls.append((cid, timeout, pin))
+      folders.append((local_folder, os.path.isdir(local_folder)))
+      released.wait(5)
+      return plugin._r1fs_data[cid]
+    plugin.r1fs.get_json = get_json
+    with patch.object(threading.Thread, "start", side_effect=RuntimeError("can't start new thread")):
+      with self.assertRaises(RuntimeError):
+        plugin.process_dauth_get_secret_request(request())
+    started = time.monotonic()
+    with self.assertRaisesRegex(RuntimeError, "unavailable"):
+      plugin.process_dauth_get_secret_request(request())
+    self.assertLess(time.monotonic() - started, 2)
+    released.set()
+    for thread in threading.enumerate():
+      if thread.name == "dauth-r1fs-read":
+        thread.join(5)
+    self.assertEqual(plugin.process_dauth_get_secret_request(request())["status"], "success")
+    with self.assertRaisesRegex(ValueError, "not running"):
+      plugin.process_dauth_get_secret_request(request(EE_SENDER="node-other", EE_ETH_SENDER="0xOTHER"))
+    self.assertEqual(calls, [("old-cid", 10, False)])  # one read, bounded and without a pin
+    # In a folder of its own (not the per-CID one that other readers share), gone once the read ended.
+    self.assertEqual([existed for _folder, existed in folders], [True])
+    self.assertFalse(os.path.exists(folders[0][0]))
+
+  def test_at_most_four_old_style_documents_are_read_at_once(self):
+    # The nodes that run a job are listed in its document, so the read starts before the sender can
+    # be checked: a caller naming many old-style jobs must not get one download per job at once.
+    plugin = existing_job()
+    released, calls = threading.Event(), []
+    def get_json(cid, local_folder=None, timeout=None, pin=True, show_logs=False):
+      calls.append(cid)
+      released.wait(5)
+      return {"NAME": cid}
+    plugin.r1fs.get_json = get_json
+    for index in range(6):
+      with self.assertRaisesRegex(RuntimeError, "unavailable"):
+        plugin._load_legacy_pipeline("cid-%d" % index)
+    deadline = time.monotonic() + 5
+    while len(calls) < 4 and time.monotonic() < deadline:
+      time.sleep(0.01)
+    self.assertEqual(sorted(calls), ["cid-0", "cid-1", "cid-2", "cid-3"])
+    released.set()
+    for thread in threading.enumerate():
+      if thread.name == "dauth-r1fs-read":
+        thread.join(5)
+    # A refused document was not marked as failed: its read starts on the next try.
+    self.assertEqual(plugin._load_legacy_pipeline("cid-4"), {"NAME": "cid-4"})
+    self.assertEqual(plugin._load_legacy_pipeline("cid-0"), {"NAME": "cid-0"})  # read meanwhile, from the memo
+    self.assertEqual(sorted(calls), ["cid-0", "cid-1", "cid-2", "cid-3", "cid-4"])
+
   def test_cached_bundle_does_not_require_peer_synchronization(self):
     plugin = existing_job()
     plugin.chainstore_hsync.side_effect = RuntimeError("Peers are unavailable")
@@ -188,6 +245,7 @@ class ExistingPipelineSecretTests(unittest.TestCase):
         node = Orchestrator.__new__(Orchestrator)
         node._blockchain_manager = engine
         node._current_dct_config_streams = {"existing": json.loads(saved.read_text())}
+        node._runtime_secret_settled_streams = None  # as Orchestrator.__init__ leaves it
         messages = []
         node.P = lambda message, **kwargs: messages.append(message)
         node._ensure_runtime_secret_resolution_state()

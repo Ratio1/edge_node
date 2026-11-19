@@ -30,7 +30,7 @@ from typing import Any
 from urllib import error, request
 
 TERMINAL_JOB_STATUSES = {"finalized", "done", "completed"}
-FAILED_JOB_STATUSES = {"failed", "cancelled", "canceled", "error"}
+FAILED_JOB_STATUSES = {"failed", "cancelled", "canceled", "error", "stopped"}
 
 
 def http_post(url: str, payload: dict, timeout: int = 30) -> dict:
@@ -48,7 +48,7 @@ def http_get(url: str, timeout: int = 15) -> dict:
     return json.loads(resp.read().decode("utf-8"))
 
 
-def launch_blackbox(rm: str, target: str, task_name: str = "e2e-blackbox") -> str:
+def launch_blackbox(rm: str, target: str, task_name: str = "e2e-blackbox", threads: int = 1) -> str:
   resp = http_post(f"{rm}/launch_network_scan", {
     "target": target,
     "start_port": 1, "end_port": 200,
@@ -61,7 +61,10 @@ def launch_blackbox(rm: str, target: str, task_name: str = "e2e-blackbox") -> st
     "selected_peers": [], "redact_credentials": True, "ics_safe_mode": False,
     "scanner_identity": "redmesh", "scanner_user_agent": "RedMesh/e2e",
     "authorized": True, "created_by_name": "e2e", "created_by_id": "e2e",
-    "nr_local_workers": 1, "target_confirmation": target,
+    "nr_local_workers": threads, "target_confirmation": target,
+    # Delay 0 and ICS safe mode off need confirming; so do threads above the production default (1).
+    "unsafe_launch_confirmations": ["dune-delay-below-production", "ics-safe-mode-off"]
+                                   + (["threads-per-node-raised"] if threads > 1 else []),
   })
   job_id = resp.get("result", {}).get("job_specs", {}).get("job_id")
   if not job_id:
@@ -364,6 +367,49 @@ def assert_legacy_finding_fields(aggregated: dict) -> list[str]:
   return failures
 
 
+def assert_pass_coverage(archive: dict) -> list[str]:
+  """RM-214 invariant on the last pass: each node report covers what its
+  threads covered, and the UI aggregate lists every node's open ports."""
+  passes = archive_passes(archive)
+  if not passes:
+    return ["archive has no passes"]
+  failures: list[str] = []
+  pr = passes[-1]
+  nodes = pr.get("worker_reports") or {}
+  threads_by_node = {a: (e or {}).get("threads") or {} for a, e in (pr.get("worker_scan_metrics") or {}).items()}
+  failures += [f"{addr}: thread metrics but no node report" for addr in sorted(set(threads_by_node) - set(nodes))]
+  assigned = set((archive.get("job_config") or {}).get("selected_peers") or [])  # a node missing from both maps
+  failures += [f"{addr}: assigned but no node report" for addr in sorted(assigned - set(nodes) - set(threads_by_node))]
+  requested = (archive.get("job_config") or {}).get("nr_local_workers")  # a thread missing from both sides
+  if isinstance(requested, int):
+    for a, t in sorted(threads_by_node.items()):
+      ports = (nodes.get(a) or {}).get("ports_scanned")
+      nr_ports = len(ports) if isinstance(ports, list) else ports
+      expected = min(requested, nr_ports) if isinstance(nr_ports, int) and nr_ports > 0 else requested  # launch caps threads at ports
+      if len(t) != expected:
+        failures.append(f"{a}: {len(t)} thread metrics, {expected} threads expected")
+  for addr, node in sorted(nodes.items()):
+    threads = threads_by_node.get(addr)
+    if not threads and isinstance(requested, int):
+      failures.append(f"{addr}: node report but no thread metrics")
+      continue
+    if not threads:
+      print(f"  coverage: {addr} has no thread metrics, thread check skipped", flush=True)
+      continue
+    counts = [t.get("ports_scanned", 0) for t in threads.values()]
+    scanned = sum(counts) if all(isinstance(c, int) for c in counts) else None  # graybox: lists
+    if scanned is not None and node.get("ports_scanned") != scanned:
+      failures.append(f"{addr}: ports_scanned {node.get('ports_scanned')} != thread sum {scanned}")
+    union = {p for t in threads.values() for p in t.get("open_ports", [])}
+    if set(node.get("open_ports", [])) != union:
+      failures.append(f"{addr}: open_ports {sorted(node.get('open_ports', []))} != thread union {sorted(union)}")
+  node_union = {p for n in nodes.values() for p in n.get("open_ports", [])}
+  ui_ports = set((archive.get("ui_aggregate") or {}).get("total_open_ports", []))
+  if ui_ports != node_union:
+    failures.append(f"ui_aggregate.total_open_ports {sorted(ui_ports)} != node union {sorted(node_union)}")
+  return failures
+
+
 def run_scenario(
   rm: str,
   name: str,
@@ -417,6 +463,7 @@ def run_scenario(
   failures = []
   failures += assert_no_dup_findings(aggregated, name)
   failures += assert_legacy_finding_fields(aggregated)
+  failures += assert_pass_coverage(archive)
 
   if failures:
     print(f"  FAIL ({len(failures)}):", flush=True)
@@ -437,6 +484,8 @@ def main() -> int:
                       help="Per-scenario bounded wait for scan/report finalization.")
   parser.add_argument("--poll-timeout", type=int, default=15,
                       help="Per-request timeout for control-plane polling.")
+  parser.add_argument("--threads", type=int, default=4,  # >1 so the thread merge is exercised
+                      help="Local scan threads per node (nr_local_workers) for the blackbox scenario.")
   args = parser.parse_args()
 
   results: list[dict] = []
@@ -445,7 +494,7 @@ def main() -> int:
       results.append(run_scenario(
         args.rm1, "blackbox", launch_blackbox,
         timeout=args.timeout, poll_timeout=args.poll_timeout,
-        target=args.target,
+        target=args.target, threads=args.threads,
       ))
     except Exception as exc:
       print(f"  EXCEPTION: {exc}", flush=True)

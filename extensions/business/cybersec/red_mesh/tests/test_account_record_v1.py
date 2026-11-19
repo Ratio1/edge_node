@@ -30,6 +30,7 @@ from extensions.business.cybersec.red_mesh.tenancy.identity import (
 
 HKEY = "app_x:auth"
 ACCOUNT = "ops.user"
+CREATED = "2026-01-01T00:00:00.000Z"
 GEN = "2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d"
 T1 = "tn_12345678-1234-4234-8234-123456789abc"
 T2 = "tn_87654321-4321-4321-8321-cba987654321"
@@ -75,11 +76,11 @@ def reader(records):
 class TestParseAccountRecord(unittest.TestCase):
   def test_a_valid_record_yields_state_generation_and_memberships(self):
     parsed = parse_account_record(record(memberships=[{"role": "tenant_admin", "tenant_id": T1}]), ACCOUNT)
-    self.assertEqual(parsed, ("active", GEN, (("tenant_admin", T1),)))
+    self.assertEqual(parsed, ("active", GEN, (("tenant_admin", T1),), CREATED))
 
   def test_accepts_a_json_string_and_an_empty_membership_list(self):
     parsed = parse_account_record(json.dumps(record()), ACCOUNT)
-    self.assertEqual(parsed, ("active", GEN, ()))
+    self.assertEqual(parsed, ("active", GEN, (), CREATED))
 
   def test_absent_and_tombstoned_records_are_indistinguishable_from_malformed(self):
     # A caller that could tell these apart could enumerate which account names exist.

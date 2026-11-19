@@ -49,6 +49,8 @@ class AccountView:
   state: str = "active"
   tenant_memberships: tuple[TenantMembership, ...] = ()
   account_generation: str | None = None
+  # RM-155: the account record's `createdAt`; binds a profile to this incarnation of the account id.
+  created_at: str | None = None
 
   @property
   def created_by(self):

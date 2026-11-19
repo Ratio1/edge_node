@@ -23,7 +23,7 @@ from uuid import uuid4
 
 import pytest
 
-from .read_endpoint_fixtures import allow_pentester, as_role, read_endpoint_fixture
+from .read_endpoint_fixtures import allow_pentester, as_role, designate_reviewer, read_endpoint_fixture
 from .contract_fixture import contract_terms
 
 OTHER_TENANT = "tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f"
@@ -40,10 +40,13 @@ ENDPOINTS = (
   ("delete_job_engagement", {"delete_documents": False}, ("super_tenant_admin",), ()),
   ("stop_monitoring", {"stop_type": "SOFT"},
    ("tenant_pentester", "super_pentester", "super_tenant_admin"), ("tenant_pentester",)),
+  # RM-155: a Tenant Admin may review too (the caller is designated below), under the same switch.
   ("approve_report", {"expected_review_revision": 1, "note": "ok"},
-   ("tenant_pentester", "super_pentester", "super_tenant_admin"), ("tenant_pentester",)),
+   ("tenant_admin", "tenant_pentester", "super_pentester", "super_tenant_admin"),
+   ("tenant_admin", "tenant_pentester")),
   ("reject_report", {"expected_review_revision": 1, "note": "not yet"},
-   ("tenant_pentester", "super_pentester", "super_tenant_admin"), ("tenant_pentester",)),
+   ("tenant_admin", "tenant_pentester", "super_pentester", "super_tenant_admin"),
+   ("tenant_admin", "tenant_pentester")),
 )
 ALL_ROLES = ("tenant_user", "tenant_pentester", "tenant_admin", "super_pentester",
              "super_tenant_admin")
@@ -62,6 +65,9 @@ def invoke(fixture, name, extra, *, tenant_id):
   is about the denial.
   """
   method = getattr(fixture.Plugin, name)
+  if name in ("approve_report", "reject_report"):
+    # The caller is a designated reviewer: these tests are about the role and the switch.
+    designate_reviewer(fixture)
   arguments = dict(extra, request_actor=fixture.actor, tenant_id=tenant_id)
   if name not in JOBLESS:
     arguments["job_id"] = "job-1"

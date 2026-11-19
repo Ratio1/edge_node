@@ -14,6 +14,7 @@ from .deployment_operations import (
 
 from .deployment_mutations import _DeploymentMutationsMixin
 from .deeploy_mixin import _DeeployMixin
+from .delegate_aliases import _DelegateAliasesMixin  # Optional metadata stays separate from deployment behavior.
 from .selected_secrets import compile_request_selections
 from .deeploy_chainstore_response_mixin import _DeeployChainstoreResponseMixin
 from .deeploy_target_nodes_mixin import _DeeployTargetNodesMixin
@@ -47,10 +48,19 @@ _CONFIG = {
 
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
   'WARMUP_DELAY' : 300,
-  'PIPELINES_CHECK_DELAY' : 300,
   'MIN_ETH_BALANCE' : 0.0003,
 
   'REQUESTS_CSTORE_HKEY': 'DEEPLOY_REQUESTS',
+  # The endpoints that change state are recorded under this oracle's id, so that the other oracles can see the
+  # requests it received (the request-tracking mixin says when a write happens): deploy, update, scale up,
+  # delete, the commands to a running app, the CSP escrow reconciliation and the preferred-node save. Reads are
+  # not recorded: the status poll that a client repeats every 2 s used to be one chain-store write per poll,
+  # stored and saved again by every oracle.
+  'REQUESTS_TRACKED_ENDPOINTS': ['create_pipeline', 'update_pipeline', 'scale_up_job_workers', 'delete_pipeline', 'send_instance_command', 'send_app_command', 'reconcile_csp_escrow_jobs', 'save_preferred_nodes'],
+  # At most one write of the record every 30 s (two a minute), however often the endpoints above are called.
+  # A change after a quiet period is written by the next process() call that runs past WARMUP_DELAY; process()
+  # runs at the end of the plugin lap, after the queued requests.
+  'REQUESTS_SAVE_INTERVAL': 30,
   'REQUESTS_LOG_INTERVAL' : 5 * 60,
   'REQUESTS_MAX_RECORDS' : 2,
 
@@ -64,6 +74,7 @@ _CONFIG = {
 class DeeployManagerApiPlugin(
   BasePlugin,
   _DeeployMixin,
+  _DelegateAliasesMixin,  # Share alias validation and CStore persistence across both endpoints.
   _DeeployChainstoreResponseMixin,
   _DeeployTargetNodesMixin,
   _NodeTagsMixin,
@@ -97,7 +108,6 @@ class DeeployManagerApiPlugin(
       )
     )
     self.__warmup_start_time = self.time()
-    self.__last_pipelines_check_time = 0
     if not self.__check_eth_balance():
       self.P(
         f"Shutting down tunnel engine for {self.__class__.__name__} due to insufficient ETH balance "
@@ -377,6 +387,68 @@ class DeeployManagerApiPlugin(
       result[DEEPLOY_KEYS.TRACE] = lines[-20:-1]
     return result
     
+
+  @BasePlugin.endpoint(method="post")
+  def get_delegate_aliases(self, request: dict):
+    """
+    Read optional aliases for active delegates of the authenticated CSP.
+
+    Parameters
+    ----------
+    request : dict
+        Signed Deeploy payload with ``delegate_addresses`` (at most 10).
+
+    Returns
+    -------
+    dict
+        Standard Deeploy response with ``aliases`` on success or ``error``
+        on failure. Missing aliases are omitted.
+
+    Examples
+    --------
+    >>> plugin.get_delegate_aliases(signed_request)['aliases']
+    {}
+    """
+    try:
+      _, inputs = self.deeploy_verify_and_get_inputs(request, request_type="get delegate aliases")  # Authenticate the complete read payload and active CSP membership.
+      auth_result = self.deeploy_get_auth_result(inputs)  # Reuse the established escrow resolution contract.
+      aliases = self.deeploy_load_delegate_aliases(auth_result, inputs.get("delegate_addresses"))  # Verify targets and read only this CSP's metadata.
+      result = {DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS, "aliases": aliases}
+    except Exception as exc:
+      result = self.__handle_error(exc, request)  # Preserve the existing API failure envelope.
+    return self._get_response(result)  # Keep response signing and server metadata unchanged.
+
+  @BasePlugin.endpoint(method="post")
+  def set_delegate_alias(self, request: dict):
+    """
+    Set or clear one optional delegate alias as the escrow owner.
+
+    Parameters
+    ----------
+    request : dict
+        Signed Deeploy payload with ``delegate_address`` and string ``alias``.
+        A blank alias clears the label without touching permissions.
+
+    Returns
+    -------
+    dict
+        Standard Deeploy response with normalized ``delegate_address`` and
+        ``alias`` on success, or ``error`` on failure.
+
+    Examples
+    --------
+    >>> plugin.set_delegate_alias(signed_clear_request)['alias']
+    ''
+    """
+    try:
+      sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type="set delegate alias")  # Verify the signature before using any caller-supplied fields.
+      auth_result = self.deeploy_get_auth_result(inputs)  # Resolve scope from the signer, not request parameters.
+      saved = self.deeploy_set_delegate_alias(sender, auth_result, inputs.get("delegate_address"), inputs.get("alias"))  # Owner and membership checks precede the per-address write.
+      result = {DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS, **saved}
+    except Exception as exc:
+      result = self.__handle_error(exc, request)  # Storage, validation, and auth failures use the standard envelope.
+    return self._get_response(result)  # Preserve the established response wrapper.
+
 
   @BasePlugin.endpoint(method="post")
   # /get_apps
@@ -1695,13 +1767,10 @@ class DeeployManagerApiPlugin(
     if not self.is_deeploy_warmed_up():
       return
 
-    if (self.time() - self.__last_pipelines_check_time) > self.cfg_pipelines_check_delay:
-      try:
-        if not any(operation["phase"] != "completed" for operation in self._operation_records().values()):
-          self.check_running_pipelines_and_add_to_r1fs()
-      except Exception as e:
-        self.P(f"Error checking running pipelines: {e}", color='r')
-      self.__last_pipelines_check_time = self.time()
+    try:
+      self._maybe_admit_node_relinks()
+    except Exception as e:
+      self.P(f"Error moving jobs from relinked nodes: {e}", color='r')
 
     self._maybe_log_and_save_tracked_requests()
     return

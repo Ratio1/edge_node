@@ -166,7 +166,9 @@ def is_tombstone(raw):
 
 
 def parse_account_record(raw, account_id):
-  """``(state, generation, memberships)`` for a valid v1 record, else ``None``.
+  """``(state, generation, memberships, created_at)`` for a valid v1 record, else ``None``.
+
+  RM-155: the creation instant binds an account profile to one incarnation of the account id.
 
   ``None`` covers absent, tombstoned and malformed alike. The caller must not distinguish them: to a
   prober, "no such account", "removed" and "unreadable" have to look the same, and to the
@@ -225,4 +227,4 @@ def parse_account_record(raw, account_id):
   # A record that is not active got there by a state change, so it carries who made it and when.
   if raw["state"] != "active" and "stateChangedAt" not in raw:
     return None
-  return raw["state"], raw["generation"], memberships
+  return raw["state"], raw["generation"], memberships, raw["createdAt"]

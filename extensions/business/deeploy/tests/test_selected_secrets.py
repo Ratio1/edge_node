@@ -161,10 +161,12 @@ class SelectedSecretTests(unittest.TestCase):
     self.assertEqual(instance(bundle["job_secrets"])["ENV"]["CUSTOM_VALUE"], "")
     self.assertIsNotNone(state)
 
-  def test_r1fs_preserves_dynamic_reference_and_selection_path_order(self):
+  def test_r1fs_preserves_every_list_order(self):
     source = pipeline({
       "SECRET_PATHS": [["ENV", "Z"], ["PER_NODE_CONFIG", "byNode", "node", "DYNAMIC_ENV", "URL"]],
       "DYNAMIC_ENV": {"URL": [{"type": "shmem", "path": ["z-provider", "A_KEY"]}]},
+      "BUILD_AND_RUN_COMMANDS": ["pip install -r requirements.txt", "gunicorn app:app"],
+      "PER_NODE_TARGET_NODES": ["node-b", "node-a"],
     })
     sorted_pipeline = _SecretStagingPlugin()._recursively_sort_pipeline_data(source)
     self.assertEqual(instance(sorted_pipeline), instance(source))

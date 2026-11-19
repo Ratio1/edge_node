@@ -310,16 +310,16 @@ def _attestation_required(job_specs, job_config) -> bool:
   return False
 
 
-def _mark_attestation_failed(owner, job_key, job_specs, *, job_id, pass_nr, message):
-  job_specs["failure_class"] = "attestation_failed"
+def _mark_job_failed(owner, job_key, job_specs, *, job_id, pass_nr, failure_class, message, meta=None):
+  job_specs["failure_class"] = failure_class
   job_specs["failure_message"] = message
   set_job_status(job_specs, JOB_STATUS_FAILED)
   owner._emit_timeline_event(
     job_specs,
-    "attestation_failed",
+    failure_class,
     message,
     actor_type="system",
-    meta={"pass_nr": pass_nr, "failure_class": "attestation_failed"},
+    meta={"pass_nr": pass_nr, "failure_class": failure_class, **(meta or {})},
   )
   emit_lifecycle_event(
     owner,
@@ -329,7 +329,7 @@ def _mark_attestation_failed(owner, job_key, job_specs, *, job_id, pass_nr, mess
     event_outcome="failure",
     pass_nr=pass_nr,
   )
-  _write_job_record(owner, job_key, job_specs, context="attestation_failed")
+  _write_job_record(owner, job_key, job_specs, context=failure_class)
   owner._build_job_archive(job_key, job_specs)
   owner._clear_live_progress(job_id, list((job_specs.get("workers") or {}).keys()))
 
@@ -381,38 +381,6 @@ def _abort_reason_text(reason):
   text = redact_credential_text(str(reason or ""))
   text = " ".join(_CONTROL_CHARS_RE.sub(" ", text).split())
   return text[:_ABORT_REASON_MAX_CHARS] or "no reason recorded"
-
-
-def _mark_scan_aborted(owner, job_key, job_specs, *, job_id, pass_nr, abort_state):
-  """Mirror of `_mark_attestation_failed` for a first pass that tested nothing."""
-  phase = abort_state["abort_phase"] or "unknown"
-  message = f"Scan aborted during {phase}: {_abort_reason_text(abort_state['abort_reason'])}"
-  job_specs["failure_class"] = "scan_aborted"
-  job_specs["failure_message"] = message
-  set_job_status(job_specs, JOB_STATUS_FAILED)
-  owner._emit_timeline_event(
-    job_specs,
-    "scan_aborted",
-    message,
-    actor_type="system",
-    meta={
-      "pass_nr": pass_nr,
-      "failure_class": "scan_aborted",
-      "abort_phase": phase,
-      "abort_reason_class": abort_state["abort_reason_class"],
-    },
-  )
-  emit_lifecycle_event(
-    owner,
-    job_specs,
-    event_type="redmesh.job.failed",
-    event_action="failed",
-    event_outcome="failure",
-    pass_nr=pass_nr,
-  )
-  _write_job_record(owner, job_key, job_specs, context="scan_aborted")
-  owner._build_job_archive(job_key, job_specs)
-  owner._clear_live_progress(job_id, list((job_specs.get("workers") or {}).keys()))
 
 
 def _ensure_rulebook_assessment_after_pass(owner, job_specs, *, job_id, pass_nr):
@@ -541,14 +509,29 @@ def maybe_finalize_pass(owner):
           f"{worker_cls.__name__ if worker_cls else 'default'} "
           f"({len(node_reports)} worker reports)"
         )
+        if not aggregated:
+          _mark_job_failed(
+            owner, job_key, job_specs, job_id=job_id, pass_nr=job_pass,
+            failure_class="report_aggregation_failed",
+            message="Worker reports could not be merged into a pass report",
+          )
+          continue
 
       risk_score = 0
       flat_findings = []
+      host_triage = {}
       risk_result = None
       abort_state = _pass_abort_state(aggregated, node_reports)
       empty_abort = bool(abort_state and abort_state["empty"])
       if aggregated:
-        risk_result, flat_findings = owner._compute_risk_and_findings(aggregated)
+        # The host triage map (report-findings.md §Triage): a closed finding leaves this pass's score and a
+        # confirmed possible one is scored certain. A failed read scores as if nothing were triaged.
+        try:
+          host_triage = _job_repo(owner).list_triage_for_record(job_specs)
+        except Exception as exc:
+          owner.P(f"[FINALIZE] {job_id} host triage unavailable: {type(exc).__name__}", color='y')
+          host_triage = {}
+        risk_result, flat_findings = owner._compute_risk_and_findings(aggregated, host_triage)
         risk_score = risk_result["score"]
         if empty_abort:
           # Nothing was tested, so there is nothing to score. The flat findings
@@ -602,6 +585,7 @@ def maybe_finalize_pass(owner):
               owner._run_structured_report_sections,
               job_id=job_id,
               findings=flat_findings,
+              triage=host_triage,  # the live host map: closes and confirms findings for the analysis only
               aggregated_report=aggregated,
               engagement=(
                 job_config.get("engagement")
@@ -827,19 +811,20 @@ def maybe_finalize_pass(owner):
       job_specs = _ensure_rulebook_assessment_after_pass(owner, job_specs, job_id=job_id, pass_nr=job_pass)
 
       if required_attestation_failed:
-        _mark_attestation_failed(
-          owner,
-          job_key,
-          job_specs,
-          job_id=job_id,
-          pass_nr=job_pass,
+        _mark_job_failed(
+          owner, job_key, job_specs, job_id=job_id, pass_nr=job_pass,
+          failure_class="attestation_failed",
           message="Required terminal blockchain attestation was not submitted",
         )
         continue
 
       if empty_abort and job_pass <= 1:
-        _mark_scan_aborted(
-          owner, job_key, job_specs, job_id=job_id, pass_nr=job_pass, abort_state=abort_state,
+        phase = abort_state["abort_phase"] or "unknown"
+        _mark_job_failed(
+          owner, job_key, job_specs, job_id=job_id, pass_nr=job_pass,
+          failure_class="scan_aborted",
+          message=f"Scan aborted during {phase}: {_abort_reason_text(abort_state['abort_reason'])}",
+          meta={"abort_phase": phase, "abort_reason_class": abort_state["abort_reason_class"]},
         )
         continue
       if empty_abort:

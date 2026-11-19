@@ -6781,35 +6781,6 @@ class _DeeployMixin:
       return False
     return True
 
-  def check_running_pipelines_and_add_to_r1fs(self):
-    self.P(f"Checking running pipelines and adding them to R1FS...")
-    running_pipelines = self.netmon.network_known_pipelines()
-    self.P(f"Retrieved pipelines from {len(running_pipelines)} nodes from NetMon.")
-    listed_job_ids = self.list_all_deployed_jobs_from_cstore()
-    self.P(f"Retrieved {len(listed_job_ids)} listed job IDs from CSTORE.")
-    netmon_job_ids = {}
-    for node, pipelines in running_pipelines.items():
-      for pipeline in pipelines:
-        deeploy_specs = pipeline.get(ct.CONFIG_STREAM.DEEPLOY_SPECS, None)
-        if deeploy_specs:
-          job_id = deeploy_specs.get(DEEPLOY_KEYS.JOB_ID, None)
-          if job_id in netmon_job_ids or not job_id:
-            continue
-          netmon_job_ids[job_id] = pipeline
-    # endfor running pipelines
-    self.P(f"Identified {len(netmon_job_ids)} unique job IDs from running pipelines in NetMon.")
-    for netmon_job_id, pipeline in netmon_job_ids.items():
-      listed_job_cid = listed_job_ids.get(str(netmon_job_id), None)
-      if listed_job_cid and len(listed_job_cid)  == 46:
-        continue
-      self.save_job_pipeline_in_cstore(pipeline, netmon_job_id)
-    # endfor job IDs
-    # This should log how many new job pipelines were added to R1FS and how many were already listed,
-    # but at the moment save_job_pipeline_in_cstore does not return a value to determine that, so we log
-    # that we checked all job IDs.
-    self.P(f"Checked all job IDs.")
-    return netmon_job_ids
-  
   def delete_pipeline_from_nodes(self, app_id=None, job_id=None, owner=None, target_nodes=None, allow_missing=False, discovered_instances=None):
     if not target_nodes:
       target_nodes = None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import ipaddress
 import json
 import math
 import re
@@ -27,7 +28,6 @@ from ..models import (
   RulebookSubmissionReference,
   RulebookSubmissionRegistry,
   VALID_RULEBOOK_ANSWER_VALUES,
-  normalize_triage_status as _normalize_triage_status,
   VALID_RULEBOOK_CHECK_STATUSES,
   VALID_RULEBOOK_REVIEW_STATES,
 )
@@ -37,6 +37,13 @@ from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode
 from ..tenancy.administration import AdministrationDenied
 from ..tenancy.ports import TenantStoreError
 from .event_redaction import stable_hmac_pseudonym, strip_sensitive_fields
+# RM-120 phase 5: finding classification moved to the shared evidence engine; the names stay
+# importable from here for the callers and tests that reach them through this module.
+from .evidence_engine import (  # noqa: F401
+  _ACCESS_KEYWORDS, _CLOSED_TRIAGE_STATUSES, _CRYPTO_KEYWORDS, _GAP_SEVERITIES, _REVIEW_SEVERITIES,
+  _finding_id, _is_actionable_finding, _matches_keywords, _search_text, _severity, _triage_status,
+  soc_outcome,
+)
 from .scan_guards import reject_model_test_for_scan_operation
 
 
@@ -90,18 +97,6 @@ _UNLABELLED_HEX_RE = re.compile(
   r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{32,128}(?![A-Fa-f0-9])"
 )
 
-_CLOSED_TRIAGE_STATUSES = {"false_positive", "remediated"}
-_GAP_SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM"}
-_REVIEW_SEVERITIES = {"LOW", "INFO", "INFORMATIONAL", "INCONCLUSIVE"}
-_ACCESS_KEYWORDS = {
-  "access", "auth", "authorization", "authentication", "credential", "credentials",
-  "login", "mfa", "password", "privilege", "session", "token", "cwe-287",
-  "cwe-306", "cwe-798", "a01", "a07",
-}
-_CRYPTO_KEYWORDS = {
-  "certificate", "cipher", "cleartext", "crypto", "cryptographic", "encryption",
-  "https", "ssl", "tls", "transport", "x509",
-}
 
 
 NIS2_BASELINE_PROFILE = {
@@ -269,7 +264,22 @@ def _target_values(job_config, job_specs=None):
   return [value for value in dict.fromkeys(values) if value]
 
 
-def _safe_text(value, *, hmac_secret, redaction_values=None, max_len=1000):
+def _is_private_ipv4(text):
+  try:
+    return ipaddress.IPv4Address(text).is_private
+  except ValueError:
+    return False
+
+
+def _safe_text(value, *, hmac_secret, redaction_values=None, max_len=1000, keep_private_ips=False):
+  """Redact `value` for the rulebook evidence surface.
+
+  `keep_private_ips` leaves RFC1918/loopback/link-local IPv4 literals readable
+  (finding titles only): a private address in a title such as "FTP PASV leaks
+  internal IP: 192.168.48.2" is the finding's subject, not a credential, and the
+  finding card prints it. Target addresses are still pseudonymised first via
+  `redaction_values`; public addresses and every credential rule are unchanged.
+  """
   if value is None:
     return ""
   if isinstance(value, (dict, list)):
@@ -290,6 +300,8 @@ def _safe_text(value, *, hmac_secret, redaction_values=None, max_len=1000):
     return f"{match.group(1)}=<redacted>"
 
   def _replace_ip(match):
+    if keep_private_ips and _is_private_ipv4(match.group(0)):
+      return match.group(0)
     return stable_hmac_pseudonym(match.group(0), hmac_secret, prefix="ip")
 
   text = _PEM_PRIVATE_KEY_RE.sub("<redacted-private-key>", text)
@@ -421,66 +433,12 @@ def _resolve_scan_context(owner, job_id, pass_nr=None, *, checked_job=_UNSET):
   }, None
 
 
-def _finding_id(finding):
-  return str(finding.get("finding_id") or finding.get("id") or "").strip()
-
-
-def _severity(finding):
-  return str(finding.get("severity") or "").strip().upper()
-
-
-def _triage_status(finding, triage_map):
-  """The live triage status, whichever vocabulary the value was written in.
-
-  `triage_state` on a finding used a different vocabulary from the one
-  `_CLOSED_TRIAGE_STATUSES` is written in, and they overlapped on one value — so
-  a finding remediated and marked `fixed` matched nothing and stayed actionable
-  after it had been dealt with.
-  """
-  triage = triage_map.get(_finding_id(finding))
-  if isinstance(triage, dict):
-    return _normalize_triage_status(triage.get("status"))
-  return _normalize_triage_status(
-    (finding.get("triage") or {}).get("status") or finding.get("triage_state")
-  )
-
-
-def _is_actionable_finding(finding, triage_map):
-  if not isinstance(finding, dict):
-    return False
-  finding_status = str(finding.get("status") or "").strip().lower()
-  if finding_status == "not_vulnerable":
-    return False
-  if _triage_status(finding, triage_map) in _CLOSED_TRIAGE_STATUSES:
-    return False
-  return bool(_finding_id(finding) or finding.get("title") or finding.get("description"))
-
-
-def _search_text(finding):
-  parts = [
-    finding.get("title"),
-    finding.get("description"),
-    finding.get("category"),
-    finding.get("probe"),
-    finding.get("cwe_id"),
-    finding.get("owasp_id"),
-    finding.get("cve"),
-    finding.get("cve_id"),
-  ]
-  return " ".join(str(part).lower() for part in parts if part)
-
-
-def _matches_keywords(finding, keywords):
-  text = _search_text(finding)
-  return any(keyword in text for keyword in keywords)
-
-
 def _safe_finding_ref(finding, *, hmac_secret, redaction_values, triage_map):
   payload = {
     "type": "finding",
     "finding_id": _safe_text(_finding_id(finding), hmac_secret=hmac_secret, redaction_values=redaction_values, max_len=160),
     "severity": _severity(finding),
-    "title": _safe_text(finding.get("title") or "Untitled finding", hmac_secret=hmac_secret, redaction_values=redaction_values, max_len=240),
+    "title": _safe_text(finding.get("title") or "Untitled finding", hmac_secret=hmac_secret, redaction_values=redaction_values, max_len=240, keep_private_ips=True),
     "category": _safe_text(finding.get("category") or "", hmac_secret=hmac_secret, redaction_values=redaction_values, max_len=120),
     "probe": _safe_text(finding.get("probe") or "", hmac_secret=hmac_secret, redaction_values=redaction_values, max_len=160),
     "cwe_id": _safe_text(finding.get("cwe_id") or "", hmac_secret=hmac_secret, redaction_values=redaction_values, max_len=80),
@@ -562,24 +520,15 @@ def _automated_check_result(check, ctx, *, hmac_secret, redaction_values, triage
   elif signal_kind == "soc_incident_evidence":
     soc = ctx["job_specs"].get("soc_event_status") or ctx["archive"].get("soc_event_status")
     detection = ctx["job_specs"].get("detection_correlation") or ctx["archive"].get("detection_correlation")
-    status_text = " ".join(
-      str(item).lower()
-      for item in [
-        (soc or {}).get("last_status") if isinstance(soc, dict) else "",
-        (soc or {}).get("status") if isinstance(soc, dict) else "",
-        (soc or {}).get("outcome") if isinstance(soc, dict) else "",
-        (detection or {}).get("status") if isinstance(detection, dict) else "",
-      ]
-      if item
-    )
-    if any(token in status_text for token in ("sent", "completed", "success", "ok")):
+    outcome = soc_outcome(soc, detection)
+    if outcome == "completed":
       result = {
         "status": "supported",
         "summary": "RedMesh has SOC export or detection-correlation metadata for this job.",
         "gap_reason": "",
         "evidence_refs": [{"type": "job_metadata", "fields": ["soc_event_status", "detection_correlation"]}],
       }
-    elif isinstance(soc, dict) or isinstance(detection, dict):
+    elif outcome == "present":
       result = {
         "status": "needs_review",
         "summary": "SOC or detection metadata exists but does not show a completed export/correlation outcome.",
@@ -804,7 +753,7 @@ def build_rulebook_assessment(
   redaction_values = _target_values(ctx["job_config"], job_specs)
   target_value = (redaction_values or [job_id or "unknown"])[0]
   target_pseudonym = stable_hmac_pseudonym(target_value, hmac_secret, prefix="target")
-  triage_map = _job_repo(owner).list_job_triage(job_id)
+  triage_map = _job_repo(owner).list_triage_for_record(job_specs)
   review = _job_repo(owner).get_rulebook_review_model(job_id, profile["profile_id"]) if include_review else None
 
   checks = []

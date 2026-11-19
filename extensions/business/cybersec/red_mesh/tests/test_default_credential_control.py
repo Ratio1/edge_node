@@ -11,6 +11,7 @@ reached the verdict.
 
 import ftplib
 import socket
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -75,20 +76,94 @@ class TestDefaultCredentialVerdict(unittest.TestCase):
     self.assertEqual(_default_credential_findings("SSH", [], control=CONTROL_ACCEPTED), [])
 
 
+class _ExecServer(paramiko.ServerInterface):
+  """Answers `id`. With `closes_before_reply`, it sends the output, the exit status and the channel
+  close before it answers the exec request, as cowrie does (RM-103 iteration 2)."""
+
+  def __init__(self, closes_before_reply):
+    self.closes_before_reply = closes_before_reply
+
+  def check_auth_password(self, username, password):
+    return paramiko.AUTH_SUCCESSFUL
+
+  def get_allowed_auths(self, username):
+    return "password"
+
+  def check_channel_request(self, kind, chanid):
+    return paramiko.OPEN_SUCCEEDED
+
+  def check_channel_exec_request(self, channel, command):
+    def run():
+      channel.send(b"uid=0(root) gid=0(root) groups=0(root)\n")
+      channel.send_exit_status(0)
+      channel.close()
+    if self.closes_before_reply:
+      run()
+    else:
+      threading.Thread(target=run, daemon=True).start()
+    return True
+
+
+_HOST_KEY = None
+
+
+def _loopback_ssh_client(closes_before_reply):
+  """An authenticated paramiko client connected to an in-process server on 127.0.0.1."""
+  global _HOST_KEY
+  if _HOST_KEY is None:
+    _HOST_KEY = paramiko.RSAKey.generate(1024)
+  listener = socket.socket()
+  listener.bind(("127.0.0.1", 0))
+  listener.listen(1)
+  port = listener.getsockname()[1]
+
+  def serve():
+    conn, _ = listener.accept()
+    listener.close()
+    transport = paramiko.Transport(conn)
+    transport.add_server_key(_HOST_KEY)
+    transport.start_server(server=_ExecServer(closes_before_reply))
+
+  threading.Thread(target=serve, daemon=True).start()
+  client = paramiko.SSHClient()
+  client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+  client.connect("127.0.0.1", port=port, username="admin", password="admin",
+                 timeout=3, auth_timeout=3, look_for_keys=False, allow_agent=False)
+  return client
+
+
 class TestAuthenticatedActions(unittest.TestCase):
 
   def test_ssh_action_records_the_command_output(self):
     client = MagicMock()
-    stdout = MagicMock()
-    stdout.read.return_value = b"uid=0(root) gid=0(root)\n"
-    client.exec_command.return_value = (MagicMock(), stdout, MagicMock())
+    chan = client.get_transport.return_value.open_session.return_value
+    chan.recv.side_effect = [b"uid=0(root) gid=0(root)\n", b""]
     self.assertEqual(_ssh_authenticated_action(client, 4.5), "exec id -> uid=0(root) gid=0(root)")
-    client.exec_command.assert_called_once_with("id", timeout=4.5)
+    client.get_transport.return_value.open_session.assert_called_once_with(timeout=4.5)
+    chan.settimeout.assert_called_once_with(4.5)
+    chan.exec_command.assert_called_once_with("id")
 
   def test_ssh_action_failure_is_none_not_an_exception(self):
     client = MagicMock()
-    client.exec_command.side_effect = paramiko.SSHException("no channel")
+    client.get_transport.return_value.open_session.side_effect = paramiko.SSHException("no channel")
     self.assertIsNone(_ssh_authenticated_action(client, 3))
+
+  def test_ssh_action_refused_on_an_open_channel_is_none(self):
+    client = MagicMock()
+    chan = client.get_transport.return_value.open_session.return_value
+    chan.exec_command.side_effect = paramiko.SSHException("Channel request failed")
+    chan.closed = False
+    self.assertIsNone(_ssh_authenticated_action(client, 3))
+    chan.recv.assert_not_called()
+
+  def test_ssh_action_over_a_real_session(self):
+    for closes_before_reply in (False, True):
+      with self.subTest(closes_before_reply=closes_before_reply):
+        client = _loopback_ssh_client(closes_before_reply)
+        try:
+          self.assertEqual(_ssh_authenticated_action(client, 3), "exec id -> uid=0(root) gid=0(root) groups=0(root)")
+        finally:
+          client.close()
 
   def test_ftp_action_records_the_working_directory(self):
     ftp = MagicMock()
@@ -127,11 +202,13 @@ class TestSshProbeWiring(unittest.TestCase):
       def connect(self, target, port, username, password, **kwargs):
         if not accept(username, password):
           raise paramiko.AuthenticationException("rejected")
-      def exec_command(self, cmd, timeout=None):
-        commands.append(cmd)
-        stdout = MagicMock()
-        stdout.read.return_value = b"uid=0(root)"
-        return MagicMock(), stdout, MagicMock()
+      def get_transport(self):
+        chan = MagicMock()
+        chan.exec_command.side_effect = commands.append
+        chan.recv.side_effect = [b"uid=0(root)", b""]
+        transport = MagicMock()
+        transport.open_session.return_value = chan
+        return transport
       def close(self): pass
 
     worker = self._worker()

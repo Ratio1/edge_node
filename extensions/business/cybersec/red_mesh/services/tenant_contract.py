@@ -13,6 +13,8 @@ from .authorization_upload import AuthorizationUploadError, validate_document
 
 CONTRACT_KIND = "redmesh_tenant_contract"
 CONTRACT_FORMATS = ("application/pdf",)
+CERTIFICATE_KIND = "redmesh_account_certificate"
+CERTIFICATE_MAX_BYTES = 10 * 1024 * 1024
 _REF_FIELDS = ("sha256", "filename", "mime", "size_bytes", "uploaded_at", "uploaded_by")
 # The binding keys an envelope may carry (RM-109 drafts, RM-133 contract drafts); a resolver names
 # the ones it expects, the rest must be absent.
@@ -111,6 +113,27 @@ def store_branding_logo(documents, *, filename, content_b64, uploaded_by, now_fn
                 envelope_fields={"schema_version": "1.1", "document_kind": "branding_logo"}, accepted=LOGO_FORMATS)
 
 
+def store_account_certificate(documents, *, account_id, qualification_id, filename, content_b64, uploaded_by,
+                              now_fn=None):
+  """RM-155. A qualification's certificate (PDF, PNG or JPEG, at most 10 MB) in an envelope of its own
+  kind naming the account and the qualification, so no contract resolver accepts it."""
+  # Refused before decoding when the text alone is over the cap (base64 is 4 chars per 3 bytes).
+  if isinstance(content_b64, str) and len(content_b64) > (CERTIFICATE_MAX_BYTES + 2) // 3 * 4:
+    raise ContractRefused(400, "too_large")
+  return _store(documents, filename, content_b64, uploaded_by, now_fn, refusal=None, accepted=None,
+                kind=CERTIFICATE_KIND, max_bytes=CERTIFICATE_MAX_BYTES,
+                envelope_fields={"schema_version": "1.0", "account_id": account_id,
+                                 "qualification_id": qualification_id})
+
+
+def read_account_certificate(documents, certificate):
+  """RM-155. The stored certificate, served only while its bytes still match the profile row (the row
+  is the authority). A file the store does not return is 404 `not_found`; anything else 409
+  `document_integrity`."""
+  return read_contract(documents, certificate, absent=(404, "not_found"), kind=CERTIFICATE_KIND, accepted=None,
+                       integrity="document_integrity")
+
+
 def image_size(raw, mime):
   """`(width, height)` of a PNG (IHDR) or a baseline/extended/progressive JPEG (SOF0/1/2); None for
   anything else, a truncated file or another JPEG coding (which the PDF renderer cannot embed)."""
@@ -145,14 +168,16 @@ def image_size(raw, mime):
 
 
 def _store(documents, filename, content_b64, uploaded_by, now_fn, *, refusal, envelope_fields,
-           accepted=CONTRACT_FORMATS):
+           accepted=CONTRACT_FORMATS, kind=CONTRACT_KIND, max_bytes=None):
   try:
     document = validate_document(filename, content_b64, accepted=accepted)
   except AuthorizationUploadError as exc:
     raise ContractRefused(400, refusal or exc.code) from None
+  if max_bytes is not None and document.size_bytes > max_bytes:
+    raise ContractRefused(400, refusal or "too_large")
   uploaded_at = (now_fn or (lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")))()
   envelope = {
-    "kind": CONTRACT_KIND, **envelope_fields, "filename": document.filename,
+    "kind": kind, **envelope_fields, "filename": document.filename,
     "mime": document.mime, "size_bytes": document.size_bytes, "sha256": document.sha256_hex,
     "uploaded_at": uploaded_at, "uploaded_by": uploaded_by,
     "content_b64": content_b64 if isinstance(content_b64, str) else "",
@@ -258,25 +283,27 @@ def read_branding_logo(documents, logo):
           "content_b64": envelope["content_b64"]}
 
 
-def read_contract(documents, contract, absent=None):
+def read_contract(documents, contract, absent=None, *, kind=CONTRACT_KIND, accepted=CONTRACT_FORMATS,
+                  integrity="contract_integrity"):
   """The stored contract file, served only if it still matches the tenant record.
 
   The tenant record is the authority: the file's bytes are hashed and sized here and compared with
   the record, never with the envelope's own claims. Anything else is 409 `contract_integrity`.
   `absent` (status, error) answers a file the store does not return (RM-109 draft downloads: 404).
+  `kind`, `accepted` and `integrity` let another document family (RM-155 certificates) reuse the checks.
   """
   if contract.get("store") != documents.name:
     raise ContractRefused(503, "unavailable")
   envelope = documents.get(contract["ref"])
   if envelope is None and absent is not None:
     raise ContractRefused(*absent)
-  if not isinstance(envelope, dict) or envelope.get("kind") != CONTRACT_KIND:
-    raise ContractRefused(409, "contract_integrity")
+  if not isinstance(envelope, dict) or envelope.get("kind") != kind:
+    raise ContractRefused(409, integrity)
   try:
-    document = validate_document(contract["filename"], envelope.get("content_b64"), accepted=CONTRACT_FORMATS)
+    document = validate_document(contract["filename"], envelope.get("content_b64"), accepted=accepted)
   except AuthorizationUploadError:
-    raise ContractRefused(409, "contract_integrity") from None
+    raise ContractRefused(409, integrity) from None
   if document.sha256_hex != contract["sha256"] or document.size_bytes != contract["size_bytes"]:
-    raise ContractRefused(409, "contract_integrity")
+    raise ContractRefused(409, integrity)
   return {"filename": contract["filename"], "mime": document.mime, "size_bytes": document.size_bytes,
           "sha256": document.sha256_hex, "content_b64": envelope["content_b64"]}

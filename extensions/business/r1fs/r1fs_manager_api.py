@@ -10,6 +10,10 @@ _CONFIG = {
   'PORT': 31235, # dynamic
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
+  # Request-driven API with no process() of its own, running on every node: instead of lapping ~30 times a
+  # second while idle, a lap with nothing queued blocks up to 0.25 s on the core wake-up event, which a
+  # request, an input, an instance command or a stop ends at once. A core without this key ignores it.
+  'IDLE_LOOP_WAIT' : 0.25,
   
   'R1FS_VERBOSE' : 11,
   
@@ -180,35 +184,94 @@ class R1fsManagerApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="post", require_token=False)
   def add_file_base64(self, file_base64_str: str, filename: str = None, secret: str = None, nonce: int = None):  # first parameter must be named token
     """
-    Upload a file to R1FS using base64-encoded data.
-    
-    This endpoint accepts file data as a base64 string and stores it in the
-    decentralized file system. Useful for uploading files directly from web
-    applications without multipart form data.
-    
-    Args:
-        file_base64_str (str): Base64-encoded file data
-        filename (str, optional): Name for the file. If not provided, a unique name is generated
-        secret (str, optional): Encryption key for the file
-        nonce (int, optional): Nonce value for encryption
-    
-    Returns:
-        dict: Response containing the Content Identifier (CID) of the uploaded file
+    Upload a file to R1FS from base64-encoded data.
+
+    This endpoint accepts file data as a base64 string, for web applications that upload without multipart
+    form data. The decoded bytes are written into a new folder of their own under the node's output folder,
+    added to R1FS (encrypted with ``secret``), and that folder is removed again whether the add succeeded or
+    raised, so the node keeps no plaintext copy of the upload and never overwrites a file it already holds.
+
+    Parameters
+    ----------
+    file_base64_str : str
+        Base64-encoded file content.
+    filename : str, optional
+        Name stored with the object and given back on download; only its last part is stored. An absolute
+        name (such as ``/abs/x``), a name with a ``..`` part (such as ``../x`` or ``a/../../x``) or ``.`` is
+        refused. A relative directory part (such as ``app/run1/a.bin``) only creates folders inside the
+        per-request folder. A unique name (``r1fs_`` and 8 hex characters) is generated when it is omitted
+        or empty.
+    secret : str, optional
+        Encryption key. The engine's default key is used when it is omitted.
+    nonce : int, optional
+        Seed of a deterministic encryption nonce. A random nonce is used when it is omitted.
+
+    Returns
+    -------
+    dict
+        ``{'cid': <cid>}`` when the engine was called (the CID is None when the engine could not add the
+        file), or ``{'error': <message>, 'status_code': 400}`` when ``filename`` is refused; the web app
+        answers the latter with HTTP 400 and that dict as detail.
+
+    Raises
+    ------
+    Exception
+        Whatever decoding the payload or the engine's ``add_file`` raises; the web app answers it with
+        HTTP 500. The staged folder is removed before an exception from ``add_file`` leaves this method.
+
+    Notes
+    -----
+    ``filename`` is joined onto the node's output folder, and the local cache's own path check only keeps
+    the result somewhere inside the whole local cache. An absolute name or a ``..`` part would let the
+    caller's bytes replace plugin caches that the node unpickles when a plugin starts, other applications'
+    data or saved configurations, so such a name is refused before anything is decoded or written. A
+    relative directory part stays inside the per-request folder and is removed with it.
+
+    The engine stores only the base name of the staged file, so the stored name, the bytes and their
+    encryption are what they were before this check; the staging folder never reaches the stored object.
+
+    Examples
+    --------
+    >>> plugin.add_file_base64('aGVsbG8=', filename='hello.txt')
+    {'cid': 'Qm...'}
+    >>> plugin.add_file_base64('aGVsbG8=', filename='../_data/x')['status_code']
+    400
     """
     start_timer = self.time()
 
     payload_len = (len(file_base64_str) if file_base64_str else 0) / 1024**2
 
     self.Pd(f"R1FS add_file_base64 payload length={payload_len:.2f} MB.")
+    # Refuse, before decoding or writing, a name that could leave the per-request folder it is joined onto
+    # below: an absolute name or a '..' part would put the caller's bytes elsewhere in the local cache. A
+    # relative directory part stays inside that folder (the published Go client sends its FilePath here).
+    if filename and (self.os_path.isabs(filename) or '..' in filename.split('/') or filename == '.'):
+      # Name the refused value, so both the caller's error and the node log show what was sent.
+      msg = f"Invalid filename {filename!r}: an absolute name, a '..' part or '.' is not allowed"
+      self.P(f"R1FS add_file_base64 refused: {msg}", color='r')
+      # The web app answers a result that carries status_code 400 with HTTP 400 and this dict as detail.
+      return {'error': msg, 'status_code': 400}
     if not filename:
-      filename = self.r1fs._get_unique_or_complete_upload_name()
+      # The engine's bare generated name (r1fs_<8 hex>, as before), so it lands in the per-request folder
+      # below instead of the engine's shared uploads folder.
+      filename = self.r1fs._get_unique_name()
+    # A new folder per request: the staged bytes cannot overwrite an existing file, and the whole folder is
+    # removed after the add.
+    stage_subdir = f"r1fs_b64_{self.uuid()}"
 
     disk_start = self.time()
-    fn = self.diskapi_save_bytes_to_output(data=file_base64_str, filename=filename, from_base64=True)
+    # Staged under the per-request folder with the given name; the engine stores only the base name, so the
+    # stored object is as before.
+    fn = self.diskapi_save_bytes_to_output(data=file_base64_str, filename=filename, subdir=stage_subdir, from_base64=True)
     disk_elapsed = self.time() - disk_start
 
     r1add_start = self.time()
-    cid = self.r1fs.add_file(file_path=fn, secret=secret, nonce=nonce)
+    try:
+      # The engine encrypts the staged file and needs it only during this call.
+      cid = self.r1fs.add_file(file_path=fn, secret=secret, nonce=nonce)
+    finally:
+      # Remove the staged plaintext whether the add succeeded or raised: R1FS keeps only the encrypted object.
+      self.diskapi_delete_directory(self.os_path.join(self.get_output_folder(), stage_subdir))
     r1add_elapsed = self.time() - r1add_start
 
     total_elapsed = self.time() - start_timer

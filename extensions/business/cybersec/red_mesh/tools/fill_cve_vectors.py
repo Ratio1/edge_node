@@ -12,18 +12,42 @@ v3.x metric (v2 only) are listed in `CVE_WITHOUT_V3`, not guessed (RM-087).
 """
 
 import argparse
+import ast
 import datetime
 import json
 import os
 import pathlib
+import re
 import sys
 import time
 import urllib.request
 
 from extensions.business.cybersec.red_mesh.cve_db import CVE_DATABASE
+from extensions.business.cybersec.red_mesh.cvss import parse_vector
 from extensions.business.cybersec.red_mesh.references.dynamic import NVD_CVSS_URL
 
 _MODULE = pathlib.Path(__file__).resolve().parent.parent / "cve_cvss_vectors.py"
+
+
+_CVE_ID = re.compile(r"CVE-\d{4}-\d{4,7}")
+
+
+def valid_vector(vector):
+  """True for a v3.x base vector that is safe to write into the module: fixed charset, all base metrics."""
+  return (isinstance(vector, str) and len(vector) <= 100 and re.fullmatch(r"CVSS:3\.[01](/[A-Z]{1,2}:[A-Z])+", vector) is not None
+          and parse_vector(vector) is not None)
+
+
+def read_module(path):
+  """`(vectors, without_v3)` of an existing generated module, read as data: nothing in the file is executed."""
+  found = {}
+  for node in ast.parse(pathlib.Path(path).read_text()).body:
+    name = node.targets[0].id if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) else ""
+    if name in ("CVE_CVSS_VECTORS", "CVE_WITHOUT_V3"):
+      value = ast.literal_eval(node.value if not isinstance(node.value, ast.Call) else node.value.args[0])
+      found[name] = value
+  vectors = {k: v for k, v in dict(found.get("CVE_CVSS_VECTORS", {})).items() if _CVE_ID.fullmatch(k) and valid_vector(v)}
+  return vectors, {c for c in found.get("CVE_WITHOUT_V3", ()) if _CVE_ID.fullmatch(c)}
 
 
 def nvd_v3_vector(record):
@@ -82,10 +106,7 @@ def main(argv=None):
 
   vectors, without_v3 = {}, set()
   if args.out.exists() and not args.refresh:
-    namespace = {}
-    exec(args.out.read_text(), namespace)
-    vectors = dict(namespace.get("CVE_CVSS_VECTORS", {}))
-    without_v3 = set(namespace.get("CVE_WITHOUT_V3", ()))
+    vectors, without_v3 = read_module(args.out)
 
   api_key = os.environ.get("NVD_API_KEY", "")
   delay = 0.7 if api_key else 6.5
@@ -96,6 +117,9 @@ def main(argv=None):
       vector = fetch(cve_id, api_key)
     except Exception as exc:  # network, 403 rate limit, missing record: report, keep going
       failed.append(f"{cve_id}: {exc}")
+      vector = None
+    if vector and not valid_vector(vector):
+      failed.append(f"{cve_id}: invalid vector from NVD, not written")
       vector = None
     if vector:
       vectors[cve_id] = vector

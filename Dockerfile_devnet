@@ -35,6 +35,15 @@ WORKDIR /edge_node
 COPY . .
 RUN rm -rf /edge_node/cmds
 
+# Offline build: a context-relative database overrides the CI download (CI never sets it).
+ARG VULNDB_PATH=
+RUN if [ -n "$VULNDB_PATH" ]; then \
+      cp "/edge_node/$VULNDB_PATH" /edge_node/extensions/business/cybersec/red_mesh/vulndb/vulndb.sqlite && \
+      python3 /edge_node/.github/actions/fetch-vulndb/verify_vulndb.py local-pin \
+        /edge_node/extensions/business/cybersec/red_mesh/vulndb/vulndb.sqlite \
+        /edge_node/extensions/business/cybersec/red_mesh/vulndb/pin.json; \
+    fi
+
 # set a generic env variable 
 ENV AINODE_DOCKER=Yes
 # set a generic env variable 

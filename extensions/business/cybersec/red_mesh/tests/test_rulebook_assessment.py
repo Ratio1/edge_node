@@ -42,6 +42,7 @@ from extensions.business.cybersec.red_mesh.services.rulebook_assessment import (
   update_rulebook_review,
 )
 from extensions.business.cybersec.red_mesh.services.triage import update_finding_triage
+from .test_execution_binding_models import binding_payload
 
 
 def _sample_findings():
@@ -468,12 +469,17 @@ class TestRulebookAssessment(unittest.TestCase):
       owner, "job-1", expected_review_revision=saved["review_revision"], expected_pass_nr=3,
       expected_profile_version="1.0.0", idempotency_key="submission-triage", actor="alice",
     )
-    owner.records[(f"{owner.cfg_instance_id}:triage", "job-1:finding-auth-1")] = {
+    # Triage is the job's tenant and host's (RM-169 step 4a), read through the job record's binding.
+    binding = binding_payload()
+    owner.job_specs["execution_binding"] = binding
+    owner.records[(f"{owner.cfg_instance_id}:triage:t:{binding['tenant_id']}", "192.0.2.10\x1ffinding-auth-1")] = {
       "job_id": "job-1",
       "finding_id": "finding-auth-1",
       "status": "false_positive",
       "actor": "analyst",
       "updated_at": owner.time(),
+      "tenant_id": binding["tenant_id"],
+      "host": "192.0.2.10",
     }
 
     replay = submit_rulebook_review(
@@ -1215,6 +1221,39 @@ class TestRulebookAssessment(unittest.TestCase):
     self.assertIsNone(owner.records[(owner.cfg_instance_id, "job-1")])
     self.assertIsNone(owner.records[(hkey, review_key)])
     owner.artifact_repo.get_json.assert_not_called()
+
+
+class TestFindingTitleRedaction(unittest.TestCase):
+  """The NIS2 evidence prints a finding title the way the finding card does."""
+
+  def _title(self, title, **kw):
+    from extensions.business.cybersec.red_mesh.services import rulebook_assessment as ra
+    ref = ra._safe_finding_ref(
+      {"finding_id": "f1", "title": title, "severity": "MEDIUM"},
+      hmac_secret="s", redaction_values=kw.get("redaction_values", []), triage_map={},
+    )
+    return ref["title"]
+
+  def test_private_address_in_title_is_kept(self):
+    self.assertEqual(
+      self._title("FTP PASV leaks internal IP: 192.168.48.2"),
+      "FTP PASV leaks internal IP: 192.168.48.2",
+    )
+
+  def test_public_address_and_target_in_title_are_still_pseudonymised(self):
+    out = self._title("Banner from 8.8.8.8 on 192.168.48.9", redaction_values=["192.168.48.9"])
+    self.assertNotIn("8.8.8.8", out)
+    self.assertNotIn("192.168.48.9", out)
+
+  def test_credentials_in_title_are_still_redacted(self):
+    out = self._title("Default credentials admin:hunter2 and password=hunter2 on 10.0.0.4")
+    self.assertNotIn("hunter2", out)
+
+  def test_private_address_in_free_text_is_still_pseudonymised(self):
+    from extensions.business.cybersec.red_mesh.services import rulebook_assessment as ra
+    out = ra._safe_text("leaks 10.0.0.4", hmac_secret="s")
+    self.assertNotIn("10.0.0.4", out)
+    self.assertIn("ip:", out)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,9 @@ WHITELIST (oracles)
 
 
 """
+# The call path of a failed secret reconciliation is logged (function names only).
+import traceback
+
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 from extensions.business.mixins.request_tracking_mixin import _RequestTrackingMixin
@@ -32,12 +35,13 @@ from extensions.business.dauth.dauth_registry import (
   dauth_registry_write_kwargs,
   load_dauth_registry_snapshot,
 )
+from extensions.business.dauth.dauth_revoked_nodes import _DauthRevokedNodesMixin
 
 from extensions.business.dauth.deployment_secrets import _DauthDeploymentSecretsMixin
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 from extensions.business.deeploy.deeploy_job_mixin import _DeeployJobMixin
 
-__VER__ = '0.3.1'
+__VER__ = '0.3.5'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -46,12 +50,26 @@ _CONFIG = {
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   'REQUEST_TIMEOUT': 600,
+  # Requests that waited longer in the queue are answered with a 503 without running:
+  # SDK clients stop reading after 120 s, the Cloudflare tunnel after 100 s, and
+  # get_secrets nonces expire after 120 s. 90 s leaves the handler time to answer.
+  'MAX_QUEUE_WAIT': 90,
   
   'DAUTH_VERBOSE' : False,
   'DAUTH_LOG_RESPONSE' : True,
-  'LOG_REQUESTS' : True,
+  # One thread answers dAuth. Each generic "Received"/"processed" line also asks the IPC manager
+  # process for its queue size, so it is turned off; dAuth's own per-sender log lines stay.
+  'LOG_REQUESTS' : False,
+  # Each profiled request sends a timing report that takes its own place in the request FIFO,
+  # competing with real dAuth requests. Profile only a 10 % sample so the timing logs keep working.
+  'PROFILE_RATE' : 0.1,
   
   'REQUESTS_CSTORE_HKEY': 'DAUTH_REQUESTS',
+  # No dAuth endpoint is recorded: dAuth answers requests continuously and the write of its record is
+  # switched off in process(). An empty list also stops the bookkeeping in memory for every request.
+  'REQUESTS_TRACKED_ENDPOINTS': [],
+  # Same bound as in Deeploy, for the day the record is switched on again: at most one write every 30 s.
+  'REQUESTS_SAVE_INTERVAL': 30,
   'REQUESTS_MAX_RECORDS': 2,
   'REQUESTS_LOG_INTERVAL': 5 * 60,
 
@@ -94,9 +112,12 @@ _CONFIG = {
     "EE_CLOUDFLARE_TOKEN_TUNNELS_MANAGER",
     "EE_CLOUDFLARE_TOKEN_LIVENESS_API",
     
-    "EE_MQTT_HOST_SEED" # this generates dynamically the EE_MQTT_HOST
+    "EE_MQTT_HOST_SEED", # this generates dynamically the EE_MQTT_HOST
+
+    "EE_REVOKED_NODE_ADDRESSES",
   ],
 
+  # subset of SUPERVISOR_KEYS sent only to oracles listed in the dAuth registry
   "DAUTH_ORACLE_ONLY_SUPERVISOR_KEYS": [
     "EE_CLOUDFLARE_TOKEN_DAUTH_MANAGER",
   ],
@@ -111,6 +132,7 @@ _CONFIG = {
 class DauthManagerPlugin(
   BasePlugin,
   _DauthMixin,
+  _DauthRevokedNodesMixin,
   _DauthDeploymentSecretsMixin,
   _DeeployMixin,
   _DeeployJobMixin,
@@ -123,6 +145,34 @@ class DauthManagerPlugin(
   CONFIG = _CONFIG
 
   def __init__(self, **kwargs):
+    """
+    Create the dAuth manager plugin and its per-instance dAuth state.
+
+    Passes every argument to the base web-app plugin, then creates the fields the
+    dAuth mixins use: the dAuth server enablement and its message, the dAuth
+    registry oracles and internal peers with their refresh time and failure flag,
+    the time of the last job-secrets sync, the web-app and pause-teardown flags, and
+    the memo of old-style pipeline documents read by ``_load_legacy_pipeline``.
+    That memo is created here, with the other fields, so a missing field fails at
+    once instead of being recreated on first use.
+
+    Parameters
+    ----------
+    **kwargs : dict
+        Plugin construction arguments supplied by the plugin runtime; passed
+        unchanged to the base plugin constructor.
+
+    Returns
+    -------
+    None
+        The instance is initialized in place.
+
+    Examples
+    --------
+    >>> plugin = DauthManagerPlugin(**plugin_kwargs)  # built by the plugin runtime
+    >>> plugin._dauth_legacy_pipelines
+    {}
+    """
     super(DauthManagerPlugin, self).__init__(**kwargs)
     self._dauth_server_enabled = None
     self._dauth_server_enabled_message = None
@@ -133,12 +183,19 @@ class DauthManagerPlugin(
     self._last_dauth_job_secrets_hsync = None
     self._dauth_web_app_initialized = False
     self._dauth_pause_teardown_succeeded = True
+    # Memo of old-style pipeline documents, cid -> (retry_at, document); retry_at is None while
+    # a helper read runs. It lets each immutable document be read once, off the request thread.
+    self._dauth_legacy_pipelines = {}
     return
   
   
 
   def on_init(self):
+    self._load_dauth_revoked_nodes()
     self._check_dauth_server_enabled_on_start()
+    if self._is_dauth_server_enabled():
+      self._require_dauth_revoked_nodes()
+      self._start_dauth_revoked_recorder()
     super(DauthManagerPlugin, self).on_init()
     self._dauth_web_app_initialized = True
     if not self._is_dauth_server_enabled():
@@ -284,10 +341,17 @@ class DauthManagerPlugin(
     if not self._dauth_pause_teardown_succeeded:
       raise RuntimeError("Cannot resume after an incomplete web app teardown")
     # endif
+    self._require_dauth_revoked_nodes()
+    self._start_dauth_revoked_recorder()
 
     self.failed = False
     self._stop_request_monitor.clear()
     self._start_request_monitor_thread()
+    return
+
+  def on_close(self):
+    self._stop_dauth_revoked_recorder()
+    super(DauthManagerPlugin, self).on_close()
     return
 
   def on_log_handler(self, text, key=None):
@@ -308,6 +372,8 @@ class DauthManagerPlugin(
 
   def process(self):
     self._maybe_hsync_dauth_job_secrets()
+    if self._is_dauth_server_enabled():
+      self._maybe_publish_dauth_revoked_unlicensed_tries()
     # TODO: this will be re-enabled in the future.
     if False:
       self._maybe_log_and_save_tracked_requests()
@@ -429,7 +495,7 @@ class DauthManagerPlugin(
     try:
       data = self.process_dauth_request(body)
     except Exception as e:
-      self.P("Error processing request: {}".format(e), color='r')
+      self.P("Error processing request from {}: {}".format(self.get_request_client_ip(), e), color='r')
       data = {
         'error' : str(e)
       }
@@ -438,6 +504,26 @@ class DauthManagerPlugin(
       **data
     })
     return response
+
+  @BasePlugin.endpoint(method="post")
+  # /announce_node_key
+  def announce_node_key(self, body: dict):
+    """
+    A node whose key dAuth reported as revoked announces its new key. The request is
+    signed by the new key and carries the announcement signed by the revoked key; only
+    the first new key per revoked key is kept (see `dauth_revoked_nodes.py`).
+    """
+    if not self._is_dauth_server_enabled():
+      return self.__get_response({
+        'error': 'dAuth server is not registered as a dAuth oracle'
+      })
+    nonce = body.get("nonce") if isinstance(body, dict) else None
+    try:
+      data = self._announce_node_key(body)
+    except Exception as e:
+      self.P("Node key announcement from {} refused: {}".format(self.get_request_client_ip(), e), color='r')
+      data = {'error': str(e)}
+    return self.__get_response({'nonce': nonce, **data})
 
   @BasePlugin.endpoint(method="post")
   # /add_secrets
@@ -459,7 +545,9 @@ class DauthManagerPlugin(
     try:
       data = self.process_dauth_add_secrets_request(body)
     except Exception as e:
-      self.P("Error processing add_secrets request: {}".format(e), color='r')
+      self.P("Error processing add_secrets request from {}: {}".format(
+        self.get_request_client_ip(), e), color='r'
+      )
       data = {
         'error' : str(e)
       }
@@ -473,16 +561,58 @@ class DauthManagerPlugin(
   @BasePlugin.endpoint(method="post")
   # /reconcile_job_secrets
   def reconcile_job_secrets(self, body: dict):
-    """Reconcile hidden secrets for a signed protocol-oracle pipeline update."""
+    """
+    Reconcile hidden secrets for a signed protocol-oracle pipeline update.
+
+    Two kinds of request are served, both signed by a protocol oracle. A lifecycle request carries `job_id`,
+    the coordinator's signed `operation` and an `action` ("prepare", "status", "commit", "revoke" or "delete").
+    An old-style job update carries `job_id`, `expected_pipeline_cid` and `pipeline_configs` (optionally
+    `identity_aliases`). Only a registered dAuth oracle serves either; any other node answers the error
+    'dAuth server is not registered as a dAuth oracle'.
+
+    Parameters
+    ----------
+    body : dict
+      The signed request: `nonce`, the sender fields, `job_id`, and either `operation` with `action` (plus the
+      coordinator-signed `pointer` for "commit" and "delete") or the old-style `expected_pipeline_cid` and
+      `pipeline_configs`; it can carry new secret values.
+
+    Returns
+    -------
+    dict
+      The signed response with the request's `nonce`, the server fields this node adds (alias, version,
+      time, epoch, uptime) and either the reconciliation result or `error`. When reconciliation fails, the
+      caller is told only that it failed, never why.
+
+    Notes
+    -----
+    A failure is logged in red with the type of the error and the functions it passed through, outermost
+    first and cut to 300 characters, so the failing step (for example the read of the operation's plan) can
+    be told from the log. The error text is not logged: new secret values can be present in the request or
+    in a dependency's error.
+
+    Examples
+    --------
+    >>> body = {"nonce": "n1", "EE_SENDER": "0xai_...", "action": "prepare"}  # unsigned: refused
+    >>> response = plugin.reconcile_job_secrets(body)  # on a registered dAuth oracle
+    >>> response["nonce"], response["error"]
+    ('n1', 'dAuth secret reconciliation failed')
+    """
     nonce = body.get("nonce") if isinstance(body, dict) else None
     if not self._is_dauth_server_enabled():
       data = {'error': 'dAuth server is not registered as a dAuth oracle'}
     else:
       try:
         data = self.process_dauth_reconcile_secrets_request(body)
-      except Exception:
-        # New values can be present in the request or dependency exceptions.
-        self.P("dAuth secret reconciliation failed.", color='r')
+      except Exception as exc:
+        # New values can be present in the request or dependency exceptions, so the error text stays out of
+        # the log. Its type and the functions it passed through are logged: before, the line said only that
+        # the reconciliation failed, and a plan that could not be read looked like any other failure. The
+        # path, outermost first, is cut to 300 characters to bound the log line: on a very deep path the
+        # innermost names (where the error was raised) are the ones cut.
+        path = " > ".join(frame.name for frame in traceback.extract_tb(exc.__traceback__))[:300]
+        self.P("dAuth secret reconciliation failed for request from {}: {} in {}.".format(
+          self.get_request_client_ip(), type(exc).__name__, path), color='r')
         data = {'error': 'dAuth secret reconciliation failed'}
     return self.__get_response({'nonce': nonce, **data})
 
@@ -507,7 +637,9 @@ class DauthManagerPlugin(
     try:
       data = self.process_dauth_get_secret_request(body)
     except Exception as e:
-      self.P("Error processing get_secrets request: {}".format(e), color='r')
+      self.P("Error processing get_secrets request from {}: {}".format(
+        self.get_request_client_ip(), e), color='r'
+      )
       data = {
         'error': str(e),
         'retryable': not isinstance(e, ValueError),
@@ -533,7 +665,9 @@ class DauthManagerPlugin(
     try:
       data = self.process_dauth_reveal_secret_request(body)
     except Exception as e:
-      self.P("Error processing reveal_job_secrets request: {}".format(e), color='r')
+      self.P("Error processing reveal_job_secrets request from {}: {}".format(
+        self.get_request_client_ip(), e), color='r'
+      )
       data = {'error': str(e)}
     return self.__get_response({
       'nonce': request_nonce,

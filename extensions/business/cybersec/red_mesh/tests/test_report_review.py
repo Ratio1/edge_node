@@ -40,7 +40,7 @@ class TestReportReviewVerdicts(unittest.TestCase):
 
   def test_approve_records_the_signer_for_the_latest_pass(self):
     owner = _Owner()
-    view = approve_report(owner, "job-1", expected_review_revision=0, note="Looks right", actor="alice")
+    view = approve_report(owner, "job-1", expected_review_revision=0, note="Looks right", actor="alice", reviewer=None)
     self.assertEqual(view["status"], "ok", view)
     self.assertEqual(view["review_status"], "approved")
     self.assertEqual(view["review_revision"], 1)
@@ -58,18 +58,18 @@ class TestReportReviewVerdicts(unittest.TestCase):
   def test_reject_requires_a_note(self):
     owner = _Owner()
     for note in ("", "   ", None):
-      result = reject_report(owner, "job-1", expected_review_revision=0, note=note, actor="alice")
+      result = reject_report(owner, "job-1", expected_review_revision=0, note=note, actor="alice", reviewer=None)
       self.assertEqual(result["error"], "note_required")
     self.assertEqual(get_report_review(owner, "job-1")["review_status"], "pending")
 
   def test_reject_then_approve_under_the_fence(self):
     owner = _Owner()
     rejected = reject_report(owner, "job-1", expected_review_revision=0,
-                             note="Findings 3 and 4 are duplicates", actor="alice")
+                             note="Findings 3 and 4 are duplicates", actor="alice", reviewer=None)
     self.assertEqual(rejected["review_status"], "rejected", rejected)
     self.assertEqual(rejected["review"]["note"], "Findings 3 and 4 are duplicates")
     self.assertEqual(rejected["review_revision"], 1)
-    approved = approve_report(owner, "job-1", expected_review_revision=1, actor="bob")
+    approved = approve_report(owner, "job-1", expected_review_revision=1, actor="bob", reviewer=None)
     self.assertEqual(approved["review_status"], "approved", approved)
     self.assertEqual(approved["review"]["reviewer"], "bob")
     self.assertEqual(approved["review"]["note"], "")
@@ -78,19 +78,19 @@ class TestReportReviewVerdicts(unittest.TestCase):
 
   def test_a_stale_revision_is_a_typed_conflict_and_a_repeat_is_a_replay(self):
     owner = _Owner()
-    approve_report(owner, "job-1", expected_review_revision=0, actor="alice")
-    wrong = approve_report(owner, "job-1", expected_review_revision=0, actor="bob")
+    approve_report(owner, "job-1", expected_review_revision=0, actor="alice", reviewer=None)
+    wrong = approve_report(owner, "job-1", expected_review_revision=0, actor="bob", reviewer=None)
     self.assertEqual(wrong["error"], "review_revision_conflict")
     self.assertEqual(wrong["current_review_revision"], 1)
-    wrong = reject_report(owner, "job-1", expected_review_revision=0, note="no", actor="bob")
+    wrong = reject_report(owner, "job-1", expected_review_revision=0, note="no", actor="bob", reviewer=None)
     self.assertEqual(wrong["error"], "review_revision_conflict")
-    replay = approve_report(owner, "job-1", expected_review_revision=1, actor="bob")
+    replay = approve_report(owner, "job-1", expected_review_revision=1, actor="bob", reviewer=None)
     self.assertTrue(replay.get("idempotent_replay"), replay)
     self.assertEqual(replay["review"]["reviewer"], "alice")
     self.assertEqual(replay["review_revision"], 1)
     for bad in (None, "x", -1):
       self.assertEqual(
-        approve_report(owner, "job-1", expected_review_revision=bad, actor="bob")["error"],
+        approve_report(owner, "job-1", expected_review_revision=bad, actor="bob", reviewer=None)["error"],
         "review_revision_conflict",
       )
 
@@ -99,7 +99,7 @@ class TestReportReviewVerdicts(unittest.TestCase):
     # `pass_reports`. Nothing re-runs a FINALIZED job today, so this pins the
     # rule for the day a re-run path exists (contract §State model).
     owner = _Owner()
-    approve_report(owner, "job-1", expected_review_revision=0, actor="alice")
+    approve_report(owner, "job-1", expected_review_revision=0, actor="alice", reviewer=None)
     owner.job_specs = _sample_job_specs(pass_count=2)
     view = get_report_review(owner, "job-1")
     self.assertEqual(view["review_status"], "pending")
@@ -107,7 +107,7 @@ class TestReportReviewVerdicts(unittest.TestCase):
     self.assertIsNone(view["review"])
     self.assertEqual(view["review_revision"], 0)
     self.assertEqual([(row["pass_nr"], row["state"]) for row in view["history"]], [(1, "approved")])
-    rejected = reject_report(owner, "job-1", expected_review_revision=0, note="Pass 2 regressed", actor="bob")
+    rejected = reject_report(owner, "job-1", expected_review_revision=0, note="Pass 2 regressed", actor="bob", reviewer=None)
     self.assertEqual(rejected["review"]["pass_nr"], 2)
     self.assertEqual(rejected["review_revision"], 1)
     self.assertEqual(rejected["history"][0]["state"], "approved")
@@ -115,27 +115,27 @@ class TestReportReviewVerdicts(unittest.TestCase):
   def test_verdicts_are_refused_on_a_job_that_is_not_finalized(self):
     owner = _Owner(job_specs=_sample_job_specs(job_status="RUNNING"))
     self.assertEqual(
-      approve_report(owner, "job-1", expected_review_revision=0, actor="alice")["error"],
+      approve_report(owner, "job-1", expected_review_revision=0, actor="alice", reviewer=None)["error"],
       "job_not_finalized")
     self.assertEqual(
-      reject_report(owner, "job-1", expected_review_revision=0, note="no", actor="alice")["error"],
+      reject_report(owner, "job-1", expected_review_revision=0, note="no", actor="alice", reviewer=None)["error"],
       "job_not_finalized")
 
   def test_verdicts_are_refused_without_a_server_derived_actor(self):
     owner = _Owner()
     for actor in ("", None, "Not An Id!"):
       self.assertEqual(
-        approve_report(owner, "job-1", expected_review_revision=0, actor=actor)["error"],
+        approve_report(owner, "job-1", expected_review_revision=0, actor=actor, reviewer=None)["error"],
         "invalid_review_actor")
       self.assertEqual(
-        reject_report(owner, "job-1", expected_review_revision=0, note="no", actor=actor)["error"],
+        reject_report(owner, "job-1", expected_review_revision=0, note="no", actor=actor, reviewer=None)["error"],
         "invalid_review_actor")
     self.assertIsNone(get_report_review(owner, "job-1")["review"])
 
   def test_an_account_id_shaped_like_an_ip_is_stored_as_itself(self):
     # `_safe_text` would pseudonymise it; the signer is validated as an id instead.
     owner = _Owner()
-    view = approve_report(owner, "job-1", expected_review_revision=0, actor="10.0.0.1")
+    view = approve_report(owner, "job-1", expected_review_revision=0, actor="10.0.0.1", reviewer=None)
     self.assertEqual(view["review"]["reviewer"], "10.0.0.1")
 
   def test_the_note_passes_through_the_redaction_rule(self):
@@ -143,16 +143,16 @@ class TestReportReviewVerdicts(unittest.TestCase):
     view = reject_report(
       owner, "job-1", expected_review_revision=0, actor="alice",
       note="checked; password=hunter2 was the shipped default",
-    )
+      reviewer=None)
     self.assertNotIn("hunter2", view["review"]["note"])
     self.assertIn("<redacted>", view["review"]["note"])
 
   def test_purge_removes_every_pass_row_and_the_audit(self):
     from extensions.business.cybersec.red_mesh.services.control import purge_job
     owner = _Owner()
-    approve_report(owner, "job-1", expected_review_revision=0, actor="alice")
+    approve_report(owner, "job-1", expected_review_revision=0, actor="alice", reviewer=None)
     owner.job_specs = _sample_job_specs(pass_count=2)
-    approve_report(owner, "job-1", expected_review_revision=0, actor="alice")
+    approve_report(owner, "job-1", expected_review_revision=0, actor="alice", reviewer=None)
     owner.records[(owner.cfg_instance_id, "job-1")] = owner.job_specs
     result = purge_job(owner, "job-1")
     self.assertEqual(result["status"], "success", result)
@@ -195,7 +195,7 @@ class TestReportReviewNis2Gate(unittest.TestCase):
     view = get_report_review(owner, "job-1")
     self.assertTrue(view["can_approve"], view)
     self.assertEqual(view["approve_blocked"], [])
-    approved = approve_report(owner, "job-1", expected_review_revision=0, actor="alice")
+    approved = approve_report(owner, "job-1", expected_review_revision=0, actor="alice", reviewer=None)
     self.assertEqual(approved["review_status"], "approved", approved)
     self.assertEqual(approved["review"]["nis2_submission_ref"], "")
 
@@ -209,14 +209,14 @@ class TestReportReviewNis2Gate(unittest.TestCase):
           "code": "nis2_review_not_submitted",
           "detail": {"profile_id": "nis2.eu_baseline.v1", "pass_nr": 3},
         }])
-        refused = approve_report(owner, "job-1", expected_review_revision=0, actor="alice")
+        refused = approve_report(owner, "job-1", expected_review_revision=0, actor="alice", reviewer=None)
         self.assertEqual(refused["error"], "approve_blocked")
         self.assertEqual(self._codes(refused), ["nis2_review_not_submitted"])
         self.assertEqual(get_report_review(owner, "job-1")["review_status"], "pending")
 
   def test_reject_is_never_gated_on_nis2(self):
     owner = self._owner("generated")
-    view = reject_report(owner, "job-1", expected_review_revision=0, note="Not ready", actor="alice")
+    view = reject_report(owner, "job-1", expected_review_revision=0, note="Not ready", actor="alice", reviewer=None)
     self.assertEqual(view["review_status"], "rejected", view)
 
   def test_a_submission_for_an_older_pass_is_stale(self):
@@ -253,7 +253,7 @@ class TestReportReviewNis2Gate(unittest.TestCase):
     owner = self._owner("submitted")
     view = get_report_review(owner, "job-1")
     self.assertTrue(view["can_approve"], view)
-    approved = approve_report(owner, "job-1", expected_review_revision=0, actor="alice")
+    approved = approve_report(owner, "job-1", expected_review_revision=0, actor="alice", reviewer=None)
     self.assertEqual(approved["review_status"], "approved", approved)
     ref = approved["review"]["nis2_submission_ref"]
     self.assertEqual(ref["profile_id"], "nis2.eu_baseline.v1")
@@ -276,12 +276,12 @@ class TestReportReviewContinuousJobs(unittest.TestCase):
     owner = _Owner(job_specs=_continuous(passes=(1, 2)))
     view = get_report_review(owner, "job-1")
     self.assertEqual((view["review_status"], view["latest_pass_nr"], view["can_approve"]), ("pending", 2, True))
-    approved = approve_report(owner, "job-1", expected_review_revision=0, actor="alice")
+    approved = approve_report(owner, "job-1", expected_review_revision=0, actor="alice", reviewer=None)
     self.assertEqual((approved["review_status"], approved["review"]["pass_nr"]), ("approved", 2), approved)
 
   def test_the_next_completed_pass_reads_pending_with_the_verdict_as_history(self):
     owner = _Owner(job_specs=_continuous(passes=(1,)))
-    approve_report(owner, "job-1", expected_review_revision=0, actor="alice")
+    approve_report(owner, "job-1", expected_review_revision=0, actor="alice", reviewer=None)
     owner.job_specs = _continuous(passes=(1, 2))
     view = get_report_review(owner, "job-1")
     self.assertEqual((view["review_status"], view["latest_pass_nr"]), ("pending", 2))
@@ -294,7 +294,7 @@ class TestReportReviewContinuousJobs(unittest.TestCase):
   def test_a_running_monitors_job_data_carries_its_review(self):
     from extensions.business.cybersec.red_mesh.services.query import get_job_data
     owner = _Owner(job_specs=_continuous(passes=(1,)))
-    reject_report(owner, "job-1", expected_review_revision=0, note="Too noisy", actor="bob")
+    reject_report(owner, "job-1", expected_review_revision=0, note="Too noisy", actor="bob", reviewer=None)
     self.assertEqual(get_job_data(owner, "job-1")["job"]["review"]["review_status"], "rejected")
     single = _Owner(job_specs=_sample_job_specs(job_status="RUNNING", job_cid=None))
     self.assertNotIn("review", get_job_data(single, "job-1")["job"])
@@ -316,7 +316,7 @@ class TestReportReviewContinuousJobs(unittest.TestCase):
       with self.subTest(name):
         owner = _Owner(job_specs=specs)
         self.assertIsNone(get_report_review(owner, "job-1")["review_status"])
-        self.assertEqual(approve_report(owner, "job-1", expected_review_revision=0, actor="alice")["error"],
+        self.assertEqual(approve_report(owner, "job-1", expected_review_revision=0, actor="alice", reviewer=None)["error"],
                          "job_not_finalized")
 
   def test_the_nis2_review_of_a_running_monitor_is_readable(self):
@@ -333,7 +333,7 @@ class TestReportReviewSupersededByNis2(unittest.TestCase):
   def setUp(self):
     self.owner = checked_read_producer("submitted")
     self.owner.job_specs = {**self.owner.job_specs, "pass_count": 3}
-    approved = approve_report(self.owner, "job-1", expected_review_revision=0, actor="alice")
+    approved = approve_report(self.owner, "job-1", expected_review_revision=0, actor="alice", reviewer=None)
     self.assertEqual(approved["review_status"], "approved", approved)
     self.approved_ref = approved["review"]["nis2_submission_ref"]
 
@@ -379,7 +379,7 @@ class TestReportReviewSupersededByNis2(unittest.TestCase):
     detail = view["reopened"]["detail"]
     self.assertEqual(detail["approved_submission_revision"], self.approved_ref["revision"])
     self.assertGreater(detail["current_submission_revision"], self.approved_ref["revision"])
-    again = approve_report(self.owner, "job-1", expected_review_revision=1, actor="bob")
+    again = approve_report(self.owner, "job-1", expected_review_revision=1, actor="bob", reviewer=None)
     self.assertFalse(again.get("idempotent_replay"), again)
     self.assertEqual(again["review_status"], "approved", again)
     self.assertEqual(again["review_revision"], 2)
@@ -387,7 +387,7 @@ class TestReportReviewSupersededByNis2(unittest.TestCase):
     self.assertIsNone(again["reopened"])
 
   def test_a_rejection_is_not_superseded_by_nis2(self):
-    reject_report(self.owner, "job-1", expected_review_revision=1, note="Wrong target", actor="bob")
+    reject_report(self.owner, "job-1", expected_review_revision=1, note="Wrong target", actor="bob", reviewer=None)
     self._reopen_nis2()
     view = get_report_review(self.owner, "job-1")
     self.assertEqual(view["review_status"], "rejected")
@@ -405,7 +405,7 @@ class TestReportReviewOnTheJobsList(unittest.TestCase):
     owner = _Owner()
     self.assertEqual(self._list(owner)["job-1"]["review"], {
       "review_status": "pending", "pass_nr": 1, "reviewer": "", "decided_at": ""})
-    approve_report(owner, "job-1", expected_review_revision=0, actor="alice")
+    approve_report(owner, "job-1", expected_review_revision=0, actor="alice", reviewer=None)
     review = self._list(owner)["job-1"]["review"]
     self.assertEqual((review["review_status"], review["pass_nr"], review["reviewer"]),
                      ("approved", 1, "alice"))
@@ -413,14 +413,14 @@ class TestReportReviewOnTheJobsList(unittest.TestCase):
 
   def test_a_verdict_on_an_earlier_pass_lists_as_pending(self):
     owner = _Owner()
-    approve_report(owner, "job-1", expected_review_revision=0, actor="alice")
+    approve_report(owner, "job-1", expected_review_revision=0, actor="alice", reviewer=None)
     owner.job_specs = _sample_job_specs(pass_count=2)
     self.assertEqual(self._list(owner)["job-1"]["review"]["review_status"], "pending")
 
   def test_the_finalized_job_read_carries_the_same_summary(self):
     from extensions.business.cybersec.red_mesh.services.query import get_job_data
     owner = _Owner()
-    reject_report(owner, "job-1", expected_review_revision=0, note="Duplicates", actor="bob")
+    reject_report(owner, "job-1", expected_review_revision=0, note="Duplicates", actor="bob", reviewer=None)
     review = get_job_data(owner, "job-1")["job"]["review"]
     self.assertEqual((review["review_status"], review["pass_nr"], review["reviewer"]), ("rejected", 1, "bob"))
 
