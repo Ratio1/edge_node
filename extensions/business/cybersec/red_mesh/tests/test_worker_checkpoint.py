@@ -206,6 +206,26 @@ class TestWorkerCheckpoint(unittest.TestCase):
     self.assertIn("hunter2", w.state["service_info"][22]["banner"])
     self.assertNotIn("redact_credentials", ckpt.load_all(self.owner, "job1", 2)["1"])
 
+  def test_bare_accepted_credential_pairs_redacted_in_saved_copy(self):
+    # Probes store accepted pairs without a lead phrase (database.py `accepted_credentials`,
+    # common.py `accepted`); the phrase-anchored walker alone leaves them in plaintext.
+    w = _worker(self.owner)
+    w.state["service_info"] = {3306: {"_service_info_mysql": {
+      "accepted_credentials": ["root:toor"], "accepted": ["admin:1234"]}}}
+    w._maybe_checkpoint(force=True)
+    saved = ckpt.load_all(self.owner, "job1", 2)["1"]["state"]["service_info"][3306]["_service_info_mysql"]
+    self.assertEqual(saved, {"accepted_credentials": ["root:***"], "accepted": ["admin:***"]})
+    self.assertEqual(w.state["service_info"][3306]["_service_info_mysql"]["accepted"], ["admin:1234"])
+
+  def test_no_save_after_stop(self):
+    # A HARD stop deletes the job's checkpoints right after job.stop(); a save still in
+    # flight on the worker thread must not write the file again.
+    w = _worker(self.owner)
+    w.stop_event = threading.Event()
+    w.stop_event.set()
+    w._maybe_checkpoint(force=True)
+    self.assertEqual(ckpt.load_all(self.owner, "job1", 2), {})
+
   def test_credentials_kept_when_redaction_off(self):
     w = _worker(self.owner, ctx=dict(CTX, redact_credentials=False))
     w.state["service_info"] = {22: {"banner": "Default credentials accepted: admin:hunter2"}}

@@ -29,6 +29,9 @@ A network (blackbox) worker may resume execution inside a pass from a checkpoint
 
 - Files are plain pickle under `plugin_data/redmesh_ckpt/<job_id>/<pass_nr>_<local_id_prefix>.pkl`,
   written only through `diskapi_save_pickle_to_data` (atomic) by `services/checkpoint.py`.
+  When the job's `redact_credentials` is on (the default), the saved state is a redacted copy:
+  phrase-anchored credential strings and the bare `user:pass` items of `accepted_credentials` and
+  `accepted` lists are masked, as in the archived report.
 - Resume granularity: per port, and per completed service or web method, as of the last save. Saves
   are throttled (a port save every `PORT_EVERY` ports, a save after each method, and any save other
   than worker start or phase end at most once per `MIN_INTERVAL`), so
@@ -69,7 +72,8 @@ A network (blackbox) worker may resume execution inside a pass from a checkpoint
   resume path, which deletes it. If `plugin_data/redmesh_ckpt` or a job folder is a symlink, no helper
   reads, writes or deletes through it.
 - Stop paths: a HARD `stop_monitoring` and `stop_and_delete_job` delete all of the job's checkpoints,
-  marker included. A soft stop keeps them, since the pass continues.
+  marker included. A soft stop keeps them, since the pass continues. A worker whose stop event is
+  set saves nothing more, so a save in flight cannot recreate a deleted checkpoint.
 - Graybox workers still restart from the beginning of the pass.
 - The checkpoint is local to the node. It is not a CStore or R1FS record.
 - Accepted limits:
