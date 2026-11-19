@@ -304,7 +304,7 @@ class ChainDistMonitorTests(unittest.TestCase):
     self.assertEqual(self.bc.submissions, [(5, ['0xnew', '0xother'])])
     self.assertEqual(self.handed_to_deeploy(), {})
 
-  def test_two_confirmed_relinks_are_kept_for_one_review_without_a_partial_automatic_update(self):
+  def test_two_confirmed_relinks_are_offered_one_at_a_time_and_both_remain_available_for_review(self):
     for old, new, license_id in (('oldA', 'newA', 31), ('oldB', 'newB', 71)):
       self.bc.link_events.extend([self.link_event('UnlinkNode', old, license_id=license_id),
                                   self.link_event('LinkNode', new, license_id=license_id)])
@@ -314,8 +314,26 @@ class ChainDistMonitorTests(unittest.TestCase):
     self.assertEqual(self.monitor.plugins_shmem['CHAIN_DIST_CONFIRMED_RELINKS'], {
       '0xoldA': ('0xnewA', 31, '0xOwner'), '0xoldB': ('0xnewB', 71, '0xOwner'),
     })
-    self.assertEqual(self.handed_to_deeploy(), {})
+    self.assertEqual(self.handed_to_deeploy(), {5: ('0xai_oldA', '0xai_newA')})
     self.assertEqual(self.bc.submissions, [])
+    # The first rollout publishes its new placement, so the monitor can hand off the second.
+    self.placements[5] = ['newA', 'oldB']
+    self.now = self.monitor.next_relink_check
+    self.run_relink_check()
+    self.assertEqual(self.handed_to_deeploy(), {5: ('0xai_oldB', '0xai_newB')})
+    self.assertEqual(self.bc.submissions, [(5, ['0xnewA', '0xoldB'])])
+
+  def test_restart_publishes_the_persisted_confirmed_links_before_polling(self):
+    self.relink()
+    self.run_relink_check()
+    self.monitor.cacheapi_load_pickle = Mock(return_value=self.monitor.relink_state)
+    self.monitor.chainstore_hset = Mock()
+    self.monitor.node_addr = '0xai_monitor'
+    self.monitor.plugins_shmem = {}
+    self.monitor.on_init()
+    self.assertEqual(self.monitor.plugins_shmem['CHAIN_DIST_CONFIRMED_RELINKS'], {
+      '0xold': ('0xnew', 7, '0xOwner'),
+    })
 
   def test_relink_in_two_transactions_is_matched_across_checks(self):
     self.bc.link_events = [self.link_event('UnlinkNode', 'old', block_number=49_000)]

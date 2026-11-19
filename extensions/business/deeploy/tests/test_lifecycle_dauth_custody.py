@@ -522,6 +522,15 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.assertEqual(self.coordinator.commands, [])
     self.http.assert_not_called()
 
+  def test_relink_to_empty_replacement_rejects_before_any_stop_or_custody_write(self):
+    previous, cid = self.legacy()
+    self.coordinator.known = {'A': [previous], 'N': []}  # The new hardware has no previous workload.
+    with self.assertRaisesRegex(ValueError, 'current address'):
+      self.coordinator._admit_node_relink_operation(7, 'A', 'N')
+    self.assertEqual(self.coordinator._get_pipeline_from_cstore('7'), cid)
+    self.assertEqual(self.coordinator.commands, [])
+    self.http.assert_not_called()
+
   def test_partial_publication_replays_before_old_cid_cleanup(self):
     previous, cid = self.legacy()
     self.admit(previous)

@@ -50,7 +50,8 @@ class JobRepairHttpTests(unittest.TestCase):
       return "owner", make_inputs(**copy.deepcopy(request))
     self.api.deeploy_verify_and_get_inputs = verify
     self.api.deeploy_get_auth_result = lambda inputs: {"escrow_owner": "owner", "sender": "owner", "sender_escrow": "escrow"}
-    self.read = dict(nonce="0x1", EE_ETH_SENDER="owner", EE_ETH_SIGN="fixture", job_id=31, coordinator="oracle")
+    self.read = dict(nonce="0x1", EE_ETH_SENDER="owner", EE_ETH_SIGN="fixture", EE_HASH="signed-preview",
+                     job_id=31, coordinator="oracle")
 
   def reviewed_update(self):
     status = self.api.get_job_repair_preview(self.read)
@@ -81,7 +82,7 @@ class JobRepairHttpTests(unittest.TestCase):
     request = self.reviewed_update()
     result = self.api.repair_update_pipeline(copy.deepcopy(request))
     self.assertEqual((result["status_code"], result["status"]), (202, "accepted"), result)
-    self.assertEqual(self.domains, ["get deployment status", "repair update pipeline"])
+    self.assertEqual(self.domains, ["get job repair preview", "repair update pipeline"])
     # A lost response resends the original envelope. Its operation and the worker inspection remain singletons.
     inspections = list(self.replay.c.commands)
     retry = self.api.repair_update_pipeline(copy.deepcopy(request))
@@ -119,4 +120,20 @@ class JobRepairHttpTests(unittest.TestCase):
     self.assertEqual(wrong["error"]["code"], "DEPLOYMENT_CONFLICT")
     self.assertEqual(set(self.replay.c._operation_records()), {self.replay.oid})
     self.replay.http.assert_not_called()
+    self.assertEqual(self.replay.c.commands, [])
+
+  def test_repair_preview_signature_binds_job_and_coordinator(self):
+    self.api.bc.eth_verify_text_signature = lambda **kwargs: "owner"  # Isolate signature recovery from v3 payload validation.
+    verify = self.api._DeeployMixin__verify_signature_v3
+    self.api.deeploy_verify_and_get_inputs = lambda request, request_type: (
+      verify(request, request_type), make_inputs(**request)
+    )
+    valid = dict(self.read, EE_HASH=self.api._deeploy_payload_hash(self.read))
+    self.assertEqual(self.api.get_job_repair_preview(valid)["status"], "reviewable")
+    for changes in (dict(job_id=32), dict(coordinator="other")):
+      blocked = self.api.get_job_repair_preview(dict(valid, **changes))
+      self.assertEqual(blocked["status"], "blocked")
+      self.assertIn("Invalid payload hash", blocked["reason"])
+    unsigned = {key: value for key, value in valid.items() if key != "EE_HASH"}
+    self.assertEqual(self.api.get_job_repair_preview(unsigned)["status"], "blocked")
     self.assertEqual(self.replay.c.commands, [])

@@ -145,6 +145,18 @@ class RepairTests(unittest.TestCase):
     self.assertEqual(self.c._operation_records()[self.oid]["outcome"], "superseded")
     self.assertTrue(all(node in ("newA", "newB") for node, _ in previous_commands + self.c.commands))
 
+  def test_expired_repair_without_dispatched_retirement_releases_parent(self):
+    child = self.admit()
+    self.state.now = max(child["preparation_deadline"], child["deadline"]) + 1
+    self.c.commands.clear()
+    self.c._advance_deployment_operation(child)
+    self.assertEqual((child["phase"], child["error"]["code"]), ("completed", "ADMISSION_PREPARATION_FAILED"))
+    self.assertEqual(self.c.commands, [])
+    self.c._advance_serialized_operation(self.c._operation_records()[self.oid])
+    parent = self.c._operation_records()[self.oid]
+    self.assertEqual(parent["phase"], "retiring_previous")
+    self.assertNotIn("repair_child", parent)
+
   def test_success_only_publishes_after_both_current_workers_report_ready(self):
     child = self.admit()
     for _ in range(3):

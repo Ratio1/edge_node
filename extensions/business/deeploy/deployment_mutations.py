@@ -197,9 +197,12 @@ class _DeploymentMutationsMixin:
 
     Notes
     -----
-    The new node keeps the old node's settings, taken from the stored job, so it
-    may be the same machine with a new key or new hardware. dAuth moves per-node
-    secrets with the same aliases. The old node is never contacted.
+    The current address must already report the previous workload, as on a host
+    that kept its local deployment during a key change. The oracle also needs
+    an observation from every retained worker before it may start retirement.
+    A license relink alone gives no evidence that a workload on a different
+    machine stopped or that the new machine can restore it. dAuth moves the
+    per-node settings only after admission; the old address is never contacted.
     """
     pipeline = self.get_job_pipeline_from_cstore(job_id, timeout=30, pin=False,
                                                 raise_on_error=False, show_logs=False)

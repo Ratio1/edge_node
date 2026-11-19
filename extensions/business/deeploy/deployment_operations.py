@@ -734,6 +734,9 @@ class _DeploymentOperationsMixin:
         # A relink also retires the workers it retains. One missing peer can strand the whole job after a partial stop.
         must_report = previous_nodes if mutation == "node_relink" else set(previous_nodes) - set(configs)
         if any(not reports.get(node) for node in must_report):
+          if mutation == "node_relink":
+            raise ValueError("A previous target does not report its workload at the current address. "
+                             "Automatic relink requires an observed workload on every previous target.")
           raise ValueError("A previous target no longer reports this job. Restore connectivity or resolve its relink before updating.")
       previous_configs, previous_new_secrets = self._prepare_deployment_secret_configs(
         previous_configs, prior_pipeline,
@@ -1020,7 +1023,12 @@ class _DeploymentOperationsMixin:
     repair = operation.get("mutation") == "same_host_repair_v1"
     if repair and not self._repair_parent_is_held(operation):
       return  # A crash between reservation writes is repaired from the parent pass.
-    if operation["phase"].removeprefix("repair_v1_") == "preparing" and self.time() >= operation["preparation_deadline"]:
+    phase = operation["phase"].removeprefix("repair_v1_")
+    if phase == "preparing" and self.time() >= operation["preparation_deadline"]:
+      self._expire_deployment_preparation(operation)
+    elif (repair and phase in ("accepted", "retiring_previous") and not operation.get("retire_challenges")
+          and self.time() >= max(operation["deadline"], operation["preparation_deadline"])):
+      # A repair can safely release its parent only before any STOP challenge was durably recorded.
       self._expire_deployment_preparation(operation)
     self._replicate_operation(operation)
     if operation["phase"].removeprefix("repair_v1_") == "cleaning_up_preparation":

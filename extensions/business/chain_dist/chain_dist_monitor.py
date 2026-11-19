@@ -103,6 +103,8 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin, _DeeployJobMixin):
     self.relink_state = self.cacheapi_load_pickle(default=None, verbose=False) or {
       'cursor': 0, 'unlinked': {}, 'links': {},
     }
+    # The persisted scan already contains confirmed links. Make them available before the first RPC poll.
+    self._publish_confirmed_relinks(self._get_relink_successors())
     self.chainstore_hset(
       hkey='chain_dist_monitor',
       key=self.node_addr,
@@ -284,10 +286,7 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin, _DeeployJobMixin):
     )
     self._update_nd_links()
     successors = self._get_relink_successors()
-    # Repair reads all confirmed links for the selected job, including a second relink in the same block range.
-    self.plugins_shmem['CHAIN_DIST_CONFIRMED_RELINKS'] = {
-      node: (new_node, *self.relink_state['unlinked'][node]) for node, new_node in successors.items()
-    }
+    self._publish_confirmed_relinks(successors)
     relinks = {}
     if successors:
       # Pending jobs are voted by check_all_jobs; closable ones are closed by check_closable_jobs.
@@ -310,8 +309,8 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin, _DeeployJobMixin):
             elif old in placement and new not in placement:
               pending_relinks.append((old, new))
           nodes.append(node)
-        # The automatic single-license mutation cannot represent two changes in one rollback plan.
-        if len(pending_relinks) == 1:
+        # Hand off one mutation at a time. A later pass can take the next pending slot after publication.
+        if pending_relinks:
           relinks[job_id] = pending_relinks[0]
         if nodes != active_nodes:
           nodes = sorted(nodes)
@@ -319,6 +318,26 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin, _DeeployJobMixin):
           self.bc.submit_node_update(job_id=job_id, nodes=nodes)
     self.plugins_shmem[NODE_RELINKS_SHMEM_KEY] = relinks
     return
+
+  def _publish_confirmed_relinks(self, successors):
+    """Share all confirmed relinks from the persisted event scan.
+
+    Parameters
+    ----------
+    successors : dict
+      Previous address to current address for each confirmed relink.
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> monitor._publish_confirmed_relinks({})  # doctest: +SKIP
+    """
+    self.plugins_shmem['CHAIN_DIST_CONFIRMED_RELINKS'] = {
+      node: (new_node, *self.relink_state['unlinked'][node]) for node, new_node in successors.items()
+    }
 
 
   def maybe_distribute_rewards(self):

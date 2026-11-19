@@ -1366,7 +1366,7 @@ class DeeployManagerApiPlugin(
     Parameters
     ----------
     request : dict
-      Existing wallet read envelope, job ID and optional pinned coordinator.
+      Versioned wallet envelope binding a job ID and the original coordinator.
 
     Returns
     -------
@@ -1378,14 +1378,16 @@ class DeeployManagerApiPlugin(
     >>> preview = oracle.get_job_repair_preview(request)  # doctest: +SKIP
     """
     try:
-      envelope = {key: request.get(key) for key in ("nonce", "EE_ETH_SIGN", "EE_ETH_SENDER")}
-      sender, inputs = self.deeploy_verify_and_get_inputs(envelope, request_type="get deployment status")
+      job_id, coordinator = request.get("job_id"), request.get("coordinator")
+      if not request.get("EE_HASH") or type(job_id) is not int or job_id <= 0 or not isinstance(coordinator, str) or not coordinator:
+        raise ValueError("The repair preview requires a signed job ID and coordinator.")
+      sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type="get job repair preview")
       owner = self.deeploy_get_auth_result(inputs)[DEEPLOY_KEYS.ESCROW_OWNER]
       if sender.lower() != owner.lower():
         raise ValueError("Only the job's CSP can approve a same-host recovery.")
-      if request.get("coordinator") and request["coordinator"] != self.bc.address:
+      if coordinator != self.bc.address:
         raise DeploymentConflictError("This receiver is not the original coordinator. Check the pinned repair endpoint.")
-      proposal = self._assess_job_repair(request.get("job_id"), owner, request.get("coordinator"))[0]
+      proposal = self._assess_job_repair(job_id, owner, coordinator)[0]
       return self._get_response(dict(status="reviewable", proposal=proposal))
     except ValueError as exc:
       return self._get_response(dict(status="blocked", reason=str(exc)))
