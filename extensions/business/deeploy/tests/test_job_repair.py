@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 from extensions.business.deeploy import job_repair
 from extensions.business.deeploy.job_repair import _JobRepairMixin, MUTATION, order_fields, worker
 from extensions.business.deeploy.deployment_operations import NODE_OPERATIONS_HKEY, DeploymentConflictError
+from extensions.business.deeploy.relink_placement import relink_pipeline
 from extensions.business.deeploy.tests.lifecycle_custody_support import Coordinator, Custodian, Engine, State, connect, report
 
 
@@ -176,6 +177,49 @@ class RepairTests(unittest.TestCase):
       self.c._assess_job_repair(31, "owner")
     self.assertEqual(self.c.commands, [])
     self.http.assert_not_called()
+
+  def test_verified_per_node_target_mirror_uses_the_signed_target_order(self):
+    for config in (self.stored, self.live):
+      worker(config)["PER_NODE_TARGET_NODES"] = list(config["DEEPLOY_SPECS"]["current_target_nodes"])
+    # Job 69 differs in the two target lists only. The signed proposal still has its original shape.
+    for key in ("BUILD_AND_RUN_COMMANDS", "CHAINSTORE_PEERS"):
+      worker(self.live)[key] = list(worker(self.stored)[key])
+    self.cid = self.state.blobs.add_json(self.stored)
+    self.state.public["DEEPLOY_DEPLOYED_JOBS", "31"] = self.cid
+    self.parent["previous_pipeline_cid"] = self.cid
+    self.c._save_operation(self.parent)
+
+    proposal, corrected, *_ = self.c._assess_job_repair(31, "owner")
+    self.assertEqual(proposal["orders"], dict(targets=[1, 0], commands=[0, 1], peers=[0, 1]))
+    self.assertEqual(worker(corrected)["PER_NODE_TARGET_NODES"], ["oldB", "oldA"])
+    self.assertEqual(worker(self.stored)["PER_NODE_TARGET_NODES"], ["oldA", "oldB"])
+    restored = relink_pipeline(corrected, {"oldA": "newA", "oldB": "newB"})
+    self.assertEqual(worker(restored)["PER_NODE_TARGET_NODES"], ["newB", "newA"])
+    self.assertEqual(self.c.commands, [])
+
+    # A different placement in this field may not be repaired implicitly.
+    worker(self.live)["PER_NODE_TARGET_NODES"] = ["oldB", "unexpected-node"]
+    with self.assertRaisesRegex(ValueError, "outside the reviewed order"):
+      self.c._assess_job_repair(31, "owner")
+
+  def test_repair_can_match_unordered_metadata_but_rejects_changed_membership(self):
+    self.stored["DEEPLOY_SPECS"].update(spare_nodes=["spareA", "spareB"],
+                                      chainstore_response_keys={"oldA": ["key1", "key2"]})
+    self.live["DEEPLOY_SPECS"].update(spare_nodes=["spareB", "spareA"],
+                                    chainstore_response_keys={"oldA": ["key2", "key1"]})
+    self.cid = self.state.blobs.add_json(self.stored)
+    self.state.public["DEEPLOY_DEPLOYED_JOBS", "31"] = self.cid
+    self.parent["previous_pipeline_cid"] = self.cid
+    self.c._save_operation(self.parent)
+
+    proposal, corrected, *_ = self.c._assess_job_repair(31, "owner")
+    self.assertEqual(proposal["orders"], dict(targets=[1, 0], commands=[1, 0], peers=[1, 0]))
+    self.assertEqual(corrected["DEEPLOY_SPECS"]["spare_nodes"], ["spareB", "spareA"])
+    self.assertEqual(corrected["DEEPLOY_SPECS"]["chainstore_response_keys"], {"oldA": ["key2", "key1"]})
+
+    self.live["DEEPLOY_SPECS"]["chainstore_response_keys"] = {"oldB": ["key2", "key1"]}
+    with self.assertRaisesRegex(ValueError, "outside the reviewed order"):
+      self.c._assess_job_repair(31, "owner")
 
   def test_late_inspections_are_reused_until_they_expire(self):
     proposal, *_ = self.c._assess_job_repair(31, "owner")

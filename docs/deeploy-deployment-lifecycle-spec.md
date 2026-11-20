@@ -158,6 +158,10 @@ The escrow owner or an active delegate who can edit the job uses **Edit → Revi
 | `POST /repair_update_pipeline` | A v3 wallet-signed **repair update pipeline** request with the ordinary edit fields, stable request ID, expected revision, and `repair={proposal,same_host:true,rotate_main_tunnel:boolean}`. The signed proposal includes version, network, job, coordinator, parent identity/sequence/plan CID, published pipeline CID, instance ID, ordered old/current pairs and index permutations for commands, peers and targets. Reordering moves only the reviewed elements. The receiver rechecks the signer's escrow access and the entire proposal and runs normal payment, resource and request validation. The escrow owner scopes the operation and its retries. |
 | `POST /get_deployment_status` | The existing poll returns the linked operation. During the handoff the parent shows `holding_for_repair` and its `repair_child_operation_id`. After the child finishes, the parent shows `completed/superseded`. The child's `relinked_nodes` lists the previous/current pairs. Existing ready counts refer to its paid workers. Retry an uncertain signed submission on the original endpoint. |
 
+Both repair endpoints support the shared Deeploy API. If another oracle receives the request, it checks the signed wallet request against the verified CStore operation and forwards the original envelope over encrypted peer messaging. The coordinator rechecks authorization, evaluates the repair and signs its ordinary response. The relay keeps only pending reply information in memory. A missing reply blocks the preview or returns retryable `ADMISSION_UNAVAILABLE` for the update. Retry the same signed update and `request_id` so the coordinator can return an operation it already accepted.
+
+The reviewed target permutation also applies to `PER_NODE_TARGET_NODES` if it exactly mirrors the corresponding target order in the saved config and every surviving worker report. This uses the existing signed target order and the exact worker fingerprint. The same-host repair continues to require a single Git worker with no per-node overrides. Legacy `DEEPLOY_SPECS.spare_nodes` and the response-key list for each node under `DEEPLOY_SPECS.chainstore_response_keys` may match the reported order only when every entry and its multiplicity agree. The ordinary legacy edit guard uses this metadata rule in a comparison copy and retains the saved order for rollback. Managed-service order fields require their exact allocation and per-node plan.
+
 Admission sends one targeted inspection per current worker. A survivor must sign its actual Git HEAD and the reviewed full configuration, including the three ordered lists. The coordinator encrypts the expected fingerprint to that worker. An already stopped worker confirms its own journaled stop, matching Git commit and empty local workload. An unavailable worker, incompatible version or changed configuration stops admission before the survivor is retired. The coordinator also checks that every previous Git commit is retrievable from the configured public repository.
 
 The signed child reserves the original operation before secret preparation. The coordinator stages independent deployment and restoration grants with dAuth. Explicit rotation of the existing main tunnel uses the new credential at its connector paths for both outcomes. The receiver rechecks license ownership, paid placement and the canonical pointer before a conditional retirement, start or publication. The worker verifies the original instance again before retiring it. The old addresses receive no grant. Restarts reuse the signed reservation and receipts. A failed rollout stops the new attempt on both hosts before restoring each original Git pin and the approved command order.
@@ -168,7 +172,7 @@ If a repair expires before recording any retirement challenge, the coordinator r
 
 The repaired deployment or restoration completes after every worker reports ready. A failed repair rollout restores each worker's verified Git commit from its stop report. The coordinator checks those commits against the signed ready reports before finalizing. If placement or the reviewed source changes, the existing progress endpoint exposes a blocked reason. The hold remains in place until the coordinator can verify that proceeding is safe.
 
-Publish the repair-capable Core package (candidate 7.7.362) before building the Edge image (candidate 2.10.744), which requires that Core version or later. Upgrade the serving dAuth instances, the original coordinator and both workers before enabling the frontend route. Configure a trusted HTTPS endpoint for that coordinator in `NEXT_PUBLIC_DEEPLOY_REPAIR_COORDINATORS` for the correct network, or verify equivalent routing at the existing ingress. Keep the worker lifecycle journals and coordinator operation data across the upgrade. Verify CSP-authenticated preview and worker reachability, then observe both app responses and the existing hostname through the rotated tunnel during the CSP's canary. Keep the recovery-capable coordinator and custodians available until the operation finishes.
+Publish the repair-capable Core package (candidate 7.7.362) before building the Edge image (candidate 2.10.744), which requires that Core version or later. Upgrade the serving dAuth instances, the original coordinator and both workers before enabling the frontend route. For the shared Deeploy API, upgrade every serving oracle to the repair relay and verify encrypted connectivity between them. A trusted HTTPS coordinator URL in `NEXT_PUBLIC_DEEPLOY_REPAIR_COORDINATORS` can also route requests directly. Keep the worker lifecycle journals and coordinator operation data across the upgrade. Verify a signed preview and worker reachability, then observe both app responses and the existing hostname through the rotated tunnel during the canary. Keep the recovery-capable coordinator and custodians available until the operation finishes.
 
 ## Single polling endpoint
 
@@ -708,3 +712,41 @@ The original lifecycle release shipped SDK, Core, then Edge together with the li
 existing journal/secret storage and coordinated rollback requirements above.
 This integration was checked offline with physically separated public/protected
 stores, the real SDK client and Core wrapper; no live node or wallet was changed.
+
+### Stateless replacement without earlier stop confirmation
+
+An authorized editor signs a read-only `get_job_repair_preview` request with
+`job_id`, `nonce`, and `replace_stateless: true`. The response binds the
+published CID, app ID and revision, previous addresses, paid slot count, and
+coordinator. A blocked relink keeps its original coordinator. Otherwise the
+registered EVM oracle roster and job ID select the coordinator before resolving
+its internal address. An unavailable mapping blocks review until it is
+available. Current worker sightings are returned separately in
+`observed_previous_nodes` and stay outside the signed proposal.
+
+The signed `repair_update_pipeline` request includes the ordinary complete
+update, an explicit target for every paid slot, and
+`repair: {replace_stateless: true, accept_unconfirmed_stop: true, proposal}`.
+Normal payment, resource, and target checks apply. The escrow owner or an
+active delegate with the editor's job-edit permission can sign. Every target
+needs a distinct active license at admission. Existing app and component IDs are preserved.
+The path supports ordinary native plugins and app runners. Local mounts,
+runtime commands, synchronization, and managed services make a job ineligible.
+Deeploy uses the normal readiness and shutdown behavior of each component. The
+signer attests that the app can run while a previous copy may still be active.
+
+Admission stages only the replacement revision and reserves any blocked
+retirement. It sends versioned replacement commands without waiting for old
+nodes or using historical license relink records. Only successful readiness
+publishes the new runtime placement. A completed cutover or a failed rollout
+that dispatched workers revokes the superseded relink's prepared grants. A
+failed preparation releases the hold so the original relink can resume. Failed
+replacement cleans up its own attempt and keeps the previous saved pointer. It cannot reconstruct the
+previous running deployment. Status exposes removed addresses under
+`unconfirmed_previous_nodes`. This operation updates the Deeploy runtime
+placement. On-chain node allocation and rewards follow the existing contract.
+
+Publish Core 7.7.363 before building Edge. Upgrade the target workers, the
+serving oracles, and dAuth before enabling the updated editor. Stateless
+operations use versioned phases so earlier coordinators and custodians cannot
+interpret a persisted replacement as an ordinary update.

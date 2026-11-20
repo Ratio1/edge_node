@@ -35,6 +35,37 @@ class DeploymentAuthenticationError(ValueError):
   """The reusable read authorization is invalid or expired."""
 
 
+STATELESS_REPLACEMENT = "stateless_replacement_v1"
+
+
+_OPERATION_PHASE_PREFIXES = {
+  "same_host_repair_v1": "repair_v1_",
+  STATELESS_REPLACEMENT: "stateless_v1_",
+}
+
+
+def deployment_operation_phase(operation):
+  """Read the logical phase of a lifecycle operation.
+
+  Parameters
+  ----------
+  operation : dict
+    Signed deployment snapshot as stored by the coordinator.
+
+  Returns
+  -------
+  str
+    Logical phase used by current code and public progress.
+
+  Examples
+  --------
+  >>> deployment_operation_phase({"mutation": STATELESS_REPLACEMENT, "phase": "stateless_v1_accepted"})
+  'accepted'
+  """
+  phase = operation["phase"]
+  return phase.removeprefix(_OPERATION_PHASE_PREFIXES.get(operation.get("mutation"), ""))
+
+
 class DeploymentConflictError(ValueError):
   """A request conflicts with observed operation identity or revision."""
 
@@ -342,6 +373,48 @@ def list_order_differs(stored, running):
   return False
 
 
+def with_observed_legacy_metadata_order(pipeline, observed):
+  """Match permutations of known unordered Deeploy metadata in a comparison copy.
+
+  Parameters
+  ----------
+  pipeline, observed : dict
+    Stored pipeline (or its independently corrected copy) and the worker's report.
+
+  Returns
+  -------
+  dict
+    Pipeline with equivalent metadata aligned to the observed order. The inputs remain intact.
+
+  Examples
+  --------
+  >>> cfg = {"DEEPLOY_SPECS": {"spare_nodes": ["a", "b"]}}
+  >>> report = {"DEEPLOY_SPECS": {"spare_nodes": ["b", "a"]}}
+  >>> with_observed_legacy_metadata_order(cfg, report) == report
+  True
+  """
+  stored_specs, live_specs = pipeline.get("DEEPLOY_SPECS"), observed.get("DEEPLOY_SPECS")
+  if not isinstance(stored_specs, dict) or not isinstance(live_specs, dict):
+    return pipeline  # An incomplete report cannot establish an equivalent order.
+
+  def align(stored, running):
+    if (isinstance(stored, list) and isinstance(running, list)
+        and all(isinstance(value, str) and value for value in stored + running)
+        and sorted(stored) == sorted(running)):
+      return list(running)  # Match membership and multiplicity before taking the order.
+    return stored
+
+  specs = dict(stored_specs)
+  if "spare_nodes" in specs:
+    specs["spare_nodes"] = align(specs["spare_nodes"], live_specs.get("spare_nodes"))
+  stored_keys, live_keys = specs.get("chainstore_response_keys"), live_specs.get("chainstore_response_keys")
+  if isinstance(stored_keys, dict) and isinstance(live_keys, dict):
+    # Responses are keyed by ID. Each key must stay with its original node.
+    specs["chainstore_response_keys"] = {node: align(keys, live_keys.get(node))
+                                         for node, keys in stored_keys.items()}
+  return dict(pipeline, DEEPLOY_SPECS=specs)
+
+
 class _DeploymentOperationsMixin:
   """Persist, execute, recover, and present asynchronous deployment operations."""
 
@@ -511,11 +584,23 @@ class _DeploymentOperationsMixin:
     """Select the newest verified snapshot per operation from local replicas."""
     latest = {}
     trusted = set(self._operation_peers())
+    registered = None
     for record in (self.chainstore_hgetall(OPERATIONS_HKEY) or {}).values():
       if not self._verify_operation_record(record, "coordinator"):
         continue
-      if record.get("coordinator") not in trusted or record.get("network") != self.evm_network:
+      if record.get("network") != self.evm_network:
         continue
+      coordinator = record["coordinator"]
+      if coordinator not in trusted:
+        # A persisted oracle record can remain valid after its signer drops out of the local NetMon view.
+        try:
+          if registered is None:
+            registered = {address.lower() for address in self.bc.get_eth_oracles()}
+          if self.bc.node_address_to_eth_address(coordinator).lower() not in registered:
+            continue
+        except (AttributeError, TypeError, ValueError):
+          continue
+        trusted.add(coordinator)
       operation_id = record.get("operation_id")
       sequence = record.get("sequence")
       if not isinstance(operation_id, str) or type(sequence) is not int:
@@ -589,8 +674,9 @@ class _DeploymentOperationsMixin:
     >>> plugin._save_operation(operation)["sequence"]  # nothing changed: no write
     1
     """
-    if operation.get("mutation") == "same_host_repair_v1" and phase not in (None, "completed"):
-      phase = "repair_v1_" + phase.removeprefix("repair_v1_")  # Older coordinators cannot dispatch this phase.
+    prefix = _OPERATION_PHASE_PREFIXES.get(operation.get("mutation"))
+    if prefix and phase not in (None, "completed"):
+      phase = prefix + phase.removeprefix(prefix)  # Older coordinators cannot dispatch this phase.
     if operation["coordinator"] != self.bc.address:
       raise ValueError("Only the accepting oracle can advance this operation.")
     # Same phase, no new event, same content as the stored snapshot: nothing durable changed.
@@ -832,7 +918,8 @@ class _DeploymentOperationsMixin:
     else:
       if reports is None:  # Standalone mutation planning has no placement observation yet.
         reports = self._job_reports(pipeline)
-      if any(required_instances(config) != required_instances(pipeline) or list_order_differs(pipeline, config)
+      if any(required_instances(config) != required_instances(pipeline)
+             or list_order_differs(with_observed_legacy_metadata_order(pipeline, config), config)
              for node_configs in reports.values() for config in node_configs):
         raise ValueError("A node runs this job differently from its stored copy; repair the stored job first.")
       configs = {node: pipeline for node in nodes}
@@ -866,7 +953,7 @@ class _DeploymentOperationsMixin:
 
   def _admit_prepared_deployment(self, request, auth_result, app_id, configs,
                                  prior_pipeline, is_create, mutation=None,
-                                 restore_owner=None, identity_aliases=None, node_aliases=None, repair=None):
+                                 restore_owner=None, identity_aliases=None, node_aliases=None, repair=None, replacement=None):
     """Save exact redacted plans and secret revisions before accepting work.
 
     Parameters
@@ -932,7 +1019,10 @@ class _DeploymentOperationsMixin:
     previous_configs = {}
     previous_operation_id = None
     previous_secret_revision_to_release = None
-    if not is_create:
+    if replacement:
+      # Use the previous pointer for version and custody checks, with no plan to restart the previous placement.
+      previous_secret_revision_to_release = prior_pipeline.get("DEEPLOY_SPECS", {}).get("secret_revision")
+    if not is_create and not replacement:
       previous_nodes = prior_pipeline.get("DEEPLOY_SPECS", {}).get("current_target_nodes", [])
       if not previous_nodes:
         raise ValueError("The previous revision has no recoverable node placement.")
@@ -1012,13 +1102,28 @@ class _DeploymentOperationsMixin:
                        previous_pipeline_cid=repair["proposal"]["pipeline_cid"],
                        repair_aliases=list(map(list, repair["aliases"].items())), repair_licenses=repair["licenses"],
                        rotate_main_tunnel=repair["rotate_main_tunnel"])
+    if replacement:
+      proposal = replacement["proposal"]
+      operation.update(phase="stateless_v1_preparing", previous_pipeline_cid=proposal["pipeline_cid"],
+                       unconfirmed_previous_nodes=replacement["unconfirmed_previous_nodes"])
+      if proposal["parent"]:
+        operation["repair_parent"] = proposal["parent"]  # Reserve the active retirement before any side effect.
     finished = threading.Event()
     self._deployment_preparations[operation_id] = finished
     try:
-      if repair:
-        existing = self._hold_repair_parent(operation, repair)
+      if repair or (replacement and operation.get("repair_parent")):
+        existing = self._hold_repair_parent(operation, repair or replacement)
         if existing:
           return self._accepted_operation_response(existing)
+      elif replacement:
+        from .job_repair import HANDOFF_LOCK
+        with HANDOFF_LOCK:  # Serialize the short reservation, leaving chain and custody calls outside the lock.
+          existing = self._find_request_operation(request, owner, "update")
+          if existing:
+            return self._accepted_operation_response(existing)
+          if self._get_pipeline_from_cstore(job_id) != operation["previous_pipeline_cid"]:
+            raise DeploymentConflictError("The published job changed during replacement review.")
+          self._save_operation(operation, message="Preparing stateless replacement.")
       else:
         self._save_operation(operation, message="Preparing durable deployment data.")
       self._deployment_secret_request(
@@ -1100,6 +1205,8 @@ class _DeploymentOperationsMixin:
       # Both workers must fence legacy writes, including one stopped by the original coordinator operation.
       metadata.update(action="start_repaired_worker_v1", parent_operation_id=operation["repair_parent"]["operation_id"],
                       previous_revision=operation["previous_revision"])
+    if action == "start" and operation.get("mutation") == STATELESS_REPLACEMENT:
+      metadata["action"] = "start_stateless_replacement_v1"  # Old workers cannot interpret this as an ordinary start.
     return metadata
 
   def _send_operation_commands(self, operation, configs, attempt, action, reports):
@@ -1250,9 +1357,10 @@ class _DeploymentOperationsMixin:
     if operation["kind"] == "delete":
       return self._advance_delete_operation(operation)
     repair = operation.get("mutation") == "same_host_repair_v1"
-    if repair and not self._repair_parent_is_held(operation):
+    replacing = operation.get("mutation") == STATELESS_REPLACEMENT
+    if (repair or (replacing and operation.get("repair_parent"))) and not self._repair_parent_is_held(operation):
       return  # A crash between reservation writes is repaired from the parent pass.
-    phase = operation["phase"].removeprefix("repair_v1_")
+    phase = deployment_operation_phase(operation)
     if phase == "preparing" and self.time() >= operation["preparation_deadline"]:
       self._expire_deployment_preparation(operation)
     elif (repair and phase in ("accepted", "retiring_previous") and not operation.get("retire_challenges")
@@ -1260,21 +1368,22 @@ class _DeploymentOperationsMixin:
       # A repair can safely release its parent only before any STOP challenge was durably recorded.
       self._expire_deployment_preparation(operation)
     self._replicate_operation(operation)
-    if operation["phase"].removeprefix("repair_v1_") == "cleaning_up_preparation":
+    if deployment_operation_phase(operation) == "cleaning_up_preparation":
       self._deployment_secret_request("revoke", operation, active_attempt=None)
       operation["recovery"] = "completed"
       self._save_operation(operation, "completed", "Incomplete deployment preparation cleaned up.")
       return
-    if operation["phase"].removeprefix("repair_v1_") == "preparing":
+    if deployment_operation_phase(operation) == "preparing":
       return self._finish_deployment_preparation(operation)
     plan = self._load_operation_plan(operation)
     configs = plan["configs"]
     reports = self._node_operation_reports(operation, "deploy")
-    phase = operation["phase"].removeprefix("repair_v1_")
+    phase = deployment_operation_phase(operation)
     if phase == "accepted":
-      next_phase = "retiring_previous" if operation["kind"] == "update" else "waiting_for_readiness"
-      self._save_operation(operation, next_phase, "Preparing target nodes.")
-      phase = operation["phase"].removeprefix("repair_v1_")
+      next_phase = "retiring_previous" if operation["kind"] == "update" and not replacing else "waiting_for_readiness"
+      message = "Starting replacement targets without previous stop confirmation." if replacing else "Preparing target nodes."
+      self._save_operation(operation, next_phase, message)
+      phase = deployment_operation_phase(operation)
     if phase == "retiring_previous" and repair:
       return self._retire_repair_workers(operation, plan)
     if phase == "retiring_previous":
@@ -1306,14 +1415,14 @@ class _DeploymentOperationsMixin:
       for node, config in active_configs.items():
         pins = pinned_sources(config)
         # A node may go offline between the readiness barrier and publication of the revision.
-        recheck = repair or bool(pins) or any(
+        recheck = repair or replacing or bool(pins) or any(
           deployment_source_mode(plugin["SIGNATURE"], config, instance) == "following"
           for plugin in config.get("PLUGINS", []) for instance in plugin.get("INSTANCES", [])
         )
         online = self._netmon_node_is_online_for_control(node) if recheck else True
         restore_bindings = operation.get("retired_runtime", {}).get(node, {}) if repair and restoring else None
         state = node_rollout_state(config, active_reports.get(node), online, expired, pins=pins,
-                                   allow_waiting_for_source=not repair, restore_bindings=restore_bindings)
+                                   allow_waiting_for_source=not (repair or replacing), restore_bindings=restore_bindings)
         if state in ("failed", "legacy_failed") or (recheck and state not in ("ready", "kept")):
           # Once the revision is published, its remaining secret/metadata writes must still finish.
           pointer = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(operation["job_id"]))
@@ -1325,7 +1434,7 @@ class _DeploymentOperationsMixin:
       expired = self.time() >= operation["deadline"]
       # Repair keeps the existing all-workers-ready barrier, including for source-following apps.
       states = {node: node_rollout_state(config, reports.get(node), self._netmon_node_is_online_for_control(node), expired,
-                                         allow_waiting_for_source=not repair)
+                                         allow_waiting_for_source=not (repair or replacing))
                 for node, config in configs.items()}
       failed = any(state in ("failed", "legacy_failed") for state in states.values())
       if failed or (expired and any(state in ("pending", "legacy_timeout") for state in states.values())):
@@ -1555,7 +1664,7 @@ class _DeploymentOperationsMixin:
         # + 120 s), as before, so a dAuth that recovers in the last seconds still gets the deployment accepted.
         # At the deadline it moves to cleanup, which has no deadline; the phase is read after the failed step.
         repair_conflict = operation.get("mutation") == "same_host_repair_v1" and isinstance(exc, DeploymentConflictError)
-        if (isinstance(exc, DeploymentCustodyError) or repair_conflict) and operation["phase"].removeprefix("repair_v1_") != "preparing":
+        if (isinstance(exc, DeploymentCustodyError) or repair_conflict) and deployment_operation_phase(operation) != "preparing":
           # Custody calls that failed in a row; a pass without an error resets the count (see above).
           failures = pause[0] + 1 if pause else 1
           # Wait 10 s after the first failure and double the wait after each further one, up to 300 s. Before,
@@ -1711,9 +1820,10 @@ class _DeploymentOperationsMixin:
       return {"status": "synchronizing", "job_id": request.get("job_id"),
               "revision": 0, "observation_stale": True, "poll_after_ms": 2000}
     operation = max(matches, key=lambda record: (record["target_revision"], record["created_at"], record["sequence"]))
-    phase = operation["phase"].removeprefix("repair_v1_")
+    phase = deployment_operation_phase(operation)
     restoring = phase in ("restoring_previous", "finalizing_recovery") or (
       operation["outcome"] == "failed" and operation["kind"] == "update"
+      and operation.get("mutation") != STATELESS_REPLACEMENT
       and (operation.get("error") or {}).get("code") != "ADMISSION_PREPARATION_FAILED"
     )
     attempt = "retire" if operation["kind"] == "delete" or phase == "retiring_previous" else "restore" if restoring else "deploy"
@@ -1776,6 +1886,10 @@ class _DeploymentOperationsMixin:
       if phase != "completed" and operation.get("repair_block"):
         # Expose the current hold without overwriting the original rollout failure in the operation.
         result.update(recovery="blocked", error=copy.deepcopy(operation["repair_block"]))
+    if operation.get("mutation") == STATELESS_REPLACEMENT:
+      result["unconfirmed_previous_nodes"] = [
+        node for node in operation["unconfirmed_previous_nodes"] if node not in operation["nodes"]
+      ]  # These addresses may still run a prior copy and are outside the replacement placement.
     if operation.get("repair_child"):
       result["repair_child_operation_id"] = operation["repair_child"]["operation_id"]
     limit = request.get("events_limit", 64)

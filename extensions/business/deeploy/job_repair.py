@@ -9,8 +9,12 @@ import time
 import uuid
 from urllib.parse import urlsplit
 
+from extensions.utils.per_node_config import PER_NODE_TARGET_NODES_KEY
+
 from .deeploy_const import WORKER_APP_RUNNER_SIGNATURE
-from .deployment_operations import DeploymentConflictError, NODE_OPERATIONS_HKEY, required_instances
+from .deployment_operations import (
+  DeploymentConflictError, NODE_OPERATIONS_HKEY, STATELESS_REPLACEMENT, required_instances, with_observed_legacy_metadata_order,
+)
 
 MUTATION = "same_host_repair_v1"
 # The original coordinator owns its parent. Serialize reservation against that coordinator's relink dispatch.
@@ -46,7 +50,8 @@ def worker(config):
     raise ValueError("A saved one-time runtime command cannot be replayed during recovery.")
   sync = instance.get("SYNC") or {}
   if (not isinstance(sync, dict) or sync.get("ENABLED", False) is not False
-      or any(instance.get(key) for key in ("PER_NODE_CONFIG", "perNodeConfig", "VOLUMES", "FILE_VOLUMES", "FIXED_SIZE_VOLUMES"))):
+      or any(instance.get(key) for key in ("PER_NODE_CONFIG", "perNodeConfig", "per_node_config",
+                                         "VOLUMES", "FILE_VOLUMES", "FIXED_SIZE_VOLUMES"))):
     raise ValueError("A job with per-worker overrides or persistent volumes requires a different recovery.")
   return instance
 
@@ -211,10 +216,15 @@ class _JobRepairMixin:
       raise ValueError("The surviving workers disagree about the previous execution order.")
     if any(set(fields[k]) != set(live[k]) for k in fields):
       raise ValueError("The previous worker configuration contains changed entries, not only an order change.")
-    # Take all content from the canonical CID. Replace only integral permutations of the three allowed lists.
-    corrected = copy.deepcopy(pipeline)
+    # Take all content from the canonical CID. Legacy metadata may echo the observed order with identical membership.
+    corrected = with_observed_legacy_metadata_order(copy.deepcopy(pipeline), witnesses[0])
     corrected["DEEPLOY_SPECS"]["current_target_nodes"] = list(live["targets"])
-    worker(corrected).update(BUILD_AND_RUN_COMMANDS=list(live["commands"]), CHAINSTORE_PEERS=list(live["peers"]))
+    corrected_worker = worker(corrected)
+    corrected_worker.update(BUILD_AND_RUN_COMMANDS=list(live["commands"]), CHAINSTORE_PEERS=list(live["peers"]))
+    if (corrected_worker.get(PER_NODE_TARGET_NODES_KEY) == fields["targets"]
+        and all(worker(observed).get(PER_NODE_TARGET_NODES_KEY) == live["targets"] for observed in witnesses)):
+      # Apply the already reviewed target permutation to a verified mirror. Overrides were rejected by worker().
+      corrected_worker[PER_NODE_TARGET_NODES_KEY] = list(live["targets"])
     # Load the v1 comparison only for this flow so older Core can continue handling ordinary updates.
     from naeural_core.business.deployment_lifecycle import repair_config_fingerprint
     for observed in witnesses:
@@ -478,6 +488,128 @@ class _JobRepairMixin:
                 licenses=licenses,
                 rotate_main_tunnel=approval["rotate_main_tunnel"])
 
+  def _stateless_replacement_proposal(self, job_id, owner):
+    """Read the published job and determine which oracle can serialize a replacement.
+
+    Parameters
+    ----------
+    job_id : int
+      Job identified by the signed wallet request.
+    owner : str
+      Authorized escrow owner.
+
+    Returns
+    -------
+    tuple
+      Reviewable placement information and the saved pipeline.
+
+    Examples
+    --------
+    >>> review, pipeline = plugin._stateless_replacement_proposal(31, owner)  # doctest: +SKIP
+    """
+    from naeural_core.business.deployment_lifecycle import stateless_worker_identities
+
+    if type(job_id) is not int or job_id < 1:
+      raise ValueError("A positive job ID is required.")
+    job = self.bc.get_job_details(job_id=job_id)
+    count = job.get("numberOfNodesRequested") if isinstance(job, dict) else None
+    if type(count) is not int or count < 1 or str(job.get("escrowOwner", "")).lower() != owner.lower():
+      raise ValueError("The published job does not have an active paid placement under this CSP.")
+    cid = self._get_pipeline_from_cstore(job_id)
+    pipeline = self.get_pipeline_from_r1fs(cid, timeout=10, pin=False, raise_on_error=False, show_logs=False) if cid else None
+    specs = (pipeline or {}).get("DEEPLOY_SPECS") or {}
+    app_id = (pipeline or {}).get("NAME")
+    nodes = specs.get("current_target_nodes")
+    if (not isinstance(app_id, str) or not app_id or str(specs.get("job_id")) != str(job_id)
+        or str((pipeline or {}).get("OWNER", "")).lower() != owner.lower()
+        or not isinstance(nodes, list) or not nodes or any(not isinstance(node, str) or not node for node in nodes)
+        or type(specs.get("revision", 0)) is not int):
+      raise ValueError("The published job and its previous placement could not be verified.")
+    if specs.get("service_kind"):
+      raise ValueError("Managed services cannot use stateless replacement.")
+    # Use the immutable plan for tracked jobs. Do not compare execution order against live observations.
+    for config in self._previous_deployment_configs(pipeline, reports={}).values():
+      stateless_worker_identities(config)
+    pending = [op for op in self._operation_records().values()
+               if str(op["job_id"]) == str(job_id) and op["phase"] != "completed"]
+    parent = None
+    if pending:
+      if len(pending) != 1:
+        raise DeploymentConflictError("Several operations are active for this job.")
+      previous = pending[0]
+      if (previous.get("mutation") != "node_relink" or previous["phase"] != "retiring_previous"
+          or previous.get("recovery") != "blocked" or (previous.get("error") or {}).get("code") != "PREVIOUS_STOP_UNCONFIRMED"
+          or previous.get("previous_pipeline_cid") != cid or previous.get("app_id") != app_id
+          or str(previous.get("owner", "")).lower() != owner.lower()):
+        raise DeploymentConflictError("The active operation cannot be replaced.")
+      coordinator = previous["coordinator"]
+      parent = {key: previous[key] for key in ("operation_id", "sequence", "plan_cid")}
+    else:
+      # Elect before looking up an internal address, using the same registered roster on every ingress.
+      registered = {address.lower() for address in self.bc.get_eth_oracles()}
+      if not registered:
+        raise DeploymentConflictError("No replacement coordinator is currently available.")
+      selected = min(registered, key=lambda address: (hashlib.sha256(f"{job_id}|{address}".encode()).digest(), address))
+      coordinator = (self.bc.address if self.bc.node_address_to_eth_address(self.bc.address).lower() == selected
+                     else self.bc.eth_addr_to_internal_addr(self.bc.eth_addr_to_checksum_address(selected)))
+      if not coordinator:
+        raise DeploymentConflictError("The selected replacement coordinator is not reachable from this oracle.")
+    # The wallet binds the published configuration and parent, separately from live worker sightings.
+    previous_nodes = sorted(set(nodes) | (set(previous["previous_nodes"]) if parent else set()))
+    proposal = dict(job_id=job_id, app_id=app_id, coordinator=coordinator, pipeline_cid=cid,
+                    network=self.evm_network, expected_revision=specs.get("revision", 0), parent=parent,
+                    previous_nodes=previous_nodes, paid_nodes=count)
+    return proposal, pipeline
+
+  def _prepare_stateless_replacement(self, request, owner, configs):
+    """Bind explicit stateless recovery approval to the desired update and current job.
+
+    Parameters
+    ----------
+    request : dict
+      Verified signed update.
+    owner : str
+      Wallet's authorized escrow owner.
+    configs : dict
+      Complete prepared configs for the explicitly selected paid targets.
+
+    Returns
+    -------
+    dict
+      Verified proposal and previous config used only for inherited values.
+
+    Examples
+    --------
+    >>> recovery = plugin._prepare_stateless_replacement(request, owner, configs)  # doctest: +SKIP
+    """
+    from naeural_core.business.deployment_lifecycle import stateless_worker_identities
+
+    approval = request["repair"]
+    if approval.get("accept_unconfirmed_stop") is not True:
+      raise ValueError("Confirm that a previous copy may still be running.")
+    proposal, pipeline = self._stateless_replacement_proposal(request["job_id"], owner)
+    if proposal != approval.get("proposal") or proposal["coordinator"] != self.bc.address:
+      raise DeploymentConflictError("The reviewed job or its operation changed. Review replacement again.")
+    if len(configs) != proposal["paid_nodes"] or not request.get("target_nodes"):
+      raise ValueError("Select exactly the number of targets paid for by the job.")
+    prior_configs = self._previous_deployment_configs(pipeline, reports={})
+    licenses = set()
+    for node, config in configs.items():
+      # Select any currently licensed worker within the paid capacity. A historical relink is unnecessary.
+      eth = self.bc.node_address_to_eth_address(node)
+      info = self.bc.get_node_license_info(node_address_eth=eth, raise_if_error=True)
+      if (not isinstance(info, dict) or info.get("isValid") is not True or type(info.get("licenseId")) is not int
+          or str(info.get("nodeAddress", "")).lower() != eth.lower() or info["licenseId"] in licenses):
+        raise ValueError("Each replacement target needs a distinct active node license.")
+      licenses.add(info["licenseId"])
+      ids = stateless_worker_identities(config)
+      source = prior_configs.get(node, pipeline)
+      if config.get("NAME") != proposal["app_id"] or ids != stateless_worker_identities(source):
+        raise ValueError("Replacement must preserve the job and its component instance IDs.")
+    observed = {node for node, reports in self._job_reports(pipeline).items() if reports}
+    return {"proposal": proposal, "prior": pipeline,
+            "unconfirmed_previous_nodes": sorted(set(proposal["previous_nodes"]) | observed)}
+
   def _hold_repair_parent(self, operation, repair):
     """Reserve the existing operation before a child custody grant or retirement.
 
@@ -501,8 +633,8 @@ class _JobRepairMixin:
       records = self._operation_records()
       parent = records[proposal["parent"]["operation_id"]]
       for existing in records.values():
-        if (existing.get("mutation") == MUTATION and existing["coordinator"] == self.bc.address
-            and existing["phase"] != "completed" and existing["repair_parent"]["operation_id"] == parent["operation_id"]):
+        if (existing.get("mutation") in (MUTATION, STATELESS_REPLACEMENT) and existing["coordinator"] == self.bc.address
+            and existing["phase"] != "completed" and existing.get("repair_parent", {}).get("operation_id") == parent["operation_id"]):
           if existing["request_hash"] == operation["request_hash"] and existing["request_id"] == operation["request_id"]:
             return existing  # A retry can arrive between saving the first child and saving the parent.
           raise DeploymentConflictError("Another approved update has already reserved this retirement.")
@@ -511,10 +643,10 @@ class _JobRepairMixin:
           or self._get_pipeline_from_cstore(parent["job_id"]) != proposal["pipeline_cid"]):
         raise DeploymentConflictError("Retirement changed during the review. Refresh recovery.")
       parent["repair_child"] = dict(operation_id=operation["operation_id"], request_hash=operation["request_hash"],
-                                    base_sequence=parent["sequence"], node_aliases=list(map(list, repair["aliases"].items())),
-                                    licenses=repair["licenses"])
+                                    base_sequence=parent["sequence"], node_aliases=operation.get("repair_aliases", []),
+                                    licenses=operation.get("repair_licenses", {}))
       # Persist the redacted, signed child identity first so a crash can always recover a reservation.
-      self._save_operation(operation, message="Preparing signed same-host recovery.")
+      self._save_operation(operation, message="Preparing signed job recovery.")
       self._save_operation(parent, "holding_for_repair", "Retirement held for the CSP-approved update.")
 
   def _reconcile_repair_parent(self, parent):
@@ -537,7 +669,7 @@ class _JobRepairMixin:
     if parent["phase"] != "holding_for_repair" and (parent["phase"] != "retiring_previous"
         or (parent.get("error") or {}).get("code") != "PREVIOUS_STOP_UNCONFIRMED"):
       return False  # Only the blocked relink can acquire a repair child.
-    children = [op for op in self._operation_records().values() if op.get("mutation") == MUTATION
+    children = [op for op in self._operation_records().values() if op.get("mutation") in (MUTATION, STATELESS_REPLACEMENT)
                 and op["coordinator"] == self.bc.address and op["job_id"] == parent["job_id"]
                 and op.get("repair_parent", {}).get("operation_id") == parent["operation_id"]]
     for child in children:
@@ -550,13 +682,13 @@ class _JobRepairMixin:
             self._save_operation(parent, "retiring_previous", "Recovery preparation ended before retirement.")
           else:
             parent.update(outcome="superseded", recovery="completed")
-            self._save_operation(parent, "completed", "The linked recovery completed on the current workers.")
+            self._save_operation(parent, "completed", "A signed recovery superseded this retirement.")
         return True
       if (parent["phase"] == "retiring_previous" and child["phase"] != "completed"
           and parent["sequence"] == link["sequence"] and parent["plan_cid"] == link["plan_cid"]):
         parent["repair_child"] = dict(operation_id=child["operation_id"], request_hash=child["request_hash"],
-                                      base_sequence=link["sequence"], node_aliases=child["repair_aliases"],
-                                      licenses=child["repair_licenses"])
+                                      base_sequence=link["sequence"], node_aliases=child.get("repair_aliases", []),
+                                      licenses=child.get("repair_licenses", {}))
         self._save_operation(parent, "holding_for_repair", "Recovered the reservation for the CSP-approved update.")
         return True
     return parent["phase"] == "holding_for_repair"
@@ -583,7 +715,7 @@ class _JobRepairMixin:
     return (parent.get("phase") == "holding_for_repair" and parent.get("coordinator") == self.bc.address
             and parent.get("job_id") == child["job_id"] and parent.get("plan_cid") == child["repair_parent"]["plan_cid"]
             and reservation.get("base_sequence") == child["repair_parent"]["sequence"]
-            and reservation.get("licenses") == child["repair_licenses"]
+            and reservation.get("licenses") == child.get("repair_licenses", {})
             and reservation.get("operation_id") == child["operation_id"] and reservation.get("request_hash") == child["request_hash"])
 
   def _retire_repair_workers(self, child, plan):

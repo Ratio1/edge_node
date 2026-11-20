@@ -4,7 +4,9 @@ import hashlib
 
 from .dauth_registry import dauth_registry_write_kwargs
 from .repair_tunnel import reconcile_restore_tunnel
-from extensions.business.deeploy.deployment_operations import required_instances, SIGNATURE_KEYS
+from extensions.business.deeploy.deployment_operations import (
+  deployment_operation_phase, required_instances, SIGNATURE_KEYS, STATELESS_REPLACEMENT,
+)
 from extensions.business.deeploy.relink_placement import relink_configs, relink_pipeline
 
 
@@ -108,12 +110,14 @@ class _DauthDeploymentSecretsMixin:
           type(operation.get("previous_revision")) is not int
           or not 0 <= operation["previous_revision"] < operation["target_revision"]))):
       raise ValueError("Invalid deployment operation identity.")
-    if operation.get("mutation") == "same_host_repair_v1":
-      phase = operation.get("phase")
-      if not isinstance(phase, str) or not phase.startswith("repair_v1_"):
+    if operation.get("mutation") in ("same_host_repair_v1", STATELESS_REPLACEMENT):
+      if not isinstance(operation.get("phase"), str):
+        raise ValueError("Invalid repair custody phase.")
+      phase = deployment_operation_phase(operation)
+      if phase == operation["phase"]:
         raise ValueError("Invalid repair custody phase.")
       # Normalize a private view only after authenticating the original signed snapshot above.
-      operation = dict(operation, phase=phase[len("repair_v1_"):])
+      operation = dict(operation, phase=phase)
     action, phase = body.get("action"), operation.get("phase")
     phases = {
       "prepare": {"preparing"}, "status": {"preparing"},
@@ -154,6 +158,8 @@ class _DauthDeploymentSecretsMixin:
     records = (self.chainstore_hgetall(hkey="DEEPLOY_OPERATIONS") or {}).values()
     if operation.get("mutation") == "same_host_repair_v1":
       self._verify_held_repair_parent(operation, body, plan, records)
+    elif operation.get("mutation") == STATELESS_REPLACEMENT and "repair_parent" in operation:
+      self._require_held_repair_parent(operation, records)
     for record in records:
       if (isinstance(record, dict) and record.get("operation_id") == operation_id
           and record.get("coordinator") == requester and record.get("EE_SENDER") == requester
@@ -161,6 +167,50 @@ class _DauthDeploymentSecretsMixin:
           and record.get("sequence", 0) > operation.get("sequence", 0)):
         raise RuntimeError("A newer deployment operation snapshot is available.")
     return job_id, operation, plan
+
+  def _require_held_repair_parent(self, operation, records):
+    """Resolve the latest authentic retirement hold for this exact child.
+
+    Parameters
+    ----------
+    operation : dict
+      Authenticated child operation.
+    records : iterable
+      Locally replicated coordinator snapshots.
+
+    Returns
+    -------
+    tuple
+      The signed parent and its reservation for this child.
+
+    Examples
+    --------
+    >>> parent, hold = plugin._require_held_repair_parent(child, replicas)  # doctest: +SKIP
+    """
+    parent_ref = operation.get("repair_parent")
+    if not isinstance(parent_ref, dict) or type(parent_ref.get("sequence")) is not int:
+      raise ValueError("The repair has no valid parent reference.")
+    requester = operation["coordinator"]
+    parents = [record for record in records if isinstance(record, dict)
+               and record.get("operation_id") == parent_ref.get("operation_id")
+               and record.get("EE_SENDER") == requester and record.get("coordinator") == requester
+               and type(record.get("sequence")) is int
+               and self.bc.verify(record, return_full_info=True, log_hash_sign_fails=False).valid]
+    if not parents:  # A dAuth with a lagging replica must wait for the authoritative hold.
+      raise RuntimeError("The original coordinator's repair hold is unavailable.")
+    parent = max(parents, key=lambda record: record["sequence"])
+    hold = parent.get("repair_child") or {}
+    if (parent.get("phase") != "holding_for_repair" or parent.get("mutation") != "node_relink"
+        or parent.get("kind") != "update" or operation["kind"] != "update"
+        or parent.get("plan_cid") != parent_ref.get("plan_cid")
+        or parent_ref["sequence"] != hold.get("base_sequence") or parent["sequence"] <= parent_ref["sequence"]
+        or hold.get("operation_id") != operation["operation_id"] or hold.get("request_hash") != operation["request_hash"]
+        or parent["operation_id"] == operation["operation_id"] or parent["target_revision"] >= operation["target_revision"]
+        or any(parent.get(key) != operation.get(key) for key in (
+          "app_id", "job_id", "network", "owner", "previous_pipeline_cid", "previous_revision",
+          "previous_secret_revision"))):
+      raise ValueError("The original operation has not authorized this repair.")
+    return parent, hold
 
   def _verify_held_repair_parent(self, operation, body, plan, records):
     """Bind a repair's custody actions to the original coordinator's held operation.
@@ -184,30 +234,10 @@ class _DauthDeploymentSecretsMixin:
     --------
     >>> plugin._verify_held_repair_parent(child, body, plan, replicas)  # doctest: +SKIP
     """
-    parent_ref = operation.get("repair_parent")
-    if not isinstance(parent_ref, dict) or type(parent_ref.get("sequence")) is not int:
-      raise ValueError("The repair has no valid parent reference.")
-    requester = operation["coordinator"]
-    parents = [record for record in records if isinstance(record, dict)
-               and record.get("operation_id") == parent_ref.get("operation_id")
-               and record.get("EE_SENDER") == requester and record.get("coordinator") == requester
-               and type(record.get("sequence")) is int
-               and self.bc.verify(record, return_full_info=True, log_hash_sign_fails=False).valid]
-    if not parents:  # A dAuth with a lagging replica must wait for the authoritative hold.
-      raise RuntimeError("The original coordinator's repair hold is unavailable.")
-    parent = max(parents, key=lambda record: record["sequence"])
-    hold = parent.get("repair_child") or {}
-    if (parent.get("phase") != "holding_for_repair" or parent.get("mutation") != "node_relink"
-        or parent.get("kind") != "update" or operation["kind"] != "update"
-        or parent.get("previous_revision") != 0 or parent.get("previous_operation_id") or parent.get("previous_secret_revision")
-        or parent.get("plan_cid") != parent_ref.get("plan_cid")
-        or parent_ref["sequence"] != hold.get("base_sequence") or parent["sequence"] <= parent_ref["sequence"]
-        or hold.get("operation_id") != operation["operation_id"] or hold.get("request_hash") != operation["request_hash"]
-        or parent["operation_id"] == operation["operation_id"] or parent["target_revision"] >= operation["target_revision"]
-        or any(parent.get(key) != operation.get(key) for key in (
-          "app_id", "job_id", "network", "owner", "previous_pipeline_cid", "previous_revision",
-          "previous_operation_id", "previous_secret_revision"))):
-      raise ValueError("The original operation has not authorized this repair.")
+    parent, hold = self._require_held_repair_parent(operation, records)
+    if (parent.get("previous_revision") != 0 or parent.get("previous_operation_id")
+        or parent.get("previous_secret_revision") or operation.get("previous_operation_id")):
+      raise ValueError("Same-host repair requires the original legacy revision.")
     pairs = hold.get("node_aliases")
     if (not isinstance(pairs, list) or not pairs
         or any(not isinstance(pair, (list, tuple)) or len(pair) != 2 or not all(isinstance(n, str) and n for n in pair)
@@ -643,13 +673,18 @@ class _DauthDeploymentSecretsMixin:
       for attempt, key in (("deploy", "configs"), ("restore", "previous_configs")):
         if attempt != active_attempt and plan[key]:
           references.append(_revision_ref(operation, attempt))
-    if active_attempt and operation.get("mutation") == "same_host_repair_v1":
+    repair_parent = (operation.get("repair_parent") if operation.get("mutation")
+                     in ("same_host_repair_v1", STATELESS_REPLACEMENT) else None)
+    if active_attempt and repair_parent:
       if (pointer.get("coordinator") != operation["coordinator"] or pointer.get("EE_SENDER") != operation["coordinator"]
           or pointer.get("plan_cid") != operation["plan_cid"]
           or not self.bc.verify(pointer, return_full_info=True, log_hash_sign_fails=False).valid):
         raise ValueError("The repair publication is unauthenticated.")
       # The held parent's two grants remain valid until the child really publishes one of its plans.
-      parent_id = operation["repair_parent"]["operation_id"]
+    # A failed replacement that dispatched workers also supersedes the parent.
+    abandoned_parent = operation.get("mutation") == STATELESS_REPLACEMENT and phase == "stopping_failed_rollout"
+    if repair_parent and (active_attempt or abandoned_parent):
+      parent_id = repair_parent["operation_id"]  # The custody context verified the held parent.
       references.extend((parent_id + ":deploy", parent_id + ":restore"))
     for reference in set(references):
       key = job_id + "|" + reference
