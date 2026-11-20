@@ -260,6 +260,7 @@ class InjectionProbes(ProbeBase):
     skip_paths = {self.target_config.login_path, self.target_config.logout_path}
 
     tested = 0
+    denied = 0
     for form_action in self.discovered_forms[:3]:
       if form_action in skip_paths:
         continue
@@ -269,6 +270,9 @@ class InjectionProbes(ProbeBase):
       try:
         page = self.auth.primary_session.get(url, timeout=10)
       except Exception:
+        continue
+      if not self.response_reached(page):
+        denied += 1
         continue
 
       input_names = re.findall(
@@ -291,8 +295,11 @@ class InjectionProbes(ProbeBase):
           form_data[csrf_field] = csrf_token
 
       try:
-        self.auth.primary_session.post(url, data=form_data, timeout=10)
+        resp = self.auth.primary_session.post(url, data=form_data, timeout=10)
       except Exception:
+        continue
+      if not self.response_reached(resp):
+        denied += 1
         continue
       tested += 1
 
@@ -336,6 +343,8 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"forms_tested={tested}"],
       ))
+    elif denied > 0:
+      self.emit_endpoint_denied("PT-A03-02")
 
   def _test_ssrf(self):
     """
@@ -505,10 +514,9 @@ class InjectionProbes(ProbeBase):
 
     # Test against: login page (common redirect after login), discovered routes.
     # Never the logout path: a GET there ends the scan session.
-    logout_path = self.target_config.logout_path
     test_paths = [self.target_config.login_path]
     for route in self.discovered_routes:
-      if route != logout_path:
+      if not self.is_logout_path(route):
         test_paths.append(route)
     # Deduplicate
     seen = set()

@@ -333,11 +333,21 @@ class MisconfigProbes(ProbeBase):
         )
       except Exception:
         continue
-      if not baseline_ok and not self.response_reached(resp, validation_ok=True):
+      # Not reached (login redirect, 404): denied. After a reached baseline a
+      # 401/403 is left to the CSRF-rejection checks below.
+      if not self.response_reached(resp, validation_ok=True) and (
+          not baseline_ok or resp.status_code not in (401, 403)):
+        denied += 1
+        continue
+      body_lower = resp.text.lower()
+      # Without the valid-token POST baseline (allow_stateful), a GET that
+      # reached the page does not show the user may POST there: a bare 401/403
+      # may be an authorization denial, so only a CSRF-specific rejection counts.
+      if (not self._allow_stateful and resp.status_code in (401, 403)
+          and "csrf" not in body_lower and "token" not in body_lower):
         denied += 1
         continue
       tested += 1
-      body_lower = resp.text.lower()
       csrf_rejected = any(m in body_lower for m in [
         "csrf", "forbidden", "token", "invalid request",
       ]) or resp.status_code == 403

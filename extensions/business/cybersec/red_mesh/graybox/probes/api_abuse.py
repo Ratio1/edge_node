@@ -204,6 +204,9 @@ class ApiAbuseProbes(ProbeBase):
         )
       except requests.RequestException:
         continue
+      if not self.response_reached(baseline):
+        self.emit_endpoint_denied("PT-OAPI4-01")
+        continue
       self.safety.throttle()
       try:
         abuse = session.get(
@@ -211,7 +214,11 @@ class ApiAbuseProbes(ProbeBase):
         )
       except requests.RequestException:
         continue
-      if baseline.status_code >= 400 or abuse.status_code >= 400:
+      if not self.response_reached(abuse):
+        # A 400/415/422 rejects the high limit (the handler ran): no verdict,
+        # as before. Anything else not reached is a denial of the principal.
+        if not self.response_reached(abuse, validation_ok=True):
+          self.emit_endpoint_denied("PT-OAPI4-01")
         continue
       base_size = len((baseline.text or "").encode())
       abuse_size = len((abuse.text or "").encode())

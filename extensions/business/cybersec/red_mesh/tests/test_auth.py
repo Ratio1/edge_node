@@ -1371,6 +1371,26 @@ class TestRegularOnlyAuthentication(unittest.TestCase):
       self.assertEqual(validate.call_count, 1)
 
   @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_probe_path_login_page_without_marker_or_identity_is_a_logout(self, mock_requests):
+    """A 200 login page at the probe path lacks the configured marker or
+    identity: the session ended."""
+    import time
+    for stage in ("authenticated_probe_marker_missing",
+                  "authenticated_probe_identity_missing"):
+      with self.subTest(stage=stage):
+        mock_requests.Session.return_value = self._form_session()
+        auth = _make_auth()
+        self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+        auth._liveness_checked_at = time.time() - 61
+
+        def login_page(session, stage=stage):
+          auth._auth_diagnostics.append({"stage": stage, "status": 200})
+          return False, False
+        with patch.object(auth, "_authenticated_probe_path", return_value="/api/me"), \
+             patch.object(auth, "_validate_authenticated_session", side_effect=login_page):
+          self.assertTrue(auth.needs_refresh())
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
   def test_probe_path_429_or_5xx_is_not_a_logout(self, mock_requests):
     import time
     mock_requests.Session.return_value = self._form_session()

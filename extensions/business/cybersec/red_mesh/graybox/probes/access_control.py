@@ -383,6 +383,7 @@ class AccessControlProbes(ProbeBase):
     }
 
     tested = 0
+    denied = 0
     accepted_evidence = []
 
     for form_path in form_paths[:5]:  # cap at 5 forms
@@ -394,7 +395,8 @@ class AccessControlProbes(ProbeBase):
         page = self.auth.regular_session.get(url, timeout=10)
       except Exception:
         continue
-      if page.status_code != 200:
+      if not self.response_reached(page):
+        denied += 1
         continue
 
       # Extract form fields
@@ -450,6 +452,11 @@ class AccessControlProbes(ProbeBase):
           timeout=10, allow_redirects=False,
         )
       except Exception:
+        continue
+      # A redirect to login or a 401/403 is a denial, not an accepted
+      # submission; a 400/422 is the handler rejecting the fields.
+      if not self.response_reached(resp, validation_ok=True):
+        denied += 1
         continue
       tested += 1
 
@@ -515,6 +522,8 @@ class AccessControlProbes(ProbeBase):
         owasp="A04:2021",
         evidence=[f"forms_tested={tested}"],
       ))
+    elif denied > 0:
+      self.emit_endpoint_denied("PT-A04-01")
 
   def _test_mass_assignment_ownership(self):
     """
@@ -965,6 +974,7 @@ class AccessControlProbes(ProbeBase):
 
     delta_evidence = []
     tested = 0
+    denied = 0
     for path in targets:
       url = self.target_url + path
       self.safety.throttle()
@@ -972,7 +982,8 @@ class AccessControlProbes(ProbeBase):
         baseline = self.auth.regular_session.get(url, timeout=10)
       except Exception:
         continue
-      if baseline.status_code != 200:
+      if not self.response_reached(baseline):
+        denied += 1
         continue
       base_body = baseline.text
       base_len = len(base_body)
@@ -984,9 +995,10 @@ class AccessControlProbes(ProbeBase):
           )
         except Exception:
           continue
-        tested += 1
-        if probed.status_code != 200:
+        if not self.response_reached(probed):
+          denied += 1
           continue
+        tested += 1
         # Detect the appearance of admin-only markers that weren't in
         # the baseline. Length-only deltas are too noisy to flag alone.
         admin_markers = ["admin panel", "/admin-panel", "manage users",
@@ -1035,6 +1047,8 @@ class AccessControlProbes(ProbeBase):
         owasp="A01:2021",
         evidence=[f"paths_tested={len(targets)}", f"requests={tested}"],
       ))
+    elif denied > 0:
+      self.emit_endpoint_denied("PT-A01-10")
 
   def _test_hidden_field_tampering(self):
     """PT-A01-12: scan discovered forms for hidden inputs and try

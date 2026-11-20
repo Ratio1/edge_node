@@ -582,7 +582,8 @@ class ProbeBase:
 
     A page that only pre-fills a username next to a change-password form is
     not a login page, so a form with an action must post to the login path.
-    With no form action to read, the username input is enough.
+    A form posting to itself (no action, empty, "#" or query-only) needs a
+    login shape: one password input, at most 3 visible fields.
     """
     import re
     text = _as_text(text)
@@ -595,14 +596,23 @@ class ProbeBase:
     ) is None:
       return False
     actions = re.findall(r'<form[^>]*\baction=["\']([^"\']*)', text, re.IGNORECASE)
-    if not actions:
+    if any(self._is_login_location(a) for a in actions):
       return True
-    # An empty, "#" or query-only action posts back to the page itself: a
-    # login form rendered inline at the protected URL.
-    return any(
-      not a.strip() or a.strip().startswith(("#", "?")) or self._is_login_location(a)
-      for a in actions
-    )
+    # No action, or an empty, "#" or query-only one, posts back to the page
+    # itself: a login form rendered inline at the protected URL. An admin
+    # "create user" page posts to itself too, so the inline form counts only
+    # with exactly one password input and at most 3 visible fields.
+    if actions and not any(
+      not a.strip() or a.strip().startswith(("#", "?")) for a in actions
+    ):
+      return False
+    passwords = re.findall(r'<input[^>]+type=["\']?password', text, re.IGNORECASE)
+    visible = [
+      tag for tag in re.findall(r'<input\b[^>]*>', text, re.IGNORECASE)
+      if not re.search(r'type=["\']?(hidden|submit|button|image|reset)\b',
+                       tag, re.IGNORECASE)
+    ] + re.findall(r'<(?:select|textarea)\b', text, re.IGNORECASE)
+    return len(passwords) == 1 and len(visible) <= 3
 
   def response_reached(self, resp, validation_ok=False, auth_required_marker="") -> bool:
     """Shared reachability check: did ``resp`` come from the endpoint's handler.

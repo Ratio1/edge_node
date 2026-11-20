@@ -188,6 +188,26 @@ class TestCsrfBypass(unittest.TestCase):
     self.assertEqual([f.status for f in probe.findings if f.scenario_id == "PT-A02-05"],
                      ["not_vulnerable"])
 
+  def test_csrf_bare_403_without_token_baseline_is_not_clean(self):
+    """No allow_stateful: a reached GET does not prove the user may POST. A
+    bare 403 on the tokenless POST may be an authorization denial, so it is
+    inconclusive, never not_vulnerable."""
+    for admin_context, reason in (("absent", "reason=admin_context_absent"),
+                                  ("provided", "reason=endpoint_denied")):
+      with self.subTest(admin_context=admin_context):
+        session = MagicMock()
+        session.get.return_value = _mock_response(status=200, text="form")
+        session.post.return_value = _mock_response(status=403, text="Forbidden")
+        probe = _make_probe(
+          primary_session=session,
+          workflow_endpoints=[WorkflowEndpoint(path="/api/transfer/")],
+        )
+        probe.auth.admin_context = admin_context
+        probe._test_csrf_bypass()
+        found = [f for f in probe.findings if f.scenario_id == "PT-A02-05"]
+        self.assertEqual([f.status for f in found], ["inconclusive"])
+        self.assertIn(reason, found[0].evidence)
+
   def test_csrf_post_only_action_405_baseline_is_decided_by_the_tokenless_post(self):
     for post_status, expected in ((403, "inconclusive"), (200, "vulnerable")):
       with self.subTest(post_status=post_status):
@@ -268,18 +288,26 @@ class TestCsrfBypass(unittest.TestCase):
                      ["not_vulnerable"])
 
   def test_csrf_login_redirect_on_tokenless_post_is_not_a_bypass(self):
-    session = MagicMock()
-    login = _mock_response(status=302, text="")
-    login.headers["Location"] = "/auth/login/"
-    session.get.return_value = _mock_response(status=200, text="form")
-    session.post.side_effect = [login]
-    probe = _make_probe(
-      primary_session=session,
-      workflow_endpoints=[WorkflowEndpoint(path="/api/transfer/")],
-    )
-    probe._test_csrf_bypass()
-    self.assertEqual([f.status for f in probe.findings if f.scenario_id == "PT-A02-05"],
-                     ["not_vulnerable"])
+    """A login redirect on the tokenless POST is a denial, not a CSRF
+    rejection: inconclusive, never not_vulnerable."""
+    for stateful in (False, True):
+      with self.subTest(stateful=stateful):
+        session = MagicMock()
+        login = _mock_response(status=302, text="")
+        login.headers["Location"] = "/auth/login/"
+        session.get.return_value = _mock_response(status=200, text="form")
+        # With allow_stateful the valid-token baseline POST comes first.
+        session.post.side_effect = (
+          [_mock_response(status=200, text="saved"), login] if stateful else [login])
+        probe = _make_probe(
+          primary_session=session, allow_stateful=stateful,
+          workflow_endpoints=[WorkflowEndpoint(path="/api/transfer/")],
+        )
+        probe.auth.admin_context = "absent"
+        probe._test_csrf_bypass()
+        found = [f for f in probe.findings if f.scenario_id == "PT-A02-05"]
+        self.assertEqual([f.status for f in found], ["inconclusive"])
+        self.assertEqual(found[0].evidence, ["reason=admin_context_absent"])
 
   def test_csrf_bypass_skips_login(self):
     """Login form is not tested for CSRF."""

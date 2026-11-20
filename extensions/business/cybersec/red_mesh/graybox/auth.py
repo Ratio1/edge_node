@@ -120,12 +120,15 @@ class AuthManager:
         and time.time() - self._liveness_checked_at >= self.LIVENESS_CHECK_SECONDS):
       self._liveness_checked_at = time.time()
       valid, retryable = self._validate_authenticated_session(self.primary_session)
-      # Only a redirect or a 401/403 means the session ended; a 429 or 5xx
-      # on the probe path is the target struggling, not a logout.
+      # Only a redirect, a 401/403, or a 2xx without the configured marker or
+      # identity (a 200 login page at the probe path) means the session ended;
+      # a 429 or 5xx on the probe path is the target struggling, not a logout.
       last_stage = (self._auth_diagnostics[-1].get("stage", "")
                     if self._auth_diagnostics else "")
       if not valid and not retryable and last_stage in (
-          "authenticated_probe_redirect", "authenticated_probe_rejected"):
+          "authenticated_probe_redirect", "authenticated_probe_rejected",
+          "authenticated_probe_marker_missing",
+          "authenticated_probe_identity_missing"):
         return True
     return False
 

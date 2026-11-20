@@ -543,7 +543,7 @@ class TestMassAssignment(unittest.TestCase):
       return _mock_response(status=200, text=verify_html)
 
     session.get = MagicMock(side_effect=mock_get)
-    session.post = MagicMock(return_value=_mock_response(status=302, text=""))
+    session.post = MagicMock(return_value=_redirect_to("/profile/"))
     probe.auth.detected_csrf_field = None
     probe.auth.extract_csrf_value = MagicMock(return_value=None)
 
@@ -761,3 +761,96 @@ class TestHiddenFieldReachability(unittest.TestCase):
     sess.post = MagicMock(return_value=redirect)
     probe._test_hidden_field_tampering()
     self.assertEqual(self._verdict(probe)[0], ["vulnerable"])
+
+
+class TestQueryRoleOverrideReachability(unittest.TestCase):
+  """PT-A01-10: a denied route says nothing about a role override."""
+
+  def test_denied_baseline_or_probe_is_inconclusive(self):
+    for admin, reason in (("provided", "endpoint_denied"),
+                          ("absent", "admin_context_absent")):
+      for name, denial in (("403", lambda: _mock_response(status=403)),
+                           ("404", lambda: _mock_response(status=404)),
+                           ("login", _login_redirect_response)):
+        for where in ("baseline", "probe"):
+          with self.subTest(admin=admin, denial=name, where=where):
+            probe = _make_probe(discovered_routes=["/dashboard/"])
+            probe.auth.admin_context = admin
+            if where == "baseline":
+              probe.auth.regular_session.get = MagicMock(
+                side_effect=lambda *a, **k: denial())
+            else:
+              probe.auth.regular_session.get = MagicMock(
+                side_effect=lambda *a, **k: (
+                  denial() if k.get("params") else _reached_response("<p>Hello</p>")))
+            probe._test_query_role_override()
+            found = [f for f in probe.findings if f.scenario_id == "PT-A01-10"]
+            self.assertEqual([f.status for f in found], ["inconclusive"])
+            self.assertIn(f"reason={reason}", found[0].evidence)
+
+
+class TestMassAssignmentReachability(unittest.TestCase):
+  """PT-A04-01: a redirect to login is not an accepted submission."""
+
+  FORM = '<form><input name="title" value="t"></form>'
+
+  def _probe(self, admin_context):
+    probe = _make_probe(allow_stateful=True)
+    probe.discovered_forms = ["/profile/"]
+    probe.auth.detected_csrf_field = None
+    probe.auth.extract_csrf_value = MagicMock(return_value=None)
+    probe.auth.admin_context = admin_context
+    return probe
+
+  def _verdict(self, probe):
+    found = [f for f in probe.findings if f.scenario_id == "PT-A04-01"]
+    return ([f.status for f in found],
+            [e for f in found for e in f.evidence if e.startswith("reason=")])
+
+  def test_denied_form_or_post_is_inconclusive(self):
+    for admin, reason in (("provided", "endpoint_denied"),
+                          ("absent", "admin_context_absent")):
+      for where in ("form", "post"):
+        with self.subTest(admin=admin, where=where):
+          probe = self._probe(admin)
+          sess = probe.auth.regular_session
+          if where == "form":
+            sess.get = MagicMock(side_effect=lambda *a, **k: _login_redirect_response())
+          else:
+            sess.get = MagicMock(return_value=_reached_response(self.FORM))
+          sess.post = MagicMock(return_value=_redirect_to("/auth/login/?next=/profile/"))
+          probe._test_mass_assignment()
+          self.assertEqual(self._verdict(probe), (["inconclusive"], [f"reason={reason}"]))
+          if where == "form":
+            sess.post.assert_not_called()
+
+
+class TestCreateUserPageIsNotALoginPage(unittest.TestCase):
+  """PT-A01-02: an admin "create user" form posts to itself and carries a
+  username and password field, but it is the admin page, not a login page."""
+
+  PAGES = (
+    # password + confirm
+    '<form method="post"><input type="hidden" name="csrf" value="t">'
+    '<input name="username"><input type="password" name="password1">'
+    '<input type="password" name="password2"><input type="submit"></form>',
+    # one password plus email and role
+    '<form method="post" action=""><input name="username">'
+    '<input type="email" name="email"><input type="password" name="password">'
+    '<select name="role"><option value="admin">admin</option></select>'
+    '<input type="submit" value="Create"></form>',
+  )
+
+  def test_create_user_page_is_reported_vulnerable(self):
+    for page in self.PAGES:
+      with self.subTest(page=page):
+        ep = AdminEndpoint(path="/admin/users/new/", method="GET",
+                           content_markers=["password"])
+        probe = _make_probe(admin_endpoints=[ep])
+        _set_admin(probe, "absent")
+        resp = _reached_response(page)
+        resp.url = "http://testapp.local:8000/admin/users/new/"
+        probe.auth.regular_session.get.return_value = resp
+        probe._test_privilege_esc()
+        found = [f for f in probe.findings if f.scenario_id == "PT-A01-02"]
+        self.assertEqual([f.status for f in found], ["vulnerable"])

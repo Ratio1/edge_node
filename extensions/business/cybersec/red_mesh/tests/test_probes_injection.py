@@ -671,6 +671,7 @@ class TestReachabilityRuleInjection(unittest.TestCase):
 
   CASES = [
     ("PT-A03-01", "_test_authenticated_injection", "get"),
+    ("PT-A03-02", "_test_stored_xss", "get"),
     ("PT-A03-03", "_test_path_traversal", "get"),
     ("PT-A03-04", "_test_reflected_xss", "get"),
     ("PT-A03-06", "_test_template_injection", "get"),
@@ -716,6 +717,22 @@ class TestReachabilityRuleInjection(unittest.TestCase):
     found, reasons = _reason(probe, "PT-A03-01")
     self.assertEqual([f.status for f in found], ["inconclusive"])
     self.assertEqual(reasons, ["reason=admin_context_absent"])
+
+  def test_stored_xss_post_redirected_to_login_is_not_clean(self):
+    """Form GET reaches the handler, the payload POST bounces to login: no
+    clean verdict from a readback of a form that never took the payload."""
+    for admin, reason in (("provided", "endpoint_denied"),
+                          ("absent", "admin_context_absent")):
+      with self.subTest(admin=admin):
+        probe = self._probe(admin)
+        session = probe.auth.primary_session
+        session.get = MagicMock(return_value=_ok(
+          '<form><input name="comment" type="text"></form>'))
+        session.post = MagicMock(side_effect=lambda *a, **k: _denial("login"))
+        probe._test_stored_xss()
+        found, reasons = _reason(probe, "PT-A03-02")
+        self.assertEqual([f.status for f in found], ["inconclusive"])
+        self.assertEqual(reasons, [f"reason={reason}"])
 
   def test_json_payload_redirected_to_login_after_reached_baseline(self):
     probe = self._probe("provided")

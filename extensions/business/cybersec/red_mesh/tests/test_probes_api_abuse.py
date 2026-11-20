@@ -80,6 +80,37 @@ class TestApi4NoPaginationCap(unittest.TestCase):
     )
 
 
+class TestApi4PaginationCapReachability(unittest.TestCase):
+  """PT-OAPI4-01: a login page is no baseline for a size comparison."""
+
+  def _login_page(self):
+    r = _resp(status=200, text="<input name='username'><input type='password' name='p'>")
+    r.url = "http://api.example/auth/login/?next=/api/records/"
+    r.history = []
+    return r
+
+  def _run(self, admin, responses):
+    ep = ApiResourceEndpoint(path="/api/records/", baseline_limit=10,
+                             abuse_limit=1000, allow_high_limit_probe=True)
+    p = _make_probe(resource_endpoints=[ep])
+    p.auth.admin_context = admin
+    p.auth.official_session.get.side_effect = responses
+    p.run_safe("api_no_pagination_cap", p._test_no_pagination_cap)
+    return [f for f in p.findings if f.scenario_id == "PT-OAPI4-01"]
+
+  def test_login_redirect_is_inconclusive_with_reason(self):
+    for admin, reason in (("provided", "endpoint_denied"),
+                          ("absent", "admin_context_absent")):
+      for name, responses in (
+        ("baseline", lambda: [self._login_page(), _resp(status=200, text="y")]),
+        ("abuse", lambda: [_resp(status=200, text="x" * 100), self._login_page()]),
+      ):
+        with self.subTest(admin=admin, denied=name):
+          found = self._run(admin, responses())
+          self.assertEqual([f.status for f in found], ["inconclusive"])
+          self.assertEqual(found[0].evidence, [f"reason={reason}"])
+
+
 class TestApi4OversizedPayload(unittest.TestCase):
 
   def test_oversized_accepted_medium(self):
