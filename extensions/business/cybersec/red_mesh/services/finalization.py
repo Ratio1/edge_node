@@ -26,6 +26,8 @@ from ..models import (
 )
 from ..repositories import ArtifactRepository, JobStateRepository
 from ..tenancy.execution import binding_from_record
+from ..tenancy.identity import IdentityStoreError
+from ..tenancy.ports import TenantStoreError
 from .config import get_attestation_config
 from .control import stop_monitoring
 from .config import get_llm_agent_config
@@ -61,28 +63,104 @@ def _write_job_record(owner, job_key, job_specs, context):
   return job_specs
 
 
-def _execution_operation_allowed(owner, job_specs, *, operation="current", config=None):
-  """Check current bound ownership for effects; local report finalization is separate."""
-  checker = getattr(type(owner), "_execution_operation_allowed", None)
-  if callable(checker):
-    checker = checker.__get__(owner, type(owner))
-  else:
-    checker = owner.__dict__.get("_execution_operation_allowed")
-  if not callable(checker):
-    return False
+def _owner_method(owner, name):
+  method = getattr(type(owner), name, None)
+  if callable(method):
+    return method.__get__(owner, type(owner))
+  method = owner.__dict__.get(name)
+  return method if callable(method) else None
+
+
+def _execution_denial_reason(owner, job_specs, *, operation="current", config=None):
+  """Why launcher-side execution is refused, as a short code, or None when it is allowed (RM-221).
+
+  Local report finalization is separate; this checks current bound ownership for effects.
+  """
+  reason_for = _owner_method(owner, "_execution_denial_reason")
+  checker = _owner_method(owner, "_execution_operation_allowed")
+  if reason_for is None and checker is None:
+    return "forbidden"
   try:
     # RM-108 phase 5: admission never yields a job with no execution_binding, so this reauthorizes
     # against the current stored record unconditionally rather than only for a bound snapshot.
     current = _job_repo(owner).get_job(job_specs["job_id"])
-    if (not isinstance(current, dict)
-        or _execution_identity(current) != _execution_identity(job_specs)
-        or current.get("launcher") != owner.ee_addr
-        or is_terminal_job_status(current.get("job_status"))):
-      return False
-    job_specs = current
-    return checker(job_specs, operation=operation, config=config) is True
+    if not isinstance(current, dict) or _execution_identity(current) != _execution_identity(job_specs):
+      return "identity_mismatch"
+    if current.get("launcher") != owner.ee_addr:
+      return "not_launcher"
+    if is_terminal_job_status(current.get("job_status")):
+      return "job_terminal"
+    if reason_for is None:  # an owner that only answers yes or no
+      return None if checker(current, operation=operation, config=config) is True else "forbidden"
+    # One reauthorization call: the boolean is derived from the reason, never asked twice.
+    reason = reason_for(current, operation=operation, config=config)
+    return reason if reason is None or (isinstance(reason, str) and reason) else "forbidden"
+  except (IdentityStoreError, TenantStoreError):
+    return "store_unavailable"
+  except Exception as exc:
+    owner.P(f"[EXECUTION] denial check raised {type(exc).__name__}", color='y')
+    return "internal_error"
+
+
+def _execution_operation_allowed(owner, job_specs, *, operation="current", config=None):
+  return _execution_denial_reason(owner, job_specs, operation=operation, config=config) is None
+
+
+def _record_execution_denied(owner, job_specs, *, operation, reason, pass_nr):
+  """One `execution_denied` timeline entry and log line per pass and operation (launcher gates only)."""
+  for event in job_specs.get("timeline") or []:
+    meta = event.get("meta") if isinstance(event, dict) else None
+    if (isinstance(meta, dict) and event.get("type") == "execution_denied"
+        and meta.get("operation") == operation and meta.get("pass_nr") == pass_nr):
+      return
+  owner.P(f"[EXECUTION] {job_specs.get('job_id')} pass {pass_nr}: {operation} refused ({reason})", color='y')
+  owner._emit_timeline_event(
+    job_specs, "execution_denied", f"Execution refused for {operation}: {reason}",
+    actor_type="system", meta={"operation": operation, "reason": reason, "pass_nr": pass_nr},
+  )
+
+
+_ANALYSIS_DENIED_MESSAGE = "Automatic analysis execution unavailable"
+
+
+class _AnalysisDenied(RuntimeError):
+  pass
+
+
+def _llm_failure_reason(owner):
+  """Why the last structured narrative failed, from the issues the provider path recorded."""
+  validation = getattr(owner, "_last_structured_llm_validation", None)
+  errors = validation.get("errors") if isinstance(validation, dict) else None
+  if not errors:
+    return "provider_error"  # the call itself raised before any validation ran
+  for error in errors:
+    if error.get("code") == "llm_call_failed":
+      # The authority check runs inside the provider call (before_provider_call); its raise lands here.
+      return ("execution_authority_denied"
+              if _ANALYSIS_DENIED_MESSAGE in str(error.get("message")) else "provider_error")
+  if any(error.get("code") == "empty_response" for error in errors):
+    return "provider_error"
+  return "validation_failed"
+
+
+def _check_execution(owner, job_specs, *, operation, pass_nr, config=None):
+  """The denial reason, or None when allowed; a denial is recorded on the job timeline."""
+  reason = _execution_denial_reason(owner, job_specs, config=config)
+  if reason is not None:
+    _record_execution_denied(owner, job_specs, operation=operation, reason=reason, pass_nr=pass_nr)
+  return reason
+
+
+def attestation_unsubmitted_reason(owner):
+  """Why a submit that returned nothing (not raised) submitted nothing: its own early returns."""
+  try:
+    if not get_attestation_config(owner)["ENABLED"]:
+      return "attestation_disabled"
+    if owner._attestation_get_tenant_private_key() is None:
+      return "no_tenant_key"
   except Exception:
-    return False
+    pass
+  return "submit_failed"
 
 
 def _execution_identity(job_specs):
@@ -98,7 +176,7 @@ def _execution_identity(job_specs):
 
 def _check_automatic_analysis_authority(owner, job_specs):
   if not _execution_operation_allowed(owner, job_specs):
-    raise RuntimeError("Automatic analysis execution unavailable")
+    raise RuntimeError(_ANALYSIS_DENIED_MESSAGE)
 
 
 def emit_attestation_status_event(owner, job_specs, **kwargs):
@@ -291,14 +369,16 @@ def _poll_automatic_analysis(owner, all_jobs):
       color='y',
     )
     sections = None
-    failed = True
+    failed, reason = True, "provider_error"
   else:
     failed = bool(getattr(owner, "_last_structured_llm_failed", None))
+    reason = _llm_failure_reason(owner) if failed else None
   owner._automatic_analysis_state = None
   return {
     "state": state,
     "sections": sections,
     "failed": failed,
+    "reason": reason,
   }, False
 
 
@@ -308,6 +388,12 @@ def _attestation_required(job_specs, job_config) -> bool:
   if isinstance(job_config, dict):
     return bool(job_config.get("blockchain_attestation_enabled", False))
   return False
+
+
+def _enqueue_misp_auto_push(owner, job_specs, pass_nr):
+  # RM-221 (owner): no automatic push while the end attestation is failed; a manual push stays possible.
+  if job_specs.get("attestation_status") != "failed":
+    enqueue_misp_auto_push(owner, job_specs, pass_nr)
 
 
 def _mark_job_failed(owner, job_key, job_specs, *, job_id, pass_nr, failure_class, message, meta=None):
@@ -556,21 +642,28 @@ def maybe_finalize_pass(owner):
       summary_text = None
       llm_report_sections = None
       structured_llm_failed = None
-      analysis_allowed = _execution_operation_allowed(owner, job_specs, config=job_config)
+      llm_failure_reason = None
+      analysis_denial = _execution_denial_reason(owner, job_specs, config=job_config)
       if empty_abort:
         pass  # no analysis of a scan that tested nothing
-      elif llm_cfg["ENABLED"] and aggregated and not analysis_allowed:
+      elif llm_cfg["ENABLED"] and aggregated and analysis_denial is not None:
         structured_llm_failed = True
+        llm_failure_reason = "execution_authority_denied"
+        _record_execution_denied(
+          owner, job_specs, operation="llm_analysis", reason=analysis_denial, pass_nr=job_pass)
       elif llm_cfg["ENABLED"] and aggregated:
         if resumed_automatic_analysis:
           llm_report_sections = automatic_completion["sections"]
           structured_llm_failed = automatic_completion["failed"]
+          llm_failure_reason = automatic_completion.get("reason") or "provider_error"
         else:
           set_job_status(job_specs, JOB_STATUS_ANALYZING)
           job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_analyzing")
           try:
-            if not _execution_operation_allowed(owner, job_specs, config=job_config):
-              raise RuntimeError("Automatic analysis execution unavailable")
+            if _check_execution(
+              owner, job_specs, operation="llm_analysis", pass_nr=job_pass, config=job_config,
+            ) is not None:
+              raise _AnalysisDenied(_ANALYSIS_DENIED_MESSAGE)
             executor = owner._get_manual_analysis_executor()
             # RM-108 phase 5: _execution_operation_allowed above already required a binding.
             provider_options = {
@@ -611,6 +704,8 @@ def maybe_finalize_pass(owner):
               color='y',
             )
             structured_llm_failed = True
+            llm_failure_reason = (
+              "execution_authority_denied" if isinstance(exc, _AnalysisDenied) else "provider_error")
 
         if llm_report_sections and not structured_llm_failed:
           llm_text, summary_text = render_legacy_llm_fields(llm_report_sections)
@@ -620,7 +715,7 @@ def maybe_finalize_pass(owner):
         owner._emit_timeline_event(
           job_specs, "llm_failed",
           f"LLM analysis unavailable for pass {job_pass}",
-          meta={"pass_nr": job_pass}
+          meta={"pass_nr": job_pass, "reason": llm_failure_reason or "provider_error"}
         )
 
       worker_metas = {}
@@ -650,7 +745,6 @@ def maybe_finalize_pass(owner):
 
       redmesh_test_attestation = None
       required_attestation = _attestation_required(job_specs, job_config)
-      required_attestation_failed = False
       terminal_after_pass = (
         run_mode == RUN_MODE_SINGLEPASS
         or job_status == JOB_STATUS_SCHEDULED_FOR_STOP
@@ -673,7 +767,11 @@ def maybe_finalize_pass(owner):
           )
           should_submit_attestation = False
 
-      if should_submit_attestation and _execution_operation_allowed(owner, job_specs):
+      attestation_failure_reason = None
+      if should_submit_attestation:
+        attestation_failure_reason = _check_execution(
+          owner, job_specs, operation="attestation", pass_nr=job_pass)
+      if should_submit_attestation and attestation_failure_reason is None:
         try:
           attestation_node_ips = [
             r.get("node_ip") for r in node_reports.values()
@@ -706,6 +804,7 @@ def maybe_finalize_pass(owner):
               pass_nr=job_pass,
             )
         except Exception as exc:
+          attestation_failure_reason = "submit_failed"
           import traceback
           owner.P(
             f"[ATTESTATION] Failed to submit test attestation for job {job_id}: {exc}\n"
@@ -724,7 +823,6 @@ def maybe_finalize_pass(owner):
       if required_attestation and terminal_after_pass and not empty_abort and not (
         isinstance(redmesh_test_attestation, dict) and redmesh_test_attestation.get("tx_hash")
       ):
-        required_attestation_failed = True
         emit_attestation_status_event(
           owner,
           job_specs,
@@ -732,6 +830,17 @@ def maybe_finalize_pass(owner):
           network=owner.REDMESH_ATTESTATION_NETWORK,
           pass_nr=job_pass,
         )
+        # RM-221: the scan finished, so the job keeps its normal terminal status and its results;
+        # only the attestation is marked failed (retry_job_attestation can submit it later).
+        attestation_failure_reason = attestation_failure_reason or attestation_unsubmitted_reason(owner)
+        job_specs["attestation_status"] = "failed"
+        job_specs["attestation_failure_reason"] = attestation_failure_reason
+        owner._emit_timeline_event(
+          job_specs, "attestation_failed", "End attestation was not submitted",
+          actor_type="system", meta={"pass_nr": job_pass, "reason": attestation_failure_reason},
+        )
+      elif required_attestation and terminal_after_pass and not empty_abort:
+        job_specs["attestation_status"] = "submitted"
 
       worker_scan_metrics = {}
       for addr, report in node_reports.items():
@@ -745,9 +854,12 @@ def maybe_finalize_pass(owner):
       if node_metrics:
         pass_metrics = node_metrics[0] if len(node_metrics) == 1 else owner._merge_worker_metrics(node_metrics)
 
-      if llm_report_sections is not None and not _execution_operation_allowed(owner, job_specs, config=job_config):
+      if llm_report_sections is not None and _check_execution(
+        owner, job_specs, operation="llm_analysis", pass_nr=job_pass, config=job_config,
+      ) is not None:
         llm_report_sections = llm_text = summary_text = None
         llm_failed = True
+        llm_failure_reason = "execution_authority_denied"
 
       pass_report = PassReport(
         pass_nr=job_pass,
@@ -761,6 +873,7 @@ def maybe_finalize_pass(owner):
         llm_analysis=llm_text,
         quick_summary=summary_text,
         llm_failed=llm_failed,
+        llm_failure_reason=llm_failure_reason if llm_failed else None,
         llm_report_sections=llm_report_sections,
         findings=flat_findings if flat_findings else None,
         scan_metrics=pass_metrics,
@@ -810,14 +923,6 @@ def maybe_finalize_pass(owner):
       job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_finalizing")
       job_specs = _ensure_rulebook_assessment_after_pass(owner, job_specs, job_id=job_id, pass_nr=job_pass)
 
-      if required_attestation_failed:
-        _mark_job_failed(
-          owner, job_key, job_specs, job_id=job_id, pass_nr=job_pass,
-          failure_class="attestation_failed",
-          message="Required terminal blockchain attestation was not submitted",
-        )
-        continue
-
       if empty_abort and job_pass <= 1:
         phase = abort_state["abort_phase"] or "unknown"
         _mark_job_failed(
@@ -856,7 +961,7 @@ def maybe_finalize_pass(owner):
         owner.P(f"[SINGLEPASS] Job {job_id} complete. Status set to FINALIZED.")
         owner._emit_timeline_event(job_specs, "finalized", "Job finalized")
         owner._build_job_archive(job_key, job_specs)
-        enqueue_misp_auto_push(owner, job_specs, job_pass)
+        _enqueue_misp_auto_push(owner, job_specs, job_pass)
         owner._clear_live_progress(job_id, list(workers.keys()))
         continue
 
@@ -885,7 +990,7 @@ def maybe_finalize_pass(owner):
         owner.P(f"[CONTINUOUS] Pass {job_pass} complete for job {job_id}. Status set to STOPPED (soft stop was scheduled)")
         owner._emit_timeline_event(job_specs, "stopped", "Job stopped")
         owner._build_job_archive(job_key, job_specs)
-        enqueue_misp_auto_push(owner, job_specs, job_pass)
+        _enqueue_misp_auto_push(owner, job_specs, job_pass)
         owner._clear_live_progress(job_id, list(workers.keys()))
         continue
 
@@ -928,7 +1033,7 @@ def maybe_finalize_pass(owner):
         )
         owner._emit_timeline_event(job_specs, "stopped", "Job stopped")
         owner._build_job_archive(job_key, job_specs)
-        enqueue_misp_auto_push(owner, job_specs, job_pass)
+        _enqueue_misp_auto_push(owner, job_specs, job_pass)
         owner._clear_live_progress(job_id, list(workers.keys()))
         continue
 

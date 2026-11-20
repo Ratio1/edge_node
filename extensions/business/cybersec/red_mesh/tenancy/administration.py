@@ -924,6 +924,25 @@ class TenantAdministrationService:
       return "engagement_expired"
     return None
 
+  def execution_basis_end_reason(self, tenant_id, engagement_id):
+    """RM-221 (owner, 2026-11-20): why an admitted job may no longer act on chain, or None.
+
+    The engagement must still be active and in its window, and its contract must still be one of
+    the tenant's valid contracts, the same basis launch admission requires (`_execution_engagement`).
+    A store it cannot read raises `TenantStoreError`.
+    """
+    ended = self.engagement_end_reason(tenant_id, engagement_id)
+    if ended is not None:
+      return ended
+    tenant = self.store.get("tenant", tenant_id)
+    row = self.store.get("engagement", tenant_id, engagement_id)
+    if self.clock() < datetime.fromisoformat(row["valid_from"]):
+      return "engagement_not_started"
+    if (not isinstance(tenant, dict) or not _valid_contract(tenant.get("contract"))
+        or row["contract_sha256"] not in _contract_sha256s(tenant)):
+      return "contract_invalid"
+    return None
+
   def _tenant_node_row(self, tenant_id, row):
     """RM-102: the read DTO for one live row, or None for a released or a dead-draining one. The
     jobs reader is called only for a draining row."""
