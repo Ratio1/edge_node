@@ -299,6 +299,19 @@ class TestDiscoveryNeverVisitsLogout(unittest.TestCase):
     fetched = [c.args[0] for c in disc.auth.primary_session.get.call_args_list]
     self.assertFalse(any(u.endswith("/auth/logout/") for u in fetched), fetched)
 
+  def test_logout_forms_and_slashless_logout_links_are_dropped(self):
+    """`/auth/logout` equals `/auth/logout/`; a logout form action is not a target."""
+    disc = _make_discovery(routes_html={
+      "/": '<a href="/auth/logout">Out</a><a href="/about/">About</a>'
+           '<form action="/auth/logout"></form><form action="/auth/logout/"></form>'
+           '<form action="/profile/"></form>',
+    })
+    routes, forms = disc.discover()
+    fetched = [c.args[0] for c in disc.auth.primary_session.get.call_args_list]
+    self.assertFalse(any("logout" in u for u in fetched), fetched)
+    self.assertFalse(any("logout" in r for r in routes), routes)
+    self.assertEqual(forms, ["/profile/"])
+
 
 if __name__ == '__main__':
   unittest.main()

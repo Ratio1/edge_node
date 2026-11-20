@@ -28,7 +28,8 @@ def _mock_response(status=200, text="", headers=None, content_type="text/html"):
 def _make_probe(debug_paths=None, workflow_endpoints=None,
                 primary_session=None, anon_session=None,
                 discovered_forms=None, login_path="/auth/login/",
-                password_reset_path="", jwt_endpoints=None):
+                password_reset_path="", jwt_endpoints=None,
+                allow_stateful=False):
   misconfig = MisconfigConfig(
     debug_paths=debug_paths or ["/debug/"],
     jwt_endpoints=jwt_endpoints or JwtEndpoint(),
@@ -56,6 +57,7 @@ def _make_probe(debug_paths=None, workflow_endpoints=None,
     target_config=cfg,
     safety=safety,
     discovered_forms=discovered_forms or [],
+    allow_stateful=allow_stateful,
   )
   return probe
 
@@ -141,6 +143,7 @@ class TestCsrfBypass(unittest.TestCase):
   def test_csrf_bypass_no_token(self):
     """POST accepted without CSRF → vulnerable."""
     session = MagicMock()
+    session.get.return_value = _mock_response(status=200, text="form")  # GET baseline
     session.post.return_value = _mock_response(status=200, text="Success")
     probe = _make_probe(
       primary_session=session,
@@ -154,14 +157,14 @@ class TestCsrfBypass(unittest.TestCase):
     self.assertIn("CWE-352", vuln[0].cwe)
 
   def test_csrf_bypass_rejected(self):
-    """Baseline POST with a token accepted, tokenless POST rejected (403) → not_vulnerable."""
+    """allow_stateful: baseline POST with a token accepted, tokenless POST rejected (403) → not_vulnerable."""
     session = MagicMock()
     session.post.side_effect = [
       _mock_response(status=200, text="saved"),                  # baseline, valid token
       _mock_response(status=403, text="CSRF token missing"),     # tokenless
     ]
     probe = _make_probe(
-      primary_session=session,
+      primary_session=session, allow_stateful=True,
       workflow_endpoints=[WorkflowEndpoint(path="/api/transfer/")],
     )
 
@@ -169,28 +172,80 @@ class TestCsrfBypass(unittest.TestCase):
     clean = [f for f in probe.findings if f.scenario_id == "PT-A02-05" and f.status == "not_vulnerable"]
     self.assertEqual(len(clean), 1)
 
+  def test_csrf_without_allow_stateful_baselines_with_a_get_never_a_post(self):
+    """No allow_stateful: the baseline is a GET, only the tokenless POST is sent."""
+    session = MagicMock()
+    session.get.return_value = _mock_response(status=200, text="form")
+    session.post.return_value = _mock_response(status=403, text="CSRF token missing")
+    probe = _make_probe(
+      primary_session=session,
+      workflow_endpoints=[WorkflowEndpoint(path="/api/transfer/")],
+    )
+    probe._test_csrf_bypass()
+    self.assertEqual(session.get.call_count, 1)
+    self.assertEqual(session.post.call_count, 1)
+    self.assertNotIn("X-CSRFToken", session.post.call_args.kwargs["headers"])
+    self.assertEqual([f.status for f in probe.findings if f.scenario_id == "PT-A02-05"],
+                     ["not_vulnerable"])
+
+  def test_csrf_post_only_action_405_baseline_is_decided_by_the_tokenless_post(self):
+    for post_status, expected in ((403, "inconclusive"), (200, "vulnerable")):
+      with self.subTest(post_status=post_status):
+        session = MagicMock()
+        session.get.return_value = _mock_response(status=405, text="")
+        session.post.return_value = _mock_response(status=post_status, text="x")
+        probe = _make_probe(
+          primary_session=session,
+          workflow_endpoints=[WorkflowEndpoint(path="/api/transfer/")],
+        )
+        probe._test_csrf_bypass()
+        self.assertEqual([f.status for f in probe.findings if f.scenario_id == "PT-A02-05"],
+                         [expected])
+
+  def test_csrf_never_posts_to_the_logout_path(self):
+    """A POST to logout ends the scan session; trailing slash is normalised."""
+    for allow_stateful in (False, True):
+      with self.subTest(allow_stateful=allow_stateful):
+        session = MagicMock()
+        session.get.return_value = _mock_response(status=200, text="form")
+        session.post.return_value = _mock_response(status=200, text="ok")
+        probe = _make_probe(
+          primary_session=session, allow_stateful=allow_stateful,
+          discovered_forms=["/auth/logout", "/profile/edit/"],
+        )
+        probe._test_csrf_bypass()
+        posted = [c.args[0] for c in session.post.call_args_list]
+        self.assertTrue(posted)
+        self.assertFalse(any("logout" in u for u in posted), posted)
+
   def test_csrf_baseline_denied_is_inconclusive(self):
-    """A 403, 404 or login redirect on the token baseline proves nothing about CSRF."""
+    """A 403, 404 or login redirect on the baseline proves nothing about CSRF."""
     login = _mock_response(status=200, text="<input name='username'><input type='password' name='p'>")
     login.url = "http://testapp.local:8000/auth/login/?next=/api/transfer/"
     login.history = []
-    for admin, reason in (("provided", "endpoint_denied"),
-                          ("absent", "admin_context_absent")):
+    cases = [
+      (stateful, admin, reason, name, resp)
+      for stateful in (False, True)
+      for admin, reason in (("provided", "endpoint_denied"),
+                            ("absent", "admin_context_absent"))
       for name, resp in (("403", _mock_response(status=403, text="Forbidden")),
                          ("404", _mock_response(status=404, text="nf")),
-                         ("login", login)):
-        with self.subTest(admin=admin, denial=name):
-          session = MagicMock()
-          session.post.return_value = resp
-          probe = _make_probe(
-            primary_session=session,
-            workflow_endpoints=[WorkflowEndpoint(path="/api/transfer/")],
-          )
-          probe.auth.admin_context = admin
-          probe._test_csrf_bypass()
-          found = [f for f in probe.findings if f.scenario_id == "PT-A02-05"]
-          self.assertEqual([f.status for f in found], ["inconclusive"])
-          self.assertEqual(found[0].evidence, [f"reason={reason}"])
+                         ("login", login))
+    ]
+    for stateful, admin, reason, name, resp in cases:
+      with self.subTest(stateful=stateful, admin=admin, denial=name):
+        session = MagicMock()
+        # The baseline is a POST with allow_stateful, else a GET.
+        (session.post if stateful else session.get).return_value = resp
+        probe = _make_probe(
+          primary_session=session, allow_stateful=stateful,
+          workflow_endpoints=[WorkflowEndpoint(path="/api/transfer/")],
+        )
+        probe.auth.admin_context = admin
+        probe._test_csrf_bypass()
+        found = [f for f in probe.findings if f.scenario_id == "PT-A02-05"]
+        self.assertEqual([f.status for f in found], ["inconclusive"])
+        self.assertEqual(found[0].evidence, [f"reason={reason}"])
 
   def test_csrf_baseline_sends_a_valid_token_first(self):
     session = MagicMock()
@@ -200,7 +255,7 @@ class TestCsrfBypass(unittest.TestCase):
       _mock_response(status=403, text="Forbidden"),
     ]
     probe = _make_probe(
-      primary_session=session,
+      primary_session=session, allow_stateful=True,
       workflow_endpoints=[WorkflowEndpoint(path="/api/transfer/")],
     )
     probe.auth.detected_csrf_field = "csrfmiddlewaretoken"
@@ -216,7 +271,8 @@ class TestCsrfBypass(unittest.TestCase):
     session = MagicMock()
     login = _mock_response(status=302, text="")
     login.headers["Location"] = "/auth/login/"
-    session.post.side_effect = [_mock_response(status=200, text="saved"), login]
+    session.get.return_value = _mock_response(status=200, text="form")
+    session.post.side_effect = [login]
     probe = _make_probe(
       primary_session=session,
       workflow_endpoints=[WorkflowEndpoint(path="/api/transfer/")],

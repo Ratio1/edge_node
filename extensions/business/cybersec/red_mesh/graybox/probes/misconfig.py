@@ -284,36 +284,57 @@ class MisconfigProbes(ProbeBase):
     vulnerable_endpoints = []
     csrf_field = self.auth.detected_csrf_field
     for path in csrf_test_endpoints[:5]:
+      # A POST to the logout URL ends the scan session.
+      if self.is_logout_path(path):
+        continue
       self.safety.throttle()
       url = self.target_url + path
-      # Baseline: the same POST with a valid token. A tokenless 403 only
-      # proves CSRF protection when the principal is allowed to POST here.
-      baseline_data = {"test": "csrf_probe"}
-      baseline_headers = {"Referer": url}
-      if csrf_field:
+      # Baseline: the principal must be allowed to use this endpoint, else a
+      # tokenless 403 proves nothing about CSRF. With allow_stateful the
+      # baseline is the same POST with a valid token; without it a GET of the
+      # endpoint, so no state-changing request is sent as the baseline.
+      baseline_ok = True
+      if self._allow_stateful:
+        baseline_data = {"test": "csrf_probe"}
+        baseline_headers = {"Referer": url}
+        if csrf_field:
+          try:
+            page = self.auth.primary_session.get(url, timeout=10)
+            token = self.auth.extract_csrf_value(page.text, csrf_field)
+          except Exception:
+            token = None
+          if token:
+            baseline_data[csrf_field] = token
+            baseline_headers["X-CSRFToken"] = token
         try:
-          page = self.auth.primary_session.get(url, timeout=10)
-          token = self.auth.extract_csrf_value(page.text, csrf_field)
+          baseline = self.auth.primary_session.post(
+            url, data=baseline_data, timeout=10, headers=baseline_headers,
+          )
         except Exception:
-          token = None
-        if token:
-          baseline_data[csrf_field] = token
-          baseline_headers["X-CSRFToken"] = token
-      try:
-        baseline = self.auth.primary_session.post(
-          url, data=baseline_data, timeout=10, headers=baseline_headers,
-        )
-      except Exception:
-        continue
-      if not self.response_reached(baseline, validation_ok=True):
-        denied += 1
-        continue
+          continue
+        if not self.response_reached(baseline, validation_ok=True):
+          denied += 1
+          continue
+      else:
+        try:
+          baseline = self.auth.primary_session.get(url, timeout=10)
+        except Exception:
+          continue
+        if baseline.status_code == 405:
+          # POST-only action: no GET baseline, the tokenless response decides.
+          baseline_ok = False
+        elif not self.response_reached(baseline):
+          denied += 1
+          continue
       try:
         resp = self.auth.primary_session.post(
           url, data={"test": "csrf_probe"}, timeout=10,
           headers={"Referer": "http://evil.example.com"},
         )
       except Exception:
+        continue
+      if not baseline_ok and not self.response_reached(resp, validation_ok=True):
+        denied += 1
         continue
       tested += 1
       body_lower = resp.text.lower()

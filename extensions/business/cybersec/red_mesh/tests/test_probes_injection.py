@@ -727,12 +727,22 @@ class TestReachabilityRuleInjection(unittest.TestCase):
     self.assertEqual([f.status for f in found], ["inconclusive"])
     self.assertEqual(reasons, ["reason=endpoint_denied"])
 
-  def test_post_only_action_is_not_a_denial(self):
-    """405 on the GET baseline of a form action: skipped, no verdict."""
+  def test_post_only_action_405_is_decided_by_the_payload_response(self):
+    """405 on the GET baseline: the form is kept and the payload POST decides."""
     probe = self._probe("absent")
     probe.auth.primary_session.get = MagicMock(return_value=_denial("405"))
+    probe.auth.primary_session.post = MagicMock(
+      side_effect=lambda url, data=None, **k: _ok(next(iter(data.values()))))
     probe._test_authenticated_injection()
-    self.assertEqual([f for f in probe.findings if f.scenario_id == "PT-A03-01"], [])
+    found, _ = _reason(probe, "PT-A03-01")
+    self.assertEqual({f.status for f in found}, {"vulnerable"})
+    probe = self._probe("absent")
+    probe.auth.primary_session.get = MagicMock(return_value=_denial("405"))
+    probe.auth.primary_session.post = MagicMock(side_effect=lambda *a, **k: _denial("403"))
+    probe._test_authenticated_injection()
+    found, reasons = _reason(probe, "PT-A03-01")
+    self.assertEqual([f.status for f in found], ["inconclusive"])
+    self.assertEqual(reasons, ["reason=admin_context_absent"])
 
   def test_post_answered_by_redirect_to_non_login_page_is_reached(self):
     """JSON POST answered by a 3xx to a non-login page counts as reached."""
@@ -813,6 +823,25 @@ class TestOpenRedirectReachability(unittest.TestCase):
     self.assertEqual([f.status for f in probe.findings if f.scenario_id == "PT-A01-04"],
                      ["not_vulnerable"])
 
+  def test_denied_by_login_redirect_is_inconclusive_with_and_without_admin(self):
+    """The login page itself is unusable, the route bounces to login."""
+    for admin, reason in (("provided", "endpoint_denied"),
+                          ("absent", "admin_context_absent")):
+      with self.subTest(admin=admin):
+        probe = self._probe(admin)
+
+        def get(url, params=None, **kw):
+          if url.endswith("/auth/login/"):
+            return _mock_response(status=403, text="")
+          resp = _mock_response(status=302, text="")
+          resp.headers["Location"] = "/auth/login/?next=/records/"
+          return resp
+        probe.auth.primary_session.get = MagicMock(side_effect=get)
+        probe._test_open_redirect()
+        found, reasons = _reason(probe, "PT-A01-04")
+        self.assertEqual([f.status for f in found], ["inconclusive"])
+        self.assertEqual(reasons, [f"reason={reason}"])
+
   def test_denied_route_by_403_or_404_is_inconclusive(self):
     for kind in ("403", "404"):
       with self.subTest(kind=kind):
@@ -841,3 +870,58 @@ class TestSsrfReplayNamesPrincipal(unittest.TestCase):
     self.assertEqual(len(vuln), 1)
     self.assertIn("Authenticate as the regular user.", vuln[0].replay_steps)
     self.assertFalse(any("official" in s for s in vuln[0].replay_steps))
+
+
+class TestSharedReachabilityCheck(unittest.TestCase):
+  """`ProbeBase.response_reached`: the login page is found by its resolved path."""
+
+  def _probe(self, target_url="http://testapp.local:8000", login_path="/auth/login/"):
+    probe = _make_probe(login_path=login_path)
+    probe.target_url = target_url
+    return probe
+
+  def _redirect(self, location, url="https://h/app/records/"):
+    resp = _mock_response(status=302, text="")
+    resp.url = url
+    if location is not None:
+      resp.headers["Location"] = location
+    return resp
+
+  def test_base_path_target_matches_login_under_the_base_path(self):
+    probe = self._probe("https://h/app", "/login/")
+    self.assertFalse(probe.response_reached(self._redirect("/app/login?next=/x")))
+    self.assertTrue(probe.response_reached(self._redirect("/app/records/1/")))
+
+  def test_relative_location_resolves_against_the_request_url(self):
+    probe = self._probe("https://h/app", "/login/")
+    self.assertFalse(probe.response_reached(
+      self._redirect("login?next=/x", url="https://h/app/records")))
+    self.assertTrue(probe.response_reached(
+      self._redirect("detail/", url="https://h/app/records/")))
+
+  def test_redirect_without_location_is_not_reached(self):
+    self.assertFalse(self._probe().response_reached(self._redirect(None)))
+
+  def test_followed_login_page_is_found_by_its_final_url_under_a_base_path(self):
+    probe = self._probe("https://h/app", "/login/")
+    resp = _ok("<p>hello</p>")
+    resp.url = "https://h/app/login/?next=/x"
+    self.assertFalse(probe.response_reached(resp))
+
+  def test_configured_auth_required_marker_makes_a_2xx_not_reached(self):
+    probe = self._probe()
+    resp = _ok('{"detail": "Authentication credentials were not provided"}')
+    self.assertTrue(probe.response_reached(resp))
+    self.assertFalse(probe.response_reached(
+      resp, auth_required_marker="authentication credentials were not provided"))
+
+  def test_profile_page_with_prefilled_username_is_not_a_login_page(self):
+    probe = self._probe()
+    profile = _ok(
+      '<form action="/profile/password/"><input name="username" value="alice">'
+      '<input type="password" name="password"></form>')
+    self.assertTrue(probe.response_reached(profile))
+    login = _ok(
+      '<form action="/auth/login/"><input name="username">'
+      '<input type="password" name="password"></form>')
+    self.assertFalse(probe.response_reached(login))

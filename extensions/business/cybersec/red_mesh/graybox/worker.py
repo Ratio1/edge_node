@@ -537,13 +537,13 @@ class GrayboxLocalWorker(BaseLocalWorker):
         # A wrong password for a configured principal could lock the
         # account the scan logs in with, so those usernames are skipped.
         configured = {
-          cred.username
+          cred.username.strip().casefold()
           for cred in (self._credentials.official, self._credentials.regular)
           if cred is not None and cred.username
         }
         candidates = [
           cand for cand in self._credentials.weak_candidates
-          if cand.split(":", 1)[0] not in configured
+          if cand.split(":", 1)[0].strip().casefold() not in configured
         ]
         try:
           weak_findings = bl_probe.run_weak_auth(

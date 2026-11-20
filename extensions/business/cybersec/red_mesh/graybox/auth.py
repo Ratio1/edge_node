@@ -30,6 +30,7 @@ from .models import GrayboxAuthState
 class AuthManager:
   MAX_AUTH_ATTEMPTS = 2
   AUTH_RETRY_DELAY_SECONDS = 0.25
+  LIVENESS_CHECK_SECONDS = 60
 
   """
   Manages authenticated HTTP sessions for graybox probes.
@@ -50,6 +51,7 @@ class AuthManager:
     self._official_configured = False
     self._session_cookie_names = {}
     self._created_at = 0.0
+    self._liveness_checked_at = 0.0
     self._refresh_count = 0
     self._auth_errors = []
     self._auth_diagnostics = []
@@ -111,6 +113,15 @@ class AuthManager:
     for session in (self.official_session, self.regular_session):
       if session is not None and not self._session_cookies_alive(session):
         return True
+    # A server-side logout that keeps the cookie, and bearer / api_key
+    # sessions, show up only on the authenticated probe path. Re-check it at
+    # most once per LIVENESS_CHECK_SECONDS. A transport error is not a logout.
+    if (self._authenticated_probe_path()
+        and time.time() - self._liveness_checked_at >= self.LIVENESS_CHECK_SECONDS):
+      self._liveness_checked_at = time.time()
+      valid, retryable = self._validate_authenticated_session(self.primary_session)
+      if not valid and not retryable:
+        return True
     return False
 
   def _remember_session_cookies(self, session):
@@ -133,7 +144,9 @@ class AuthManager:
       present = set(session.cookies.get_dict().keys())
     except Exception:
       return True
-    return expected.issubset(present)
+    # Dead only when every recorded login cookie is gone: a one-shot flash
+    # cookie that disappears after one request is not a logout.
+    return not expected.isdisjoint(present)
 
   def ensure_sessions(self, official_creds, regular_creds=None):
     """Re-authenticate if sessions are stale or not yet created."""
@@ -186,6 +199,7 @@ class AuthManager:
       self._remember_session_cookies(self.regular_session)
 
     self._created_at = time.time()
+    self._liveness_checked_at = self._created_at
     return True
 
   @staticmethod

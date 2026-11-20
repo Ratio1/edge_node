@@ -409,14 +409,24 @@ class _ReportMixin:
 
     routes = []
     forms = []
+    coverage_notes = []
+    admin_context = ""
+    primary_principal = ""
     for methods in service_info.values():
       if not isinstance(methods, dict):
         continue
+      auth_info = methods.get("_graybox_auth")
+      if isinstance(auth_info, dict):
+        admin_context = admin_context or str(auth_info.get("admin_context") or "")
+        primary_principal = primary_principal or str(auth_info.get("primary_principal") or "")
       discovery = methods.get("_graybox_discovery")
       if not isinstance(discovery, dict):
         continue
       routes.extend(discovery.get("routes") or [])
       forms.extend(discovery.get("forms") or [])
+      note = discovery.get("coverage_note")
+      if isinstance(note, str) and note and note not in coverage_notes:
+        coverage_notes.append(note)
 
     scenario_total = 0
     scenario_vulnerable = 0
@@ -448,6 +458,9 @@ class _ReportMixin:
       "total_forms_discovered": len(self._dedupe_items(forms)),
       "total_scenarios": scenario_total,
       "total_scenarios_vulnerable": scenario_vulnerable,
+      "graybox_coverage_note": " ".join(coverage_notes),
+      "graybox_admin_context": admin_context,
+      "graybox_primary_principal": primary_principal,
     }
 
   def _local_node_address(self):
@@ -1080,6 +1093,9 @@ class _ReportMixin:
       "total_forms_discovered": 0,
       "total_scenarios": 0,
       "total_scenarios_vulnerable": 0,
+      "graybox_coverage_note": "",
+      "graybox_admin_context": "",
+      "graybox_primary_principal": "",
     }
     if scan_type == "webapp":
       graybox_stats = self._extract_graybox_ui_stats(agg, latest)
@@ -1189,4 +1205,7 @@ class _ReportMixin:
       total_forms_discovered=graybox_stats["total_forms_discovered"],
       total_scenarios=graybox_stats["total_scenarios"],
       total_scenarios_vulnerable=graybox_stats["total_scenarios_vulnerable"],
+      graybox_coverage_note=graybox_stats["graybox_coverage_note"],
+      graybox_admin_context=graybox_stats["graybox_admin_context"],
+      graybox_primary_principal=graybox_stats["graybox_primary_principal"],
     )

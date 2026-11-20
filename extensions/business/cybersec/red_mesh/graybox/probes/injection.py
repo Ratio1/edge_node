@@ -159,22 +159,26 @@ class InjectionProbes(ProbeBase):
         page = self.auth.primary_session.get(url, timeout=10)
       except Exception:
         continue
-      if page.status_code == 405:
-        continue  # POST-only action: the GET baseline does not apply
-      if not self.response_reached(page):
+      # 405: a POST-only action. The GET baseline does not apply and there is
+      # no form to read, so the payload POST with common field names decides.
+      post_only = page.status_code == 405
+      if not post_only and not self.response_reached(page):
         denied += 1
         continue
+      page_text = "" if post_only else page.text
 
       # Extract input field names
       input_names = re.findall(
         r'<input[^>]+name=["\']([^"\']+)["\'][^>]*type=["\']?text',
-        page.text, re.IGNORECASE,
+        page_text, re.IGNORECASE,
       )
       textarea_names = re.findall(
         r'<textarea[^>]+name=["\']([^"\']+)["\']',
-        page.text, re.IGNORECASE,
+        page_text, re.IGNORECASE,
       )
       all_inputs = input_names + textarea_names
+      if post_only:
+        all_inputs = ["title", "name", "comment", "message", "description"]
       if not all_inputs:
         continue
 
@@ -182,7 +186,7 @@ class InjectionProbes(ProbeBase):
       csrf_field = self.auth.detected_csrf_field
       csrf_token = None
       if csrf_field:
-        csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
+        csrf_token = self.auth.extract_csrf_value(page_text, csrf_field)
 
       for label, payload, cwe in payloads:
         self.safety.throttle()
@@ -540,14 +544,10 @@ class InjectionProbes(ProbeBase):
       if path != login_path:
         # Baseline: plain GET of the same URL. The login page is exempt, it is
         # the classic ?next= target and is reachable without a session.
-        self.safety.throttle()
-        try:
-          base = session.get(
-            self.target_url + path, timeout=10, allow_redirects=False,
-          )
-        except Exception:
+        reached = self.baseline_reached(session, self.target_url + path, allow_redirects=False)
+        if reached is None:
           continue
-        if not self.response_reached(base):
+        if not reached:
           denied += 1
           continue
       for param in redirect_params:
@@ -672,12 +672,10 @@ class InjectionProbes(ProbeBase):
       url = self.target_url + route
 
       # Baseline: a plain GET must reach the handler before the route counts.
-      self.safety.throttle()
-      try:
-        base = session.get(url, timeout=10)
-      except Exception:
+      reached = self.baseline_reached(session, url)
+      if reached is None:
         continue
-      if not self.response_reached(base):
+      if not reached:
         denied += 1
         continue
 
@@ -761,12 +759,10 @@ class InjectionProbes(ProbeBase):
     denied = 0
     for ep in endpoints:
       url = self.target_url + ep.path
-      self.safety.throttle()
-      try:
-        base = self.auth.primary_session.get(url, timeout=10)
-      except Exception:
+      reached = self.baseline_reached(self.auth.primary_session, url)
+      if reached is None:
         continue
-      if not self.response_reached(base):
+      if not reached:
         denied += 1
         continue
       self.safety.throttle()
@@ -832,12 +828,10 @@ class InjectionProbes(ProbeBase):
     denied = 0
     for ep in endpoints:
       url = self.target_url + ep.path
-      self.safety.throttle()
-      try:
-        base = self.auth.primary_session.get(url, timeout=10)
-      except Exception:
+      reached = self.baseline_reached(self.auth.primary_session, url)
+      if reached is None:
         continue
-      if not self.response_reached(base):
+      if not reached:
         denied += 1
         continue
       for payload in payloads:
@@ -914,12 +908,10 @@ class InjectionProbes(ProbeBase):
     denied = 0
     for ep in endpoints:
       url = self.target_url + ep.path
-      self.safety.throttle()
-      try:
-        base = self.auth.primary_session.get(url, timeout=10)
-      except Exception:
+      reached = self.baseline_reached(self.auth.primary_session, url)
+      if reached is None:
         continue
-      if not self.response_reached(base):
+      if not reached:
         denied += 1
         continue
       for payload in payloads:
@@ -995,14 +987,10 @@ class InjectionProbes(ProbeBase):
     denied = 0
     for ep in endpoints:
       url = self.target_url + ep.path
-      self.safety.throttle()
-      try:
-        base = self.auth.primary_session.get(
-          url, allow_redirects=False, timeout=10,
-        )
-      except Exception:
+      reached = self.baseline_reached(self.auth.primary_session, url, allow_redirects=False)
+      if reached is None:
         continue
-      if not self.response_reached(base):
+      if not reached:
         denied += 1
         continue
       self.safety.throttle()

@@ -193,7 +193,7 @@ class AccessControlProbes(ProbeBase):
       else:
         continue  # only GET for read-only probes
 
-      if self.exempt_denial(resp, url, method):
+      if self.exempt_denial(resp, url):
         continue  # login redirect or a denial: the secure result
       if resp.status_code == 200:
         body_lower = resp.text.lower()
@@ -270,7 +270,7 @@ class AccessControlProbes(ProbeBase):
       # Only test verb tampering if the baseline is denied (403/401/302-to-login)
       baseline_denied = baseline.status_code in (401, 403)
       if not baseline_denied:
-        baseline_denied = bool(self.exempt_denial(baseline, url, ep.method))
+        baseline_denied = bool(self.exempt_denial(baseline, url))
       if not baseline_denied and baseline.status_code == 200:
         body_lower = baseline.text.lower()
         baseline_denied = any(m in body_lower for m in denial_markers)
@@ -588,7 +588,7 @@ class AccessControlProbes(ProbeBase):
             )
           except Exception:
             continue
-          if self.bare_not_found(patch_resp, url, "PATCH"):
+          if self.bare_not_found(patch_resp, url):
             continue
           tested += 1
           if patch_resp.status_code >= 400:
@@ -705,7 +705,7 @@ class AccessControlProbes(ProbeBase):
           )
         except Exception:
           continue
-        if self.bare_not_found(patch_resp, url, "PATCH"):
+        if self.bare_not_found(patch_resp, url):
           continue
         tested += 1
         if patch_resp.status_code >= 400:
@@ -811,7 +811,7 @@ class AccessControlProbes(ProbeBase):
           )
         except Exception:
           continue
-        if self.bare_not_found(del_resp, url, "DELETE"):
+        if self.bare_not_found(del_resp, url):
           continue
         tested += 1
         if del_resp.status_code >= 400:
@@ -1083,17 +1083,18 @@ class AccessControlProbes(ProbeBase):
       except Exception:
         continue
       if page.status_code == 405:
-        continue  # POST-only action: no GET baseline, no form to read
+        continue  # POST-only action: no form to read, so no hidden field to tamper with
       if not self.response_reached(page):
         denied += 1
         continue
       if page.status_code != 200:
         continue
+      page_text = page.text
 
       # Extract hidden inputs and detect any auth-related field.
       hidden_fields = {}
       for tag in re.finditer(
-        r'<input\b[^>]*type=["\']hidden["\'][^>]*>', page.text, re.I,
+        r'<input\b[^>]*type=["\']hidden["\'][^>]*>', page_text, re.I,
       ):
         attrs = tag.group(0)
         name_m = re.search(r'name=["\']([^"\']+)', attrs)
@@ -1107,11 +1108,11 @@ class AccessControlProbes(ProbeBase):
 
       # Also extract a CSRF token if needed.
       csrf_field = self.auth.detected_csrf_field or "csrfmiddlewaretoken"
-      csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
+      csrf_token = self.auth.extract_csrf_value(page_text, csrf_field)
 
       # Build payload: copy all visible fields, override auth fields.
       visible_inputs = {}
-      for tag in re.finditer(r'<input\b([^>]*)>', page.text, re.I):
+      for tag in re.finditer(r'<input\b([^>]*)>', page_text, re.I):
         attrs = tag.group(1)
         if 'type="hidden"' in attrs.lower() or "type='hidden'" in attrs.lower():
           continue

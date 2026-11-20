@@ -194,6 +194,7 @@ class FormAuth(AuthStrategy):
     orchestrator can distinguish retryable transport failures from
     definitive credential failures.
     """
+    self.last_response = None
     session = self.make_session()
     login_url = self.target_url + self.target_config.login_path
 

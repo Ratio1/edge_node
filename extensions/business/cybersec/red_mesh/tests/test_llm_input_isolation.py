@@ -136,6 +136,25 @@ ENGAGEMENT = {
 # ---------------------------------------------------------------------
 
 
+class TestGrayboxCoverageNote(unittest.TestCase):
+  """RM-219: a regular-only scan tells the narrative what it did not reach."""
+
+  def test_coverage_note_and_admin_context_reach_the_scan_summary(self):
+    aggregated = {
+      "service_info": {"443": {
+        "_graybox_auth": {"admin_context": "absent", "primary_principal": "regular"},
+        "_graybox_discovery": {
+          "routes": ["/a/"],
+          "coverage_note": "Crawled as the regular user; admin-only pages not reached.",
+        },
+      }},
+    }
+    out = build_llm_input(findings=[ENRICHED_FINDING], aggregated_report=aggregated)
+    summary = out.to_dict()["scan_summary"]
+    self.assertEqual(summary["admin_context"], "absent")
+    self.assertIn("admin-only pages not reached", summary["discovery_coverage_note"])
+
+
 class TestRawBlobsExcluded(unittest.TestCase):
   """The LLM must never see the raw aggregated_report dict."""
 

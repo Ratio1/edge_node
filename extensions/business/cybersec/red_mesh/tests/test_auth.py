@@ -1026,6 +1026,13 @@ class TestAuthManagerLifecycle(unittest.TestCase):
     self.assertEqual(state.refresh_count, 2)
     self.assertEqual(state.auth_errors, ("official_login_failed",))
 
+  def test_regular_only_state_has_an_authenticated_session(self):
+    auth = _make_auth()
+    auth.regular_session = MagicMock()
+    self.assertTrue(auth.auth_state.has_authenticated_session)
+    auth.regular_session = None
+    self.assertFalse(auth.auth_state.has_authenticated_session)
+
   def test_cleanup_closes_sessions(self):
     """cleanup() closes all sessions."""
     auth = _make_auth()
@@ -1325,6 +1332,75 @@ class TestRegularOnlyAuthentication(unittest.TestCase):
     self.assertTrue(auth.ensure_sessions(None, regular))
     self.assertIs(auth.primary_session, second)
     self.assertEqual(auth._refresh_count, 1)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_a_one_shot_flash_cookie_disappearing_is_not_a_logout(self, mock_requests):
+    session = self._form_session(
+      cookies={"sessionid": "s", "messages": "flash", "csrftoken": "c"})
+    mock_requests.Session.return_value = session
+    auth = _make_auth()
+    self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+    del session._jar["messages"]
+    self.assertFalse(auth.needs_refresh())
+    del session._jar["sessionid"]  # every login cookie gone: logged out
+    self.assertTrue(auth.needs_refresh())
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_probe_path_revalidates_the_primary_session_at_most_once_a_minute(self, mock_requests):
+    import time
+    mock_requests.Session.return_value = self._form_session()
+    auth = _make_auth()
+    self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+    with patch.object(auth, "_authenticated_probe_path", return_value="/api/me"), \
+         patch.object(auth, "_validate_authenticated_session",
+                      return_value=(False, False)) as validate:
+      # Just authenticated: inside the 60 s window, no extra request.
+      self.assertFalse(auth.needs_refresh())
+      validate.assert_not_called()
+      # Window over, and the probe path now rejects the session (a logout that
+      # keeps the cookie, or a revoked bearer token): refresh.
+      auth._liveness_checked_at = time.time() - 61
+      self.assertTrue(auth.needs_refresh())
+      self.assertEqual(validate.call_count, 1)
+      validate.assert_called_with(auth.primary_session)
+      # Checked again within the window: no further request.
+      self.assertFalse(auth.needs_refresh())
+      self.assertEqual(validate.call_count, 1)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_probe_path_transport_error_is_not_a_logout(self, mock_requests):
+    import time
+    mock_requests.Session.return_value = self._form_session()
+    auth = _make_auth()
+    self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+    auth._liveness_checked_at = time.time() - 61
+    with patch.object(auth, "_authenticated_probe_path", return_value="/api/me"), \
+         patch.object(auth, "_validate_authenticated_session",
+                      return_value=(False, True)):
+      self.assertFalse(auth.needs_refresh())
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_no_probe_path_means_no_liveness_request(self, mock_requests):
+    import time
+    mock_requests.Session.return_value = self._form_session()
+    auth = _make_auth()
+    self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+    auth._liveness_checked_at = time.time() - 61
+    with patch.object(auth, "_validate_authenticated_session") as validate:
+      self.assertFalse(auth.needs_refresh())
+      validate.assert_not_called()
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_form_authenticate_resets_last_response(self, mock_requests):
+    from extensions.business.cybersec.red_mesh.graybox.auth_strategies import FormAuth
+    mock_requests.Session.return_value = self._form_session()
+    strategy = FormAuth(
+      "http://testapp.local:8000", GrayboxTargetConfig(), verify_tls=False)
+    strategy.last_response = "stale"
+    with patch.object(strategy, "make_session", side_effect=RuntimeError("stop")):
+      with self.assertRaises(RuntimeError):
+        strategy.authenticate({"username": "u", "password": "p"})
+    self.assertIsNone(strategy.last_response)
 
   def test_cleanup_closes_each_distinct_session_once(self):
     auth = _make_auth()

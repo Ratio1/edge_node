@@ -93,7 +93,7 @@ class DiscoveryModule:
       if path in visited:
         continue
       visited.add(path)
-      if self._logout_path and path == self._logout_path:
+      if self._is_logout(path):
         continue
 
       self.safety.throttle()
@@ -136,7 +136,8 @@ class DiscoveryModule:
       # Record form actions but do NOT follow them
       for action in parser.forms:
         normalized = self._normalize(action)
-        if normalized and self._in_scope(normalized):
+        if (normalized and self._in_scope(normalized)
+            and not self._is_logout(normalized)):
           all_forms.add(normalized)
 
     result = self.discover_result(known_routes=known_routes)
@@ -168,7 +169,7 @@ class DiscoveryModule:
       if path in visited:
         continue
       visited.add(path)
-      if self._logout_path and path == self._logout_path:
+      if self._is_logout(path):
         continue
 
       self.safety.throttle()
@@ -203,7 +204,8 @@ class DiscoveryModule:
 
       for action in parser.forms:
         normalized = self._normalize(action)
-        if normalized and self._in_scope(normalized):
+        if (normalized and self._in_scope(normalized)
+            and not self._is_logout(normalized)):
           all_forms.add(normalized)
 
     self.routes = sorted(all_routes)
@@ -225,6 +227,11 @@ class DiscoveryModule:
     if (parsed.path or "").endswith("/") and not path.endswith("/"):
       path += "/"
     return path
+
+  def _is_logout(self, path):
+    """True for the logout URL, trailing slash ignored (`/logout` == `/logout/`)."""
+    return bool(self._logout_path) and (
+      path.rstrip("/") == self._logout_path.rstrip("/"))
 
   def _in_scope(self, path):
     """Check if path is within the configured scope prefix."""

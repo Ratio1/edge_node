@@ -287,7 +287,8 @@ class TestNegativeAmountScenarioPTA0604(unittest.TestCase):
     sess = probe.auth.primary_session
     # GET form (extract fields), POST returns 302 → accepted
     sess.get = MagicMock(return_value=self._form_response())
-    sess.post = MagicMock(return_value=_mock_response(status=302))
+    sess.post = MagicMock(return_value=_mock_response(
+      status=302, headers={"content-type": "text/html", "Location": "/records/"}))
 
     probe._test_validation_bypass()
 
@@ -452,11 +453,21 @@ class TestValidationBypassReachability(unittest.TestCase):
     self.assertEqual({k: v[0] for k, v in self._verdicts(probe).items()}, {
       "PT-A06-02": "vulnerable", "PT-A06-04": "vulnerable"})
 
-  def test_post_only_action_405_is_not_a_denial(self):
+  def test_post_only_action_405_is_decided_by_the_payload_response(self):
+    """405 on the GET baseline: the form is kept and the payload POST decides."""
+    probe = self._probe("absent")
+    sess = probe.auth.primary_session
+    sess.get = MagicMock(return_value=_mock_response(status=405))
+    sess.post = MagicMock(return_value=_mock_response(
+      status=302, text="", headers={"Location": "/records/"}))
+    probe._test_validation_bypass()
+    self.assertEqual({k: v[0] for k, v in self._verdicts(probe).items()}, {
+      "PT-A06-02": "vulnerable", "PT-A06-04": "vulnerable"})
     probe = self._probe("absent")
     probe.auth.primary_session.get = MagicMock(return_value=_mock_response(status=405))
+    probe.auth.primary_session.post = MagicMock(return_value=_mock_response(status=403))
     probe._test_validation_bypass()
-    self.assertEqual({k: v for k, v in self._verdicts(probe).items()}, {
-      "PT-A06-02": ("inconclusive", ["reason=no_evaluable_responses"]),
-      "PT-A06-04": ("inconclusive", ["reason=no_evaluable_responses"]),
+    self.assertEqual(self._verdicts(probe), {
+      "PT-A06-02": ("inconclusive", ["reason=admin_context_absent"]),
+      "PT-A06-04": ("inconclusive", ["reason=admin_context_absent"]),
     })

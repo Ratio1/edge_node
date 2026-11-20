@@ -428,6 +428,9 @@ class UiAggregate:
   total_forms_discovered: int = 0           # webapp: discovered forms
   total_scenarios: int = 0                  # webapp: probe scenarios run
   total_scenarios_vulnerable: int = 0       # webapp: vulnerable count
+  graybox_coverage_note: str = ""           # webapp: discovery coverage (regular-only scan states what it could not reach)
+  graybox_admin_context: str = ""           # webapp: "provided" or "absent"
+  graybox_primary_principal: str = ""       # webapp: "official" or "regular", the principal the scan ran as
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -453,6 +456,9 @@ class UiAggregate:
       total_forms_discovered=d.get("total_forms_discovered", 0),
       total_scenarios=d.get("total_scenarios", 0),
       total_scenarios_vulnerable=d.get("total_scenarios_vulnerable", 0),
+      graybox_coverage_note=d.get("graybox_coverage_note", ""),
+      graybox_admin_context=d.get("graybox_admin_context", ""),
+      graybox_primary_principal=d.get("graybox_primary_principal", ""),
     )
 
 

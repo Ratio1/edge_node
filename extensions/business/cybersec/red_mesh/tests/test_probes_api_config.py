@@ -167,6 +167,18 @@ class TestApi8ReachabilityRule(unittest.TestCase):
         self.assertEqual(regular, {"http://api.example/api/me/",
                                    "http://api.example/api/open/"})
 
+  def test_auth_required_marker_in_a_2xx_body_is_a_denial(self):
+    ep = ApiFunctionEndpoint(path="/api/me/", auth_required_marker="please sign in")
+    p = _make_probe(function_endpoints=[ep])
+    p.auth.admin_context = "absent"
+    p.auth.official_session.get.return_value = _resp(
+      text="Please sign in to continue",
+      headers={"Access-Control-Allow-Origin": "https://trusted.example"})
+    p._test_cors_misconfig()
+    self.assertEqual(
+      [(f.status, f.evidence) for f in p.findings],
+      [("inconclusive", ["reason=admin_context_absent"])])
+
   def test_reached_endpoint_with_good_headers_is_clean(self):
     p = _make_probe(function_endpoints=[ApiFunctionEndpoint(path="/api/me/")])
     p.auth.official_session.get.return_value = _resp(

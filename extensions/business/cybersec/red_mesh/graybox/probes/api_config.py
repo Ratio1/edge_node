@@ -111,7 +111,9 @@ class ApiConfigProbes(ProbeBase):
         )
       except requests.RequestException:
         continue
-      reached = self.response_reached(baseline) and self.response_reached(resp)
+      marker = getattr(ep, "auth_required_marker", "")
+      reached = (self.response_reached(baseline, auth_required_marker=marker)
+                 and self.response_reached(resp, auth_required_marker=marker))
 
       acao = resp.headers.get("Access-Control-Allow-Origin", "")
       acac = (resp.headers.get("Access-Control-Allow-Credentials") or "").lower()
@@ -192,7 +194,8 @@ class ApiConfigProbes(ProbeBase):
         resp = self._session_for(ep).get(url, timeout=10, allow_redirects=False)
       except requests.RequestException:
         continue
-      reached = self.response_reached(resp)
+      reached = self.response_reached(
+        resp, auth_required_marker=getattr(ep, "auth_required_marker", ""))
       missing = []
       headers_lower = {k.lower(): v for k, v in resp.headers.items()}
       if "x-content-type-options" not in headers_lower:

@@ -484,7 +484,7 @@ class ApiAccessProbes(ProbeBase):
         if self.response_reached(plain_resp):
           base["plain_mutating_method_allowed"] = True
           return True
-        if not self.exempt_denial(plain_resp, _url, method):
+        if not self.exempt_denial(plain_resp, _url):
           base["plain_mutating_method_unexpected_status"] = plain_resp.status_code
           return False
 

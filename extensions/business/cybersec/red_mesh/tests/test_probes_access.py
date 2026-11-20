@@ -20,6 +20,12 @@ def _mock_response(status=200, text="", content_type="application/json", json_da
   return resp
 
 
+def _redirect_to(location, status=302):
+  resp = _mock_response(status=status, text="")
+  resp.headers["Location"] = location
+  return resp
+
+
 def _make_probe(idor_endpoints=None, admin_endpoints=None,
                 regular_username="alice", discovered_routes=None,
                 regular_session=None, allow_stateful=False):
@@ -427,7 +433,7 @@ class TestHiddenFieldTamperingPTA0112(unittest.TestCase):
   def test_pt_a01_12_vulnerable_when_tampered_value_accepted(self):
     probe = self._make_probe_with_form(
       self._form_with_hidden_role(),
-      _mock_response(status=302, text=""),
+      _redirect_to("/records/"),
     )
     probe._test_hidden_field_tampering()
     f = [x for x in probe.findings if x.scenario_id == "PT-A01-12"]
@@ -672,6 +678,28 @@ class TestExemptDenialIsSecure(unittest.TestCase):
     self.assertEqual([f for f in probe.findings if f.scenario_id == "PT-A01-05"], [])
 
 
+class TestAdminBaselineIsAlwaysAGet(unittest.TestCase):
+
+  def test_mutating_callers_make_the_admin_session_send_only_get(self):
+    ep = IdorEndpoint(path="/api/records/{id}/", test_ids=[99], owner_field="owner")
+    for method, runner in (("PATCH", "_test_ownership_update"),
+                           ("DELETE", "_test_ownership_delete")):
+      with self.subTest(method=method):
+        probe = _make_probe(idor_endpoints=[ep])
+        _set_admin(probe, "provided")
+        sess = probe.auth.regular_session
+        sess.get.return_value = _mock_response(json_data={"owner": "bob", "title": "t"})
+        sess.cookies.get.return_value = None
+        sess.patch.return_value = _mock_response(status=404)
+        sess.delete.return_value = _mock_response(status=404)
+        getattr(probe, runner)()
+        verbs = [c.args[0] for c in probe.auth.official_session.request.call_args_list]
+        self.assertEqual(verbs, ["GET"])
+        # 404 explained by the admin reaching the endpoint: counted as tested.
+        found = [f for f in probe.findings if f.scenario_id in ("PT-A01-05", "PT-A01-06")]
+        self.assertEqual([f.status for f in found], ["not_vulnerable"])
+
+
 class TestHiddenFieldReachability(unittest.TestCase):
 
   FORM = ('<form><input type="hidden" name="role" value="user">'
@@ -712,11 +740,17 @@ class TestHiddenFieldReachability(unittest.TestCase):
     probe._test_hidden_field_tampering()
     self.assertEqual(self._verdict(probe), (["inconclusive"], ["reason=admin_context_absent"]))
 
-  def test_post_only_action_405_is_not_a_denial(self):
+  def test_post_only_action_405_is_skipped_without_a_post(self):
+    """405 on the GET: no form, so no hidden field to tamper with. Nothing is
+    POSTed (a guessed role=admin POST would change the account) and the
+    action is neither tested nor counted as denied."""
     probe = self._probe("absent")
-    probe.auth.regular_session.get = MagicMock(return_value=_mock_response(status=405))
+    sess = probe.auth.regular_session
+    sess.get = MagicMock(return_value=_mock_response(status=405))
+    sess.post = MagicMock()
     probe._test_hidden_field_tampering()
-    self.assertEqual(self._verdict(probe), ([], []))
+    sess.post.assert_not_called()
+    self.assertNotIn("vulnerable", self._verdict(probe)[0])
 
   def test_post_answered_by_redirect_to_non_login_page_is_reached(self):
     probe = self._probe("provided")

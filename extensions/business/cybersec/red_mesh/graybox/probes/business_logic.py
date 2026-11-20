@@ -181,7 +181,7 @@ class BusinessLogicProbes(ProbeBase):
 
       # A denial (401/403, login redirect, or a 404 the admin reached) is the
       # secure result. A bare 404 is skipped: it may be a mistyped path.
-      if self.exempt_denial(resp, url, sent):
+      if self.exempt_denial(resp, url):
         endpoints_tested += 1
         continue
       if resp.status_code == 404:
@@ -284,23 +284,25 @@ class BusinessLogicProbes(ProbeBase):
         page = self.auth.primary_session.get(url, timeout=10)
       except Exception:
         continue
-      if page.status_code == 405:
-        continue  # POST-only action: no GET baseline, no form to read
-      if not self.response_reached(page):
+      # 405: a POST-only action. No GET baseline and no form to read, so the
+      # payload POST (configured amount and status fields) decides.
+      post_only = page.status_code == 405
+      if not post_only and not self.response_reached(page):
         denied += 1
         continue
-      if page.status_code != 200:
+      if not post_only and page.status_code != 200:
         continue
+      page_text = "" if post_only else page.text
 
       csrf_field = self.auth.detected_csrf_field
       csrf_token = None
       if csrf_field:
-        csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
+        csrf_token = self.auth.extract_csrf_value(page_text, csrf_field)
 
       # Extract all form fields with current values.
       # Parse <input> (any type), <textarea>, and <select> elements.
       form_fields = {}
-      for tag in re.finditer(r'<input\b([^>]*)>', page.text, re.I):
+      for tag in re.finditer(r'<input\b([^>]*)>', page_text, re.I):
         attrs = tag.group(1)
         name_m = re.search(r'name=["\']([^"\']+)', attrs)
         val_m = re.search(r'value=["\']([^"\']*)', attrs)
@@ -310,13 +312,13 @@ class BusinessLogicProbes(ProbeBase):
             form_fields[name] = val_m.group(1) if val_m else ""
       for m in re.finditer(
         r'<textarea[^>]+name=["\']([^"\']+)["\'][^>]*>(.*?)</textarea>',
-        page.text, re.I | re.DOTALL,
+        page_text, re.I | re.DOTALL,
       ):
         form_fields[m.group(1)] = m.group(2).strip()
       # Extract <select> current values via selected option
       for sel in re.finditer(
         r'<select[^>]+name=["\']([^"\']+)["\'][^>]*>(.*?)</select>',
-        page.text, re.I | re.DOTALL,
+        page_text, re.I | re.DOTALL,
       ):
         sel_name = sel.group(1)
         sel_body = sel.group(2)
