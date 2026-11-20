@@ -47,7 +47,6 @@ class RealStoreOwner(FinalizationOwner):
     super().__init__()
     self.store = {}
     self.service = RecordingService()
-    self.gate_log = []
     binding = webapp_binding()
     job = {
       "job_id": "job-1", "job_status": "RUNNING", "job_pass": 1, "job_revision": 0,
@@ -107,10 +106,8 @@ class RealStoreOwner(FinalizationOwner):
     return PentesterApi01Plugin._get_job_state_repository(self)
 
   def _execution_operation_allowed(self, job_specs, *, operation="current", config=None, **kwargs):
-    result = PentesterApi01Plugin._execution_operation_allowed(
+    return PentesterApi01Plugin._execution_operation_allowed(
       self, job_specs, operation=operation, config=config, **kwargs)
-    self.gate_log.append(("api", operation, config is not None, result))
-    return result
 
   def _execution_denial_reason(self, job_specs, *, operation="current", config=None, **kwargs):
     return PentesterApi01Plugin._execution_denial_reason(
@@ -209,7 +206,6 @@ def test_an_allowed_pass_logs_no_denial_and_submits_the_attestation():
 
 class _ReasonOwner:
   ee_addr = "node-a"
-  calls = 0
 
   def P(self, *args, **kwargs):
     pass

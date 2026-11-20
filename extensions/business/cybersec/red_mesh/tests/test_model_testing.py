@@ -1535,67 +1535,77 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertIn("attestation_failure_reason", stub)
     self.assertEqual(stub["failure_class"], "")
 
-  def test_model_test_finalization_end_attestation_exception_marks_failed(self):
-    mock_plugin_modules()
-    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+  def test_model_test_finalization_unsubmitted_end_attestation_marks_attestation_failed(self):
+    # A raising submit, and an end-attestation gate denial, which is logged and on the timeline (RM-221).
+    for submit_error, denial, expected in ((RuntimeError("chain offline"), None, "submit_failed"),
+                                           (None, "account_changed", "account_changed")):
+      with self.subTest(expected=expected):
+          mock_plugin_modules()
+          from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
 
-    plugin = MagicMock()
-    plugin.ee_addr = "launcher-node"
-    plugin.ee_id = "Launcher"
-    plugin.REDMESH_ATTESTATION_NETWORK = "unit-test"
-    plugin.time.return_value = 200.0
-    plugin.r1fs = MagicMock()
-    binding = binding_payload()
-    plugin.r1fs.get_json.return_value = {
-      "job_type": "model_test",
-      "blockchain_attestation_enabled": True,
-      "execution_binding": binding,
-    }
-    plugin.r1fs.add_json.return_value = "QmArchiveCID"
-    plugin.r1fs.get_json.side_effect = [
-      {"job_type": "model_test", "blockchain_attestation_enabled": True, "execution_binding": binding},
-      {"job_id": "job-123"},
-    ]
-    plugin._submit_redmesh_test_attestation = MagicMock(side_effect=RuntimeError("chain offline"))
-    plugin._execution_operation_allowed = MagicMock(return_value=True)
-    job_specs = {
-      "job_id": "job-123",
-      "job_status": "RUNNING",
-      "job_type": "model_test",
-      "scan_type": "model_test",
-      "run_mode": "SINGLEPASS",
-      "target": "Unit Provider / unit-model",
-      "task_name": "CBRN smoke",
-      "launcher": "launcher-node",
-      "launcher_alias": "Launcher",
-      "date_created": 100.0,
-      "job_config_cid": "QmConfigCID",
-      "workers": {"launcher-node": {"finished": True}},
-      "timeline": [],
-      "blockchain_attestation_enabled": True,
-      "execution_binding": binding,
-    }
-    _bind_job_store(plugin, job_specs)
+          plugin = MagicMock()
+          plugin.ee_addr = "launcher-node"
+          plugin.ee_id = "Launcher"
+          plugin.REDMESH_ATTESTATION_NETWORK = "unit-test"
+          plugin.time.return_value = 200.0
+          plugin.r1fs = MagicMock()
+          binding = binding_payload()
+          plugin.r1fs.get_json.return_value = {
+            "job_type": "model_test",
+            "blockchain_attestation_enabled": True,
+            "execution_binding": binding,
+          }
+          plugin.r1fs.add_json.return_value = "QmArchiveCID"
+          plugin.r1fs.get_json.side_effect = [
+            {"job_type": "model_test", "blockchain_attestation_enabled": True, "execution_binding": binding},
+            {"job_id": "job-123"},
+          ]
+          plugin._submit_redmesh_test_attestation = MagicMock(side_effect=submit_error)
+          plugin._execution_operation_allowed = MagicMock(return_value=True)
+          plugin._execution_denial_reason = MagicMock(return_value=denial)
+          job_specs = {
+            "job_id": "job-123",
+            "job_status": "RUNNING",
+            "job_type": "model_test",
+            "scan_type": "model_test",
+            "run_mode": "SINGLEPASS",
+            "target": "Unit Provider / unit-model",
+            "task_name": "CBRN smoke",
+            "launcher": "launcher-node",
+            "launcher_alias": "Launcher",
+            "date_created": 100.0,
+            "job_config_cid": "QmConfigCID",
+            "workers": {"launcher-node": {"finished": True}},
+            "timeline": [],
+            "blockchain_attestation_enabled": True,
+            "execution_binding": binding,
+          }
+          _bind_job_store(plugin, job_specs)
 
-    result = PentesterApi01Plugin._finalize_model_test_job(
-      plugin,
-      "job-123",
-      job_specs,
-      {
-        "status": "finished",
-        "model_test_results": {"overall_status": "passed", "cases": []},
-        "model_test_summary": {"overall_status": "passed"},
-      },
-      "QmWorkerResult",
-    )
+          result = PentesterApi01Plugin._finalize_model_test_job(
+            plugin,
+            "job-123",
+            job_specs,
+            {
+              "status": "finished",
+              "model_test_results": {"overall_status": "passed", "cases": []},
+              "model_test_summary": {"overall_status": "passed"},
+            },
+            "QmWorkerResult",
+          )
 
-    self.assertTrue(result)
-    archive = plugin.r1fs.add_json.call_args.args[0]
-    self.assertEqual(archive["timeline"][-1]["type"], "finalized")
-    stub = plugin._write_job_record.call_args.args[1]
-    self.assertEqual(stub["job_status"], "FINALIZED")
-    self.assertEqual(stub["attestation_status"], "failed")
-    self.assertEqual(stub["attestation_failure_reason"], "submit_failed")
+          self.assertTrue(result)
+          archive = plugin.r1fs.add_json.call_args.args[0]
+          self.assertEqual(archive["timeline"][-1]["type"], "finalized")
+          stub = plugin._write_job_record.call_args.args[1]
+          self.assertEqual(stub["job_status"], "FINALIZED")
+          self.assertEqual(stub["attestation_status"], "failed")
+          self.assertEqual(stub["attestation_failure_reason"], expected)
+          denied = [c.kwargs["meta"] for c in plugin._emit_timeline_event.call_args_list
+                    if c.args[1] == "execution_denied"]
+          self.assertEqual(denied, [{"operation": "attestation", "reason": denial, "pass_nr": 1}] if denial else [])
+          self.assertEqual(any("[EXECUTION]" in str(c.args) for c in plugin.P.call_args_list), bool(denial))
+          self.assertEqual(plugin._submit_redmesh_test_attestation.called, not denial)
 
   def test_model_test_finalization_stores_successful_end_attestation(self):
     mock_plugin_modules()

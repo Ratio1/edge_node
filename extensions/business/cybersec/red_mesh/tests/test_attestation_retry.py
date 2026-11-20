@@ -1,5 +1,5 @@
 """RM-221: a finished job whose end attestation failed keeps its results and can retry the attestation."""
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from extensions.business.cybersec.red_mesh.models import CStoreJobFinalized, JobArchive, PassReport
 from extensions.business.cybersec.red_mesh.tenancy.administration import AdministrationDenied
@@ -39,16 +39,20 @@ def _retry(Plugin, plugin, actor, case):
 
 
 def test_retry_submits_the_end_attestation_from_the_archive_without_rescanning():
-  case, stub = _stub()
+  case, stub = _stub(worker_count=3)  # three workers assigned, two reported in the last pass
   Plugin, plugin, actor = _plugin(case, stub)
-  result = _retry(Plugin, plugin, actor, case)
+  with patch("extensions.business.cybersec.red_mesh.services.event_hooks.emit_attestation_status_event") as soc:
+    result = _retry(Plugin, plugin, actor, case)
   assert result == {"success": True, "attestation_status": "submitted", "tx_hash": "0xretry"}
-  _, kwargs = plugin._submit_redmesh_test_attestation.call_args
-  assert (kwargs["vulnerability_score"], kwargs["report_cid"], kwargs["node_ips"]) == (
-    50, "QmAggregate", ["192.0.2.1", "192.0.2.2"])
+  args, kwargs = plugin._submit_redmesh_test_attestation.call_args
+  assert (len(args[2]), kwargs["vulnerability_score"], kwargs["report_cid"], kwargs["node_ips"]) == (
+    3, 50, "QmAggregate", ["192.0.2.1", "192.0.2.2"])
+  assert soc.call_args.kwargs == {"state": "submitted", "network": plugin.REDMESH_ATTESTATION_NETWORK,
+                                  "tx_hash": "0xretry"}
   claim, settle = (call.args[1] for call in plugin._write_job_record.call_args_list)
   assert claim["attestation_status"] == "submitting" and not claim.get("attestation_failure_reason")
-  assert settle["attestation_status"] == "submitted" and settle["redmesh_test_attestation"]["tx_hash"] == "0xretry"
+  assert settle["attestation_status"] == "submitted" and settle["redmesh_test_attestation"] == {
+    "tx_hash": "0xretry", "network": plugin.REDMESH_ATTESTATION_NETWORK}
   assert plugin._log_audit_event.call_args.args[1]["outcome"] == "submitted"
   assert not plugin.scan_jobs.mock_calls  # nothing was rescanned or restarted
 
@@ -88,13 +92,14 @@ def test_a_refused_reauthorization_blocks_the_retry_names_the_reason_and_audits_
 
 
 def test_a_settle_failure_after_a_submit_still_returns_and_audits_the_tx_hash():
-  case, stub = _stub()
-  Plugin, plugin, actor = _plugin(case, stub)
-  plugin._write_job_record = MagicMock(side_effect=[stub, None])  # claim lands, settle fails
-  result = _retry(Plugin, plugin, actor, case)
-  assert result == {"success": False, "error": "conflict", "status_code": 409, "tx_hash": "0xretry"}
-  assert plugin._log_audit_event.call_args.args[1]["outcome"] == "settle_failed"
-  assert plugin._log_audit_event.call_args.args[1]["tx_hash"] == "0xretry"
+  for settle in (None, RuntimeError("cstore down")):  # the settle write is refused, or raises
+    case, stub = _stub()
+    Plugin, plugin, actor = _plugin(case, stub)
+    plugin._write_job_record = MagicMock(side_effect=[stub, settle])  # claim lands, settle fails
+    result = _retry(Plugin, plugin, actor, case)
+    assert result == {"success": False, "error": "conflict", "status_code": 409, "tx_hash": "0xretry"}
+    assert plugin._log_audit_event.call_args.args[1]["outcome"] == "settle_failed"
+    assert plugin._log_audit_event.call_args.args[1]["tx_hash"] == "0xretry"
 
 
 def test_a_model_test_retry_attests_the_stub_worker_count():
