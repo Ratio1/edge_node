@@ -67,8 +67,8 @@ TMP_MIN_AGE = 300  # seconds; a younger temp file may belong to a save in progre
 # file become GBs of memory.
 _ALLOWED_GLOBALS = frozenset(("datetime", n) for n in ("datetime", "date", "time", "timedelta", "timezone"))
 MAX_NODES = 1_000_000  # container and leaf nodes of one payload, shared references counted each time
-# str/bytes length of one payload, counted once per reference: a resumed worker copies a shared string per
-# reference (credential redaction, JSON), so one 32 KB string referenced 1M times would become 32 GB.
+# str/bytes length of one pass (or one final marker), counted once per reference: a resumed worker copies a
+# shared string per reference (credential redaction, JSON), so one 32 KB string referenced 1M times is 32 GB.
 MAX_TEXT_BYTES = 2 * MAX_FILE_BYTES
 # Opcodes of one pass (all its files) or of one final marker, counted before anything is unpickled. A native
 # opcode allocates at most about 250 bytes (EMPTY_SET). Measured peak at the caps: +725 MB for an EMPTY_SET
@@ -105,8 +105,10 @@ def get_worker_checkpoint_config(owner):
   )
 
 
-def _within_node_bound(obj):
-  """Walk `obj` without de-duplicating shared references; False past `MAX_NODES` or `MAX_TEXT_BYTES`."""
+def _within_node_bound(obj, budget=None):
+  """Walk `obj` without de-duplicating shared references; False past `MAX_NODES` or the text bound: the pass's
+  remaining `budget["text"]` (taken when True), else `MAX_TEXT_BYTES`."""
+  max_text = MAX_TEXT_BYTES if budget is None else budget["text"]
   stack, count, text = [obj], 0, 0
   while stack:
     item = stack.pop()
@@ -115,13 +117,15 @@ def _within_node_bound(obj):
       return False
     if isinstance(item, (str, bytes)):
       text += len(item)
-      if text > MAX_TEXT_BYTES:
+      if text > max_text:
         return False
     elif isinstance(item, dict):
       stack.extend(item.keys())
       stack.extend(item.values())
     elif isinstance(item, (list, tuple, set, frozenset)):
       stack.extend(item)
+  if budget is not None:
+    budget["text"] -= text
   return True
 
 
@@ -200,8 +204,8 @@ def _read_file(path, budget=None):
   """Unpickle one checkpoint file through the restricted unpickler. None when it is unreadable, refused,
   oversized, over the opcode or node bound, or over `budget`. Never follows a symlink.
 
-  `budget` is the remaining `{"bytes", "opcodes"}` of a pass, shared by its files; this file's share is taken
-  before it is unpickled. Without one the file gets the full `MAX_FILE_BYTES` / `MAX_OPCODES`. A pass that
+  `budget` is the remaining `{"bytes", "opcodes", "text"}` of a pass, shared by its files; this file's share is taken
+  before it is unpickled. Without one the file gets the full caps. A pass that
   runs out refuses its later files, so it launches fresh instead of resuming."""
   try:
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # a FIFO must not block the open
@@ -220,7 +224,7 @@ def _read_file(path, budget=None):
       budget["bytes"] -= len(data)
       budget["opcodes"] -= opcodes
     payload = _RestrictedUnpickler(io.BytesIO(data)).load()
-    return payload if _within_node_bound(payload) else None
+    return payload if _within_node_bound(payload, budget) else None
   except Exception:
     return None
 
@@ -238,7 +242,7 @@ def load_all(owner, job_id, pass_nr):
   except (OSError, TypeError, ValueError):
     return {}
   result = {}
-  budget = {"bytes": MAX_FILE_BYTES, "opcodes": MAX_OPCODES}  # the whole pass, not each file
+  budget = {"bytes": MAX_FILE_BYTES, "opcodes": MAX_OPCODES, "text": MAX_TEXT_BYTES}  # the whole pass, not each file
   for name in sorted(names):
     prefix = name[len(lead):-len(".pkl")]
     payload = _read_file(os.path.join(job_dir, name), budget)

@@ -218,6 +218,11 @@ class TestCheckpointStore(unittest.TestCase):
     with patch.object(ckpt, "MAX_TEXT_BYTES", 50_000):
       self.assertEqual(list(ckpt.load_all(self.owner, "job1", 1)), ["few"])
     self.assertFalse(os.path.exists(os.path.join(self.base, "job1", "1_many.pkl")))
+    for prefix in ("a", "b"):  # each under the cap, the pass over it
+      ckpt.save(self.owner, "job1", 2, prefix, _payload(state={"x": [text] * 30}))
+    with patch.object(ckpt, "MAX_TEXT_BYTES", 50_000):
+      self.assertEqual(list(ckpt.load_all(self.owner, "job1", 2)), ["a"])
+    self.assertFalse(os.path.exists(os.path.join(self.base, "job1", "2_b.pkl")))
 
   def test_opcode_count_over_cap_is_refused_before_load(self):
     ckpt.save(self.owner, "job1", 1, "spray", _payload(state={"x": [set() for _ in range(100)]}))
