@@ -6,7 +6,6 @@ longer be read or written.
 """
 import json
 import unittest
-from unittest.mock import patch
 from uuid import uuid4
 
 from .test_tenant_administration import FakeAdministrationStore
@@ -76,9 +75,6 @@ class TestConfigTableMatchesDeployment(unittest.TestCase):
 
 class RetirementCase(unittest.TestCase):
   def setUp(self):
-    env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    env.start()
-    self.addCleanup(env.stop)
     self.owner = FakeAdministrationStore()
     self.store = CstoreTenantAdministrationStore(self.owner, "deployment")
     self.service = TenantAdministrationService(CstoreAuthAccountReader(self.owner), self.store)

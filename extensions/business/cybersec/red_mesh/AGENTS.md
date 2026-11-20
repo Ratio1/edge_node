@@ -678,3 +678,15 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
   migrated by hand (hub task RM-222 §Migration); there is no compatibility path.
 - Tests set `_stream_id` on the plugin or owner stub instead of `cfg_tenancy_namespace`;
   `tests/test_tenancy_namespace.py` pins the accessor and `test_plugin_config.py` pins that the key is gone.
+
+### 2026-11-20 — RM-222: the account hkey is derived, never configured
+
+- `R1EN_CSTORE_AUTH_HKEY` is no longer read, from instance `ENV` or `os.environ`. The account store
+  hash is `<pipeline name>:auth`, built by `tenancy.account_hkey(owner)` from the same stream id as the
+  tenancy namespace; `CstoreAuthAccountReader._hkey` raises `IdentityStoreError` when it is empty
+  (503 `identity_store_unavailable`). `AUTH_HKEY_ENV` is removed. A value still present has no effect.
+- Deeploy still injects the variable into runner `ENV`; RedMesh ignores it. A fresh deeploy job starts
+  with an empty account store.
+- Tests set `_stream_id` on the owner or store stub (`FakeAdministrationStore._stream_id = "deployment"`)
+  and expect the hash `deployment:auth`; `tests/test_tenancy_namespace.py` pins the derivation and that
+  the env var is ignored.

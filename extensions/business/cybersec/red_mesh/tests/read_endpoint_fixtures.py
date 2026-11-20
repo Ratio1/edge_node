@@ -3,7 +3,7 @@ from collections import deque
 from contextlib import contextmanager
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 from extensions.business.cybersec.red_mesh.tenancy.administration import TenantAdministrationService
@@ -30,9 +30,6 @@ def install_tenant_read_store(case, owner, Plugin, *, jobs=None, role="super_ten
   binding in its `job_config`, as the finalizer writes it; the artifact reader refuses one that does
   not. Returns `(actor, tenant_id)` for the call under test.
   """
-  environment = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-  environment.start()
-  case.addCleanup(environment.stop)
   store = FakeAdministrationStore()
   owner._stream_id = "deployment"
   owner.cfg_chainstore_peers = []
@@ -55,7 +52,7 @@ def install_tenant_read_store(case, owner, Plugin, *, jobs=None, role="super_ten
   # Identity lives under the auth hkey and tenancy under a JSON-encoded one; every other hash
   # (the plugin's own records) keeps whatever the caller's fixture already installed.
   def ours(hkey):
-    return hkey == "auth" or hkey.startswith('["redmesh"')
+    return hkey == "deployment:auth" or hkey.startswith('["redmesh"')
 
   def get(*, hkey, key):
     if hkey == owner.cfg_instance_id:
@@ -103,60 +100,59 @@ def _binding_for(record, tenant_id):
 @contextmanager
 def read_endpoint_fixture(*, bound=True, archived=True, role="tenant_admin"):
   """`role` is the bound reader's single membership; a platform role carries `tenant_id: None`."""
-  with patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"}):
-    Plugin = api_fixtures.TestPhase3Archive()._get_plugin_class()
-    store = ReadStore()
-    tenant_store = CstoreTenantAdministrationStore(store, "deployment")
-    administration = TenantAdministrationService(CstoreAuthAccountReader(store), tenant_store)
-    request_id = str(uuid4())
-    prepared = administration.prepare_tenant({"account_id": "creator"}, request_id,
-      "Read fixture", "read-fixture", "initial", **contract_terms())
-    assert prepared["success"], prepared
-    tenant_id = prepared["data"]["tenantId"]
-    store.grant("initial", tenant_id)
-    activated = administration.activate_tenant({"account_id": "creator"}, request_id)
-    assert activated["success"], activated
-    store.account("reader", memberships=[{"role": role,
-                                "tenant_id": None if role in PLATFORM_ROLES else tenant_id}]
-                  if bound else None)
-    binding = {**binding_payload(), "tenant_id": tenant_id}
-    job = {"job_id": "job-1", "target": "192.0.2.10", "scan_type": "network",
-           "job_status": "FINALIZED" if archived else "RUNNING", "launcher": "node-a",
-           "workers": {}, "pass_reports": [] if archived else [{"pass_nr": 1, "report_cid": "pass"}]}
-    config = {"target": job["target"]}
-    if bound:
-      job["execution_binding"] = binding
-      config["execution_binding"] = deepcopy(binding)
-    pass_report = {"pass_nr": 1, "llm_analysis": "Associated analysis", "quick_summary": "Summary",
-                   "aggregated_report_cid": "aggregate", "worker_reports": {"node-a": {"report_cid": "worker"}},
-                   "findings": [{"finding_id": "finding-1", "title": "Fixture finding"}]}
-    artifacts = {"pass": pass_report, "aggregate": AggregatedScanData(
-      open_ports=[443], service_info={}, web_tests_info={}, completed_tests=[]).to_dict(),
-                 "worker": {"job_id": "job-1", "worker_addr": "node-a", "open_ports": [443]},
-                 "archive": {"job_id": "job-1", "job_config": config, "passes": [deepcopy(pass_report)]}}
-    if archived:
-      job["job_cid"] = "archive"
-    # RM-108 phase 5: storage holds no record under a key other than its own job_id any more.
-    store.jobs["job-1"] = job
-    artifact_reads = []
-    def get_json(cid, **kwargs):
-      artifact_reads.append((cid, kwargs))
-      value = artifacts.get(cid)
-      if isinstance(value, Exception):
-        raise value
-      return value
-    owner = SimpleNamespace(cfg_instance_id=store.cfg_instance_id, _stream_id="deployment",
-      cfg_chainstore_peers=[],
-      chainstore_hget=store.chainstore_hget, chainstore_hgetall=store.chainstore_hgetall,
-      chainstore_hkeys=store.chainstore_hkeys, chainstore_hset=store.chainstore_hset,
-      r1fs=SimpleNamespace(get_json=get_json),
-      scan_jobs={"job-1": {}}, model_test_jobs={}, time=lambda: 100.0,
-      _audit_log=deque([{"job_id": "foreign", "event": "private"}, {"job_id": "job-1", "event": "visible"}]))
-    owner._normalize_job_record = lambda key, record, **kwargs: Plugin._normalize_job_record(owner, key, record, **kwargs)
-    store.reads.clear()
-    yield SimpleNamespace(Plugin=Plugin, owner=owner, store=store, actor={"account_id": "reader"},
-      tenant_id=tenant_id if bound else None, job=job, artifacts=artifacts, artifact_reads=artifact_reads,
-      administration=administration, tenant_store=tenant_store)
+  Plugin = api_fixtures.TestPhase3Archive()._get_plugin_class()
+  store = ReadStore()
+  tenant_store = CstoreTenantAdministrationStore(store, "deployment")
+  administration = TenantAdministrationService(CstoreAuthAccountReader(store), tenant_store)
+  request_id = str(uuid4())
+  prepared = administration.prepare_tenant({"account_id": "creator"}, request_id,
+    "Read fixture", "read-fixture", "initial", **contract_terms())
+  assert prepared["success"], prepared
+  tenant_id = prepared["data"]["tenantId"]
+  store.grant("initial", tenant_id)
+  activated = administration.activate_tenant({"account_id": "creator"}, request_id)
+  assert activated["success"], activated
+  store.account("reader", memberships=[{"role": role,
+                              "tenant_id": None if role in PLATFORM_ROLES else tenant_id}]
+                if bound else None)
+  binding = {**binding_payload(), "tenant_id": tenant_id}
+  job = {"job_id": "job-1", "target": "192.0.2.10", "scan_type": "network",
+         "job_status": "FINALIZED" if archived else "RUNNING", "launcher": "node-a",
+         "workers": {}, "pass_reports": [] if archived else [{"pass_nr": 1, "report_cid": "pass"}]}
+  config = {"target": job["target"]}
+  if bound:
+    job["execution_binding"] = binding
+    config["execution_binding"] = deepcopy(binding)
+  pass_report = {"pass_nr": 1, "llm_analysis": "Associated analysis", "quick_summary": "Summary",
+                 "aggregated_report_cid": "aggregate", "worker_reports": {"node-a": {"report_cid": "worker"}},
+                 "findings": [{"finding_id": "finding-1", "title": "Fixture finding"}]}
+  artifacts = {"pass": pass_report, "aggregate": AggregatedScanData(
+    open_ports=[443], service_info={}, web_tests_info={}, completed_tests=[]).to_dict(),
+               "worker": {"job_id": "job-1", "worker_addr": "node-a", "open_ports": [443]},
+               "archive": {"job_id": "job-1", "job_config": config, "passes": [deepcopy(pass_report)]}}
+  if archived:
+    job["job_cid"] = "archive"
+  # RM-108 phase 5: storage holds no record under a key other than its own job_id any more.
+  store.jobs["job-1"] = job
+  artifact_reads = []
+  def get_json(cid, **kwargs):
+    artifact_reads.append((cid, kwargs))
+    value = artifacts.get(cid)
+    if isinstance(value, Exception):
+      raise value
+    return value
+  owner = SimpleNamespace(cfg_instance_id=store.cfg_instance_id, _stream_id="deployment",
+    cfg_chainstore_peers=[],
+    chainstore_hget=store.chainstore_hget, chainstore_hgetall=store.chainstore_hgetall,
+    chainstore_hkeys=store.chainstore_hkeys, chainstore_hset=store.chainstore_hset,
+    r1fs=SimpleNamespace(get_json=get_json),
+    scan_jobs={"job-1": {}}, model_test_jobs={}, time=lambda: 100.0,
+    _audit_log=deque([{"job_id": "foreign", "event": "private"}, {"job_id": "job-1", "event": "visible"}]))
+  owner._normalize_job_record = lambda key, record, **kwargs: Plugin._normalize_job_record(owner, key, record, **kwargs)
+  store.reads.clear()
+  yield SimpleNamespace(Plugin=Plugin, owner=owner, store=store, actor={"account_id": "reader"},
+    tenant_id=tenant_id if bound else None, job=job, artifacts=artifacts, artifact_reads=artifact_reads,
+    administration=administration, tenant_store=tenant_store)
 
 
 def as_role(fixture, role, *, tenant_id=_SAME_TENANT):
@@ -168,7 +164,7 @@ def as_role(fixture, role, *, tenant_id=_SAME_TENANT):
   local = tenant_id is _SAME_TENANT
   row = {"role": role, "tenant_id": None if role in PLATFORM_ROLES
          else fixture.tenant_id if local else tenant_id}
-  fixture.store.data[("auth", "reader")]["memberships"] = [row]
+  fixture.store.data[("deployment:auth", "reader")]["memberships"] = [row]
   return fixture.tenant_id if local or role in PLATFORM_ROLES else tenant_id
 
 
@@ -189,7 +185,7 @@ def designate_reviewer(fixture, account="reader", *, enabled=True, full_name="Ri
   account-profile row the policy reads. `reports:review` needs this beside the role and the
   Allow Pentester switch; `full_name=""` gives a designated account with an incomplete profile."""
   from extensions.business.cybersec.red_mesh.tenancy import account_profile
-  created_at = fixture.store.data[("auth", account)]["createdAt"]
+  created_at = fixture.store.data[("deployment:auth", account)]["createdAt"]
   row = {**account_profile.new_row(created_at), "full_name": full_name, "report_reviewer": enabled,
          "updated_by": "creator", "updated_at": "2026-11-03T00:00:00+00:00"}
   fixture.tenant_store.put(account_profile.KIND, account, record=row)

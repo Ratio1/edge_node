@@ -69,9 +69,6 @@ class TestDataMaintenance(unittest.TestCase):
     cls.Plugin = PentesterApi01Plugin
 
   def setUp(self):
-    environment = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    environment.start()
-    self.addCleanup(environment.stop)
     self.storage = FakeAdministrationStore()
     self.storage.account("pentester", memberships=[{"role": "super_pentester", "tenant_id": None}])
     self.plugin = object.__new__(self.Plugin)
@@ -195,7 +192,7 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertEqual((rows[(JOBS, "old1")]["class"], rows[(JOBS, "old1")]["reason"]),
                      ("old", "binding_schema_1"))
     self.assertEqual(rows[(f"{JOBS}:live", "old1:node-a")]["reason"], "old_job")
-    self.assertEqual(rows[("auth", "creator")]["class"], "current")
+    self.assertEqual(rows[("deployment:auth", "creator")]["class"], "current")
     tenancy = [row for (hkey, _), row in rows.items() if hkey == TENANCY]
     self.assertEqual({row["class"] for row in tenancy}, {"current"})
     self.assertEqual({json.loads(row["field"])[0] for row in tenancy}, {"tenant", "receipt", "domain"})
@@ -221,9 +218,9 @@ class TestDataMaintenance(unittest.TestCase):
     hkeys = self.plugin.export_redmesh_records(self.actor, 0, 0, 1)["data"]["hkeys"]
     names = {item["hkey"] for item in hkeys}
     self.assertEqual({JOBS + suffix for suffix in built} - names, set())
-    self.assertLessEqual({JOBS, TENANCY, COMPLIANCE, "auth", f"{JOBS}:integrations:{self.tenant}",
+    self.assertLessEqual({JOBS, TENANCY, COMPLIANCE, "deployment:auth", f"{JOBS}:integrations:{self.tenant}",
                           f"{JOBS}:triage:t:{self.tenant}", f"{JOBS}:triage:audit:{self.tenant}"}, names)
-    self.assertEqual([item["hkey"] for item in hkeys if item["account"]], ["auth"])
+    self.assertEqual([item["hkey"] for item in hkeys if item["account"]], ["deployment:auth"])
 
   def test_host_triage_rows_are_registered_classified_and_restorable(self):
     # RM-169 step 4a: one hkey per tenant, field `host\x1ffinding_id`; no job owns a row.
@@ -895,12 +892,12 @@ class TestDataMaintenance(unittest.TestCase):
     busy = self.scan()[(JOBS, "busy")]
     stale = dict(rows[(JOBS, "old1")])
     self.storage.data[(JOBS, "old1")]["job_status"] = "STOPPED"
-    outcomes = self.clean(stale, busy, rows[(JOBS, "new1")], rows[("auth", "creator")],
+    outcomes = self.clean(stale, busy, rows[(JOBS, "new1")], rows[("deployment:auth", "creator")],
                           {"hkey": JOBS, "field": "never", "sha256": "0" * 64})
     self.assertEqual([item["outcome"] for item in outcomes],
                      ["changed", "running", "not_old", "refused", "absent"])
     self.assertEqual(self.files.deleted, [])
-    self.assertIsNotNone(self.storage.data[("auth", "creator")])
+    self.assertIsNotNone(self.storage.data[("deployment:auth", "creator")])
 
   def test_a_failed_file_delete_keeps_the_row(self):
     self.files.refuse = {REPORT}
@@ -923,7 +920,7 @@ class TestDataMaintenance(unittest.TestCase):
   def test_restore_writes_back_what_is_gone_and_never_overwrites(self):
     rows = self.scan()
     saved = [{"hkey": key[0], "field": key[1], "value": rows[key]["value"]}
-             for key in ((JOBS, "old1"), (JOBS, "new1"), ("auth", "creator"))]
+             for key in ((JOBS, "old1"), (JOBS, "new1"), ("deployment:auth", "creator"))]
     self.clean(rows[(JOBS, "old1")])
     self.storage.data[(JOBS, "new1")]["job_status"] = "STOPPED"
     self.events.clear()

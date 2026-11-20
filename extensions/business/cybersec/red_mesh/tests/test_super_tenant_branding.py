@@ -4,7 +4,6 @@ import copy
 import hashlib
 import struct
 import unittest
-from unittest.mock import patch
 from uuid import uuid4
 
 from .contract_fixture import CONTRACT_PDF, FakeDocumentStore, contract_b64
@@ -41,9 +40,6 @@ class _BrandingCase(unittest.TestCase):
     cls.Plugin = PentesterApi01Plugin
 
   def setUp(self):
-    env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    env.start()
-    self.addCleanup(env.stop)
     self.store = FakeAdministrationStore()
     self.store.account("pentester", memberships=[{"role": "super_pentester", "tenant_id": None}])
     self.store.account("scoped-sta", memberships=[{"role": "super_tenant_admin", "tenant_id": "tn_" + str(uuid4())}])

@@ -2,7 +2,6 @@
 import inspect
 import json
 import unittest
-from unittest.mock import patch
 from uuid import uuid4
 
 from pydantic import create_model
@@ -20,12 +19,9 @@ class TestNodeFailurePolicyTransport(unittest.TestCase):
     cls.Plugin = PentesterApi01Plugin
 
   def setUp(self):
-    env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    env.start()
-    self.addCleanup(env.stop)
     self.store = FakeAdministrationStore()
     self.plugin = object.__new__(self.Plugin)
-    self.plugin._stream_id = "policy-transport"
+    self.plugin._stream_id = "deployment"
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
       setattr(self.plugin, name, getattr(self.store, name))
     self.creator = {"account_id": "creator"}

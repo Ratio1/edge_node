@@ -22,9 +22,6 @@ class TestTenantDelete(unittest.TestCase):
     cls.Plugin = PentesterApi01Plugin
 
   def setUp(self):
-    environment = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    environment.start()
-    self.addCleanup(environment.stop)
     self.storage = FakeAdministrationStore()
     self.plugin = object.__new__(self.Plugin)
     self.plugin._stream_id = "deployment"

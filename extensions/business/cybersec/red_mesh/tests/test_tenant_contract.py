@@ -21,9 +21,6 @@ class _PluginCase(unittest.TestCase):
     cls.Plugin = PentesterApi01Plugin
 
   def setUp(self):
-    env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    env.start()
-    self.addCleanup(env.stop)
     self.store = FakeAdministrationStore()
     self.documents = FakeDocumentStore()
     self.plugin = object.__new__(self.Plugin)

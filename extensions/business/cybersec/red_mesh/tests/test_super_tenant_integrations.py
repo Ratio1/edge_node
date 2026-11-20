@@ -33,9 +33,6 @@ class _Case(unittest.TestCase):
     cls.Plugin = PentesterApi01Plugin
 
   def setUp(self):
-    env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    env.start()
-    self.addCleanup(env.stop)
     self.store = FakeAdministrationStore()
     self.store.account("pentester", memberships=[{"role": "super_pentester", "tenant_id": None}])
     self.tenant = "tn_" + str(uuid4())

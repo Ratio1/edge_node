@@ -37,9 +37,6 @@ class PurgeAdmissionCase(unittest.TestCase):
     TestPhase1ConfigCID._mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
 
-    env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    env.start()
-    self.addCleanup(env.stop)
     self.Plugin = PentesterApi01Plugin
     self.store = ReadStore()
     self.tenants = CstoreTenantAdministrationStore(self.store, "deployment")

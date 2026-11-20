@@ -7,3 +7,10 @@ def tenancy_namespace(owner):
   value = getattr(owner, "_stream_id", None)
   value = value.strip() if isinstance(value, str) else ""
   return value or None
+
+
+def account_hkey(owner):
+  """The CStore hash of the Navigator account store: ``<pipeline name>:auth``. None when the
+  namespace is unavailable. Derived, never configured."""
+  namespace = tenancy_namespace(owner)
+  return f"{namespace}:auth" if namespace else None

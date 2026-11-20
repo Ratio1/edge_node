@@ -28,9 +28,6 @@ def doc(sha256, ref, uploaded_by="creator", mime="application/pdf", kind="agreem
 
 class TestTenantEngagements(unittest.TestCase):
   def setUp(self):
-    env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    env.start()
-    self.addCleanup(env.stop)
     self.owner = FakeAdministrationStore()
     self.store = CstoreTenantAdministrationStore(self.owner, "deployment")
     # RM-102: this fixture models no job records, so a release always finds none running.

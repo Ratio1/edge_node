@@ -54,11 +54,12 @@ print it whole.
 | `INSTANCE_ID` | Instance name | `"redmesh_api"` |
 | `PORT` | API port the Navigator calls | `5082` |
 | `CHAINSTORE_PEERS` | Node addresses that share job state | `["<node address>", "..."]` |
-| `ENV.R1EN_CSTORE_AUTH_HKEY` | CStore hash of the Navigator account store (identity reads) | `"<pipeline name>:auth-v1"` |
 
-There is no tenancy namespace key. Tenant records live in a CStore partition named after the
-pipeline (deeploy `app_id`), so a new deeploy job starts with an empty tenant partition. A pipeline
-with an empty name answers `unavailable` on every tenant-scoped call.
+There is no tenancy namespace key and no account hash key. The Navigator account store (identity
+reads) is the CStore hash `<pipeline name>:auth`, derived and not configurable. Tenant records live
+in a CStore partition named after the pipeline (deeploy `app_id`), so a new deeploy job starts with
+an empty tenant partition. A pipeline with an empty name answers `unavailable` on every tenant-scoped
+call.
 
 ### Common
 
