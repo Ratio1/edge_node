@@ -31,7 +31,7 @@ def _plugin(case, stub, archive=ARCHIVE):
   plugin._write_job_record = MagicMock(side_effect=lambda job_id, value, **kwargs: value)
   plugin._submit_redmesh_test_attestation = MagicMock(return_value={"tx_hash": "0xretry"})
   plugin._attestation_get_tenant_private_key = MagicMock(return_value="key")
-  plugin._execution_service().engagement_end_reason.return_value = None  # the engagement is active
+  plugin._execution_service().execution_basis_end_reason.return_value = None  # engagement and contract valid
   return Plugin, plugin, actor
 
 
@@ -95,11 +95,12 @@ def test_a_refused_reauthorization_blocks_the_retry_names_the_reason_and_audits_
 def test_an_ended_engagement_or_an_unreadable_store_blocks_the_retry():
   from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
   for ended, expected in (("engagement_revoked", "engagement_revoked"), ("engagement_expired", "engagement_expired"),
+                          ("contract_invalid", "contract_invalid"),
                           (TenantStoreError("down"), "store_unavailable")):  # owner 2026-11-20: active engagements only
     case, stub = _stub()
     Plugin, plugin, actor = _plugin(case, stub)
     service = plugin._execution_service()
-    service.engagement_end_reason = MagicMock(side_effect=ended if isinstance(ended, Exception) else None,
+    service.execution_basis_end_reason = MagicMock(side_effect=ended if isinstance(ended, Exception) else None,
                                               return_value=None if isinstance(ended, Exception) else ended)
     plugin._execution_service = lambda: service
     result = _retry(Plugin, plugin, actor, case)
