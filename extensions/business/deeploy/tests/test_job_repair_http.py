@@ -143,27 +143,77 @@ class JobRepairHttpTests(unittest.TestCase):
     self.assertEqual(self.api.get_job_repair_preview(unsigned)["status"], "blocked")
     self.assertEqual(self.replay.c.commands, [])
 
-  def test_dapp_preview_payload_passes_real_wallet_authorization_and_nonce_validation(self):
-    # Stub the chain, but keep the endpoint, production v3 verification and nonce/escrow authorization.
-    account = Account.create()
+  def _use_wallet_verification(self, escrow_details):
+    # Keep production v3 verification and nonce/escrow authorization with fixture chain responses.
     check_time = 1795096800
     self.api.time = lambda: check_time
     self.api.time_to_str = str
     self.api.NestedDotDict = NestedDotDict
     del self.api.deeploy_verify_and_get_inputs, self.api.deeploy_get_auth_result
     self.api.bc.is_valid_eth_address = Web3.is_address
-    self.api.bc.get_user_escrow_details = lambda address: dict(isActive=True, escrowOwner=address, escrowAddress=address)
+    self.api.bc.get_user_escrow_details = escrow_details
     self.api.bc.eth_verify_text_signature = lambda text, signature, **kwargs: Account.recover_message(
       encode_defunct(text=text), signature=signature)
+    return check_time
+
+  def _sign_request(self, account, request_type, payload):
+    # Sign the same payload and endpoint domain as the dApp with a disposable wallet.
+    digest = self.api._deeploy_payload_hash(payload)
+    message = self.api._deeploy_wrapper_message(request_type, payload, digest)
+    signature = account.sign_message(encode_defunct(text=message)).signature.to_0x_hex()
+    return dict(payload, EE_HASH=digest, EE_ETH_SIGN=signature, EE_ETH_SENDER=account.address)
+
+  def test_delegate_can_preview_and_submit_with_escrow_scoped_retry(self):
+    delegate = Account.create()
+    request = self.reviewed_update()
+    # Use the coordinator's existing paid-job owner fixture and an active delegate with no secret-reveal permission.
+    membership = dict(isActive=True, escrowOwner="owner", escrowAddress="escrow", permissions=1)
+    check_time = self._use_wallet_verification(lambda address: membership)
+    nonce = hex(check_time * 1000 - 1)
+    preview = self._sign_request(delegate, "get job repair preview", dict(job_id=31, coordinator="oracle", nonce=nonce))
+    result = self.api.get_job_repair_preview(preview)
+    self.assertEqual((result["status"], result.get("proposal")), ("reviewable", request["repair"]["proposal"]), result)
+
+    payload = {key: value for key, value in request.items() if key not in ("EE_HASH", "EE_ETH_SIGN", "EE_ETH_SENDER")}
+    update = self._sign_request(delegate, "repair update pipeline", dict(payload, nonce=nonce))
+    # A preview does not authorize submission after the delegate leaves or switches escrow.
+    for status, owner in ((False, "owner"), (True, "unrelated-owner")):
+      membership.update(isActive=status, escrowOwner=owner)
+      blocked = self.api.get_job_repair_preview(preview)
+      self.assertEqual(blocked["status"], "blocked")
+      self.assertIn("does not belong" if status else "no active escrow", blocked["reason"])
+      self.assertNotEqual(self.api.repair_update_pipeline(copy.deepcopy(update))["status_code"], 202)
+      self.assertEqual(set(self.replay.c._operation_records()), {self.replay.oid})
+      self.replay.http.assert_not_called()
+      self.assertEqual(self.replay.c.commands, [])
+    membership.update(isActive=True, escrowOwner="owner")
+
+    accepted = self.api.repair_update_pipeline(copy.deepcopy(update))
+    self.assertEqual((accepted["status_code"], accepted["status"]), (202, "accepted"), accepted)
+    child = self.replay.c._operation_records()[accepted["operation_id"]]
+    self.assertEqual(child["owner"], "owner")  # Custody and job ownership remain scoped to the escrow.
+    inspections = list(self.replay.c.commands)
+    retry = self.api.repair_update_pipeline(copy.deepcopy(update))
+    self.assertEqual((retry["status_code"], retry.get("operation_id")), (202, accepted["operation_id"]), retry)
+    self.assertEqual(self.replay.c.commands, inspections)
+    self.assertTrue(self.replay.http.called)
+    membership["isActive"] = False
+    # A previous successful submission still requires current escrow access on a signed retry.
+    revoked = self.api.repair_update_pipeline(copy.deepcopy(update))
+    self.assertIn("no active escrow", revoked["error"]["message"])
+    self.assertEqual(self.replay.c.commands, inspections)
+
+  def test_dapp_preview_payload_passes_real_wallet_authorization_and_nonce_validation(self):
+    account = Account.create()
+    check_time = self._use_wallet_verification(
+      lambda address: dict(isActive=True, escrowOwner=address, escrowAddress=address),
+    )
     self.api._assess_job_repair = lambda job_id, owner, coordinator: (
       {"job_id": job_id, "coordinator": coordinator, "owner": owner},
     )
 
     def sign(payload):
-      digest = self.api._deeploy_payload_hash(payload)
-      message = self.api._deeploy_wrapper_message("get job repair preview", payload, digest)
-      signature = account.sign_message(encode_defunct(text=message)).signature.to_0x_hex()
-      return dict(payload, EE_HASH=digest, EE_ETH_SIGN=signature, EE_ETH_SENDER=account.address)
+      return self._sign_request(account, "get job repair preview", payload)
 
     # EditJobPage signs exactly these three fields.
     payload = dict(job_id=31, coordinator="oracle", nonce=hex(check_time * 1000 - 1))
