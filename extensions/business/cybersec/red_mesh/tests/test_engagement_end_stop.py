@@ -56,6 +56,40 @@ class TestEngagementEndReason(unittest.TestCase):
     self.assertEqual(self.reason(engagement_id="not-an-id"), "engagement_not_found")
 
 
+class TestExecutionBasisEndReason(TestEngagementEndReason):
+  """RM-221 (owner, 2026-11-20): on-chain effects of an admitted job need its engagement and contract still valid."""
+  test_an_engagement_in_force_has_no_end_reason = None
+  test_the_window_ends_at_valid_until = None
+  test_a_revoked_engagement_has_ended = None
+  test_an_unknown_engagement_has_ended = None
+
+  def basis(self, instant=INSIDE):
+    self.service.clock = lambda: instant
+    return self.service.execution_basis_end_reason(self.tenant, self.engagement_id)
+
+  def test_the_basis_holds_only_inside_the_engagement_window(self):
+    self.assertEqual(self.basis(datetime(2020, 1, 1, tzinfo=timezone.utc)), "engagement_not_started")
+    self.assertEqual(self.basis(datetime(2026, 10, 31, tzinfo=timezone.utc)), "engagement_expired")
+
+  def test_an_engagement_in_force_under_its_contract_has_no_end_reason(self):
+    self.assertIsNone(self.basis())
+
+  def test_an_ended_engagement_ends_the_basis(self):
+    self.assertTrue(self.service.revoke_engagement(self.actor, self.tenant, self.engagement_id, "Contract ended")["success"])
+    self.assertEqual(self.basis(), "engagement_revoked")
+
+  def test_an_engagement_whose_contract_the_tenant_no_longer_holds_ends_the_basis(self):
+    real_get = self.service.store.get
+
+    def get(kind, *ids):
+      record = real_get(kind, *ids)
+      if kind == "tenant":
+        record = {**record, "contract": {**record["contract"], "sha256": "f" * 64}}
+      return record
+    self.service.store.get = get
+    self.assertEqual(self.basis(), "contract_invalid")
+
+
 class TestPluginEngagementEndReason(unittest.TestCase):
   """The plugin seam never stops a job on a store it cannot read."""
 
