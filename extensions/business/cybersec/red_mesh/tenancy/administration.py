@@ -935,6 +935,8 @@ class TenantAdministrationService:
       return ended
     tenant = self.store.get("tenant", tenant_id)
     row = self.store.get("engagement", tenant_id, engagement_id)
+    if self.clock() < datetime.fromisoformat(row["valid_from"]):
+      return "engagement_not_started"
     if (not isinstance(tenant, dict) or not _valid_contract(tenant.get("contract"))
         or row["contract_sha256"] not in _contract_sha256s(tenant)):
       return "contract_invalid"

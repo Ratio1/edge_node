@@ -63,9 +63,13 @@ class TestExecutionBasisEndReason(TestEngagementEndReason):
   test_a_revoked_engagement_has_ended = None
   test_an_unknown_engagement_has_ended = None
 
-  def basis(self):
-    self.service.clock = lambda: INSIDE
+  def basis(self, instant=INSIDE):
+    self.service.clock = lambda: instant
     return self.service.execution_basis_end_reason(self.tenant, self.engagement_id)
+
+  def test_the_basis_holds_only_inside_the_engagement_window(self):
+    self.assertEqual(self.basis(datetime(2020, 1, 1, tzinfo=timezone.utc)), "engagement_not_started")
+    self.assertEqual(self.basis(datetime(2026, 10, 31, tzinfo=timezone.utc)), "engagement_expired")
 
   def test_an_engagement_in_force_under_its_contract_has_no_end_reason(self):
     self.assertIsNone(self.basis())
