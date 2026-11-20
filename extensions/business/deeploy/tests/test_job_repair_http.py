@@ -343,6 +343,28 @@ class JobRepairHttpTests(unittest.TestCase):
     self.assertEqual(response.get_solver_method()(**response.get_method_kwargs()), reply["result"])
     self.assertEqual(self.api._repair_relay_pending, {})
 
+  def test_relay_processing_checks_the_registry_once_and_bounds_a_batch(self):
+    self.api.const = self.api.ct
+    fields = self.api.const.PAYLOAD_DATA
+    registry_reads = []
+    inspected = []
+    def read_registry():
+      registry_reads.append(True)
+      return ["0xOracle"]
+    self.api.bc = SimpleNamespace(address="receiver", get_eth_oracles=read_registry)
+    frame = {
+      fields.EE_IS_ENCRYPTED: True,
+      fields.EE_PAYLOAD_PATH: ["peer", "admin", "DEEPLOY_MANAGER_API", "instance"],
+      fields.EE_DESTINATION: "receiver",
+      fields.EE_ENCRYPTED_DATA: "fixture",
+    }
+    self.api.dataapi_struct_datas = lambda **kwargs: [frame] * 64
+    self.api._handle_job_repair_peer = lambda payload, registered: inspected.append((payload, registered))
+
+    self.api._process_job_repair_relay()
+    self.assertEqual(registry_reads, [True])
+    self.assertEqual(inspected, [(frame, {"0xoracle"})] * 32)
+
   def _use_wallet_verification(self, escrow_details):
     # Keep production v3 verification and nonce/escrow authorization with fixture chain responses.
     check_time = 1795096800
