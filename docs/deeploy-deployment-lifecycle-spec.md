@@ -716,7 +716,8 @@ stores, the real SDK client and Core wrapper; no live node or wallet was changed
 ### Stateless replacement without earlier stop confirmation
 
 An authorized editor signs a read-only `get_job_repair_preview` request with
-`job_id`, `nonce`, and `replace_stateless: true`. The response binds the
+`job_id`, `nonce`, `network`, and `replace_stateless: true`. The receiver
+requires its network in the signed payload before looking up placement. The response binds the
 published CID, app ID and revision, previous addresses, paid slot count, and
 coordinator. A blocked relink keeps its original coordinator. Otherwise the
 registered EVM oracle roster and job ID select the coordinator before resolving
@@ -732,9 +733,12 @@ active delegate with the editor's job-edit permission can sign. Every target
 needs a distinct active license at admission. The coordinator binds the exact
 licensed address, license ID and license owner, and rechecks the placement
 before dispatch and publication. dAuth independently verifies the license
-before releasing replacement credentials and the full placement before
-publication. Preview and admission require a paid execution epoch. Existing
-app and component IDs are preserved.
+and current paid execution term before releasing replacement credentials. It
+verifies the full placement before publication. Preview and admission require a
+paid execution epoch. Extensions take effect at the next credential request.
+Existing app and component IDs are preserved. If the saved per-slot component
+IDs differ, replacement preview refuses the plan until there is an explicit
+mapping for those identities.
 The path supports ordinary native plugins and app runners. Local mounts,
 runtime commands, synchronization, and managed services make a job ineligible.
 Deeploy uses the normal readiness and shutdown behavior of each component. The
@@ -752,13 +756,20 @@ received the replacement and keeps the previous saved pointer. Status carries
 forward `unconfirmed_previous_nodes` and clears a reused address after
 successful takeover. This operation updates the Deeploy runtime
 placement. On-chain node allocation and rewards follow the existing contract.
-If custody might already have published, the coordinator resolves publication
-before treating the rollout as failed.
+The coordinator uploads the redacted R1FS metadata before persisting the signed
+publication pointer and sending it to dAuth. A retry uses that exact pointer.
+When readiness or placement can no longer be verified after a possible custody
+send, a finalizing `status` request can finish the same publication only if
+dAuth finds its signed bundle or signed pointer for that exact revision.
+Missing or inconclusive evidence leaves the operation blocked.
 
 If a replica cannot confirm routing for a signed retry, it returns retryable
 `503 ADMISSION_UNAVAILABLE`. Keep the original request ID and payload until
 the coordinator resolves it. An authoritative refusal of a stale replacement
-proposal returns `409 REPLACEMENT_REVIEW_STALE` and requires a fresh review.
+proposal returns `409 REPLACEMENT_REVIEW_STALE`. Its signed `non_admission`
+contains the exact `request_id` and the wallet-signed `request_hash`. The
+client can clear a pending resend when those fields and the coordinator signer
+match the original request. A fresh review uses a new request ID.
 
 Publish Core 7.7.363 before building Edge. Upgrade the target workers, the
 serving oracles, and dAuth before enabling the updated editor. Stateless

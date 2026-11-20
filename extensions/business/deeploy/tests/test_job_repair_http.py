@@ -4,7 +4,7 @@ import copy
 import hashlib
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from eth_account import Account
 from eth_account.messages import encode_defunct
@@ -57,6 +57,7 @@ class JobRepairHttpTests(unittest.TestCase):
                  "_admit_prepared_deployment", "_accepted_operation_response", "get_job_pipeline_from_cstore"):
       setattr(self.api, name, getattr(coordinator, name))
     self.api.bc = coordinator.bc
+    self.api.evm_network = coordinator.evm_network
     self.domains = []
     def verify(request, request_type):
       self.domains.append(request_type)
@@ -64,7 +65,7 @@ class JobRepairHttpTests(unittest.TestCase):
     self.api.deeploy_verify_and_get_inputs = verify
     self.api.deeploy_get_auth_result = lambda inputs: {"escrow_owner": "owner", "sender": "owner", "sender_escrow": "escrow"}
     self.read = dict(nonce="0x1", EE_ETH_SENDER="owner", EE_ETH_SIGN="fixture", EE_HASH="signed-preview",
-                     job_id=31, coordinator="oracle")
+                     job_id=31, coordinator="oracle", network=coordinator.evm_network)
 
   def reviewed_update(self):
     status = self.api.get_job_repair_preview(self.read)
@@ -352,12 +353,42 @@ class JobRepairHttpTests(unittest.TestCase):
     refusal = self.api.repair_update_pipeline(stale)
     self.assertEqual(refusal["status_code"], 409, refusal)
     self.assertEqual(refusal["error"]["code"], "REPLACEMENT_REVIEW_STALE")
+    self.assertEqual(refusal["non_admission"], {"request_id": stale["request_id"], "request_hash": stale["EE_HASH"]})
     self.replay.epoch = self.replay.job["lastExecutionEpoch"]  # The last execution epoch is already unpaid.
     preview = self.api.get_job_repair_preview(dict(self.read, replace_stateless=True))
     self.assertEqual(preview["status"], "blocked")
     self.assertIn("no paid execution epochs", preview["reason"])
     self.assertIn("no paid execution epochs", self.api.repair_update_pipeline(request)["error"]["message"])
     self.assertEqual(self.replay.c.commands, [])
+
+  def test_stateless_preview_declines_cross_network_and_ambiguous_component_ids(self):
+    self.replacement_request()
+    wrong = self.api.get_job_repair_preview(dict(self.read, replace_stateless=True, network="other"))
+    self.assertIn("name this network", wrong["reason"])
+    coordinator = self.replay.c
+    first, second = copy.deepcopy(self.replay.stored), copy.deepcopy(self.replay.stored)
+    lifecycle.worker(second)["INSTANCE_ID"] = "different-slot"
+    plan_cid = coordinator.r1fs.add_json({"configs": {"oldA": first, "oldB": second}})
+    self.replay.state.public["DEEPLOY_DEPLOYED_JOBS", "31"] = {
+      "pipeline_cid": self.replay.cid, "plan_cid": plan_cid,
+    }
+    preview = self.api.get_job_repair_preview(dict(self.read, replace_stateless=True))
+    self.assertEqual(preview["status"], "blocked")
+    self.assertIn("different component IDs", preview["reason"])
+    self.assertEqual(coordinator.commands, [])
+
+  def test_replacement_grant_denies_expired_job_and_observes_extension(self):
+    accepted = self.api.repair_update_pipeline(self.replacement_request())
+    self.assertEqual(accepted["status_code"], 202, accepted)
+    vault = self.replay.dauth
+    reference = accepted["operation_id"] + ":deploy"
+    self.replay.epoch = self.replay.job["lastExecutionEpoch"]
+    with self.assertRaisesRegex(ValueError, "no paid execution epochs"):
+      vault._load_revision_runner_secret_bundle("31", reference, "newA")
+    self.replay.job["lastExecutionEpoch"] += 2
+    bundle = vault._load_revision_runner_secret_bundle("31", reference, "newA")
+    self.assertEqual(bundle["revision"], reference)
+    self.assertNotIn("replacement_owner", bundle)
 
   def test_stateless_replacement_rechecks_target_license_after_acceptance(self):
     request = self.replacement_request()
@@ -395,6 +426,71 @@ class JobRepairHttpTests(unittest.TestCase):
     vault.bc.get_node_license_info = read
     coordinator._advance_deployment_operation(child)
     self.assertEqual(child["outcome"], "succeeded")
+
+  def test_failed_pipeline_upload_does_not_create_publication_intent(self):
+    coordinator = self.replay.c
+    accepted = self.api.repair_update_pipeline(self.replacement_request())
+    self.assertEqual(accepted["status_code"], 202, accepted)
+    child = coordinator._operation_records()[accepted["operation_id"]]
+    coordinator._advance_deployment_operation(child)
+    report(self.replay.state, child, "deploy", "ready")
+    coordinator._advance_deployment_operation(child)
+    self.assertEqual(deployment_operation_phase(child), "finalizing")
+    with patch.object(coordinator, "_save_pipeline_to_r1fs", return_value=None):
+      with self.assertRaisesRegex(RuntimeError, "metadata persistence"):
+        coordinator._advance_deployment_operation(child)
+    child = coordinator._operation_records()[accepted["operation_id"]]
+    self.assertNotIn("replacement_publication_started", child)
+    self.replay.epoch = self.replay.job["lastExecutionEpoch"]
+    coordinator._advance_deployment_operation(child)
+    self.assertEqual(deployment_operation_phase(child), "stopping_failed_rollout")
+    self.assertEqual(coordinator._get_pipeline_from_cstore(31), self.replay.cid)
+
+  def test_replacement_resumes_exact_partial_custody_write_after_expiry(self):
+    coordinator, state = self.replay.c, self.replay.state
+    accepted = self.api.repair_update_pipeline(self.replacement_request())
+    self.assertEqual(accepted["status_code"], 202, accepted)
+    child = coordinator._operation_records()[accepted["operation_id"]]
+    coordinator._advance_deployment_operation(child)
+    report(state, child, "deploy", "ready")
+    coordinator._advance_deployment_operation(child)
+    state.fail_write = lambda hkey, key: "before" if hkey == "DEEPLOY_DEPLOYED_JOBS" else None
+    with self.assertRaises(RuntimeError):
+      coordinator._advance_deployment_operation(child)
+    child = coordinator._operation_records()[accepted["operation_id"]]
+    intent = child["replacement_publication"]["pipeline_cid"]
+    self.assertEqual(coordinator._get_pipeline_from_cstore(31), self.replay.cid)
+    self.assertEqual(state.secrets["DAUTH_JOB_SECRETS", "31"]["pipeline_cid"], intent)
+    self.replay.epoch = self.replay.job["lastExecutionEpoch"]
+    state.fail_write = None
+    coordinator._advance_deployment_operation(child)
+    self.assertEqual(child["outcome"], "succeeded")
+    self.assertEqual(coordinator._get_pipeline_from_cstore(31), intent)
+    self.assertTrue(all(cfg["DEEPLOY_OPERATION"]["action"] != "stop" for _, cfg in coordinator.commands))
+
+  def test_unconfirmed_custody_send_cannot_start_publication_after_expiry(self):
+    coordinator, state = self.replay.c, self.replay.state
+    accepted = self.api.repair_update_pipeline(self.replacement_request())
+    self.assertEqual(accepted["status_code"], 202, accepted)
+    child = coordinator._operation_records()[accepted["operation_id"]]
+    coordinator._advance_deployment_operation(child)
+    report(state, child, "deploy", "ready")
+    coordinator._advance_deployment_operation(child)
+    with patch.object(coordinator, "_deployment_secret_request", side_effect=RuntimeError("fixture lost call")):
+      with self.assertRaisesRegex(RuntimeError, "lost call"):
+        coordinator._advance_deployment_operation(child)
+    child = coordinator._operation_records()[accepted["operation_id"]]
+    intent = child["replacement_publication"]["pipeline_cid"]
+    self.replay.epoch = self.replay.job["lastExecutionEpoch"]
+    with self.assertRaisesRegex(RuntimeError, "verify replacement publication"):
+      coordinator._advance_deployment_operation(child)
+    self.assertEqual((deployment_operation_phase(child), child["recovery"]), ("finalizing", "blocked"))
+    self.assertNotIn(("DAUTH_JOB_SECRETS", "31"), state.secrets)
+    self.assertEqual(coordinator._get_pipeline_from_cstore(31), self.replay.cid)
+    self.replay.job["lastExecutionEpoch"] += 2
+    coordinator._advance_deployment_operation(child)
+    self.assertEqual(child["outcome"], "succeeded")
+    self.assertEqual(coordinator._get_pipeline_from_cstore(31), intent)
 
   def test_stateless_replacement_cleans_up_only_durably_dispatched_targets(self):
     request = self.replacement_request()

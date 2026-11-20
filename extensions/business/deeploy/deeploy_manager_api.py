@@ -1215,8 +1215,19 @@ class DeeployManagerApiPlugin(
         is_create=is_create, **({"repair": repair, "mutation": SAME_HOST_REPAIR} if repair_update else {}),
       )
     except StaleReplacementReviewError as exc:
+      # A concurrent reservation takes precedence over a stale proposal. Unavailable records cannot prove nonadmission.
+      try:
+        existing_operation = self._find_request_operation(
+          request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], "update",
+          repair_parent=(proposal.get("parent") or {}).get("operation_id"),
+        )
+        if existing_operation:
+          return self._accepted_operation_response(existing_operation)
+      except Exception:
+        return self._deployment_admission_error(RuntimeError("Replacement acceptance could not be verified."))
       result = {"status_code": 409, "status": "error",
-                "error": {"code": "REPLACEMENT_REVIEW_STALE", "message": str(exc), "retryable": False}}
+                "error": {"code": "REPLACEMENT_REVIEW_STALE", "message": str(exc), "retryable": False},
+                "non_admission": {"request_id": request["request_id"], "request_hash": request["EE_HASH"]}}
     except DeploymentConflictError as exc:
       result = {"status_code": 409, "status": "error",
                 "error": {"code": "DEPLOYMENT_CONFLICT", "message": str(exc), "retryable": False}}
@@ -1466,7 +1477,8 @@ class DeeployManagerApiPlugin(
     Parameters
     ----------
     request : dict
-      Versioned wallet envelope binding a fresh nonce, job ID and original coordinator.
+      Versioned wallet envelope binding a fresh nonce and job ID. A same-host
+      preview binds the original coordinator. A replacement preview binds the network.
 
     Returns
     -------
@@ -1485,6 +1497,8 @@ class DeeployManagerApiPlugin(
       if not re.fullmatch(r"0x[0-9a-fA-F]{1,16}", nonce):
         raise ValueError("The repair preview nonce must be a hexadecimal timestamp.")
       replacing = request.get("replace_stateless") is True
+      if replacing and request.get("network") != self.evm_network:
+        raise ValueError("The signed replacement preview must name this network.")
       if (not request.get("EE_HASH") or type(job_id) is not int or job_id <= 0
           or (not replacing and (not isinstance(coordinator, str) or not coordinator))):
         raise ValueError("The repair preview requires a signed job ID and coordinator.")

@@ -25,7 +25,7 @@ from .dauth_registry import (
   dauth_registry_write_kwargs,
 )
 from ratio1.const.base import dAuth
-from extensions.business.deeploy.deployment_operations import replacement_license_binding
+from extensions.business.deeploy.deployment_operations import replacement_license_binding, replacement_paid_slots
 
 
 DAUTH_JOB_SECRETS_CSTORE_HKEY = "DAUTH_JOB_SECRETS"
@@ -873,11 +873,16 @@ class _DauthMixin(object):
         raise ValueError("The recipient no longer owns the reviewed repair license.")
       self._check_repair_paid_job(job_id, grant["owner"], grant["slots"])
     if replacing:
-      binding = (secret_bundle.get("replacement_licenses") or {}).get(recipient)
+      licenses = secret_bundle.get("replacement_licenses") or {}
+      binding = licenses.get(recipient)
       if not binding or replacement_license_binding(self.bc, recipient) != binding:
         raise ValueError("The recipient no longer owns the reviewed replacement license.")
+      # Use the current paid end date so an extension preserves access to this exact revision.
+      owner = secret_bundle.get("replacement_owner")
+      if not isinstance(owner, str) or not owner or replacement_paid_slots(self, job_id, owner) != len(licenses):
+        raise ValueError("The reviewed replacement no longer has its paid placement.")
     return {key: value for key, value in secret_bundle.items()
-            if key not in (placements, "repair_grant", "repair_plan_cid", "replacement_licenses")}
+            if key not in (placements, "repair_grant", "repair_plan_cid", "replacement_licenses", "replacement_owner")}
 
   def process_dauth_reveal_secret_request(self, body):
     requester, requester_eth = self._verify_signed_dauth_body(body, endpoint="reveal_job_secrets")

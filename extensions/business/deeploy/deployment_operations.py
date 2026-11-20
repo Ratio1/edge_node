@@ -1513,6 +1513,7 @@ class _DeploymentOperationsMixin:
     configs = plan["configs"]
     reports = self._node_operation_reports(operation, "deploy")
     phase = deployment_operation_phase(operation)
+    resume_replacement = False
     if phase == "accepted":
       next_phase = "retiring_previous" if operation["kind"] == "update" and not replacing else "waiting_for_readiness"
       message = "Starting replacement targets without previous stop confirmation." if replacing else "Preparing target nodes."
@@ -1562,7 +1563,8 @@ class _DeploymentOperationsMixin:
           pointer = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(operation["job_id"]))
           if not isinstance(pointer, dict) or pointer.get("operation_id") != operation["operation_id"]:
             if replacing and operation.get("replacement_publication_started"):
-              raise DeploymentCustodyError("Waiting to verify replacement publication or worker readiness.")
+              resume_replacement = True  # Only dAuth may finish a publication once readiness is lost.
+              break
             phase = "restoring_previous" if restoring else "waiting_for_readiness"
             self._save_operation(operation, phase, "Rechecking node evidence before revision publication.")
           break
@@ -1633,7 +1635,7 @@ class _DeploymentOperationsMixin:
         self._recheck_repair_placement(operation, finalizing=True)  # A placement can change after readiness.
       if replacing:
         pointer = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(operation["job_id"]))
-        if not isinstance(pointer, dict) or pointer.get("operation_id") != operation["operation_id"]:
+        if not resume_replacement and (not isinstance(pointer, dict) or pointer.get("operation_id") != operation["operation_id"]):
           try:
             check_replacement_placement(self, operation)
           except ReplacementPlacementError as exc:
@@ -1644,14 +1646,26 @@ class _DeploymentOperationsMixin:
             operation.update(error=dict(code="REPLACEMENT_PLACEMENT_CHANGED", message=str(exc), retryable=True),
                              recovery="blocked")
             self._save_operation(operation)
-            raise DeploymentCustodyError("Replacement publication is waiting for verified placement.") from exc
-        if (operation.get("error") or {}).get("code") == "REPLACEMENT_PLACEMENT_CHANGED":
-          operation.update(error=None, recovery=None)  # A revalidated placement may resume publication.
+            resume_replacement = True
+        if resume_replacement:
+          result = self.commit_deployment_revision(operation, next(iter(active_configs.values())), resume_only=True)
+          if (result.get("publication_committed") is not True
+              or result.get("pipeline_cid") != operation["replacement_publication"]["pipeline_cid"]):
+            message = "Waiting to verify replacement publication or worker readiness."
+            if not operation.get("error"):
+              operation.update(error=dict(code="REPLACEMENT_PUBLICATION_UNCONFIRMED", message=message, retryable=True),
+                               recovery="blocked")
+              self._save_operation(operation)
+            raise DeploymentCustodyError(message)
+        else:
+          self._commit_operation_revision(operation, active_configs)
+        if (operation.get("error") or {}).get("code") in (
+          "REPLACEMENT_PLACEMENT_CHANGED", "REPLACEMENT_PUBLICATION_UNCONFIRMED",
+        ):
+          operation.update(error=None, recovery=None)  # The custodian confirmed the exact publication.
           self._save_operation(operation)
-        if not operation.get("replacement_publication_started"):
-          operation["replacement_publication_started"] = True  # Persist before a possibly partial custody write.
-          self._save_operation(operation)
-      self._commit_operation_revision(operation, active_configs)
+      else:
+        self._commit_operation_revision(operation, active_configs)
       self._release_unused_secret_revisions(operation, plan, active_attempt="restore" if restored else "deploy")
       applied_outcome = "waiting_for_source" if operation.get("waiting_for_source") else "succeeded"
       operation.update(outcome="failed" if restored else applied_outcome,

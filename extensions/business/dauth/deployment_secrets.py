@@ -125,6 +125,8 @@ class _DauthDeploymentSecretsMixin:
       "revoke": {"preparing", "cleaning_up_preparation", "stopping_failed_rollout", "finalizing", "finalizing_recovery", "retiring_previous"},
       "delete": {"retiring_previous"},
     }
+    if operation.get("mutation") == STATELESS_REPLACEMENT:
+      phases["status"].add("finalizing")  # Reconcile the exact published attempt if the original reply was lost.
     if action not in phases or phase not in phases[action]:
       raise ValueError("Secret action does not match the deployment phase.")
     if (operation.get("kind") == "delete") != (action == "delete" or (action == "revoke" and phase == "retiring_previous")):
@@ -439,6 +441,7 @@ class _DauthDeploymentSecretsMixin:
         # Earlier dAuth versions require the ordinary "pipelines" field and cannot grant this revision.
         record["replacement_pipelines"] = record.pop("pipelines")
         record["replacement_licenses"] = operation["replacement_licenses"]
+        record["replacement_owner"] = operation["owner"]
       records.append((reference, record))
     if is_repair:
       # An unapproved token change must never commit a restore plan that still uses a revoked connector.
@@ -480,7 +483,8 @@ class _DauthDeploymentSecretsMixin:
       placements = "repair_pipelines" if operation.get("mutation") == "same_host_repair_v1" else "pipelines"
       if operation.get("mutation") == STATELESS_REPLACEMENT:
         placements = "replacement_pipelines"
-        if record is None or record.get("replacement_licenses") != operation.get("replacement_licenses"):
+        if (record is None or record.get("replacement_licenses") != operation.get("replacement_licenses")
+            or record.get("replacement_owner") != operation["owner"]):
           return False  # Recovery must not treat an ordinary grant as a scoped replacement grant.
       if (record is None or record.get(placements) != configs or
           (operation.get("mutation") == "same_host_repair_v1" and (
@@ -493,7 +497,7 @@ class _DauthDeploymentSecretsMixin:
         raise RuntimeError("Deployment secret replication is pending.")
     return True
 
-  def _publish_deployment_secrets(self, job_id, operation, plan, pointer, deleted=False):
+  def _publish_deployment_secrets(self, job_id, operation, plan, pointer, deleted=False, resume_only=False):
     """
     Bind custodied secrets to a verified coordinator-signed final pointer.
 
@@ -526,11 +530,15 @@ class _DauthDeploymentSecretsMixin:
       True for a delete: the pointer must carry ``pipeline_cid`` None, the job's
       previous secret revision is revoked and an empty bundle is published in place
       of the prepared one. Default False.
+    resume_only : bool, optional
+      A replacement may finish only if an exact signed custody write or pointer
+      proves that publication already started.
 
     Returns
     -------
-    None
-      The bundle and the pointer are written to the chain store.
+    bool
+      True after publication. False when a resume-only call finds no proof of
+      an earlier write. A missing replica does not prove publication failed.
 
     Raises
     ------
@@ -562,6 +570,8 @@ class _DauthDeploymentSecretsMixin:
     current = self.chainstore_hget(hkey=POINTERS, key=job_id)
     current_fields = {key: value for key, value in current.items() if key not in AUTH_FIELDS} if isinstance(current, dict) else current
     replacing = operation.get("mutation") == STATELESS_REPLACEMENT
+    if replacing and pointer != operation.get("replacement_publication"):
+      raise ValueError("The replacement pointer must match the persisted publication intent.")
     already_published = current_fields == expected
     if replacing and already_published:
       # An unauthenticated replica cannot waive the exact placement check for a new publication.
@@ -572,9 +582,22 @@ class _DauthDeploymentSecretsMixin:
       or self._load_dauth_pipeline_cid(job_id) != operation.get("previous_pipeline_cid")
     ):
       raise ValueError("Deployment publication has been superseded.")
-    if replacing and not already_published:
-      # Recheck at the authoritative publication boundary, after the coordinator's last check.
-      check_replacement_placement(self, operation)
+    started = already_published
+    if replacing and not started:
+      # dAuth writes the signed current bundle before the public pointer. Either exact write can prove continuation.
+      previous_write = self._load_dauth_job_secret_bundle(job_id)
+      if isinstance(previous_write, dict) and all(
+        previous_write.get(key) == value for key, value in (
+          ("job_id", job_id), ("operation_id", operation["operation_id"]), ("coordinator", operation["coordinator"]),
+          ("deployment_revision", operation["target_revision"]), ("pipeline_cid", pointer["pipeline_cid"]), ("deleted", False),
+        )
+      ):
+        signature = self.bc.verify(previous_write, return_full_info=True, log_hash_sign_fails=False)
+        started = signature.valid and self.bc.is_dauth_oracle(
+          node_address_eth=self.bc.node_address_to_eth_address(signature.sender),
+        )
+    if resume_only and not started:
+      return False
     if deleted:
       self._revoke_deployment_secret_revisions(job_id, operation, plan, None)
       bundle = dict(job_id=job_id, job_secrets={})
@@ -595,17 +618,21 @@ class _DauthDeploymentSecretsMixin:
       placements = "repair_pipelines" if operation.get("mutation") == "same_host_repair_v1" else "pipelines"
       if replacing:
         placements = "replacement_pipelines"
-        if record is None or record.get("replacement_licenses") != operation["replacement_licenses"]:
+        if (record is None or record.get("replacement_licenses") != operation["replacement_licenses"]
+            or record.get("replacement_owner") != operation["owner"]):
           raise ValueError("Replacement publication requires the reviewed credential grant.")
       if (record is None or record.get(placements) != configs or
           (operation.get("mutation") == "same_host_repair_v1" and record.get("repair_plan_cid") != operation["plan_cid"])):
         raise RuntimeError("Active deployment secrets are unavailable.")
       bundle = {key: copy.deepcopy(value) for key, value in record.items()
-                if key not in (placements, "repair_plan_cid", "repair_grant", "replacement_licenses")}
+                if key not in (placements, "repair_plan_cid", "repair_grant", "replacement_licenses", "replacement_owner")}
     bundle.update(job_id=job_id, deployment_revision=operation["target_revision"],
                   operation_id=operation["operation_id"], coordinator=operation["coordinator"],
                   deleted=deleted, pipeline_cid=pointer["pipeline_cid"])
     self.bc.sign(bundle, add_data=True, use_digest=True)
+    if replacing and not started:
+      # Recheck after loading R1FS and immediately before the first write to custody.
+      check_replacement_placement(self, operation)
     if not self._write_dauth_job_secret_bundle(job_id, bundle):
       raise RuntimeError("Deployment secret publication is pending.")
     if not self._write_job_pipeline_cid(job_id, pointer):
@@ -613,6 +640,7 @@ class _DauthDeploymentSecretsMixin:
     previous_cid = operation.get("previous_pipeline_cid")
     if previous_cid and previous_cid != pointer["pipeline_cid"]:
       self._delete_pipeline_cid_from_r1fs(previous_cid)
+    return True
 
   def _revoke_deployment_secret_revisions(self, job_id, operation, plan, active_attempt):
     """
@@ -736,7 +764,14 @@ class _DauthDeploymentSecretsMixin:
       self._prepare_deployment_secret_revisions(job_id, operation, plan, body)
       result["prepared"] = True
     elif action == "status":
-      result["prepared"] = self._deployment_secrets_prepared(job_id, operation, plan)
+      if operation.get("mutation") == STATELESS_REPLACEMENT and operation["phase"] == "finalizing":
+        # Old custodians refuse status in this phase, so none can start a fresh publication on this request.
+        pointer = body.get("pointer")
+        result["prepared"] = self._publish_deployment_secrets(job_id, operation, plan, pointer, resume_only=True)
+        result["publication_committed"] = result["prepared"]
+        result["pipeline_cid"] = pointer["pipeline_cid"]
+      else:
+        result["prepared"] = self._deployment_secrets_prepared(job_id, operation, plan)
     elif action == "revoke":
       self._revoke_deployment_secret_revisions(job_id, operation, plan, body.get("active_attempt"))
     else:

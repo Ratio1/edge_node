@@ -135,13 +135,39 @@ class _DeeployJobMixin:
 
     return result
 
-  def commit_deployment_revision(self, operation, pipeline):
+  def commit_deployment_revision(self, operation, pipeline, resume_only=False):
     """Ask dAuth to publish an exact ready revision and its bound secrets.
 
-    The coordinator signs public metadata only. dAuth obtains the secret bundle
-    by its immutable plan reference; neither it nor restoration values are read
-    into coordinator memory. Repeating the same operation repairs partial writes.
+    Replacement persists the exact pointer after metadata upload and before
+    making the first custody call. A resume-only call can finish a prior write.
+
+    Parameters
+    ----------
+    operation : dict
+      Coordinator-owned finalization snapshot.
+    pipeline : dict
+      Representative redacted configuration from the deployment plan.
+    resume_only : bool
+      Let dAuth finish only a replacement publication it can prove started.
+
+    Returns
+    -------
+    dict
+      Authenticated result from the custodian.
+
+    Examples
+    --------
+    >>> plugin.commit_deployment_revision(operation, pipeline)  # doctest: +SKIP
     """
+    from .deployment_operations import STATELESS_REPLACEMENT
+
+    replacing = operation.get("mutation") == STATELESS_REPLACEMENT
+    pointer = operation.get("replacement_publication") if replacing else None
+    if pointer is not None:
+      # Reuse the signed CID even when the original reply or pointer replication was lost.
+      return self._deployment_secret_request("status" if resume_only else "commit", operation, pointer=pointer)
+    if resume_only:
+      raise RuntimeError("The exact replacement publication pointer is unavailable.")
     # The plan holds every node's exact config of this revision; later updates
     # rebuild from it, since configs can differ per node (scale-up instance IDs).
     expected = dict(job_id=str(operation["job_id"]), revision=operation["target_revision"],
@@ -158,7 +184,10 @@ class _DeeployJobMixin:
         raise RuntimeError("Deployment metadata persistence is pending.")
       pointer = dict(expected, pipeline_cid=cid)
       self.bc.sign(pointer, add_data=True, use_digest=True)
-    self._deployment_secret_request("commit", operation, pointer=pointer)
+    if replacing:
+      operation.update(replacement_publication=pointer, replacement_publication_started=True)
+      self._save_operation(operation)  # A failed R1FS upload never records a custody intent.
+    return self._deployment_secret_request("commit", operation, pointer=pointer)
 
   def _load_dauth_job_secret_bundle(self, job_id):
     return self.chainstore_hget(

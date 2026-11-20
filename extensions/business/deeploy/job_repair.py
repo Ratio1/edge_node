@@ -526,8 +526,10 @@ class _JobRepairMixin:
     if specs.get("service_kind"):
       raise ValueError("Managed services cannot use stateless replacement.")
     # Use the immutable plan for tracked jobs. Do not compare execution order against live observations.
-    for config in self._previous_deployment_configs(pipeline, reports={}).values():
-      stateless_worker_identities(config)
+    identities = stateless_worker_identities(pipeline)
+    if any(stateless_worker_identities(config) != identities
+           for config in self._previous_deployment_configs(pipeline, reports={}).values()):
+      raise ValueError("The saved workers have different component IDs. This replacement cannot match them to new targets.")
     pending = [op for op in self._operation_records(job_id=job_id).values()
                if str(op["job_id"]) == str(job_id) and op["phase"] != "completed"]
     parent = None
@@ -618,7 +620,8 @@ class _JobRepairMixin:
       raise StaleReplacementReviewError("The reviewed job or its operation changed. Review replacement again.")
     if len(configs) != proposal["paid_nodes"] or not request.get("target_nodes"):
       raise ValueError("Select exactly the number of targets paid for by the job.")
-    prior_configs = self._previous_deployment_configs(pipeline, reports={})
+    # Preview validated every paid slot against this exact published representative.
+    expected_ids = stateless_worker_identities(pipeline)
     licenses = {}
     license_ids = set()
     for node, config in configs.items():
@@ -628,9 +631,7 @@ class _JobRepairMixin:
         raise ValueError("Each replacement target needs a distinct active node license.")
       licenses[node] = license_binding
       license_ids.add(license_binding[0])
-      ids = stateless_worker_identities(config)
-      source = prior_configs.get(node, pipeline)
-      if config.get("NAME") != proposal["app_id"] or ids != stateless_worker_identities(source):
+      if config.get("NAME") != proposal["app_id"] or stateless_worker_identities(config) != expected_ids:
         raise ValueError("Replacement must preserve the job and its component instance IDs.")
     observed = self._stateless_replacement_observations(pipeline)
     return {"proposal": proposal, "prior": pipeline, "licenses": licenses,
