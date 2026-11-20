@@ -42,7 +42,10 @@ def _retry(Plugin, plugin, actor, case):
 def test_retry_submits_the_end_attestation_from_the_archive_without_rescanning():
   case, stub = _stub(worker_count=3)  # three workers assigned, two reported in the last pass
   Plugin, plugin, actor = _plugin(case, stub)
-  with patch("extensions.business.cybersec.red_mesh.services.event_hooks.emit_attestation_status_event") as soc:
+  def emit(owner, job_specs, **kwargs):
+    job_specs["soc_event_status"] = {"attestation": "delivered"}  # what the real hook records on the job
+  with patch("extensions.business.cybersec.red_mesh.services.event_hooks.emit_attestation_status_event",
+             side_effect=emit) as soc:
     result = _retry(Plugin, plugin, actor, case)
   assert result == {"success": True, "attestation_status": "submitted", "tx_hash": "0xretry"}
   args, kwargs = plugin._submit_redmesh_test_attestation.call_args
@@ -52,6 +55,7 @@ def test_retry_submits_the_end_attestation_from_the_archive_without_rescanning()
                                   "tx_hash": "0xretry"}
   claim, settle = (call.args[1] for call in plugin._write_job_record.call_args_list)
   assert claim["attestation_status"] == "submitting" and not claim.get("attestation_failure_reason")
+  assert settle["soc_event_status"] == {"attestation": "delivered"}  # emitted before the settle write, so persisted
   assert settle["attestation_status"] == "submitted" and settle["redmesh_test_attestation"] == {
     "tx_hash": "0xretry", "network": plugin.REDMESH_ATTESTATION_NETWORK}
   assert plugin._log_audit_event.call_args.args[1]["outcome"] == "submitted"
