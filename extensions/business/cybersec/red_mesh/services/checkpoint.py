@@ -5,11 +5,12 @@ resumes the pass instead of scanning it again. Every file goes through the frame
 `diskapi_*_pickle_*_data` helpers (`save_pickle` writes atomically). `save_pickle` swallows errors,
 so `save` confirms the file exists. Plain functions taking `owner`, like the other services.
 """
+import io
 import os
 import pickle
+import pickletools
 import re
 import time
-from collections import deque
 from math import isfinite
 
 from .config import resolve_config_block
@@ -58,14 +59,21 @@ _FINAL_FILE = re.compile(r"^final_(\d+)\.pkl$")
 _TMP_FILE = re.compile(r"^(?:\d+_[A-Za-z0-9_-]+|final_\d+)\.pkl\..+\.tmp$")
 TMP_MIN_AGE = 300  # seconds; a younger temp file may belong to a save in progress
 
-# Globals a worker state may legitimately pickle. A state of dicts, lists, tuples, str, int, float,
-# bool, None and bytes needs none: those use native opcodes. Callables such as `str`, `list` or
-# `dict` are not allowed: through REDUCE they can chain into memo-shared amplification.
-_ALLOWED_GLOBALS = frozenset(
-  [("builtins", "set"), ("builtins", "frozenset"), ("collections", "OrderedDict"), ("collections", "deque")]
-  + [("datetime", n) for n in ("datetime", "date", "time", "timedelta", "timezone")]
-)
+# Globals a worker state may legitimately pickle. A state of dicts, lists, tuples, sets, frozensets, str,
+# int, float, bool, None and bytes needs none: `save_pickle` writes `pickle.HIGHEST_PROTOCOL`, and from
+# protocol 4 those use native opcodes. An allowed global must not copy an argument container: called through
+# REDUCE on one memoised list, `set`, `list`, `deque` or `OrderedDict` copy it on every call, so a few KB of
+# file become GBs of memory.
+_ALLOWED_GLOBALS = frozenset(("datetime", n) for n in ("datetime", "date", "time", "timedelta", "timezone"))
 MAX_NODES = 1_000_000  # container and leaf nodes of one payload, shared references counted each time
+# Opcodes of one pass (all its files) or of one final marker, counted before anything is unpickled. A native
+# opcode allocates at most about 250 bytes (EMPTY_SET). Measured peak at the caps: +725 MB for an EMPTY_SET
+# spray, +224 MB for one 32 MiB str literal. A payload inside MAX_NODES needs at most about 2 opcodes per node;
+# a full-range scan state is about 0.6 per node.
+MAX_OPCODES = 3 * MAX_NODES
+# A protocol 4/5 pickler memoises with MEMOIZE only. An explicit PUT index sizes the unpickler's memo table
+# (about 12 bytes per slot), so a 9-byte file could ask for GBs.
+_REFUSED_OPCODES = frozenset(("PUT", "BINPUT", "LONG_BINPUT"))
 
 
 class _RestrictedUnpickler(pickle.Unpickler):
@@ -99,12 +107,12 @@ def _within_node_bound(obj):
   while stack:
     item = stack.pop()
     count += 1
-    if count > MAX_NODES:
+    if count + len(stack) > MAX_NODES:  # every stacked entry is a node still to count; a cycle must not grow it
       return False
     if isinstance(item, dict):
       stack.extend(item.keys())
       stack.extend(item.values())
-    elif isinstance(item, (list, tuple, set, frozenset, deque)):
+    elif isinstance(item, (list, tuple, set, frozenset)):
       stack.extend(item)
   return True
 
@@ -169,23 +177,46 @@ def save(owner, job_id, pass_nr, prefix, payload):
   return _write(owner, job_id, payload, pass_nr, prefix)
 
 
-def _read_file(path):
+def _count_opcodes(data):
+  """Opcodes in `data`, or None past `MAX_OPCODES` or on an opcode our pickler never writes. Raises on a
+  malformed stream."""
+  count = 0
+  for opcode, _arg, _pos in pickletools.genops(data):
+    count += 1
+    if count > MAX_OPCODES or opcode.name in _REFUSED_OPCODES:
+      return None
+  return count
+
+
+def _read_file(path, budget=None):
   """Unpickle one checkpoint file through the restricted unpickler. None when it is unreadable, refused,
-  oversized or over the node bound. Never follows a symlink."""
+  oversized, over the opcode or node bound, or over `budget`. Never follows a symlink.
+
+  `budget` is the remaining `{"bytes", "opcodes"}` of a pass, shared by its files; this file's share is taken
+  before it is unpickled. Without one the file gets the full `MAX_FILE_BYTES` / `MAX_OPCODES`."""
   try:
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, "rb") as fh:
-      if os.fstat(fh.fileno()).st_size > MAX_FILE_BYTES:
+      data = fh.read(MAX_FILE_BYTES + 1)
+    if len(data) > MAX_FILE_BYTES:
+      return None
+    opcodes = _count_opcodes(data)
+    if opcodes is None:
+      return None
+    if budget is not None:
+      if len(data) > budget["bytes"] or opcodes > budget["opcodes"]:
         return None
-      payload = _RestrictedUnpickler(fh).load()
-      return payload if _within_node_bound(payload) else None
+      budget["bytes"] -= len(data)
+      budget["opcodes"] -= opcodes
+    payload = _RestrictedUnpickler(io.BytesIO(data)).load()
+    return payload if _within_node_bound(payload) else None
   except Exception:
     return None
 
 
 def load_all(owner, job_id, pass_nr):
-  """Return `{prefix: payload}` for one pass. Unreadable, refused, oversized, over-bound or wrong-version files
-  are deleted. A symlinked job folder or file is skipped, never followed."""
+  """Return `{prefix: payload}` for one pass. Unreadable, refused, oversized, over-bound, over-budget or
+  wrong-version files are deleted. A symlinked job folder or file is skipped, never followed."""
   job_dir = _job_dir(owner, job_id)
   if job_dir is None:
     return {}
@@ -196,9 +227,10 @@ def load_all(owner, job_id, pass_nr):
   except (OSError, TypeError, ValueError):
     return {}
   result = {}
+  budget = {"bytes": MAX_FILE_BYTES, "opcodes": MAX_OPCODES}  # the whole pass, not each file
   for name in sorted(names):
     prefix = name[len(lead):-len(".pkl")]
-    payload = _read_file(os.path.join(job_dir, name))
+    payload = _read_file(os.path.join(job_dir, name), budget)
     if isinstance(payload, dict) and payload.get("version") == CHECKPOINT_VERSION:
       result[prefix] = payload
     else:
