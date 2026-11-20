@@ -1526,13 +1526,14 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     archive = plugin.r1fs.add_json.call_args.args[0]
     terminal_events = [event for event in archive["timeline"] if event["type"] in {"finalized", "failed", "canceled"}]
     self.assertEqual(len(terminal_events), 1)
-    self.assertEqual(terminal_events[0]["type"], "failed")
+    # RM-221: the test finished; only its end attestation is failed.
+    self.assertEqual(terminal_events[0]["type"], "finalized")
     self.assertEqual(terminal_events[0]["meta"]["overall_status"], "complete")
-    self.assertEqual(terminal_events[0]["meta"]["error_class"], "finalization_failed")
     stub = plugin._write_job_record.call_args.args[1]
-    self.assertEqual(stub["job_status"], "FAILED")
-    self.assertEqual(stub["failure_class"], "attestation_failed")
-    self.assertEqual(job_specs["failure_class"], "attestation_failed")
+    self.assertEqual(stub["job_status"], "FINALIZED")
+    self.assertEqual(stub["attestation_status"], "failed")
+    self.assertIn("attestation_failure_reason", stub)
+    self.assertEqual(stub["failure_class"], "")
 
   def test_model_test_finalization_end_attestation_exception_marks_failed(self):
     mock_plugin_modules()
@@ -1590,10 +1591,11 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
 
     self.assertTrue(result)
     archive = plugin.r1fs.add_json.call_args.args[0]
-    self.assertEqual(archive["timeline"][-1]["type"], "failed")
+    self.assertEqual(archive["timeline"][-1]["type"], "finalized")
     stub = plugin._write_job_record.call_args.args[1]
-    self.assertEqual(stub["job_status"], "FAILED")
-    self.assertEqual(job_specs["failure_class"], "attestation_failed")
+    self.assertEqual(stub["job_status"], "FINALIZED")
+    self.assertEqual(stub["attestation_status"], "failed")
+    self.assertEqual(stub["attestation_failure_reason"], "submit_failed")
 
   def test_model_test_finalization_stores_successful_end_attestation(self):
     mock_plugin_modules()

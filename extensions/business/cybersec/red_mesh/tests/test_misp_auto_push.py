@@ -405,9 +405,16 @@ class TestFinalizationLoop:
     enqueue.assert_called_once_with(plugin, job_specs, job_pass)
     assert job_specs["pass_reports"][-1]["pass_nr"] == job_pass
 
-  def test_attestation_failure_is_not_pushed(self):
-    plugin, job_specs, enqueue = self._finalize(job={"blockchain_attestation_enabled": True})
-    assert job_specs["failure_class"] == "attestation_failed"
+  @pytest.mark.parametrize("run_mode,job_pass,job_status,terminal", (
+    ("SINGLEPASS", 1, "RUNNING", "FINALIZED"),
+    ("CONTINUOUS_MONITORING", 2, "SCHEDULED_FOR_STOP", "STOPPED"),
+  ))
+  def test_attestation_failure_is_not_pushed(self, run_mode, job_pass, job_status, terminal):
+    plugin, job_specs, enqueue = self._finalize(
+      run_mode, job_pass, job_status, job={"blockchain_attestation_enabled": True})
+    # RM-221: a finished scan keeps its normal terminal status; only the attestation is failed.
+    assert (job_specs["job_status"], job_specs["attestation_status"]) == (terminal, "failed")
+    assert not job_specs.get("failure_class")
     enqueue.assert_not_called()
 
   def test_an_aborted_first_pass_is_not_pushed(self):
