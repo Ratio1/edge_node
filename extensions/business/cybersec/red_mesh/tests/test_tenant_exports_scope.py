@@ -58,7 +58,7 @@ def assert_denied(result, status, error):
 
 
 def set_membership(fixture, role, tenant_id):
-  fixture.store.data[("auth", "reader")]["memberships"] = [
+  fixture.store.data[("deployment:auth", "reader")]["memberships"] = [
     {"role": role, "tenant_id": tenant_id}]
 
 

@@ -13,6 +13,7 @@ from .contract_fixture import LEGAL, contract_terms, install_contract, legal_dto
 
 class FakeAdministrationStore:
   def __init__(self):
+    self._stream_id = "deployment"  # the owner the account reader derives its hash from
     self.data = {}
     self.writes = []
     self.fail_write = None
@@ -33,11 +34,11 @@ class FakeAdministrationStore:
     a membership edit: a new generation is a new incarnation, which is its own test (`account_changed`).
     """
     at = "2026-01-01T00:00:00.000Z"
-    existing = self.data.get(("auth", name))
+    existing = self.data.get(("deployment:auth", name))
     if generation is None:
       generation = existing["generation"] if isinstance(existing, dict) and "generation" in existing else str(uuid4())
     resolved_state = state if state is not None else ("active" if active else "deleting")
-    self.data[("auth", name)] = {
+    self.data[("deployment:auth", name)] = {
       "schemaVersion": 1,
       "accountId": name,
       "state": resolved_state,
@@ -51,11 +52,11 @@ class FakeAdministrationStore:
       "passwordChangedAt": at,
     }
     if resolved_state != "active":
-      self.data[("auth", name)].update(stateChangedAt=at, stateChangedBy="creator")
+      self.data[("deployment:auth", name)].update(stateChangedAt=at, stateChangedBy="creator")
 
   def grant(self, name, tenant_id, role="tenant_admin"):
     # Idempotent, as the Navigator's writer is: a v1 record refuses a duplicate row outright.
-    rows = self.data[("auth", name)]["memberships"]
+    rows = self.data[("deployment:auth", name)]["memberships"]
     row = {"role": role, "tenant_id": tenant_id}
     if row not in rows:
       rows.append(row)
@@ -82,9 +83,6 @@ class FakeAdministrationStore:
 
 class TestTenantAdministration(unittest.TestCase):
   def setUp(self):
-    self.env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    self.env.start()
-    self.addCleanup(self.env.stop)
     self.store = FakeAdministrationStore()
     self.repo = CstoreTenantAdministrationStore(self.store, "test-deployment")
     self.service = TenantAdministrationService(CstoreAuthAccountReader(self.store), self.repo)
@@ -282,7 +280,7 @@ class TestTenantAdministration(unittest.TestCase):
     self.assertEqual(self.prepare()["data"]["state"], "active")
     self.assertTrue(self.service.activate_tenant(self.actor, self.request)["data"]["allowPentester"])
     self.assertEqual(len(self.store.writes), before)
-    self.assertEqual(self.store.data[("auth", "initial")]["memberships"], [])
+    self.assertEqual(self.store.data[("deployment:auth", "initial")]["memberships"], [])
 
   def test_pending_retry_rechecks_admin_incarnation_and_creator_authority(self):
     self.prepare()
@@ -403,7 +401,7 @@ class TestTenantAdministration(unittest.TestCase):
     self.assertEqual(self.service.authorize_tenant_membership(reader, tenant_id, "reader", "tenant_admin")["status_code"], 403)
     approval = self.service.authorize_tenant_membership({"account_id": "initial"}, tenant_id, "reader", "tenant_admin")["data"]
     self.assertEqual(approval, {"accountId": "reader", "tenantId": tenant_id, "role": "tenant_admin", "remove": False,
-                                "accountGeneration": self.store.data[("auth", "reader")]["generation"]})
+                                "accountGeneration": self.store.data[("deployment:auth", "reader")]["generation"]})
 
   def test_domain_lookup_requires_creator_and_sees_pending_reservation(self):
     self.assertEqual(self.service.check_tenant_domain(self.actor, "example")["data"], {"available": True})
@@ -428,7 +426,7 @@ class TestTenantAdministration(unittest.TestCase):
     prepared = self.prepare()["data"]
     for state in (None, "deleting"):
       if state is None:
-        del self.store.data[("auth", "initial")]
+        del self.store.data[("deployment:auth", "initial")]
       else:
         self.store.account("initial", active=False)
         self.store.grant("initial", prepared["tenantId"])
@@ -669,7 +667,7 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
 
     store = FakeAdministrationStore()
     plugin = object.__new__(self.Plugin)
-    plugin.cfg_tenancy_namespace = "deployment"
+    plugin._stream_id = "deployment"
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
       setattr(plugin, name, getattr(store, name))
     # The core's FastAPI template copies these real signature fields into a Pydantic model.
@@ -678,21 +676,20 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
     RequestModel = create_model("AllowPentesterRequest", **fields)
     actor = {"account_id": "creator"}
     request_id = str(uuid4())
-    with patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"}):
-      tenant_id = plugin.prepare_tenant(actor, request_id, "Tenant", "tenant", "initial", **install_contract(plugin))["data"]["tenantId"]
-      store.grant("initial", tenant_id)
-      plugin.activate_tenant(actor, request_id)
-      for value in (True, False, 0, 1, "true", "false", None, [], {}):
-        with self.subTest(value=value):
-          payload = RequestModel.model_validate_json(json.dumps({
-            "actor": actor, "tenant_id": tenant_id, "allow_pentester": value}))
-          before = len(store.writes)
-          result = plugin.update_tenant_allow_pentester(**payload.model_dump())
-          self.assertEqual(result["status_code"], 200 if type(value) is bool else 400)
-          if type(value) is not bool:
-            self.assertEqual(len(store.writes), before)
-      missing = RequestModel.model_validate_json(json.dumps({"actor": actor, "tenant_id": tenant_id}))
-      self.assertEqual(plugin.update_tenant_allow_pentester(**missing.model_dump())["status_code"], 400)
+    tenant_id = plugin.prepare_tenant(actor, request_id, "Tenant", "tenant", "initial", **install_contract(plugin))["data"]["tenantId"]
+    store.grant("initial", tenant_id)
+    plugin.activate_tenant(actor, request_id)
+    for value in (True, False, 0, 1, "true", "false", None, [], {}):
+      with self.subTest(value=value):
+        payload = RequestModel.model_validate_json(json.dumps({
+          "actor": actor, "tenant_id": tenant_id, "allow_pentester": value}))
+        before = len(store.writes)
+        result = plugin.update_tenant_allow_pentester(**payload.model_dump())
+        self.assertEqual(result["status_code"], 200 if type(value) is bool else 400)
+        if type(value) is not bool:
+          self.assertEqual(len(store.writes), before)
+    missing = RequestModel.model_validate_json(json.dumps({"actor": actor, "tenant_id": tenant_id}))
+    self.assertEqual(plugin.update_tenant_allow_pentester(**missing.model_dump())["status_code"], 400)
 
   def test_missing_namespace_denies_every_administration_method_before_store_access(self):
     from unittest.mock import MagicMock
@@ -708,7 +705,7 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
       for name in methods:
         with self.subTest(namespace=namespace, method=name):
           plugin = object.__new__(self.Plugin)
-          plugin.cfg_tenancy_namespace = namespace
+          plugin._stream_id = namespace
           plugin.chainstore_hget = MagicMock(side_effect=AssertionError("No storage access"))
           plugin.chainstore_hset = MagicMock(side_effect=AssertionError("No storage write"))
           result = getattr(plugin, name)(actor={"account_id": "creator"})
@@ -720,43 +717,25 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
   def test_enabled_real_plugin_creation_and_read_use_server_configuration(self):
     store = FakeAdministrationStore()
     plugin = object.__new__(self.Plugin)
-    plugin.cfg_tenancy_namespace = "deployment"
+    plugin._stream_id = "deployment"
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
       setattr(plugin, name, getattr(store, name))
     actor = {"account_id": "creator", "namespace": "browser-ignored"}
     request = str(uuid4())
-    with patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"}):
-      prepared = plugin.prepare_tenant(actor, request, "Tenant", "tenant", "initial", **install_contract(plugin))
-      self.assertTrue(prepared["success"], prepared)
-      tenant_id = prepared["data"]["tenantId"]
-      store.grant("initial", tenant_id)
-      self.assertTrue(plugin.activate_tenant(actor, request)["success"])
-      self.assertEqual(plugin.list_tenants(actor)["data"][0]["tenantId"], tenant_id)
-      self.assertEqual(plugin.get_tenant(actor, tenant_id)["data"]["tenantId"], tenant_id)
-      self.assertEqual(plugin.get_tenant_members(actor, tenant_id)["data"][0]["accountId"], "initial")
-      self.assertFalse(plugin.check_tenant_domain(actor, "tenant")["data"]["available"])
-      self.assertEqual(plugin.authorize_tenant_membership(actor, tenant_id, "initial", "tenant_admin")["data"]["accountId"], "initial")
-      state = plugin.authorize_account_state_change(actor, "initial", "deactivated", tenant_id)
-      self.assertEqual((state["status_code"], state["error"]), (409, "last_tenant_admin"))
+    prepared = plugin.prepare_tenant(actor, request, "Tenant", "tenant", "initial", **install_contract(plugin))
+    self.assertTrue(prepared["success"], prepared)
+    tenant_id = prepared["data"]["tenantId"]
+    store.grant("initial", tenant_id)
+    self.assertTrue(plugin.activate_tenant(actor, request)["success"])
+    self.assertEqual(plugin.list_tenants(actor)["data"][0]["tenantId"], tenant_id)
+    self.assertEqual(plugin.get_tenant(actor, tenant_id)["data"]["tenantId"], tenant_id)
+    self.assertEqual(plugin.get_tenant_members(actor, tenant_id)["data"][0]["accountId"], "initial")
+    self.assertFalse(plugin.check_tenant_domain(actor, "tenant")["data"]["available"])
+    self.assertEqual(plugin.authorize_tenant_membership(actor, tenant_id, "initial", "tenant_admin")["data"]["accountId"], "initial")
+    state = plugin.authorize_account_state_change(actor, "initial", "deactivated", tenant_id)
+    self.assertEqual((state["status_code"], state["error"]), (409, "last_tenant_admin"))
     self.assertTrue(all(json.loads(hkey)[3] == "deployment" for hkey, _ in store.writes))
 
-
-def test_auth_hkey_is_read_from_the_plugin_instance_env_before_the_process_env(monkeypatch):
-  """RM-026 MVP: the hkey is a pipeline-level value, so the plugin reads its own instance ENV first
-  and falls back to os.environ. Note what this does NOT claim: deeploy's injector
-  (deeploy_mixin._ensure_runner_cstore_auth_env) targets CONTAINERIZED_APPS_SIGNATURES only, so a
-  deeploy-launched PENTESTER_API_01 gets no hkey unless its instance config carries
-  ENV.R1EN_CSTORE_AUTH_HKEY or the host env sets it. Instance ENV wins over the host env."""
-  from types import SimpleNamespace
-  from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity import (
-    AUTH_HKEY_ENV, CstoreAuthAccountReader)
-  monkeypatch.delenv(AUTH_HKEY_ENV, raising=False)
-  owner = SimpleNamespace(cfg_env={AUTH_HKEY_ENV: " pipeline-hkey "}, chainstore_hget=lambda **k: None)
-  assert CstoreAuthAccountReader(owner)._hkey() == "pipeline-hkey"
-  monkeypatch.setenv(AUTH_HKEY_ENV, "process-hkey")
-  assert CstoreAuthAccountReader(owner)._hkey() == "pipeline-hkey"
-  owner.cfg_env = None
-  assert CstoreAuthAccountReader(owner)._hkey() == "process-hkey"
 
 class TestTenantRootAdministrator(TestTenantAdministration):
   """RM-026 MVP: the founder is recorded so a tenant admin cannot reset the founder's credential and

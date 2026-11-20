@@ -17,6 +17,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 
 from ..references.framework_packs import controls_for_level
+from ..tenancy import tenancy_namespace
 from ..tenancy.compliance import JOB_REF as _JOB_REF
 from .evidence_engine import actionable_findings, classify
 from .framework_evidence_mapping import CONTROL_SIGNALS, CANDIDATE_SUMMARIES, candidate_presentation, resolve
@@ -92,7 +93,7 @@ def suggest(owner, tenant_id, pack_id, pack, level, assessment_revision, jobs, *
   selected = _finalized(jobs)[:MAX_JOBS]
   # Read before the cache lookup and keyed on, so a triage change shows at once, not after the TTL.
   triage = {job_id: _host_triage(owner, record) for job_id, record in selected}
-  key = (getattr(owner, "cfg_tenancy_namespace", None), tenant_id, pack_id,
+  key = (tenancy_namespace(owner), tenant_id, pack_id,
          _digest(level, assessment_revision, selected, triage))
   with _cache_lock:
     hit = _cache.get(key)

@@ -41,7 +41,7 @@ FAULTS = (
 
 def admit(fixture, role="super_tenant_admin"):
   """Give the reader a membership that holds evidence:read, and return the call's tenant."""
-  fixture.store.data[("auth", "reader")]["memberships"] = [
+  fixture.store.data[("deployment:auth", "reader")]["memberships"] = [
     {"role": role, "tenant_id": None}]
   return fixture.tenant_id
 
@@ -53,19 +53,19 @@ def apply_fault(fixture, fault):
   if fault == "actor":
     actor = None
   elif fault == "deleted":
-    fixture.store.data.pop(("auth", "reader"))
+    fixture.store.data.pop(("deployment:auth", "reader"))
   elif fault == "inactive":
     fixture.store.account("reader", active=False,
       memberships=[{"role": "super_tenant_admin", "tenant_id": None}])
   elif fault == "none_scope":
-    fixture.store.data[("auth", "reader")]["memberships"] = []
+    fixture.store.data[("deployment:auth", "reader")]["memberships"] = []
   elif fault in memberships:
-    fixture.store.data[("auth", "reader")]["memberships"] = [
+    fixture.store.data[("deployment:auth", "reader")]["memberships"] = [
       {"role": memberships[fault], "tenant_id": fixture.tenant_id}]
   elif fault == "other_tenant":
     tenant_id = "tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f"
   elif fault == "identity_store":
-    fixture.store.fail_hkey = "auth"
+    fixture.store.fail_hkey = "deployment:auth"
   return actor, tenant_id
 
 

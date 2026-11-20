@@ -20,9 +20,6 @@ def assignment_location(*ids):
 
 class TestTenantNodeAdministration(unittest.TestCase):
   def setUp(self):
-    self.env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    self.env.start()
-    self.addCleanup(self.env.stop)
     self.owner = FakeAdministrationStore()
     self.store = CstoreTenantAdministrationStore(self.owner, "deployment")
     self.peers = ["Node-B", "Node-A"]

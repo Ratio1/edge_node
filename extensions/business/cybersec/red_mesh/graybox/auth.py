@@ -30,6 +30,7 @@ from .models import GrayboxAuthState
 class AuthManager:
   MAX_AUTH_ATTEMPTS = 2
   AUTH_RETRY_DELAY_SECONDS = 0.25
+  LIVENESS_CHECK_SECONDS = 60
 
   """
   Manages authenticated HTTP sessions for graybox probes.
@@ -47,7 +48,10 @@ class AuthManager:
     self.anon_session = None
     self.official_session = None
     self.regular_session = None
+    self._official_configured = False
+    self._session_cookie_names = {}
     self._created_at = 0.0
+    self._liveness_checked_at = 0.0
     self._refresh_count = 0
     self._auth_errors = []
     self._auth_diagnostics = []
@@ -57,6 +61,28 @@ class AuthManager:
   def detected_csrf_field(self) -> str | None:
     """Public read access to the auto-detected CSRF field name."""
     return self._detected_csrf_field
+
+  @property
+  def primary_session(self):
+    """Session probes run under: official when configured, else regular.
+
+    ``official_session`` is never set to the regular session, so reports
+    that read it never claim admin access a regular-only scan did not have.
+    """
+    return self.official_session or self.regular_session
+
+  @property
+  def primary_principal(self) -> str:
+    if self.official_session is not None:
+      return "official"
+    if self.regular_session is not None:
+      return "regular"
+    return ""
+
+  @property
+  def admin_context(self) -> str:
+    """``provided`` when official (admin) credentials were configured, else ``absent``."""
+    return "provided" if self._official_configured else "absent"
 
   @property
   def is_expired(self) -> bool:
@@ -75,11 +101,60 @@ class AuthManager:
   def needs_refresh(self, require_regular=False) -> bool:
     if self.is_expired:
       return True
-    if self.official_session is None:
+    if self.primary_session is None:
+      return True
+    if self._official_configured and self.official_session is None:
       return True
     if require_regular and self.regular_session is None:
       return True
+    # A server-side logout (for example a GET of the logout URL) drops the
+    # session cookie while the session object lives on; probes would then
+    # run anonymously and report false clean results.
+    for session in (self.official_session, self.regular_session):
+      if session is not None and not self._session_cookies_alive(session):
+        return True
+    # A server-side logout that keeps the cookie, and bearer / api_key
+    # sessions, show up only on the authenticated probe path. Re-check it at
+    # most once per LIVENESS_CHECK_SECONDS. A transport error is not a logout.
+    if (self._authenticated_probe_path()
+        and time.time() - self._liveness_checked_at >= self.LIVENESS_CHECK_SECONDS):
+      self._liveness_checked_at = time.time()
+      valid, retryable = self._validate_authenticated_session(self.primary_session)
+      # Only a redirect, a 401/403, or a 2xx without the configured marker or
+      # identity (a 200 login page at the probe path) means the session ended;
+      # a 429 or 5xx on the probe path is the target struggling, not a logout.
+      last_stage = (self._auth_diagnostics[-1].get("stage", "")
+                    if self._auth_diagnostics else "")
+      if not valid and not retryable and last_stage in (
+          "authenticated_probe_redirect", "authenticated_probe_rejected",
+          "authenticated_probe_marker_missing",
+          "authenticated_probe_identity_missing"):
+        return True
     return False
+
+  def _remember_session_cookies(self, session):
+    """Record the login cookies of a form session (CSRF cookies excluded)."""
+    if session is None or self._resolve_auth_type() != "form":
+      return
+    try:
+      names = set(session.cookies.get_dict().keys())
+    except Exception:
+      return
+    names = {n for n in names if "csrf" not in n.lower() and n not in COMMON_CSRF_FIELDS}
+    if names:
+      self._session_cookie_names[id(session)] = names
+
+  def _session_cookies_alive(self, session) -> bool:
+    expected = self._session_cookie_names.get(id(session))
+    if not expected:
+      return True
+    try:
+      present = set(session.cookies.get_dict().keys())
+    except Exception:
+      return True
+    # Dead only when every recorded login cookie is gone: a one-shot flash
+    # cookie that disappears after one request is not a logout.
+    return not expected.isdisjoint(present)
 
   def ensure_sessions(self, official_creds, regular_creds=None):
     """Re-authenticate if sessions are stale or not yet created."""
@@ -101,23 +176,38 @@ class AuthManager:
     regular_creds = self._coerce_creds(regular_creds, principal="regular")
     self._auth_errors = []
     self._auth_diagnostics = []
+    self._session_cookie_names = {}
+    self._official_configured = self._credentials_configured(official_creds)
+    regular_configured = self._credentials_configured(regular_creds)
 
-    self.official_session = self._try_login_with_retry(
-      "official",
-      official_creds,
-    )
-    if not self.official_session:
+    # Never call the auth strategy for an unconfigured principal: a login
+    # with empty credentials counts toward lockout and WAF limits.
+    if not self._official_configured and not regular_configured:
+      self._record_auth_error("no_credentials_configured")
       return False
 
-    if self._credentials_configured(regular_creds):
+    if self._official_configured:
+      self.official_session = self._try_login_with_retry(
+        "official",
+        official_creds,
+      )
+      if not self.official_session:
+        return False
+      self._remember_session_cookies(self.official_session)
+
+    if regular_configured:
       self.regular_session = self._try_login_with_retry(
         "regular",
         regular_creds,
       )
       if not self.regular_session:
-        self._record_auth_error("regular_login_failed")
+        # Regular is the primary principal when official is absent.
+        if not self._official_configured:
+          return False
+      self._remember_session_cookies(self.regular_session)
 
     self._created_at = time.time()
+    self._liveness_checked_at = self._created_at
     return True
 
   @staticmethod
@@ -164,9 +254,11 @@ class AuthManager:
     Prevents session accumulation on targets with session limits.
     """
     logout_url = self._logout_url_for_current_auth()
+    closed = set()
     for session in [self.official_session, self.regular_session]:
-      if session is None:
+      if session is None or id(session) in closed:
         continue
+      closed.add(id(session))
       try:
         if logout_url:
           session.get(logout_url, timeout=5)
@@ -179,6 +271,7 @@ class AuthManager:
     self.official_session = None
     self.regular_session = None
     self.anon_session = None
+    self._session_cookie_names = {}
     self._created_at = 0.0
 
   def preflight_check(self) -> str | None:
@@ -213,6 +306,29 @@ class AuthManager:
     Returns a Session on success (caller must close it), None on failure.
     """
     return self._try_login(username, password)
+
+  def failure_reason(self) -> str:
+    """Name the principal whose login failed and why, for the abort reason."""
+    if "no_credentials_configured" in self._auth_errors:
+      return "no official or regular credentials are configured"
+    principal = "official" if self._official_configured else "regular"
+    if f"{principal}_login_transport_error" in self._auth_errors:
+      cause = "failed: target unreachable during login"
+    elif f"{principal}_login_failed" in self._auth_errors:
+      cause = "rejected"
+    else:
+      return ""
+    label = "Official (admin)" if principal == "official" else "Regular"
+    reason = f"{label} login {cause}"
+    if principal == "regular":
+      reason += " (no official credentials configured)"
+    if self._auth_diagnostics:
+      last = self._auth_diagnostics[-1]
+      detail = last.get("stage", "")
+      if last.get("status") is not None:
+        detail += f", HTTP {last['status']}"
+      reason += f"; last check: {detail}"
+    return reason
 
   def _record_auth_error(self, code):
     self._auth_errors.append(code)
@@ -320,6 +436,8 @@ class AuthManager:
     # of whether the credential check ultimately succeeded.
     if strategy.last_detected_csrf_field:
       self._detected_csrf_field = strategy.last_detected_csrf_field
+    if session is None:
+      self._record_auth_diagnostic("login_rejected", strategy.last_response)
     if session is not None:
       valid, retryable_failure = self._validate_authenticated_session(session)
       if not valid:

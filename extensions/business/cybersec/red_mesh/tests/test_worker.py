@@ -823,7 +823,9 @@ class TestProbeDispatch(unittest.TestCase):
     self.assertEqual(metrics["probe_breakdown"]["_crash"], "failed")
     self.assertEqual(metrics["probe_breakdown"]["_ok"], "completed")
     self.assertEqual(metrics["probes_failed"], 1)
-    self.assertEqual(metrics["probes_completed"], 1)
+    # _ok plus the lockout checks that run after every probe (RM-219).
+    self.assertEqual(metrics["probe_breakdown"]["_graybox_lockout_checks"], "completed")
+    self.assertEqual(metrics["probes_completed"], 2)
 
   def test_probe_error_records_finding(self):
     """Crashed probe emits inconclusive finding."""
@@ -1266,6 +1268,318 @@ class TestGrayboxAbortBehavior(unittest.TestCase):
 
     serialized = json.dumps(worker.state, default=str)
     self.assertNotIn(secret, serialized)
+
+
+class TestRegularOnlyWorker(unittest.TestCase):
+  """RM-219: the worker scans with regular credentials when admin is absent."""
+
+  def _worker_with_real_auth(self, post_ok=True):
+    from extensions.business.cybersec.red_mesh.graybox.auth import AuthManager
+    worker = _make_worker(
+      official_username="", official_password="", bearer_token="",
+      bearer_refresh_token="", api_key="", regular_bearer_token="",
+      regular_bearer_refresh_token="", regular_api_key="",
+    )
+    worker.auth = AuthManager(worker.target_url, worker.target_config, verify_tls=False)
+    session = MagicMock()
+    session.get.return_value = MagicMock(
+      status_code=200, text="", url="http://testapp.local:8000/auth/login/",
+      history=[], headers={"content-type": "text/html"},
+    )
+    if post_ok:
+      session.post.return_value = MagicMock(
+        status_code=200, text="", url="http://testapp.local:8000/dashboard/",
+        history=[MagicMock()], headers={"content-type": "text/html"},
+      )
+      session.cookies.get_dict.return_value = {"sessionid": "s"}
+    else:
+      session.post.return_value = MagicMock(
+        status_code=200, text='<input type="password" name="password">',
+        url="http://testapp.local:8000/auth/login/", history=[],
+        headers={"content-type": "text/html"},
+      )
+      session.cookies.get_dict.return_value = {}
+    return worker, session
+
+  def test_authentication_passes_and_records_regular_principal(self):
+    worker, session = self._worker_with_real_auth()
+    with patch(
+      "extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests",
+    ) as mock_requests:
+      mock_requests.Session.return_value = session
+      worker._run_authentication_phase()
+
+    auth_info = worker.state["service_info"]["8000"]["_graybox_auth"]
+    self.assertFalse(auth_info["official_success"])
+    self.assertTrue(auth_info["regular_success"])
+    self.assertEqual(auth_info["admin_context"], "absent")
+    self.assertEqual(auth_info["primary_principal"], "regular")
+    # Only the regular principal logged in.
+    self.assertEqual(session.post.call_count, 1)
+    self.assertEqual(session.post.call_args.kwargs["data"]["username"], "alice")
+
+    mock_probe = MagicMock()
+    mock_probe.run.return_value = GrayboxProbeRunResult(findings=[], outcome="completed")
+    mock_cls = MagicMock(return_value=mock_probe)
+    mock_cls.requires_regular_session = False
+    mock_cls.requires_auth = True
+    mock_cls.is_stateful = False
+    with patch.object(worker, "_import_probe", return_value=mock_cls):
+      worker._run_registered_probe(
+        GrayboxProbeDefinition(key="_authed", cls_path="fake.Probe"),
+        worker._build_probe_kwargs(DiscoveryResult()),
+      )
+    self.assertEqual(worker.metrics.build().probe_breakdown["_authed"], "completed")
+    self.assertEqual(worker.auth._refresh_count, 0)
+
+  def test_rejected_regular_login_aborts_naming_the_principal(self):
+    from extensions.business.cybersec.red_mesh.graybox.worker import GrayboxAbort
+    worker, session = self._worker_with_real_auth(post_ok=False)
+    with patch(
+      "extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests",
+    ) as mock_requests:
+      mock_requests.Session.return_value = session
+      with self.assertRaises(GrayboxAbort) as ctx:
+        worker._run_authentication_phase()
+
+    self.assertIn("Regular login rejected", str(ctx.exception))
+    self.assertEqual(ctx.exception.reason_class, "auth_failed")
+    auth_info = worker.state["service_info"]["8000"]["_graybox_auth"]
+    self.assertIn("Regular login rejected", auth_info["failure_reason"])
+
+
+class TestLockoutOrdering(unittest.TestCase):
+  """RM-219: no wrong-password login for a configured principal before the
+  last step that needs that principal's session."""
+
+  def test_enumeration_checks_run_after_probes_and_weak_auth(self):
+    worker = _make_worker(weak_candidates=["guest:guest"])
+    worker.safety.validate_target.return_value = None
+    worker.auth.preflight_check.return_value = None
+    worker.auth.authenticate.return_value = True
+    worker.auth.ensure_sessions.return_value = True
+    worker.auth._auth_errors = []
+    worker.auth._auth_diagnostics = []
+    worker.discovery.discover_result.return_value = DiscoveryResult()
+    order = []
+    worker._run_probe_phase = lambda result: order.append("probes")
+    worker._run_weak_auth_phase = lambda result: order.append("weak_auth")
+    with patch(
+      "extensions.business.cybersec.red_mesh.graybox.worker.MisconfigProbes",
+    ) as mock_cls:
+      mock_cls.return_value.run_lockout_checks.side_effect = (
+        lambda: order.append("lockout_checks") or []
+      )
+      worker.execute_job()
+
+    self.assertEqual(order, ["probes", "weak_auth", "lockout_checks"])
+
+  def test_registered_misconfig_run_sends_no_enumeration_login(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes.misconfig import MisconfigProbes
+    probe = MisconfigProbes.__new__(MisconfigProbes)
+    probe.findings = []
+    called = []
+    for name in dir(MisconfigProbes):
+      if name.startswith("_test_"):
+        setattr(probe, name, (lambda n: lambda: called.append(n))(name))
+    probe.run()
+    self.assertNotIn("_test_account_enumeration_timing", called)
+    self.assertNotIn("_test_account_enumeration", called)
+    probe.run_lockout_checks()
+    self.assertEqual(
+      called[-2:],
+      ["_test_account_enumeration_timing", "_test_account_enumeration"],
+    )
+
+  def test_weak_auth_skips_configured_principals(self):
+    worker = _make_worker(
+      weak_candidates=["admin:admin", "alice:alice", "guest:guest"],
+    )
+    worker.auth.ensure_sessions.return_value = True
+    with patch(
+      "extensions.business.cybersec.red_mesh.graybox.worker.BusinessLogicProbes",
+    ) as mock_cls:
+      mock_cls.return_value.run_weak_auth.return_value = []
+      worker._run_weak_auth_phase(DiscoveryResult())
+
+    candidates = mock_cls.return_value.run_weak_auth.call_args.args[0]
+    self.assertEqual(candidates, ["guest:guest"])
+
+  def test_weak_auth_compares_usernames_case_and_space_insensitively(self):
+    worker = _make_worker(
+      weak_candidates=["Admin:x", " ALICE :y", "guest:guest"],
+    )
+    worker.auth.ensure_sessions.return_value = True
+    with patch(
+      "extensions.business.cybersec.red_mesh.graybox.worker.BusinessLogicProbes",
+    ) as mock_cls:
+      mock_cls.return_value.run_weak_auth.return_value = []
+      worker._run_weak_auth_phase(DiscoveryResult())
+
+    candidates = mock_cls.return_value.run_weak_auth.call_args.args[0]
+    self.assertEqual(candidates, ["guest:guest"])
+
+
+class TestDiscoveryCoverageNote(unittest.TestCase):
+  """RM-219: a regular-only report states what the crawl could not reach."""
+
+  def _stored(self, admin_context, principal):
+    worker = _make_worker()
+    worker.auth.admin_context = admin_context
+    worker.auth.primary_principal = principal
+    worker._store_discovery_results(["/a/"], ["/f/"])
+    return worker.state["service_info"]["8000"]["_graybox_discovery"]
+
+  def test_regular_only_scan_states_its_coverage(self):
+    info = self._stored("absent", "regular")
+    self.assertEqual(info["crawled_as"], "regular")
+    self.assertIn("admin-only pages not reached", info["coverage_note"])
+
+  def test_scan_with_admin_carries_no_coverage_note(self):
+    info = self._stored("provided", "official")
+    self.assertEqual(info["crawled_as"], "official")
+    self.assertEqual(info["coverage_note"], "")
+
+
+# The 34 scenarios that work with a regular session only (assessment
+# 2026-11-19_graybox-probes-without-admin, section 4).
+REGULAR_ONLY_WORKS_IDS = frozenset({
+  # Regular as attacker
+  "PT-A01-01", "PT-A01-02", "PT-A01-03", "PT-A01-05", "PT-A01-06", "PT-A04-02",
+  "PT-OAPI1-01", "PT-OAPI5-03", "PT-OAPI5-04", "PT-OAPI3-01", "PT-OAPI3-02",
+  "PT-OAPI6-01", "PT-OAPI6-02",
+  # Anonymous or credential-only
+  "PT-A02-01", "PT-A02-02", "PT-A02-03", "PT-A02-07", "PT-A02-12", "PT-A02-17",
+  "PT-A02-18", "PT-A05-01", "PT-A07-01", "PT-A07-02", "PT-A07-04", "PT-OAPI9-01",
+  # Any logged-in session
+  "PT-A02-04", "PT-A02-06", "PT-A07-03", "PT-OAPI2-02", "PT-OAPI2-03",
+  "PT-OAPI4-01", "PT-OAPI8-03", "PT-OAPI9-02", "PT-OAPI9-03",
+})
+
+
+class TestRegularOnlyScanEmitsTheWorksScenarios(unittest.TestCase):
+  """RM-219 AC2: official credentials blank, a real AuthManager and discovery,
+  a URL+method router standing in for the target, every probe family configured."""
+
+  def _run(self):
+    from extensions.business.cybersec.red_mesh.graybox.auth import AuthManager
+    from extensions.business.cybersec.red_mesh.graybox.discovery import DiscoveryModule
+    from extensions.business.cybersec.red_mesh.graybox.safety import SafetyControls
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      GrayboxTargetConfig, AccessControlConfig, IdorEndpoint, AdminEndpoint,
+      BusinessLogicConfig, WorkflowEndpoint, RecordEndpoint, InjectionConfig,
+      SsrfEndpoint, ReflectiveEndpoint, JsonLookupEndpoint, MisconfigConfig,
+      JwtEndpoint, ApiSecurityConfig, ApiObjectEndpoint, ApiPropertyEndpoint,
+      ApiFunctionEndpoint, ApiResourceEndpoint, ApiBusinessFlow, ApiTokenEndpoint,
+      ApiInventoryPaths,
+    )
+    from . import graybox_app_fixture as fx
+
+    cfg = GrayboxTargetConfig(
+      access_control=AccessControlConfig(
+        idor_endpoints=[IdorEndpoint(path="/api/records/{id}/", test_ids=[2], owner_field="owner")],
+        admin_endpoints=[AdminEndpoint(
+          path="/manage/users/", method="GET", content_markers=["all users"])],
+      ),
+      misconfig=MisconfigConfig(jwt_endpoints=JwtEndpoint(
+        token_path="/api/token/", protected_path="/api/me/",
+        username="alice", password="pw")),
+      injection=InjectionConfig(
+        ssrf_endpoints=[SsrfEndpoint(path="/api/fetch/", param="url")],
+        xss_endpoints=[ReflectiveEndpoint(path="/api/echo/", param="q")],
+        ssti_endpoints=[ReflectiveEndpoint(path="/api/echo/", param="q")],
+        cmd_endpoints=[ReflectiveEndpoint(path="/api/echo/", param="q")],
+        header_endpoints=[ReflectiveEndpoint(path="/redirect/", param="next")],
+        json_type_endpoints=[JsonLookupEndpoint(path="/api/records/1/", field="id")],
+      ),
+      business_logic=BusinessLogicConfig(
+        workflow_endpoints=[WorkflowEndpoint(path="/admin/force-pay/", method="POST", expected_guard="403")],
+        record_endpoints=[RecordEndpoint(path="/records/1/")],
+      ),
+      api_security=ApiSecurityConfig(
+        object_endpoints=[ApiObjectEndpoint(
+          path="/api/records/{id}/", test_ids=[2], owner_field="owner")],
+        property_endpoints=[ApiPropertyEndpoint(path="/api/profile/{id}/", test_id=1)],
+        function_endpoints=[
+          ApiFunctionEndpoint(path="/api/admin/export/", method="GET", privilege="admin"),
+          ApiFunctionEndpoint(path="/api/admin/users/7/promote/", method="POST",
+                              privilege="admin",
+                              revert_path="/api/admin/users/7/demote/"),
+        ],
+        resource_endpoints=[ApiResourceEndpoint(path="/api/list/", rate_limit_expected=True)],
+        business_flows=[ApiBusinessFlow(
+          path="/api/auth/signup/", flow_name="signup",
+          body_template={"email": "{test_account}"}, test_account="probe@example.test",
+          allow_static_test_account_body=True,
+          revert_path="/api/auth/signup/revert/")],
+        token_endpoints=ApiTokenEndpoint(
+          token_path="/api/token/", protected_path="/api/me/",
+          logout_path="/api/auth/logout/"),
+        inventory_paths=ApiInventoryPaths(
+          current_version="/api/v1/", canonical_probe_path="/api/v1/me/",
+          deprecated_paths=["/api/v0/"]),
+      ),
+      password_reset_path="/auth/password-reset/",
+    )
+    app = fx.FakeApp()
+    worker = _make_worker(
+      official_username="", official_password="", bearer_token="",
+      bearer_refresh_token="", api_key="", regular_bearer_token="",
+      regular_bearer_refresh_token="", regular_api_key="",
+      regular_username="alice", regular_password="pw",
+      allow_stateful_probes=True, weak_candidates=["guest:guest"],
+      target_config=cfg.to_dict(),
+    )
+    worker.safety = SafetyControls(request_delay=0.0, target_is_local=True)
+    worker.auth = AuthManager(worker.target_url, worker.target_config, verify_tls=False)
+    worker.discovery = DiscoveryModule(
+      target_url=worker.target_url, auth_manager=worker.auth,
+      safety=worker.safety, target_config=worker.target_config)
+    with patch("requests.Session", side_effect=app.session_factory), \
+         patch("time.sleep"):
+      worker._run_authentication_phase()
+      self.discovery_from = len(app.log)
+      result = worker._run_discovery_phase()
+      self.discovery_to = len(app.log)
+      worker._run_probe_phase(result)
+      worker._run_weak_auth_phase(result)
+      worker._run_lockout_checks(result)
+    return worker, app
+
+  def test_every_works_scenario_emits_on_the_regular_session(self):
+    worker, app = self._run()
+    emitted = {
+      f["scenario_id"]
+      for probes in worker.state["graybox_results"].values()
+      for probe in probes.values()
+      for f in probe["findings"]
+    }
+    missing = sorted(REGULAR_ONLY_WORKS_IDS - emitted)
+    self.assertEqual(missing, [], f"emitted: {sorted(emitted)}")
+    # A "Works" id must be tested, not reported as denied for the regular user.
+    denied = sorted(
+      f["scenario_id"]
+      for probes in worker.state["graybox_results"].values()
+      for probe in probes.values()
+      for f in probe["findings"]
+      if f["scenario_id"] in REGULAR_ONLY_WORKS_IDS and any(
+        r in str(f.get("evidence", ""))
+        for r in ("reason=endpoint_denied", "reason=admin_context_absent")
+      )
+    )
+    self.assertEqual(denied, [])
+    # The sessions are reused: nothing re-authenticated during the scan.
+    self.assertEqual(worker.auth._refresh_count, 0)
+    # No login was ever sent for the unconfigured admin principal.
+    self.assertNotIn("", [name for name, _ in app.login_attempts])
+    # Discovery crawled with the regular session, not an anonymous one.
+    regular_id = worker.auth.regular_session.id
+    crawled = app.log[self.discovery_from:self.discovery_to]
+    self.assertTrue(crawled)
+    self.assertEqual({sid for sid, _, _ in crawled}, {regular_id})
+    # And never fetched the logout URL.
+    self.assertFalse(any(method == "GET" and path == "/auth/logout/"
+                         for _, method, path in app.log))
 
 
 if __name__ == '__main__':

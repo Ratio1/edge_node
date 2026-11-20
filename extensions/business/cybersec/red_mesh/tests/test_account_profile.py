@@ -39,13 +39,10 @@ class _ProfileCase(unittest.TestCase):
     cls.Plugin = PentesterApi01Plugin
 
   def setUp(self):
-    env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    env.start()
-    self.addCleanup(env.stop)
     self.store = FakeAdministrationStore()
     self.documents = FakeDocumentStore()
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenancy_namespace = "deployment"
+    self.plugin._stream_id = "deployment"
     self.plugin.cfg_chainstore_peers = []
     self.plugin.P = lambda *args, **kwargs: None
     self.plugin._document_store = lambda: self.documents
@@ -481,7 +478,7 @@ class TestCreatedAtGuard(_ProfileCase):
     ok(self, self.plugin.set_report_reviewer(self.actor("creator"), "tuser", True))
     ok(self, self.plugin.upload_account_certificate(self.actor("tuser"), None, "q1", "a.png", b64(PNG)))
     # The account is deleted and created again under the same id: another `createdAt`.
-    self.store.data[("auth", "tuser")]["createdAt"] = "2026-06-01T00:00:00.000Z"
+    self.store.data[("deployment:auth", "tuser")]["createdAt"] = "2026-06-01T00:00:00.000Z"
     profile = ok(self, self.get("tuser"))
     self.assertEqual((profile["full_name"], profile["report_reviewer"], profile["qualifications"]), ("", False, []))
     self.assertFalse(self.service.reviewer_snapshot("tuser")["full_name"])
@@ -495,12 +492,12 @@ class TestCreatedAtGuard(_ProfileCase):
   def test_designating_a_re_created_account_also_deletes_the_stale_certificate_files(self):
     ok(self, self.update("tuser", None, {"qualifications": [{"name": "OSCP"}]}))
     ok(self, self.plugin.upload_account_certificate(self.actor("tuser"), None, "q1", "a.png", b64(PNG)))
-    self.store.data[("auth", "tuser")]["createdAt"] = "2026-06-01T00:00:00.000Z"
+    self.store.data[("deployment:auth", "tuser")]["createdAt"] = "2026-06-01T00:00:00.000Z"
     ok(self, self.plugin.set_report_reviewer(self.actor("creator"), "tuser", True))
     self.assertEqual(self.documents.deleted, ["doc-1"])
     self.assertEqual(self.row("tuser")["qualifications"], [])
     # Designating the re-created account is its own act and is not inherited either.
-    self.store.data[("auth", "tpent")]["createdAt"] = "2026-06-01T00:00:00.000Z"
+    self.store.data[("deployment:auth", "tpent")]["createdAt"] = "2026-06-01T00:00:00.000Z"
     self.assertFalse(ok(self, self.get("creator", "tpent"))["report_reviewer"])
 
 
@@ -509,7 +506,7 @@ class TestPurge(_ProfileCase):
     return self.plugin.purge_account_profile(self.actor(actor), account_id)
 
   def deleting(self, name="tuser"):
-    self.store.account(name, memberships=self.store.data[("auth", name)]["memberships"], state="deleting")
+    self.store.account(name, memberships=self.store.data[("deployment:auth", name)]["memberships"], state="deleting")
 
   def setUp(self):
     super().setUp()
@@ -565,7 +562,7 @@ class TestPurge(_ProfileCase):
     self.assertIsNone(self.row("tuser"))
 
   def test_after_the_tombstone_only_a_super_tenant_admin_can_still_purge(self):
-    self.store.data[("auth", "tuser")] = "null"  # tombstoned
+    self.store.data[("deployment:auth", "tuser")] = "null"  # tombstoned
     refused(self, self.purge("tadmin"), 404, "not_found")
     ok(self, self.purge("creator"))
     self.assertIsNone(self.row("tuser"))
@@ -622,7 +619,7 @@ class TestReviewPolicyThroughTenantAdmission(_ProfileCase):
     self.set_allow(True)
     ok(self, self.plugin.set_report_reviewer(self.actor("creator"), "tpent", True))
     self.assertIsNone(self.decide("tpent"))
-    self.store.data[("auth", "tpent")]["createdAt"] = "2026-06-01T00:00:00.000Z"
+    self.store.data[("deployment:auth", "tpent")]["createdAt"] = "2026-06-01T00:00:00.000Z"
     self.assertEqual(self.decide("tpent"), (403, "reviewer_not_designated"))
 
   def test_other_operations_do_not_read_the_designation(self):

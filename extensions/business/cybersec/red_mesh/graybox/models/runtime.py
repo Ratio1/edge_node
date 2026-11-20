@@ -148,7 +148,7 @@ class GrayboxAuthState:
 
   @property
   def has_authenticated_session(self) -> bool:
-    return self.official_authenticated
+    return self.official_authenticated or self.regular_authenticated
 
 
 @dataclass(frozen=True)

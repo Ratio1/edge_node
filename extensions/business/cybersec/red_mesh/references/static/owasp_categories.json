@@ -1,7 +1,7 @@
 {
   "version": "2021",
-  "last_refreshed": "2026-05-04",
-  "source": "https://owasp.org/Top10/",
+  "last_refreshed": "2026-11-19",
+  "source": "https://top10.owasp.org/2021/",
   "categories": {
     "A01:2021": {
       "code": "A01:2021",

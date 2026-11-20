@@ -22,12 +22,9 @@ class TestTenantDelete(unittest.TestCase):
     cls.Plugin = PentesterApi01Plugin
 
   def setUp(self):
-    environment = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    environment.start()
-    self.addCleanup(environment.stop)
     self.storage = FakeAdministrationStore()
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenancy_namespace = "deployment"
+    self.plugin._stream_id = "deployment"
     self.plugin.cfg_instance_id = "jobs"
     self.plugin.P = lambda *args, **kwargs: None
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hkeys", "chainstore_hset"):

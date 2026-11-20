@@ -14,6 +14,10 @@ Static reference tables used by the PTES-aligned report generator.
 
 ## Refresh procedure
 
+OWASP data stays on the 2021 edition, although OWASP published the 2025 edition (December 2025):
+probes and findings carry `A0x:2021` codes, so moving to 2025 is a code migration, not a refresh.
+A refresh checks the 2021 pages (`https://top10.owasp.org/2021/`) for changes.
+
 1. Pull the latest from each source (links in each JSON's `source` field).
 2. Update the `last_refreshed` field to today's ISO date (`YYYY-MM-DD`).
 3. Update the `version` field if the source has rev'd.

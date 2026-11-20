@@ -14,7 +14,9 @@ from ..model_testing.constants import (
   selected_model_test_worker_addr,
 )
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..tenancy import tenancy_namespace
 from ..tenancy.effects import EffectState
+from . import checkpoint
 from .event_hooks import emit_lifecycle_event
 from .secrets import collect_secret_refs_from_job_config
 from .state_machine import is_terminal_job_status, set_job_status
@@ -67,6 +69,14 @@ def _foreign_launcher_error(owner, job_id, job_specs, action):
   }
 
 
+def _delete_checkpoints(owner, job_id):
+  """RM-201: drop every local worker checkpoint of a stopped job; a failure is logged, never raised."""
+  try:
+    checkpoint.delete_job(owner, job_id)
+  except Exception as exc:
+    owner.P(f"Could not delete checkpoints of job {job_id}: {exc}", color='y')
+
+
 def stop_and_delete_job(owner, job_id: str, *, checked_job=None, snapshot_mode=None, ledger=None):
   """
   Stop a running job, mark it stopped, then delegate to purge_job
@@ -96,6 +106,7 @@ def stop_and_delete_job(owner, job_id: str, *, checked_job=None, snapshot_mode=N
       job.stop()
     owner.P(f"Job {job_id} stopped.")
   owner.scan_jobs.pop(job_id, None)
+  _delete_checkpoints(owner, job_id)
 
   if isinstance(job_specs, dict):
     # Contract 4 before the first irreversible act. Everything below -- worker cancellation, the
@@ -686,8 +697,8 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None,
       tenant = binding.get("tenant_id") if isinstance(binding, dict) else None
       if isinstance(tenant, str) and tenant.strip():
         tenants.add(tenant)
-    namespace = getattr(owner, "cfg_tenancy_namespace", None)
-    if swept_ids is None and isinstance(namespace, str) and namespace.strip():
+    namespace = tenancy_namespace(owner)
+    if swept_ids is None and namespace is not None:
       tenancy_hkey = json.dumps(["redmesh", "tenancy", 1, namespace], separators=(",", ":"))
       try:
         rows = owner.chainstore_hgetall(hkey=tenancy_hkey)
@@ -999,6 +1010,7 @@ def stop_monitoring(owner, job_id: str, stop_type: str = "SOFT", *, checked_job=
           owner.P(f"Stopping job {job_id} on local worker {local_worker_id}.")
           job.stop()
         owner.scan_jobs.pop(job_id, None)
+      _delete_checkpoints(owner, job_id)
 
       worker_entry = job_specs.setdefault("workers", {}).setdefault(owner.ee_addr, {})
       worker_entry["finished"] = True

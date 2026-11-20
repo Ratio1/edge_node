@@ -302,6 +302,8 @@ def _summarize_scan(
     "routes_discovered": 0,
     "scenarios_tested": 0,
     "scan_type": "",
+    "discovery_coverage_note": "",
+    "admin_context": "",
   }
   if not isinstance(aggregated, dict):
     return out
@@ -313,6 +315,17 @@ def _summarize_scan(
   service_info = aggregated.get("service_info") or {}
   if isinstance(service_info, dict):
     out["services_count"] = len(service_info)
+    # A regular-only graybox scan states what its crawl could not reach, so the
+    # narrative does not claim admin coverage.
+    for methods in service_info.values():
+      if not isinstance(methods, dict):
+        continue
+      auth_info = methods.get("_graybox_auth")
+      if isinstance(auth_info, dict) and not out["admin_context"]:
+        out["admin_context"] = _sanitize(auth_info.get("admin_context", ""), 32)
+      discovery = methods.get("_graybox_discovery")
+      if isinstance(discovery, dict) and not out["discovery_coverage_note"]:
+        out["discovery_coverage_note"] = _sanitize(discovery.get("coverage_note", ""), 200)
 
   out["scan_type"] = _sanitize(aggregated.get("scan_type", ""), 32)
 

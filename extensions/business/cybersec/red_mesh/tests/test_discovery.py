@@ -39,7 +39,7 @@ def _make_discovery(scope_prefix="", max_pages=50, max_depth=3, routes_html=None
     return _mock_response(text="<html></html>")
 
   session.get.side_effect = mock_get
-  auth.official_session = session
+  auth.primary_session = session
   auth.anon_session = session
 
   disc = DiscoveryModule(
@@ -167,7 +167,7 @@ class TestDiscoveryModule(unittest.TestCase):
       return _mock_response(text='<a href="/api/data">API</a>')
 
     session.get.side_effect = mock_get
-    auth.official_session = session
+    auth.primary_session = session
     auth.anon_session = session
 
     disc = DiscoveryModule("http://testapp.local:8000", auth, safety, cfg)
@@ -251,7 +251,7 @@ class TestABasePathTargetIsNotCrawledTwice(unittest.TestCase):
 
     session = MagicMock()
     session.get.side_effect = mock_get
-    auth.official_session = session
+    auth.primary_session = session
     auth.anon_session = session
 
     disc = DiscoveryModule(
@@ -278,6 +278,39 @@ class TestABasePathTargetIsNotCrawledTwice(unittest.TestCase):
       "http://testapp.local:8000/app/users", requested,
       "the crawl queued the route but never requested it at its real URL",
     )
+
+
+
+class TestDiscoveryNeverVisitsLogout(unittest.TestCase):
+  """RM-219: a GET of the logout URL would end the scan session."""
+
+  def test_logout_link_and_configured_route_are_not_fetched(self):
+    disc = _make_discovery(routes_html={
+      "/": '<a href="/auth/logout/">Log out</a><a href="/about/">About</a>',
+    })
+    routes, _ = disc.discover()
+    fetched = [c.args[0] for c in disc.auth.primary_session.get.call_args_list]
+    self.assertFalse(any(u.endswith("/auth/logout/") for u in fetched), fetched)
+    self.assertNotIn("/auth/logout/", routes)
+    self.assertIn("/about/", routes)
+
+    disc = _make_discovery()
+    disc.discover_result(known_routes=["/auth/logout/"])
+    fetched = [c.args[0] for c in disc.auth.primary_session.get.call_args_list]
+    self.assertFalse(any(u.endswith("/auth/logout/") for u in fetched), fetched)
+
+  def test_logout_forms_and_slashless_logout_links_are_dropped(self):
+    """`/auth/logout` equals `/auth/logout/`; a logout form action is not a target."""
+    disc = _make_discovery(routes_html={
+      "/": '<a href="/auth/logout">Out</a><a href="/about/">About</a>'
+           '<form action="/auth/logout"></form><form action="/auth/logout/"></form>'
+           '<form action="/profile/"></form>',
+    })
+    routes, forms = disc.discover()
+    fetched = [c.args[0] for c in disc.auth.primary_session.get.call_args_list]
+    self.assertFalse(any("logout" in u for u in fetched), fetched)
+    self.assertFalse(any("logout" in r for r in routes), routes)
+    self.assertEqual(forms, ["/profile/"])
 
 
 if __name__ == '__main__':

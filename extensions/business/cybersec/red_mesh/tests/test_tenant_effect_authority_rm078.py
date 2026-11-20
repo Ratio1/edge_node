@@ -190,7 +190,6 @@ class TestTenantReadAccessAdmitsTheEffectOperations(unittest.TestCase):
 
   def setUp(self):
     from uuid import uuid4
-    from unittest.mock import patch
     from extensions.business.cybersec.red_mesh.repositories import JobStateRepository
     from extensions.business.cybersec.red_mesh.tenancy.administration import (
       AdministrationDenied, TenantAdministrationService)
@@ -203,9 +202,6 @@ class TestTenantReadAccessAdmitsTheEffectOperations(unittest.TestCase):
     from .test_tenant_read_access import ReadStore
 
     self.AdministrationDenied = AdministrationDenied
-    env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    env.start()
-    self.addCleanup(env.stop)
     self.store = ReadStore()
     administration = TenantAdministrationService(
       CstoreAuthAccountReader(self.store), CstoreTenantAdministrationStore(self.store, "deployment"))

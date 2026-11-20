@@ -105,6 +105,7 @@ def _make_api_auth_probe(*, allowed_scenario_ids=None, unverified_api_auth=False
   auth = MagicMock()
   auth.official_session = MagicMock()
   auth.regular_session = MagicMock()
+  auth.primary_session = auth.official_session
   auth.verify_tls = True
   auth.make_anonymous_session = MagicMock(return_value=MagicMock())
   safety = MagicMock()
