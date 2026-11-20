@@ -8,6 +8,7 @@ from uuid import uuid4
 _RELAY_KEY = "DEEPLOY_REPAIR_RELAY_V1"
 _RELAY_TIMEOUT = 45
 _RELAY_MAX_PENDING = 32
+_RELAY_MAX_PER_TICK = 32
 _RELAY_REQUEST_BYTES = 256 * 1024
 
 
@@ -81,6 +82,8 @@ class _RepairRelayMixin:
 
   def _process_job_repair_relay(self):
     fields = self.const.PAYLOAD_DATA  # Use the actual Core wire keys, including EE_DEST.
+    registered = None
+    examined = 0
     for payload in self.dataapi_struct_datas(as_list=True):
       if not isinstance(payload, dict) or payload.get(fields.EE_IS_ENCRYPTED) is not True:
         continue
@@ -91,25 +94,35 @@ class _RepairRelayMixin:
       if (payload.get(fields.EE_DESTINATION) != self.bc.address or not isinstance(ciphertext, str)
           or len(ciphertext) > 2 * _RELAY_REQUEST_BYTES):
         continue
+      if examined >= _RELAY_MAX_PER_TICK:
+        break  # Leave the Deeploy process time for other admin work.
+      examined += 1
+      if registered is None:
+        try:
+          registered = {address.lower() for address in self.bc.get_eth_oracles()}
+        except Exception:
+          self.P("Could not authenticate Deeploy repair relay peers.", color="y")
+          return  # An unavailable registry cannot authorize any relay message in this batch.
       try:
-        self._handle_job_repair_peer(payload)
+        self._handle_job_repair_peer(payload, registered=registered)
       except Exception:
         # Never log incoming payloads, decrypted data, or exception text that could echo them.
         self.P("Could not process a Deeploy repair relay message.", color="y")
 
-  def _is_repair_relay_oracle(self, node):
+  def _is_repair_relay_oracle(self, node, registered=None):
     # Resolve the address directly from its public key, independently of the local heartbeat roster.
     if not isinstance(node, str):
       return False
     try:
       eth_address = self.bc.node_address_to_eth_address(node).lower()
-      return eth_address in {address.lower() for address in self.bc.get_eth_oracles()}
+      roster = registered if registered is not None else {address.lower() for address in self.bc.get_eth_oracles()}
+      return eth_address in roster
     except (AttributeError, TypeError, ValueError):
       return False
 
-  def _handle_job_repair_peer(self, payload):
+  def _handle_job_repair_peer(self, payload, registered=None):
     sender = payload.get(self.const.PAYLOAD_DATA.EE_SENDER)
-    if not self.bc.verify(payload, return_full_info=True).valid or not self._is_repair_relay_oracle(sender):
+    if not self._is_repair_relay_oracle(sender, registered) or not self.bc.verify(payload, return_full_info=True).valid:
       return
     message = self.receive_and_decrypt_payload(payload).get(_RELAY_KEY)
     if not isinstance(message, dict) or not isinstance(message.get("id"), str) or len(message["id"]) != 32:
