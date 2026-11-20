@@ -67,7 +67,7 @@ TMP_MIN_AGE = 300  # seconds; a younger temp file may belong to a save in progre
 # file become GBs of memory.
 _ALLOWED_GLOBALS = frozenset(("datetime", n) for n in ("datetime", "date", "time", "timedelta", "timezone"))
 MAX_NODES = 1_000_000  # container and leaf nodes of one payload, shared references counted each time
-# str/bytes length of one pass (or one final marker), counted once per reference: a resumed worker copies a
+# str/bytes/bytearray length of one pass (or one final marker), counted once per reference: a resumed worker copies a
 # shared string per reference (credential redaction, JSON), so one 32 KB string referenced 1M times is 32 GB.
 MAX_TEXT_BYTES = 2 * MAX_FILE_BYTES
 # Opcodes of one pass (all its files) or of one final marker, counted before anything is unpickled. A native
@@ -115,7 +115,7 @@ def _within_node_bound(obj, budget=None):
     count += 1
     if count + len(stack) > MAX_NODES:  # every stacked entry is a node still to count; a cycle must not grow it
       return False
-    if isinstance(item, (str, bytes)):
+    if isinstance(item, (str, bytes, bytearray)):  # protocol 5 writes a bytearray natively (BYTEARRAY8)
       text += len(item)
       if text > max_text:
         return False
