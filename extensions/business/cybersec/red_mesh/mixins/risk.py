@@ -132,7 +132,8 @@ class _RiskScoringMixin:
         )
 
     def normalize_flat_finding(finding, port, protocol, probe_name, category):
-      item = {k: v for k, v in finding.items()}
+      # A worker's finding never carries host triage: only the live host map (read on the launcher) does.
+      item = {k: v for k, v in finding.items() if k != "triage"}
       normalized_confidence, recognised = _normalize_confidence(
         item.get("confidence", "firm"),
       )

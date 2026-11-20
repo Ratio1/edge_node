@@ -53,6 +53,7 @@ class _Owner(QueryStore):
 
   def chainstore_hset(self, *, hkey, key, value):
     self.points[(hkey, key)] = value
+    return True
 
   def _get_job_from_cstore(self, job_id):
     return self.job if job_id == self.job["job_id"] else None

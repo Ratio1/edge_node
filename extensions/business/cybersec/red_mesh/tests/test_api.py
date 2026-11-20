@@ -3216,7 +3216,7 @@ class TestPhase2PassFinalization(unittest.TestCase):
     self.assertEqual(pass_report_dict["redmesh_test_attestation"]["tx_hash"], "0xend")
     plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
 
-  def test_finalization_required_end_attestation_failure_marks_failed(self):
+  def test_finalization_required_end_attestation_failure_keeps_job_finalized(self):
     PentesterApi01Plugin = self._get_plugin_class()
     plugin, job_specs = self._build_finalize_plugin()
     job_specs["blockchain_attestation_enabled"] = True
@@ -3243,9 +3243,12 @@ class TestPhase2PassFinalization(unittest.TestCase):
 
     PentesterApi01Plugin._maybe_finalize_pass(plugin)
 
-    self.assertEqual(job_specs["job_status"], "FAILED")
-    self.assertEqual(job_specs["failure_class"], "attestation_failed")
-    self.assertIn("terminal blockchain attestation", job_specs["failure_message"])
+    # RM-221: the scan finished; only the attestation is failed, and the results stay.
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertEqual(job_specs["attestation_status"], "failed")
+    self.assertIn(job_specs["attestation_failure_reason"], {"attestation_disabled", "no_tenant_key", "submit_failed"})
+    self.assertFalse(job_specs.get("failure_class"))
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
     plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
     event_types = [c.args[1] for c in plugin._emit_timeline_event.call_args_list]
     self.assertIn("attestation_failed", event_types)
@@ -3605,6 +3608,35 @@ class TestPhase4UiAggregate(unittest.TestCase):
     self.assertEqual(result["total_forms_discovered"], 2)
     self.assertEqual(result["total_scenarios"], 3)
     self.assertEqual(result["total_scenarios_vulnerable"], 1)
+
+  def test_regular_only_report_states_coverage_and_does_not_claim_admin(self):
+    """RM-219: the archive carries the coverage note, the principal and admin_context."""
+    plugin, _ = self._make_plugin()
+    p = self._make_pass(findings=[self._make_finding(severity="HIGH", finding_id="gb1")])
+    agg = self._make_webapp_aggregated()
+    agg["service_info"]["443"]["_graybox_discovery"]["coverage_note"] = (
+      "Crawled as the regular user; admin-only pages not reached.")
+    agg["service_info"]["443"]["_graybox_auth"] = {
+      "official_success": False, "regular_success": True,
+      "admin_context": "absent", "primary_principal": "regular",
+    }
+    result = plugin._compute_ui_aggregate([p], agg, job_config={"scan_type": "webapp"}).to_dict()
+    self.assertIn("admin-only pages not reached", result["graybox_coverage_note"])
+    self.assertEqual(result["graybox_admin_context"], "absent")
+    self.assertEqual(result["graybox_primary_principal"], "regular")
+    from extensions.business.cybersec.red_mesh.models.archive import UiAggregate
+    restored = UiAggregate.from_dict(result)
+    self.assertEqual(restored.graybox_admin_context, "absent")
+
+  def test_report_with_admin_carries_no_coverage_note(self):
+    plugin, _ = self._make_plugin()
+    p = self._make_pass(findings=[self._make_finding(severity="HIGH", finding_id="gb1")])
+    agg = self._make_webapp_aggregated()
+    agg["service_info"]["443"]["_graybox_auth"] = {
+      "admin_context": "provided", "primary_principal": "official"}
+    result = plugin._compute_ui_aggregate([p], agg, job_config={"scan_type": "webapp"}).to_dict()
+    self.assertEqual(result["graybox_coverage_note"], "")
+    self.assertEqual(result["graybox_admin_context"], "provided")
 
 
 
@@ -5385,7 +5417,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       {"fin-job": stub}.get(key) if hkey == "test-instance" else rows.get((hkey, key)))
     plugin.chainstore_hgetall.side_effect = lambda hkey: (
       {"fin-job": stub} if hkey == "test-instance" else {k: v for (h, k), v in rows.items() if h == hkey})
-    plugin.chainstore_hset.side_effect = lambda hkey, key, value: rows.__setitem__((hkey, key), value)
+    plugin.chainstore_hset.side_effect = lambda hkey, key, value: rows.__setitem__((hkey, key), value) or True
     plugin.chainstore_hkeys.side_effect = lambda hkey: [k for (h, k) in rows if h == hkey]
 
     result = update_finding_triage(plugin, "fin-job", "f-1", "accepted_risk", note="Approved by analyst",

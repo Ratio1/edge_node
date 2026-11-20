@@ -21,13 +21,10 @@ class _PluginCase(unittest.TestCase):
     cls.Plugin = PentesterApi01Plugin
 
   def setUp(self):
-    env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    env.start()
-    self.addCleanup(env.stop)
     self.store = FakeAdministrationStore()
     self.documents = FakeDocumentStore()
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenancy_namespace = "deployment"
+    self.plugin._stream_id = "deployment"
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
       setattr(self.plugin, name, getattr(self.store, name))
     self.plugin._document_store = lambda: self.documents
@@ -96,7 +93,7 @@ class TestUploadTenantContract(_PluginCase):
     self.assertEqual((downloaded["sha256"], downloaded["content_b64"]), (CONTRACT_SHA256, contract_b64()))
 
   def test_no_namespace_means_no_upload(self):
-    self.plugin.cfg_tenancy_namespace = None
+    self.plugin._stream_id = None
     self.assertEqual(self.upload()["status_code"], 503)
     self.assertEqual(self.documents.puts, [])
 

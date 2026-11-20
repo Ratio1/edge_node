@@ -53,9 +53,13 @@ print it whole.
 |---|---|---|
 | `INSTANCE_ID` | Instance name | `"redmesh_api"` |
 | `PORT` | API port the Navigator calls | `5082` |
-| `TENANCY_NAMESPACE` | CStore partition for every tenant record. Unset means every scoped read, launch and administration call answers `unavailable` | `"dev"` |
 | `CHAINSTORE_PEERS` | Node addresses that share job state | `["<node address>", "..."]` |
-| `ENV.R1EN_CSTORE_AUTH_HKEY` | CStore hash of the Navigator account store (identity reads) | `"<pipeline name>:auth-v1"` |
+
+There is no tenancy namespace key and no account hash key. The Navigator account store (identity
+reads) is the CStore hash `<pipeline name>:auth`, derived and not configurable. Tenant records live
+in a CStore partition named after the pipeline (deeploy `app_id`), so a new deeploy job starts with
+an empty tenant partition. A pipeline with an empty name answers `unavailable` on every tenant-scoped
+call.
 
 ### Common
 
@@ -65,7 +69,7 @@ print it whole.
 | `CHECK_JOBS_EACH` | `15` | Seconds between job checks |
 | `WARMUP_DELAY` | `30` | Seconds before the first check |
 | `DISTRIBUTION_STRATEGY` / `PORT_ORDER` | slice / shuffle | How ports are split and ordered |
-| `LLM_AGENT` | disabled | `ENABLED`, `TIMEOUT`, `MODEL`, `STRUCTURED_MAX_FINDINGS`, `STRUCTURED_MAX_TOKENS`, ... |
+| `LLM_AGENT` | disabled | `ENABLED`, `TIMEOUT`, `MODEL`, `STRUCTURED_MAX_FINDINGS`, `STRUCTURED_MAX_TOKENS`, `LOCAL_STRUCTURED_CHUNK_TIMEOUT` (seconds per local narrative chunk, default `270`, max `1800`; keep it below both LLM Agent API timeouts, `REQUEST_TIMEOUT` (HTTP front) and `REQUEST_TIMEOUT_SECONDS` (model call), default `300` each), ... |
 | `LLM_AGENT_API_HOST` / `LLM_AGENT_API_PORT` | `127.0.0.1` / none | Required when `LLM_AGENT.ENABLED` |
 | `GRAYBOX_BUDGETS` | 10 / 100 / 1 | Web app probe budgets |
 | `SCAN_TARGET_ALLOWLIST` | `[]` | Extra allowed targets |

@@ -7,7 +7,7 @@ from extensions.business.cybersec.red_mesh.models import FindingTriageAuditEntry
 from extensions.business.cybersec.red_mesh.repositories.cstore import JobStateRepository
 from extensions.business.cybersec.red_mesh.services import control, triage
 from .test_triage_store import TENANT_A, TENANT_B
-from .test_triage_write import HOST, _Owner, _Repo
+from .test_triage_write import HOST, _Owner, _Repo, write
 
 
 class _PurgeRepo(_Repo):
@@ -19,7 +19,7 @@ class _PurgeRepo(_Repo):
 
 
 class _PurgeOwner(_Owner):
-  cfg_tenancy_namespace = "deployment"
+  _stream_id = "deployment"
 
   def _get_artifact_repository(self):
     return _PurgeRepo(self)
@@ -90,6 +90,52 @@ class TestTriageSurvivesPurge(unittest.TestCase):
     self.assertNotEqual(result["status"], "success")
     self.assertEqual(set(self.host_rows(TENANT_A)), {f"{HOST}\x1ff1"})
     self.assertEqual(set(self.host_rows(TENANT_B)), {f"{HOST}\x1ff1"})
+
+  def _interrupted_audit(self, tenant, job_id="job-1"):
+    """A triage change of `tenant`'s f1 whose state is confirmed but whose audit append is refused."""
+    real = self.owner.chainstore_hset
+    audit_hkey = f"inst:triage:audit:{tenant}"
+    self.owner.chainstore_hset = lambda **kw: False if kw["hkey"] == audit_hkey else real(**kw)
+    result, _ = write(self.owner, job_id=job_id, ids="f1", status="false_positive", note="old note")
+    self.assertEqual([r["outcome"] for r in result["results"]], ["write_failed"])
+    self.owner.chainstore_hset = real
+
+  def test_a_whole_purge_drops_unfinished_triage_changes_so_none_comes_back(self):
+    self._interrupted_audit(TENANT_A)
+    self.assertEqual(control.purge_all_jobs(self.owner)["status"], "success")
+    self.assertEqual(self.owner.hashes[f"inst:triage:audit:{TENANT_A}"], {})
+    self.owner.add_job("job-2")
+    write(self.owner, job_id="job-2", ids="f1", status="remediated", note="new")
+    audit = triage._job_repo(self.owner).get_host_triage_audit(TENANT_A, HOST, "f1")
+    self.assertEqual([(e["job_id"], e["note"]) for e in audit], [("job-2", "new")])
+
+  def test_a_tenant_scoped_purge_keeps_the_other_tenants_unfinished_changes(self):
+    self._interrupted_audit(TENANT_A)
+    self._interrupted_audit(TENANT_B, job_id="job-b")
+    jobs = {"job-1": deepcopy(self.owner.hashes["inst"]["job-1"])}
+    self.assertEqual(control.purge_all_jobs(self.owner, checked_jobs=jobs, snapshot_mode="tenant_bound")["status"],
+                     "success")
+    self.assertEqual([key[0] for key in self.owner._triage_unfinished_writes], [TENANT_B])
+
+  def test_a_tenant_purge_with_no_jobs_left_still_deletes_its_host_triage(self):
+    # the last job went in a single-job purge, which keeps host triage; the tenant-wide purge now sees no job
+    result = control.purge_all_jobs(self.owner, checked_jobs={}, snapshot_mode="tenant_bound", tenant_id=TENANT_A)
+    self.assertEqual(result["status"], "success", result)
+    self.assertEqual(self.host_rows(TENANT_A), {})
+    self.assertEqual(self.owner.hashes[f"inst:triage:audit:{TENANT_A}"], {})
+    self.assertEqual(set(self.host_rows(TENANT_B)), {f"{HOST}\x1ff1"})
+
+  def test_a_refused_triage_delete_reports_partial_and_keeps_the_unfinished_change(self):
+    self._interrupted_audit(TENANT_A)
+    real = self.owner.chainstore_hset
+    host_hkeys = {f"inst:triage:t:{TENANT_A}", f"inst:triage:audit:{TENANT_A}"}
+    self.owner.chainstore_hset = lambda **kw: False if kw["hkey"] in host_hkeys else real(**kw)
+    result = control.purge_all_jobs(self.owner)
+    self.assertEqual(result["status"], "partial", result)
+    self.assertIn(f"inst:triage:t:{TENANT_A}", [e["scope"] for e in result["errors"]])
+    self.assertEqual(set(self.host_rows(TENANT_A)), {f"{HOST}\x1ff1"})
+    self.assertEqual([key[0] for key in self.owner._triage_unfinished_writes], [TENANT_A])
+    self.assertEqual(self.host_rows(TENANT_B), {})  # the other tenant's sweep still ran
 
 
 if __name__ == "__main__":

@@ -288,7 +288,7 @@ class TestEngagementDraftRoles(_EngagementDraftCase):
     self.assertEqual(self.events, [])
 
   def test_no_namespace_means_unavailable_before_any_storage_access(self):
-    self.plugin.cfg_tenancy_namespace = None
+    self.plugin._stream_id = None
     for name in ("create_engagement_draft", "update_engagement_draft", "get_engagement_draft",
                  "list_engagement_drafts", "delete_engagement_draft", "upload_engagement_draft_document",
                  "download_engagement_draft_document", "activate_engagement_draft"):

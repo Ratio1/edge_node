@@ -179,6 +179,13 @@ class BusinessLogicProbes(ProbeBase):
       except Exception:
         continue
 
+      # A denial (401/403, login redirect, or a 404 the admin reached) is the
+      # secure result. A bare 404 is skipped: it may be a mistyped path.
+      if self.exempt_denial(resp, url):
+        endpoints_tested += 1
+        continue
+      if resp.status_code == 404:
+        continue
       endpoints_tested += 1
       if resp.status_code < 400:
         body_lower = resp.text.lower()
@@ -242,7 +249,7 @@ class BusinessLogicProbes(ProbeBase):
     server accepts them. Tests negative monetary amounts and forbidden state
     transitions.
     """
-    if not self.auth.official_session:
+    if not self.auth.primary_session:
       return
 
     endpoints = self.target_config.business_logic.record_endpoints
@@ -258,6 +265,8 @@ class BusinessLogicProbes(ProbeBase):
         break
 
     bypass_evidence = []
+    tested = 0
+    denied = 0
     # PT-A06-04 (Negative amount accepted) is a strict subset of PT-A06-02
     # — track separately so the catalog row fires when negative amount is
     # accepted, even if the invalid-state branch also triggers PT-A06-02.
@@ -272,21 +281,28 @@ class BusinessLogicProbes(ProbeBase):
       # Step 1: GET the form to extract current state and CSRF token
       self.safety.throttle()
       try:
-        page = self.auth.official_session.get(url, timeout=10)
+        page = self.auth.primary_session.get(url, timeout=10)
       except Exception:
         continue
-      if page.status_code != 200:
+      # 405: a POST-only action. No GET baseline and no form to read, so the
+      # payload POST (configured amount and status fields) decides.
+      post_only = page.status_code == 405
+      if not post_only and not self.response_reached(page):
+        denied += 1
         continue
+      if not post_only and page.status_code != 200:
+        continue
+      page_text = "" if post_only else page.text
 
       csrf_field = self.auth.detected_csrf_field
       csrf_token = None
       if csrf_field:
-        csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
+        csrf_token = self.auth.extract_csrf_value(page_text, csrf_field)
 
       # Extract all form fields with current values.
       # Parse <input> (any type), <textarea>, and <select> elements.
       form_fields = {}
-      for tag in re.finditer(r'<input\b([^>]*)>', page.text, re.I):
+      for tag in re.finditer(r'<input\b([^>]*)>', page_text, re.I):
         attrs = tag.group(1)
         name_m = re.search(r'name=["\']([^"\']+)', attrs)
         val_m = re.search(r'value=["\']([^"\']*)', attrs)
@@ -296,13 +312,13 @@ class BusinessLogicProbes(ProbeBase):
             form_fields[name] = val_m.group(1) if val_m else ""
       for m in re.finditer(
         r'<textarea[^>]+name=["\']([^"\']+)["\'][^>]*>(.*?)</textarea>',
-        page.text, re.I | re.DOTALL,
+        page_text, re.I | re.DOTALL,
       ):
         form_fields[m.group(1)] = m.group(2).strip()
       # Extract <select> current values via selected option
       for sel in re.finditer(
         r'<select[^>]+name=["\']([^"\']+)["\'][^>]*>(.*?)</select>',
-        page.text, re.I | re.DOTALL,
+        page_text, re.I | re.DOTALL,
       ):
         sel_name = sel.group(1)
         sel_body = sel.group(2)
@@ -325,14 +341,18 @@ class BusinessLogicProbes(ProbeBase):
         headers["X-CSRFToken"] = csrf_token
 
       try:
-        resp = self.auth.official_session.post(
+        resp = self.auth.primary_session.post(
           url, data=payload, headers=headers,
           timeout=10, allow_redirects=False,
         )
       except Exception:
         resp = None
 
-      if resp is not None:
+      if resp is not None and not self.response_reached(resp):
+        # Payload denied or redirected to login: the handler never saw it.
+        denied += 1
+      elif resp is not None:
+        tested += 1
         # Success indicators: 302 redirect (form accepted) or 200 without error
         accepted = resp.status_code in (301, 302)
         if not accepted and resp.status_code == 200:
@@ -362,7 +382,7 @@ class BusinessLogicProbes(ProbeBase):
           # Re-fetch CSRF token (may have been consumed)
           if csrf_field:
             try:
-              page2 = self.auth.official_session.get(url, timeout=10)
+              page2 = self.auth.primary_session.get(url, timeout=10)
               csrf_token = self.auth.extract_csrf_value(page2.text, csrf_field)
             except Exception:
               pass
@@ -377,14 +397,14 @@ class BusinessLogicProbes(ProbeBase):
             headers2["X-CSRFToken"] = csrf_token
 
           try:
-            resp2 = self.auth.official_session.post(
+            resp2 = self.auth.primary_session.post(
               url, data=payload2, headers=headers2,
               timeout=10, allow_redirects=False,
             )
           except Exception:
             resp2 = None
 
-          if resp2 is not None:
+          if resp2 is not None and self.response_reached(resp2):
             accepted2 = resp2.status_code in (301, 302)
             if not accepted2 and resp2.status_code == 200:
               body_lower = resp2.text.lower()
@@ -415,15 +435,22 @@ class BusinessLogicProbes(ProbeBase):
                     "and business state machine transitions. "
                     "Never rely on client-side validation alone.",
       ))
-    elif endpoints:
+    elif tested:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A06-02",
         title="Business logic validation — no bypass detected",
         status="not_vulnerable",
         severity="INFO",
         owasp="A06:2021",
-        evidence=[f"endpoints_tested={len(endpoints)}"],
+        evidence=[f"endpoints_tested={tested}"],
       ))
+    elif denied:
+      self.emit_endpoint_denied("PT-A06-02")
+    else:
+      self.emit_inconclusive(
+        "PT-A06-02", "Business logic validation bypass", "A06:2021",
+        "no_evaluable_responses",
+      )
 
     # PT-A06-04 — Negative amount accepted (strict subset of PT-A06-02).
     # Always emit one finding so coverage accounting shows the probe ran.
@@ -447,12 +474,19 @@ class BusinessLogicProbes(ProbeBase):
                     "validation alone is insufficient — always re-validate at "
                     "the model or service boundary.",
       ))
-    elif endpoints:
+    elif tested:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A06-04",
         title="Negative amount — guard held",
         status="not_vulnerable",
         severity="INFO",
         owasp="A04:2021",
-        evidence=[f"endpoints_tested={len(endpoints)}"],
+        evidence=[f"endpoints_tested={tested}"],
       ))
+    elif denied:
+      self.emit_endpoint_denied("PT-A06-04")
+    else:
+      self.emit_inconclusive(
+        "PT-A06-04", "Negative amount accepted", "A04:2021",
+        "no_evaluable_responses",
+      )

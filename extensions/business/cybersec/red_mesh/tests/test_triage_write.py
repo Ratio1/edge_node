@@ -87,6 +87,7 @@ class TestTriageWrite(unittest.TestCase):
                      ("false_positive", TENANT_A, HOST, "job-1", "analyst"))
     self.assertEqual(triage._job_repo(self.owner).get_host_triage_audit(TENANT_A, HOST, "f1")[0]["actor"], "analyst")
     self.assertEqual(emit.call_args.kwargs["event_action"], "triaged")
+    self.assertEqual(emit.call_args.kwargs["finding"]["triage_entry_id"], stored["audit_entry_id"])
     self.assertEqual(self.owner.audit[0][0], "finding_triage_updated")
     self.assertNotIn("inst:triage", self.owner.hashes)  # nothing under the legacy keys
 
@@ -224,6 +225,370 @@ class TestTriageWrite(unittest.TestCase):
     self.assertIn(f"{HOST}\x1ff1", self.owner.hashes[self.hkey])
     retry, _ = write(self.owner, ids=["f1", "f2"], status="remediated")
     self.assertEqual([r["outcome"] for r in retry["results"]], ["unchanged", "updated"])
+
+  def _refuse_writes_to(self, hkey):
+    """The store refuses (returns False) every write to `hkey`, as CStore does when it cannot store a key."""
+    real = self.owner.chainstore_hset
+
+    def refusing(**kwargs):
+      if kwargs["hkey"] == hkey:
+        return False
+      return real(**kwargs)
+    self.owner.chainstore_hset = refusing
+
+  def test_a_refused_state_write_is_reported_and_nothing_follows_it(self):
+    self.owner.hashes["inst"]["job-1"]["soc_event_status"] = {}
+    self._refuse_writes_to(self.hkey)
+    with patch.object(triage, "_write_job_record") as soc_write:
+      result, emit = write(self.owner, ids=["f1", "f2"])
+    self.assertEqual([(r["finding_id"], r["outcome"], r.get("retryable")) for r in result["results"]],
+                     [("f1", "write_failed", True), ("f2", "write_failed", True)])
+    self.assertFalse(result["complete"])
+    emit.assert_not_called()
+    soc_write.assert_not_called()
+    self.assertEqual(self.owner.audit, [])
+    self.assertNotIn(f"inst:triage:audit:{TENANT_A}", self.owner.hashes)
+
+  def test_a_refused_audit_write_is_reported(self):
+    self.owner.hashes["inst"]["job-1"]["soc_event_status"] = {}
+    self._refuse_writes_to(f"inst:triage:audit:{TENANT_A}")
+    with patch.object(triage, "_write_job_record") as soc_write:
+      result, emit = write(self.owner, ids="f1")
+    self.assertEqual([(r["outcome"], r.get("retryable")) for r in result["results"]], [("write_failed", True)])
+    self.assertFalse(result["complete"])
+    emit.assert_not_called()
+    soc_write.assert_not_called()
+    self.assertEqual(self.owner.audit, [])
+
+  def test_a_retry_after_a_refused_audit_write_writes_the_entry_once(self):
+    real = self.owner.chainstore_hset
+    self._refuse_writes_to(f"inst:triage:audit:{TENANT_A}")
+    write(self.owner, ids="f1")
+    self.owner.chainstore_hset = real
+    retry, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in retry["results"]], ["updated"])
+    emit.assert_called_once()
+    self.assertEqual(len(self._audit()), 1)
+
+  def test_a_pruned_audit_entry_is_not_written_again(self):
+    write(self.owner, ids="f1")
+    audit_hkey = f"inst:triage:audit:{TENANT_A}"
+    (field,) = self.owner.hashes[audit_hkey]
+    self.owner.hashes[audit_hkey][field] = None  # a tombstone: hkeys lists it, hget reads None
+    again, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in again["results"]], ["unchanged"])
+    emit.assert_not_called()
+
+  def test_a_refused_write_leaves_the_ledger_unpersisted(self):
+    self._refuse_writes_to(self.hkey)
+    ledger = EffectLedger()
+    with patch.object(triage, "emit_finding_event"):
+      triage.update_finding_triage(self.owner, "job-1", "f1", "remediated", actor="a", ledger=ledger)
+    self.assertNotEqual(ledger.state, EffectState.PERSISTED)
+
+  def _audit(self):
+    return triage._job_repo(self.owner).get_host_triage_audit(TENANT_A, HOST, "f1")
+
+  def test_a_retry_completes_an_audit_entry_lost_after_the_state_write_exactly_once(self):
+    real = triage.JobStateRepository.append_host_triage_audit
+    with patch.object(triage.JobStateRepository, "append_host_triage_audit", side_effect=RuntimeError("down")):
+      with self.assertRaises(RuntimeError):
+        write(self.owner, ids="f1", note="why")
+    self.assertEqual(self.owner.hashes[self.hkey][f"{HOST}\x1ff1"]["status"], "false_positive")
+    self.assertEqual(self._audit(), [])
+    self.owner.now = 2000.0  # the retry comes later
+    with patch.object(triage.JobStateRepository, "append_host_triage_audit", autospec=True, side_effect=real) as spy:
+      retry, emit = write(self.owner, ids="f1", note="why")
+    self.assertEqual(spy.call_count, 1)
+    self.assertEqual([r["outcome"] for r in retry["results"]], ["updated"])
+    self.assertTrue(retry["complete"])
+    emit.assert_called_once()
+    (entry,) = self._audit()
+    self.assertEqual((entry["status"], entry["note"], entry["actor"], entry["timestamp"]),
+                     ("false_positive", "why", "analyst", 1000.0))  # the change as made, not the retry time
+    again, emit = write(self.owner, ids="f1", note="why")
+    self.assertEqual([r["outcome"] for r in again["results"]], ["unchanged"])
+    emit.assert_not_called()
+    self.assertEqual(len(self._audit()), 1)
+
+  def test_a_state_and_its_audit_entry_share_one_id(self):
+    write(self.owner, ids="f1")
+    stored = self.owner.hashes[self.hkey][f"{HOST}\x1ff1"]
+    (field,) = self.owner.hashes[f"inst:triage:audit:{TENANT_A}"]
+    self.assertTrue(field.endswith(f"\x1f{stored['audit_entry_id']}"))
+
+  def test_a_record_without_an_audit_id_is_left_alone_on_an_unchanged_write(self):
+    write(self.owner, ids="f1")
+    del self.owner.hashes[self.hkey][f"{HOST}\x1ff1"]["audit_entry_id"]  # written by an older node
+    self.owner.hashes[f"inst:triage:audit:{TENANT_A}"].clear()
+    again, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in again["results"]], ["unchanged"])
+    emit.assert_not_called()
+    self.assertEqual(self._audit(), [])
+
+
+  def _unconfirmed_writes_to(self, hkey):
+    """Writes to `hkey` land locally but return False, as CStore does when the peers do not confirm in time."""
+    real = self.owner.chainstore_hset
+    calls = []
+
+    def unconfirmed(**kwargs):
+      real(**kwargs)
+      calls.append(kwargs["hkey"])
+      return kwargs["hkey"] != hkey
+    self.owner.chainstore_hset = unconfirmed
+    return real, calls
+
+  def test_a_retry_after_an_unconfirmed_state_write_writes_it_again_before_reporting_success(self):
+    real, _ = self._unconfirmed_writes_to(self.hkey)
+    first, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in first["results"]], ["write_failed"])
+    emit.assert_not_called()
+    self.owner.chainstore_hset = real
+    _, calls = self._unconfirmed_writes_to(None)  # every write confirmed from here on
+    retry, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in retry["results"]], ["updated"])
+    self.assertTrue(retry["complete"])
+    self.assertIn(self.hkey, calls)  # the state is written again, and confirmed this time
+    emit.assert_called_once()
+    self.assertEqual(len(self._audit()), 1)
+    again, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in again["results"]], ["unchanged"])
+    emit.assert_not_called()
+
+  def test_a_retry_after_an_unconfirmed_audit_write_writes_it_again_and_emits_the_event(self):
+    audit_hkey = f"inst:triage:audit:{TENANT_A}"
+    real, _ = self._unconfirmed_writes_to(audit_hkey)
+    first, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in first["results"]], ["write_failed"])
+    self.assertEqual(len(self._audit()), 1)  # the entry is stored locally, but not confirmed
+    emit.assert_not_called()
+    self.owner.chainstore_hset = real
+    _, calls = self._unconfirmed_writes_to(None)
+    retry, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in retry["results"]], ["updated"])
+    self.assertTrue(retry["complete"])
+    self.assertIn(audit_hkey, calls)
+    emit.assert_called_once()
+    self.assertEqual(len(self._audit()), 1)
+
+  def test_a_new_status_finishes_the_missing_audit_entry_of_the_previous_one_first(self):
+    real = self.owner.chainstore_hset
+    self._refuse_writes_to(f"inst:triage:audit:{TENANT_A}")
+    write(self.owner, ids="f1", status="false_positive")
+    self.owner.chainstore_hset = real
+    self.owner.now = 2000.0
+    second, emit = write(self.owner, ids="f1", status="reopened")
+    self.assertEqual([r["outcome"] for r in second["results"]], ["updated"])
+    self.assertEqual(sorted((e["timestamp"], e["status"]) for e in self._audit()),
+                     [(1000.0, "false_positive"), (2000.0, "reopened")])
+    self.assertEqual([c.kwargs["finding"]["triage_state"] for c in emit.call_args_list], ["false_positive", "reopened"])
+    self.assertEqual(self.owner.hashes[self.hkey][f"{HOST}\x1ff1"]["status"], "reopened")
+
+  def test_after_a_restart_a_new_status_still_finishes_a_missing_audit_entry(self):
+    real = self.owner.chainstore_hset
+    self._refuse_writes_to(f"inst:triage:audit:{TENANT_A}")
+    write(self.owner, ids="f1", status="false_positive")
+    self.owner.chainstore_hset = real
+    self.owner.__dict__.pop("_triage_unfinished_writes", None)  # the launcher restarted
+    self.owner.now = 2000.0
+    write(self.owner, ids="f1", status="reopened")
+    self.assertEqual(sorted(e["status"] for e in self._audit()), ["false_positive", "reopened"])
+
+  def test_a_refused_state_write_is_not_finished_by_the_next_request(self):
+    real = self.owner.chainstore_hset
+    self._refuse_writes_to(self.hkey)
+    write(self.owner, ids="f1", status="false_positive")  # nothing stored
+    self.owner.chainstore_hset = real
+    second, emit = write(self.owner, ids="f1", status="remediated")
+    self.assertEqual([e["status"] for e in self._audit()], ["remediated"])
+    emit.assert_called_once()
+
+
+  def _record(self):
+    return self.owner.hashes[self.hkey][f"{HOST}\x1ff1"]
+
+  def _audit_field(self, entry_id):
+    return f"{HOST}\x1ff1\x1f{entry_id}"
+
+  def _logged_writes(self):
+    real = self.owner.chainstore_hset
+    calls = []
+
+    def logged(**kwargs):
+      calls.append((kwargs["hkey"], kwargs["key"]))
+      return real(**kwargs)
+    self.owner.chainstore_hset = logged
+    return calls
+
+  def test_a_new_status_rewrites_an_unconfirmed_audit_entry_before_replacing_the_record(self):
+    audit_hkey = f"inst:triage:audit:{TENANT_A}"
+    real, _ = self._unconfirmed_writes_to(audit_hkey)
+    write(self.owner, ids="f1", status="false_positive")
+    first_id = self._record()["audit_entry_id"]
+    self.owner.chainstore_hset = real
+    calls = self._logged_writes()
+    self.owner.now = 2000.0
+    second, emit = write(self.owner, ids="f1", status="reopened")
+    self.assertEqual([r["outcome"] for r in second["results"]], ["updated"])
+    self.assertLess(calls.index((audit_hkey, self._audit_field(first_id))), calls.index((self.hkey, f"{HOST}\x1ff1")))
+    self.assertEqual([c.kwargs["finding"]["triage_state"] for c in emit.call_args_list], ["false_positive", "reopened"])
+
+  def test_an_unconfirmed_audit_entry_is_written_again_after_another_launcher_replaced_the_record(self):
+    audit_hkey = f"inst:triage:audit:{TENANT_A}"
+    real, _ = self._unconfirmed_writes_to(audit_hkey)
+    write(self.owner, ids="f1", status="false_positive")
+    first_id = self._record()["audit_entry_id"]
+    self.owner.chainstore_hset = real
+    # a sibling job's launcher on another node set the same (tenant, host, finding) and its change replicated here
+    self.owner.hashes[self.hkey][f"{HOST}\x1ff1"] = dict(self._record(), status="remediated", audit_entry_id="other")
+    self.owner.hashes[audit_hkey][self._audit_field("other")] = {"status": "remediated"}
+    calls = self._logged_writes()
+    write(self.owner, ids="f1", status="reopened")
+    self.assertIn((audit_hkey, self._audit_field(first_id)), calls)
+    # the confirmed false_positive state is not written again over the newer record: one state write, for reopened
+    self.assertEqual(calls.count((self.hkey, f"{HOST}\x1ff1")), 1)
+    self.assertEqual(self._record()["status"], "reopened")
+
+  def test_a_state_write_that_stored_nothing_is_dropped_not_finished(self):
+    write(self.owner, ids="f1", status="false_positive")
+    real = self.owner.chainstore_hset
+    self._refuse_writes_to(self.hkey)
+    write(self.owner, ids="f1", status="remediated")  # refused: the record still holds false_positive
+    self.owner.chainstore_hset = real
+    third, emit = write(self.owner, ids="f1", status="reopened")
+    self.assertEqual([r["outcome"] for r in third["results"]], ["updated"])
+    self.assertEqual([c.kwargs["finding"]["triage_state"] for c in emit.call_args_list], ["reopened"])
+    self.assertEqual(sorted(e["status"] for e in self._audit()), ["false_positive", "reopened"])
+
+  def test_an_event_emitted_before_a_failed_write_persists_the_soc_status(self):
+    self.owner.hashes["inst"]["job-1"]["soc_event_status"] = {}
+    real, _ = self._unconfirmed_writes_to(f"inst:triage:audit:{TENANT_A}")
+    write(self.owner, ids="f1", status="false_positive")
+    self.owner.chainstore_hset = real
+    self._refuse_writes_to(self.hkey)
+    with patch.object(triage, "_write_job_record") as soc_write:
+      second, emit = write(self.owner, ids="f1", status="reopened")
+    self.assertEqual([r["outcome"] for r in second["results"]], ["write_failed"])
+    emit.assert_called_once()  # the finished false_positive change
+    soc_write.assert_called_once()
+
+  def test_an_event_that_failed_after_a_confirmed_audit_entry_is_emitted_by_the_retry(self):
+    with patch.object(triage, "emit_finding_event", side_effect=RuntimeError("event bus down")):
+      with self.assertRaises(RuntimeError):
+        triage.update_finding_triage(self.owner, "job-1", "f1", "false_positive", actor="analyst")
+    self.assertEqual(len(self._audit()), 1)  # state and audit entry confirmed, the event not emitted
+    calls = self._logged_writes()
+    retry, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in retry["results"]], ["updated"])
+    emit.assert_called_once()
+    self.assertEqual(calls, [])  # both writes were confirmed: the retry only emits
+    self.assertEqual(len(self._audit()), 1)
+    again, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in again["results"]], ["unchanged"])
+    emit.assert_not_called()
+
+  def test_a_failed_soc_delivery_is_reported_and_sent_again_by_the_next_request(self):
+    failed = {"status": "error", "integration_id": "wazuh", "error": "ConnectionError"}
+    with patch.object(triage, "emit_finding_event", return_value=failed):
+      first = triage.update_finding_triage(self.owner, "job-1", "f1", "false_positive", actor="analyst")
+    self.assertEqual([(r["outcome"], r.get("soc_event")) for r in first["results"]], [("updated", "error")])
+    self.assertTrue(first["complete"])  # state and audit are stored; only the SIEM copy is late
+    retry, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in retry["results"]], ["updated"])
+    emit.assert_called_once()
+    entry_id = self.owner.hashes[self.hkey][f"{HOST}\x1ff1"]["audit_entry_id"]
+    self.assertEqual(emit.call_args.kwargs["finding"]["triage_entry_id"], entry_id)  # the same change, the same key
+    self.assertEqual(len(self._audit()), 1)
+    again, emit = write(self.owner, ids="f1")
+    self.assertEqual([r["outcome"] for r in again["results"]], ["unchanged"])
+    emit.assert_not_called()
+
+  def test_a_skipped_or_invalid_soc_event_is_not_sent_again(self):
+    for result in ({"status": "skipped", "error": "event_export_disabled"},
+                   {"status": "error", "integration_id": "wazuh", "error": "invalid_event"}):
+      owner = _Owner()
+      owner.add_job("job-1")
+      with patch.object(triage, "emit_finding_event", return_value=result):
+        first = triage.update_finding_triage(owner, "job-1", "f1", "false_positive", actor="analyst")
+      self.assertNotIn("soc_event", first["results"][0])
+      again, emit = write(owner, ids="f1")
+      self.assertEqual([r["outcome"] for r in again["results"]], ["unchanged"])
+      emit.assert_not_called()
+
+  def test_an_audit_only_finish_records_the_write_on_the_ledger(self):
+    real, _ = self._unconfirmed_writes_to(f"inst:triage:audit:{TENANT_A}")
+    write(self.owner, ids="f1")
+    self.owner.chainstore_hset = real
+    ledger = EffectLedger()
+    with patch.object(triage, "emit_finding_event"):
+      retry = triage.update_finding_triage(self.owner, "job-1", "f1", "false_positive", actor="analyst",
+                                           ledger=ledger)
+    self.assertEqual([r["outcome"] for r in retry["results"]], ["updated"])
+    self.assertEqual(ledger.state, EffectState.PERSISTED)
+
+  def test_two_launchers_lose_no_status_from_the_audit(self):
+    # Launcher B runs a sibling job on the same host and shares the store with launcher A.
+    other = _Owner()
+    other.ee_addr, other.hashes, other.archives = "node-b", self.owner.hashes, self.owner.archives
+    other.add_job("job-2", launcher="node-b")
+    audit_hkey = f"inst:triage:audit:{TENANT_A}"
+
+    def refuse_audit_of(owner, refused):
+      real = owner.chainstore_hset
+
+      def refusing(**kwargs):
+        if kwargs["hkey"] == audit_hkey and kwargs["value"] and kwargs["value"].get("status") == refused:
+          return False
+        return real(**kwargs)
+      owner.chainstore_hset = refusing
+      return real
+    real_a = refuse_audit_of(self.owner, "false_positive")
+    write(self.owner, ids="f1", status="false_positive")  # A: state confirmed, audit entry not stored
+    real_b = refuse_audit_of(other, "remediated")
+    other.now = 2000.0
+    write(other, job_id="job-2", ids="f1", status="remediated")  # B finishes A's entry, its own is not stored
+    self.owner.chainstore_hset, other.chainstore_hset = real_a, real_b
+    self.owner.now = 3000.0
+    result, emit = write(self.owner, ids="f1", status="reopened")
+    self.assertEqual([r["outcome"] for r in result["results"]], ["updated"])
+    self.assertEqual(sorted((e["timestamp"], e["status"]) for e in self._audit()),
+                     [(1000.0, "false_positive"), (2000.0, "remediated"), (3000.0, "reopened")])
+    self.assertEqual(self._record()["status"], "reopened")
+
+  def test_an_unfinished_change_whose_record_was_deleted_elsewhere_does_not_come_back(self):
+    real = self.owner.chainstore_hset
+    self._refuse_writes_to(f"inst:triage:audit:{TENANT_A}")
+    write(self.owner, ids="f1", status="false_positive", note="old note")
+    self.owner.chainstore_hset = real
+    # a purge on another node deleted the record (and the audit): this launcher's map was not cleared
+    self.owner.hashes[self.hkey].clear()
+    self.owner.add_job("job-2")
+    result, emit = write(self.owner, job_id="job-2", ids="f1", status="remediated", note="new")
+    self.assertEqual([r["outcome"] for r in result["results"]], ["updated"])
+    self.assertEqual([(e["job_id"], e["note"]) for e in self._audit()], [("job-2", "new")])
+    emit.assert_called_once()
+
+  def test_a_malformed_record_with_a_missing_audit_entry_does_not_block_writes(self):
+    self.owner.hashes.setdefault(self.hkey, {})[f"{HOST}\x1ff1"] = {
+      "finding_id": "f1", "tenant_id": TENANT_A, "host": HOST, "status": "bogus", "audit_entry_id": "x"}
+    result, emit = write(self.owner, ids="f1", status="remediated")
+    self.assertEqual([r["outcome"] for r in result["results"]], ["updated"])
+    self.assertEqual([e["status"] for e in self._audit()], ["remediated"])
+
+  def test_a_record_naming_another_tenant_host_or_finding_is_never_replayed_or_replaced(self):
+    write(self.owner, ids="f1", status="false_positive")
+    good = deepcopy(self._record())
+    for foreign in ({"tenant_id": TENANT_B}, {"host": "198.51.100.7"}, {"finding_id": "f2"}, {"tenant_id": None}):
+      self.owner.hashes[self.hkey][f"{HOST}\x1ff1"] = dict(good, audit_entry_id="lost", **foreign)
+      calls = self._logged_writes()
+      with patch.object(triage, "emit_finding_event") as emit:
+        result = triage.update_finding_triage(self.owner, "job-1", "f1", "remediated", actor="analyst")
+      self.owner.chainstore_hset = self.owner.__class__.chainstore_hset.__get__(self.owner)
+      self.assertEqual(result["results"], [{"finding_id": "f1", "outcome": "store_inconsistent"}], foreign)
+      self.assertFalse(result["complete"])
+      self.assertEqual(calls, [], foreign)  # fail closed: no replay to the row's own tenant, no overwrite
+      emit.assert_not_called()
 
 
 if __name__ == "__main__":

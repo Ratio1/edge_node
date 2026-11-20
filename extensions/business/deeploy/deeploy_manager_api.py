@@ -3,6 +3,7 @@
 Needs configuration based on injected `EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER`
 
 """
+import re
 import threading
 
 from naeural_core.main.net_mon import NetMonCt
@@ -13,7 +14,9 @@ from .deployment_operations import (
 )
 
 from .deployment_mutations import _DeploymentMutationsMixin
+from .job_repair import _JobRepairMixin, MUTATION as SAME_HOST_REPAIR
 from .deeploy_mixin import _DeeployMixin
+from .delegate_aliases import _DelegateAliasesMixin  # Optional metadata stays separate from deployment behavior.
 from .selected_secrets import compile_request_selections
 from .deeploy_chainstore_response_mixin import _DeeployChainstoreResponseMixin
 from .deeploy_target_nodes_mixin import _DeeployTargetNodesMixin
@@ -73,12 +76,14 @@ _CONFIG = {
 class DeeployManagerApiPlugin(
   BasePlugin,
   _DeeployMixin,
+  _DelegateAliasesMixin,  # Share alias validation and CStore persistence across both endpoints.
   _DeeployChainstoreResponseMixin,
   _DeeployTargetNodesMixin,
   _NodeTagsMixin,
   _DeeployJobMixin,
   _DeploymentOperationsMixin,
   _DeploymentMutationsMixin,
+  _JobRepairMixin,
   _RequestTrackingMixin,
   ):
   """
@@ -385,6 +390,68 @@ class DeeployManagerApiPlugin(
       result[DEEPLOY_KEYS.TRACE] = lines[-20:-1]
     return result
     
+
+  @BasePlugin.endpoint(method="post")
+  def get_delegate_aliases(self, request: dict):
+    """
+    Read optional aliases for active delegates of the authenticated CSP.
+
+    Parameters
+    ----------
+    request : dict
+        Signed Deeploy payload with ``delegate_addresses`` (at most 10).
+
+    Returns
+    -------
+    dict
+        Standard Deeploy response with ``aliases`` on success or ``error``
+        on failure. Missing aliases are omitted.
+
+    Examples
+    --------
+    >>> plugin.get_delegate_aliases(signed_request)['aliases']
+    {}
+    """
+    try:
+      _, inputs = self.deeploy_verify_and_get_inputs(request, request_type="get delegate aliases")  # Authenticate the complete read payload and active CSP membership.
+      auth_result = self.deeploy_get_auth_result(inputs)  # Reuse the established escrow resolution contract.
+      aliases = self.deeploy_load_delegate_aliases(auth_result, inputs.get("delegate_addresses"))  # Verify targets and read only this CSP's metadata.
+      result = {DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS, "aliases": aliases}
+    except Exception as exc:
+      result = self.__handle_error(exc, request)  # Preserve the existing API failure envelope.
+    return self._get_response(result)  # Keep response signing and server metadata unchanged.
+
+  @BasePlugin.endpoint(method="post")
+  def set_delegate_alias(self, request: dict):
+    """
+    Set or clear one optional delegate alias as the escrow owner.
+
+    Parameters
+    ----------
+    request : dict
+        Signed Deeploy payload with ``delegate_address`` and string ``alias``.
+        A blank alias clears the label without touching permissions.
+
+    Returns
+    -------
+    dict
+        Standard Deeploy response with normalized ``delegate_address`` and
+        ``alias`` on success, or ``error`` on failure.
+
+    Examples
+    --------
+    >>> plugin.set_delegate_alias(signed_clear_request)['alias']
+    ''
+    """
+    try:
+      sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type="set delegate alias")  # Verify the signature before using any caller-supplied fields.
+      auth_result = self.deeploy_get_auth_result(inputs)  # Resolve scope from the signer, not request parameters.
+      saved = self.deeploy_set_delegate_alias(sender, auth_result, inputs.get("delegate_address"), inputs.get("alias"))  # Owner and membership checks precede the per-address write.
+      result = {DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS, **saved}
+    except Exception as exc:
+      result = self.__handle_error(exc, request)  # Storage, validation, and auth failures use the standard envelope.
+    return self._get_response(result)  # Preserve the established response wrapper.
+
 
   @BasePlugin.endpoint(method="post")
   # /get_apps
@@ -709,6 +776,7 @@ class DeeployManagerApiPlugin(
     self,
     request: dict,
     is_create: bool = True,
+    repair_update: bool = False,
   ):
     """
     Common logic for processing pipeline create/update requests.
@@ -734,6 +802,12 @@ class DeeployManagerApiPlugin(
     try:
       self.__ensure_eth_balance()
       request_type = "create pipeline" if is_create else "update pipeline"
+      if repair_update:
+        if not request.get("EE_HASH") or not isinstance(request.get("repair"), dict):
+          raise ValueError("The repair requires a versioned signed wallet update.")
+        request_type = "repair update pipeline"
+      elif "repair" in request:
+        raise ValueError("Send a reviewed recovery only to the signed repair endpoint.")
       sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type=request_type)
       normalized_request = self._normalize_plugins_input(
         self.deepcopy(request),
@@ -757,10 +831,19 @@ class DeeployManagerApiPlugin(
         job_app_type = submitted_job_app_type
       auth_result = self.deeploy_get_auth_result(inputs)
       job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
-      existing_operation = self._find_request_operation(
-        request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
-        "create" if is_create else "update",
-      )
+      repair = None
+      if repair_update:
+        proposal = request["repair"].get("proposal") or {}
+        if proposal.get("coordinator") != self.bc.address:
+          raise DeploymentConflictError("Submit recovery to the original coordinator.")
+        # The authenticated editor can be a delegate. The saved operation is scoped to the escrow owner.
+        existing_operation = self._find_request_operation(
+          request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], "update",
+          repair_parent=(proposal.get("parent") or {}).get("operation_id"),
+        )
+      else:
+        existing_operation = self._find_request_operation(
+          request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], "create" if is_create else "update")
       if existing_operation:
         return self._accepted_operation_response(existing_operation)
       # Readiness is always reported by the node lifecycle service.
@@ -1094,10 +1177,13 @@ class DeeployManagerApiPlugin(
       prior_pipeline = None if is_create else self.get_job_pipeline_from_cstore(
         job_id, timeout=30, pin=False, raise_on_error=False, show_logs=False,
       )
+      if repair_update:
+        # All ordinary payment, plugin, resource and availability checks have succeeded before inspecting any worker.
+        repair = self._prepare_job_repair(request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER])
       return self._admit_prepared_deployment(
         request=request, auth_result=auth_result, app_id=app_id,
         configs=prepared_pipeline_configs, prior_pipeline=prior_pipeline,
-        is_create=is_create,
+        is_create=is_create, **({"repair": repair, "mutation": SAME_HOST_REPAIR} if repair_update else {}),
       )
     except DeploymentConflictError as exc:
       result = {"status_code": 409, "status": "error",
@@ -1285,11 +1371,11 @@ class DeeployManagerApiPlugin(
           The provided keys are merged into the pipeline configuration at the top level.
 
       service_kind : str, optional
-          Stable managed-service identity. Existing legacy CockroachDB jobs are detected and backfilled on update.
+          Stable managed-service identity. Existing legacy R1DB jobs are detected and backfilled on update.
 
       cockroachdb_certificate_regeneration_id : str, optional
-          UUIDv4 operation id for an explicit full-fleet CockroachDB TLS certificate regeneration.
-          Valid only for CockroachDB service updates with all-node response confirmation enabled.
+          UUIDv4 operation id for an explicit full-fleet R1DB TLS certificate regeneration.
+          Valid only for R1DB service updates with all-node response confirmation enabled.
 
       nonce : str
           The nonce used for signing the request
@@ -1340,6 +1426,64 @@ class DeeployManagerApiPlugin(
       )
     )
     return self._process_pipeline_request(request, is_create=False)
+
+  @BasePlugin.endpoint(method="post")
+  def get_job_repair_preview(self, request: dict):
+    """Assess an owner-selected job without sending worker commands or changing custody.
+
+    Parameters
+    ----------
+    request : dict
+      Versioned wallet envelope binding a fresh nonce, job ID and original coordinator.
+
+    Returns
+    -------
+    dict
+      Reviewable correction or reason the current observation blocks recovery.
+
+    Examples
+    --------
+    >>> preview = oracle.get_job_repair_preview(request)  # doctest: +SKIP
+    """
+    try:
+      job_id, coordinator = request.get("job_id"), request.get("coordinator")
+      nonce = request.get("nonce")
+      if not isinstance(nonce, str) or not nonce.strip():
+        raise ValueError("A nonce is required for the repair preview.")
+      if not re.fullmatch(r"0x[0-9a-fA-F]{1,16}", nonce):
+        raise ValueError("The repair preview nonce must be a hexadecimal timestamp.")
+      if not request.get("EE_HASH") or type(job_id) is not int or job_id <= 0 or not isinstance(coordinator, str) or not coordinator:
+        raise ValueError("The repair preview requires a signed job ID and coordinator.")
+      _, inputs = self.deeploy_verify_and_get_inputs(request, request_type="get job repair preview")
+      owner = self.deeploy_get_auth_result(inputs)[DEEPLOY_KEYS.ESCROW_OWNER]
+      if coordinator != self.bc.address:
+        raise DeploymentConflictError("This receiver is not the original coordinator. Check the pinned repair endpoint.")
+      proposal = self._assess_job_repair(job_id, owner, coordinator)[0]
+      return self._get_response(dict(status="reviewable", proposal=proposal))
+    except ValueError as exc:
+      return self._get_response(dict(status="blocked", reason=str(exc)))
+    except Exception:
+      return self._get_response(dict(status="blocked", reason="The current job, license or worker evidence is unavailable."))
+
+  @BasePlugin.endpoint(method="post")
+  def repair_update_pipeline(self, request: dict):
+    """Accept a CSP-signed legacy correction and update on its original coordinator.
+
+    Parameters
+    ----------
+    request : dict
+      Versioned fix, placement and ordinary edit under a dedicated wallet signature.
+
+    Returns
+    -------
+    dict
+      Existing deployment acceptance or structured admission error.
+
+    Examples
+    --------
+    >>> result = oracle.repair_update_pipeline(wallet_request)  # doctest: +SKIP
+    """
+    return self._process_pipeline_request(request, is_create=False, repair_update=True)
 
   @BasePlugin.endpoint(method="post")
   def get_deployment_status(self, request: dict):

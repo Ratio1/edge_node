@@ -5,7 +5,7 @@ import unittest
 
 from extensions.business.cybersec.red_mesh import cve_db
 from extensions.business.cybersec.red_mesh.findings import _finding_to_jsonable
-from extensions.business.cybersec.red_mesh.cve_view import build_cve_view, filter_listed
+from extensions.business.cybersec.red_mesh.cve_view import MAX_SUMMARY_ROWS, build_cve_view, filter_listed
 from extensions.business.cybersec.red_mesh.llm_input_builder import _sanitize_finding, build_llm_input
 from extensions.business.cybersec.red_mesh.mixins.risk import _RiskScoringMixin
 from extensions.business.cybersec.red_mesh.vulndb.reader import load_vulndb
@@ -298,6 +298,29 @@ class RiskAndConsumerTests(unittest.TestCase):
     static = build_llm_input(findings=[dict(f, vulndb_build_id=None) for f in findings], aggregated_report={})
     self.assertNotIn("cve_view", static.scan_summary)
     self.assertEqual(len(static.findings), 3)
+
+  def test_llm_view_summary_is_bounded_across_services(self):
+    # 100 services, each with a listed, a rolled-up and a possible CVE. The summary keeps MAX_SUMMARY_ROWS rows of
+    # each kind, the KEV and highest-CVSS ones first, and counts the rows it left out.
+    findings = []
+    for port in range(1, 101):
+      n = 3 * port
+      findings += [raw(n, kev=True, port=port), raw(n + 1, score=5.0 if port != 70 else 6.0, port=port),
+                   raw(n + 2, confidence="tentative", reason="banner_only", port=port, score=9.0 if port == 90 else 4.0)]
+    summary = build_llm_input(findings=findings, aggregated_report={}, max_findings=1).scan_summary["cve_view"]
+    self.assertEqual((len(summary["rollups"]), summary["omitted_rollups"]), (MAX_SUMMARY_ROWS, 100 - MAX_SUMMARY_ROWS))
+    self.assertEqual((len(summary["possible"]), summary["omitted_possible"]), (MAX_SUMMARY_ROWS, 100 - MAX_SUMMARY_ROWS))
+    self.assertEqual(summary["rollups"][0]["port"], 70)
+    self.assertEqual(summary["possible"][0]["port"], 90)
+    self.assertEqual(summary["counts"]["possible"], 100)
+
+  def test_llm_view_summary_ranks_a_non_numeric_score_as_no_score(self):
+    # A worker-supplied numeric string ranks like a missing score, as the finding path's _safe_float reads it.
+    findings = [raw(1, confidence="tentative", reason="banner_only", port=22, score="7.5"),
+                raw(2, confidence="tentative", reason="banner_only", port=80, score=5.0)]
+    summary = build_llm_input(findings=findings, aggregated_report={}, max_findings=1).scan_summary["cve_view"]
+    self.assertEqual([p["port"] for p in summary["possible"]], [80, 22])
+    self.assertIsNone(summary["possible"][1]["top"][0]["score"])
 
   def test_llm_kev_follows_the_generated_tri_state(self):
     out = lambda **kw: _sanitize_finding(dict(raw(1), cvss_data_freshness="", **kw))

@@ -1,7 +1,7 @@
 {
   "version": "OWASP Top 10 2021",
-  "last_refreshed": "2026-05-04",
-  "source": "https://owasp.org/Top10/ — per-category CWE mappings",
+  "last_refreshed": "2026-11-19",
+  "source": "https://top10.owasp.org/2021/ — per-category CWE mappings",
   "note": "CWE -> [OWASP categories]. Most CWEs map to a single category; some are surfaced by multiple categories (e.g. CWE-200 spans A01 and A05).",
   "mappings": {
     "16":   ["A05:2021"],

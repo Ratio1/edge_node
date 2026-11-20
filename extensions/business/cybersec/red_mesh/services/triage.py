@@ -7,6 +7,7 @@ from ..model_testing.artifacts import ModelTestArchive
 from ..model_testing.constants import is_model_test_job
 from ..models import FindingTriageAuditEntry, FindingTriageState, JobArchive, VALID_TRIAGE_STATUSES
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..repositories.cstore import TriageStoreError
 from ..tenancy.administration import AdministrationDenied
 from ..tenancy.job_artifacts import (
   MAX_ARTIFACT_REFERENCES, TenantJobArtifacts, checked_job_snapshot, validate_snapshot_mode,
@@ -120,8 +121,7 @@ def _checked_triage_map(owner, job, archive, finding_id=""):
       state = deepcopy(repo.get_host_triage(tenant_id, host, identifier))
       if state is None:
         continue
-      if (not isinstance(state, dict) or state.get("finding_id") != identifier
-          or state.get("tenant_id") != tenant_id or state.get("host") != host):
+      if not isinstance(state, dict) or not _names_key(state, tenant_id, host, identifier):
         raise ValueError("Invalid finding state identity")
       result[identifier] = FindingTriageState.from_dict(state).to_dict()
     return result
@@ -202,9 +202,21 @@ def update_finding_triage(owner, job_id: str, finding_ids, status: str, note: st
   Tenant and host come from the job's own execution binding; `actor` is the server-resolved account, never
   a body field. A pending rulebook submission on any job of the same tenant and host blocks the write: the
   locks of every such job are taken in sorted `(job_id, profile_id)` order, the order purge uses, so no two
-  takers can wait on each other. The locks are per process; the pending registry read below is what holds
-  across nodes. A set of findings (a dismissed rollup) is written one record each, because CStore has no
+  takers can wait on each other. The locks are per process. Across nodes only the pending registry read below
+  applies, and a read is not a lock: a submission that a sibling job's launcher on another node starts after
+  that read can still see this write land. Known limit, accepted for v1 (owner, 2026-11-18); CStore has no
+  cross-node lock. A set of findings (a dismissed rollup) is written one record each, because CStore has no
   cross-record transaction: the result lists each member and a retry skips the ones already written.
+
+  A write the store did not confirm (CStore can store a field locally and then time out waiting for its peers)
+  reports `write_failed`. The launcher remembers it in memory, and the next request for that finding writes the
+  state and audit entry again, and emits the event, before it reports or replaces the record. A change whose writes
+  were confirmed but whose event failed is kept too; the next request emits only the event. After a launcher
+  restart only a missing audit entry marks a change unfinished: an audit entry stored locally but never
+  confirmed then reads as finished, and its finding event is not emitted. A purge drops the unfinished changes
+  of the tenants it sweeps on its own node; on another launcher a change is dropped when its record is found
+  deleted, unless another launcher wrote the finding again first. Known limits, accepted for v1
+  (owner, 2026-11-18).
   """
   from .rulebook_assessment import _submission_lock, list_rulebook_profiles
 
@@ -251,10 +263,90 @@ def update_finding_triage(owner, job_id: str, finding_ids, status: str, note: st
   return _error("triage_contention", "Jobs of this host are changing; retry.", job_id=job_id, retryable=True)
 
 
-def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, actor, review_at, confirm,
-                                  checked, ledger):
+def _names_key(state, tenant_id, host, finding_id):
+  """True when a stored record names the (tenant, host, finding) it is stored under."""
+  return (state.get("finding_id") == finding_id and state.get("tenant_id") == tenant_id
+          and state.get("host") == host)
+
+
+def _unfinished_writes(owner):
+  """`(tenant, host, finding) -> {"state", "state_confirmed", "audit_confirmed", "audit"}`: the triage changes this
+  launcher started whose writes the store did not all confirm, or whose event was not emitted. In memory: a restart forgets it, and then only a missing audit entry marks a change
+  unfinished."""
+  unfinished = getattr(owner, "_triage_unfinished_writes", None)
+  if not isinstance(unfinished, dict):
+    unfinished = owner._triage_unfinished_writes = {}
+  return unfinished
+
+
+def _stored_state(stored):
+  """`stored` as a FindingTriageState, or None for a malformed record (left as is, like one without an entry id)."""
+  try:
+    return FindingTriageState.from_dict(stored)
+  except (KeyError, TypeError, ValueError):
+    return None
+
+
+def _commit_triage(owner, repo, key, state, ledger, announce, write_state=True, write_audit=True, audit_payload=None):
+  """Write `state` and its audit entry under `state.audit_entry_id`, each write confirmed, then `announce` it.
+
+  The unfinished map holds the change, with the phase it reached, until the event is delivered or skipped (a
+  retryable SOC delivery failure keeps it, and the third return value is True): the next request for
+  the finding repeats only what is left (`write_state`/`write_audit` False skip a confirmed write; same fields and
+  payloads) before it reports. Each confirmed write is recorded on the ledger. The audit entry records the change
+  as made (job, actor, time).
+
+  Known limits of the SOC retry: the map has one slot per finding, so a newer change that is written while an
+  older change's event still fails replaces it, and only the newer event is sent later. The event goes to the job
+  and pass of the request that sends it, which are part of its dedupe key, so a retry through another job of the
+  host, or after the pass advances, gets another key.
+  """
   from ..tenancy.effects import EffectState
 
+  if ledger is not None:
+    ledger.checkpoint()
+  unfinished = _unfinished_writes(owner)
+  state_payload = state.to_dict()
+  if write_state:
+    unfinished[key] = {"state": state_payload, "state_confirmed": False, "audit_confirmed": False}
+    state_payload = repo.put_host_triage(state)
+    if ledger is not None:
+      ledger.record(EffectState.PERSISTED)
+  if write_audit:
+    unfinished[key] = {"state": state_payload, "state_confirmed": True, "audit_confirmed": False}
+    audit_payload = repo.append_host_triage_audit(FindingTriageAuditEntry(
+      job_id=state_payload["job_id"], finding_id=state_payload["finding_id"], status=state_payload["status"],
+      note=state_payload.get("note", ""), actor=state_payload.get("actor", ""), timestamp=state_payload["updated_at"],
+      tenant_id=state_payload["tenant_id"], host=state_payload["host"]), entry_id=state_payload["audit_entry_id"])
+    if ledger is not None:
+      ledger.record(EffectState.PERSISTED)
+  unfinished[key] = {"state": state_payload, "state_confirmed": True, "audit_confirmed": True, "audit": audit_payload}
+  soc_failed = _soc_delivery_failed(announce(state_payload))
+  if not soc_failed:  # a failed SIEM delivery keeps the change, so the next request for the finding sends it again
+    unfinished.pop(key, None)
+  return state_payload, audit_payload, soc_failed
+
+
+def _soc_delivery_failed(result):
+  """True when the SOC event was not delivered and a retry may deliver it: a transport error or a cooldown. A
+  skip (export disabled, no secret) or an event the adapter rejects (`invalid_event`) is final."""
+  return isinstance(result, dict) and result.get("status") == "error" and result.get("error") != "invalid_event"
+
+
+def _announce_triage(owner, record, archived, state_payload):
+  """The node audit log line and the finding event of a written change; the event goes to this request's job."""
+  if hasattr(owner, "_log_audit_event"):
+    owner._log_audit_event("finding_triage_updated", {
+      "job_id": state_payload["job_id"], "finding_id": state_payload["finding_id"], "status": state_payload["status"],
+      "actor": state_payload.get("actor", "")})
+  finding_event = dict(archived)
+  finding_event["triage_state"] = state_payload["status"]
+  finding_event["triage_entry_id"] = state_payload.get("audit_entry_id")  # the event's dedupe key, per change
+  return emit_finding_event(owner, record, finding=finding_event, event_action="triaged")
+
+
+def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, actor, review_at, confirm,
+                                  checked, ledger):
   now = owner.time()
   if is_model_test_job(job):
     return _error("model_test_not_supported", "Model-test jobs have no finding triage.", job_id=job_id)
@@ -278,6 +370,7 @@ def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, 
   # The event and the SOC status go on the stored record, not on a detached admission snapshot.
   record = (owner._get_job_from_cstore(job_id) if checked else job) or job
   results = []
+  announced = False
   for finding_id in ids:
     archived = _find_archive_finding(archive, finding_id)
     if archived is None:
@@ -287,6 +380,45 @@ def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, 
       results.append({"finding_id": finding_id, "outcome": "not_tentative"})
       continue
     stored = repo.get_host_triage(tenant_id, host, finding_id)
+    if isinstance(stored, dict) and not _names_key(stored, tenant_id, host, finding_id):
+      # A broken store, as on the read side: never replayed (its body would choose the write's tenant and host),
+      # never replaced. Fails closed for this member.
+      results.append({"finding_id": finding_id, "outcome": "store_inconsistent"})
+      continue
+    key = (tenant_id, host, finding_id)
+    unfinished = _unfinished_writes(owner)
+    pending = unfinished.get(key)
+    stored_id = stored.get("audit_entry_id") if isinstance(stored, dict) else None
+    # An unfinished change is finished first, under its own entry id, so its audit entry is written once, before this
+    # request is reported or replaces the record:
+    # - this launcher wrote its state and the store confirmed it, but not its audit entry: the entry is written again,
+    #   whatever the record holds now (a sibling job's launcher may have replaced it since);
+    # - this launcher wrote its state but the store did not confirm it, and the record still holds it: both again;
+    # - otherwise the record's audit entry is missing (after a restart, or written by another node): both again.
+    # A state write that stored nothing, or that a newer change replaced before it was confirmed, was reported
+    # `write_failed` and is dropped. A record without the id (an older node wrote it) is left as is. Known limit: a
+    # node that sees the state before the audit field replicates finishes it too; the entry is the same field and
+    # payload, but the finding event is emitted again.
+    # A change whose writes were both confirmed but whose event was not emitted (the announce raised) is announced.
+    # Both this launcher's change and the stored record's are reconciled: another launcher's change may have replaced
+    # this one's record and lost its own audit entry, and this request must not overwrite it unrecorded.
+    finishes = []  # (state, phase), oldest first
+    pending_id = pending["state"].get("audit_entry_id") if pending else None
+    if pending and pending["state_confirmed"] and stored is None:
+      # The store confirmed this state, so a missing record was deleted (a purge, maybe on another node): dropped.
+      unfinished.pop(key, None)
+      pending = pending_id = None
+    if pending and pending["state_confirmed"]:
+      finishes.append((FindingTriageState.from_dict(pending["state"]), {
+        "write_state": False, "write_audit": not pending["audit_confirmed"], "audit_payload": pending.get("audit")}))
+    elif not pending or pending_id != stored_id:
+      unfinished.pop(key, None)
+    if stored_id and (stored_id != pending_id or not finishes):
+      own = stored_id == pending_id  # this launcher's unconfirmed state, still the record: both writes again
+      if own or not repo.has_host_triage_audit_entry(tenant_id, host, finding_id, stored_id):
+        finish = _stored_state(stored)
+        if finish is not None:
+          finishes.append((finish, {}))
     # A write keeps an earlier confirmation unless it is a new one or the finding is dismissed as a false positive.
     kept = isinstance(stored, dict) and stored.get("confirmed") is True and status != "false_positive"
     confirmed = True if confirm or kept else None
@@ -295,29 +427,35 @@ def _update_finding_triage_locked(owner, job_id, job, scope, ids, status, note, 
             and stored.get("review_at") == (review_at or None)
             and bool(stored.get("confirmed")) == bool(confirmed)
             and (not confirmed or stored.get("confirmed_by") == confirmed_by))
-    if same:
+    if same and not finishes:
       results.append({"finding_id": finding_id, "outcome": "unchanged", "triage": deepcopy(stored)})
       continue
-    if ledger is not None:
-      ledger.checkpoint()
-    state_payload = repo.put_host_triage(FindingTriageState(
-      job_id=job_id, finding_id=finding_id, status=status, note=note or "", actor=actor or "", updated_at=now,
-      review_at=review_at or None, tenant_id=tenant_id, host=host,
-      confirmed=confirmed, confirmed_by=confirmed_by))
-    if ledger is not None:
-      ledger.record(EffectState.PERSISTED)
-    audit_payload = repo.append_host_triage_audit(FindingTriageAuditEntry(
-      job_id=job_id, finding_id=finding_id, status=status, note=note or "", actor=actor or "",
-      timestamp=owner.time(), tenant_id=tenant_id, host=host))
-    if hasattr(owner, "_log_audit_event"):
-      owner._log_audit_event("finding_triage_updated", {
-        "job_id": job_id, "finding_id": finding_id, "status": status, "actor": actor or ""})
-    finding_event = dict(archived)
-    finding_event["triage_state"] = status
-    emit_finding_event(owner, record, finding=finding_event, event_action="triaged")
-    results.append({"finding_id": finding_id, "outcome": "updated", "triage": state_payload,
-                    "audit": audit_payload})
-  if any(item["outcome"] == "updated" for item in results) and isinstance(record.get("soc_event_status"), dict):
+    state_payload = deepcopy(stored)
+    announce = lambda payload, archived=archived: _announce_triage(owner, record, archived, payload)
+    soc_failed = False
+    try:
+      for finish, phase in finishes:
+        _, audit_payload, failed = _commit_triage(owner, repo, key, finish, ledger, announce, **phase)
+        soc_failed = soc_failed or failed
+        announced = True
+      if not same:
+        state_payload, audit_payload, failed = _commit_triage(owner, repo, key, FindingTriageState(
+          job_id=job_id, finding_id=finding_id, status=status, note=note or "", actor=actor or "", updated_at=now,
+          review_at=review_at or None, tenant_id=tenant_id, host=host,
+          confirmed=confirmed, confirmed_by=confirmed_by,
+          audit_entry_id=repo.new_host_triage_audit_entry_id(now)), ledger, announce)
+        soc_failed = soc_failed or failed
+        announced = True
+    except TriageStoreError:
+      # The store did not confirm a write: report it, never a success; a retry finishes the member.
+      results.append({"finding_id": finding_id, "outcome": "write_failed", "retryable": True})
+      continue
+    item = {"finding_id": finding_id, "outcome": "updated", "triage": state_payload, "audit": audit_payload}
+    if soc_failed:
+      item["soc_event"] = "error"  # stored and audited; the next request for the finding sends the event again
+    results.append(item)
+  # An emitted event changes the record's SOC status, also when a later write of the same member failed.
+  if announced and isinstance(record.get("soc_event_status"), dict):
     _write_job_record(owner, job_id, record, context="finding_triage_soc_event")
   return {
     "job_id": job_id,

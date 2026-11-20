@@ -154,6 +154,9 @@ class CStoreJobRunning:
   end_attestation_required: bool = False
   failure_class: str = ""
   failure_message: str = ""
+  # RM-221: end-attestation outcome of a finished scan: submitted | failed | submitting.
+  attestation_status: str = None
+  attestation_failure_reason: str = None
   job_type: str = None
   model_test_summary: dict = None
   model_test_node_selection: dict = None
@@ -211,6 +214,8 @@ class CStoreJobRunning:
       end_attestation_required=d.get("end_attestation_required", False),
       failure_class=d.get("failure_class", ""),
       failure_message=d.get("failure_message", ""),
+      attestation_status=d.get("attestation_status"),
+      attestation_failure_reason=d.get("attestation_failure_reason"),
       job_type=d.get("job_type"),
       model_test_summary=d.get("model_test_summary"),
       model_test_node_selection=d.get("model_test_node_selection"),
@@ -260,6 +265,10 @@ class CStoreJobFinalized:
   end_attestation_required: bool = False
   failure_class: str = ""
   failure_message: str = ""
+  # RM-221: end-attestation outcome of a finished scan: submitted | failed | submitting.
+  attestation_status: str = None
+  attestation_failure_reason: str = None
+  redmesh_test_attestation: dict = None  # the end attestation a retry submitted; the archive stays as written
   job_type: str = None
   model_test_summary: dict = None
   model_test_node_selection: dict = None
@@ -315,6 +324,9 @@ class CStoreJobFinalized:
       end_attestation_required=d.get("end_attestation_required", False),
       failure_class=d.get("failure_class", ""),
       failure_message=d.get("failure_message", ""),
+      attestation_status=d.get("attestation_status"),
+      attestation_failure_reason=d.get("attestation_failure_reason"),
+      redmesh_test_attestation=d.get("redmesh_test_attestation"),
       job_type=d.get("job_type"),
       model_test_summary=d.get("model_test_summary"),
       model_test_node_selection=d.get("model_test_node_selection"),

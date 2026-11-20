@@ -56,6 +56,9 @@ class DiscoveryModule:
     self._scope_prefix = target_config.discovery.scope_prefix
     self._max_pages = target_config.discovery.max_pages
     self._max_depth = target_config.discovery.max_depth
+    # Never crawl the logout URL: a GET there ends the scan session.
+    logout_path = getattr(target_config, "logout_path", "") or ""
+    self._logout_path = self._normalize(logout_path.lstrip("/")) if logout_path else ""
     self.routes = []
     self.forms = []
 
@@ -90,11 +93,13 @@ class DiscoveryModule:
       if path in visited:
         continue
       visited.add(path)
+      if self._is_logout(path):
+        continue
 
       self.safety.throttle()
 
       # Use authenticated session if available, else anonymous
-      session = self.auth.official_session or self.auth.anon_session
+      session = self.auth.primary_session or self.auth.anon_session
       if session is None:
         break
 
@@ -131,7 +136,8 @@ class DiscoveryModule:
       # Record form actions but do NOT follow them
       for action in parser.forms:
         normalized = self._normalize(action)
-        if normalized and self._in_scope(normalized):
+        if (normalized and self._in_scope(normalized)
+            and not self._is_logout(normalized)):
           all_forms.add(normalized)
 
     result = self.discover_result(known_routes=known_routes)
@@ -163,10 +169,12 @@ class DiscoveryModule:
       if path in visited:
         continue
       visited.add(path)
+      if self._is_logout(path):
+        continue
 
       self.safety.throttle()
 
-      session = self.auth.official_session or self.auth.anon_session
+      session = self.auth.primary_session or self.auth.anon_session
       if session is None:
         break
 
@@ -196,7 +204,8 @@ class DiscoveryModule:
 
       for action in parser.forms:
         normalized = self._normalize(action)
-        if normalized and self._in_scope(normalized):
+        if (normalized and self._in_scope(normalized)
+            and not self._is_logout(normalized)):
           all_forms.add(normalized)
 
     self.routes = sorted(all_routes)
@@ -218,6 +227,11 @@ class DiscoveryModule:
     if (parsed.path or "").endswith("/") and not path.endswith("/"):
       path += "/"
     return path
+
+  def _is_logout(self, path):
+    """True for the logout URL, trailing slash ignored (`/logout` == `/logout/`)."""
+    return bool(self._logout_path) and (
+      path.rstrip("/") == self._logout_path.rstrip("/"))
 
   def _in_scope(self, path):
     """Check if path is within the configured scope prefix."""

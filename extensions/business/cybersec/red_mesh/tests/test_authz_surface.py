@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 from .conftest import mock_plugin_modules
 
 TEST_CHANNEL_TOKEN = "test-model-token-material-at-least-32-bytes"
-EXPECTED_ENDPOINTS = 148  # +3 framework assessment list, create, archive (RM-120 phase 10b); +6 framework assessment (RM-120 phases 3 and 5); +7 account profile, reviewer designation and certificates (RM-155 phase 1); +1 super-tenant provider read for every account's reports; +2 STA deployment integrations, -3 tenant integrations (RM-139); +2 Demo attestation bridge (RM-141); +2 public branding for the sign-in page; +3 super-tenant branding (RM-134); +1 list_deployment_nodes (RM-126); +5 data maintenance (RM-108, temporary); +3 tenant contract (RM-095 phase 1); +6 engagements (RM-095 phase 2); +1 delete_tenant, -4 tenant assets (RM-107); +7 tenant drafts (RM-109 phase 2); +3 draft release/close and tenant document download (RM-109 phase 3); +8 engagement drafts (RM-109 phase 4); +3 super-tenant profile and generated pack (RM-110 phase 1); +6 tenant assets (RM-125)
+EXPECTED_ENDPOINTS = 149  # +3 framework assessment list, create, archive (RM-120 phase 10b); +6 framework assessment (RM-120 phases 3 and 5); +7 account profile, reviewer designation and certificates (RM-155 phase 1); +1 super-tenant provider read for every account's reports; +2 STA deployment integrations, -3 tenant integrations (RM-139); +2 Demo attestation bridge (RM-141); +2 public branding for the sign-in page; +3 super-tenant branding (RM-134); +1 list_deployment_nodes (RM-126); +5 data maintenance (RM-108, temporary); +3 tenant contract (RM-095 phase 1); +6 engagements (RM-095 phase 2); +1 delete_tenant, -4 tenant assets (RM-107); +7 tenant drafts (RM-109 phase 2); +3 draft release/close and tenant document download (RM-109 phase 3); +8 engagement drafts (RM-109 phase 4); +3 super-tenant profile and generated pack (RM-110 phase 1); +6 tenant assets (RM-125); +1 retry_job_attestation (RM-221)
 TOKEN_ENDPOINTS = {"launch_model_test", "preflight_model_test_provider"}
 LAUNCH_ENDPOINTS = ("launch_network_scan", "launch_webapp_scan", "launch_test", "launch_model_test")
 # Pre-RM-075 public positional contract; account actor fields are appended to launches.
@@ -175,6 +175,7 @@ ENDPOINT_FIRST_ARGS = {
   'get_audit_log': 'limit',
   'stop_monitoring': 'job_id',
   'analyze_job': 'job_id',
+  'retry_job_attestation': 'job_id',
   'get_analysis': 'job_id',
   'llm_health': 'request_actor',
 }
@@ -308,8 +309,9 @@ class TestAuthzSurface(unittest.TestCase):
                                                (TEST_CHANNEL_TOKEN, "", 401)):
         with self.subTest(endpoint=name, status=expected_status, configured=bool(configured)):
           plugin = object.__new__(self.Plugin)
+          plugin._stream_id = "app"
           plugin.chainstore_hget = MagicMock(side_effect=AssertionError("must not read the store"))
-          with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": configured, "R1EN_CSTORE_AUTH_HKEY": "app:auth"}, clear=True), \
+          with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": configured}, clear=True), \
                patch(f"extensions.business.cybersec.red_mesh.pentester_api_01.{name}") as downstream:
             kwargs = {"actor": {"account_id": "ops.user"}} if name == "launch_model_test" else {}
             result = self.endpoints[name](plugin, token, **kwargs)
@@ -347,8 +349,8 @@ class TestAuthzSurface(unittest.TestCase):
   def test_the_production_actor_seam_reads_the_account_store(self):
     # The seam resolves through cstore-auth; a MagicMock store yields "not found", never "allowed".
     plugin = MagicMock()
-    with patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "app:auth"}):
-      view, err = self.Plugin._resolve_launch_actor(plugin, {"account_id": "someone"})
+    plugin._stream_id = "app"
+    view, err = self.Plugin._resolve_launch_actor(plugin, {"account_id": "someone"})
     self.assertIsNone(view)
     self.assertEqual(err["status_code"], 404)
 
@@ -359,13 +361,11 @@ class TestAuthzSurface(unittest.TestCase):
       for state in ("deactivated", "deleting", None, "", False, 0, [], {}):
         with self.subTest(endpoint=name, state=state):
           plugin = object.__new__(self.Plugin)
+          plugin._stream_id = "app"
           plugin.chainstore_hget = MagicMock(return_value=_account_record(state=state, **at))
           target = f"extensions.business.cybersec.red_mesh.pentester_api_01.{name}"
           with patch(target, return_value={"unexpected_launch": True}) as launch, \
-               patch.dict("os.environ", {
-                 "REDMESH_BACKEND_TOKEN": TEST_CHANNEL_TOKEN,
-                 "R1EN_CSTORE_AUTH_HKEY": "app:auth",
-               }):
+               patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": TEST_CHANNEL_TOKEN}):
             result = _call_launch(self.endpoints[name], plugin, actor={"account_id": "ops.user"})
           self.assertEqual(result.get("status_code"), 404)
           self.assertEqual(result.get("error_class"), "actor_not_found")
@@ -373,18 +373,19 @@ class TestAuthzSurface(unittest.TestCase):
 
   def test_real_reader_denials_stop_all_four_launchers(self):
     cases = (
-      ("missing actor", None, None, None, "app:auth", 404),
-      ("unknown actor", {"account_id": "ops.user"}, None, None, "app:auth", 404),
-      ("tombstoned actor", {"account_id": "ops.user"}, "null", None, "app:auth", 404),
-      ("missing hkey", {"account_id": "ops.user"}, {}, None, "", 503),
-      ("store failure", {"account_id": "ops.user"}, None, ConnectionError("private store detail"), "app:auth", 503),
+      ("missing actor", None, None, None, "app", 404),
+      ("unknown actor", {"account_id": "ops.user"}, None, None, "app", 404),
+      ("tombstoned actor", {"account_id": "ops.user"}, "null", None, "app", 404),
+      ("missing stream id", {"account_id": "ops.user"}, {}, None, "", 503),
+      ("store failure", {"account_id": "ops.user"}, None, ConnectionError("private store detail"), "app", 503),
     )
     for name in LAUNCH_ENDPOINTS:
-      for label, actor, record, failure, hkey, status in cases:
+      for label, actor, record, failure, stream, status in cases:
         with self.subTest(endpoint=name, case=label):
           plugin = object.__new__(self.Plugin)
+          plugin._stream_id = stream
           plugin.chainstore_hget = MagicMock(return_value=record, side_effect=failure)
-          env = {"R1EN_CSTORE_AUTH_HKEY": hkey}
+          env = {}
           if name == "launch_model_test":
             env["REDMESH_BACKEND_TOKEN"] = TEST_CHANNEL_TOKEN
           with patch.dict("os.environ", env, clear=True), \
@@ -394,10 +395,10 @@ class TestAuthzSurface(unittest.TestCase):
           self.assertEqual(result["error_class"], "actor_not_found" if status == 404 else "identity_store_unavailable")
           self.assertNotIn("private store detail", str(result))
           launch.assert_not_called()
-          if actor is None or not hkey:
+          if actor is None or not stream:
             plugin.chainstore_hget.assert_not_called()
           else:
-            plugin.chainstore_hget.assert_called_once_with(hkey=hkey, key="ops.user")
+            plugin.chainstore_hget.assert_called_once_with(hkey=f"{stream}:auth", key="ops.user")
 
   def test_real_active_account_overrides_request_attribution_without_new_token(self):
     for name in LAUNCH_ENDPOINTS:
@@ -405,8 +406,9 @@ class TestAuthzSurface(unittest.TestCase):
                           [{"role": "tenant_pentester", "tenant_id": "tn_00000000-0000-4000-8000-000000000001"}]):
         with self.subTest(endpoint=name, memberships=memberships):
           plugin = object.__new__(self.Plugin)
+          plugin._stream_id = "app"
           plugin.chainstore_hget = MagicMock(return_value=_account_record(memberships=memberships))
-          env = {"R1EN_CSTORE_AUTH_HKEY": "app:auth"}
+          env = {}
           if name == "launch_model_test":
             env["REDMESH_BACKEND_TOKEN"] = TEST_CHANNEL_TOKEN + "\n"
           with patch.dict("os.environ", env, clear=True), \
@@ -423,8 +425,9 @@ class TestAuthzSurface(unittest.TestCase):
       for version in ([], {}, True, False, 1.0, 0.0, "1", None):
         with self.subTest(endpoint=name, version=version):
           plugin = object.__new__(self.Plugin)
+          plugin._stream_id = "app"
           plugin.chainstore_hget = MagicMock(return_value=_account_record(schemaVersion=version))
-          env = {"R1EN_CSTORE_AUTH_HKEY": "app:auth"}
+          env = {}
           if name == "launch_model_test":
             env["REDMESH_BACKEND_TOKEN"] = TEST_CHANNEL_TOKEN
           with patch.dict("os.environ", env, clear=True), \

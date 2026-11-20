@@ -409,14 +409,24 @@ class _ReportMixin:
 
     routes = []
     forms = []
+    coverage_notes = []
+    admin_context = ""
+    primary_principal = ""
     for methods in service_info.values():
       if not isinstance(methods, dict):
         continue
+      auth_info = methods.get("_graybox_auth")
+      if isinstance(auth_info, dict):
+        admin_context = admin_context or str(auth_info.get("admin_context") or "")
+        primary_principal = primary_principal or str(auth_info.get("primary_principal") or "")
       discovery = methods.get("_graybox_discovery")
       if not isinstance(discovery, dict):
         continue
       routes.extend(discovery.get("routes") or [])
       forms.extend(discovery.get("forms") or [])
+      note = discovery.get("coverage_note")
+      if isinstance(note, str) and note and note not in coverage_notes:
+        coverage_notes.append(note)
 
     scenario_total = 0
     scenario_vulnerable = 0
@@ -448,6 +458,9 @@ class _ReportMixin:
       "total_forms_discovered": len(self._dedupe_items(forms)),
       "total_scenarios": scenario_total,
       "total_scenarios_vulnerable": scenario_vulnerable,
+      "graybox_coverage_note": " ".join(coverage_notes),
+      "graybox_admin_context": admin_context,
+      "graybox_primary_principal": primary_principal,
     }
 
   def _local_node_address(self):
@@ -585,25 +598,19 @@ class _ReportMixin:
               dct_aggregated_report[field] = local_job_status[field]
             elif field in aggregation_fields:
               type_or_func = aggregation_fields[field]
-              if field not in dct_aggregated_report:
-                field_type = type(local_job_status[field])
-                dct_aggregated_report[field] = field_type()
-              #endif
-              if isinstance(dct_aggregated_report[field], list):
-                existing = set(dct_aggregated_report[field])
-                merged = existing.union(local_job_status[field])
-                try:
-                  dct_aggregated_report[field] = sorted(merged)
-                except TypeError:
-                  dct_aggregated_report[field] = list(merged)
-              elif isinstance(dct_aggregated_report[field], dict):
-                dct_aggregated_report[field] = self.merge_objects_deep(
-                  dct_aggregated_report[field],
-                  local_job_status[field])
+              existing, new = dct_aggregated_report[field], local_job_status[field]
+              if existing is None or new is None:  # null is "no data", as in merge_objects_deep
+                dct_aggregated_report[field] = new if existing is None else existing
+              elif isinstance(existing, (list, dict)) or isinstance(new, (list, dict)):
+                merged = self.merge_objects_deep(existing, new)  # raises on a container/scalar mismatch, either order
+                if isinstance(merged, list):
+                  try:
+                    merged = sorted(merged)  # scalar lists (open_ports, completed_tests) stay sorted
+                  except TypeError:
+                    pass  # dict items keep merge order
+                dct_aggregated_report[field] = merged
               else:
-                _existing = dct_aggregated_report[field]
-                _new = local_job_status[field]
-                dct_aggregated_report[field] = type_or_func([_existing, _new])
+                dct_aggregated_report[field] = type_or_func([existing, new])
               # end if aggregation type
             # end if standard (one time) or aggregated fields
           # for each field in this local job
@@ -629,13 +636,13 @@ class _ReportMixin:
       # endif we have local jobs
     except Exception as exc:
       if log_details:
-        self.P("Error during report aggregation: {}:\n{}\n{}\ntype_or_func={}, field={}".format(
-          exc, self.trace_info(),
-          self.json_dumps(dct_aggregated_report, indent=2),
-          type_or_func, field
+        # No report bodies: thread reports are not credential-redacted yet.
+        self.P("Error during report aggregation: {}:\n{}\ntype_or_func={}, field={}".format(
+          exc, self.trace_info(), type_or_func, field
         ))
       else:
         self.P("Manual report aggregation failed", color='y')
+      dct_aggregated_report = {}  # all-or-nothing: never return a partial merge
     # Phase 0 dedup pass: collapse findings duplicated across workers
     # because each worker stamps its own _source_worker_id /
     # _source_node_addr before merge. The JSON-key fallback in
@@ -685,8 +692,13 @@ class _ReportMixin:
         return merged
     elif isinstance(obj_a, set) and isinstance(obj_b, set):
       return obj_a.union(obj_b)
+    elif obj_b is None or obj_a is None:
+      return obj_a if obj_b is None else obj_b  # null is "no data": never erases the other side
+    elif isinstance(obj_a, (dict, list, set)) or isinstance(obj_b, (dict, list, set)):
+      # A container against another type would erase one side: fail the merge.
+      raise TypeError(f"cannot merge {type(obj_b).__name__} into {type(obj_a).__name__}")
     else:
-      return obj_b  # Prefer obj_b in case of conflict
+      return obj_b  # Prefer obj_b in case of a scalar conflict
 
   def _redact_report(self, report):
     """
@@ -1081,6 +1093,9 @@ class _ReportMixin:
       "total_forms_discovered": 0,
       "total_scenarios": 0,
       "total_scenarios_vulnerable": 0,
+      "graybox_coverage_note": "",
+      "graybox_admin_context": "",
+      "graybox_primary_principal": "",
     }
     if scan_type == "webapp":
       graybox_stats = self._extract_graybox_ui_stats(agg, latest)
@@ -1190,4 +1205,7 @@ class _ReportMixin:
       total_forms_discovered=graybox_stats["total_forms_discovered"],
       total_scenarios=graybox_stats["total_scenarios"],
       total_scenarios_vulnerable=graybox_stats["total_scenarios_vulnerable"],
+      graybox_coverage_note=graybox_stats["graybox_coverage_note"],
+      graybox_admin_context=graybox_stats["graybox_admin_context"],
+      graybox_primary_principal=graybox_stats["graybox_primary_principal"],
     )

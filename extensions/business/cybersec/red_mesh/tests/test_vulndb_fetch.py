@@ -86,7 +86,22 @@ class VulndbFetchTests(unittest.TestCase):
         text = (ROOT / ".github/actions/fetch-vulndb/action.yml").read_text()
         self.assertIn('if [ ! -f "$pin" ]', text)
         self.assertIn("present=false", text)
-        self.assertEqual(text.count("if: steps.pin.outputs.present == 'true'"), 3)
+        self.assertIn("::warning title=vulndb::No pin.json", text)
+
+    def test_action_never_fails_the_build(self):
+        text = (ROOT / ".github/actions/fetch-vulndb/action.yml").read_text()
+        # One gated step does the fetch and checks in a child shell; a failure removes the DB and warns.
+        self.assertEqual(text.count("if: steps.pin.outputs.present == 'true'"), 1)
+        self.assertIn("if ! bash -euo pipefail <<'CHECKS'", text)
+        failure = text.split("CHECKS\n        then", 1)[1]
+        self.assertIn('rm -f "$db"', failure)
+        self.assertIn("::warning title=vulndb::vulndb fetch or verification failed", failure)
+        self.assertIn("::warning title=vulndb::Invalid pin.json", text)
+
+    def test_action_installs_only_after_verify(self):
+        text = (ROOT / ".github/actions/fetch-vulndb/action.yml").read_text()
+        checks = text.split("<<'CHECKS'", 1)[1].split("        CHECKS\n", 1)[0]
+        self.assertLess(checks.index("verify_vulndb.py\" verify"), checks.index("cp \"$RUNNER_TEMP/vulndb/vulndb.sqlite\""))
 
 
 if __name__ == "__main__":

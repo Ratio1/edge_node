@@ -125,11 +125,11 @@ class TestCweTop25(unittest.TestCase):
     self.assertEqual(ranks, list(range(1, 26)))
 
   def test_known_top25_entries(self):
-    # Per CWE Top 25 (2024), XSS is rank 1 and Out-of-bounds Write is rank 2.
+    # Per CWE Top 25 (2025), XSS is rank 1 and SQL Injection is rank 2.
     self.assertTrue(is_cwe_top25(79))
     self.assertEqual(cwe_top25_rank(79), 1)
-    self.assertTrue(is_cwe_top25(787))
-    self.assertEqual(cwe_top25_rank(787), 2)
+    self.assertTrue(is_cwe_top25(89))
+    self.assertEqual(cwe_top25_rank(89), 2)
 
   def test_non_top25_returns_false(self):
     self.assertFalse(is_cwe_top25(999999))
