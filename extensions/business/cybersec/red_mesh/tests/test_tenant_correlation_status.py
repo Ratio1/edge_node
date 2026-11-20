@@ -25,8 +25,8 @@ def test_status_uses_real_tenant_authority_and_detached_projection():
     assert result == {"job_id": "job-1", "found": True, "correlation": summary}
     result["correlation"]["counts"]["matched_events"] = 99
     assert fixture.job["detection_correlation"] == summary
-    assert fixture.store.reads[0] == ("get", "auth", "reader")
-    assert sum(row == ("get", "auth", "reader") for row in fixture.store.reads) == 1
+    assert fixture.store.reads[0] == ("get", "deployment:auth", "reader")
+    assert sum(row == ("get", "deployment:auth", "reader") for row in fixture.store.reads) == 1
     # The tenant reader point-reads the job; it never enumerates the shared job hash.
     assert fixture.store.reads[-1] == ("get", fixture.store.cfg_instance_id, "job-1")
     assert fixture.store.writes == writes
@@ -59,7 +59,7 @@ def test_real_admission_denials_never_read_artifacts_or_write(fault, status):
     if fault == "missing_actor":
       actor = None
     elif fault.endswith("memberships") or fault == "none_scope":
-      fixture.store.data[("auth", "reader")]["memberships"] = {
+      fixture.store.data[("deployment:auth", "reader")]["memberships"] = {
         "none_scope": [], "null_memberships": None, "malformed_memberships": "private",
       }[fault]
     elif fault == "inactive":
@@ -110,7 +110,7 @@ def test_actual_native_status_wire_and_typed_denials(read_native, response_forma
     elif outcome == "model":
       fixture.job["job_type"] = "model_test"
     elif outcome == "member":
-      fixture.store.data[("auth", "reader")]["memberships"] = []
+      fixture.store.data[("deployment:auth", "reader")]["memberships"] = []
     elif outcome == "missing":
       fixture.store.jobs.clear()
     elif outcome == "actorless":

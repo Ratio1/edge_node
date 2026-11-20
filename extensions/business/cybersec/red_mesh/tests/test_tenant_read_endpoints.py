@@ -64,8 +64,8 @@ def test_every_endpoint_reads_from_fresh_stored_requester_and_checked_job(name):
     writes = list(fixture.store.writes)
     result = invoke(fixture, name)
     assert isinstance(result, dict) and "error" not in result, result
-    assert fixture.store.reads[0] == ("get", "auth", "reader")
-    assert sum(row == ("get", "auth", "reader") for row in fixture.store.reads) == 1
+    assert fixture.store.reads[0] == ("get", "deployment:auth", "reader")
+    assert sum(row == ("get", "deployment:auth", "reader") for row in fixture.store.reads) == 1
     assert fixture.store.writes == writes
     if name == "get_report":
       assert result["job_id"] == "job-1" and result["cid"] == "aggregate"
@@ -85,7 +85,7 @@ def test_denial_precedes_jobs_artifacts_and_audit(name, fault):
     if fault == "revoked":
       fixture.store.account("reader", active=False)
     elif fault == "missing":
-      fixture.store.data.pop(("auth", "reader"))
+      fixture.store.data.pop(("deployment:auth", "reader"))
     elif fault == "malformed":
       fixture.actor = {"account_id": []}
     else:

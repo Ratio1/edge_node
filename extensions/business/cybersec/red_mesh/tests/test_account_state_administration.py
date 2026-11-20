@@ -17,9 +17,6 @@ from .contract_fixture import contract_terms
 
 class TestAccountStateAdministration(unittest.TestCase):
   def setUp(self):
-    self.env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    self.env.start()
-    self.addCleanup(self.env.stop)
     self.store = FakeAdministrationStore()
     self.repo = CstoreTenantAdministrationStore(self.store, "test-deployment")
     self.service = TenantAdministrationService(CstoreAuthAccountReader(self.store), self.repo)
@@ -59,14 +56,14 @@ class TestAccountStateAdministration(unittest.TestCase):
   def test_the_approval_names_the_account_its_generation_and_the_requested_state(self):
     data = self.approved(self.creator, "member", "deactivated")
     self.assertEqual(data, {"accountId": "member", "state": "deactivated",
-                            "accountGeneration": self.store.data[("auth", "member")]["generation"]})
+                            "accountGeneration": self.store.data[("deployment:auth", "member")]["generation"]})
     self.store.account("member", state="deactivated", memberships=[{"role": "tenant_user", "tenant_id": self.tenant}])
     self.assertEqual(self.approved(self.creator, "member", "active")["state"], "active")
 
   def test_asking_for_the_state_an_account_already_holds_is_approved_unchanged(self):
     self.store.account("member", state="deactivated", memberships=[{"role": "tenant_user", "tenant_id": self.tenant}])
     data = self.approved(self.admin, "member", "deactivated")
-    self.assertEqual(data["accountGeneration"], self.store.data[("auth", "member")]["generation"])
+    self.assertEqual(data["accountGeneration"], self.store.data[("deployment:auth", "member")]["generation"])
 
   def test_an_unknown_state_or_account_id_is_refused_before_anything_is_read(self):
     for state in ("deleting", "", None, "ACTIVE"):
@@ -76,10 +73,10 @@ class TestAccountStateAdministration(unittest.TestCase):
 
   def test_an_unknown_tombstoned_or_deleting_account_is_not_found(self):
     self.assertEqual(self.denied(self.creator, "nobody", "deactivated"), (404, "not_found"))
-    self.store.data[("auth", "gone")] = "null"
+    self.store.data[("deployment:auth", "gone")] = "null"
     self.assertEqual(self.denied(self.creator, "gone", "deactivated"), (404, "not_found"))
     self.store.account("leaving", active=False, memberships=[{"role": "tenant_user", "tenant_id": self.tenant}])
-    self.assertEqual(self.store.data[("auth", "leaving")]["state"], "deleting")
+    self.assertEqual(self.store.data[("deployment:auth", "leaving")]["state"], "deleting")
     self.assertEqual(self.denied(self.creator, "leaving", "deactivated"), (404, "not_found"))
 
   def test_nobody_archives_their_own_account_whatever_else_the_rules_would_say(self):

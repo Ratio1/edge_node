@@ -52,16 +52,16 @@ def _no_stop(fixture):
 ))
 def test_denials_never_stop_a_worker_or_emit_a_lifecycle_event(fault, status):
   with read_endpoint_fixture(bound=True, archived=False, role="super_pentester") as fixture:
-    account = fixture.store.data[("auth", "reader")]
+    account = fixture.store.data[("deployment:auth", "reader")]
     actor, tenant_id = fixture.actor, fixture.tenant_id
     if fault == "actor": actor = None
-    elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
+    elif fault == "deleted": fixture.store.data.pop(("deployment:auth", "reader"))
     elif fault == "inactive": fixture.store.account("reader", active=False)
     elif fault == "none_scope": account["memberships"] = []
     elif fault == "tenant_user": as_role(fixture, "tenant_user")
     elif fault == "missing_tenant": tenant_id = None
     elif fault == "other_tenant": tenant_id = OTHER_TENANT
-    elif fault == "identity_store": fixture.store.fail_hkey = "auth"
+    elif fault == "identity_store": fixture.store.fail_hkey = "deployment:auth"
 
     with _no_stop(fixture) as stop:
       result = fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=actor,

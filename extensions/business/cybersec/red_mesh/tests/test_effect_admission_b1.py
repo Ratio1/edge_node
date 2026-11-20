@@ -24,7 +24,7 @@ def call(fixture, name, **kwargs):
 
 
 def as_tenant_user(fixture):
-  fixture.store.data[("auth", "reader")]["memberships"] = [
+  fixture.store.data[("deployment:auth", "reader")]["memberships"] = [
     {"role": "tenant_user", "tenant_id": fixture.tenant_id}]
 
 
@@ -51,16 +51,16 @@ def test_effects_no_longer_use_the_unscoped_global_job_lookup(name):
 def test_denials_are_effect_free_and_write_no_status_record(name, fault, status):
   """The probe-amplification defect: denial paths must not touch integration status."""
   with read_endpoint_fixture(bound=True) as fixture:
-    account = fixture.store.data[("auth", "reader")]
+    account = fixture.store.data[("deployment:auth", "reader")]
     kwargs = {}
     if fault == "actor": kwargs["request_actor"] = None
-    elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
+    elif fault == "deleted": fixture.store.data.pop(("deployment:auth", "reader"))
     elif fault == "inactive": fixture.store.account("reader", active=False)
     elif fault == "user": as_tenant_user(fixture)
     elif fault == "memberships": account["memberships"] = []
     elif fault == "other_tenant": kwargs["tenant_id"] = "tn_00000000-0000-4000-8000-000000000000"
     elif fault == "no_tenant": kwargs["tenant_id"] = None
-    elif fault == "identity_store": fixture.store.fail_hkey = "auth"
+    elif fault == "identity_store": fixture.store.fail_hkey = "deployment:auth"
 
     with patch.object(opencti_export, "record_integration_status",
                       side_effect=AssertionError(SECRET)) as opencti_record, \
@@ -135,7 +135,7 @@ def test_a_landed_persist_is_never_reported_as_nothing_happened():
 def test_test_event_export_is_refused_to_every_tenant_role(role):
   """RM-139: the destinations are the deployment's, so only a full-portfolio STA may test them."""
   with read_endpoint_fixture(bound=True) as fixture:
-    fixture.store.data[("auth", "reader")]["memberships"] = [{"role": role, "tenant_id": fixture.tenant_id}]
+    fixture.store.data[("deployment:auth", "reader")]["memberships"] = [{"role": role, "tenant_id": fixture.tenant_id}]
     with patch("extensions.business.cybersec.red_mesh.pentester_api_01.test_event_export",
                side_effect=AssertionError(SECRET)) as probe:
       result = fixture.Plugin.test_event_export(fixture.owner, request_actor=fixture.actor,

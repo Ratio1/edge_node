@@ -34,11 +34,11 @@ class TestPluginSourceDefaults(unittest.TestCase):
     self.assertIn("PORT", self.config)
     self.assertIsNone(self.config["PORT"])
 
-  def test_tenancy_namespace_is_unbound_by_default(self):
+  def test_tenancy_namespace_is_not_configurable(self):
     # The namespace is the only tenancy precondition. The former TENANT_ADMINISTRATION_ENABLED flag
     # gated the endpoints that create tenants and assets, which every launch now requires, so a
     # deployment with it off could sign in and do nothing; it was removed on 2026-09-21.
-    self.assertIsNone(self.config["TENANCY_NAMESPACE"])
+    self.assertNotIn("TENANCY_NAMESPACE", self.config)
     self.assertNotIn("TENANT_ADMINISTRATION_ENABLED", self.config)
 
 
