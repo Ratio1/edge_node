@@ -31,6 +31,7 @@ def _plugin(case, stub, archive=ARCHIVE):
   plugin._write_job_record = MagicMock(side_effect=lambda job_id, value, **kwargs: value)
   plugin._submit_redmesh_test_attestation = MagicMock(return_value={"tx_hash": "0xretry"})
   plugin._attestation_get_tenant_private_key = MagicMock(return_value="key")
+  plugin._execution_service().engagement_end_reason.return_value = None  # the engagement is active
   return Plugin, plugin, actor
 
 
@@ -89,6 +90,33 @@ def test_a_refused_reauthorization_blocks_the_retry_names_the_reason_and_audits_
     plugin._write_job_record.assert_not_called()  # not claimed: the record is left alone
     assert plugin._log_audit_event.call_args.args == (
       "attestation_retry", {"job_id": "retry-job", "actor": "reader", "outcome": "denied", "reason": expected})
+
+
+def test_an_ended_engagement_or_an_unreadable_store_blocks_the_retry():
+  from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
+  for ended, expected in (("engagement_revoked", "engagement_revoked"), ("engagement_expired", "engagement_expired"),
+                          (TenantStoreError("down"), "store_unavailable")):  # owner 2026-11-20: active engagements only
+    case, stub = _stub()
+    Plugin, plugin, actor = _plugin(case, stub)
+    service = plugin._execution_service()
+    service.engagement_end_reason = MagicMock(side_effect=ended if isinstance(ended, Exception) else None,
+                                              return_value=None if isinstance(ended, Exception) else ended)
+    plugin._execution_service = lambda: service
+    result = _retry(Plugin, plugin, actor, case)
+    assert (result["error"], result["attestation_failure_reason"]) == ("execution_denied", expected)
+    plugin._submit_redmesh_test_attestation.assert_not_called()
+    plugin._write_job_record.assert_not_called()
+
+
+def test_a_failing_soc_event_still_settles_and_audits_the_submitted_retry():
+  case, stub = _stub()
+  Plugin, plugin, actor = _plugin(case, stub)
+  with patch("extensions.business.cybersec.red_mesh.services.event_hooks.emit_attestation_status_event",
+             side_effect=RuntimeError("no export secret")):
+    result = _retry(Plugin, plugin, actor, case)
+  assert result == {"success": True, "attestation_status": "submitted", "tx_hash": "0xretry"}
+  assert plugin._write_job_record.call_args.args[1]["attestation_status"] == "submitted"
+  assert plugin._log_audit_event.call_args.args[1]["outcome"] == "submitted"
 
 
 def test_a_settle_failure_after_a_submit_still_returns_and_audits_the_tx_hash():
