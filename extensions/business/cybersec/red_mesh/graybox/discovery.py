@@ -56,6 +56,9 @@ class DiscoveryModule:
     self._scope_prefix = target_config.discovery.scope_prefix
     self._max_pages = target_config.discovery.max_pages
     self._max_depth = target_config.discovery.max_depth
+    # Never crawl the logout URL: a GET there ends the scan session.
+    logout_path = getattr(target_config, "logout_path", "") or ""
+    self._logout_path = self._normalize(logout_path.lstrip("/")) if logout_path else ""
     self.routes = []
     self.forms = []
 
@@ -90,11 +93,13 @@ class DiscoveryModule:
       if path in visited:
         continue
       visited.add(path)
+      if self._logout_path and path == self._logout_path:
+        continue
 
       self.safety.throttle()
 
       # Use authenticated session if available, else anonymous
-      session = self.auth.official_session or self.auth.anon_session
+      session = self.auth.primary_session or self.auth.anon_session
       if session is None:
         break
 
@@ -163,10 +168,12 @@ class DiscoveryModule:
       if path in visited:
         continue
       visited.add(path)
+      if self._logout_path and path == self._logout_path:
+        continue
 
       self.safety.throttle()
 
-      session = self.auth.official_session or self.auth.anon_session
+      session = self.auth.primary_session or self.auth.anon_session
       if session is None:
         break
 

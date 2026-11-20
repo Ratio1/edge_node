@@ -431,8 +431,9 @@ class GrayboxLocalWorker(BaseLocalWorker):
       self._phase_open = False
 
     if not auth_ok:
+      reason = self.auth.failure_reason() or "Authentication failed"
       self._abort(
-        "Official authentication failed. Cannot proceed with graybox scan.",
+        f"Graybox authentication failed: {reason}. Cannot proceed with graybox scan.",
         reason_class="auth_failed",
       )
 
@@ -564,7 +565,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
     if probe_cls.requires_regular_session and not self.auth.regular_session:
       self.metrics.record_probe(store_key, "skipped:missing_regular_session")
       return
-    if probe_cls.requires_auth and not self.auth.official_session:
+    if probe_cls.requires_auth and not self.auth.primary_session:
       self.metrics.record_probe(store_key, "skipped:missing_auth")
       return
 
@@ -669,6 +670,9 @@ class GrayboxLocalWorker(BaseLocalWorker):
     port_info["_graybox_auth"] = {
       "official_success": self.auth.official_session is not None,
       "regular_success": self.auth.regular_session is not None,
+      "admin_context": self.auth.admin_context,
+      "primary_principal": self.auth.primary_principal,
+      "failure_reason": self.auth.failure_reason(),
       "auth_errors": list(self.auth._auth_errors),
       "auth_diagnostics": list(getattr(self.auth, "_auth_diagnostics", [])),
       "findings": [],

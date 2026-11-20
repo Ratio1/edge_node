@@ -26,7 +26,7 @@ def _mock_response(status=200, text="", headers=None, content_type="text/html"):
 
 
 def _make_probe(debug_paths=None, workflow_endpoints=None,
-                official_session=None, anon_session=None,
+                primary_session=None, anon_session=None,
                 discovered_forms=None, login_path="/auth/login/",
                 password_reset_path="", jwt_endpoints=None):
   misconfig = MisconfigConfig(
@@ -43,7 +43,7 @@ def _make_probe(debug_paths=None, workflow_endpoints=None,
     password_reset_path=password_reset_path,
   )
   auth = MagicMock()
-  auth.official_session = official_session
+  auth.primary_session = primary_session
   auth.anon_session = anon_session or MagicMock()
   auth.detected_csrf_field = None
   auth.extract_csrf_value = MagicMock(return_value=None)
@@ -129,7 +129,7 @@ class TestCookieAttributes(unittest.TestCase):
     """Missing Secure/HttpOnly → vulnerable."""
     session = MagicMock()
     session.cookies = [self._make_cookie(secure=False, httponly=False)]
-    probe = _make_probe(official_session=session)
+    probe = _make_probe(primary_session=session)
 
     probe._test_cookie_attributes()
     vuln = [f for f in probe.findings if f.scenario_id == "PT-A02-04" and f.status == "vulnerable"]
@@ -143,7 +143,7 @@ class TestCsrfBypass(unittest.TestCase):
     session = MagicMock()
     session.post.return_value = _mock_response(status=200, text="Success")
     probe = _make_probe(
-      official_session=session,
+      primary_session=session,
       workflow_endpoints=[WorkflowEndpoint(path="/api/transfer/")],
     )
 
@@ -158,7 +158,7 @@ class TestCsrfBypass(unittest.TestCase):
     session = MagicMock()
     session.post.return_value = _mock_response(status=403, text="CSRF token missing")
     probe = _make_probe(
-      official_session=session,
+      primary_session=session,
       workflow_endpoints=[WorkflowEndpoint(path="/api/transfer/")],
     )
 
@@ -171,7 +171,7 @@ class TestCsrfBypass(unittest.TestCase):
     session = MagicMock()
     session.post.return_value = _mock_response(status=200, text="OK")
     probe = _make_probe(
-      official_session=session,
+      primary_session=session,
       discovered_forms=["/auth/login/", "/profile/edit/"],
       login_path="/auth/login/",
     )
@@ -197,7 +197,7 @@ class TestSessionToken(unittest.TestCase):
     jwt = self._make_jwt(alg="none")
     session = MagicMock()
     session.cookies.get_dict.return_value = {"token": jwt}
-    probe = _make_probe(official_session=session)
+    probe = _make_probe(primary_session=session)
 
     probe._test_session_token()
     vuln = [f for f in probe.findings if f.scenario_id == "PT-A02-06" and f.status == "vulnerable"]
@@ -208,7 +208,7 @@ class TestSessionToken(unittest.TestCase):
     """Short session ID → inconclusive."""
     session = MagicMock()
     session.cookies.get_dict.return_value = {"sid": "abc123"}
-    probe = _make_probe(official_session=session)
+    probe = _make_probe(primary_session=session)
 
     probe._test_session_token()
     inc = [f for f in probe.findings if f.scenario_id == "PT-A02-06" and f.status == "inconclusive"]
@@ -221,7 +221,7 @@ class TestSessionToken(unittest.TestCase):
     session.cookies.get_dict.return_value = {
       "sessionid": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
     }
-    probe = _make_probe(official_session=session)
+    probe = _make_probe(primary_session=session)
 
     probe._test_session_token()
     clean = [f for f in probe.findings if f.scenario_id == "PT-A02-06" and f.status == "not_vulnerable"]
@@ -250,7 +250,7 @@ class TestSessionFixation(unittest.TestCase):
     # Official session has the same cookie value
     official = MagicMock()
     official.cookies = self._mock_cookie_jar({"sessionid": "FIXED_TOKEN_123"})
-    probe.auth.official_session = official
+    probe.auth.primary_session = official
 
     probe.auth.detected_csrf_field = None
 
@@ -272,7 +272,7 @@ class TestSessionFixation(unittest.TestCase):
 
     official = MagicMock()
     official.cookies = self._mock_cookie_jar({"sessionid": "POST_AUTH_TOKEN"})
-    probe.auth.official_session = official
+    probe.auth.primary_session = official
 
     probe.auth.detected_csrf_field = None
 
@@ -289,7 +289,7 @@ class TestSessionFixation(unittest.TestCase):
     anon.cookies = self._mock_cookie_jar({})
     anon.close = MagicMock()
     probe.auth.make_anonymous_session.return_value = anon
-    probe.auth.official_session = MagicMock()
+    probe.auth.primary_session = MagicMock()
 
     probe._test_session_fixation()
     self.assertEqual(len([f for f in probe.findings if f.scenario_id == "PT-A07-03"]), 0)
@@ -306,7 +306,7 @@ class TestSessionFixation(unittest.TestCase):
 
     official = MagicMock()
     official.cookies = self._mock_cookie_jar({"csrftoken": "SAME_CSRF", "sessionid": "POST_AUTH"})
-    probe.auth.official_session = official
+    probe.auth.primary_session = official
 
     probe.auth.detected_csrf_field = "csrfmiddlewaretoken"
 

@@ -23,7 +23,7 @@ class InjectionProbes(ProbeBase):
 
   def run(self):
     self.run_safe("login_injection", self._test_login_injection)
-    if self.auth.official_session:
+    if self.auth.primary_session:
       self.run_safe("authenticated_injection", self._test_authenticated_injection)
       if self._allow_stateful:
         self.run_safe("stored_xss", self._test_stored_xss)
@@ -46,7 +46,7 @@ class InjectionProbes(ProbeBase):
         "PT-API7-01", "ssrf_body_field", self._test_ssrf_body_field,
       )
     self.run_safe("open_redirect", self._test_open_redirect)
-    if self.auth.official_session:
+    if self.auth.primary_session:
       self.run_safe("path_traversal", self._test_path_traversal)
       self.run_safe("reflected_xss", self._test_reflected_xss)
       self.run_safe("template_injection", self._test_template_injection)
@@ -155,7 +155,7 @@ class InjectionProbes(ProbeBase):
       url = self.target_url + form_action
 
       try:
-        page = self.auth.official_session.get(url, timeout=10)
+        page = self.auth.primary_session.get(url, timeout=10)
       except Exception:
         continue
 
@@ -185,7 +185,7 @@ class InjectionProbes(ProbeBase):
           form_data[csrf_field] = csrf_token
 
         try:
-          resp = self.auth.official_session.post(url, data=form_data, timeout=10)
+          resp = self.auth.primary_session.post(url, data=form_data, timeout=10)
         except Exception:
           continue
         tested += 1
@@ -249,7 +249,7 @@ class InjectionProbes(ProbeBase):
       url = self.target_url + form_action
 
       try:
-        page = self.auth.official_session.get(url, timeout=10)
+        page = self.auth.primary_session.get(url, timeout=10)
       except Exception:
         continue
 
@@ -273,14 +273,14 @@ class InjectionProbes(ProbeBase):
           form_data[csrf_field] = csrf_token
 
       try:
-        self.auth.official_session.post(url, data=form_data, timeout=10)
+        self.auth.primary_session.post(url, data=form_data, timeout=10)
       except Exception:
         continue
       tested += 1
 
       self.safety.throttle()
       try:
-        readback = self.auth.official_session.get(url, timeout=10)
+        readback = self.auth.primary_session.get(url, timeout=10)
       except Exception:
         continue
 
@@ -337,7 +337,7 @@ class InjectionProbes(ProbeBase):
     for ep in ssrf_endpoints:
       self.safety.throttle()
       url = self.target_url + "/" + ep.path.lstrip("/")
-      session = self.auth.official_session or self.auth.anon_session
+      session = self.auth.primary_session or self.auth.anon_session
 
       try:
         t0 = _time.monotonic()
@@ -418,7 +418,7 @@ class InjectionProbes(ProbeBase):
       return
 
     payload_url = "http://127.0.0.1:1/internal-probe"
-    session = self.auth.official_session or getattr(self.auth, "anon_session", None)
+    session = self.auth.primary_session or getattr(self.auth, "anon_session", None)
     if session is None:
       return
 
@@ -473,7 +473,7 @@ class InjectionProbes(ProbeBase):
 
     Read-only: only sends GET requests with modified query parameters.
     """
-    session = self.auth.official_session or self.auth.anon_session
+    session = self.auth.primary_session or self.auth.anon_session
     if not session:
       return
 
@@ -485,10 +485,13 @@ class InjectionProbes(ProbeBase):
     payload = "//evil.example.com"
     payload_alt = "https://evil.example.com"
 
-    # Test against: login page (common redirect after login), discovered routes
-    test_paths = [self.target_config.login_path, self.target_config.logout_path]
+    # Test against: login page (common redirect after login), discovered routes.
+    # Never the logout path: a GET there ends the scan session.
+    logout_path = self.target_config.logout_path
+    test_paths = [self.target_config.login_path]
     for route in self.discovered_routes:
-      test_paths.append(route)
+      if route != logout_path:
+        test_paths.append(route)
     # Deduplicate
     seen = set()
     unique_paths = []
@@ -585,7 +588,7 @@ class InjectionProbes(ProbeBase):
 
     Read-only: only sends GET requests with modified parameters.
     """
-    session = self.auth.official_session
+    session = self.auth.primary_session
     if not session:
       return
 
@@ -691,7 +694,7 @@ class InjectionProbes(ProbeBase):
       url = self.target_url + ep.path
       self.safety.throttle()
       try:
-        resp = self.auth.official_session.get(
+        resp = self.auth.primary_session.get(
           url, params={ep.param: payload}, timeout=10,
         )
       except Exception:
@@ -749,7 +752,7 @@ class InjectionProbes(ProbeBase):
       for payload in payloads:
         self.safety.throttle()
         try:
-          resp = self.auth.official_session.get(
+          resp = self.auth.primary_session.get(
             url, params={ep.param: payload}, timeout=10,
           )
         except Exception:
@@ -817,7 +820,7 @@ class InjectionProbes(ProbeBase):
       for payload in payloads:
         self.safety.throttle()
         try:
-          resp = self.auth.official_session.get(
+          resp = self.auth.primary_session.get(
             url, params={ep.param: payload}, timeout=10,
           )
         except Exception:
@@ -883,7 +886,7 @@ class InjectionProbes(ProbeBase):
       url = self.target_url + ep.path
       self.safety.throttle()
       try:
-        resp = self.auth.official_session.get(
+        resp = self.auth.primary_session.get(
           url, params={ep.param: payload},
           allow_redirects=False, timeout=10,
         )
@@ -950,7 +953,7 @@ class InjectionProbes(ProbeBase):
       # Baseline: clean integer
       self.safety.throttle()
       try:
-        baseline = self.auth.official_session.post(
+        baseline = self.auth.primary_session.post(
           url, data=_json.dumps({ep.field: 1}),
           headers=headers, timeout=10,
         )
@@ -964,7 +967,7 @@ class InjectionProbes(ProbeBase):
       for variant in payloads_to_try:
         self.safety.throttle()
         try:
-          resp = self.auth.official_session.post(
+          resp = self.auth.primary_session.post(
             url, data=_json.dumps({ep.field: variant}),
             headers=headers, timeout=10,
           )

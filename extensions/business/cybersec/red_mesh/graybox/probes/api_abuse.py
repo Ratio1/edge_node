@@ -35,7 +35,7 @@ class ApiAbuseProbes(ProbeBase):
     return self.run_runtime_scenarios(self.probe_key)
 
   def _session(self):
-    return self.auth.official_session or self.auth.regular_session
+    return self.auth.primary_session
 
   def _low_priv_session(self):
     return self.auth.regular_session

@@ -35,6 +35,7 @@ def _make_probe(**api_cfg_kwargs):
   auth = MagicMock()
   auth.regular_session = MagicMock()
   auth.official_session = MagicMock()
+  auth.primary_session = auth.official_session
   auth.make_anonymous_session = MagicMock(return_value=MagicMock())
   safety = MagicMock()
   safety.throttle = MagicMock()

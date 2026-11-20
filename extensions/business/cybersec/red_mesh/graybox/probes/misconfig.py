@@ -32,7 +32,7 @@ class MisconfigProbes(ProbeBase):
 
   def _test_debug_exposure(self):
     """PT-A02-01: check debug/config endpoints for information disclosure."""
-    session = self.auth.anon_session or self.auth.official_session
+    session = self.auth.anon_session or self.auth.primary_session
     if not session:
       return
 
@@ -75,7 +75,7 @@ class MisconfigProbes(ProbeBase):
     Tests both the root URL and discovered API routes, since many apps
     only set CORS headers on API endpoints (e.g. /api/*).
     """
-    session = self.auth.anon_session or self.auth.official_session
+    session = self.auth.anon_session or self.auth.primary_session
     if not session:
       return
 
@@ -168,7 +168,7 @@ class MisconfigProbes(ProbeBase):
 
   def _test_security_headers(self):
     """PT-A02-03: check for missing security headers."""
-    session = self.auth.anon_session or self.auth.official_session
+    session = self.auth.anon_session or self.auth.primary_session
     if not session:
       return
 
@@ -214,10 +214,10 @@ class MisconfigProbes(ProbeBase):
 
   def _test_cookie_attributes(self):
     """PT-A02-04: check session cookie security attributes."""
-    if not self.auth.official_session:
+    if not self.auth.primary_session:
       return
 
-    cookies = self.auth.official_session.cookies
+    cookies = self.auth.primary_session.cookies
     issues = []
     for cookie in cookies:
       if not cookie.secure:
@@ -256,7 +256,7 @@ class MisconfigProbes(ProbeBase):
     Submit POST without CSRF token to state-changing endpoints.
     If the server accepts → CSRF bypass detected.
     """
-    if not self.auth.official_session:
+    if not self.auth.primary_session:
       return
 
     csrf_test_endpoints = []
@@ -277,7 +277,7 @@ class MisconfigProbes(ProbeBase):
       self.safety.throttle()
       url = self.target_url + path
       try:
-        resp = self.auth.official_session.post(
+        resp = self.auth.primary_session.post(
           url, data={"test": "csrf_probe"}, timeout=10,
           headers={"Referer": "http://evil.example.com"},
         )
@@ -328,7 +328,7 @@ class MisconfigProbes(ProbeBase):
 
     Tests JWT alg=none, short session IDs.
     """
-    if not self.auth.official_session:
+    if not self.auth.primary_session:
       return
 
     import base64
@@ -336,7 +336,7 @@ class MisconfigProbes(ProbeBase):
     evidence = []
     status = "not_vulnerable"
 
-    cookies = self.auth.official_session.cookies.get_dict()
+    cookies = self.auth.primary_session.cookies.get_dict()
     for name, value in cookies.items():
       parts = value.split(".")
       if len(parts) == 3:
@@ -1087,7 +1087,7 @@ class MisconfigProbes(ProbeBase):
     post-auth cookies on the already-established official session.
     Read-only: does not perform additional logins.
     """
-    if not self.auth.official_session:
+    if not self.auth.primary_session:
       return
 
     login_url = self.target_url + self.target_config.login_path
@@ -1112,7 +1112,7 @@ class MisconfigProbes(ProbeBase):
       return  # no pre-auth cookies → can't test fixation
 
     # Step 2: get post-auth cookies from the existing official session
-    post_cookies = self.auth.official_session.cookies
+    post_cookies = self.auth.primary_session.cookies
     if hasattr(post_cookies, "get_dict"):
       post_cookies = post_cookies.get_dict()
     else:

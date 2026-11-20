@@ -21,7 +21,7 @@ def _mock_response(status=200, text="", headers=None):
 
 def _make_probe(workflow_endpoints=None, record_endpoints=None,
                 allow_stateful=False, regular_session=None,
-                official_session=None):
+                primary_session=None):
   cfg = GrayboxTargetConfig(
     business_logic=BusinessLogicConfig(
       workflow_endpoints=workflow_endpoints or [],
@@ -30,7 +30,7 @@ def _make_probe(workflow_endpoints=None, record_endpoints=None,
   )
   auth = MagicMock()
   auth.regular_session = regular_session or MagicMock()
-  auth.official_session = official_session or MagicMock()
+  auth.primary_session = primary_session or MagicMock()
   auth.anon_session = MagicMock()
   auth.target_url = "http://testapp.local:8000"
   auth.target_config = cfg
@@ -284,7 +284,7 @@ class TestNegativeAmountScenarioPTA0604(unittest.TestCase):
   def test_pt_a06_04_emits_vulnerable_when_negative_amount_accepted(self):
     record_ep = RecordEndpoint(path="/records/1/")
     probe = _make_probe(record_endpoints=[record_ep], allow_stateful=True)
-    sess = probe.auth.official_session
+    sess = probe.auth.primary_session
     # GET form (extract fields), POST returns 302 → accepted
     sess.get = MagicMock(return_value=self._form_response())
     sess.post = MagicMock(return_value=_mock_response(status=302))
@@ -300,7 +300,7 @@ class TestNegativeAmountScenarioPTA0604(unittest.TestCase):
   def test_pt_a06_04_emits_not_vulnerable_when_amount_rejected(self):
     record_ep = RecordEndpoint(path="/records/1/")
     probe = _make_probe(record_endpoints=[record_ep], allow_stateful=True)
-    sess = probe.auth.official_session
+    sess = probe.auth.primary_session
     sess.get = MagicMock(return_value=self._form_response())
     # 200 with explicit error rejecting negative amount
     sess.post = MagicMock(return_value=_mock_response(

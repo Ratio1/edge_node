@@ -61,6 +61,8 @@ class AuthStrategy(ABC):
     # orchestrator copies it back into AuthManager so probe callers keep
     # using the legacy public API.
     self.last_detected_csrf_field: Optional[str] = None
+    # Last login response seen, kept so a rejected login can be diagnosed.
+    self.last_response = None
 
   def make_session(self) -> requests.Session:
     """Create a fresh, unauthenticated ``requests.Session`` honouring TLS verify."""
@@ -226,6 +228,7 @@ class FormAuth(AuthStrategy):
       session.close()
       raise
 
+    self.last_response = resp
     if self._is_login_success(resp, session, login_url):
       self._session = session
       return session

@@ -1268,5 +1268,83 @@ class TestGrayboxAbortBehavior(unittest.TestCase):
     self.assertNotIn(secret, serialized)
 
 
+class TestRegularOnlyWorker(unittest.TestCase):
+  """RM-219: the worker scans with regular credentials when admin is absent."""
+
+  def _worker_with_real_auth(self, post_ok=True):
+    from extensions.business.cybersec.red_mesh.graybox.auth import AuthManager
+    worker = _make_worker(
+      official_username="", official_password="", bearer_token="",
+      bearer_refresh_token="", api_key="", regular_bearer_token="",
+      regular_bearer_refresh_token="", regular_api_key="",
+    )
+    worker.auth = AuthManager(worker.target_url, worker.target_config, verify_tls=False)
+    session = MagicMock()
+    session.get.return_value = MagicMock(
+      status_code=200, text="", url="http://testapp.local:8000/auth/login/",
+      history=[], headers={"content-type": "text/html"},
+    )
+    if post_ok:
+      session.post.return_value = MagicMock(
+        status_code=200, text="", url="http://testapp.local:8000/dashboard/",
+        history=[MagicMock()], headers={"content-type": "text/html"},
+      )
+      session.cookies.get_dict.return_value = {"sessionid": "s"}
+    else:
+      session.post.return_value = MagicMock(
+        status_code=200, text='<input type="password" name="password">',
+        url="http://testapp.local:8000/auth/login/", history=[],
+        headers={"content-type": "text/html"},
+      )
+      session.cookies.get_dict.return_value = {}
+    return worker, session
+
+  def test_authentication_passes_and_records_regular_principal(self):
+    worker, session = self._worker_with_real_auth()
+    with patch(
+      "extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests",
+    ) as mock_requests:
+      mock_requests.Session.return_value = session
+      worker._run_authentication_phase()
+
+    auth_info = worker.state["service_info"]["8000"]["_graybox_auth"]
+    self.assertFalse(auth_info["official_success"])
+    self.assertTrue(auth_info["regular_success"])
+    self.assertEqual(auth_info["admin_context"], "absent")
+    self.assertEqual(auth_info["primary_principal"], "regular")
+    # Only the regular principal logged in.
+    self.assertEqual(session.post.call_count, 1)
+    self.assertEqual(session.post.call_args.kwargs["data"]["username"], "alice")
+
+    mock_probe = MagicMock()
+    mock_probe.run.return_value = GrayboxProbeRunResult(findings=[], outcome="completed")
+    mock_cls = MagicMock(return_value=mock_probe)
+    mock_cls.requires_regular_session = False
+    mock_cls.requires_auth = True
+    mock_cls.is_stateful = False
+    with patch.object(worker, "_import_probe", return_value=mock_cls):
+      worker._run_registered_probe(
+        GrayboxProbeDefinition(key="_authed", cls_path="fake.Probe"),
+        worker._build_probe_kwargs(DiscoveryResult()),
+      )
+    self.assertEqual(worker.metrics.build().probe_breakdown["_authed"], "completed")
+    self.assertEqual(worker.auth._refresh_count, 0)
+
+  def test_rejected_regular_login_aborts_naming_the_principal(self):
+    from extensions.business.cybersec.red_mesh.graybox.worker import GrayboxAbort
+    worker, session = self._worker_with_real_auth(post_ok=False)
+    with patch(
+      "extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests",
+    ) as mock_requests:
+      mock_requests.Session.return_value = session
+      with self.assertRaises(GrayboxAbort) as ctx:
+        worker._run_authentication_phase()
+
+    self.assertIn("Regular login rejected", str(ctx.exception))
+    self.assertEqual(ctx.exception.reason_class, "auth_failed")
+    auth_info = worker.state["service_info"]["8000"]["_graybox_auth"]
+    self.assertIn("Regular login rejected", auth_info["failure_reason"])
+
+
 if __name__ == '__main__':
   unittest.main()

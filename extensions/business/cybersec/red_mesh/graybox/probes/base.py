@@ -226,7 +226,7 @@ class ProbeBase:
     Run a probe with error recovery.
 
     Does NOT call ensure_sessions — the worker is responsible for session
-    lifecycle. Probes just use self.auth.official_session /
+    lifecycle. Probes just use self.auth.primary_session /
     self.auth.regular_session as-is.
     """
     try:

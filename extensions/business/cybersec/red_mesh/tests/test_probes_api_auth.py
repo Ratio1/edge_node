@@ -45,6 +45,7 @@ def _make_probe(*, token_endpoints, allow_stateful=False):
   auth = MagicMock()
   auth.official_session = MagicMock()
   auth.regular_session = MagicMock()
+  auth.primary_session = auth.official_session
   auth.verify_tls = True
   safety = MagicMock()
   safety.throttle = MagicMock()

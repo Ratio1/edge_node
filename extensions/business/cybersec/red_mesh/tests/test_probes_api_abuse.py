@@ -33,6 +33,7 @@ def _make_probe(*, resource_endpoints=None, business_flows=None,
   auth = MagicMock()
   auth.official_session = MagicMock()
   auth.regular_session = MagicMock()
+  auth.primary_session = auth.official_session
   safety = MagicMock()
   safety.throttle = MagicMock()
   safety.sanitize_error = MagicMock(side_effect=lambda s: s)

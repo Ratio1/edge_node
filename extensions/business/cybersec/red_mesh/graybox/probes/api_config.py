@@ -51,7 +51,7 @@ class ApiConfigProbes(ProbeBase):
   # ── helpers ────────────────────────────────────────────────────────
 
   def _session(self):
-    return self.auth.official_session or self.auth.regular_session
+    return self.auth.primary_session
 
   def _anon_session(self):
     if hasattr(self.auth, "make_anonymous_session"):

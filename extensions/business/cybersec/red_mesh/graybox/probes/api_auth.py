@@ -66,7 +66,7 @@ class ApiAuthProbes(ProbeBase):
   def _obtain_token(self, *, consume_budget: bool = True):
     """Return (token, raw_payload) from token_path or configured bearer session."""
     tok = self.target_config.api_security.token_endpoints
-    session = self.auth.official_session or self.auth.regular_session
+    session = self.auth.primary_session
     if session is None:
       return None, None
     if not tok.token_path:

@@ -242,7 +242,7 @@ class BusinessLogicProbes(ProbeBase):
     server accepts them. Tests negative monetary amounts and forbidden state
     transitions.
     """
-    if not self.auth.official_session:
+    if not self.auth.primary_session:
       return
 
     endpoints = self.target_config.business_logic.record_endpoints
@@ -272,7 +272,7 @@ class BusinessLogicProbes(ProbeBase):
       # Step 1: GET the form to extract current state and CSRF token
       self.safety.throttle()
       try:
-        page = self.auth.official_session.get(url, timeout=10)
+        page = self.auth.primary_session.get(url, timeout=10)
       except Exception:
         continue
       if page.status_code != 200:
@@ -325,7 +325,7 @@ class BusinessLogicProbes(ProbeBase):
         headers["X-CSRFToken"] = csrf_token
 
       try:
-        resp = self.auth.official_session.post(
+        resp = self.auth.primary_session.post(
           url, data=payload, headers=headers,
           timeout=10, allow_redirects=False,
         )
@@ -362,7 +362,7 @@ class BusinessLogicProbes(ProbeBase):
           # Re-fetch CSRF token (may have been consumed)
           if csrf_field:
             try:
-              page2 = self.auth.official_session.get(url, timeout=10)
+              page2 = self.auth.primary_session.get(url, timeout=10)
               csrf_token = self.auth.extract_csrf_value(page2.text, csrf_field)
             except Exception:
               pass
@@ -377,7 +377,7 @@ class BusinessLogicProbes(ProbeBase):
             headers2["X-CSRFToken"] = csrf_token
 
           try:
-            resp2 = self.auth.official_session.post(
+            resp2 = self.auth.primary_session.post(
               url, data=payload2, headers=headers2,
               timeout=10, allow_redirects=False,
             )
