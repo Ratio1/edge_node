@@ -69,9 +69,9 @@ class TestFrameworkReview(FrameworkAssessmentFixture):
     self.refused(self.mutate('approve', expected=2), 403, 'reviewer_not_designated')
     self.assertFalse(self.ok(self.plugin.get_account_profile(self.creator))['compliance_reviewer'])
     # Recreated account must not inherit old designation or false override.
-    self.storage.data[('auth', 'initial')]['createdAt'] = '2026-11-16T08:00:00.000Z'
+    self.storage.data[('deployment:auth', 'initial')]['createdAt'] = '2026-11-16T08:00:00.000Z'
     self.refused(self.mutate('approve', expected=2, actor=self.admin), 403, 'reviewer_not_designated')
-    self.storage.data[('auth', 'creator')]['createdAt'] = '2026-11-16T08:00:00.000Z'
+    self.storage.data[('deployment:auth', 'creator')]['createdAt'] = '2026-11-16T08:00:00.000Z'
     self.assertTrue(self.ok(self.review())['can_review'])
 
   def test_flagged_admin_review_dto_matches_mutation_authority(self):
@@ -231,7 +231,7 @@ class TestFrameworkReview(FrameworkAssessmentFixture):
     # Throw away plugin/service instances; preserve CStore and document store only.
     old = self.plugin
     self.plugin = object.__new__(self.Plugin)
-    for name in ('cfg_tenancy_namespace', 'cfg_instance_id', 'P', 'chainstore_hget', 'chainstore_hgetall',
+    for name in ('_stream_id', 'cfg_instance_id', 'P', 'chainstore_hget', 'chainstore_hgetall',
                  'chainstore_hkeys', 'chainstore_hset', '_log_audit_event', 'configured_peers_reader'):
       setattr(self.plugin, name, getattr(old, name))
     self.plugin._document_store = lambda: self.documents
