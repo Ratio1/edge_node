@@ -728,8 +728,9 @@ class TestReachabilityRuleInjection(unittest.TestCase):
     self.assertEqual(reasons, ["reason=endpoint_denied"])
 
   def test_post_only_action_405_is_decided_by_the_payload_response(self):
-    """405 on the GET baseline: the form is kept and the payload POST decides."""
+    """405 on the GET baseline, stateful probes allowed: the payload POST decides."""
     probe = self._probe("absent")
+    probe._allow_stateful = True
     probe.auth.primary_session.get = MagicMock(return_value=_denial("405"))
     probe.auth.primary_session.post = MagicMock(
       side_effect=lambda url, data=None, **k: _ok(next(iter(data.values()))))
@@ -737,12 +738,22 @@ class TestReachabilityRuleInjection(unittest.TestCase):
     found, _ = _reason(probe, "PT-A03-01")
     self.assertEqual({f.status for f in found}, {"vulnerable"})
     probe = self._probe("absent")
+    probe._allow_stateful = True
     probe.auth.primary_session.get = MagicMock(return_value=_denial("405"))
     probe.auth.primary_session.post = MagicMock(side_effect=lambda *a, **k: _denial("403"))
     probe._test_authenticated_injection()
     found, reasons = _reason(probe, "PT-A03-01")
     self.assertEqual([f.status for f in found], ["inconclusive"])
     self.assertEqual(reasons, ["reason=admin_context_absent"])
+
+  def test_post_only_action_405_sends_no_post_without_allow_stateful(self):
+    """POST-only actions often create or delete records: no payload POST
+    unless stateful probes are allowed."""
+    probe = self._probe("absent")
+    probe.auth.primary_session.get = MagicMock(return_value=_denial("405"))
+    probe.auth.primary_session.post = MagicMock()
+    probe._test_authenticated_injection()
+    probe.auth.primary_session.post.assert_not_called()
 
   def test_post_answered_by_redirect_to_non_login_page_is_reached(self):
     """JSON POST answered by a 3xx to a non-login page counts as reached."""
@@ -914,6 +925,18 @@ class TestSharedReachabilityCheck(unittest.TestCase):
     self.assertTrue(probe.response_reached(resp))
     self.assertFalse(probe.response_reached(
       resp, auth_required_marker="authentication credentials were not provided"))
+
+  def test_inline_login_form_posting_to_itself_is_not_reached(self):
+    """A login form rendered at the protected URL with an empty, "#" or
+    query-only action is a denial, not the handler."""
+    probe = _make_probe()
+    for action in ('action=""', 'action="#"', 'action="?next=/admin/"'):
+      body = (f'<form method="post" {action}><input name="username">'
+              '<input type="password" name="password"></form>')
+      resp = _mock_response(status=200, text=body)
+      resp.url = "http://testapp.local:8000/admin/users/"
+      resp.history = []
+      self.assertFalse(probe.response_reached(resp), action)
 
   def test_profile_page_with_prefilled_username_is_not_a_login_page(self):
     probe = self._probe()

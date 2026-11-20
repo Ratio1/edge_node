@@ -1351,9 +1351,12 @@ class TestRegularOnlyAuthentication(unittest.TestCase):
     mock_requests.Session.return_value = self._form_session()
     auth = _make_auth()
     self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+    def rejected(session):
+      auth._auth_diagnostics.append({"stage": "authenticated_probe_rejected"})
+      return False, False
     with patch.object(auth, "_authenticated_probe_path", return_value="/api/me"), \
          patch.object(auth, "_validate_authenticated_session",
-                      return_value=(False, False)) as validate:
+                      side_effect=rejected) as validate:
       # Just authenticated: inside the 60 s window, no extra request.
       self.assertFalse(auth.needs_refresh())
       validate.assert_not_called()
@@ -1366,6 +1369,21 @@ class TestRegularOnlyAuthentication(unittest.TestCase):
       # Checked again within the window: no further request.
       self.assertFalse(auth.needs_refresh())
       self.assertEqual(validate.call_count, 1)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_probe_path_429_or_5xx_is_not_a_logout(self, mock_requests):
+    import time
+    mock_requests.Session.return_value = self._form_session()
+    auth = _make_auth()
+    self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+    auth._liveness_checked_at = time.time() - 61
+
+    def throttled(session):
+      auth._auth_diagnostics.append({"stage": "authenticated_probe_error", "status": 429})
+      return False, False
+    with patch.object(auth, "_authenticated_probe_path", return_value="/api/me"), \
+         patch.object(auth, "_validate_authenticated_session", side_effect=throttled):
+      self.assertFalse(auth.needs_refresh())
 
   @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
   def test_probe_path_transport_error_is_not_a_logout(self, mock_requests):

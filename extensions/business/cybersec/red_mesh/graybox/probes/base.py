@@ -597,7 +597,12 @@ class ProbeBase:
     actions = re.findall(r'<form[^>]*\baction=["\']([^"\']*)', text, re.IGNORECASE)
     if not actions:
       return True
-    return any(self._is_login_location(a) for a in actions)
+    # An empty, "#" or query-only action posts back to the page itself: a
+    # login form rendered inline at the protected URL.
+    return any(
+      not a.strip() or a.strip().startswith(("#", "?")) or self._is_login_location(a)
+      for a in actions
+    )
 
   def response_reached(self, resp, validation_ok=False, auth_required_marker="") -> bool:
     """Shared reachability check: did ``resp`` come from the endpoint's handler.

@@ -161,7 +161,10 @@ class InjectionProbes(ProbeBase):
         continue
       # 405: a POST-only action. The GET baseline does not apply and there is
       # no form to read, so the payload POST with common field names decides.
+      # Such actions often create or delete records, so only with allow_stateful.
       post_only = page.status_code == 405
+      if post_only and not self._allow_stateful:
+        continue
       if not post_only and not self.response_reached(page):
         denied += 1
         continue

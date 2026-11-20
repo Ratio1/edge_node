@@ -1556,6 +1556,18 @@ class TestRegularOnlyScanEmitsTheWorksScenarios(unittest.TestCase):
     }
     missing = sorted(REGULAR_ONLY_WORKS_IDS - emitted)
     self.assertEqual(missing, [], f"emitted: {sorted(emitted)}")
+    # A "Works" id must be tested, not reported as denied for the regular user.
+    denied = sorted(
+      f["scenario_id"]
+      for probes in worker.state["graybox_results"].values()
+      for probe in probes.values()
+      for f in probe["findings"]
+      if f["scenario_id"] in REGULAR_ONLY_WORKS_IDS and any(
+        r in str(f.get("evidence", ""))
+        for r in ("reason=endpoint_denied", "reason=admin_context_absent")
+      )
+    )
+    self.assertEqual(denied, [])
     # The sessions are reused: nothing re-authenticated during the scan.
     self.assertEqual(worker.auth._refresh_count, 0)
     # No login was ever sent for the unconfigured admin principal.
