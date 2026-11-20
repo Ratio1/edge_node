@@ -834,10 +834,13 @@ class DeeployManagerApiPlugin(
       repair = None
       if repair_update:
         proposal = request["repair"].get("proposal") or {}
-        if sender.lower() != auth_result[DEEPLOY_KEYS.ESCROW_OWNER].lower() or proposal.get("coordinator") != self.bc.address:
-          raise DeploymentConflictError("The CSP must submit recovery to the original coordinator.")
-        existing_operation = self._find_request_operation(request, sender, "update",
-                                                          repair_parent=(proposal.get("parent") or {}).get("operation_id"))
+        if proposal.get("coordinator") != self.bc.address:
+          raise DeploymentConflictError("Submit recovery to the original coordinator.")
+        # The authenticated editor can be a delegate. The saved operation is scoped to the escrow owner.
+        existing_operation = self._find_request_operation(
+          request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], "update",
+          repair_parent=(proposal.get("parent") or {}).get("operation_id"),
+        )
       else:
         existing_operation = self._find_request_operation(
           request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], "create" if is_create else "update")
@@ -1451,10 +1454,8 @@ class DeeployManagerApiPlugin(
         raise ValueError("The repair preview nonce must be a hexadecimal timestamp.")
       if not request.get("EE_HASH") or type(job_id) is not int or job_id <= 0 or not isinstance(coordinator, str) or not coordinator:
         raise ValueError("The repair preview requires a signed job ID and coordinator.")
-      sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type="get job repair preview")
+      _, inputs = self.deeploy_verify_and_get_inputs(request, request_type="get job repair preview")
       owner = self.deeploy_get_auth_result(inputs)[DEEPLOY_KEYS.ESCROW_OWNER]
-      if sender.lower() != owner.lower():
-        raise ValueError("Only the job's CSP can approve a same-host recovery.")
       if coordinator != self.bc.address:
         raise DeploymentConflictError("This receiver is not the original coordinator. Check the pinned repair endpoint.")
       proposal = self._assess_job_repair(job_id, owner, coordinator)[0]
