@@ -33,6 +33,7 @@ from .models import (
 # Weak auth uses a direct import (not the registry) because it is a
 # distinct pipeline phase, not a generic probe.
 from .probes.business_logic import BusinessLogicProbes
+from .probes.misconfig import MisconfigProbes
 
 
 PROBE_LEVEL_SKIP_OWASP = {
@@ -314,6 +315,10 @@ class GrayboxLocalWorker(BaseLocalWorker):
         return
 
       self._run_weak_auth_phase(discovery_result)
+      if self._check_stopped():
+        return
+
+      self._run_lockout_checks(discovery_result)
 
     except GrayboxAbort as exc:
       self.state["aborted"] = True
@@ -431,8 +436,9 @@ class GrayboxLocalWorker(BaseLocalWorker):
       self._phase_open = False
 
     if not auth_ok:
+      reason = self.auth.failure_reason() or "Authentication failed"
       self._abort(
-        "Official authentication failed. Cannot proceed with graybox scan.",
+        f"Graybox authentication failed: {reason}. Cannot proceed with graybox scan.",
         reason_class="auth_failed",
       )
 
@@ -528,9 +534,20 @@ class GrayboxLocalWorker(BaseLocalWorker):
         bl_probe = BusinessLogicProbes(
           **dict(probe_context.to_kwargs(), allow_stateful=False),
         )
+        # A wrong password for a configured principal could lock the
+        # account the scan logs in with, so those usernames are skipped.
+        configured = {
+          cred.username.strip().casefold()
+          for cred in (self._credentials.official, self._credentials.regular)
+          if cred is not None and cred.username
+        }
+        candidates = [
+          cand for cand in self._credentials.weak_candidates
+          if cand.split(":", 1)[0].strip().casefold() not in configured
+        ]
         try:
           weak_findings = bl_probe.run_weak_auth(
-            self._credentials.weak_candidates,
+            candidates,
             self._credentials.max_weak_attempts,
           )
           self._store_findings("_graybox_weak_auth", weak_findings)
@@ -544,6 +561,24 @@ class GrayboxLocalWorker(BaseLocalWorker):
         self._phase_open = False
     elif self._credentials.weak_candidates and "_graybox_weak_auth" in (self.job_config.excluded_features or []):
       self.metrics.record_probe("_graybox_weak_auth", "skipped:disabled")
+
+  def _run_lockout_checks(self, discovery_result: DiscoveryResult):
+    """Run the checks that send wrong passwords for a configured username.
+
+    They run last, after every probe and the weak_auth phase, because a
+    lockout they trigger would make any later session refresh fail.
+    """
+    excluded = set(self.job_config.excluded_features or [])
+    if "graybox" in excluded or "_graybox_misconfig" in excluded:
+      return
+    store_key = "_graybox_lockout_checks"
+    try:
+      probe = MisconfigProbes(**self._build_probe_kwargs(discovery_result).to_kwargs())
+      self._store_findings(store_key, probe.run_lockout_checks())
+      self.metrics.record_probe(store_key, "completed")
+    except Exception as exc:
+      self._record_probe_error(store_key, exc)
+      self.metrics.record_probe(store_key, "failed")
 
   def _run_registered_probe(self, entry, probe_context: GrayboxProbeContext):
     """Run one registered probe through a shared capability and error boundary."""
@@ -564,7 +599,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
     if probe_cls.requires_regular_session and not self.auth.regular_session:
       self.metrics.record_probe(store_key, "skipped:missing_regular_session")
       return
-    if probe_cls.requires_auth and not self.auth.official_session:
+    if probe_cls.requires_auth and not self.auth.primary_session:
       self.metrics.record_probe(store_key, "skipped:missing_auth")
       return
 
@@ -669,6 +704,9 @@ class GrayboxLocalWorker(BaseLocalWorker):
     port_info["_graybox_auth"] = {
       "official_success": self.auth.official_session is not None,
       "regular_success": self.auth.regular_session is not None,
+      "admin_context": self.auth.admin_context,
+      "primary_principal": self.auth.primary_principal,
+      "failure_reason": self.auth.failure_reason(),
       "auth_errors": list(self.auth._auth_errors),
       "auth_diagnostics": list(getattr(self.auth, "_auth_diagnostics", [])),
       "findings": [],
@@ -679,6 +717,11 @@ class GrayboxLocalWorker(BaseLocalWorker):
     port_info["_graybox_discovery"] = {
       "routes": routes,
       "forms": forms,
+      "crawled_as": self.auth.primary_principal,
+      "coverage_note": (
+        "Crawled as the regular user; admin-only pages not reached."
+        if self.auth.admin_context == "absent" else ""
+      ),
       "findings": [],
     }
 

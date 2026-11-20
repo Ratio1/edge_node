@@ -21,7 +21,7 @@ def _mock_response(status=200, text="", headers=None):
 
 def _make_probe(workflow_endpoints=None, record_endpoints=None,
                 allow_stateful=False, regular_session=None,
-                official_session=None):
+                primary_session=None):
   cfg = GrayboxTargetConfig(
     business_logic=BusinessLogicConfig(
       workflow_endpoints=workflow_endpoints or [],
@@ -30,7 +30,7 @@ def _make_probe(workflow_endpoints=None, record_endpoints=None,
   )
   auth = MagicMock()
   auth.regular_session = regular_session or MagicMock()
-  auth.official_session = official_session or MagicMock()
+  auth.primary_session = primary_session or MagicMock()
   auth.anon_session = MagicMock()
   auth.target_url = "http://testapp.local:8000"
   auth.target_config = cfg
@@ -284,10 +284,11 @@ class TestNegativeAmountScenarioPTA0604(unittest.TestCase):
   def test_pt_a06_04_emits_vulnerable_when_negative_amount_accepted(self):
     record_ep = RecordEndpoint(path="/records/1/")
     probe = _make_probe(record_endpoints=[record_ep], allow_stateful=True)
-    sess = probe.auth.official_session
+    sess = probe.auth.primary_session
     # GET form (extract fields), POST returns 302 → accepted
     sess.get = MagicMock(return_value=self._form_response())
-    sess.post = MagicMock(return_value=_mock_response(status=302))
+    sess.post = MagicMock(return_value=_mock_response(
+      status=302, headers={"content-type": "text/html", "Location": "/records/"}))
 
     probe._test_validation_bypass()
 
@@ -300,7 +301,7 @@ class TestNegativeAmountScenarioPTA0604(unittest.TestCase):
   def test_pt_a06_04_emits_not_vulnerable_when_amount_rejected(self):
     record_ep = RecordEndpoint(path="/records/1/")
     probe = _make_probe(record_endpoints=[record_ep], allow_stateful=True)
-    sess = probe.auth.official_session
+    sess = probe.auth.primary_session
     sess.get = MagicMock(return_value=self._form_response())
     # 200 with explicit error rejecting negative amount
     sess.post = MagicMock(return_value=_mock_response(
@@ -343,3 +344,130 @@ class TestCapabilities(unittest.TestCase):
 
 if __name__ == '__main__':
   unittest.main()
+
+
+# ── RM-219 reachability rule ────────────────────────────────────────────
+
+def _login_page():
+  """A login redirect already followed by `requests`: 200 plus the login form."""
+  resp = _mock_response(
+    status=200,
+    text="<input name='username'><input type='password' name='password'>",
+  )
+  resp.url = "http://testapp.local:8000/auth/login/?next=/orders/1"
+  resp.history = [MagicMock(headers={"Location": "/auth/login/?next=/orders/1"})]
+  return resp
+
+
+def _reached(text="ok"):
+  resp = _mock_response(status=200, text=text)
+  resp.url = "http://testapp.local:8000/orders/1"
+  resp.history = []
+  return resp
+
+
+def _set_admin(probe, admin_context, admin_status=200):
+  probe.auth.admin_context = admin_context
+  probe.auth.official_session = MagicMock()
+  probe.auth.official_session.request = MagicMock(
+    return_value=_reached() if admin_status == 200 else _mock_response(status=admin_status))
+
+
+class TestWorkflowDenialIsSecure(unittest.TestCase):
+  """PT-A06-01: a denial is the secure result, a login redirect is a denial."""
+
+  def _run(self, response, admin_context, admin_status=200):
+    probe = _make_probe(workflow_endpoints=[
+      WorkflowEndpoint(path="/orders/1", method="GET", expected_guard="403")])
+    _set_admin(probe, admin_context, admin_status)
+    probe.auth.regular_session.get.return_value = response
+    probe._test_workflow_bypass()
+    return [(f.status) for f in probe.findings if f.scenario_id == "PT-A06-01"]
+
+  def test_403_and_login_redirect_are_clean_with_and_without_admin(self):
+    for admin in ("provided", "absent"):
+      for name, resp in (("403", _mock_response(status=403)), ("login", _login_page())):
+        with self.subTest(admin=admin, denial=name):
+          self.assertEqual(self._run(resp, admin), ["not_vulnerable"])
+
+  def test_404_is_clean_only_when_admin_reached_the_endpoint(self):
+    self.assertEqual(self._run(_mock_response(status=404), "provided", 200),
+                     ["not_vulnerable"])
+
+  def test_404_is_skipped_without_admin_or_when_admin_also_404(self):
+    self.assertEqual(self._run(_mock_response(status=404), "absent"), [])
+    self.assertEqual(self._run(_mock_response(status=404), "provided", 404), [])
+
+
+class TestValidationBypassReachability(unittest.TestCase):
+
+  FORM = ('<form><input name="amount" value="100.00">'
+          '<input name="status" value="draft"></form>')
+
+  def _probe(self, admin_context):
+    probe = _make_probe(record_endpoints=[RecordEndpoint(path="/records/1/")])
+    probe.auth.admin_context = admin_context
+    return probe
+
+  def _verdicts(self, probe):
+    out = {}
+    for f in probe.findings:
+      if f.scenario_id in ("PT-A06-02", "PT-A06-04"):
+        out[f.scenario_id] = (f.status, [e for e in f.evidence if e.startswith("reason=")])
+    return out
+
+  def test_denied_form_by_403_404_login_is_inconclusive(self):
+    for admin, reason in (("provided", "endpoint_denied"),
+                          ("absent", "admin_context_absent")):
+      for name, resp in (("403", _mock_response(status=403)),
+                         ("404", _mock_response(status=404)),
+                         ("login", _login_page())):
+        with self.subTest(admin=admin, denial=name):
+          probe = self._probe(admin)
+          probe.auth.primary_session.get = MagicMock(return_value=resp)
+          probe._test_validation_bypass()
+          self.assertEqual(self._verdicts(probe), {
+            "PT-A06-02": ("inconclusive", [f"reason={reason}"]),
+            "PT-A06-04": ("inconclusive", [f"reason={reason}"]),
+          })
+
+  def test_reached_get_but_payload_post_redirected_to_login(self):
+    probe = self._probe("absent")
+    sess = probe.auth.primary_session
+    sess.get = MagicMock(return_value=_reached(self.FORM))
+    redirect = _mock_response(status=302, text="", headers={"Location": "/auth/login/?next=/records/1/"})
+    sess.post = MagicMock(return_value=redirect)
+    probe._test_validation_bypass()
+    self.assertEqual(self._verdicts(probe), {
+      "PT-A06-02": ("inconclusive", ["reason=admin_context_absent"]),
+      "PT-A06-04": ("inconclusive", ["reason=admin_context_absent"]),
+    })
+
+  def test_post_answered_by_redirect_to_non_login_page_is_accepted(self):
+    probe = self._probe("provided")
+    sess = probe.auth.primary_session
+    sess.get = MagicMock(return_value=_reached(self.FORM))
+    sess.post = MagicMock(return_value=_mock_response(
+      status=302, text="", headers={"Location": "/records/"}))
+    probe._test_validation_bypass()
+    self.assertEqual({k: v[0] for k, v in self._verdicts(probe).items()}, {
+      "PT-A06-02": "vulnerable", "PT-A06-04": "vulnerable"})
+
+  def test_post_only_action_405_is_decided_by_the_payload_response(self):
+    """405 on the GET baseline: the form is kept and the payload POST decides."""
+    probe = self._probe("absent")
+    sess = probe.auth.primary_session
+    sess.get = MagicMock(return_value=_mock_response(status=405))
+    sess.post = MagicMock(return_value=_mock_response(
+      status=302, text="", headers={"Location": "/records/"}))
+    probe._test_validation_bypass()
+    self.assertEqual({k: v[0] for k, v in self._verdicts(probe).items()}, {
+      "PT-A06-02": "vulnerable", "PT-A06-04": "vulnerable"})
+    probe = self._probe("absent")
+    probe.auth.primary_session.get = MagicMock(return_value=_mock_response(status=405))
+    probe.auth.primary_session.post = MagicMock(return_value=_mock_response(status=403))
+    probe._test_validation_bypass()
+    self.assertEqual(self._verdicts(probe), {
+      "PT-A06-02": ("inconclusive", ["reason=admin_context_absent"]),
+      "PT-A06-04": ("inconclusive", ["reason=admin_context_absent"]),
+    })

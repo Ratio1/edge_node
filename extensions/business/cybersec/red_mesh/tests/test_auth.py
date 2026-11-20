@@ -1026,6 +1026,13 @@ class TestAuthManagerLifecycle(unittest.TestCase):
     self.assertEqual(state.refresh_count, 2)
     self.assertEqual(state.auth_errors, ("official_login_failed",))
 
+  def test_regular_only_state_has_an_authenticated_session(self):
+    auth = _make_auth()
+    auth.regular_session = MagicMock()
+    self.assertTrue(auth.auth_state.has_authenticated_session)
+    auth.regular_session = None
+    self.assertFalse(auth.auth_state.has_authenticated_session)
+
   def test_cleanup_closes_sessions(self):
     """cleanup() closes all sessions."""
     auth = _make_auth()
@@ -1199,6 +1206,248 @@ class TestLoginSuccessIsJudgedOnTheRealClientsResponse(unittest.TestCase):
         allowlist=["/auth/"],
       ),
     )
+
+
+class TestRegularOnlyAuthentication(unittest.TestCase):
+  """RM-219: a scan with regular credentials only, admin (official) absent."""
+
+  def _form_session(self, cookies=None, rejected=False):
+    session = MagicMock()
+    session.get.return_value = _mock_response(
+      text='<input type="hidden" name="csrfmiddlewaretoken" value="tok">'
+    )
+    if rejected:
+      session.post.return_value = _mock_response(
+        url="http://testapp.local:8000/auth/login/",
+        text='<input type="password" name="password">',
+      )
+      session.cookies.get_dict.return_value = {"csrftoken": "c"}
+    else:
+      session.post.return_value = _mock_response(
+        url="http://testapp.local:8000/dashboard/", history=[MagicMock()],
+      )
+      jar = dict(cookies or {"sessionid": "s", "csrftoken": "c"})
+      session.cookies.get_dict.side_effect = lambda: dict(jar)
+      session._jar = jar
+    return session
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_form_regular_only_logs_in_as_regular_with_no_official_request(self, mock_requests):
+    session = self._form_session()
+    mock_requests.Session.return_value = session
+    auth = _make_auth()
+
+    ok = auth.authenticate({"username": "", "password": ""},
+                           {"username": "user", "password": "pw"})
+
+    self.assertTrue(ok)
+    self.assertIsNone(auth.official_session)
+    self.assertIs(auth.regular_session, session)
+    self.assertIs(auth.primary_session, session)
+    self.assertEqual(auth.primary_principal, "regular")
+    self.assertEqual(auth.admin_context, "absent")
+    # One login: one GET of the login page and one POST, both as regular.
+    self.assertEqual(session.post.call_count, 1)
+    self.assertEqual(session.post.call_args.kwargs["data"]["username"], "user")
+
+  def test_bearer_and_api_key_regular_only(self):
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      ApiSecurityConfig, AuthDescriptor,
+    )
+    for auth_type, creds, header in (
+      ("bearer", {"bearer_token": "REG-TOKEN"}, "Authorization"),
+      ("api_key", {"api_key": "REG-KEY"}, "X-Api-Key"),
+    ):
+      with self.subTest(auth_type=auth_type), patch(
+        "extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests",
+      ) as mock_requests:
+        session = MagicMock()
+        session.headers = {}
+        session.params = {}
+        mock_requests.Session.return_value = session
+        cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(
+          auth=AuthDescriptor(auth_type=auth_type),
+        ))
+        auth = AuthManager("http://api.example", cfg, verify_tls=False)
+
+        self.assertTrue(auth.authenticate(None, creds))
+        self.assertIsNone(auth.official_session)
+        self.assertIs(auth.primary_session, session)
+        self.assertIn(header, session.headers)
+        # Only the regular principal built a session.
+        self.assertEqual(mock_requests.Session.call_count, 1)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_rejected_regular_login_fails_and_names_the_principal(self, mock_requests):
+    mock_requests.Session.return_value = self._form_session(rejected=True)
+    auth = _make_auth()
+
+    self.assertFalse(auth.authenticate(None, {"username": "user", "password": "bad"}))
+    reason = auth.failure_reason()
+    self.assertIn("Regular login rejected", reason)
+    self.assertIn("no official credentials configured", reason)
+    self.assertIn("login_rejected", reason)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_no_credentials_at_all_sends_nothing(self, mock_requests):
+    auth = _make_auth()
+    self.assertFalse(auth.authenticate(None, None))
+    mock_requests.Session.assert_not_called()
+    self.assertIn("no official or regular credentials", auth.failure_reason())
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_rejected_official_login_names_official(self, mock_requests):
+    mock_requests.Session.return_value = self._form_session(rejected=True)
+    auth = _make_auth()
+    self.assertFalse(auth.authenticate({"username": "admin", "password": "bad"},
+                                       {"username": "user", "password": "pw"}))
+    self.assertTrue(auth.failure_reason().startswith("Official (admin) login rejected"))
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_ensure_sessions_does_not_reauthenticate_without_official(self, mock_requests):
+    session = self._form_session()
+    mock_requests.Session.return_value = session
+    auth = _make_auth()
+    regular = {"username": "user", "password": "pw"}
+    self.assertTrue(auth.authenticate(None, regular))
+
+    for _ in range(5):
+      self.assertTrue(auth.ensure_sessions(None, regular))
+
+    self.assertEqual(auth._refresh_count, 0)
+    self.assertEqual(session.post.call_count, 1)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_server_side_logout_triggers_relogin(self, mock_requests):
+    first = self._form_session()
+    second = self._form_session()
+    mock_requests.Session.side_effect = [first, second]
+    auth = _make_auth()
+    regular = {"username": "user", "password": "pw"}
+    self.assertTrue(auth.authenticate(None, regular))
+
+    # The server ended the session: the session cookie is gone, CSRF stays.
+    del first._jar["sessionid"]
+    self.assertTrue(auth.needs_refresh())
+    self.assertTrue(auth.ensure_sessions(None, regular))
+    self.assertIs(auth.primary_session, second)
+    self.assertEqual(auth._refresh_count, 1)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_a_one_shot_flash_cookie_disappearing_is_not_a_logout(self, mock_requests):
+    session = self._form_session(
+      cookies={"sessionid": "s", "messages": "flash", "csrftoken": "c"})
+    mock_requests.Session.return_value = session
+    auth = _make_auth()
+    self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+    del session._jar["messages"]
+    self.assertFalse(auth.needs_refresh())
+    del session._jar["sessionid"]  # every login cookie gone: logged out
+    self.assertTrue(auth.needs_refresh())
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_probe_path_revalidates_the_primary_session_at_most_once_a_minute(self, mock_requests):
+    import time
+    mock_requests.Session.return_value = self._form_session()
+    auth = _make_auth()
+    self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+    def rejected(session):
+      auth._auth_diagnostics.append({"stage": "authenticated_probe_rejected"})
+      return False, False
+    with patch.object(auth, "_authenticated_probe_path", return_value="/api/me"), \
+         patch.object(auth, "_validate_authenticated_session",
+                      side_effect=rejected) as validate:
+      # Just authenticated: inside the 60 s window, no extra request.
+      self.assertFalse(auth.needs_refresh())
+      validate.assert_not_called()
+      # Window over, and the probe path now rejects the session (a logout that
+      # keeps the cookie, or a revoked bearer token): refresh.
+      auth._liveness_checked_at = time.time() - 61
+      self.assertTrue(auth.needs_refresh())
+      self.assertEqual(validate.call_count, 1)
+      validate.assert_called_with(auth.primary_session)
+      # Checked again within the window: no further request.
+      self.assertFalse(auth.needs_refresh())
+      self.assertEqual(validate.call_count, 1)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_probe_path_login_page_without_marker_or_identity_is_a_logout(self, mock_requests):
+    """A 200 login page at the probe path lacks the configured marker or
+    identity: the session ended."""
+    import time
+    for stage in ("authenticated_probe_marker_missing",
+                  "authenticated_probe_identity_missing"):
+      with self.subTest(stage=stage):
+        mock_requests.Session.return_value = self._form_session()
+        auth = _make_auth()
+        self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+        auth._liveness_checked_at = time.time() - 61
+
+        def login_page(session, stage=stage):
+          auth._auth_diagnostics.append({"stage": stage, "status": 200})
+          return False, False
+        with patch.object(auth, "_authenticated_probe_path", return_value="/api/me"), \
+             patch.object(auth, "_validate_authenticated_session", side_effect=login_page):
+          self.assertTrue(auth.needs_refresh())
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_probe_path_429_or_5xx_is_not_a_logout(self, mock_requests):
+    import time
+    mock_requests.Session.return_value = self._form_session()
+    auth = _make_auth()
+    self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+    auth._liveness_checked_at = time.time() - 61
+
+    def throttled(session):
+      auth._auth_diagnostics.append({"stage": "authenticated_probe_error", "status": 429})
+      return False, False
+    with patch.object(auth, "_authenticated_probe_path", return_value="/api/me"), \
+         patch.object(auth, "_validate_authenticated_session", side_effect=throttled):
+      self.assertFalse(auth.needs_refresh())
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_probe_path_transport_error_is_not_a_logout(self, mock_requests):
+    import time
+    mock_requests.Session.return_value = self._form_session()
+    auth = _make_auth()
+    self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+    auth._liveness_checked_at = time.time() - 61
+    with patch.object(auth, "_authenticated_probe_path", return_value="/api/me"), \
+         patch.object(auth, "_validate_authenticated_session",
+                      return_value=(False, True)):
+      self.assertFalse(auth.needs_refresh())
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_no_probe_path_means_no_liveness_request(self, mock_requests):
+    import time
+    mock_requests.Session.return_value = self._form_session()
+    auth = _make_auth()
+    self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+    auth._liveness_checked_at = time.time() - 61
+    with patch.object(auth, "_validate_authenticated_session") as validate:
+      self.assertFalse(auth.needs_refresh())
+      validate.assert_not_called()
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_form_authenticate_resets_last_response(self, mock_requests):
+    from extensions.business.cybersec.red_mesh.graybox.auth_strategies import FormAuth
+    mock_requests.Session.return_value = self._form_session()
+    strategy = FormAuth(
+      "http://testapp.local:8000", GrayboxTargetConfig(), verify_tls=False)
+    strategy.last_response = "stale"
+    with patch.object(strategy, "make_session", side_effect=RuntimeError("stop")):
+      with self.assertRaises(RuntimeError):
+        strategy.authenticate({"username": "u", "password": "p"})
+    self.assertIsNone(strategy.last_response)
+
+  def test_cleanup_closes_each_distinct_session_once(self):
+    auth = _make_auth()
+    shared = MagicMock()
+    auth.official_session = shared
+    auth.regular_session = shared
+    auth.cleanup()
+    shared.close.assert_called_once()
+    self.assertEqual(shared.get.call_count, 1)  # one logout request
 
 
 if __name__ == '__main__':

@@ -3606,6 +3606,35 @@ class TestPhase4UiAggregate(unittest.TestCase):
     self.assertEqual(result["total_scenarios"], 3)
     self.assertEqual(result["total_scenarios_vulnerable"], 1)
 
+  def test_regular_only_report_states_coverage_and_does_not_claim_admin(self):
+    """RM-219: the archive carries the coverage note, the principal and admin_context."""
+    plugin, _ = self._make_plugin()
+    p = self._make_pass(findings=[self._make_finding(severity="HIGH", finding_id="gb1")])
+    agg = self._make_webapp_aggregated()
+    agg["service_info"]["443"]["_graybox_discovery"]["coverage_note"] = (
+      "Crawled as the regular user; admin-only pages not reached.")
+    agg["service_info"]["443"]["_graybox_auth"] = {
+      "official_success": False, "regular_success": True,
+      "admin_context": "absent", "primary_principal": "regular",
+    }
+    result = plugin._compute_ui_aggregate([p], agg, job_config={"scan_type": "webapp"}).to_dict()
+    self.assertIn("admin-only pages not reached", result["graybox_coverage_note"])
+    self.assertEqual(result["graybox_admin_context"], "absent")
+    self.assertEqual(result["graybox_primary_principal"], "regular")
+    from extensions.business.cybersec.red_mesh.models.archive import UiAggregate
+    restored = UiAggregate.from_dict(result)
+    self.assertEqual(restored.graybox_admin_context, "absent")
+
+  def test_report_with_admin_carries_no_coverage_note(self):
+    plugin, _ = self._make_plugin()
+    p = self._make_pass(findings=[self._make_finding(severity="HIGH", finding_id="gb1")])
+    agg = self._make_webapp_aggregated()
+    agg["service_info"]["443"]["_graybox_auth"] = {
+      "admin_context": "provided", "primary_principal": "official"}
+    result = plugin._compute_ui_aggregate([p], agg, job_config={"scan_type": "webapp"}).to_dict()
+    self.assertEqual(result["graybox_coverage_note"], "")
+    self.assertEqual(result["graybox_admin_context"], "provided")
+
 
 
 class TestPhase3Archive(unittest.TestCase):
