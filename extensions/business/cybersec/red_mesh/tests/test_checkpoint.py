@@ -1,8 +1,11 @@
 import os
 import pickle
 import shutil
+import struct
 import tempfile
+import threading
 import time
+import tracemalloc
 import unittest
 from unittest.mock import patch
 from collections import OrderedDict, deque
@@ -60,6 +63,22 @@ class _Custom:
 class _CallsStr:
   def __reduce__(self):
     return (str, ("x",))
+
+
+class _Calls:
+  """Pickles as `fn([(1, 2)])` through REDUCE: a call that copies its argument container."""
+
+  def __init__(self, fn):
+    self.fn = fn
+
+  def __reduce__(self):
+    return (self.fn, ([(1, 2)],))
+
+
+# {"version": 1, "x": []} with the list stored at memo index 10**6 by LONG_BINPUT: the C unpickler grows its memo
+# table to the index (about 12 bytes per slot). A protocol-4/5 pickler only ever emits MEMOIZE.
+_MEMO_PUT_FILE = (b"\x80\x04}(\x8c\x07version" + b"K" + bytes([ckpt.CHECKPOINT_VERSION])
+                  + b"\x8c\x01x]r" + struct.pack("<I", 10 ** 6) + b"u.")
 
 
 def _payload(**kw):
@@ -132,7 +151,7 @@ class TestCheckpointStore(unittest.TestCase):
       "open_ports": [22, 80], "ports_scanned": [1, 2], "port_banners": {22: "SSH-2.0", 80: ""},
       "service_info": {22: {"banner": "x", "findings": [{"title": "t", "severity": "HIGH"}]}},
       "scan_metadata": {"internal_ips": ["10.0.0.1"], "seen": {1, 2}, "frozen": frozenset({3})},
-      "raw": b"\x00\xff", "odd": OrderedDict(a=1), "dq": deque([1, 2]),
+      "raw": b"\x00\xff",
       "when": datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
       "delta": timedelta(seconds=5), "pair": (1, "a", None, 2.5, True),
     }
@@ -153,6 +172,97 @@ class TestCheckpointStore(unittest.TestCase):
     ckpt.save(self.owner, "job1", 1, "s", _payload(state={"x": _CallsStr()}))
     self.assertEqual(ckpt.load_all(self.owner, "job1", 1), {})
     self.assertFalse(os.path.exists(os.path.join(self.base, "job1", "1_s.pkl")))
+
+  def test_copying_globals_called_through_reduce_are_refused(self):
+    for name, fn in (("set", set), ("frozenset", frozenset), ("odict", OrderedDict), ("deque", deque)):
+      ckpt.save(self.owner, "job1", 1, name, _payload(state={"x": _Calls(fn)}))
+    self.assertEqual(ckpt.load_all(self.owner, "job1", 1), {})
+    self.assertEqual(os.listdir(os.path.join(self.base, "job1")), [])
+
+  def _write_raw(self, name, data):
+    os.makedirs(os.path.join(self.base, "job1"), exist_ok=True)
+    path = os.path.join(self.base, "job1", name)
+    with open(path, "wb") as fh:
+      fh.write(data)
+    return path
+
+  def test_memo_put_opcode_is_refused(self):
+    self.assertIsInstance(pickle.loads(_MEMO_PUT_FILE), dict)
+    path = self._write_raw("1_put.pkl", _MEMO_PUT_FILE)
+    self.assertEqual(ckpt.load_all(self.owner, "job1", 1), {})
+    self.assertFalse(os.path.exists(path))
+
+  def test_final_marker_goes_through_the_same_prescan(self):
+    path = self._write_raw("final_1.pkl", _MEMO_PUT_FILE)
+    with patch.object(ckpt, "_RestrictedUnpickler") as unpickler:
+      self.assertIsNone(ckpt.load_final_marker(self.owner, "job1", 1))
+    unpickler.assert_not_called()
+    self.assertFalse(os.path.exists(path))
+
+  def test_fifo_final_marker_does_not_block(self):
+    os.makedirs(os.path.join(self.base, "job1"))
+    os.mkfifo(os.path.join(self.base, "job1", "final_1.pkl"))
+    result = []
+    reader = threading.Thread(target=lambda: result.append(ckpt._read_file(
+      os.path.join(self.base, "job1", "final_1.pkl"))), daemon=True)
+    reader.start()
+    reader.join(5)
+    self.assertFalse(reader.is_alive(), "opening a FIFO blocked the loader")
+    self.assertEqual(result, [None])
+
+  def test_shared_string_counts_once_per_reference(self):
+    text = "x" * 1000  # a resumed worker copies a shared string once per reference (redaction, JSON)
+    ckpt.save(self.owner, "job1", 1, "few", _payload(state={"x": [text] * 10}))
+    ckpt.save(self.owner, "job1", 1, "many", _payload(state={"x": [text] * 100}))
+    self.assertLess(os.path.getsize(os.path.join(self.base, "job1", "1_many.pkl")), 2000)
+    with patch.object(ckpt, "MAX_TEXT_BYTES", 50_000):
+      self.assertEqual(list(ckpt.load_all(self.owner, "job1", 1)), ["few"])
+    self.assertFalse(os.path.exists(os.path.join(self.base, "job1", "1_many.pkl")))
+    for prefix in ("a", "b"):  # each under the cap, the pass over it
+      ckpt.save(self.owner, "job1", 2, prefix, _payload(state={"x": [text] * 30}))
+    with patch.object(ckpt, "MAX_TEXT_BYTES", 50_000):
+      self.assertEqual(list(ckpt.load_all(self.owner, "job1", 2)), ["a"])
+    self.assertFalse(os.path.exists(os.path.join(self.base, "job1", "2_b.pkl")))
+    # Protocol 5 writes a bytearray as BYTEARRAY8, with no global to refuse; it counts like str and bytes.
+    path = self._write_raw("3_ba.pkl", pickle.dumps(_payload(state={"x": [bytearray(1000)] * 100}), protocol=5))
+    with patch.object(ckpt, "MAX_TEXT_BYTES", 50_000):
+      self.assertEqual(ckpt.load_all(self.owner, "job1", 3), {})
+    self.assertFalse(os.path.exists(path))
+
+  def test_opcode_count_over_cap_is_refused_before_load(self):
+    ckpt.save(self.owner, "job1", 1, "spray", _payload(state={"x": [set() for _ in range(100)]}))
+    ckpt.save(self.owner, "job1", 1, "ok", _payload())
+    with patch.object(ckpt, "MAX_OPCODES", 60), patch.object(ckpt, "_RestrictedUnpickler") as unpickler:
+      self.assertIsNone(ckpt._read_file(os.path.join(self.base, "job1", "1_spray.pkl")))
+    unpickler.assert_not_called()
+    with patch.object(ckpt, "MAX_OPCODES", 60):
+      self.assertEqual(list(ckpt.load_all(self.owner, "job1", 1)), ["ok"])
+    self.assertFalse(os.path.exists(os.path.join(self.base, "job1", "1_spray.pkl")))
+
+  def test_pass_budget_refuses_files_past_it(self):
+    for prefix in ("a", "b"):
+      ckpt.save(self.owner, "job1", 1, prefix, _payload(blob="x" * 1200))
+    size = os.path.getsize(os.path.join(self.base, "job1", "1_a.pkl"))
+    with patch.object(ckpt, "MAX_FILE_BYTES", size + 100):  # each file fits, the two together do not
+      self.assertEqual(list(ckpt.load_all(self.owner, "job1", 1)), ["a"])
+    self.assertFalse(os.path.exists(os.path.join(self.base, "job1", "1_b.pkl")))
+    for prefix in ("c", "d"):
+      ckpt.save(self.owner, "job1", 2, prefix, _payload(state={"x": list(range(10))}))
+    with patch.object(ckpt, "MAX_OPCODES", 40):  # each file is under 40 opcodes, the two together are not
+      self.assertEqual(list(ckpt.load_all(self.owner, "job1", 2)), ["c"])
+    self.assertFalse(os.path.exists(os.path.join(self.base, "job1", "2_d.pkl")))
+
+  def test_node_walk_of_a_self_referencing_list_stays_small(self):
+    looped = []
+    looped.extend([looped] * 1000)  # each pop would push 1000 more entries
+    tracemalloc.start()
+    try:
+      with patch.object(ckpt, "MAX_NODES", 10_000):
+        self.assertFalse(ckpt._within_node_bound(looped))
+      peak = tracemalloc.get_traced_memory()[1]
+    finally:
+      tracemalloc.stop()
+    self.assertLess(peak, 2 * 1024 * 1024)
 
   def test_memo_shared_dag_is_rejected_and_deleted_quickly(self):
     dag = []
