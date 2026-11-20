@@ -47,18 +47,18 @@ def apply_fault(fixture, fault):
   if fault == "actor":
     actor = None
   elif fault == "deleted":
-    fixture.store.data.pop(("auth", "reader"))
+    fixture.store.data.pop(("deployment:auth", "reader"))
   elif fault == "inactive":
     fixture.store.account("reader", active=False,
       memberships=[{"role": "super_pentester", "tenant_id": fixture.tenant_id}])
   elif fault == "none_scope":
-    fixture.store.data[("auth", "reader")]["memberships"] = []
+    fixture.store.data[("deployment:auth", "reader")]["memberships"] = []
   elif fault == "user":
     as_role(fixture, "tenant_user")
   elif fault == "other_tenant":
     tenant_id = "tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f"
   elif fault == "identity_store":
-    fixture.store.fail_hkey = "auth"
+    fixture.store.fail_hkey = "deployment:auth"
   return actor, tenant_id
 
 

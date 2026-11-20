@@ -1,8 +1,8 @@
 """CStore account reader for the RedMesh v1 account record (RM-084 P6).
 
-Reads the record the Navigator writes, server-side, through the plugin's ``chainstore_hget``. Needs
-only ``R1EN_CSTORE_AUTH_HKEY`` -- the auth *secret* is the password pepper and is never read here,
-and neither is a password.
+Reads the record the Navigator writes, server-side, through the plugin's ``chainstore_hget``. Its hash is
+``<pipeline name>:auth``, derived by ``account_hkey``. The auth *secret* is the password pepper and is
+never read here, and neither is a password.
 
 Parsing lives in ``tenancy/account_record.py`` so that this file is about *reaching* the store and
 that one is about what a record means. What this layer binds to is only the addressing:
@@ -17,12 +17,11 @@ no memberships key -- the legacy bridge. All of it is gone: an account's authori
 rows it actually holds.
 """
 import json
-import os
 
+from .. import account_hkey
 from ..account_record import parse_account_record
 from ..identity import AccountView, IdentityStoreError, TenantMembership, canonical_account_id
 
-AUTH_HKEY_ENV = "R1EN_CSTORE_AUTH_HKEY"
 ACTIVE_STATE = "active"
 MAX_ENUMERATED_ACCOUNTS = 10000
 
@@ -32,17 +31,9 @@ class CstoreAuthAccountReader:
     self._owner = owner
 
   def _hkey(self):
-    # The plugin instance ENV first: deeploy injects the hkey there (a pipeline-level value), and
-    # this plugin runs in-process, so that ENV never becomes os.environ the way it does for a
-    # containerized app. os.environ remains the fallback for node-level configuration.
-    instance_env = getattr(self._owner, "cfg_env", None)
-    hkey = ""
-    if isinstance(instance_env, dict):
-      hkey = str(instance_env.get(AUTH_HKEY_ENV) or "").strip()
+    hkey = account_hkey(self._owner)
     if not hkey:
-      hkey = os.environ.get(AUTH_HKEY_ENV, "").strip()
-    if not hkey:
-      raise IdentityStoreError(f"{AUTH_HKEY_ENV} is not configured")
+      raise IdentityStoreError("Account store is unavailable: the pipeline name is empty")
     return hkey
 
   def get_account(self, account_id):

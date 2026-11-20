@@ -35,7 +35,7 @@ class ApiAbuseProbes(ProbeBase):
     return self.run_runtime_scenarios(self.probe_key)
 
   def _session(self):
-    return self.auth.official_session or self.auth.regular_session
+    return self.auth.primary_session
 
   def _low_priv_session(self):
     return self.auth.regular_session
@@ -204,6 +204,9 @@ class ApiAbuseProbes(ProbeBase):
         )
       except requests.RequestException:
         continue
+      if not self.response_reached(baseline):
+        self.emit_endpoint_denied("PT-OAPI4-01")
+        continue
       self.safety.throttle()
       try:
         abuse = session.get(
@@ -211,7 +214,11 @@ class ApiAbuseProbes(ProbeBase):
         )
       except requests.RequestException:
         continue
-      if baseline.status_code >= 400 or abuse.status_code >= 400:
+      if not self.response_reached(abuse):
+        # A 400/415/422 rejects the high limit (the handler ran): no verdict,
+        # as before. Anything else not reached is a denial of the principal.
+        if not self.response_reached(abuse, validation_ok=True):
+          self.emit_endpoint_denied("PT-OAPI4-01")
         continue
       base_size = len((baseline.text or "").encode())
       abuse_size = len((abuse.text or "").encode())
@@ -297,6 +304,8 @@ class ApiAbuseProbes(ProbeBase):
     if session is None:
       self.emit_inconclusive("PT-OAPI4-03", title, owasp, "no_authenticated_session")
       return
+    reached_any = False
+    denied_any = False
     for ep in self.target_config.api_security.resource_endpoints:
       if not ep.rate_limit_expected:
         continue  # FP guard — only fire when operator marked endpoint
@@ -313,10 +322,18 @@ class ApiAbuseProbes(ProbeBase):
           resp = session.get(self.target_url + ep.path, timeout=10)
         except requests.RequestException:
           break
-        n += 1
         if resp.status_code == 429:
+          n += 1
           saw_429 = True
           break
+        # The first GET is the baseline: a denied endpoint says nothing about
+        # its rate limit, so it is not counted as tested.
+        if not self.response_reached(resp):
+          denied_any = True
+          n = 0
+          break
+        reached_any = True
+        n += 1
         if resp.headers.get("Retry-After"):
           saw_retry_after = True
         if any(h.lower().startswith("x-ratelimit") for h in resp.headers):
@@ -334,6 +351,10 @@ class ApiAbuseProbes(ProbeBase):
           ),
           response=resp,
         )
+    if denied_any and not reached_any and not any(
+      f.scenario_id == "PT-OAPI4-03" for f in self.findings
+    ):
+      self.emit_endpoint_denied("PT-OAPI4-03")
 
   # ── PT-OAPI6-01 — flow no rate limit (STATEFUL) ────────────────────
 

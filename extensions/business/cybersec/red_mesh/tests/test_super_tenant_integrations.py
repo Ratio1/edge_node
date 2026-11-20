@@ -33,15 +33,12 @@ class _Case(unittest.TestCase):
     cls.Plugin = PentesterApi01Plugin
 
   def setUp(self):
-    env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    env.start()
-    self.addCleanup(env.stop)
     self.store = FakeAdministrationStore()
     self.store.account("pentester", memberships=[{"role": "super_pentester", "tenant_id": None}])
     self.tenant = "tn_" + str(uuid4())
     self.store.account("scoped-sta", memberships=[{"role": "super_tenant_admin", "tenant_id": self.tenant}])
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenancy_namespace = "deployment"
+    self.plugin._stream_id = "deployment"
     self.plugin.cfg_instance_id = "jobs"
     self.plugin.config_data = json.loads(json.dumps(DEEPLOY))
     self.plugin.P = lambda *args, **kwargs: None

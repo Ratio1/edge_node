@@ -24,15 +24,23 @@ class MisconfigProbes(ProbeBase):
     self.run_safe("login_rate_limiting", self._test_login_rate_limiting)
     self.run_safe("password_reset_token", self._test_password_reset_token)
     self.run_safe("password_reset_token_reuse", self._test_password_reset_token_reuse)
-    self.run_safe("account_enumeration_timing", self._test_account_enumeration_timing)
     self.run_safe("jwt_weak_alg", self._test_jwt_weak_alg)
     self.run_safe("session_fixation", self._test_session_fixation)
+    return self.findings
+
+  def run_lockout_checks(self):
+    """PT-A02-17 and PT-A07-04: wrong-password logins for the configured username.
+
+    The worker runs these after every probe and after the weak_auth phase, so a
+    lockout they trigger cannot make a later session refresh fail (RM-219).
+    """
+    self.run_safe("account_enumeration_timing", self._test_account_enumeration_timing)
     self.run_safe("account_enumeration", self._test_account_enumeration)
     return self.findings
 
   def _test_debug_exposure(self):
     """PT-A02-01: check debug/config endpoints for information disclosure."""
-    session = self.auth.anon_session or self.auth.official_session
+    session = self.auth.anon_session or self.auth.primary_session
     if not session:
       return
 
@@ -75,7 +83,7 @@ class MisconfigProbes(ProbeBase):
     Tests both the root URL and discovered API routes, since many apps
     only set CORS headers on API endpoints (e.g. /api/*).
     """
-    session = self.auth.anon_session or self.auth.official_session
+    session = self.auth.anon_session or self.auth.primary_session
     if not session:
       return
 
@@ -168,7 +176,7 @@ class MisconfigProbes(ProbeBase):
 
   def _test_security_headers(self):
     """PT-A02-03: check for missing security headers."""
-    session = self.auth.anon_session or self.auth.official_session
+    session = self.auth.anon_session or self.auth.primary_session
     if not session:
       return
 
@@ -214,10 +222,10 @@ class MisconfigProbes(ProbeBase):
 
   def _test_cookie_attributes(self):
     """PT-A02-04: check session cookie security attributes."""
-    if not self.auth.official_session:
+    if not self.auth.primary_session:
       return
 
-    cookies = self.auth.official_session.cookies
+    cookies = self.auth.primary_session.cookies
     issues = []
     for cookie in cookies:
       if not cookie.secure:
@@ -256,7 +264,7 @@ class MisconfigProbes(ProbeBase):
     Submit POST without CSRF token to state-changing endpoints.
     If the server accepts → CSRF bypass detected.
     """
-    if not self.auth.official_session:
+    if not self.auth.primary_session:
       return
 
     csrf_test_endpoints = []
@@ -272,23 +280,79 @@ class MisconfigProbes(ProbeBase):
       return
 
     tested = 0
+    denied = 0
     vulnerable_endpoints = []
+    csrf_field = self.auth.detected_csrf_field
     for path in csrf_test_endpoints[:5]:
+      # A POST to the logout URL ends the scan session.
+      if self.is_logout_path(path):
+        continue
       self.safety.throttle()
       url = self.target_url + path
+      # Baseline: the principal must be allowed to use this endpoint, else a
+      # tokenless 403 proves nothing about CSRF. With allow_stateful the
+      # baseline is the same POST with a valid token; without it a GET of the
+      # endpoint, so no state-changing request is sent as the baseline.
+      baseline_ok = True
+      if self._allow_stateful:
+        baseline_data = {"test": "csrf_probe"}
+        baseline_headers = {"Referer": url}
+        if csrf_field:
+          try:
+            page = self.auth.primary_session.get(url, timeout=10)
+            token = self.auth.extract_csrf_value(page.text, csrf_field)
+          except Exception:
+            token = None
+          if token:
+            baseline_data[csrf_field] = token
+            baseline_headers["X-CSRFToken"] = token
+        try:
+          baseline = self.auth.primary_session.post(
+            url, data=baseline_data, timeout=10, headers=baseline_headers,
+          )
+        except Exception:
+          continue
+        if not self.response_reached(baseline, validation_ok=True):
+          denied += 1
+          continue
+      else:
+        try:
+          baseline = self.auth.primary_session.get(url, timeout=10)
+        except Exception:
+          continue
+        if baseline.status_code == 405:
+          # POST-only action: no GET baseline, the tokenless response decides.
+          baseline_ok = False
+        elif not self.response_reached(baseline):
+          denied += 1
+          continue
       try:
-        resp = self.auth.official_session.post(
+        resp = self.auth.primary_session.post(
           url, data={"test": "csrf_probe"}, timeout=10,
           headers={"Referer": "http://evil.example.com"},
         )
       except Exception:
         continue
-      tested += 1
+      # Not reached (login redirect, 404): denied. After a reached baseline a
+      # 401/403 is left to the CSRF-rejection checks below.
+      if not self.response_reached(resp, validation_ok=True) and (
+          not baseline_ok or resp.status_code not in (401, 403)):
+        denied += 1
+        continue
       body_lower = resp.text.lower()
+      # Without the valid-token POST baseline (allow_stateful), a GET that
+      # reached the page does not show the user may POST there: a bare 401/403
+      # may be an authorization denial, so only a CSRF-specific rejection counts.
+      if (not self._allow_stateful and resp.status_code in (401, 403)
+          and "csrf" not in body_lower and "token" not in body_lower):
+        denied += 1
+        continue
+      tested += 1
       csrf_rejected = any(m in body_lower for m in [
         "csrf", "forbidden", "token", "invalid request",
       ]) or resp.status_code == 403
-      if not csrf_rejected and resp.status_code < 400:
+      if (not csrf_rejected and resp.status_code < 400
+          and self.response_reached(resp)):
         vulnerable_endpoints.append(path)
 
     if vulnerable_endpoints:
@@ -321,6 +385,8 @@ class MisconfigProbes(ProbeBase):
         owasp="A02:2021",
         evidence=[f"endpoints_tested={tested}"],
       ))
+    elif denied > 0:
+      self.emit_endpoint_denied("PT-A02-05")
 
   def _test_session_token(self):
     """
@@ -328,7 +394,7 @@ class MisconfigProbes(ProbeBase):
 
     Tests JWT alg=none, short session IDs.
     """
-    if not self.auth.official_session:
+    if not self.auth.primary_session:
       return
 
     import base64
@@ -336,7 +402,7 @@ class MisconfigProbes(ProbeBase):
     evidence = []
     status = "not_vulnerable"
 
-    cookies = self.auth.official_session.cookies.get_dict()
+    cookies = self.auth.primary_session.cookies.get_dict()
     for name, value in cookies.items():
       parts = value.split(".")
       if len(parts) == 3:
@@ -936,12 +1002,15 @@ class MisconfigProbes(ProbeBase):
     # Use the official credentials we already authenticated with — the
     # AuthManager doesn't expose them directly, but we can read from the
     # env shape passed at probe-init time.
+    # Only the configured issuer account: falling back to the regular username
+    # would send it a wrong password and could lock the account later probes
+    # need (RM-219).
     issue_creds = {
-      "username": jwt_cfg.username or self.regular_username or "admin",
+      "username": jwt_cfg.username or "",
       "password": jwt_cfg.password or "",
     }
-    if not issue_creds["password"]:
-      # Without a password we can't issue a baseline token.
+    if not issue_creds["username"] or not issue_creds["password"]:
+      # Without issuer credentials we can't issue a baseline token.
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A02-12",
         title="JWT weak-alg probe — issuer credentials not configured",
@@ -949,7 +1018,7 @@ class MisconfigProbes(ProbeBase):
         severity="INFO",
         owasp="A02:2021",
         evidence=[f"token_path={jwt_cfg.token_path}",
-                  "reason=jwt_endpoints.password not set in target_config"],
+                  "reason=jwt_endpoints.username or password not set in target_config"],
       ))
       return
 
@@ -1087,7 +1156,7 @@ class MisconfigProbes(ProbeBase):
     post-auth cookies on the already-established official session.
     Read-only: does not perform additional logins.
     """
-    if not self.auth.official_session:
+    if not self.auth.primary_session:
       return
 
     login_url = self.target_url + self.target_config.login_path
@@ -1112,7 +1181,7 @@ class MisconfigProbes(ProbeBase):
       return  # no pre-auth cookies → can't test fixation
 
     # Step 2: get post-auth cookies from the existing official session
-    post_cookies = self.auth.official_session.cookies
+    post_cookies = self.auth.primary_session.cookies
     if hasattr(post_cookies, "get_dict"):
       post_cookies = post_cookies.get_dict()
     else:

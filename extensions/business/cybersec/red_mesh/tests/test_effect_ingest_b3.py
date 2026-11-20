@@ -34,18 +34,18 @@ def apply_fault(fixture, fault):
   if fault == "actor":
     actor = None
   elif fault == "deleted":
-    fixture.store.data.pop(("auth", "reader"))
+    fixture.store.data.pop(("deployment:auth", "reader"))
   elif fault == "inactive":
     fixture.store.account("reader", active=False,
       memberships=[{"role": "tenant_admin", "tenant_id": fixture.tenant_id}])
   elif fault == "none_scope":
-    fixture.store.data[("auth", "reader")]["memberships"] = []
+    fixture.store.data[("deployment:auth", "reader")]["memberships"] = []
   elif fault == "user":
     as_role(fixture, "tenant_user")
   elif fault == "other_tenant":
     tenant_id = "tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f"
   elif fault == "identity_store":
-    fixture.store.fail_hkey = "auth"
+    fixture.store.fail_hkey = "deployment:auth"
   return actor, tenant_id
 
 
@@ -118,7 +118,7 @@ def test_an_unsafe_parse_message_cannot_reach_the_caller():
 def test_upload_denials_never_reach_storage(fault, status):
   # RM-084 P3: the upload is tenant-scoped under `authorization:upload`, bound to Allow Pentester.
   with read_endpoint_fixture(bound=True, role="tenant_pentester") as fixture:
-    account = fixture.store.data[("auth", "reader")]
+    account = fixture.store.data[("deployment:auth", "reader")]
     actor, tenant_id = fixture.actor, allow_pentester(fixture)
     if fault == "actor": actor = None
     elif fault == "inactive": fixture.store.account("reader", active=False)

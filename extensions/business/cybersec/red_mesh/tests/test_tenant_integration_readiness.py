@@ -123,7 +123,7 @@ def test_public_projection_omits_history_and_never_reads_a_stored_record():
 def test_every_export_role_is_admitted(role):
   with read_endpoint_fixture(bound=True) as fixture:
     fixture.owner.CONFIG, fixture.owner.config_data = {}, {}
-    fixture.store.data[("auth", "reader")]["memberships"] = [
+    fixture.store.data[("deployment:auth", "reader")]["memberships"] = [
       {"role": role, "tenant_id": None if role == "super_tenant_admin" else fixture.tenant_id}]
     payload = fixture.Plugin.get_integration_status(fixture.owner, request_actor=fixture.actor,
                                                   tenant_id=fixture.tenant_id)
@@ -201,9 +201,9 @@ def test_native_admission_denies_before_any_configuration_evaluation(read_native
     fixture.owner.CONFIG, fixture.owner.config_data = {}, {}
     poison_history(fixture)
     body = {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id}
-    account = fixture.store.data[("auth", "reader")]
+    account = fixture.store.data[("deployment:auth", "reader")]
     if fault == "actor": body.pop("request_actor")
-    elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
+    elif fault == "deleted": fixture.store.data.pop(("deployment:auth", "reader"))
     elif fault == "inactive": fixture.store.account("reader", active=False)
     elif fault in ("memberships", "null_memberships"):
       account["memberships"] = [] if fault == "memberships" else None
@@ -211,7 +211,7 @@ def test_native_admission_denies_before_any_configuration_evaluation(read_native
       account["memberships"] = [{"role": "tenant_user", "tenant_id": fixture.tenant_id}]
     elif fault == "other_tenant": body["tenant_id"] = "tn_00000000-0000-4000-8000-000000000000"
     elif fault == "missing_tenant": body.pop("tenant_id")
-    elif fault == "identity_store": fixture.store.fail_hkey = "auth"
+    elif fault == "identity_store": fixture.store.fail_hkey = "deployment:auth"
     # Patch the plugin module's own binding: pentester_api_01 imports the function into
     # its namespace at import time, so patching the service module would be vacuous.
     from extensions.business.cybersec.red_mesh import pentester_api_01
@@ -281,6 +281,6 @@ def test_without_a_tenant_any_other_caller_is_refused_before_any_evaluation(memb
 def test_the_sta_read_without_a_tenant_fails_closed_when_identity_is_unreadable():
   with read_endpoint_fixture(bound=True) as fixture:
     fixture.owner.CONFIG, fixture.owner.config_data = {}, {}
-    fixture.store.fail_hkey = "auth"
+    fixture.store.fail_hkey = "deployment:auth"
     assert fixture.Plugin.get_integration_status(fixture.owner, request_actor={"account_id": "creator"}) == {
       "success": False, "error": "unavailable", "status_code": 503}

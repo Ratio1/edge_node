@@ -226,7 +226,7 @@ class ProbeBase:
     Run a probe with error recovery.
 
     Does NOT call ensure_sessions — the worker is responsible for session
-    lifecycle. Probes just use self.auth.official_session /
+    lifecycle. Probes just use self.auth.primary_session /
     self.auth.regular_session as-is.
     """
     try:
@@ -544,6 +544,229 @@ class ProbeBase:
   def stateful_request(self, session, method: str, url: str, **kwargs):
     """Issue a state-changing request through the scoped session wrapper."""
     return self.request(session, method, url, **kwargs)
+
+  # ── Reachability rule (RM-219) ──────────────────────────────────────
+  #
+  # A denied endpoint is not a clean endpoint. A response "reached the
+  # handler" only when it is a 2xx that is not the login page (after
+  # redirects), or a 3xx whose Location is not the login page. 401/403/404/405
+  # and a redirect to login all mean "not reached"; a list of denial codes is
+  # not enough because the target may deny with 404 or a login redirect.
+
+  def _login_url_path(self) -> str:
+    """Path of the configured login page, base-path aware, no trailing slash."""
+    login_path = getattr(self.target_config, "login_path", "")
+    if not isinstance(login_path, str) or not login_path:
+      return ""
+    from urllib.parse import urlparse
+    return urlparse(self.target_url + "/" + login_path.lstrip("/")).path.rstrip("/")
+
+  def _is_login_location(self, location, base_url="") -> bool:
+    """True when ``location`` points at the configured login page.
+
+    A relative ``location`` is resolved against ``base_url`` (the request
+    URL), so ``login?next=`` and ``/app/login`` both match a login page that
+    lives under a base path. Query and trailing slash are ignored.
+    """
+    location = _as_text(location)
+    login = self._login_url_path()
+    if not login or not location:
+      return False
+    from urllib.parse import urljoin, urlparse
+    base_url = _as_text(base_url) or (self.target_url + "/")
+    target = urlparse(urljoin(base_url, location)).path.rstrip("/")
+    return target == login
+
+  def _has_login_form(self, text) -> bool:
+    """True when the body is a login form: password input plus username field.
+
+    A page that only pre-fills a username next to a change-password form is
+    not a login page, so a form with an action must post to the login path.
+    A form posting to itself (no action, empty, "#" or query-only) needs a
+    login shape: one password input, at most 3 visible fields.
+    """
+    import re
+    text = _as_text(text)
+    if not re.search(r'<input[^>]+type=["\']?password', text, re.IGNORECASE):
+      return False
+    username_field = getattr(self.target_config, "username_field", "")
+    if isinstance(username_field, str) and username_field and re.search(
+      r'<input[^>]+name=["\']?' + re.escape(username_field) + r'["\'\s>]',
+      text, re.IGNORECASE,
+    ) is None:
+      return False
+    actions = re.findall(
+      r'<form[^>]*\baction=(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))', text, re.IGNORECASE)
+    actions = ["".join(groups) for groups in actions]
+    if any(self._is_login_location(a) for a in actions):
+      return True
+    # No action, or an empty, "#" or query-only one, posts back to the page
+    # itself: a login form rendered inline at the protected URL. An admin
+    # "create user" page posts to itself too, so the inline form counts only
+    # with exactly one password input and at most 3 visible fields.
+    if actions and not any(
+      not a.strip() or a.strip().startswith(("#", "?")) for a in actions
+    ):
+      return False
+    passwords = re.findall(r'<input[^>]+type=["\']?password', text, re.IGNORECASE)
+    visible = [
+      tag for tag in re.findall(r'<input\b[^>]*>', text, re.IGNORECASE)
+      if not re.search(r'type=["\']?(hidden|submit|button|image|reset)\b',
+                       tag, re.IGNORECASE)
+    ] + re.findall(r'<(?:select|textarea)\b', text, re.IGNORECASE)
+    return len(passwords) == 1 and len(visible) <= 3
+
+  def response_reached(self, resp, validation_ok=False, auth_required_marker="") -> bool:
+    """Shared reachability check: did ``resp`` come from the endpoint's handler.
+
+    ``validation_ok`` counts 400/415/422 as reached: the handler parsed the
+    request and rejected the input, which is the secure result of a
+    type-confusion probe and not a denial of the principal.
+    ``auth_required_marker`` is the endpoint's configured auth-required body
+    marker: a 2xx that carries it is a denial page, not the handler.
+    """
+    if resp is None:
+      return False
+    status = getattr(resp, "status_code", None)
+    if not isinstance(status, int):
+      return False
+    if validation_ok and status in (400, 415, 422):
+      return True
+    request_url = _as_text(getattr(resp, "url", "")) or _as_text(
+      getattr(getattr(resp, "request", None), "url", ""))
+    headers = getattr(resp, "headers", None)
+    if 300 <= status < 400:
+      # Only seen when the caller sent allow_redirects=False. A redirect with
+      # no Location is not a handled request.
+      try:
+        location = headers.get("Location", "") if headers is not None else ""
+      except Exception:
+        location = ""
+      location = _as_text(location)
+      if not location:
+        return False
+      return not self._is_login_location(location, request_url)
+    if not 200 <= status < 300:
+      return False
+    if self._is_login_location(request_url):
+      return False
+    history = getattr(resp, "history", None)
+    if isinstance(history, (list, tuple)):
+      for hop in history:
+        hop_headers = getattr(hop, "headers", None)
+        try:
+          hop_location = hop_headers.get("Location", "") if hop_headers is not None else ""
+        except Exception:
+          hop_location = ""
+        hop_url = _as_text(getattr(hop, "url", ""))
+        if self._is_login_location(hop_location, hop_url):
+          return False
+    text = getattr(resp, "text", "")
+    if (isinstance(auth_required_marker, str) and auth_required_marker.strip()
+        and auth_required_marker.strip().lower() in _as_text(text).lower()):
+      return False
+    return not self._has_login_form(text)
+
+  def is_logout_path(self, path) -> bool:
+    """True when ``path`` is the logout URL (trailing slash and query ignored)."""
+    logout = getattr(self.target_config, "logout_path", "")
+    path = _as_text(path)
+    if not isinstance(logout, str) or not logout or not path:
+      return False
+    from urllib.parse import urlparse
+    return (urlparse(path).path.rstrip("/")
+            == urlparse(logout).path.rstrip("/"))
+
+  def baseline_reached(self, session, url, **kwargs):
+    """Plain GET baseline of ``url``: True/False for reached, None on a
+    transport failure (the caller skips the endpoint)."""
+    self.safety.throttle()
+    try:
+      resp = session.get(url, timeout=10, **kwargs)
+    except Exception:
+      return None
+    return self.response_reached(resp)
+
+  def _admin_baseline_reached(self, url) -> bool:
+    """True when the admin session got a reached response on ``url``.
+
+    Only meaningful with admin credentials: it tells a real denial of the
+    regular user (admin gets 2xx on the same endpoint) from a mistyped path
+    (admin gets 404 too). Always a plain GET, whatever verb the probe uses:
+    the baseline must never mutate state under the admin principal.
+    """
+    if getattr(self.auth, "admin_context", "") != "provided":
+      return False
+    admin = getattr(self.auth, "official_session", None)
+    if admin is None:
+      return False
+    cache = self.__dict__.setdefault("_admin_baseline_cache", {})
+    if url not in cache:
+      try:
+        self.safety.throttle()
+        resp = self.request(admin, "GET", url, timeout=10,
+                            allow_redirects=False)
+        cache[url] = self.response_reached(resp)
+      except Exception:
+        cache[url] = False
+    return cache[url]
+
+  def exempt_denial(self, resp, url) -> str:
+    """Reason string when ``resp`` is a denial of the scan principal, else "".
+
+    For scenarios where a denial is the secure result: 401/403, a login
+    redirect, and a 404 only when an admin baseline reached the endpoint.
+    """
+    if resp is None:
+      return ""
+    status = getattr(resp, "status_code", None)
+    if not isinstance(status, int):
+      return ""
+    if status in (401, 403):
+      return f"status_{status}"
+    if self.response_reached(resp):
+      return ""
+    if 200 <= status < 400:
+      return "login_redirect"
+    if status == 404 and self._admin_baseline_reached(url):
+      return "status_404_admin_reached"
+    return ""
+
+  def bare_not_found(self, resp, url) -> bool:
+    """True for a 404 that no admin baseline explains: skip, never clean."""
+    return (
+      getattr(resp, "status_code", None) == 404
+      and not self._admin_baseline_reached(url)
+    )
+
+  def denial_reason(self) -> str:
+    """Reason code for an endpoint that denied the scan principal."""
+    if getattr(self.auth, "admin_context", "") == "absent":
+      return "admin_context_absent"
+    return "endpoint_denied"
+
+  def emit_endpoint_denied(self, scenario_id):
+    """Inconclusive finding for a scenario whose every endpoint was denied."""
+    try:
+      from ..scenario_catalog import graybox_scenario
+      entry = graybox_scenario(scenario_id) or {}
+    except ImportError:
+      entry = {}
+    self.emit_inconclusive(
+      scenario_id,
+      entry.get("title") or scenario_id,
+      entry.get("owasp") or "",
+      self.denial_reason(),
+    )
+
+  def principal_label(self) -> str:
+    """Human name of the primary scan principal, for replay steps."""
+    principal = getattr(self.auth, "primary_principal", "")
+    if principal == "regular":
+      return "the regular user"
+    if principal == "official":
+      return "the official user"
+    return "the scan user"
 
   def _record_error(self, probe_name, error_msg):
     """Store a non-fatal error as an INFO GrayboxFinding."""

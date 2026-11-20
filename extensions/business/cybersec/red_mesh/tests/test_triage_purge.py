@@ -19,7 +19,7 @@ class _PurgeRepo(_Repo):
 
 
 class _PurgeOwner(_Owner):
-  cfg_tenancy_namespace = "deployment"
+  _stream_id = "deployment"
 
   def _get_artifact_repository(self):
     return _PurgeRepo(self)

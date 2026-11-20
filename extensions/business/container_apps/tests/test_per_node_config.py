@@ -244,6 +244,23 @@ class TestContainerRunnerPerNodeConfig(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "IMAGE"):
       plugin._apply_per_node_config()
 
+  def test_saved_overlay_cannot_replace_a_coordinator_restore_binding(self):
+    binding = {"image_id": "sha256:" + "a" * 64}
+    for overlay in ({"default": {"DEEPLOY_RUNTIME_ARTIFACTS": {}}},
+                    {"byIndex": {"0": {"deeploy_runtime_artifacts": {}}}},
+                    {"byNode": {"other": {"Deeploy_Runtime_Artifacts": {}}}},
+                    {"0xai_node_b": {"DEEPLOY_RUNTIME_ARTIFACTS": {}}}):
+      with self.subTest(overlay=overlay):
+        plugin = make_runner()
+        plugin.config_data = {"CHAINSTORE_PEERS": ["0xai_node_b"], "DEEPLOY_RUNTIME_ARTIFACTS": binding,
+                              "PER_NODE_CONFIG": overlay}
+        with self.assertRaisesRegex(ValueError, "system-managed"):
+          plugin._apply_per_node_config()
+        self.assertEqual(plugin.config_data["DEEPLOY_RUNTIME_ARTIFACTS"], binding)
+    plugin.config_data["PER_NODE_CONFIG"] = {"default": {"ENV": {"ROLE": "reader"}}}
+    self.assertTrue(plugin._apply_per_node_config())
+    self.assertEqual(plugin.config_data["DEEPLOY_RUNTIME_ARTIFACTS"], binding)
+
   def test_per_node_config_rejects_one_shot_commands(self):
     plugin = make_runner()
 

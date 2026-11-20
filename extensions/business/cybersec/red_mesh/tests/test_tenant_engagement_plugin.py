@@ -27,12 +27,9 @@ class TestTenantEngagementPlugin(unittest.TestCase):
     cls.store_engagement_document = staticmethod(store_engagement_document)
 
   def setUp(self):
-    environment = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    environment.start()
-    self.addCleanup(environment.stop)
     self.storage = FakeAdministrationStore()
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenancy_namespace = "deployment"
+    self.plugin._stream_id = "deployment"
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
       setattr(self.plugin, name, getattr(self.storage, name))
     self.events = []
@@ -92,7 +89,7 @@ class TestTenantEngagementPlugin(unittest.TestCase):
     # RM-084 P6: tenant execution is no longer a rollout a deployment opts into, so the capability
     # reports the only state there is -- whatever a stale `TENANT_EXECUTION_ENABLED` still says.
     # (Moved here from the retired tenant asset suite, RM-107.)
-    self.plugin.cfg_tenancy_namespace = ""
+    self.plugin._stream_id = ""
     with patch.object(self.plugin, "chainstore_hget", side_effect=AssertionError("No stored capability reads")), \
          patch.object(self.plugin, "chainstore_hgetall", side_effect=AssertionError("No capability enumeration")), \
          patch.object(self.plugin, "chainstore_hset", side_effect=AssertionError("No capability writes")):

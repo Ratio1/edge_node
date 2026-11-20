@@ -115,6 +115,7 @@ class StructuredReportAdapterTests(unittest.TestCase):
       "STRUCTURED_MAX_FINDINGS": 6,
       "STRUCTURED_MAX_TOKENS": 2048,
       "STRUCTURED_TEMPERATURE": None,
+      "LOCAL_STRUCTURED_CHUNK_TIMEOUT": 270.0,
     }
     mod.get_llm_agent_config = lambda _self: self._cfg_value
     self._orig_live_llm = os.environ.get("LIVE_LLM")
@@ -167,9 +168,21 @@ class StructuredReportAdapterTests(unittest.TestCase):
     self.assertIn("messages", owner._calls[0]["payload"])
     self.assertGreater(len(owner._calls[0]["payload"]["messages"]), 0)
     self.assertNotIn("response_format", owner._calls[0]["payload"])
-    self.assertEqual(owner._calls[0]["timeout"], 120)
+    self.assertEqual(owner._calls[0]["timeout"], 270)
     self.assertEqual(out["prompt_profile"], "local_cybersecqwen_quota_v1")
     self.assertEqual(out["provider_path"], "local")
+
+  def test_local_chunk_timeout_comes_from_config(self):
+    # RM-217: the configured value reaches the agent call unclamped,
+    # and the general TIMEOUT does not cap it.
+    self._cfg_value = {**self._cfg_value, "TIMEOUT": 60.0, "LOCAL_STRUCTURED_CHUNK_TIMEOUT": 400.0}
+    owner = _FakeOwner(chat_response={
+      "choices": [{"message": {"content": _valid_llm_response_content()}}],
+    })
+    _run(owner, job_id="j1", findings=[], aggregated_report={})
+
+    self.assertGreaterEqual(len(owner._calls), 1)
+    self.assertEqual({call["timeout"] for call in owner._calls}, {400.0})
 
   def test_remote_profile_uses_json_object_response_format(self):
     self._cfg_value = {

@@ -37,9 +37,6 @@ class PurgeAdmissionCase(unittest.TestCase):
     TestPhase1ConfigCID._mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
 
-    env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    env.start()
-    self.addCleanup(env.stop)
     self.Plugin = PentesterApi01Plugin
     self.store = ReadStore()
     self.tenants = CstoreTenantAdministrationStore(self.store, "deployment")
@@ -55,7 +52,7 @@ class PurgeAdmissionCase(unittest.TestCase):
       "execution_binding": {**binding_payload(), "tenant_id": self.tenant_id}}
     self.actor = {"account_id": "reader"}
     self.owner = SimpleNamespace(
-      cfg_instance_id=self.store.cfg_instance_id, cfg_tenancy_namespace="deployment",
+      cfg_instance_id=self.store.cfg_instance_id, _stream_id="deployment",
       cfg_tenant_execution_enabled=False, cfg_tenant_execution_stage="compatibility",
       chainstore_hget=self.store.chainstore_hget, chainstore_hgetall=self.store.chainstore_hgetall,
       chainstore_hset=self.store.chainstore_hset, P=lambda *a, **k: None)

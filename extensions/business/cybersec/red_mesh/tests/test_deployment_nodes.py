@@ -1,6 +1,5 @@
 """RM-126: the deployment's node directory and the two reads that carry it."""
 import unittest
-from unittest.mock import patch
 from uuid import uuid4
 
 from .test_tenant_administration import FakeAdministrationStore
@@ -110,9 +109,6 @@ class TestNodePublicIp(unittest.TestCase):
 
 class TestDeploymentNodeReads(unittest.TestCase):
   def setUp(self):
-    self.env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    self.env.start()
-    self.addCleanup(self.env.stop)
     self.owner = FakeAdministrationStore()
     self.store = CstoreTenantAdministrationStore(self.owner, "deployment")
     self.peers = ["0xai_rm4", "0xai_rm3"]
@@ -188,12 +184,9 @@ class TestDeploymentNodesPlugin(unittest.TestCase):
     cls.Plugin = PentesterApi01Plugin
 
   def setUp(self):
-    environment = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    environment.start()
-    self.addCleanup(environment.stop)
     self.storage = FakeAdministrationStore()
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenancy_namespace = "deployment"
+    self.plugin._stream_id = "deployment"
     self.plugin.cfg_chainstore_peers = ["0xai_rm3", "0xai_rm4"]
     self.plugin.cfg_instance_id = "pentester-api-01"
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):

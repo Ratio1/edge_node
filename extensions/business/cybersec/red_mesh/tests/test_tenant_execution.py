@@ -62,7 +62,7 @@ class TestTenantExecution(unittest.TestCase):
       "engagement_id": asset["engagementId"], "engagement_asset_id": "ea_1",
       "engagement_hash": asset["engagementHash"], "asset_target": self.target,
       "asset_target_digest": asset["assets"][0]["targetDigest"], "actor_id": "creator",
-      "actor_generation": self.owner.data[("auth", "creator")]["generation"], "node_failure_policy": "stop",
+      "actor_generation": self.owner.data[("deployment:auth", "creator")]["generation"], "node_failure_policy": "stop",
       "original_launcher": "coordinator-only", "participant_order": ["node-b"],
     })
     self.assertEqual(len(self.owner.writes), before)
@@ -85,7 +85,7 @@ class TestTenantExecution(unittest.TestCase):
     self.assertEqual(denied.exception.error, "pentesting_disabled")
     self.service.update_tenant_allow_pentester(self.actor, self.tenant, True)
     self.assertEqual(self.admit(actor, asset).to_dict()["actor_id"], "pentester")
-    self.owner.data[("auth", "pentester")]["memberships"] = []
+    self.owner.data[("deployment:auth", "pentester")]["memberships"] = []
     with self.assertRaises(AdministrationDenied):
       self.admit(actor, asset)
 
@@ -97,7 +97,7 @@ class TestTenantExecution(unittest.TestCase):
     # RM-084 P6: an account has membership rows, possibly zero; there is no "unknown" third state.
     self.assertEqual(AccountView("fixture", True).tenant_memberships, ())
     for malformed in (None, {}, "", False):
-      self.owner.data[("auth", "explicit")]["memberships"] = malformed
+      self.owner.data[("deployment:auth", "explicit")]["memberships"] = malformed
       self.assertIsNone(self.service.accounts.get_account("explicit"))
 
   def test_private_admission_reuses_exact_resolved_account(self):
@@ -200,7 +200,7 @@ class TestTenantExecution(unittest.TestCase):
     self.owner.account("pentester", memberships=[{"role": "tenant_pentester", "tenant_id": self.tenant}])
     self.service.update_tenant_allow_pentester(self.actor, self.tenant, True)
     binding = self.admit({"account_id": "pentester"}, asset).build_binding("coordinator", ["node-a"])
-    raw = self.owner.data[("auth", "pentester")]
+    raw = self.owner.data[("deployment:auth", "pentester")]
     raw.update(
       password={**raw["password"], "salt": "bmV3c2FsdG5ld3NhbHRuZQ==",
                 "hash": "bm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm4="},
@@ -226,7 +226,7 @@ class TestTenantExecution(unittest.TestCase):
       self.service.reauthorize_execution(binding)
     self.assertEqual(denied.exception.error, "pentesting_disabled")
     self.service.update_tenant_allow_pentester(self.actor, self.tenant, True)
-    raw = self.owner.data[("auth", "pentester")]
+    raw = self.owner.data[("deployment:auth", "pentester")]
     original = raw["generation"]
     raw["generation"] = str(uuid4())  # the account was recreated, or archived and restored
     with self.assertRaises(AdministrationDenied) as denied:
@@ -307,7 +307,7 @@ class TestTenantExecution(unittest.TestCase):
     # A record with no generation is not an account (RM-084 P6 removed the legacy creation-time
     # incarnation that used to stand in for one), so it is unknown rather than changed.
     self.owner.account("operator", memberships=[{"role": "super_pentester", "tenant_id": self.tenant}])
-    self.owner.data[("auth", "operator")].pop("generation")
+    self.owner.data[("deployment:auth", "operator")].pop("generation")
     with self.assertRaises(AdministrationDenied) as denied:
       self.admit({"account_id": "operator"}, asset)
     self.assertEqual(denied.exception.status_code, 404)
@@ -360,7 +360,7 @@ class TestTenantExecution(unittest.TestCase):
     asset = self.ready()
     for generation in (123, False, [], {}, None, "", "   ", "\ud800", "generation-1"):
       with self.subTest(generation=repr(generation)):
-        self.owner.data[("auth", "creator")]["generation"] = generation
+        self.owner.data[("deployment:auth", "creator")]["generation"] = generation
         self.assertIsNone(self.service.accounts.get_account("creator"))
         self.assertNotIn("creator", [view.account_id for view in self.service.accounts.list_accounts()])
         with self.assertRaises(AdministrationDenied) as denied:

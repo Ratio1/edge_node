@@ -89,7 +89,7 @@ class TestActivationWithoutAdmin(_SetupCase):
 
   def test_activation_without_an_admin_touches_no_account_and_records_no_founder(self):
     draft_id, request_id = self.ready_without_admin(), str(uuid4())
-    accounts = {key: value for key, value in self.store.data.items() if key[0] == "auth"}
+    accounts = {key: value for key, value in self.store.data.items() if key[0] == "deployment:auth"}
     prepared = ok(self, self.activate(draft_id, request_id))
     self.assertEqual((prepared["state"], prepared["initialAdminId"], prepared["initialAdminGeneration"]),
                      ("pending", None, None))
@@ -100,7 +100,7 @@ class TestActivationWithoutAdmin(_SetupCase):
                      (prepared["tenantId"], None, 0))
     tenant, = self.rows("tenant")
     self.assertIsNone(tenant["root_admin_id"])
-    self.assertEqual({key: value for key, value in self.store.data.items() if key[0] == "auth"}, accounts)
+    self.assertEqual({key: value for key, value in self.store.data.items() if key[0] == "deployment:auth"}, accounts)
     # The tenant reads back valid everywhere: list, detail, close.
     row, = ok(self, self.plugin.list_tenants(self.actor))
     self.assertEqual(row["rootAdminId"], None)

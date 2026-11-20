@@ -1,5 +1,6 @@
 """Exercise real durable admission separately from request-planning fixtures."""
 import copy
+import hashlib
 import threading
 import unittest
 from collections import OrderedDict
@@ -94,13 +95,13 @@ class Admission(_DeploymentOperationsMixin, _DeeployMixin):
     pointer = self.storage.get(('DEEPLOY_DEPLOYED_JOBS', str(job_id)))
     return pointer.get('pipeline_cid') if isinstance(pointer, dict) else pointer
 
-  def _previous_deployment_configs(self, pipeline):
+  def _previous_deployment_configs(self, pipeline, reports=None):
     # Scenario fixtures supply the public plan separately from flat custody data.
     if pipeline.get('DEEPLOY_SPECS', {}).get('secret_revision'):
       if self.previous_configs is None:
         raise ValueError('The exact previous node configurations are unavailable.')
       return copy.deepcopy(self.previous_configs)
-    return super()._previous_deployment_configs(pipeline)
+    return super()._previous_deployment_configs(pipeline, reports)
 
   def seed_previous(self, configs, bundle):
     self.previous_configs = configs
@@ -120,6 +121,21 @@ class Admission(_DeploymentOperationsMixin, _DeeployMixin):
 
 
 class DeploymentAdmissionTests(unittest.TestCase):
+  def test_admitted_pin_projection_is_available_on_local_replicas(self):
+    plugin = Admission()
+    cfg = config("A")
+    group = cfg["PLUGINS"][0]
+    group["SIGNATURE"] = "WORKER_APP_RUNNER"
+    instance = group["INSTANCES"][0]
+    instance["ENV"] = {}
+    instance.update(PINNED_VERSION=True, VCS_DATA={"COMMIT": "a" * 40})
+    accepted = plugin._admit_prepared_deployment(
+      request={"request_id": "pin", "job_id": 7}, auth_result={DEEPLOY_KEYS.ESCROW_OWNER: "owner"},
+      app_id="app", configs={"A": cfg}, prior_pipeline=None, is_create=True)
+    signed = plugin._operation_records()[accepted["operation_id"]]
+    expected = hashlib.sha256(("a" * 40).encode()).hexdigest()
+    self.assertEqual(signed["pinned_sources"], {"deploy": {"A": {"WORKER_APP_RUNNER|instance-A": expected}}})
+
   def test_live_admission_does_not_block_other_jobs_or_race_recovery(self):
     plugin = Admission()
     staging = threading.Event()
@@ -259,6 +275,16 @@ class DeploymentAdmissionTests(unittest.TestCase):
       self.assertEqual(plugin.storage[SECRET_REVISIONS_HKEY, "7|" + restore_revision]["job_secrets"]["secret"], "old-secret")
     self.assertEqual(plugin.storage[SECRET_REVISIONS_HKEY, "7|previous:deploy"]["pipelines"], previous)
     self.assertEqual(plugin.commands, [])
+
+  def test_update_rejects_unsafe_saved_overlay_before_retiring_current_nodes(self):
+    plugin = Admission()
+    previous = {node: config(node) for node in ("A", "B")}
+    previous["B"]["PLUGINS"][0]["INSTANCES"][0]["PER_NODE_CONFIG"] = {
+      "byNode": {"B": {"deeploy_runtime_artifacts": {"image_id": "sha256:" + "b" * 64}}}}
+    plugin.seed_previous(previous, {"pipelines": previous, "job_secrets": {"secret": "old-secret"}})
+    with self.assertRaisesRegex(ValueError, "system-managed"):
+      plugin.admit({"request_id": "update", "job_id": 7, "expected_revision": 1}, prior=config("A"))
+    self.assertEqual((plugin.plans, plugin.writes, plugin.commands), ({}, [], []))
 
   def test_update_preconditions_fail_before_secret_or_plan_writes(self):
     for revision in (None, True, 0, 2):

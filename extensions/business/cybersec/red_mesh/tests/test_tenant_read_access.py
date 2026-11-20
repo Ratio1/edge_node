@@ -48,9 +48,6 @@ class ReadStore(FakeAdministrationStore):
 
 class TestTenantReadAccess(unittest.TestCase):
   def setUp(self):
-    env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    env.start()
-    self.addCleanup(env.stop)
     self.store = ReadStore()
     self.accounts = CstoreAuthAccountReader(self.store)
     self.tenants = CstoreTenantAdministrationStore(self.store, "deployment")
@@ -91,8 +88,8 @@ class TestTenantReadAccess(unittest.TestCase):
         self.store.reads.clear()
         result = self.read(operation, actor={"account_id": " READER "})
         self.assertEqual(result, self.record if operation == "get" else {"job-1": self.record})
-        self.assertEqual(self.store.reads[0], ("get", "auth", "reader"))
-        self.assertEqual(sum(event == ("get", "auth", "reader") for event in self.store.reads), 1)
+        self.assertEqual(self.store.reads[0], ("get", "deployment:auth", "reader"))
+        self.assertEqual(sum(event == ("get", "deployment:auth", "reader") for event in self.store.reads), 1)
         for kind, ids in (("tenant", (self.tenant_id,)), ("receipt", ("creator", self.request_id)),
                           ("domain", ("example",))):
           hkey, key = self.tenants._location(kind, ids)
@@ -167,7 +164,7 @@ class TestTenantReadAccess(unittest.TestCase):
           self.assert_no_job_read()
       for memberships in (None, {}, [{"role": "tenant_user", "tenant_id": None}], [{"role": "owner", "tenant_id": self.tenant_id}]):
         with self.subTest(operation=operation, memberships=memberships):
-          self.store.data[("auth", "reader")]["memberships"] = memberships
+          self.store.data[("deployment:auth", "reader")]["memberships"] = memberships
           self.store.reads.clear()
           with self.assertRaises(AdministrationDenied) as raised:
             self.read(operation)
@@ -176,7 +173,7 @@ class TestTenantReadAccess(unittest.TestCase):
       self.store.account("reader", memberships=[{"role": "tenant_user", "tenant_id": self.tenant_id}])
 
   def test_identity_unavailable_is_sanitized_before_job_reads(self):
-    self.store.fail_hkey = "auth"
+    self.store.fail_hkey = "deployment:auth"
     for operation in ("get", "list"):
       with self.subTest(operation=operation):
         self.store.reads.clear()
