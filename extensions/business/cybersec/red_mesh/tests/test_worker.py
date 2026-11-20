@@ -1406,5 +1406,26 @@ class TestLockoutOrdering(unittest.TestCase):
     self.assertEqual(candidates, ["guest:guest"])
 
 
+class TestDiscoveryCoverageNote(unittest.TestCase):
+  """RM-219: a regular-only report states what the crawl could not reach."""
+
+  def _stored(self, admin_context, principal):
+    worker = _make_worker()
+    worker.auth.admin_context = admin_context
+    worker.auth.primary_principal = principal
+    worker._store_discovery_results(["/a/"], ["/f/"])
+    return worker.state["service_info"]["8000"]["_graybox_discovery"]
+
+  def test_regular_only_scan_states_its_coverage(self):
+    info = self._stored("absent", "regular")
+    self.assertEqual(info["crawled_as"], "regular")
+    self.assertIn("admin-only pages not reached", info["coverage_note"])
+
+  def test_scan_with_admin_carries_no_coverage_note(self):
+    info = self._stored("provided", "official")
+    self.assertEqual(info["crawled_as"], "official")
+    self.assertEqual(info["coverage_note"], "")
+
+
 if __name__ == '__main__':
   unittest.main()

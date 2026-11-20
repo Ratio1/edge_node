@@ -583,3 +583,147 @@ class TestMassAssignment(unittest.TestCase):
 
 if __name__ == '__main__':
   unittest.main()
+
+
+# ── RM-219 reachability rule ────────────────────────────────────────────
+
+def _login_redirect_response():
+  """A redirect to the login page, already followed by `requests`."""
+  resp = _mock_response(
+    status=200, content_type="text/html",
+    text="<form><input name='username'><input type='password' name='password'></form>",
+  )
+  resp.url = "http://testapp.local:8000/auth/login/?next=/api/records/99/"
+  resp.history = [MagicMock(headers={"Location": "/auth/login/?next=/api/records/99/"})]
+  return resp
+
+
+def _reached_response(text="ok"):
+  resp = _mock_response(status=200, content_type="text/html", text=text)
+  resp.url = "http://testapp.local:8000/x/"
+  resp.history = []
+  return resp
+
+
+def _set_admin(probe, admin_context, admin_status=200):
+  probe.auth.admin_context = admin_context
+  probe.auth.official_session = MagicMock()
+  probe.auth.official_session.request = MagicMock(
+    return_value=_reached_response() if admin_status == 200
+    else _mock_response(status=admin_status))
+
+
+class TestExemptDenialIsSecure(unittest.TestCase):
+  """A denial is the secure result for PT-A01-01/-02/-03 (and -05/-06)."""
+
+  def _idor(self, response, admin_context, admin_status=200):
+    ep = IdorEndpoint(path="/api/records/{id}/", test_ids=[99], owner_field="owner")
+    probe = _make_probe(idor_endpoints=[ep])
+    _set_admin(probe, admin_context, admin_status)
+    probe.auth.regular_session.get.return_value = response
+    probe._test_idor()
+    return [f for f in probe.findings if f.scenario_id == "PT-A01-01"]
+
+  def test_idor_403_and_login_redirect_are_clean_with_and_without_admin(self):
+    for admin in ("provided", "absent"):
+      for name, resp in (("403", _mock_response(status=403, text="no")),
+                         ("login", _login_redirect_response())):
+        with self.subTest(admin=admin, denial=name):
+          found = self._idor(resp, admin)
+          self.assertEqual([f.status for f in found], ["not_vulnerable"])
+
+  def test_idor_404_is_clean_only_when_admin_baseline_reached(self):
+    found = self._idor(_mock_response(status=404, text="nf"), "provided", 200)
+    self.assertEqual([f.status for f in found], ["not_vulnerable"])
+
+  def test_idor_404_is_skipped_without_admin_or_when_admin_also_404(self):
+    for admin, admin_status in (("absent", 200), ("provided", 404)):
+      with self.subTest(admin=admin, admin_status=admin_status):
+        found = self._idor(_mock_response(status=404, text="nf"), admin, admin_status)
+        self.assertEqual(found, [])
+
+  def test_privilege_esc_login_page_is_not_a_finding(self):
+    ep = AdminEndpoint(path="/api/admin/users/", method="GET")
+    probe = _make_probe(admin_endpoints=[ep])
+    _set_admin(probe, "absent")
+    probe.auth.regular_session.get.return_value = _login_redirect_response()
+    probe._test_privilege_esc()
+    self.assertEqual([f for f in probe.findings if f.scenario_id == "PT-A01-02"], [])
+
+  def test_verb_tampering_login_page_baseline_is_a_denied_baseline(self):
+    ep = AdminEndpoint(path="/api/admin/users/", method="GET")
+    probe = _make_probe(admin_endpoints=[ep])
+    _set_admin(probe, "absent")
+    probe.auth.regular_session.request = MagicMock(side_effect=lambda m, u, **k: (
+      _login_redirect_response()))
+    probe._test_verb_tampering()
+    found = [f for f in probe.findings if f.scenario_id == "PT-A01-03"]
+    self.assertEqual([f.status for f in found], ["not_vulnerable"])
+
+  def test_ownership_update_404_is_skipped_not_clean(self):
+    ep = IdorEndpoint(path="/api/records/{id}/", test_ids=[99], owner_field="owner")
+    probe = _make_probe(idor_endpoints=[ep])
+    _set_admin(probe, "absent")
+    probe.auth.regular_session.get.return_value = _mock_response(
+      json_data={"owner": "bob", "title": "t"})
+    probe.auth.regular_session.cookies.get.return_value = None
+    probe.auth.regular_session.patch.return_value = _mock_response(status=404)
+    probe._test_ownership_update()
+    self.assertEqual([f for f in probe.findings if f.scenario_id == "PT-A01-05"], [])
+
+
+class TestHiddenFieldReachability(unittest.TestCase):
+
+  FORM = ('<form><input type="hidden" name="role" value="user">'
+          '<input type="text" name="title" value="t"></form>')
+
+  def _probe(self, admin_context):
+    probe = _make_probe()
+    probe.discovered_forms = ["/records/1/"]
+    probe.auth.detected_csrf_field = None
+    probe.auth.extract_csrf_value = MagicMock(return_value=None)
+    probe.auth.admin_context = admin_context
+    return probe
+
+  def _verdict(self, probe):
+    found = [f for f in probe.findings if f.scenario_id == "PT-A01-12"]
+    return ([f.status for f in found],
+            [e for f in found for e in f.evidence if e.startswith("reason=")])
+
+  def test_denied_form_by_403_404_login_is_inconclusive(self):
+    for admin, reason in (("provided", "endpoint_denied"),
+                          ("absent", "admin_context_absent")):
+      for name, resp in (("403", _mock_response(status=403)),
+                         ("404", _mock_response(status=404)),
+                         ("login", _login_redirect_response())):
+        with self.subTest(admin=admin, denial=name):
+          probe = self._probe(admin)
+          probe.auth.regular_session.get = MagicMock(return_value=resp)
+          probe._test_hidden_field_tampering()
+          self.assertEqual(self._verdict(probe), (["inconclusive"], [f"reason={reason}"]))
+
+  def test_reached_get_but_payload_post_redirected_to_login(self):
+    probe = self._probe("absent")
+    sess = probe.auth.regular_session
+    sess.get = MagicMock(return_value=_reached_response(self.FORM))
+    redirect = _mock_response(status=302, text="")
+    redirect.headers["Location"] = "/auth/login/?next=/records/1/"
+    sess.post = MagicMock(return_value=redirect)
+    probe._test_hidden_field_tampering()
+    self.assertEqual(self._verdict(probe), (["inconclusive"], ["reason=admin_context_absent"]))
+
+  def test_post_only_action_405_is_not_a_denial(self):
+    probe = self._probe("absent")
+    probe.auth.regular_session.get = MagicMock(return_value=_mock_response(status=405))
+    probe._test_hidden_field_tampering()
+    self.assertEqual(self._verdict(probe), ([], []))
+
+  def test_post_answered_by_redirect_to_non_login_page_is_reached(self):
+    probe = self._probe("provided")
+    sess = probe.auth.regular_session
+    sess.get = MagicMock(return_value=_reached_response(self.FORM))
+    redirect = _mock_response(status=302, text="")
+    redirect.headers["Location"] = "/records/"
+    sess.post = MagicMock(return_value=redirect)
+    probe._test_hidden_field_tampering()
+    self.assertEqual(self._verdict(probe)[0], ["vulnerable"])

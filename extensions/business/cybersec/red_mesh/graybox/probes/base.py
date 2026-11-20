@@ -545,6 +545,159 @@ class ProbeBase:
     """Issue a state-changing request through the scoped session wrapper."""
     return self.request(session, method, url, **kwargs)
 
+  # ── Reachability rule (RM-219) ──────────────────────────────────────
+  #
+  # A denied endpoint is not a clean endpoint. A response "reached the
+  # handler" only when it is a 2xx that is not the login page (after
+  # redirects), or a 3xx whose Location is not the login page. 401/403/404/405
+  # and a redirect to login all mean "not reached"; a list of denial codes is
+  # not enough because the target may deny with 404 or a login redirect.
+
+  def _is_login_location(self, location) -> bool:
+    """True when ``location`` (URL or path) points at the configured login page."""
+    login_path = getattr(self.target_config, "login_path", "")
+    location = _as_text(location)
+    if not isinstance(login_path, str) or not login_path or not location:
+      return False
+    from urllib.parse import urlparse
+    login = urlparse(login_path).path.rstrip("/")
+    target = urlparse(location).path.rstrip("/")
+    return bool(login) and target == login
+
+  def _has_login_form(self, text) -> bool:
+    """True when the body carries a password input plus the username field."""
+    import re
+    text = _as_text(text)
+    if not re.search(r'<input[^>]+type=["\']?password', text, re.IGNORECASE):
+      return False
+    username_field = getattr(self.target_config, "username_field", "")
+    if not isinstance(username_field, str) or not username_field:
+      return True
+    return re.search(
+      r'<input[^>]+name=["\']?' + re.escape(username_field) + r'["\'\s>]',
+      text, re.IGNORECASE,
+    ) is not None
+
+  def response_reached(self, resp, validation_ok=False) -> bool:
+    """Shared reachability check: did ``resp`` come from the endpoint's handler.
+
+    ``validation_ok`` counts 400/415/422 as reached: the handler parsed the
+    request and rejected the input, which is the secure result of a
+    type-confusion probe and not a denial of the principal.
+    """
+    if resp is None:
+      return False
+    status = getattr(resp, "status_code", None)
+    if not isinstance(status, int):
+      return False
+    if validation_ok and status in (400, 415, 422):
+      return True
+    headers = getattr(resp, "headers", None)
+    if 300 <= status < 400:
+      # Only seen when the caller sent allow_redirects=False.
+      try:
+        location = headers.get("Location", "") if headers is not None else ""
+      except Exception:
+        location = ""
+      location = _as_text(location)
+      return not self._is_login_location(location)
+    if not 200 <= status < 300:
+      return False
+    if self._is_login_location(getattr(resp, "url", "")):
+      return False
+    history = getattr(resp, "history", None)
+    if isinstance(history, (list, tuple)):
+      for hop in history:
+        hop_headers = getattr(hop, "headers", None)
+        try:
+          hop_location = hop_headers.get("Location", "") if hop_headers is not None else ""
+        except Exception:
+          hop_location = ""
+        if self._is_login_location(hop_location):
+          return False
+    return not self._has_login_form(getattr(resp, "text", ""))
+
+  def _admin_baseline_reached(self, url, method="GET") -> bool:
+    """True when the admin session got a reached response on ``url``.
+
+    Only meaningful with admin credentials: it tells a real denial of the
+    regular user (admin gets 2xx on the same endpoint) from a mistyped path
+    (admin gets 404 too).
+    """
+    if getattr(self.auth, "admin_context", "") != "provided":
+      return False
+    admin = getattr(self.auth, "official_session", None)
+    if admin is None:
+      return False
+    cache = self.__dict__.setdefault("_admin_baseline_cache", {})
+    key = (method.upper(), url)
+    if key not in cache:
+      try:
+        self.safety.throttle()
+        resp = self.request(admin, method.upper(), url, timeout=10,
+                            allow_redirects=False)
+        cache[key] = self.response_reached(resp)
+      except Exception:
+        cache[key] = False
+    return cache[key]
+
+  def exempt_denial(self, resp, url, method="GET") -> str:
+    """Reason string when ``resp`` is a denial of the scan principal, else "".
+
+    For scenarios where a denial is the secure result: 401/403, a login
+    redirect, and a 404 only when an admin baseline reached the endpoint.
+    """
+    if resp is None:
+      return ""
+    status = getattr(resp, "status_code", None)
+    if not isinstance(status, int):
+      return ""
+    if status in (401, 403):
+      return f"status_{status}"
+    if self.response_reached(resp):
+      return ""
+    if 200 <= status < 400:
+      return "login_redirect"
+    if status == 404 and self._admin_baseline_reached(url, method):
+      return "status_404_admin_reached"
+    return ""
+
+  def bare_not_found(self, resp, url, method="GET") -> bool:
+    """True for a 404 that no admin baseline explains: skip, never clean."""
+    return (
+      getattr(resp, "status_code", None) == 404
+      and not self._admin_baseline_reached(url, method)
+    )
+
+  def denial_reason(self) -> str:
+    """Reason code for an endpoint that denied the scan principal."""
+    if getattr(self.auth, "admin_context", "") == "absent":
+      return "admin_context_absent"
+    return "endpoint_denied"
+
+  def emit_endpoint_denied(self, scenario_id):
+    """Inconclusive finding for a scenario whose every endpoint was denied."""
+    try:
+      from ..scenario_catalog import graybox_scenario
+      entry = graybox_scenario(scenario_id) or {}
+    except ImportError:
+      entry = {}
+    self.emit_inconclusive(
+      scenario_id,
+      entry.get("title") or scenario_id,
+      entry.get("owasp") or "",
+      self.denial_reason(),
+    )
+
+  def principal_label(self) -> str:
+    """Human name of the primary scan principal, for replay steps."""
+    principal = getattr(self.auth, "primary_principal", "")
+    if principal == "regular":
+      return "the regular user"
+    if principal == "official":
+      return "the official user"
+    return "the scan user"
+
   def _record_error(self, probe_name, error_msg):
     """Store a non-fatal error as an INFO GrayboxFinding."""
     error_msg = self._sanitize_error(error_msg)

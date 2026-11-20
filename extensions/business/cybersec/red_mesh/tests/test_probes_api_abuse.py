@@ -115,6 +115,40 @@ class TestApi4NoRateLimit(unittest.TestCase):
     self.assertEqual(vuln[0].severity, "LOW")
 
 
+class TestApi4RateLimitReachability(unittest.TestCase):
+  """PT-OAPI4-03: a denied endpoint says nothing about its rate limit."""
+
+  def _login_page(self):
+    r = _resp(status=200, text="<input name='username'><input type='password' name='p'>")
+    r.url = "http://api.example/auth/login/?next=/api/list/"
+    r.history = []
+    return r
+
+  def test_denied_endpoint_is_inconclusive_with_reason(self):
+    for admin, reason in (("provided", "endpoint_denied"),
+                          ("absent", "admin_context_absent")):
+      for name, denial in (("403", _resp(status=403)), ("404", _resp(status=404)),
+                           ("login", self._login_page())):
+        with self.subTest(admin=admin, denial=name):
+          ep = ApiResourceEndpoint(path="/api/list/", rate_limit_expected=True)
+          p = _make_probe(resource_endpoints=[ep])
+          p.auth.admin_context = admin
+          p.auth.official_session.get.return_value = denial
+          p.run_safe("api_no_rate_limit", p._test_no_rate_limit)
+          found = [f for f in p.findings if f.scenario_id == "PT-OAPI4-03"]
+          self.assertEqual([f.status for f in found], ["inconclusive"])
+          self.assertEqual(found[0].evidence, [f"reason={reason}"])
+
+  def test_reached_endpoint_still_reports_missing_rate_limit(self):
+    ep = ApiResourceEndpoint(path="/api/list/", rate_limit_expected=True)
+    p = _make_probe(resource_endpoints=[ep])
+    p.auth.admin_context = "absent"
+    p.auth.official_session.get.return_value = _resp(status=200)
+    p.run_safe("api_no_rate_limit", p._test_no_rate_limit)
+    self.assertEqual([f.status for f in p.findings if f.scenario_id == "PT-OAPI4-03"],
+                     ["vulnerable"])
+
+
 class TestApi6FlowAbuse(unittest.TestCase):
 
   def test_stateful_disabled_emits_inconclusive(self):

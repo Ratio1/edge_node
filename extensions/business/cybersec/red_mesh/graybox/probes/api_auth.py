@@ -155,6 +155,19 @@ class ApiAuthProbes(ProbeBase):
     self.safety.throttle()
     session = self.auth.make_anonymous_session()
     try:
+      # Baseline: the real token must reach the protected path first, else a
+      # denial of the forged token proves nothing.
+      baseline = session.get(
+        url, headers=self._auth_headers_for_token(real_token),
+        timeout=10,
+        allow_redirects=False,
+      )
+      if not self.response_reached(baseline):
+        self.emit_endpoint_denied("PT-OAPI2-01")
+        return
+      if not self.budget():
+        return
+      self.safety.throttle()
       resp = session.get(
         url, headers=self._auth_headers_for_token(forged),
         timeout=10,
@@ -168,7 +181,7 @@ class ApiAuthProbes(ProbeBase):
     finally:
       session.close()
 
-    if resp.status_code < 400:
+    if self.response_reached(resp):
       self.emit_vulnerable(
         "PT-OAPI2-01", title,
         "CRITICAL", owasp, ["CWE-347", "CWE-327"],

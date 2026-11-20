@@ -636,3 +636,208 @@ class TestCapabilities(unittest.TestCase):
 
 if __name__ == '__main__':
   unittest.main()
+
+
+# ── RM-219 reachability rule ────────────────────────────────────────────
+
+LOGIN_URL = "http://testapp.local:8000/auth/login/?next=/x/"
+
+
+def _denial(kind):
+  """A response that did not reach the handler: 403, 404, or a login redirect."""
+  if kind == "login":
+    resp = _mock_response(status=200, text="<form><input name='username'>"
+                          "<input type='password' name='password'></form>")
+    resp.url = LOGIN_URL
+    resp.history = [MagicMock(headers={"Location": "/auth/login/?next=/x/"})]
+    return resp
+  return _mock_response(status=int(kind), text="denied")
+
+
+def _ok(text="fine"):
+  resp = _mock_response(status=200, text=text)
+  resp.url = "http://testapp.local:8000/x/"
+  resp.history = []
+  return resp
+
+
+def _reason(probe, scenario_id):
+  found = [f for f in probe.findings if f.scenario_id == scenario_id]
+  return found, [e for f in found for e in f.evidence if e.startswith("reason=")]
+
+
+class TestReachabilityRuleInjection(unittest.TestCase):
+  """Every denied endpoint is inconclusive, with admin present and absent."""
+
+  CASES = [
+    ("PT-A03-01", "_test_authenticated_injection", "get"),
+    ("PT-A03-03", "_test_path_traversal", "get"),
+    ("PT-A03-04", "_test_reflected_xss", "get"),
+    ("PT-A03-06", "_test_template_injection", "get"),
+    ("PT-A03-07", "_test_command_injection", "get"),
+    ("PT-A03-12", "_test_header_injection", "get"),
+    ("PT-A03-15", "_test_json_type_confusion", "post"),
+  ]
+
+  def _probe(self, admin_context):
+    ep = ReflectiveEndpoint(path="/api/x/", param="q")
+    probe = _make_probe(
+      discovered_forms=["/records/new/"],
+      xss_endpoints=[ep], ssti_endpoints=[ep], cmd_endpoints=[ep],
+      header_endpoints=[ep],
+      json_type_endpoints=[JsonLookupEndpoint(path="/api/lookup/", field="id")],
+    )
+    probe.discovered_routes = ["/records/"]
+    probe.auth.admin_context = admin_context
+    return probe
+
+  def test_denied_endpoint_is_inconclusive_with_reason(self):
+    for admin, reason in (("provided", "endpoint_denied"),
+                          ("absent", "admin_context_absent")):
+      for kind in ("403", "404", "login"):
+        for sid, method, verb in self.CASES:
+          with self.subTest(admin=admin, kind=kind, sid=sid):
+            probe = self._probe(admin)
+            session = probe.auth.primary_session
+            setattr(session, verb, MagicMock(side_effect=lambda *a, **k: _denial(kind)))
+            getattr(probe, method)()
+            found, reasons = _reason(probe, sid)
+            self.assertEqual([f.status for f in found], ["inconclusive"])
+            self.assertEqual(reasons, [f"reason={reason}"])
+
+  def test_baseline_reached_but_payload_redirected_to_login(self):
+    """GET baseline reaches the handler, the payload POST bounces to login."""
+    probe = self._probe("absent")
+    session = probe.auth.primary_session
+    session.get = MagicMock(return_value=_ok(
+      '<form><input name="title" type="text"></form>'))
+    session.post = MagicMock(side_effect=lambda *a, **k: _denial("login"))
+    probe._test_authenticated_injection()
+    found, reasons = _reason(probe, "PT-A03-01")
+    self.assertEqual([f.status for f in found], ["inconclusive"])
+    self.assertEqual(reasons, ["reason=admin_context_absent"])
+
+  def test_json_payload_redirected_to_login_after_reached_baseline(self):
+    probe = self._probe("provided")
+    session = probe.auth.primary_session
+    session.post = MagicMock(side_effect=[_ok('{"matched":1}'), _denial("login"),
+                                          _denial("login")])
+    probe._test_json_type_confusion()
+    found, reasons = _reason(probe, "PT-A03-15")
+    self.assertEqual([f.status for f in found], ["inconclusive"])
+    self.assertEqual(reasons, ["reason=endpoint_denied"])
+
+  def test_post_only_action_is_not_a_denial(self):
+    """405 on the GET baseline of a form action: skipped, no verdict."""
+    probe = self._probe("absent")
+    probe.auth.primary_session.get = MagicMock(return_value=_denial("405"))
+    probe._test_authenticated_injection()
+    self.assertEqual([f for f in probe.findings if f.scenario_id == "PT-A03-01"], [])
+
+  def test_post_answered_by_redirect_to_non_login_page_is_reached(self):
+    """JSON POST answered by a 3xx to a non-login page counts as reached."""
+    probe = self._probe("provided")
+    redirect = _mock_response(status=302, text="")
+    redirect.headers["Location"] = "/records/"
+    probe.auth.primary_session.post = MagicMock(return_value=redirect)
+    probe._test_json_type_confusion()
+    found, _ = _reason(probe, "PT-A03-15")
+    self.assertEqual([f.status for f in found], ["vulnerable"])
+
+  def test_clean_only_when_an_endpoint_was_reached(self):
+    probe = _make_probe(xss_endpoints=[
+      ReflectiveEndpoint(path="/api/a/", param="q"),
+      ReflectiveEndpoint(path="/api/b/", param="q"),
+    ])
+    probe.auth.admin_context = "absent"
+    ok = _ok("nothing here")
+    probe.auth.primary_session.get = MagicMock(side_effect=[
+      _denial("403"), ok, ok, ok,  # first endpoint denied, second reached
+    ])
+    probe._test_reflected_xss()
+    found, _ = _reason(probe, "PT-A03-04")
+    self.assertEqual([f.status for f in found], ["not_vulnerable"])
+
+  def test_payload_denied_after_reached_baseline_is_not_clean(self):
+    probe = self._probe("absent")
+    probe.auth.primary_session.get = MagicMock(side_effect=[_ok(), _denial("403")])
+    probe._test_template_injection()
+    found, reasons = _reason(probe, "PT-A03-06")
+    self.assertEqual([f.status for f in found], ["inconclusive"])
+
+
+class TestOpenRedirectReachability(unittest.TestCase):
+
+  def _probe(self, admin_context="absent"):
+    probe = _make_probe()
+    probe.discovered_routes = ["/records/"]
+    probe.auth.admin_context = admin_context
+    return probe
+
+  def test_login_next_echo_is_not_an_open_redirect(self):
+    """A login redirect that echoes ?next=//evil.example.com is not reported."""
+    probe = self._probe()
+
+    def get(url, params=None, **kw):
+      resp = _mock_response(status=302, text="")
+      resp.headers["Location"] = "/auth/login/?next=//evil.example.com" if params else "/auth/login/"
+      return resp
+    probe.auth.primary_session.get = MagicMock(side_effect=get)
+    probe._test_open_redirect()
+    # The login page itself was reached and handled ?next= safely; /records/
+    # bounced to login and is not counted.
+    self.assertEqual([f.status for f in probe.findings if f.scenario_id == "PT-A01-04"],
+                     ["not_vulnerable"])
+
+  def test_login_path_stays_a_target_judged_by_parsed_host(self):
+    probe = self._probe()
+
+    def get(url, params=None, **kw):
+      resp = _mock_response(status=302 if params else 200, text="")
+      if params:
+        resp.headers["Location"] = params["next"] if "next" in params else "/home/"
+      return resp
+    probe.auth.primary_session.get = MagicMock(side_effect=get)
+    probe._test_open_redirect()
+    found = [f for f in probe.findings if f.scenario_id == "PT-A01-04"]
+    self.assertEqual([f.status for f in found], ["vulnerable"])
+    self.assertTrue(any(e.startswith("endpoint=/auth/login/") for e in found[0].evidence))
+
+  def test_substring_host_match_is_not_enough(self):
+    """Location=/x?u=evil.example.com has the string but not the host."""
+    probe = self._probe()
+    resp = _mock_response(status=302, text="")
+    resp.headers["Location"] = "/home/?u=evil.example.com"
+    probe.auth.primary_session.get = MagicMock(return_value=resp)
+    probe._test_open_redirect()
+    self.assertEqual([f.status for f in probe.findings if f.scenario_id == "PT-A01-04"],
+                     ["not_vulnerable"])
+
+  def test_denied_route_by_403_or_404_is_inconclusive(self):
+    for kind in ("403", "404"):
+      with self.subTest(kind=kind):
+        probe = self._probe("provided")
+        probe.auth.primary_session.get = MagicMock(side_effect=lambda *a, **k: _denial(kind))
+        probe._test_open_redirect()
+        found, reasons = _reason(probe, "PT-A01-04")
+        self.assertEqual([f.status for f in found], ["inconclusive"])
+        self.assertEqual(reasons, ["reason=endpoint_denied"])
+
+
+class TestSsrfReplayNamesPrincipal(unittest.TestCase):
+
+  def test_body_field_replay_names_regular_user(self):
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import ApiSecurityConfig
+    probe = _make_probe(ssrf_endpoints=[SsrfEndpoint(path="/api/fetch/", param="url")])
+    probe.target_config = GrayboxTargetConfig(
+      injection=InjectionConfig(ssrf_endpoints=[SsrfEndpoint(path="/api/fetch/", param="url")]),
+      api_security=ApiSecurityConfig(ssrf_body_fields=["url"]),
+    )
+    probe.auth.primary_principal = "regular"
+    probe.auth.primary_session.post = MagicMock(return_value=_mock_response(
+      status=200, text="http://127.0.0.1:1/internal-probe"))
+    probe._test_ssrf_body_field()
+    vuln = [f for f in probe.findings if f.scenario_id == "PT-API7-01"]
+    self.assertEqual(len(vuln), 1)
+    self.assertIn("Authenticate as the regular user.", vuln[0].replay_steps)
+    self.assertFalse(any("official" in s for s in vuln[0].replay_steps))

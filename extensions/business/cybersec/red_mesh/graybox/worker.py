@@ -717,6 +717,11 @@ class GrayboxLocalWorker(BaseLocalWorker):
     port_info["_graybox_discovery"] = {
       "routes": routes,
       "forms": forms,
+      "crawled_as": self.auth.primary_principal,
+      "coverage_note": (
+        "Crawled as the regular user; admin-only pages not reached."
+        if self.auth.admin_context == "absent" else ""
+      ),
       "findings": [],
     }
 

@@ -146,6 +146,7 @@ class InjectionProbes(ProbeBase):
     ]
     login_path = self.target_config.login_path
     tested = 0
+    denied = 0
     vulnerable_forms = []
 
     for form_action in self.discovered_forms:
@@ -157,6 +158,11 @@ class InjectionProbes(ProbeBase):
       try:
         page = self.auth.primary_session.get(url, timeout=10)
       except Exception:
+        continue
+      if page.status_code == 405:
+        continue  # POST-only action: the GET baseline does not apply
+      if not self.response_reached(page):
+        denied += 1
         continue
 
       # Extract input field names
@@ -187,6 +193,9 @@ class InjectionProbes(ProbeBase):
         try:
           resp = self.auth.primary_session.post(url, data=form_data, timeout=10)
         except Exception:
+          continue
+        if not self.response_reached(resp):
+          denied += 1
           continue
         tested += 1
 
@@ -225,6 +234,8 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"forms_tested={tested}"],
       ))
+    elif denied > 0 and not vulnerable_forms and tested == 0:
+      self.emit_endpoint_denied("PT-A03-01")
 
   def _test_stored_xss(self):
     """
@@ -450,7 +461,7 @@ class InjectionProbes(ProbeBase):
                        "response_status=200",
                        "reflected_marker=internal-probe"],
             replay_steps=[
-              "Authenticate as the official user.",
+              f"Authenticate as {self.principal_label()}.",
               f"POST {url} with JSON body `{{\"{body_field}\": \"{payload_url}\"}}`.",
               "Observe the response reflects the internal-probe marker, "
               "confirming the server fetched the user-controlled URL.",
@@ -501,9 +512,44 @@ class InjectionProbes(ProbeBase):
         unique_paths.append(p)
 
     tested = 0
+    denied = 0
     vulnerable_evidence = []
+    login_path = self.target_config.login_path
+
+    def _evil_redirect(resp):
+      # Parsed host, not substring: a login redirect that echoes ?next=//evil
+      # carries the payload in its query, not as the redirect target.
+      from urllib.parse import urlparse
+      if resp.status_code not in (301, 302, 303, 307, 308):
+        return ""
+      location = resp.headers.get("Location", "")
+      try:
+        host = urlparse(location).hostname or ""
+      except ValueError:
+        return ""
+      return location if host.lower() == "evil.example.com" else ""
+
+    def _counts(path, resp):
+      # The login page is reachable without a session: any non-error answer
+      # counts. Other paths must reach their handler.
+      if path == login_path:
+        return resp.status_code < 400
+      return self.response_reached(resp)
 
     for path in unique_paths[:10]:  # cap to avoid excessive requests
+      if path != login_path:
+        # Baseline: plain GET of the same URL. The login page is exempt, it is
+        # the classic ?next= target and is reachable without a session.
+        self.safety.throttle()
+        try:
+          base = session.get(
+            self.target_url + path, timeout=10, allow_redirects=False,
+          )
+        except Exception:
+          continue
+        if not self.response_reached(base):
+          denied += 1
+          continue
       for param in redirect_params:
         self.safety.throttle()
         url = self.target_url + path
@@ -514,16 +560,18 @@ class InjectionProbes(ProbeBase):
           )
         except Exception:
           continue
+        if not _counts(path, resp):
+          denied += 1
+          continue
         tested += 1
 
         # Check for redirect to evil domain
-        if resp.status_code in (301, 302, 303, 307, 308):
-          location = resp.headers.get("Location", "")
-          if "evil.example.com" in location:
-            vulnerable_evidence.append(
-              f"endpoint={path}; param={param}; location={location}"
-            )
-            break  # one redirect per path is enough
+        location = _evil_redirect(resp)
+        if location:
+          vulnerable_evidence.append(
+            f"endpoint={path}; param={param}; location={location}"
+          )
+          break  # one redirect per path is enough
 
         # Also test the alternate payload (full URL)
         if not vulnerable_evidence or vulnerable_evidence[-1].split(";")[0] != f"endpoint={path}":
@@ -535,15 +583,17 @@ class InjectionProbes(ProbeBase):
             )
           except Exception:
             continue
+          if not _counts(path, resp2):
+            denied += 1
+            continue
           tested += 1
 
-          if resp2.status_code in (301, 302, 303, 307, 308):
-            location2 = resp2.headers.get("Location", "")
-            if "evil.example.com" in location2:
-              vulnerable_evidence.append(
-                f"endpoint={path}; param={param}; location={location2}"
-              )
-              break
+          location2 = _evil_redirect(resp2)
+          if location2:
+            vulnerable_evidence.append(
+              f"endpoint={path}; param={param}; location={location2}"
+            )
+            break
 
       if len(vulnerable_evidence) >= 3:
         break  # enough evidence
@@ -577,6 +627,8 @@ class InjectionProbes(ProbeBase):
         owasp="A01:2021",
         evidence=[f"parameters_tested={tested}"],
       ))
+    elif denied > 0:
+      self.emit_endpoint_denied("PT-A01-04")
 
   def _test_path_traversal(self):
     """
@@ -613,10 +665,21 @@ class InjectionProbes(ProbeBase):
       test_routes.append("/")
 
     tested = 0
+    denied = 0
     vulnerable_evidence = []
 
     for route in test_routes[:10]:  # cap to avoid excessive requests
       url = self.target_url + route
+
+      # Baseline: a plain GET must reach the handler before the route counts.
+      self.safety.throttle()
+      try:
+        base = session.get(url, timeout=10)
+      except Exception:
+        continue
+      if not self.response_reached(base):
+        denied += 1
+        continue
 
       # Strategy 1: inject via query parameters
       for param in file_params:
@@ -627,6 +690,9 @@ class InjectionProbes(ProbeBase):
           try:
             resp = session.get(url, params={param: payload}, timeout=10)
           except Exception:
+            continue
+          if not self.response_reached(resp):
+            denied += 1
             continue
           tested += 1
 
@@ -672,6 +738,8 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"requests_tested={tested}"],
       ))
+    elif denied > 0:
+      self.emit_endpoint_denied("PT-A03-03")
 
   # ── Batch 2 — A03 family expansion ──────────────────────────────────────
 
@@ -690,14 +758,26 @@ class InjectionProbes(ProbeBase):
 
     vulnerable = []
     tested = 0
+    denied = 0
     for ep in endpoints:
       url = self.target_url + ep.path
+      self.safety.throttle()
+      try:
+        base = self.auth.primary_session.get(url, timeout=10)
+      except Exception:
+        continue
+      if not self.response_reached(base):
+        denied += 1
+        continue
       self.safety.throttle()
       try:
         resp = self.auth.primary_session.get(
           url, params={ep.param: payload}, timeout=10,
         )
       except Exception:
+        continue
+      if not self.response_reached(resp):
+        denied += 1
         continue
       tested += 1
       if resp.status_code == 200 and sentinel in resp.text:
@@ -731,6 +811,8 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"endpoints_tested={tested}"],
       ))
+    elif denied > 0:
+      self.emit_endpoint_denied("PT-A03-04")
 
   def _test_template_injection(self):
     """PT-A03-06: detect server-side template injection.
@@ -747,8 +829,17 @@ class InjectionProbes(ProbeBase):
 
     vulnerable = []
     tested = 0
+    denied = 0
     for ep in endpoints:
       url = self.target_url + ep.path
+      self.safety.throttle()
+      try:
+        base = self.auth.primary_session.get(url, timeout=10)
+      except Exception:
+        continue
+      if not self.response_reached(base):
+        denied += 1
+        continue
       for payload in payloads:
         self.safety.throttle()
         try:
@@ -756,6 +847,9 @@ class InjectionProbes(ProbeBase):
             url, params={ep.param: payload}, timeout=10,
           )
         except Exception:
+          continue
+        if not self.response_reached(resp):
+          denied += 1
           continue
         tested += 1
         # Avoid false positives on echo-only sinks: require the body to
@@ -798,6 +892,8 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"requests_tested={tested}"],
       ))
+    elif denied > 0:
+      self.emit_endpoint_denied("PT-A03-06")
 
   def _test_command_injection(self):
     """PT-A03-07: detect OS command injection via shell metacharacters.
@@ -815,8 +911,17 @@ class InjectionProbes(ProbeBase):
 
     vulnerable = []
     tested = 0
+    denied = 0
     for ep in endpoints:
       url = self.target_url + ep.path
+      self.safety.throttle()
+      try:
+        base = self.auth.primary_session.get(url, timeout=10)
+      except Exception:
+        continue
+      if not self.response_reached(base):
+        denied += 1
+        continue
       for payload in payloads:
         self.safety.throttle()
         try:
@@ -824,6 +929,9 @@ class InjectionProbes(ProbeBase):
             url, params={ep.param: payload}, timeout=10,
           )
         except Exception:
+          continue
+        if not self.response_reached(resp):
+          denied += 1
           continue
         tested += 1
         if resp.status_code == 200 and sentinel.search(resp.text):
@@ -864,6 +972,8 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"requests_tested={tested}"],
       ))
+    elif denied > 0:
+      self.emit_endpoint_denied("PT-A03-07")
 
   def _test_header_injection(self):
     """PT-A03-12: detect HTTP header injection via CRLF.
@@ -882,8 +992,19 @@ class InjectionProbes(ProbeBase):
 
     vulnerable = []
     tested = 0
+    denied = 0
     for ep in endpoints:
       url = self.target_url + ep.path
+      self.safety.throttle()
+      try:
+        base = self.auth.primary_session.get(
+          url, allow_redirects=False, timeout=10,
+        )
+      except Exception:
+        continue
+      if not self.response_reached(base):
+        denied += 1
+        continue
       self.safety.throttle()
       try:
         resp = self.auth.primary_session.get(
@@ -891,6 +1012,9 @@ class InjectionProbes(ProbeBase):
           allow_redirects=False, timeout=10,
         )
       except Exception:
+        continue
+      if not self.response_reached(resp):
+        denied += 1
         continue
       tested += 1
       if resp.headers.get(inject_name) == inject_value:
@@ -929,6 +1053,8 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"requests_tested={tested}"],
       ))
+    elif denied > 0:
+      self.emit_endpoint_denied("PT-A03-12")
 
   def _test_json_type_confusion(self):
     """PT-A03-15: detect lax JSON body parsing on typed fields.
@@ -946,6 +1072,7 @@ class InjectionProbes(ProbeBase):
 
     vulnerable = []
     tested = 0
+    denied = 0
     for ep in endpoints:
       url = self.target_url + ep.path
       headers = {"Content-Type": "application/json"}
@@ -961,6 +1088,9 @@ class InjectionProbes(ProbeBase):
         continue
       if baseline.status_code >= 500:
         continue
+      if not self.response_reached(baseline, validation_ok=True):
+        denied += 1
+        continue
 
       # Variant: list
       payloads_to_try = [[1], {"$gt": 0}]
@@ -972,6 +1102,9 @@ class InjectionProbes(ProbeBase):
             headers=headers, timeout=10,
           )
         except Exception:
+          continue
+        if not self.response_reached(resp, validation_ok=True):
+          denied += 1
           continue
         tested += 1
         if resp.status_code < 400:
@@ -1014,3 +1147,5 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"requests_tested={tested}"],
       ))
+    elif denied > 0:
+      self.emit_endpoint_denied("PT-A03-15")

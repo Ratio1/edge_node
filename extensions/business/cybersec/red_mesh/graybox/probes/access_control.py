@@ -95,8 +95,11 @@ class AccessControlProbes(ProbeBase):
 
     for ep in endpoints:
       self.safety.throttle()
-      result = self._test_single_idor(ep)
-      endpoints_tested += 1
+      outcome = {}
+      result = self._test_single_idor(ep, outcome)
+      # A bare 404 is skipped (mistyped path), a denial counts as tested.
+      if outcome.get("evaluated"):
+        endpoints_tested += 1
       if result:
         vulnerable_evidence = result
         break
@@ -124,7 +127,7 @@ class AccessControlProbes(ProbeBase):
         ],
         remediation="Authorize object access using both role and ownership checks server-side.",
       ))
-    else:
+    elif endpoints_tested:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-01",
         title="Object-level authorization — no bypass detected",
@@ -134,13 +137,19 @@ class AccessControlProbes(ProbeBase):
         evidence=[f"endpoints_tested={endpoints_tested}"],
       ))
 
-  def _test_single_idor(self, ep):
-    """Test one IDOR endpoint. Returns (owner, url, path) on hit, None on miss."""
+  def _test_single_idor(self, ep, outcome=None):
+    """Test one IDOR endpoint. Returns (owner, url, path) on hit, None on miss.
+
+    ``outcome["evaluated"]`` is set when some id got a response that is not a
+    bare 404.
+    """
     path_tpl = ep.path
     for test_id in ep.test_ids:
       path = path_tpl.replace("{id}", str(test_id))
       url = self.target_url + path
       resp = self.auth.regular_session.get(url, timeout=10)
+      if outcome is not None and not self.bare_not_found(resp, url):
+        outcome["evaluated"] = True
       if resp.status_code != 200:
         continue
       ct = resp.headers.get("content-type", "")
@@ -184,6 +193,8 @@ class AccessControlProbes(ProbeBase):
       else:
         continue  # only GET for read-only probes
 
+      if self.exempt_denial(resp, url, method):
+        continue  # login redirect or a denial: the secure result
       if resp.status_code == 200:
         body_lower = resp.text.lower()
         denial_markers = ["access denied", "permission denied", "forbidden",
@@ -258,6 +269,8 @@ class AccessControlProbes(ProbeBase):
 
       # Only test verb tampering if the baseline is denied (403/401/302-to-login)
       baseline_denied = baseline.status_code in (401, 403)
+      if not baseline_denied:
+        baseline_denied = bool(self.exempt_denial(baseline, url, ep.method))
       if not baseline_denied and baseline.status_code == 200:
         body_lower = baseline.text.lower()
         baseline_denied = any(m in body_lower for m in denial_markers)
@@ -276,7 +289,8 @@ class AccessControlProbes(ProbeBase):
           continue
         tested += 1
 
-        if resp.status_code < 400 and resp.status_code not in (301, 302):
+        if (resp.status_code < 400 and resp.status_code not in (301, 302)
+            and self.response_reached(resp)):
           body_lower = resp.text.lower()
           if not any(m in body_lower for m in denial_markers):
             bypass_evidence.append(
@@ -574,6 +588,8 @@ class AccessControlProbes(ProbeBase):
             )
           except Exception:
             continue
+          if self.bare_not_found(patch_resp, url, "PATCH"):
+            continue
           tested += 1
           if patch_resp.status_code >= 400:
             continue
@@ -689,6 +705,8 @@ class AccessControlProbes(ProbeBase):
           )
         except Exception:
           continue
+        if self.bare_not_found(patch_resp, url, "PATCH"):
+          continue
         tested += 1
         if patch_resp.status_code >= 400:
           continue
@@ -792,6 +810,8 @@ class AccessControlProbes(ProbeBase):
             url, headers=headers, timeout=10,
           )
         except Exception:
+          continue
+        if self.bare_not_found(del_resp, url, "DELETE"):
           continue
         tested += 1
         if del_resp.status_code >= 400:
@@ -1053,6 +1073,7 @@ class AccessControlProbes(ProbeBase):
     )
     tampered_evidence = []
     tested = 0
+    denied = 0
 
     for form_path in forms[:5]:
       url = self.target_url + form_path
@@ -1060,6 +1081,11 @@ class AccessControlProbes(ProbeBase):
       try:
         page = self.auth.regular_session.get(url, timeout=10)
       except Exception:
+        continue
+      if page.status_code == 405:
+        continue  # POST-only action: no GET baseline, no form to read
+      if not self.response_reached(page):
+        denied += 1
         continue
       if page.status_code != 200:
         continue
@@ -1113,6 +1139,10 @@ class AccessControlProbes(ProbeBase):
         )
       except Exception:
         continue
+      if not self.response_reached(resp):
+        # Payload denied or redirected to login: the handler never saw it.
+        denied += 1
+        continue
       tested += 1
 
       # Vulnerable signal: 2xx/3xx without an "invalid"/"error" body,
@@ -1157,3 +1187,5 @@ class AccessControlProbes(ProbeBase):
         owasp="A01:2021",
         evidence=[f"forms_with_hidden_auth_fields={tested}"],
       ))
+    elif denied > 0:
+      self.emit_endpoint_denied("PT-A01-12")

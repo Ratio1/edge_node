@@ -280,10 +280,34 @@ class MisconfigProbes(ProbeBase):
       return
 
     tested = 0
+    denied = 0
     vulnerable_endpoints = []
+    csrf_field = self.auth.detected_csrf_field
     for path in csrf_test_endpoints[:5]:
       self.safety.throttle()
       url = self.target_url + path
+      # Baseline: the same POST with a valid token. A tokenless 403 only
+      # proves CSRF protection when the principal is allowed to POST here.
+      baseline_data = {"test": "csrf_probe"}
+      baseline_headers = {"Referer": url}
+      if csrf_field:
+        try:
+          page = self.auth.primary_session.get(url, timeout=10)
+          token = self.auth.extract_csrf_value(page.text, csrf_field)
+        except Exception:
+          token = None
+        if token:
+          baseline_data[csrf_field] = token
+          baseline_headers["X-CSRFToken"] = token
+      try:
+        baseline = self.auth.primary_session.post(
+          url, data=baseline_data, timeout=10, headers=baseline_headers,
+        )
+      except Exception:
+        continue
+      if not self.response_reached(baseline, validation_ok=True):
+        denied += 1
+        continue
       try:
         resp = self.auth.primary_session.post(
           url, data={"test": "csrf_probe"}, timeout=10,
@@ -296,7 +320,8 @@ class MisconfigProbes(ProbeBase):
       csrf_rejected = any(m in body_lower for m in [
         "csrf", "forbidden", "token", "invalid request",
       ]) or resp.status_code == 403
-      if not csrf_rejected and resp.status_code < 400:
+      if (not csrf_rejected and resp.status_code < 400
+          and self.response_reached(resp)):
         vulnerable_endpoints.append(path)
 
     if vulnerable_endpoints:
@@ -329,6 +354,8 @@ class MisconfigProbes(ProbeBase):
         owasp="A02:2021",
         evidence=[f"endpoints_tested={tested}"],
       ))
+    elif denied > 0:
+      self.emit_endpoint_denied("PT-A02-05")
 
   def _test_session_token(self):
     """

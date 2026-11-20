@@ -135,6 +135,16 @@ class ApiAccessProbes(ProbeBase):
     owasp = "API1:2023"
     cwe = ["CWE-639", "CWE-284"]
 
+    # A denial of the regular user on an object endpoint is the secure result:
+    # 401/403, a login redirect, or a 404 that the admin reached.
+    denial = self.exempt_denial(resp, url)
+    if denial:
+      self.emit_clean(
+        "PT-OAPI1-01", title, owasp,
+        [f"endpoint={url}", f"response_status={resp.status_code}",
+         f"marker=denied_{denial}", f"test_id={test_id}"],
+      )
+      return "clean"
     # FP guard 1: skip non-API responses (web IDOR is AccessControlProbes' job).
     content_type = (resp.headers.get("content-type") or "").lower()
     if "application/json" not in content_type:
@@ -357,6 +367,17 @@ class ApiAccessProbes(ProbeBase):
         )
         found_any = True
         continue
+      # Login redirect, or a 404 that the admin reached: also a denial.
+      denial = self.exempt_denial(resp, url)
+      if denial:
+        self.emit_clean(
+          scenario_id, title, owasp,
+          [f"endpoint={url}", f"principal={principal}",
+           f"response_status={status}",
+           f"marker=denied_{denial}"],
+        )
+        found_any = True
+        continue
       # Other 4xx/5xx — endpoint refused for other reasons; skip.
       if status >= 400:
         continue
@@ -460,10 +481,10 @@ class ApiAccessProbes(ProbeBase):
           return self.MUTATION_ATTEMPTED_UNKNOWN
         base["plain_status"] = plain_resp.status_code
         _evidence.append(f"plain_status={plain_resp.status_code}")
-        if plain_resp.status_code < 400:
+        if self.response_reached(plain_resp):
           base["plain_mutating_method_allowed"] = True
           return True
-        if plain_resp.status_code not in (401, 403):
+        if not self.exempt_denial(plain_resp, _url, method):
           base["plain_mutating_method_unexpected_status"] = plain_resp.status_code
           return False
 
@@ -479,12 +500,13 @@ class ApiAccessProbes(ProbeBase):
           return self.MUTATION_ATTEMPTED_UNKNOWN
         base["override_status"] = resp.status_code
         _evidence.append(f"override_status={resp.status_code}")
-        return resp.status_code < 400
+        base["override_reached"] = self.response_reached(resp)
+        return base["override_reached"]
 
       def verify(base):
         if base.get("plain_mutating_method_allowed"):
           return False
-        return base.get("override_status", 999) < 400
+        return bool(base.get("override_reached"))
 
       def revert(base, _revert_url=revert_url, _ep=ep):
         return self._revert_function_endpoint(session, _revert_url, _ep)
@@ -566,10 +588,11 @@ class ApiAccessProbes(ProbeBase):
         except requests.RequestException:
           return self.MUTATION_ATTEMPTED_UNKNOWN
         base["mutate_status"] = resp.status_code
-        return resp.status_code < 400
+        base["mutate_reached"] = self.response_reached(resp)
+        return base["mutate_reached"]
 
       def verify(base):
-        return base.get("mutate_status", 999) < 400
+        return bool(base.get("mutate_reached"))
 
       def revert(base, _revert_url=revert_url, _ep=ep):
         return self._revert_function_endpoint(session, _revert_url, _ep)

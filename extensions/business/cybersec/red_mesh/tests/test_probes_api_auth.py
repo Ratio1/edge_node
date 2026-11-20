@@ -88,11 +88,37 @@ class TestApi2AlgNone(unittest.TestCase):
     p.auth.official_session.post.return_value = _resp(
       json_body={"token": real},
     )
-    p.auth.make_anonymous_session.return_value.get.return_value = _resp(status=401)
+    # Baseline with the real token is accepted, the forged token is rejected.
+    p.auth.make_anonymous_session.return_value.get.side_effect = [
+      _resp(status=200, json_body={"id": 1}), _resp(status=401),
+    ]
     p.run_safe("api_jwt_alg_none", p._test_jwt_alg_none)
     clean = [f for f in p.findings
              if f.scenario_id == "PT-OAPI2-01" and f.status == "not_vulnerable"]
     self.assertEqual(len(clean), 1)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.probes.api_auth.requests")
+  def test_denied_real_token_baseline_is_inconclusive(self, mock_requests):
+    """A 403/404/login redirect for the real token makes the forged 403 meaningless."""
+    login = _resp(status=200)
+    login.text = "<input name='username'><input type='password' name='p'>"
+    login.url = "http://api.example/auth/login/?next=/api/me/"
+    login.history = []
+    for admin, reason in (("provided", "endpoint_denied"),
+                          ("absent", "admin_context_absent")):
+      for name, denial in (("403", _resp(status=403)), ("404", _resp(status=404)),
+                           ("login", login)):
+        with self.subTest(admin=admin, denial=name):
+          tok = ApiTokenEndpoint(token_path="/api/token/", protected_path="/api/me/")
+          p = _make_probe(token_endpoints=tok)
+          p.auth.admin_context = admin
+          p.auth.official_session.post.return_value = _resp(
+            json_body={"token": _hs256_jwt({"sub": "alice"}, "topsecret")})
+          p.auth.make_anonymous_session.return_value.get.return_value = denial
+          p.run_safe("api_jwt_alg_none", p._test_jwt_alg_none)
+          found = [f for f in p.findings if f.scenario_id == "PT-OAPI2-01"]
+          self.assertEqual([f.status for f in found], ["inconclusive"])
+          self.assertEqual(found[0].evidence, [f"reason={reason}"])
 
 
 class TestApi2WeakHmac(unittest.TestCase):

@@ -104,6 +104,77 @@ class TestApi8SecurityHeaders(unittest.TestCase):
     self.assertEqual(vuln[0].severity, "LOW")
 
 
+def _login_page():
+  r = _resp(status=200, text="<input name='username'><input type='password' name='p'>")
+  r.url = "http://api.example/auth/login/?next=/api/me/"
+  r.history = []
+  return r
+
+
+class TestApi8ReachabilityRule(unittest.TestCase):
+  """PT-OAPI8-01/-02: headers on a denied response can convict, never clear."""
+
+  CASES = [("PT-OAPI8-01", "_test_cors_misconfig"),
+           ("PT-OAPI8-02", "_test_security_headers")]
+
+  def test_denied_endpoint_with_clean_headers_is_inconclusive(self):
+    good = {"Access-Control-Allow-Origin": "https://trusted.example",
+            "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"}
+    for admin, reason in (("provided", "endpoint_denied"),
+                          ("absent", "admin_context_absent")):
+      for name in ("403", "404", "login"):
+        for sid, method in self.CASES:
+          with self.subTest(admin=admin, denial=name, sid=sid):
+            p = _make_probe(function_endpoints=[ApiFunctionEndpoint(path="/api/me/")])
+            p.auth.admin_context = admin
+            denial = _login_page() if name == "login" else _resp(status=int(name))
+            denial.headers = dict(good)
+            p.auth.official_session.get.return_value = denial
+            getattr(p, method)()
+            found = [f for f in p.findings if f.scenario_id == sid]
+            self.assertEqual([f.status for f in found], ["inconclusive"])
+            self.assertEqual(found[0].evidence, [f"reason={reason}"])
+
+  def test_bad_headers_on_a_denied_response_are_vulnerable(self):
+    p = _make_probe(function_endpoints=[ApiFunctionEndpoint(path="/api/me/")])
+    p.auth.admin_context = "absent"
+    p.auth.official_session.get.return_value = _resp(
+      status=403, headers={"Access-Control-Allow-Origin": "*",
+                           "Access-Control-Allow-Credentials": "true"})
+    p._test_cors_misconfig()
+    p._test_security_headers()
+    self.assertEqual(
+      sorted((f.scenario_id, f.status) for f in p.findings),
+      [("PT-OAPI8-01", "vulnerable"), ("PT-OAPI8-02", "vulnerable")])
+
+  def test_endpoint_privilege_user_or_anon_is_tested_as_regular(self):
+    eps = [ApiFunctionEndpoint(path="/api/admin/", privilege="admin"),
+           ApiFunctionEndpoint(path="/api/me/", privilege="user"),
+           ApiFunctionEndpoint(path="/api/open/", privilege="anon")]
+    for sid, method in self.CASES:
+      with self.subTest(sid=sid):
+        p = _make_probe(function_endpoints=eps)
+        p.auth.admin_context = "provided"
+        ok = _resp(status=200, headers={"Access-Control-Allow-Origin": "x",
+                                        "X-Content-Type-Options": "nosniff",
+                                        "Cache-Control": "no-store"})
+        p.auth.official_session.get.return_value = ok
+        p.auth.regular_session.get.return_value = ok
+        getattr(p, method)()
+        official = {c.args[0] for c in p.auth.official_session.get.call_args_list}
+        regular = {c.args[0] for c in p.auth.regular_session.get.call_args_list}
+        self.assertEqual(official, {"http://api.example/api/admin/"})
+        self.assertEqual(regular, {"http://api.example/api/me/",
+                                   "http://api.example/api/open/"})
+
+  def test_reached_endpoint_with_good_headers_is_clean(self):
+    p = _make_probe(function_endpoints=[ApiFunctionEndpoint(path="/api/me/")])
+    p.auth.official_session.get.return_value = _resp(
+      headers={"Access-Control-Allow-Origin": "https://trusted.example"})
+    p._test_cors_misconfig()
+    self.assertEqual([f.status for f in p.findings], ["not_vulnerable"])
+
+
 class TestApi8DebugEndpointExposed(unittest.TestCase):
 
   def test_actuator_env_emits_medium(self):

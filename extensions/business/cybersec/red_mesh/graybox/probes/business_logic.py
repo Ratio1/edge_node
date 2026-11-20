@@ -179,6 +179,13 @@ class BusinessLogicProbes(ProbeBase):
       except Exception:
         continue
 
+      # A denial (401/403, login redirect, or a 404 the admin reached) is the
+      # secure result. A bare 404 is skipped: it may be a mistyped path.
+      if self.exempt_denial(resp, url, sent):
+        endpoints_tested += 1
+        continue
+      if resp.status_code == 404:
+        continue
       endpoints_tested += 1
       if resp.status_code < 400:
         body_lower = resp.text.lower()
@@ -258,6 +265,8 @@ class BusinessLogicProbes(ProbeBase):
         break
 
     bypass_evidence = []
+    tested = 0
+    denied = 0
     # PT-A06-04 (Negative amount accepted) is a strict subset of PT-A06-02
     # — track separately so the catalog row fires when negative amount is
     # accepted, even if the invalid-state branch also triggers PT-A06-02.
@@ -274,6 +283,11 @@ class BusinessLogicProbes(ProbeBase):
       try:
         page = self.auth.primary_session.get(url, timeout=10)
       except Exception:
+        continue
+      if page.status_code == 405:
+        continue  # POST-only action: no GET baseline, no form to read
+      if not self.response_reached(page):
+        denied += 1
         continue
       if page.status_code != 200:
         continue
@@ -332,7 +346,11 @@ class BusinessLogicProbes(ProbeBase):
       except Exception:
         resp = None
 
-      if resp is not None:
+      if resp is not None and not self.response_reached(resp):
+        # Payload denied or redirected to login: the handler never saw it.
+        denied += 1
+      elif resp is not None:
+        tested += 1
         # Success indicators: 302 redirect (form accepted) or 200 without error
         accepted = resp.status_code in (301, 302)
         if not accepted and resp.status_code == 200:
@@ -384,7 +402,7 @@ class BusinessLogicProbes(ProbeBase):
           except Exception:
             resp2 = None
 
-          if resp2 is not None:
+          if resp2 is not None and self.response_reached(resp2):
             accepted2 = resp2.status_code in (301, 302)
             if not accepted2 and resp2.status_code == 200:
               body_lower = resp2.text.lower()
@@ -415,15 +433,22 @@ class BusinessLogicProbes(ProbeBase):
                     "and business state machine transitions. "
                     "Never rely on client-side validation alone.",
       ))
-    elif endpoints:
+    elif tested:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A06-02",
         title="Business logic validation — no bypass detected",
         status="not_vulnerable",
         severity="INFO",
         owasp="A06:2021",
-        evidence=[f"endpoints_tested={len(endpoints)}"],
+        evidence=[f"endpoints_tested={tested}"],
       ))
+    elif denied:
+      self.emit_endpoint_denied("PT-A06-02")
+    else:
+      self.emit_inconclusive(
+        "PT-A06-02", "Business logic validation bypass", "A06:2021",
+        "no_evaluable_responses",
+      )
 
     # PT-A06-04 — Negative amount accepted (strict subset of PT-A06-02).
     # Always emit one finding so coverage accounting shows the probe ran.
@@ -447,12 +472,19 @@ class BusinessLogicProbes(ProbeBase):
                     "validation alone is insufficient — always re-validate at "
                     "the model or service boundary.",
       ))
-    elif endpoints:
+    elif tested:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A06-04",
         title="Negative amount — guard held",
         status="not_vulnerable",
         severity="INFO",
         owasp="A04:2021",
-        evidence=[f"endpoints_tested={len(endpoints)}"],
+        evidence=[f"endpoints_tested={tested}"],
       ))
+    elif denied:
+      self.emit_endpoint_denied("PT-A06-04")
+    else:
+      self.emit_inconclusive(
+        "PT-A06-04", "Negative amount accepted", "A04:2021",
+        "no_evaluable_responses",
+      )
