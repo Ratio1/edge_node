@@ -729,7 +729,12 @@ update, an explicit target for every paid slot, and
 `repair: {replace_stateless: true, accept_unconfirmed_stop: true, proposal}`.
 Normal payment, resource, and target checks apply. The escrow owner or an
 active delegate with the editor's job-edit permission can sign. Every target
-needs a distinct active license at admission. Existing app and component IDs are preserved.
+needs a distinct active license at admission. The coordinator binds the exact
+licensed address, license ID and license owner, and rechecks the placement
+before dispatch and publication. dAuth independently verifies the license
+before releasing replacement credentials and the full placement before
+publication. Preview and admission require a paid execution epoch. Existing
+app and component IDs are preserved.
 The path supports ordinary native plugins and app runners. Local mounts,
 runtime commands, synchronization, and managed services make a job ineligible.
 Deeploy uses the normal readiness and shutdown behavior of each component. The
@@ -738,13 +743,22 @@ signer attests that the app can run while a previous copy may still be active.
 Admission stages only the replacement revision and reserves any blocked
 retirement. It sends versioned replacement commands without waiting for old
 nodes or using historical license relink records. Only successful readiness
-publishes the new runtime placement. A completed cutover or a failed rollout
-that dispatched workers revokes the superseded relink's prepared grants. A
-failed preparation releases the hold so the original relink can resume. Failed
-replacement cleans up its own attempt and keeps the previous saved pointer. It cannot reconstruct the
-previous running deployment. Status exposes removed addresses under
-`unconfirmed_previous_nodes`. This operation updates the Deeploy runtime
+publishes the new runtime placement. Dispatch intent is persisted before each
+first start. If the replacement fails before any dispatch intent, only its
+grants are revoked and the original relink can resume. A completed cutover or a
+failed rollout with a recorded dispatch supersedes the relink and revokes its
+prepared grants. Failure requires cleanup only on workers that might have
+received the replacement and keeps the previous saved pointer. Status carries
+forward `unconfirmed_previous_nodes` and clears a reused address after
+successful takeover. This operation updates the Deeploy runtime
 placement. On-chain node allocation and rewards follow the existing contract.
+If custody might already have published, the coordinator resolves publication
+before treating the rollout as failed.
+
+If a replica cannot confirm routing for a signed retry, it returns retryable
+`503 ADMISSION_UNAVAILABLE`. Keep the original request ID and payload until
+the coordinator resolves it. An authoritative refusal of a stale replacement
+proposal returns `409 REPLACEMENT_REVIEW_STALE` and requires a fresh review.
 
 Publish Core 7.7.363 before building Edge. Upgrade the target workers, the
 serving oracles, and dAuth before enabling the updated editor. Stateless

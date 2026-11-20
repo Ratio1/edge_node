@@ -1,8 +1,10 @@
 """Exercise the CSP's public Deeploy handlers with real update planning and repair custody."""
 
 import copy
+import hashlib
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from eth_account import Account
 from eth_account.messages import encode_defunct
@@ -10,6 +12,8 @@ from naeural_core.utils.fastapi_utils import PostponedRequest
 from naeural_core.utils.plugins_base.plugin_base_utils import NestedDotDict
 from web3 import Web3
 
+from extensions.business.dauth.deployment_secrets import REVISIONS
+from extensions.business.deeploy.deployment_operations import OPERATIONS_HKEY, deployment_operation_phase
 from extensions.business.deeploy.repair_relay import _RELAY_KEY
 from extensions.business.deeploy.tests import test_update_requests as updates
 from extensions.business.deeploy.tests import test_job_repair as lifecycle
@@ -288,17 +292,147 @@ class JobRepairHttpTests(unittest.TestCase):
     self.assertEqual((child["phase"], child["outcome"]), ("completed", "failed"))
     self.assertEqual(self.replay.c._get_pipeline_from_cstore(31), self.replay.cid)
 
+  def test_stateless_replacement_expiry_before_dispatch_releases_parent_and_preserves_its_grants(self):
+    request = self.replacement_request()
+    coordinator, state, vault = self.replay.c, self.replay.state, self.replay.dauth
+    coordinator.known["earlier-offline-worker"] = [self.replay.live]
+    parent_refs = [f"{self.replay.oid}:{attempt}" for attempt in ("deploy", "restore")]
+    for revision in parent_refs:
+      state.secrets[REVISIONS, f"31|{revision}"] = dict(
+        job_id="31", revision=revision, pipelines={"newA": self.replay.stored}, job_secrets={},
+      )
+    accepted = self.api.repair_update_pipeline(request)
+    self.assertEqual(accepted["status_code"], 202, accepted)
+    child = coordinator._operation_records()[accepted["operation_id"]]
+    state.now = child["deadline"] + 1  # The coordinator resumes its accepted operation after its rollout deadline.
+    coordinator._advance_deployment_operation(child)
+    self.assertEqual(deployment_operation_phase(child), "stopping_failed_rollout")
+    coordinator._advance_deployment_operation(coordinator._operation_records()[child["operation_id"]])
+    coordinator._advance_serialized_operation(coordinator._operation_records()[self.replay.oid])
+    self.assertEqual(coordinator.commands, [])  # No start or stop may be sent to an untouched target.
+    self.assertEqual(coordinator._operation_records()[self.replay.oid]["phase"], "retiring_previous")
+    self.assertEqual(coordinator._get_pipeline_from_cstore(31), self.replay.cid)
+    coordinator.deeploy_verify_and_get_inputs = lambda *args, **kwargs: ("owner", {})
+    coordinator.deeploy_get_auth_result = lambda inputs: {"escrow_owner": "owner"}
+    status = coordinator._deployment_status({"operation_id": child["operation_id"]})
+    self.assertIn("newA", status["unconfirmed_previous_nodes"])  # A selected target never received this replacement.
+    for revision in parent_refs:
+      self.assertEqual(vault._load_revision_runner_secret_bundle("31", revision, "newA")["revision"], revision)
+    with self.assertRaisesRegex(ValueError, "revoked"):
+      vault._load_revision_runner_secret_bundle("31", child["operation_id"] + ":deploy", "newA")
+    del coordinator.known["earlier-offline-worker"]
+    proposal, _ = coordinator._stateless_replacement_proposal(31, "owner")
+    preview = self.api.get_job_repair_preview(dict(self.read, replace_stateless=True))
+    self.assertIn("earlier-offline-worker", preview["observed_previous_nodes"])
+    request["repair"]["proposal"] = proposal
+    request["request_id"] = "replacement-after-expiry"
+    following = self.api.repair_update_pipeline(request)
+    self.assertEqual(following["status_code"], 202, following)
+    next_attempt = coordinator._operation_records()[following["operation_id"]]
+    self.assertIn("earlier-offline-worker", next_attempt["unconfirmed_previous_nodes"])
+
+  def test_operation_reads_isolate_unrelated_registry_failures(self):
+    coordinator, state = self.replay.c, self.replay.state
+    remote_id = hashlib.sha256(b"remote").hexdigest()[:16] + "-fixture"
+    remote = dict(self.replay.parent, job_id=99, coordinator="remote", operation_id=remote_id)
+    lifecycle.Engine("remote").sign(remote)
+    state.public[OPERATIONS_HKEY, remote_id] = remote
+    unavailable = Mock(side_effect=ConnectionError("fixture registry unavailable"))
+    coordinator.bc.get_eth_oracles = unavailable
+    self.assertEqual(set(coordinator._operation_records(job_id=31)), {self.replay.oid})
+    self.assertEqual(set(coordinator._operation_records(own_only=True)), {self.replay.oid})
+    unavailable.assert_not_called()
+    with self.assertRaisesRegex(RuntimeError, "authority is temporarily unavailable"):
+      coordinator._operation_records(job_id=99)
+
+  def test_stateless_replacement_checks_expiry_and_returns_definite_stale_review(self):
+    request = self.replacement_request()
+    stale = copy.deepcopy(request)
+    stale["repair"]["proposal"]["pipeline_cid"] = "earlier-cid"
+    refusal = self.api.repair_update_pipeline(stale)
+    self.assertEqual(refusal["status_code"], 409, refusal)
+    self.assertEqual(refusal["error"]["code"], "REPLACEMENT_REVIEW_STALE")
+    self.replay.epoch = self.replay.job["lastExecutionEpoch"]  # The last execution epoch is already unpaid.
+    preview = self.api.get_job_repair_preview(dict(self.read, replace_stateless=True))
+    self.assertEqual(preview["status"], "blocked")
+    self.assertIn("no paid execution epochs", preview["reason"])
+    self.assertIn("no paid execution epochs", self.api.repair_update_pipeline(request)["error"]["message"])
+    self.assertEqual(self.replay.c.commands, [])
+
+  def test_stateless_replacement_rechecks_target_license_after_acceptance(self):
+    request = self.replacement_request()
+    coordinator, vault = self.replay.c, self.replay.dauth
+    accepted = self.api.repair_update_pipeline(request)
+    self.assertEqual(accepted["status_code"], 202, accepted)
+    child = coordinator._operation_records()[accepted["operation_id"]]
+    self.assertEqual(child["replacement_licenses"]["newA"], [1, "license-owner"])
+    # A valid registration at the same node address can now belong to another license owner.
+    for plugin in (coordinator, vault):
+      read = plugin.bc.get_node_license_info
+      plugin.bc.get_node_license_info = lambda read=read, **kwargs: dict(read(**kwargs), owner="new-license-owner")
+    with self.assertRaisesRegex(ValueError, "no longer owns"):
+      vault._load_revision_runner_secret_bundle("31", child["operation_id"] + ":deploy", "newA")
+    coordinator._advance_deployment_operation(child)
+    self.assertEqual(deployment_operation_phase(child), "stopping_failed_rollout")
+    self.assertEqual(child["error"]["code"], "REPLACEMENT_PLACEMENT_CHANGED")
+    self.assertEqual(coordinator.commands, [])
+
+  def test_stateless_replacement_checks_license_again_before_publication(self):
+    request = self.replacement_request()
+    coordinator, vault = self.replay.c, self.replay.dauth
+    accepted = self.api.repair_update_pipeline(request)
+    self.assertEqual(accepted["status_code"], 202, accepted)
+    child = coordinator._operation_records()[accepted["operation_id"]]
+    coordinator._advance_deployment_operation(child)
+    report(self.replay.state, child, "deploy", "ready")
+    coordinator._advance_deployment_operation(child)
+    self.assertEqual(deployment_operation_phase(child), "finalizing")
+    read = vault.bc.get_node_license_info
+    vault.bc.get_node_license_info = lambda **kwargs: dict(read(**kwargs), owner="new-license-owner")
+    with self.assertRaises(RuntimeError):  # Only the custodian observes the transfer at this boundary.
+      coordinator._advance_deployment_operation(child)
+    self.assertEqual(coordinator._get_pipeline_from_cstore(31), self.replay.cid)
+    vault.bc.get_node_license_info = read
+    coordinator._advance_deployment_operation(child)
+    self.assertEqual(child["outcome"], "succeeded")
+
+  def test_stateless_replacement_cleans_up_only_durably_dispatched_targets(self):
+    request = self.replacement_request()
+    coordinator, state = self.replay.c, self.replay.state
+    accepted = self.api.repair_update_pipeline(request)
+    self.assertEqual(accepted["status_code"], 202, accepted)
+    child = coordinator._operation_records()[accepted["operation_id"]]
+    send = coordinator.cmdapi_start_pipeline
+
+    def interrupted_send(**command):
+      send(**command)
+      raise RuntimeError("The first command acknowledgement was lost")
+
+    coordinator.cmdapi_start_pipeline = interrupted_send
+    with self.assertRaisesRegex(RuntimeError, "acknowledgement was lost"):
+      coordinator._advance_deployment_operation(child)
+    child = coordinator._operation_records()[accepted["operation_id"]]
+    first = coordinator.commands[0][0]
+    self.assertEqual(child["dispatched_nodes"], [first])
+    state.now = child["deadline"] + 1
+    coordinator.cmdapi_start_pipeline = send
+    coordinator._advance_deployment_operation(child)
+    coordinator._advance_deployment_operation(child)
+    self.assertEqual([(node, cfg["DEEPLOY_OPERATION"]["action"]) for node, cfg in coordinator.commands],
+                     [(first, "start_stateless_replacement_v1"), (first, "stop")])
+
   def test_ordinary_endpoint_and_wrong_receiver_refuse_before_custody_or_inspection(self):
     request = self.reviewed_update()
     refused = self.api.update_pipeline(copy.deepcopy(request))
     self.assertEqual(refused["status_code"], 400, refused)
     self.assertEqual(refused["error"]["code"], "INVALID_DEPLOYMENT_REQUEST")
-    self.api.bc = SimpleNamespace(address="other")
-    self.api._operation_records = lambda: {}  # Without a verified parent this receiver cannot forward.
+    self.api.bc = SimpleNamespace(address="other", get_eth_oracles=lambda: ["0xoracle"],
+                                  node_address_to_eth_address=lambda address: "0x" + address)
+    self.api._operation_records = lambda **kwargs: {}  # Without a verified parent this receiver cannot forward.
     self.assertEqual(self.api.get_job_repair_preview(self.read)["status"], "blocked")
     wrong = self.api.repair_update_pipeline(copy.deepcopy(request))
-    self.assertEqual(wrong["status_code"], 409, wrong)
-    self.assertEqual(wrong["error"]["code"], "DEPLOYMENT_CONFLICT")
+    self.assertEqual(wrong["status_code"], 503, wrong)
+    self.assertEqual(wrong["error"]["code"], "ADMISSION_UNAVAILABLE")
     self.assertEqual(set(self.replay.c._operation_records()), {self.replay.oid})
     self.replay.http.assert_not_called()
     self.assertEqual(self.replay.c.commands, [])
@@ -351,19 +485,30 @@ class JobRepairHttpTests(unittest.TestCase):
     def read_registry():
       registry_reads.append(True)
       return ["0xOracle"]
-    self.api.bc = SimpleNamespace(address="receiver", get_eth_oracles=read_registry)
+    self.api.bc = SimpleNamespace(address="receiver", get_eth_oracles=read_registry,
+                                  node_address_to_eth_address=lambda address: "0x" + address,
+                                  verify=lambda payload, **kwargs: SimpleNamespace(valid=payload["trusted_fixture"]))
     frame = {
       fields.EE_IS_ENCRYPTED: True,
       fields.EE_PAYLOAD_PATH: ["peer", "admin", "DEEPLOY_MANAGER_API", "instance"],
       fields.EE_DESTINATION: "receiver",
       fields.EE_ENCRYPTED_DATA: "fixture",
+      fields.EE_SENDER: "oracle",
+      "trusted_fixture": True,
     }
-    self.api.dataapi_struct_datas = lambda **kwargs: [frame] * 64
-    self.api._handle_job_repair_peer = lambda payload, registered: inspected.append((payload, registered))
+    later = dict(frame, sequence="next tick")
+    rejected = dict(frame, trusted_fixture=False)
+    batches = iter([[rejected, *[frame] * 32, later], []])
+    self.api.dataapi_struct_datas = lambda **kwargs: next(batches)
+    self.api._handle_job_repair_peer = lambda payload, **kwargs: inspected.append(payload)
 
     self.api._process_job_repair_relay()
     self.assertEqual(registry_reads, [True])
-    self.assertEqual(inspected, [(frame, {"0xoracle"})] * 32)
+    self.assertEqual(inspected, [frame] * 32)
+    self.api._process_job_repair_relay()
+    self.assertEqual(registry_reads, [True, True])
+    self.assertEqual(inspected[-1], later)
+    self.assertEqual(self.api._repair_relay_backlog, [])
 
   def _use_wallet_verification(self, escrow_details):
     # Keep production v3 verification and nonce/escrow authorization with fixture chain responses.

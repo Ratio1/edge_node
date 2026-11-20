@@ -294,7 +294,7 @@ class DeploymentMutationTests(unittest.TestCase):
                   request_hash="h", kind="update", mutation="node_relink", job_id=7, app_id="app",
                   owner="owner", network="test", coordinator="oracle", target_revision=first["attempt"],
                   phase="completed", outcome="failed", updated_at=plugin.now, EE_SIGN="valid", EE_SENDER="oracle")
-    plugin._operation_records = lambda: {failed["operation_id"]: failed}
+    plugin._operation_records = lambda **scope: {failed["operation_id"]: failed}
     plugin.captured_scale = None
     plugin.now += 3599
     self.assertIsNone(plugin._admit_node_relink_operation(7, "A", "N"))

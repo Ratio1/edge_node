@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from extensions.business.deeploy import job_repair
@@ -23,7 +24,9 @@ class RepairTests(unittest.TestCase):
     self.c = RepairCoordinator(self.state)
     self.dauth = Custodian(self.state)
     self.http = connect(self, self.state, self.dauth)
-    self.job = dict(escrowOwner="owner", numberOfNodesRequested=2, activeNodes=["0xoldA", "0xoldB"])
+    self.job = dict(escrowOwner="owner", numberOfNodesRequested=2, activeNodes=["0xoldA", "0xoldB"],
+                    lastExecutionEpoch=20)
+    self.epoch = 10
     self.stored = dict(NAME="app", OWNER="owner", TYPE="void",
                        DEEPLOY_SPECS=dict(current_target_nodes=["oldA", "oldB"], job_id=31),
                        PLUGINS=[dict(SIGNATURE="WORKER_APP_RUNNER", INSTANCES=[dict(
@@ -55,6 +58,7 @@ class RepairTests(unittest.TestCase):
 
   def configure(self, plugin):
     plugin.engine.web3_get_job_details = lambda job_id: self.job
+    plugin.netmon.epoch_manager = SimpleNamespace(get_current_epoch=lambda: self.epoch)
     plugin.bc.encrypt_str = lambda fingerprint, node: "disposable-ciphertext-" + node
     plugin.engine.web3_is_node_licensed = lambda address, **kw: address.lower() in ("0xnewa", "0xnewb")
     plugin.bc.get_node_license_info = lambda node_address_eth, **kw: dict(

@@ -11,7 +11,7 @@ from naeural_core import constants as ct
 from .deeploy_job_mixin import _DeeployJobMixin
 from .deployment_operations import (
   STATELESS_REPLACEMENT,
-  _DeploymentOperationsMixin, DeploymentAuthenticationError, DeploymentConflictError,
+  _DeploymentOperationsMixin, DeploymentAuthenticationError, DeploymentConflictError, StaleReplacementReviewError,
 )
 
 from .deployment_mutations import _DeploymentMutationsMixin
@@ -1214,6 +1214,9 @@ class DeeployManagerApiPlugin(
         configs=prepared_pipeline_configs, prior_pipeline=prior_pipeline,
         is_create=is_create, **({"repair": repair, "mutation": SAME_HOST_REPAIR} if repair_update else {}),
       )
+    except StaleReplacementReviewError as exc:
+      result = {"status_code": 409, "status": "error",
+                "error": {"code": "REPLACEMENT_REVIEW_STALE", "message": str(exc), "retryable": False}}
     except DeploymentConflictError as exc:
       result = {"status_code": 409, "status": "error",
                 "error": {"code": "DEPLOYMENT_CONFLICT", "message": str(exc), "retryable": False}}
@@ -1489,7 +1492,7 @@ class DeeployManagerApiPlugin(
       owner = self.deeploy_get_auth_result(inputs)[DEEPLOY_KEYS.ESCROW_OWNER]
       if replacing:
         proposal, pipeline = self._stateless_replacement_proposal(job_id, owner)
-        observed = sorted(node for node, reports in self._job_reports(pipeline).items() if reports)
+        observed = self._stateless_replacement_observations(pipeline)
         return self._get_response(dict(status="reviewable", proposal=proposal, observed_previous_nodes=observed))
       if coordinator != self.bc.address:
         forwarded = self._forward_job_repair(request, owner, "preview")

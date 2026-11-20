@@ -2,6 +2,7 @@
 
 import json
 import time
+from itertools import chain
 from uuid import uuid4
 
 
@@ -9,6 +10,7 @@ _RELAY_KEY = "DEEPLOY_REPAIR_RELAY_V1"
 _RELAY_TIMEOUT = 45
 _RELAY_MAX_PENDING = 32
 _RELAY_MAX_PER_TICK = 32
+_RELAY_MAX_BACKLOG = 64
 _RELAY_REQUEST_BYTES = 256 * 1024
 
 
@@ -23,23 +25,30 @@ class _RepairRelayMixin:
     replacing = method == "update" and request["repair"].get("replace_stateless") is True
     if not isinstance(coordinator, str) or (method == "update" and not replacing and not isinstance(parent_id, str)):
       return None
+    if not self._is_repair_relay_oracle(coordinator):
+      return None  # Only a currently registered coordinator can receive the signed wallet envelope.
+    records = self._operation_records(job_id=request["job_id"])
     # A signed operation determines the destination. Retried updates can name a parent already superseded.
-    matches = [record for record in self._operation_records().values()
+    matches = [record for record in records.values()
                if record["coordinator"] == coordinator and str(record["job_id"]) == str(request["job_id"])
                and record["owner"].lower() == owner.lower() and record.get("mutation") == "node_relink"
                and (record["operation_id"] == parent_id if method == "update"
                     else record["phase"] == "retiring_previous")]
     if replacing and parent_id is None:
       # An exact retry may be looking up an already admitted replacement. Match only the verified owner and job.
-      admitted = [record for record in self._operation_records().values()
+      admitted = [record for record in records.values()
                   if record["coordinator"] == coordinator and record.get("request_id") == request.get("request_id")
                   and str(record["job_id"]) == str(request["job_id"]) and record["owner"].lower() == owner.lower()]
-      if not admitted and self._stateless_replacement_proposal(request["job_id"], owner)[0] != proposal:
-        return None  # A forwarded request without a parent must name the current reviewed admission owner.
+      if not admitted:
+        try:
+          current, _ = self._stateless_replacement_proposal(request["job_id"], owner)
+        except ValueError:
+          return self._repair_relay_unavailable(method)  # This ingress cannot decide whether the coordinator admitted it.
+        if current["coordinator"] != coordinator:
+          return self._repair_relay_unavailable(method)
+        # The verified current owner can distinguish a stale proposal from an exact accepted retry.
     elif len(matches) != 1:
-      return None
-    if not self._is_repair_relay_oracle(coordinator):  # A custody-only peer cannot receive the wallet envelope or its token.
-      return None
+      return self._repair_relay_unavailable(method)  # A missing replica is not a confirmed rejection.
     if len(json.dumps(request, ensure_ascii=False).encode()) > _RELAY_REQUEST_BYTES:
       raise ValueError("The signed repair is too large to forward.")
     # Never cache a wallet payload or credentials in the relay's pending state.
@@ -82,9 +91,12 @@ class _RepairRelayMixin:
 
   def _process_job_repair_relay(self):
     fields = self.const.PAYLOAD_DATA  # Use the actual Core wire keys, including EE_DEST.
+    backlog = getattr(self, "_repair_relay_backlog", ())
+    inputs = self.dataapi_struct_datas(as_list=True)
     registered = None
-    examined = 0
-    for payload in self.dataapi_struct_datas(as_list=True):
+    handled = 0
+    overflow = []
+    for payload in chain(backlog, inputs):
       if not isinstance(payload, dict) or payload.get(fields.EE_IS_ENCRYPTED) is not True:
         continue
       path = payload.get(fields.EE_PAYLOAD_PATH)
@@ -94,20 +106,28 @@ class _RepairRelayMixin:
       if (payload.get(fields.EE_DESTINATION) != self.bc.address or not isinstance(ciphertext, str)
           or len(ciphertext) > 2 * _RELAY_REQUEST_BYTES):
         continue
-      if examined >= _RELAY_MAX_PER_TICK:
-        break  # Leave the Deeploy process time for other admin work.
-      examined += 1
       if registered is None:
         try:
           registered = {address.lower() for address in self.bc.get_eth_oracles()}
         except Exception:
           self.P("Could not authenticate Deeploy repair relay peers.", color="y")
-          return  # An unavailable registry cannot authorize any relay message in this batch.
+          return  # Keep authenticated overflow and retry it when authority is available.
       try:
-        self._handle_job_repair_peer(payload, registered=registered)
+        if not self._is_repair_relay_oracle(payload.get(fields.EE_SENDER), registered):
+          continue
+        if not self.bc.verify(payload, return_full_info=True).valid:
+          continue
+        # Only authenticated traffic may use the dispatch budget or the bounded overflow buffer.
+        if handled >= _RELAY_MAX_PER_TICK:
+          if len(overflow) < _RELAY_MAX_BACKLOG:
+            overflow.append(payload)
+          continue
+        handled += 1
+        self._handle_job_repair_peer(payload, registered=registered, authenticated=True)
       except Exception:
         # Never log incoming payloads, decrypted data, or exception text that could echo them.
         self.P("Could not process a Deeploy repair relay message.", color="y")
+    self._repair_relay_backlog = overflow
 
   def _is_repair_relay_oracle(self, node, registered=None):
     # Resolve the address directly from its public key, independently of the local heartbeat roster.
@@ -120,9 +140,11 @@ class _RepairRelayMixin:
     except (AttributeError, TypeError, ValueError):
       return False
 
-  def _handle_job_repair_peer(self, payload, registered=None):
+  def _handle_job_repair_peer(self, payload, registered=None, authenticated=False):
     sender = payload.get(self.const.PAYLOAD_DATA.EE_SENDER)
-    if not self._is_repair_relay_oracle(sender, registered) or not self.bc.verify(payload, return_full_info=True).valid:
+    if not authenticated and (
+      not self._is_repair_relay_oracle(sender, registered) or not self.bc.verify(payload, return_full_info=True).valid
+    ):
       return
     message = self.receive_and_decrypt_payload(payload).get(_RELAY_KEY)
     if not isinstance(message, dict) or not isinstance(message.get("id"), str) or len(message["id"]) != 32:

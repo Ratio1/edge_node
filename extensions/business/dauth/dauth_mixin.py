@@ -25,6 +25,7 @@ from .dauth_registry import (
   dauth_registry_write_kwargs,
 )
 from ratio1.const.base import dAuth
+from extensions.business.deeploy.deployment_operations import replacement_license_binding
 
 
 DAUTH_JOB_SECRETS_CSTORE_HKEY = "DAUTH_JOB_SECRETS"
@@ -852,13 +853,15 @@ class _DauthMixin(object):
       raise ValueError("dAuth secret bundle revision identity mismatch.")
     repair = ":repair_v1:" in revision
     placements = "repair_pipelines" if repair else "pipelines"
+    replacing = "replacement_pipelines" in secret_bundle
+    if replacing:
+      placements = "replacement_pipelines"  # This grant is valid only while the exact worker owns its license.
     pipelines = secret_bundle.get(placements)
     if not isinstance(pipelines, dict):
       raise ValueError("dAuth secret revision has no authorized pipeline plan.")
     normalized_requester = self._normalize_node_address_for_compare(requester)
-    if normalized_requester not in [
-      self._normalize_node_address_for_compare(node) for node in pipelines
-    ]:
+    recipient = next((node for node in pipelines if self._normalize_node_address_for_compare(node) == normalized_requester), None)
+    if recipient is None:
       raise ValueError("Sender is not authorized for the requested job revision.")
     if repair:
       # A previously staged replica must not release a renewed credential after another license or job transfer.
@@ -869,7 +872,12 @@ class _DauthMixin(object):
           or self._current_repair_license(eth) != grant.get("licenses", {}).get(eth.lower())):
         raise ValueError("The recipient no longer owns the reviewed repair license.")
       self._check_repair_paid_job(job_id, grant["owner"], grant["slots"])
-    return {key: value for key, value in secret_bundle.items() if key not in (placements, "repair_grant", "repair_plan_cid")}
+    if replacing:
+      binding = (secret_bundle.get("replacement_licenses") or {}).get(recipient)
+      if not binding or replacement_license_binding(self.bc, recipient) != binding:
+        raise ValueError("The recipient no longer owns the reviewed replacement license.")
+    return {key: value for key, value in secret_bundle.items()
+            if key not in (placements, "repair_grant", "repair_plan_cid", "replacement_licenses")}
 
   def process_dauth_reveal_secret_request(self, body):
     requester, requester_eth = self._verify_signed_dauth_body(body, endpoint="reveal_job_secrets")

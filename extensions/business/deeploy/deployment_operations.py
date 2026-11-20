@@ -70,6 +70,103 @@ class DeploymentConflictError(ValueError):
   """A request conflicts with observed operation identity or revision."""
 
 
+class StaleReplacementReviewError(DeploymentConflictError):
+  """The coordinator refused a replacement whose signed proposal has changed."""
+
+
+class ReplacementPlacementError(ValueError):
+  """The replacement's paid job or license binding is no longer valid."""
+
+
+def replacement_paid_slots(plugin, job_id, owner):
+  """Read the paid capacity of a currently funded replacement job.
+
+  Parameters
+  ----------
+  plugin : object
+    Coordinator or custodian with chain and epoch access.
+  job_id : int or str
+    Paid job identifier.
+  owner : str
+    Expected escrow owner.
+
+  Returns
+  -------
+  int
+    Active paid slot count.
+
+  Examples
+  --------
+  >>> replacement_paid_slots(plugin, 31, owner)  # doctest: +SKIP
+  2
+  """
+  job = plugin.bc.get_job_details(job_id=int(job_id))
+  slots = job.get("numberOfNodesRequested") if isinstance(job, dict) else None
+  if type(slots) is not int or slots < 1 or str(job.get("escrowOwner", "")).lower() != owner.lower():
+    raise ReplacementPlacementError("The published job does not have an active paid placement under this CSP.")
+  # The last execution epoch is the first epoch outside the paid interval.
+  expires = job.get("lastExecutionEpoch")
+  if type(expires) is not int or expires <= plugin.netmon.epoch_manager.get_current_epoch():
+    raise ReplacementPlacementError("The job has no paid execution epochs remaining.")
+  return slots
+
+
+def replacement_license_binding(bc, node):
+  """Read the active registration for one replacement target.
+
+  Parameters
+  ----------
+  bc : object
+    Blockchain wrapper.
+  node : str
+    Exact internal worker address.
+
+  Returns
+  -------
+  list
+    License ID and normalized license owner.
+
+  Examples
+  --------
+  >>> replacement_license_binding(bc, worker)  # doctest: +SKIP
+  [42, '0xowner']
+  """
+  eth = bc.node_address_to_eth_address(node)
+  # Read invalid registrations as data. A transport failure remains retryable.
+  info = bc.get_node_license_info(node_address_eth=eth, raise_if_error=False)
+  if (not isinstance(info, dict) or info.get("isValid") is not True or type(info.get("licenseId")) is not int
+      or str(info.get("nodeAddress", "")).lower() != eth.lower()
+      or not isinstance(info.get("owner"), str) or not info["owner"]):
+    raise ReplacementPlacementError("Each replacement target needs an active node license.")
+  return [info["licenseId"], info["owner"].lower()]
+
+
+def check_replacement_placement(plugin, operation):
+  """Revalidate the paid job and exact licensed targets before an external effect.
+
+  Parameters
+  ----------
+  plugin : object
+    Coordinator or custodian with chain and epoch access.
+  operation : dict
+    Signed replacement snapshot.
+
+  Returns
+  -------
+  None
+    Raises if the placement is unavailable or no longer authorized.
+
+  Examples
+  --------
+  >>> check_replacement_placement(plugin, operation)  # doctest: +SKIP
+  """
+  bindings = operation.get("replacement_licenses", {})
+  if (set(bindings) != set(operation["nodes"])
+      or replacement_paid_slots(plugin, operation["job_id"], operation["owner"]) != len(bindings)
+      or any(replacement_license_binding(plugin.bc, node) != binding for node, binding in bindings.items())):
+    raise ReplacementPlacementError("The replacement's paid placement or node license changed. Review the job again.")
+
+
 class DeploymentCustodyError(RuntimeError):
   """dAuth could not do a custody call now; past preparation the operations worker waits before it tries again.
 
@@ -580,12 +677,34 @@ class _DeploymentOperationsMixin:
     except Exception:
       return False
 
-  def _operation_records(self):
-    """Select the newest verified snapshot per operation from local replicas."""
+  def _operation_records(self, *, job_id=None, operation_id=None, own_only=False):
+    """Select the newest verified snapshots matching the local read scope.
+
+    Parameters
+    ----------
+    job_id, operation_id : int or str, optional
+      Limit registry dependencies to the requested job or operation.
+    own_only : bool, optional
+      Reconcile only operations signed by this coordinator.
+
+    Returns
+    -------
+    dict
+      Operation ID to verified snapshot.
+
+    Examples
+    --------
+    >>> records = plugin._operation_records(job_id=31)  # doctest: +SKIP
+    """
     latest = {}
-    trusted = set(self._operation_peers())
+    trusted = {self.bc.address} if own_only else set(self._operation_peers())
     registered = None
     for record in (self.chainstore_hgetall(OPERATIONS_HKEY) or {}).values():
+      # Scope before any registry lookup. An unrelated remote signer must not stall local reconciliation.
+      if (not isinstance(record, dict) or (job_id is not None and str(record.get("job_id")) != str(job_id))
+          or (operation_id is not None and record.get("operation_id") != operation_id)
+          or (own_only and record.get("coordinator") != self.bc.address)):
+        continue
       if not self._verify_operation_record(record, "coordinator"):
         continue
       if record.get("network") != self.evm_network:
@@ -593,24 +712,28 @@ class _DeploymentOperationsMixin:
       coordinator = record["coordinator"]
       if coordinator not in trusted:
         # A persisted oracle record can remain valid after its signer drops out of the local NetMon view.
-        try:
-          if registered is None:
+        if registered is None:
+          try:
             registered = {address.lower() for address in self.bc.get_eth_oracles()}
+          except Exception as exc:
+            # Authority unavailable is distinct from a signer that is absent from the registry.
+            raise RuntimeError("Deployment operation authority is temporarily unavailable.") from exc
+        try:
           if self.bc.node_address_to_eth_address(coordinator).lower() not in registered:
             continue
         except (AttributeError, TypeError, ValueError):
           continue
         trusted.add(coordinator)
-      operation_id = record.get("operation_id")
+      record_id = record.get("operation_id")
       sequence = record.get("sequence")
-      if not isinstance(operation_id, str) or type(sequence) is not int:
+      if not isinstance(record_id, str) or type(sequence) is not int:
         continue
       writer_prefix = hashlib.sha256(record["coordinator"].encode()).hexdigest()[:16] + "-"
-      if not operation_id.startswith(writer_prefix):
+      if not record_id.startswith(writer_prefix):
         continue
-      previous = latest.get(operation_id)
+      previous = latest.get(record_id)
       if previous is None or sequence > previous["sequence"]:
-        latest[operation_id] = record
+        latest[record_id] = record
     return latest
 
   def _save_operation(self, operation, phase=None, message=None):
@@ -789,7 +912,7 @@ class _DeploymentOperationsMixin:
       raise ValueError("A stable request_id of 1 to 128 characters is required.")
     digest = request_digest(request)
     job_id = str(request.get("job_id"))
-    records = [record for record in self._operation_records().values()
+    records = [record for record in self._operation_records(job_id=job_id).values()
                if record.get("owner", "").lower() == owner.lower()
                and str(record.get("job_id")) == job_id]
     for record in records:
@@ -947,7 +1070,7 @@ class _DeploymentOperationsMixin:
     """
     pointer = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(job_id))
     generation = pointer.get("revision", 0) if isinstance(pointer, dict) else 0
-    observed = [record["target_revision"] for record in self._operation_records().values()
+    observed = [record["target_revision"] for record in self._operation_records(job_id=job_id).values()
                 if str(record["job_id"]) == str(job_id)]
     return max([previous_revision, generation] + observed) + 1
 
@@ -1105,7 +1228,8 @@ class _DeploymentOperationsMixin:
     if replacement:
       proposal = replacement["proposal"]
       operation.update(phase="stateless_v1_preparing", previous_pipeline_cid=proposal["pipeline_cid"],
-                       unconfirmed_previous_nodes=replacement["unconfirmed_previous_nodes"])
+                       unconfirmed_previous_nodes=replacement["unconfirmed_previous_nodes"],
+                       replacement_licenses=replacement["licenses"], dispatched_nodes=[])
       if proposal["parent"]:
         operation["repair_parent"] = proposal["parent"]  # Reserve the active retirement before any side effect.
     finished = threading.Event()
@@ -1122,7 +1246,7 @@ class _DeploymentOperationsMixin:
           if existing:
             return self._accepted_operation_response(existing)
           if self._get_pipeline_from_cstore(job_id) != operation["previous_pipeline_cid"]:
-            raise DeploymentConflictError("The published job changed during replacement review.")
+            raise StaleReplacementReviewError("The published job changed during replacement review.")
           self._save_operation(operation, message="Preparing stateless replacement.")
       else:
         self._save_operation(operation, message="Preparing durable deployment data.")
@@ -1281,6 +1405,7 @@ class _DeploymentOperationsMixin:
     3
     """
     check_placement = action == "start" and operation.get("mutation") == "same_host_repair_v1"
+    check_replacement = action == "start" and operation.get("mutation") == STATELESS_REPLACEMENT
     repair_restore = check_placement and attempt == "restore"
     for node, config in configs.items():
       report = reports.get(node, {})
@@ -1300,12 +1425,14 @@ class _DeploymentOperationsMixin:
         # One fresh read covers this batch, including starts retried after a coordinator restart.
         self._recheck_repair_placement(operation)
         check_placement = False
+      if check_replacement:
+        # Check once for this batch of actual sends, including retries after a restart.
+        check_replacement_placement(self, operation)
+        check_replacement = False
       if action == "start":
         validate_saved_overlays(config)  # Resumed plans may predate the reserved restoration field.
       # Record the send time in memory only: the save below then finds nothing changed and writes no new
       # snapshot for a mere retry.
-      sent_at[key] = self.time()
-      self._save_operation(operation)
       payload = copy.deepcopy(config) if action == "start" else {
         "NAME": operation["app_id"], "TYPE": config["TYPE"],
       }
@@ -1335,6 +1462,13 @@ class _DeploymentOperationsMixin:
       payload["DEEPLOY_OPERATION"] = self._operation_metadata(operation, attempt, action)
       if self._deployment_operations_stop.is_set():
         return
+      if action == "start" and operation.get("mutation") == STATELESS_REPLACEMENT:
+        if self.time() >= operation["deadline"]:
+          return  # Chain checks can take the rollout past its deadline before any dispatch intent is recorded.
+        # Once persisted, cleanup must assume this worker may have received the command.
+        operation["dispatched_nodes"] = sorted(set(operation["dispatched_nodes"]) | {node})
+      self._save_operation(operation)
+      sent_at[key] = self.time()
       self.cmdapi_start_pipeline(config=payload, node_address=node)
 
   def _advance_serialized_operation(self, operation):
@@ -1344,7 +1478,7 @@ class _DeploymentOperationsMixin:
     if operation.get("mutation") == "node_relink" and hasattr(self, "_reconcile_repair_parent"):
       from .job_repair import HANDOFF_LOCK
       with HANDOFF_LOCK:
-        current = self._operation_records().get(operation["operation_id"])
+        current = self._operation_records(operation_id=operation["operation_id"], own_only=True).get(operation["operation_id"])
         if not current or current["sequence"] != operation["sequence"] or self._reconcile_repair_parent(current):
           return  # An HTTP reservation may have completed after this worker took its snapshot.
         return self._advance_deployment_operation(operation)
@@ -1427,6 +1561,8 @@ class _DeploymentOperationsMixin:
           # Once the revision is published, its remaining secret/metadata writes must still finish.
           pointer = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(operation["job_id"]))
           if not isinstance(pointer, dict) or pointer.get("operation_id") != operation["operation_id"]:
+            if replacing and operation.get("replacement_publication_started"):
+              raise DeploymentCustodyError("Waiting to verify replacement publication or worker readiness.")
             phase = "restoring_previous" if restoring else "waiting_for_readiness"
             self._save_operation(operation, phase, "Rechecking node evidence before revision publication.")
           break
@@ -1442,21 +1578,24 @@ class _DeploymentOperationsMixin:
         if any(state in ("legacy_failed", "legacy_timeout") for state in states.values()):
           # Stop snapshots replace failure snapshots; keep upgrade guidance on the operation.
           message += " Update the node to support the requested source mode."
-        operation["error"] = dict(code="INSTANCE_FAILED" if failed else "READINESS_DEADLINE_EXCEEDED",
-                                  message=message, retryable=False)
-        operation["recovery"] = "in_progress"
-        operation["recovery_started_at"] = self.time()
-        self._save_operation(operation, "stopping_failed_rollout", "Stopping the failed rollout on all targets.")
+        self._fail_deployment_rollout(operation, "INSTANCE_FAILED" if failed else "READINESS_DEADLINE_EXCEEDED", message)
       elif "pending" not in states.values():
         operation["waiting_for_source"] = "kept" in states.values()  # Persist the barrier decision across restarts.
         self._save_operation(operation, "finalizing", "Revision applied; waiting for source." if operation["waiting_for_source"]
                              else "All required instances are ready.")
       else:
         pending = {node: configs[node] for node, state in states.items() if state == "pending"}
-        self._send_operation_commands(operation, pending, "deploy", "start", reports)
+        try:
+          self._send_operation_commands(operation, pending, "deploy", "start", reports)
+        except ReplacementPlacementError as exc:
+          # A confirmed license or payment change never starts additional targets.
+          self._fail_deployment_rollout(operation, "REPLACEMENT_PLACEMENT_CHANGED", str(exc))
       return
     if phase == "stopping_failed_rollout":
       # Requiring all stop acknowledgments provides the stateful restoration barrier.
+      if replacing:
+        # Dispatch intent survives a crash. Targets that never got an intent must not receive a STOP.
+        configs = {node: configs[node] for node in operation["dispatched_nodes"]}
       if all(reports.get(node, {}).get("status") == "stopped" for node in configs):
         if operation["kind"] == "update" and operation["previous_nodes"]:
           operation["restore_deadline"] = self.time() + self.cfg_deployment_readiness_timeout
@@ -1492,6 +1631,26 @@ class _DeploymentOperationsMixin:
       active_configs = plan["previous_configs"] if restored else configs
       if repair:
         self._recheck_repair_placement(operation, finalizing=True)  # A placement can change after readiness.
+      if replacing:
+        pointer = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(operation["job_id"]))
+        if not isinstance(pointer, dict) or pointer.get("operation_id") != operation["operation_id"]:
+          try:
+            check_replacement_placement(self, operation)
+          except ReplacementPlacementError as exc:
+            if not operation.get("replacement_publication_started"):
+              self._fail_deployment_rollout(operation, "REPLACEMENT_PLACEMENT_CHANGED", str(exc))
+              return
+            # Once custody might have published, a missing replica is insufficient evidence for rollback.
+            operation.update(error=dict(code="REPLACEMENT_PLACEMENT_CHANGED", message=str(exc), retryable=True),
+                             recovery="blocked")
+            self._save_operation(operation)
+            raise DeploymentCustodyError("Replacement publication is waiting for verified placement.") from exc
+        if (operation.get("error") or {}).get("code") == "REPLACEMENT_PLACEMENT_CHANGED":
+          operation.update(error=None, recovery=None)  # A revalidated placement may resume publication.
+          self._save_operation(operation)
+        if not operation.get("replacement_publication_started"):
+          operation["replacement_publication_started"] = True  # Persist before a possibly partial custody write.
+          self._save_operation(operation)
       self._commit_operation_revision(operation, active_configs)
       self._release_unused_secret_revisions(operation, plan, active_attempt="restore" if restored else "deploy")
       applied_outcome = "waiting_for_source" if operation.get("waiting_for_source") else "succeeded"
@@ -1499,6 +1658,29 @@ class _DeploymentOperationsMixin:
                        recovery="completed" if restored else None)
       self._save_operation(operation, "completed",
                            "Previous revision restored." if restored else "Deployment completed.")
+
+  def _fail_deployment_rollout(self, operation, code, message):
+    """Schedule cleanup of a deployment that cannot finish.
+
+    Parameters
+    ----------
+    operation : dict
+      Coordinator-owned rollout snapshot.
+    code, message : str
+      Sanitized public failure.
+
+    Returns
+    -------
+    None
+      Saves the failure and the next phase.
+
+    Examples
+    --------
+    >>> plugin._fail_deployment_rollout(operation, "INSTANCE_FAILED", "A required instance failed.")  # doctest: +SKIP
+    """
+    operation.update(error=dict(code=code, message=message, retryable=False), recovery="in_progress",
+                     recovery_started_at=self.time())
+    self._save_operation(operation, "stopping_failed_rollout", "Cleaning up the failed rollout.")
 
   def _expire_deployment_preparation(self, operation):
     """Record deadline failure before waiting for plan or secret cleanup."""
@@ -1621,8 +1803,7 @@ class _DeploymentOperationsMixin:
     for operation_id, finished in self._deployment_preparations.copy().items():
       if finished.is_set():
         self._deployment_preparations.pop(operation_id)
-    own = [copy.deepcopy(operation) for operation in self._operation_records().values()
-           if operation["coordinator"] == self.bc.address]
+    own = [copy.deepcopy(operation) for operation in self._operation_records(own_only=True).values()]
     # Keep a custody wait only for an operation still read here, so one whose records are gone leaves no
     # entry behind and the map never holds more than this oracle's own operations.
     self._custody_retry = {operation["operation_id"]: self._custody_retry[operation["operation_id"]]
@@ -1790,7 +1971,7 @@ class _DeploymentOperationsMixin:
     if not selector and request.get("job_id") is None:
       raise ValueError("operation_id, request_id, or job_id is required.")
     matches = []
-    records = self._operation_records()
+    records = self._operation_records(job_id=request.get("job_id"), operation_id=request.get("operation_id"))
     for record in records.values():
       if record.get("owner", "").lower() != owner.lower():
         continue
@@ -1830,7 +2011,11 @@ class _DeploymentOperationsMixin:
     reports = self._node_operation_reports(operation, attempt)
     if attempt == "retire" and operation.get("mutation") == "same_host_repair_v1":
       # An already stopped worker owes no second STOP. Display the original signed receipt at its actual signer.
-      parent = records.get(operation["repair_parent"]["operation_id"], {})
+      parent_id = operation["repair_parent"]["operation_id"]
+      parent = records.get(parent_id)
+      if parent is None and request.get("operation_id"):
+        parent = self._operation_records(job_id=operation["job_id"], operation_id=parent_id).get(parent_id)
+      parent = parent or {}
       if (parent.get("repair_child") or {}).get("operation_id") == operation["operation_id"]:
         for node, receipt in self._node_operation_reports(parent, "retire").items():
           if report_confirms_retirement(receipt, operation["previous_instances"].get(node)):
@@ -1887,9 +2072,11 @@ class _DeploymentOperationsMixin:
         # Expose the current hold without overwriting the original rollout failure in the operation.
         result.update(recovery="blocked", error=copy.deepcopy(operation["repair_block"]))
     if operation.get("mutation") == STATELESS_REPLACEMENT:
+      # Reusing an address resolves it only when the new workload has passed readiness and publication.
+      taken_over = set(operation["nodes"]) if operation.get("outcome") == "succeeded" else set()
       result["unconfirmed_previous_nodes"] = [
-        node for node in operation["unconfirmed_previous_nodes"] if node not in operation["nodes"]
-      ]  # These addresses may still run a prior copy and are outside the replacement placement.
+        node for node in operation["unconfirmed_previous_nodes"] if node not in taken_over
+      ]
     if operation.get("repair_child"):
       result["repair_child_operation_id"] = operation["repair_child"]["operation_id"]
     limit = request.get("events_limit", 64)

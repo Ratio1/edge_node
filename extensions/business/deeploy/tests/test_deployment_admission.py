@@ -165,8 +165,8 @@ class DeploymentAdmissionTests(unittest.TestCase):
         # Admission finishes AFTER the worker captures `preparing`. It must
         # still skip that stale snapshot, then reload deadline failure next pass.
         read_records = plugin._operation_records
-        def finish_while_reading():
-          snapshots = read_records()
+        def finish_while_reading(**scope):
+          snapshots = read_records(**scope)
           release.set()
           admission.result(timeout=5)
           return snapshots
