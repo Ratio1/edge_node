@@ -24,9 +24,17 @@ class MisconfigProbes(ProbeBase):
     self.run_safe("login_rate_limiting", self._test_login_rate_limiting)
     self.run_safe("password_reset_token", self._test_password_reset_token)
     self.run_safe("password_reset_token_reuse", self._test_password_reset_token_reuse)
-    self.run_safe("account_enumeration_timing", self._test_account_enumeration_timing)
     self.run_safe("jwt_weak_alg", self._test_jwt_weak_alg)
     self.run_safe("session_fixation", self._test_session_fixation)
+    return self.findings
+
+  def run_lockout_checks(self):
+    """PT-A02-17 and PT-A07-04: wrong-password logins for the configured username.
+
+    The worker runs these after every probe and after the weak_auth phase, so a
+    lockout they trigger cannot make a later session refresh fail (RM-219).
+    """
+    self.run_safe("account_enumeration_timing", self._test_account_enumeration_timing)
     self.run_safe("account_enumeration", self._test_account_enumeration)
     return self.findings
 
@@ -936,12 +944,15 @@ class MisconfigProbes(ProbeBase):
     # Use the official credentials we already authenticated with — the
     # AuthManager doesn't expose them directly, but we can read from the
     # env shape passed at probe-init time.
+    # Only the configured issuer account: falling back to the regular username
+    # would send it a wrong password and could lock the account later probes
+    # need (RM-219).
     issue_creds = {
-      "username": jwt_cfg.username or self.regular_username or "admin",
+      "username": jwt_cfg.username or "",
       "password": jwt_cfg.password or "",
     }
-    if not issue_creds["password"]:
-      # Without a password we can't issue a baseline token.
+    if not issue_creds["username"] or not issue_creds["password"]:
+      # Without issuer credentials we can't issue a baseline token.
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A02-12",
         title="JWT weak-alg probe — issuer credentials not configured",
@@ -949,7 +960,7 @@ class MisconfigProbes(ProbeBase):
         severity="INFO",
         owasp="A02:2021",
         evidence=[f"token_path={jwt_cfg.token_path}",
-                  "reason=jwt_endpoints.password not set in target_config"],
+                  "reason=jwt_endpoints.username or password not set in target_config"],
       ))
       return
 

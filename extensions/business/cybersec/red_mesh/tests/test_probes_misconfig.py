@@ -447,6 +447,19 @@ class TestJwtWeakAlgPTA0212(unittest.TestCase):
     self.assertEqual(len(f), 1)
     self.assertEqual(f[0].status, "inconclusive")
 
+  def test_pt_a02_12_never_falls_back_to_the_regular_username(self):
+    """RM-219: the issuer password sent under the regular username would be a
+    wrong-password login for an account the scan needs."""
+    jwt_cfg = JwtEndpoint(token_path="/api/token/", protected_path="/api/me/",
+                          username="", password="issuer-pass")
+    probe = _make_probe(jwt_endpoints=jwt_cfg)
+    probe.regular_username = "alice"
+    probe.auth.make_anonymous_session = MagicMock()
+    probe._test_jwt_weak_alg()
+    probe.auth.make_anonymous_session.assert_not_called()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A02-12"]
+    self.assertEqual(f[0].status, "inconclusive")
+
 
 class TestPasswordResetTokenReusePTA0218(unittest.TestCase):
   """PT-A02-18 — token-not-invalidated detection via two-issue identity check."""

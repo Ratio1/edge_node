@@ -823,7 +823,9 @@ class TestProbeDispatch(unittest.TestCase):
     self.assertEqual(metrics["probe_breakdown"]["_crash"], "failed")
     self.assertEqual(metrics["probe_breakdown"]["_ok"], "completed")
     self.assertEqual(metrics["probes_failed"], 1)
-    self.assertEqual(metrics["probes_completed"], 1)
+    # _ok plus the lockout checks that run after every probe (RM-219).
+    self.assertEqual(metrics["probe_breakdown"]["_graybox_lockout_checks"], "completed")
+    self.assertEqual(metrics["probes_completed"], 2)
 
   def test_probe_error_records_finding(self):
     """Crashed probe emits inconclusive finding."""
@@ -1344,6 +1346,64 @@ class TestRegularOnlyWorker(unittest.TestCase):
     self.assertEqual(ctx.exception.reason_class, "auth_failed")
     auth_info = worker.state["service_info"]["8000"]["_graybox_auth"]
     self.assertIn("Regular login rejected", auth_info["failure_reason"])
+
+
+class TestLockoutOrdering(unittest.TestCase):
+  """RM-219: no wrong-password login for a configured principal before the
+  last step that needs that principal's session."""
+
+  def test_enumeration_checks_run_after_probes_and_weak_auth(self):
+    worker = _make_worker(weak_candidates=["guest:guest"])
+    worker.safety.validate_target.return_value = None
+    worker.auth.preflight_check.return_value = None
+    worker.auth.authenticate.return_value = True
+    worker.auth.ensure_sessions.return_value = True
+    worker.auth._auth_errors = []
+    worker.auth._auth_diagnostics = []
+    worker.discovery.discover_result.return_value = DiscoveryResult()
+    order = []
+    worker._run_probe_phase = lambda result: order.append("probes")
+    worker._run_weak_auth_phase = lambda result: order.append("weak_auth")
+    with patch(
+      "extensions.business.cybersec.red_mesh.graybox.worker.MisconfigProbes",
+    ) as mock_cls:
+      mock_cls.return_value.run_lockout_checks.side_effect = (
+        lambda: order.append("lockout_checks") or []
+      )
+      worker.execute_job()
+
+    self.assertEqual(order, ["probes", "weak_auth", "lockout_checks"])
+
+  def test_registered_misconfig_run_sends_no_enumeration_login(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes.misconfig import MisconfigProbes
+    probe = MisconfigProbes.__new__(MisconfigProbes)
+    probe.findings = []
+    called = []
+    for name in dir(MisconfigProbes):
+      if name.startswith("_test_"):
+        setattr(probe, name, (lambda n: lambda: called.append(n))(name))
+    probe.run()
+    self.assertNotIn("_test_account_enumeration_timing", called)
+    self.assertNotIn("_test_account_enumeration", called)
+    probe.run_lockout_checks()
+    self.assertEqual(
+      called[-2:],
+      ["_test_account_enumeration_timing", "_test_account_enumeration"],
+    )
+
+  def test_weak_auth_skips_configured_principals(self):
+    worker = _make_worker(
+      weak_candidates=["admin:admin", "alice:alice", "guest:guest"],
+    )
+    worker.auth.ensure_sessions.return_value = True
+    with patch(
+      "extensions.business.cybersec.red_mesh.graybox.worker.BusinessLogicProbes",
+    ) as mock_cls:
+      mock_cls.return_value.run_weak_auth.return_value = []
+      worker._run_weak_auth_phase(DiscoveryResult())
+
+    candidates = mock_cls.return_value.run_weak_auth.call_args.args[0]
+    self.assertEqual(candidates, ["guest:guest"])
 
 
 if __name__ == '__main__':
