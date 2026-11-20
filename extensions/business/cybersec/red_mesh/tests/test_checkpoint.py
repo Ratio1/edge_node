@@ -3,6 +3,7 @@ import pickle
 import shutil
 import struct
 import tempfile
+import threading
 import time
 import tracemalloc
 import unittest
@@ -72,6 +73,12 @@ class _Calls:
 
   def __reduce__(self):
     return (self.fn, ([(1, 2)],))
+
+
+# {"version": 1, "x": []} with the list stored at memo index 10**6 by LONG_BINPUT: the C unpickler grows its memo
+# table to the index (about 12 bytes per slot). A protocol-4/5 pickler only ever emits MEMOIZE.
+_MEMO_PUT_FILE = (b"\x80\x04}(\x8c\x07version" + b"K" + bytes([ckpt.CHECKPOINT_VERSION])
+                  + b"\x8c\x01x]r" + struct.pack("<I", 10 ** 6) + b"u.")
 
 
 def _payload(**kw):
@@ -180,14 +187,37 @@ class TestCheckpointStore(unittest.TestCase):
     return path
 
   def test_memo_put_opcode_is_refused(self):
-    # {"version": 1, "x": []} with the list stored at memo index 10**6 by LONG_BINPUT: the C unpickler grows its
-    # memo table to the index (about 12 bytes per slot). A protocol-4/5 pickler only ever emits MEMOIZE.
-    data = (b"\x80\x04}(\x8c\x07version" + b"K" + bytes([ckpt.CHECKPOINT_VERSION])
-            + b"\x8c\x01x]r" + struct.pack("<I", 10 ** 6) + b"u.")
-    self.assertIsInstance(pickle.loads(data), dict)
-    path = self._write_raw("1_put.pkl", data)
+    self.assertIsInstance(pickle.loads(_MEMO_PUT_FILE), dict)
+    path = self._write_raw("1_put.pkl", _MEMO_PUT_FILE)
     self.assertEqual(ckpt.load_all(self.owner, "job1", 1), {})
     self.assertFalse(os.path.exists(path))
+
+  def test_final_marker_goes_through_the_same_prescan(self):
+    path = self._write_raw("final_1.pkl", _MEMO_PUT_FILE)
+    with patch.object(ckpt, "_RestrictedUnpickler") as unpickler:
+      self.assertIsNone(ckpt.load_final_marker(self.owner, "job1", 1))
+    unpickler.assert_not_called()
+    self.assertFalse(os.path.exists(path))
+
+  def test_fifo_final_marker_does_not_block(self):
+    os.makedirs(os.path.join(self.base, "job1"))
+    os.mkfifo(os.path.join(self.base, "job1", "final_1.pkl"))
+    result = []
+    reader = threading.Thread(target=lambda: result.append(ckpt._read_file(
+      os.path.join(self.base, "job1", "final_1.pkl"))), daemon=True)
+    reader.start()
+    reader.join(5)
+    self.assertFalse(reader.is_alive(), "opening a FIFO blocked the loader")
+    self.assertEqual(result, [None])
+
+  def test_shared_string_counts_once_per_reference(self):
+    text = "x" * 1000  # a resumed worker copies a shared string once per reference (redaction, JSON)
+    ckpt.save(self.owner, "job1", 1, "few", _payload(state={"x": [text] * 10}))
+    ckpt.save(self.owner, "job1", 1, "many", _payload(state={"x": [text] * 100}))
+    self.assertLess(os.path.getsize(os.path.join(self.base, "job1", "1_many.pkl")), 2000)
+    with patch.object(ckpt, "MAX_TEXT_BYTES", 50_000):
+      self.assertEqual(list(ckpt.load_all(self.owner, "job1", 1)), ["few"])
+    self.assertFalse(os.path.exists(os.path.join(self.base, "job1", "1_many.pkl")))
 
   def test_opcode_count_over_cap_is_refused_before_load(self):
     ckpt.save(self.owner, "job1", 1, "spray", _payload(state={"x": [set() for _ in range(100)]}))

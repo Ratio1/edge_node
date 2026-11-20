@@ -10,6 +10,7 @@ import os
 import pickle
 import pickletools
 import re
+import stat
 import time
 from math import isfinite
 
@@ -19,7 +20,7 @@ from .state_machine import is_terminal_job_status
 
 CHECKPOINT_VERSION = 1
 CHECKPOINT_SUBFOLDER = "plugin_data/redmesh_ckpt"
-MAX_FILE_BYTES = 32 * 1024 * 1024  # a larger file is treated as corrupt
+MAX_FILE_BYTES = 32 * 1024 * 1024  # a larger file is treated as corrupt; also the byte budget of one pass
 
 # Exact payload schema (version 1). `metrics` is `vars(metrics)`. No `reference_dump` (the owner
 # never sets `dynamic_reference_cache`) and never the worker object (owner, thread, Event, SQLite).
@@ -66,10 +67,13 @@ TMP_MIN_AGE = 300  # seconds; a younger temp file may belong to a save in progre
 # file become GBs of memory.
 _ALLOWED_GLOBALS = frozenset(("datetime", n) for n in ("datetime", "date", "time", "timedelta", "timezone"))
 MAX_NODES = 1_000_000  # container and leaf nodes of one payload, shared references counted each time
+# str/bytes length of one payload, counted once per reference: a resumed worker copies a shared string per
+# reference (credential redaction, JSON), so one 32 KB string referenced 1M times would become 32 GB.
+MAX_TEXT_BYTES = 2 * MAX_FILE_BYTES
 # Opcodes of one pass (all its files) or of one final marker, counted before anything is unpickled. A native
 # opcode allocates at most about 250 bytes (EMPTY_SET). Measured peak at the caps: +725 MB for an EMPTY_SET
 # spray, +224 MB for one 32 MiB str literal. A payload inside MAX_NODES needs at most about 2 opcodes per node;
-# a full-range scan state is about 0.6 per node.
+# a full-range scan state is about 0.6 to 1.1 per node.
 MAX_OPCODES = 3 * MAX_NODES
 # A protocol 4/5 pickler memoises with MEMOIZE only. An explicit PUT index sizes the unpickler's memo table
 # (about 12 bytes per slot), so a 9-byte file could ask for GBs.
@@ -102,14 +106,18 @@ def get_worker_checkpoint_config(owner):
 
 
 def _within_node_bound(obj):
-  """Walk `obj` without de-duplicating shared references; False past `MAX_NODES`."""
-  stack, count = [obj], 0
+  """Walk `obj` without de-duplicating shared references; False past `MAX_NODES` or `MAX_TEXT_BYTES`."""
+  stack, count, text = [obj], 0, 0
   while stack:
     item = stack.pop()
     count += 1
     if count + len(stack) > MAX_NODES:  # every stacked entry is a node still to count; a cycle must not grow it
       return False
-    if isinstance(item, dict):
+    if isinstance(item, (str, bytes)):
+      text += len(item)
+      if text > MAX_TEXT_BYTES:
+        return False
+    elif isinstance(item, dict):
       stack.extend(item.keys())
       stack.extend(item.values())
     elif isinstance(item, (list, tuple, set, frozenset)):
@@ -193,10 +201,13 @@ def _read_file(path, budget=None):
   oversized, over the opcode or node bound, or over `budget`. Never follows a symlink.
 
   `budget` is the remaining `{"bytes", "opcodes"}` of a pass, shared by its files; this file's share is taken
-  before it is unpickled. Without one the file gets the full `MAX_FILE_BYTES` / `MAX_OPCODES`."""
+  before it is unpickled. Without one the file gets the full `MAX_FILE_BYTES` / `MAX_OPCODES`. A pass that
+  runs out refuses its later files, so it launches fresh instead of resuming."""
   try:
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # a FIFO must not block the open
     with os.fdopen(fd, "rb") as fh:
+      if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+        return None
       data = fh.read(MAX_FILE_BYTES + 1)
     if len(data) > MAX_FILE_BYTES:
       return None
