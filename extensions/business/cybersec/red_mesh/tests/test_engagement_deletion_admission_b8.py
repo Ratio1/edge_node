@@ -55,17 +55,17 @@ def _no_deletion(fixture):
 ))
 def test_denials_never_redact_or_delete_a_document(fault, status):
   with read_endpoint_fixture(bound=True, role="super_tenant_admin") as fixture:
-    account = fixture.store.data[("auth", "reader")]
+    account = fixture.store.data[("deployment:auth", "reader")]
     actor, tenant_id = fixture.actor, fixture.tenant_id
     if fault == "actor": actor = None
-    elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
+    elif fault == "deleted": fixture.store.data.pop(("deployment:auth", "reader"))
     elif fault == "inactive": fixture.store.account("reader", active=False)
     elif fault == "none_scope": account["memberships"] = []
     # The owning tenant's own administrator does not hold `engagement:delete` (RM-084 P3).
     elif fault == "tenant_admin": as_role(fixture, "tenant_admin")
     elif fault == "missing_tenant": tenant_id = None
     elif fault == "unknown_tenant": tenant_id = OTHER_TENANT
-    elif fault == "identity_store": fixture.store.fail_hkey = "auth"
+    elif fault == "identity_store": fixture.store.fail_hkey = "deployment:auth"
 
     with _no_deletion(fixture):
       result = fixture.Plugin.delete_job_engagement(fixture.owner, **BODY, request_actor=actor,

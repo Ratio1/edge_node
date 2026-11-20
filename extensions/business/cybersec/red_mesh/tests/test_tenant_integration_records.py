@@ -6,7 +6,6 @@ longer be read or written.
 """
 import json
 import unittest
-from unittest.mock import patch
 from uuid import uuid4
 
 from .test_tenant_administration import FakeAdministrationStore
@@ -76,9 +75,6 @@ class TestConfigTableMatchesDeployment(unittest.TestCase):
 
 class RetirementCase(unittest.TestCase):
   def setUp(self):
-    env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    env.start()
-    self.addCleanup(env.stop)
     self.owner = FakeAdministrationStore()
     self.store = CstoreTenantAdministrationStore(self.owner, "deployment")
     self.service = TenantAdministrationService(CstoreAuthAccountReader(self.owner), self.store)
@@ -143,7 +139,7 @@ class TestPluginStartCleanup(RetirementCase):
   def setUp(self):
     super().setUp()
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenancy_namespace = "deployment"
+    self.plugin._stream_id = "deployment"
     self.logs = []
     self.plugin.P = lambda *args, **kwargs: self.logs.append(" ".join(str(arg) for arg in args))
     self.enumerations = 0
@@ -189,7 +185,7 @@ class TestPluginStartCleanup(RetirementCase):
     self.assertEqual(self.enumerations, enumerations)
 
   def test_a_node_without_a_tenancy_namespace_has_nothing_to_clean(self):
-    self.plugin.cfg_tenancy_namespace = None
+    self.plugin._stream_id = None
     self.run_cleanup()
     self.assertEqual(self.enumerations, 0)
     self.assertEqual(len(self.live_rows()), 3)

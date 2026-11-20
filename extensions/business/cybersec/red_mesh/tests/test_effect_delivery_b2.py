@@ -93,7 +93,7 @@ def test_a_typed_configuration_failure_keeps_its_code_after_a_persist(name, serv
 @pytest.mark.parametrize("name,service,config", DELIVERIES)
 def test_delivery_endpoints_deny_an_unauthorized_caller_without_effects(name, service, config):
   with read_endpoint_fixture(bound=True) as fixture:
-    fixture.store.data[("auth", "reader")]["memberships"] = [
+    fixture.store.data[("deployment:auth", "reader")]["memberships"] = [
       {"role": "tenant_user", "tenant_id": fixture.tenant_id}]
     with patch.object(service, "record_integration_status",
                       side_effect=AssertionError(SECRET)) as recorder, \
@@ -174,17 +174,17 @@ def test_misp_denials_reach_neither_the_server_nor_the_job_record(misp_ready, fa
   """B1's denial matrix, extended to the endpoint the security review found untested."""
   service = misp_ready
   with read_endpoint_fixture(bound=True) as fixture:
-    account = fixture.store.data[("auth", "reader")]
+    account = fixture.store.data[("deployment:auth", "reader")]
     actor, tenant_id = fixture.actor, fixture.tenant_id
     if fault == "actor": actor = None
-    elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
+    elif fault == "deleted": fixture.store.data.pop(("deployment:auth", "reader"))
     elif fault == "inactive": fixture.store.account("reader", active=False)
     elif fault == "user":
       account["memberships"] = [{"role": "tenant_user", "tenant_id": tenant_id}]
     elif fault == "memberships": account["memberships"] = []
     elif fault == "other_tenant": tenant_id = "tn_00000000-0000-4000-8000-000000000000"
     elif fault == "no_tenant": tenant_id = None
-    elif fault == "identity_store": fixture.store.fail_hkey = "auth"
+    elif fault == "identity_store": fixture.store.fail_hkey = "deployment:auth"
 
     with patch.object(service, "PyMISP", side_effect=AssertionError(SECRET)) as transport, \
          patch.object(service, "emit_export_status_event",

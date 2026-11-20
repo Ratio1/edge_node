@@ -9,7 +9,6 @@ import copy
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from extensions.business.cybersec.red_mesh.tenancy.account_record import (
   SCHEMA_VERSION,
@@ -17,7 +16,6 @@ from extensions.business.cybersec.red_mesh.tenancy.account_record import (
   parse_account_record,
 )
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity import (
-  AUTH_HKEY_ENV,
   CstoreAuthAccountReader,
 )
 from extensions.business.cybersec.red_mesh.tenancy.identity import (
@@ -70,7 +68,7 @@ class _Store:
 def reader(records):
   store = _Store(records)
   return CstoreAuthAccountReader(SimpleNamespace(
-    chainstore_hget=store.hget, chainstore_hgetall=store.hgetall)), store
+    _stream_id="app_x", chainstore_hget=store.hget, chainstore_hgetall=store.hgetall)), store
 
 
 class TestParseAccountRecord(unittest.TestCase):
@@ -169,8 +167,7 @@ class TestCanonicalAccountId(unittest.TestCase):
 class TestCstoreAuthAccountReader(unittest.TestCase):
   def test_reads_a_record_into_an_account_view(self):
     read, store = reader({ACCOUNT: record(memberships=[{"role": "tenant_admin", "tenant_id": T1}])})
-    with patch.dict("os.environ", {AUTH_HKEY_ENV: HKEY}, clear=True):
-      view = read.get_account(ACCOUNT)
+    view = read.get_account(ACCOUNT)
     self.assertEqual(view.account_id, ACCOUNT)
     self.assertTrue(view.active)
     self.assertEqual(view.state, "active")
@@ -180,8 +177,7 @@ class TestCstoreAuthAccountReader(unittest.TestCase):
 
   def test_carries_no_account_role_at_all(self):
     read, _ = reader({ACCOUNT: record()})
-    with patch.dict("os.environ", {AUTH_HKEY_ENV: HKEY}, clear=True):
-      view = read.get_account(ACCOUNT)
+    view = read.get_account(ACCOUNT)
     self.assertFalse(hasattr(view, "role"))
     self.assertFalse(hasattr(view, "app_role"))
     self.assertFalse(hasattr(view, "tenant_memberships_present"))
@@ -192,46 +188,41 @@ class TestCstoreAuthAccountReader(unittest.TestCase):
         read, _ = reader({ACCOUNT: record(state=state,
                                           stateChangedAt="2026-02-01T00:00:00.000Z",
                                           stateChangedBy="admin")})
-        with patch.dict("os.environ", {AUTH_HKEY_ENV: HKEY}, clear=True):
-          view = read.get_account(ACCOUNT)
+        view = read.get_account(ACCOUNT)
         self.assertIsNotNone(view)
         self.assertFalse(view.active)
         self.assertEqual(view.state, state)
 
   def test_absent_tombstoned_and_malformed_all_read_as_no_account(self):
     read, _ = reader({"gone": TOMBSTONE, "broken": {"schemaVersion": 99}})
-    with patch.dict("os.environ", {AUTH_HKEY_ENV: HKEY}, clear=True):
-      for key in ("missing", "gone", "broken"):
-        with self.subTest(key=key):
-          self.assertIsNone(read.get_account(key))
+    for key in ("missing", "gone", "broken"):
+      with self.subTest(key=key):
+        self.assertIsNone(read.get_account(key))
 
   def test_an_admin_account_with_no_memberships_grants_nothing(self):
     # The legacy bridge used to derive a full-portfolio Super-Tenant Admin here, from a stored
     # `role: admin`. There is no role to derive from, and an empty list holds nothing.
     read, _ = reader({ACCOUNT: record(memberships=[])})
-    with patch.dict("os.environ", {AUTH_HKEY_ENV: HKEY}, clear=True):
-      self.assertEqual(read.get_account(ACCOUNT).tenant_memberships, ())
+    self.assertEqual(read.get_account(ACCOUNT).tenant_memberships, ())
 
   def test_enumeration_returns_only_readable_records_under_canonical_ids(self):
     read, _ = reader({ACCOUNT: record(), "gone": TOMBSTONE, "broken": {"schemaVersion": 99},
                       "NotCanonical": record("NotCanonical")})
-    with patch.dict("os.environ", {AUTH_HKEY_ENV: HKEY}, clear=True):
-      views = read.list_accounts()
+    views = read.list_accounts()
     self.assertEqual([view.account_id for view in views], [ACCOUNT])
 
   def test_a_missing_hkey_fails_closed(self):
-    read, _ = reader({ACCOUNT: record()})
-    with patch.dict("os.environ", {}, clear=True):
-      with self.assertRaises(IdentityStoreError):
-        read.get_account(ACCOUNT)
+    store = _Store({ACCOUNT: record()})
+    read = CstoreAuthAccountReader(SimpleNamespace(_stream_id="", chainstore_hget=store.hget))
+    with self.assertRaises(IdentityStoreError):
+      read.get_account(ACCOUNT)
 
   def test_a_store_failure_is_an_error_not_an_absent_account(self):
     def explode(hkey, key, token=None, debug=False):
       raise RuntimeError("chain store unreachable")
-    read = CstoreAuthAccountReader(SimpleNamespace(chainstore_hget=explode))
-    with patch.dict("os.environ", {AUTH_HKEY_ENV: HKEY}, clear=True):
-      with self.assertRaises(IdentityStoreError):
-        read.get_account(ACCOUNT)
+    read = CstoreAuthAccountReader(SimpleNamespace(_stream_id="app_x", chainstore_hget=explode))
+    with self.assertRaises(IdentityStoreError):
+      read.get_account(ACCOUNT)
 
 
 class _StubReader:

@@ -73,7 +73,7 @@ def test_plugin_reads_the_tenant_display_name_for_the_tenant_tag():
     assert fixture.Plugin._get_tenant_display_name(fixture.owner, fixture.tenant_id) == display
     assert fixture.Plugin._get_tenant_display_name(
       fixture.owner, "tn_00000000-0000-4000-8000-000000000000") is None
-    fixture.owner.cfg_tenancy_namespace = ""
+    fixture.owner._stream_id = ""
     assert fixture.Plugin._get_tenant_display_name(fixture.owner, fixture.tenant_id) is None
 
 
@@ -128,9 +128,9 @@ def test_native_admission_denies_before_config_and_artifacts(read_native, respon
   with read_endpoint_fixture(bound=True) as fixture:
     install_json_producer(fixture)
     body = {"job_id": "job-1", "request_actor": fixture.actor, "tenant_id": fixture.tenant_id}
-    account = fixture.store.data[("auth", "reader")]
+    account = fixture.store.data[("deployment:auth", "reader")]
     if fault == "actor": body.pop("request_actor")
-    elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
+    elif fault == "deleted": fixture.store.data.pop(("deployment:auth", "reader"))
     elif fault == "inactive": fixture.store.account("reader", active=False)
     elif fault in ("user", "role_spoof"):
       account["memberships"] = [{"role": "tenant_user", "tenant_id": fixture.tenant_id}]
@@ -141,7 +141,7 @@ def test_native_admission_denies_before_config_and_artifacts(read_native, respon
       account["memberships"] = [] if fault == "memberships" else None
     elif fault == "other_tenant": body["tenant_id"] = "tn_00000000-0000-4000-8000-000000000000"
     elif fault == "missing_tenant": body.pop("tenant_id")
-    elif fault == "identity_store": fixture.store.fail_hkey = "auth"
+    elif fault == "identity_store": fixture.store.fail_hkey = "deployment:auth"
     elif fault == "unbound_job": fixture.job.pop("execution_binding")
     elif fault == "missing_job": fixture.store.jobs.clear()
     with no_export_effects(fixture), patch.object(misp_export, "get_misp_export_config",
@@ -329,7 +329,7 @@ def test_native_current_stored_export_roles_and_finite_json_controls(read_native
   install(module)
   with read_endpoint_fixture(bound=True) as fixture:
     install_json_producer(fixture)
-    account = fixture.store.data[("auth", "reader")]
+    account = fixture.store.data[("deployment:auth", "reader")]
     account["memberships"] = [
       {"role": role, "tenant_id": None if role == "super_tenant_admin" else fixture.tenant_id}]
     fixture.artifacts["pass"]["optional_metadata"] = {"large": 10**100, "flag": True, "text": "nan", "nothing": None}

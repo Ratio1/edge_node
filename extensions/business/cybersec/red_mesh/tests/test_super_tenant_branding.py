@@ -4,7 +4,6 @@ import copy
 import hashlib
 import struct
 import unittest
-from unittest.mock import patch
 from uuid import uuid4
 
 from .contract_fixture import CONTRACT_PDF, FakeDocumentStore, contract_b64
@@ -41,15 +40,12 @@ class _BrandingCase(unittest.TestCase):
     cls.Plugin = PentesterApi01Plugin
 
   def setUp(self):
-    env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    env.start()
-    self.addCleanup(env.stop)
     self.store = FakeAdministrationStore()
     self.store.account("pentester", memberships=[{"role": "super_pentester", "tenant_id": None}])
     self.store.account("scoped-sta", memberships=[{"role": "super_tenant_admin", "tenant_id": "tn_" + str(uuid4())}])
     self.documents = FakeDocumentStore()
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenancy_namespace = "deployment"
+    self.plugin._stream_id = "deployment"
     self.plugin.P = lambda *args, **kwargs: None
     self.plugin._document_store = lambda: self.documents
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
@@ -275,7 +271,7 @@ class TestBrandingGates(_BrandingCase):
     self.assertEqual(ok(self, self.update({"theme": "navy"}))["theme"], "navy")
 
   def test_no_namespace_means_unavailable_before_any_storage_access(self):
-    self.plugin.cfg_tenancy_namespace = None
+    self.plugin._stream_id = None
     for name in ("get_super_tenant_branding", "update_super_tenant_branding", "download_super_tenant_branding_logo"):
       with self.subTest(name):
         self.assertEqual(getattr(self.Plugin, name).__http_method__, "post")
@@ -308,7 +304,7 @@ class TestPublicBranding(_BrandingCase):
     refused(self, self.plugin.download_public_branding_logo(), 404, "not_found")
 
   def test_no_namespace_means_unavailable(self):
-    self.plugin.cfg_tenancy_namespace = None
+    self.plugin._stream_id = None
     for name in ("get_public_branding", "download_public_branding_logo"):
       with self.subTest(name):
         self.assertEqual(getattr(self.Plugin, name).__http_method__, "post")
