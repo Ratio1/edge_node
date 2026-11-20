@@ -595,7 +595,9 @@ class ProbeBase:
       text, re.IGNORECASE,
     ) is None:
       return False
-    actions = re.findall(r'<form[^>]*\baction=["\']([^"\']*)', text, re.IGNORECASE)
+    actions = re.findall(
+      r'<form[^>]*\baction=(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))', text, re.IGNORECASE)
+    actions = ["".join(groups) for groups in actions]
     if any(self._is_login_location(a) for a in actions):
       return True
     # No action, or an empty, "#" or query-only one, posts back to the page

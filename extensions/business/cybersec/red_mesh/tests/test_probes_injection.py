@@ -734,6 +734,19 @@ class TestReachabilityRuleInjection(unittest.TestCase):
         self.assertEqual([f.status for f in found], ["inconclusive"])
         self.assertEqual(reasons, [f"reason={reason}"])
 
+  def test_stored_xss_readback_redirected_to_login_is_not_clean(self):
+    """POST reached, but the readback GET bounces to login: the payload was
+    never looked for, so no clean verdict."""
+    probe = self._probe("absent")
+    session = probe.auth.primary_session
+    session.get = MagicMock(side_effect=[
+      _ok('<form><input name="comment" type="text"></form>'), _denial("login")])
+    session.post = MagicMock(return_value=_ok("saved"))
+    probe._test_stored_xss()
+    found, reasons = _reason(probe, "PT-A03-02")
+    self.assertEqual([f.status for f in found], ["inconclusive"])
+    self.assertEqual(reasons, ["reason=admin_context_absent"])
+
   def test_json_payload_redirected_to_login_after_reached_baseline(self):
     probe = self._probe("provided")
     session = probe.auth.primary_session

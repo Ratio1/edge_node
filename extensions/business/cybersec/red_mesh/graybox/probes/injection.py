@@ -301,13 +301,16 @@ class InjectionProbes(ProbeBase):
       if not self.response_reached(resp):
         denied += 1
         continue
-      tested += 1
 
       self.safety.throttle()
       try:
         readback = self.auth.primary_session.get(url, timeout=10)
       except Exception:
         continue
+      if not self.response_reached(readback):
+        denied += 1
+        continue
+      tested += 1
 
       if canary in readback.text and payload in readback.text:
         self.findings.append(GrayboxFinding(

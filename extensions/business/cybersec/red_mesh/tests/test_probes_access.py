@@ -839,6 +839,9 @@ class TestCreateUserPageIsNotALoginPage(unittest.TestCase):
     '<input type="email" name="email"><input type="password" name="password">'
     '<select name="role"><option value="admin">admin</option></select>'
     '<input type="submit" value="Create"></form>',
+    # unquoted explicit action, username and a single password field
+    '<form method=post action=/admin/users/new/><input name="username">'
+    '<input type="password" name="password"><input type="submit"></form>',
   )
 
   def test_create_user_page_is_reported_vulnerable(self):
