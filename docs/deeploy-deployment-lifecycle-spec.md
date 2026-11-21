@@ -777,8 +777,9 @@ If a replica cannot confirm routing for a signed retry, it returns retryable
 `503 ADMISSION_UNAVAILABLE`. Keep the original request ID and payload until
 the coordinator resolves it. An authoritative refusal of a stale replacement
 proposal returns `409 REPLACEMENT_REVIEW_STALE`. The coordinator persists the
-refusal under the same admission lock so a delayed exact request cannot be
-admitted. Its `non_admission` contains the network, decimal-string job ID,
+refusal to its data volume under the same admission lock and replicates it
+through CStore. A delayed exact request cannot be admitted, including after a
+restart before the local CStore flush. Its `non_admission` contains the network, decimal-string job ID,
 coordinator, request ID, wallet payload hash and a signature. The signature
 is EIP-191 over `Ratio1 Deeploy replacement refusal v1\n` followed by the
 compact JSON array of those five fields in that order. The browser verifies

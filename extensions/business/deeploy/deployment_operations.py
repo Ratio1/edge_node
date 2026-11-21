@@ -8,6 +8,7 @@ other oracles only aggregate replicated observations for polling.
 import copy
 import hashlib
 import json
+import os
 import re
 import threading
 # The call path of an error that stops an operation is logged (function names only).
@@ -935,16 +936,32 @@ class _DeploymentOperationsMixin:
       raise DeploymentConflictError("A deployment operation or recovery is already active for this job.")
     return None
 
-  @staticmethod
-  def _replacement_refusal_key(owner, job_id, request_id, coordinator):
+  def _replacement_refusal_key(self, owner, job_id, request_id, coordinator):
     """Index a terminal outcome by the same owner and job scope as admission."""
-    identity = [owner.lower(), str(job_id), request_id, coordinator]
+    identity = [self.evm_network, owner.lower(), str(job_id), request_id, coordinator]
     return hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+
+  def _replacement_refusal_path(self, key):
+    # The existing data volume contains these small records independently of the CStore flush interval.
+    return os.path.join(self.log.get_data_folder(), f"deeploy-refusal-{key}.json")
 
   def _load_replacement_refusal(self, owner, job_id, request_id, coordinator):
     """Read a terminal refusal from this oracle's local durable replica."""
     key = self._replacement_refusal_key(owner, job_id, request_id, coordinator)
-    record = self.chainstore_hget(hkey=REPLACEMENT_REFUSALS_HKEY, key=key)
+    record = None
+    if coordinator == self.bc.address:
+      try:
+        with open(self._replacement_refusal_path(key), encoding="utf-8") as stream:
+          record = json.load(stream)
+      except FileNotFoundError:
+        pass  # A replica may still have a prior record.
+      except (OSError, ValueError) as exc:
+        raise RuntimeError("The local replacement refusal could not be read.") from exc
+      else:
+        if not isinstance(record, dict):
+          raise RuntimeError("The local replacement refusal is invalid.")
+    if record is None:
+      record = self.chainstore_hget(hkey=REPLACEMENT_REFUSALS_HKEY, key=key)
     if record is None:
       return None
     if (not isinstance(record, dict) or record.get("EE_SENDER") != coordinator
@@ -1014,6 +1031,8 @@ class _DeploymentOperationsMixin:
         record = dict(owner=owner.lower(), proof=proof)
         self.bc.sign(record, add_data=True, use_digest=True)
         key = self._replacement_refusal_key(owner, job_id, request_id, self.bc.address)
+        # A coordinator crash before the next CStore flush must not bring a refused request back to life.
+        self._save_cache_file_strict(self._replacement_refusal_path(key), record, as_json=True)
         if not self.chainstore_hset(hkey=REPLACEMENT_REFUSALS_HKEY, key=key, value=record, readonly=True,
                                     **self._operation_write_kwargs()):
           raise RuntimeError("Replacement refusal persistence is pending.")

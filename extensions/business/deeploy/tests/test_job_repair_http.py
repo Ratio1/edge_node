@@ -3,12 +3,14 @@
 import copy
 import hashlib
 import unittest
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from eth_account import Account
 from eth_account.messages import encode_defunct
 from naeural_core.utils.fastapi_utils import PostponedRequest
+from naeural_core.utils.plugins_base.persistence_serialization_mixin import _PersistenceSerializationMixin
 from naeural_core.utils.plugins_base.plugin_base_utils import NestedDotDict
 from web3 import Web3
 
@@ -58,6 +60,9 @@ class JobRepairHttpTests(unittest.TestCase):
                  "_refused_replacement_request", "_refuse_replacement_request", "_load_replacement_refusal"):
       setattr(self.api, name, getattr(coordinator, name))
     self.api.bc = coordinator.bc
+    directory = self.enterContext(TemporaryDirectory())
+    coordinator.log = SimpleNamespace(get_data_folder=lambda: directory)
+    coordinator._save_cache_file_strict = _PersistenceSerializationMixin._save_cache_file_strict
     coordinator.bc.eth_sign_text = lambda message, **kwargs: Account.from_key(bytes([1]) * 32).sign_message(
       encode_defunct(text=message),
     ).signature.to_0x_hex()
@@ -356,11 +361,10 @@ class JobRepairHttpTests(unittest.TestCase):
     stale = copy.deepcopy(request)
     stale["repair"]["proposal"]["pipeline_cid"] = "earlier-cid"
     # A stale decision is provisional until the coordinator has stored it.
-    self.replay.state.fail_write = lambda hkey, key: "before" if hkey == REPLACEMENT_REFUSALS_HKEY else None
-    unavailable = self.api.repair_update_pipeline(stale)
+    with patch.object(self.replay.c, "_save_cache_file_strict", side_effect=OSError("disk unavailable")):
+      unavailable = self.api.repair_update_pipeline(stale)
     self.assertEqual(unavailable["status_code"], 503, unavailable)
     self.assertNotIn("non_admission", unavailable)
-    self.replay.state.fail_write = None
     refusal = self.api.repair_update_pipeline(stale)
     self.assertEqual(refusal["status_code"], 409, refusal)
     self.assertEqual(refusal["error"]["code"], "REPLACEMENT_REVIEW_STALE")
@@ -374,6 +378,10 @@ class JobRepairHttpTests(unittest.TestCase):
       self.assertNotIn("non_admission", self.api.get_deployment_status(lookup))
     # Even when the previously refused proposal is current again, the exact retry cannot enter custody.
     monitor = self.replay.c
+    # Model a coordinator restart before its CStore replica reached disk.
+    for key in list(self.replay.state.public):
+      if key[0] == REPLACEMENT_REFUSALS_HKEY:
+        del self.replay.state.public[key]
     with patch.object(monitor, "_stateless_replacement_proposal",
                       return_value=(stale["repair"]["proposal"], self.replay.stored)):
       self.assertEqual(self.api.repair_update_pipeline(stale)["non_admission"], refusal["non_admission"])
