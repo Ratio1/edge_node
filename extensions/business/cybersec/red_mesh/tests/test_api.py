@@ -3216,7 +3216,7 @@ class TestPhase2PassFinalization(unittest.TestCase):
     self.assertEqual(pass_report_dict["redmesh_test_attestation"]["tx_hash"], "0xend")
     plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
 
-  def test_finalization_required_end_attestation_failure_marks_failed(self):
+  def test_finalization_required_end_attestation_failure_keeps_job_finalized(self):
     PentesterApi01Plugin = self._get_plugin_class()
     plugin, job_specs = self._build_finalize_plugin()
     job_specs["blockchain_attestation_enabled"] = True
@@ -3243,9 +3243,12 @@ class TestPhase2PassFinalization(unittest.TestCase):
 
     PentesterApi01Plugin._maybe_finalize_pass(plugin)
 
-    self.assertEqual(job_specs["job_status"], "FAILED")
-    self.assertEqual(job_specs["failure_class"], "attestation_failed")
-    self.assertIn("terminal blockchain attestation", job_specs["failure_message"])
+    # RM-221: the scan finished; only the attestation is failed, and the results stay.
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertEqual(job_specs["attestation_status"], "failed")
+    self.assertIn(job_specs["attestation_failure_reason"], {"attestation_disabled", "no_tenant_key", "submit_failed"})
+    self.assertFalse(job_specs.get("failure_class"))
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
     plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
     event_types = [c.args[1] for c in plugin._emit_timeline_event.call_args_list]
     self.assertIn("attestation_failed", event_types)

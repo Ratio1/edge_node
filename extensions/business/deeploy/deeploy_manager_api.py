@@ -10,11 +10,13 @@ from naeural_core.main.net_mon import NetMonCt
 from naeural_core import constants as ct
 from .deeploy_job_mixin import _DeeployJobMixin
 from .deployment_operations import (
-  _DeploymentOperationsMixin, DeploymentAuthenticationError, DeploymentConflictError,
+  STATELESS_REPLACEMENT,
+  _DeploymentOperationsMixin, DeploymentAuthenticationError, DeploymentConflictError, StaleReplacementReviewError,
 )
 
 from .deployment_mutations import _DeploymentMutationsMixin
 from .job_repair import _JobRepairMixin, MUTATION as SAME_HOST_REPAIR
+from .repair_relay import _RepairRelayMixin
 from .deeploy_mixin import _DeeployMixin
 from .delegate_aliases import _DelegateAliasesMixin  # Optional metadata stays separate from deployment behavior.
 from .selected_secrets import compile_request_selections
@@ -40,6 +42,7 @@ _CONFIG = {
   **BasePlugin.CONFIG,
 
   'PORT': None,
+  'NETWORK_ROUTE_BY_HANDLER': True,  # Queue only Deeploy peer payloads from the shared admin listener.
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   'REQUEST_TIMEOUT': 600,
@@ -84,6 +87,7 @@ class DeeployManagerApiPlugin(
   _DeploymentOperationsMixin,
   _DeploymentMutationsMixin,
   _JobRepairMixin,
+  _RepairRelayMixin,
   _RequestTrackingMixin,
   ):
   """
@@ -100,6 +104,10 @@ class DeeployManagerApiPlugin(
 
   def check_debug_logging_enabled(self):
     return self.cfg_deeploy_verbose or super(DeeployManagerApiPlugin, self).check_debug_logging_enabled()
+
+  def get_registered_payload_signatures(self):
+    # The business manager uses this filter before adding admin payloads to the API's input queue.
+    return {"DEEPLOY_MANAGER_API"}
 
   def on_init(self):
     super(DeeployManagerApiPlugin, self).on_init()
@@ -122,6 +130,7 @@ class DeeployManagerApiPlugin(
     self._pending_managed_update_actions = {}
     self._applied_managed_update_actions = {}
     self._managed_update_action_lock = threading.Lock()
+    self._repair_relay_pending = {}  # Pending HTTP replies live only on the receiving API's process loop.
     self._init_deployment_operations()
     return
 
@@ -799,13 +808,17 @@ class DeeployManagerApiPlugin(
     service_kind = None
     cockroachdb_legacy_compat_contexts = None
     create_job_claim_key = None
+    replacing = False
     try:
       self.__ensure_eth_balance()
       request_type = "create pipeline" if is_create else "update pipeline"
       if repair_update:
         if not request.get("EE_HASH") or not isinstance(request.get("repair"), dict):
           raise ValueError("The repair requires a versioned signed wallet update.")
-        request_type = "repair update pipeline"
+        if not isinstance(request["repair"].get("proposal"), dict):
+          raise ValueError("A reviewed repair proposal is required.")
+        replacing = request["repair"].get("replace_stateless") is True
+        request_type = "repair update pipeline"  # The signed repair object distinguishes the two operations.
       elif "repair" in request:
         raise ValueError("Send a reviewed recovery only to the signed repair endpoint.")
       sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type=request_type)
@@ -835,6 +848,9 @@ class DeeployManagerApiPlugin(
       if repair_update:
         proposal = request["repair"].get("proposal") or {}
         if proposal.get("coordinator") != self.bc.address:
+          forwarded = self._forward_job_repair(request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], "update")
+          if forwarded is not None:
+            return forwarded  # The coordinator returns the normal admission response through the relay.
           raise DeploymentConflictError("Submit recovery to the original coordinator.")
         # The authenticated editor can be a delegate. The saved operation is scoped to the escrow owner.
         existing_operation = self._find_request_operation(
@@ -846,6 +862,10 @@ class DeeployManagerApiPlugin(
           request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], "create" if is_create else "update")
       if existing_operation:
         return self._accepted_operation_response(existing_operation)
+      if replacing:
+        refusal = self._refused_replacement_request(request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER])
+        if refusal:
+          return self._replacement_refusal_response(refusal)
       # Readiness is always reported by the node lifecycle service.
       inputs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE] = False
       inputs.chainstore_response = False
@@ -937,13 +957,16 @@ class DeeployManagerApiPlugin(
       else:
         # Discover the live deployment so we can validate node affinity and reuse existing specs.
         try:
-          pipeline_context = self._gather_running_pipeline_context(
+          pipeline_context = (self._gather_persisted_pipeline_update_context(
+            owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER], app_id=app_id, job_id=job_id,
+            project_id=inputs.get(DEEPLOY_KEYS.PROJECT_ID, None),
+          ) if replacing else self._gather_running_pipeline_context(
             owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
             app_id=app_id,
             job_id=job_id,
-          )
+          ))
         except ValueError as exc:
-          if DEEPLOY_ERRORS.NODES3 not in str(exc):
+          if replacing or DEEPLOY_ERRORS.NODES3 not in str(exc):
             raise
           pipeline_context = self._gather_persisted_pipeline_update_context(
             owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
@@ -960,6 +983,8 @@ class DeeployManagerApiPlugin(
           deeploy_specs=deeploy_specs_for_update,
           discovered_plugin_instances=discovered_plugin_instances,
         )
+        if replacing and service_kind:
+          raise ValueError("Managed services cannot use stateless replacement.")
         cockroachdb_legacy_compat_contexts = (
           self._get_cockroachdb_legacy_compat_contexts_from_discovered(
             discovered_plugin_instances,
@@ -1174,9 +1199,17 @@ class DeeployManagerApiPlugin(
         owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
         prepared_deploy_plan=prepared_create_deploy_plan,
       )
-      prior_pipeline = None if is_create else self.get_job_pipeline_from_cstore(
+      prior_pipeline = None if is_create or replacing else self.get_job_pipeline_from_cstore(
         job_id, timeout=30, pin=False, raise_on_error=False, show_logs=False,
       )
+      if replacing:
+        replacement = self._prepare_stateless_replacement(
+          request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], prepared_pipeline_configs,
+        )
+        return self._admit_prepared_deployment(
+          request=request, auth_result=auth_result, app_id=app_id, configs=prepared_pipeline_configs,
+          prior_pipeline=replacement["prior"], is_create=False, mutation=STATELESS_REPLACEMENT, replacement=replacement,
+        )
       if repair_update:
         # All ordinary payment, plugin, resource and availability checks have succeeded before inspecting any worker.
         repair = self._prepare_job_repair(request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER])
@@ -1185,6 +1218,13 @@ class DeeployManagerApiPlugin(
         configs=prepared_pipeline_configs, prior_pipeline=prior_pipeline,
         is_create=is_create, **({"repair": repair, "mutation": SAME_HOST_REPAIR} if repair_update else {}),
       )
+    except StaleReplacementReviewError:
+      try:
+        return self._refuse_replacement_request(
+          request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], (proposal.get("parent") or {}).get("operation_id"),
+        )
+      except Exception:
+        return self._deployment_admission_error(RuntimeError("Replacement acceptance could not be verified."))
     except DeploymentConflictError as exc:
       result = {"status_code": 409, "status": "error",
                 "error": {"code": "DEPLOYMENT_CONFLICT", "message": str(exc), "retryable": False}}
@@ -1434,7 +1474,8 @@ class DeeployManagerApiPlugin(
     Parameters
     ----------
     request : dict
-      Versioned wallet envelope binding a fresh nonce, job ID and original coordinator.
+      Versioned wallet envelope binding a fresh nonce and job ID. A same-host
+      preview binds the original coordinator. A replacement preview binds the network.
 
     Returns
     -------
@@ -1452,11 +1493,22 @@ class DeeployManagerApiPlugin(
         raise ValueError("A nonce is required for the repair preview.")
       if not re.fullmatch(r"0x[0-9a-fA-F]{1,16}", nonce):
         raise ValueError("The repair preview nonce must be a hexadecimal timestamp.")
-      if not request.get("EE_HASH") or type(job_id) is not int or job_id <= 0 or not isinstance(coordinator, str) or not coordinator:
+      replacing = request.get("replace_stateless") is True
+      if replacing and request.get("network") != self.evm_network:
+        raise ValueError("The signed replacement preview must name this network.")
+      if (not request.get("EE_HASH") or type(job_id) is not int or job_id <= 0
+          or (not replacing and (not isinstance(coordinator, str) or not coordinator))):
         raise ValueError("The repair preview requires a signed job ID and coordinator.")
       _, inputs = self.deeploy_verify_and_get_inputs(request, request_type="get job repair preview")
       owner = self.deeploy_get_auth_result(inputs)[DEEPLOY_KEYS.ESCROW_OWNER]
+      if replacing:
+        proposal, pipeline = self._stateless_replacement_proposal(job_id, owner)
+        observed = self._stateless_replacement_observations(pipeline)
+        return self._get_response(dict(status="reviewable", proposal=proposal, observed_previous_nodes=observed))
       if coordinator != self.bc.address:
+        forwarded = self._forward_job_repair(request, owner, "preview")
+        if forwarded is not None:
+          return forwarded  # Treat a peer preview exactly like a preview completed on this receiver.
         raise DeploymentConflictError("This receiver is not the original coordinator. Check the pinned repair endpoint.")
       proposal = self._assess_job_repair(job_id, owner, coordinator)[0]
       return self._get_response(dict(status="reviewable", proposal=proposal))
@@ -1489,7 +1541,12 @@ class DeeployManagerApiPlugin(
   def get_deployment_status(self, request: dict):
     """Read authorized deployment progress from this oracle's durable replica."""
     try:
-      return self._get_response(self._deployment_status(request))
+      result = self._deployment_status(request)
+      coordinator = self._replacement_status_coordinator(request)
+      if (coordinator and coordinator != self.bc.address
+          and result.get("status") == "synchronizing" and not result.get("non_admission")):
+        return self._forward_replacement_status(request, coordinator)
+      return self._get_response(result)
     except DeploymentAuthenticationError as exc:
       return self._get_response({"status_code": 401, "status": "error",
                                  "error": {"code": "AUTHENTICATION_FAILED", "message": str(exc), "retryable": False}})
@@ -1844,6 +1901,7 @@ class DeeployManagerApiPlugin(
     return (self.time() - self.__warmup_start_time) > self.cfg_warmup_delay
 
   def process(self):
+    self._process_job_repair_relay()  # Process peer replies before ordinary warmup-gated maintenance.
     if not self.is_deeploy_warmed_up():
       return
 

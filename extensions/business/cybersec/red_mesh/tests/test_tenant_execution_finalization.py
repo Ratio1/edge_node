@@ -149,7 +149,7 @@ class FinalizationOwner(_RedMeshLlmAgentMixin, _ReportMixin, _RiskScoringMixin):
     return 1
 
   def _emit_timeline_event(self, job_specs, event, label, **kwargs):
-    job_specs["timeline"].append({"type": event, "label": label})
+    job_specs["timeline"].append({"type": event, "label": label, "meta": kwargs.get("meta") or {}})
 
   def _build_job_archive(self, key, job_specs):
     self.archives.append(deepcopy(job_specs))
