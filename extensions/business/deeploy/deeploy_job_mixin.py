@@ -192,7 +192,7 @@ class _DeeployJobMixin:
       # Only the first dispatch can prove that a signed pre-write refusal leaves no earlier send in doubt.
       result = self._deployment_secret_request("commit", operation, pointer=pointer, report_prewrite_refusal=True)
       if result.get("publication_refused_before_write") is True:
-        raise ReplacementPublicationRefused("dAuth refused publication before writing because the job's paid term ended.")
+        raise ReplacementPublicationRefused("dAuth refused publication before writing because the reviewed placement changed.")
       return result
     return self._deployment_secret_request("commit", operation, pointer=pointer)
 

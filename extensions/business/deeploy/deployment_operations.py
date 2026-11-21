@@ -80,8 +80,8 @@ class ReplacementPlacementError(ValueError):
   """The replacement's paid job or license binding is no longer valid."""
 
 
-class ReplacementTermExpired(ReplacementPlacementError):
-  """The chain returned a paid term that has already ended."""
+class ReplacementPlacementMismatch(ReplacementPlacementError):
+  """A successful chain read showed that the reviewed placement cannot proceed."""
 
 
 class ReplacementPublicationRefused(ValueError):
@@ -119,7 +119,7 @@ def replacement_paid_slots(plugin, job_id, owner):
   if type(expires) is not int:
     raise ReplacementPlacementError("The job's paid execution term could not be verified.")
   if expires <= plugin.netmon.epoch_manager.get_current_epoch():
-    raise ReplacementTermExpired("The job has no paid execution epochs remaining.")
+    raise ReplacementPlacementMismatch("The job has no paid execution epochs remaining.")
   return slots
 
 
@@ -173,10 +173,12 @@ def check_replacement_placement(plugin, operation):
   >>> check_replacement_placement(plugin, operation)  # doctest: +SKIP
   """
   bindings = operation.get("replacement_licenses", {})
-  if (set(bindings) != set(operation["nodes"])
-      or replacement_paid_slots(plugin, operation["job_id"], operation["owner"]) != len(bindings)
-      or any(replacement_license_binding(plugin.bc, node) != binding for node, binding in bindings.items())):
-    raise ReplacementPlacementError("The replacement's paid placement or node license changed. Review the job again.")
+  if set(bindings) != set(operation["nodes"]):
+    raise ReplacementPlacementError("The replacement placement could not be verified.")
+  if replacement_paid_slots(plugin, operation["job_id"], operation["owner"]) != len(bindings):
+    raise ReplacementPlacementMismatch("The replacement's paid worker count changed. Review the job again.")
+  if any(replacement_license_binding(plugin.bc, node) != binding for node, binding in bindings.items()):
+    raise ReplacementPlacementMismatch("A replacement worker's license changed. Review the job again.")
 
 
 class DeploymentCustodyError(RuntimeError):
@@ -945,6 +947,16 @@ class _DeploymentOperationsMixin:
     # The existing data volume contains these small records independently of the CStore flush interval.
     return os.path.join(self.log.get_data_folder(), f"deeploy-refusal-{key}.json")
 
+  @staticmethod
+  def _replacement_status_coordinator(request):
+    # Limit the outcome lookup to a specific update and reviewed coordinator.
+    coordinator, request_id = request.get("replacement_coordinator"), request.get("request_id")
+    if (request.get("kind") == "update" and isinstance(request_id, str) and 1 <= len(request_id) <= 128
+        and request.get("job_id") is not None and not request.get("operation_id")
+        and isinstance(coordinator, str) and 1 <= len(coordinator) <= 128):
+      return coordinator
+    return None
+
   def _load_replacement_refusal(self, owner, job_id, request_id, coordinator):
     """Read a terminal refusal from this oracle's local durable replica."""
     key = self._replacement_refusal_key(owner, job_id, request_id, coordinator)
@@ -973,7 +985,7 @@ class _DeploymentOperationsMixin:
         or proof.get("coordinator") != coordinator or proof.get("job_id") != str(job_id)
         or proof.get("request_id") != request_id):
       raise RuntimeError("Replacement refusal identity mismatch.")
-    return proof
+    return record
 
   def _replacement_refusal_response(self, proof):
     """Return the same definitive result for a refused submission or exact retry."""
@@ -985,10 +997,23 @@ class _DeploymentOperationsMixin:
 
   def _refused_replacement_request(self, request, owner):
     """Reject reuse of a refused request ID before reserving a new operation."""
-    proof = self._load_replacement_refusal(owner, request["job_id"], request["request_id"], self.bc.address)
-    if proof and proof["request_hash"] != request["EE_HASH"]:
+    record = self._load_replacement_refusal(owner, request["job_id"], request["request_id"], self.bc.address)
+    if record is None:
+      return None
+    proof = record["proof"]
+    if proof["request_hash"] != request["EE_HASH"]:
       raise DeploymentConflictError("request_id was already used for different replacement input.")
+    # A previous local decision may have survived an unconfirmed CStore broadcast.
+    self._replicate_replacement_refusal(record)
     return proof
+
+  def _replicate_replacement_refusal(self, record):
+    # Retry the same signed immutable value. Re-signing it could disagree with a peer that already has it.
+    proof = record["proof"]
+    key = self._replacement_refusal_key(record["owner"], proof["job_id"], proof["request_id"], proof["coordinator"])
+    if not self.chainstore_hset(hkey=REPLACEMENT_REFUSALS_HKEY, key=key, value=record, readonly=True,
+                                **self._operation_write_kwargs()):
+      raise RuntimeError("Replacement refusal replication is pending.")
 
   def _refuse_replacement_request(self, request, owner, parent):
     """Resolve a stale replacement against the coordinator's admission record.
@@ -1033,9 +1058,7 @@ class _DeploymentOperationsMixin:
         key = self._replacement_refusal_key(owner, job_id, request_id, self.bc.address)
         # A coordinator crash before the next CStore flush must not bring a refused request back to life.
         self._save_cache_file_strict(self._replacement_refusal_path(key), record, as_json=True)
-        if not self.chainstore_hset(hkey=REPLACEMENT_REFUSALS_HKEY, key=key, value=record, readonly=True,
-                                    **self._operation_write_kwargs()):
-          raise RuntimeError("Replacement refusal persistence is pending.")
+        self._replicate_replacement_refusal(record)
       return self._replacement_refusal_response(proof)
 
   def _accepted_operation_response(self, operation):
@@ -2129,13 +2152,11 @@ class _DeploymentOperationsMixin:
       matches.append(record)
     if not matches:
       # Only the owner's request lookup can return a stored refusal; missing replica state stays uncertain.
-      coordinator = request.get("replacement_coordinator")
-      if (request.get("kind") == "update" and isinstance(request.get("request_id"), str)
-          and 1 <= len(request["request_id"]) <= 128 and request.get("job_id") is not None
-          and isinstance(coordinator, str) and 1 <= len(coordinator) <= 128):
-        proof = self._load_replacement_refusal(owner, request["job_id"], request["request_id"], coordinator)
-        if proof:
-          return {"status": "synchronizing", "job_id": request["job_id"], "non_admission": proof}
+      coordinator = self._replacement_status_coordinator(request)
+      if coordinator:
+        refusal = self._load_replacement_refusal(owner, request["job_id"], request["request_id"], coordinator)
+        if refusal:
+          return {"status": "synchronizing", "job_id": request["job_id"], "non_admission": refusal["proof"]}
       if not selector and request.get("job_id") is not None:
         pipeline = self.get_job_pipeline_from_cstore(
           request["job_id"], timeout=5, pin=False, raise_on_error=False, show_logs=False,

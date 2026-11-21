@@ -1541,7 +1541,12 @@ class DeeployManagerApiPlugin(
   def get_deployment_status(self, request: dict):
     """Read authorized deployment progress from this oracle's durable replica."""
     try:
-      return self._get_response(self._deployment_status(request))
+      result = self._deployment_status(request)
+      coordinator = self._replacement_status_coordinator(request)
+      if (coordinator and coordinator != self.bc.address
+          and result.get("status") == "synchronizing" and not result.get("non_admission")):
+        return self._forward_replacement_status(request, coordinator)
+      return self._get_response(result)
     except DeploymentAuthenticationError as exc:
       return self._get_response({"status_code": 401, "status": "error",
                                  "error": {"code": "AUTHENTICATION_FAILED", "message": str(exc), "retryable": False}})

@@ -5,7 +5,7 @@ import hashlib
 from .dauth_registry import dauth_registry_write_kwargs
 from .repair_tunnel import reconcile_restore_tunnel
 from extensions.business.deeploy.deployment_operations import (
-  check_replacement_placement, deployment_operation_phase, required_instances, ReplacementTermExpired,
+  check_replacement_placement, deployment_operation_phase, required_instances, ReplacementPlacementMismatch,
   SIGNATURE_KEYS, STATELESS_REPLACEMENT,
 )
 from extensions.business.deeploy.relink_placement import relink_configs, relink_pipeline
@@ -778,7 +778,7 @@ class _DauthDeploymentSecretsMixin:
     else:
       try:
         self._publish_deployment_secrets(job_id, operation, plan, body.get("pointer"), deleted=action == "delete")
-      except ReplacementTermExpired:
+      except ReplacementPlacementMismatch:
         if (action != "commit" or operation.get("mutation") != STATELESS_REPLACEMENT
             or body.get("report_prewrite_refusal") is not True):
           raise

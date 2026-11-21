@@ -63,7 +63,8 @@ class JobRepairHttpTests(unittest.TestCase):
     directory = self.enterContext(TemporaryDirectory())
     coordinator.log = SimpleNamespace(get_data_folder=lambda: directory)
     coordinator._save_cache_file_strict = _PersistenceSerializationMixin._save_cache_file_strict
-    coordinator.bc.eth_sign_text = lambda message, **kwargs: Account.from_key(bytes([1]) * 32).sign_message(
+    # Keep the production BCWrapper in the call path. Only its underlying test engine supplies a key.
+    coordinator.engine.eth_sign_text = lambda message, **kwargs: Account.from_key(bytes([1]) * 32).sign_message(
       encode_defunct(text=message),
     ).signature.to_0x_hex()
     coordinator._get_response = self.api._get_response
@@ -365,11 +366,17 @@ class JobRepairHttpTests(unittest.TestCase):
       unavailable = self.api.repair_update_pipeline(stale)
     self.assertEqual(unavailable["status_code"], 503, unavailable)
     self.assertNotIn("non_admission", unavailable)
+    # The first broadcast fails after the atomic local save. Retrying the exact request must publish that proof.
+    self.replay.state.fail_write = lambda namespace, key: "before" if namespace == REPLACEMENT_REFUSALS_HKEY else None
+    self.assertEqual(self.api.repair_update_pipeline(stale)["status_code"], 503)
+    self.assertFalse(any(key[0] == REPLACEMENT_REFUSALS_HKEY for key in self.replay.state.public))
+    self.replay.state.fail_write = None
     refusal = self.api.repair_update_pipeline(stale)
     self.assertEqual(refusal["status_code"], 409, refusal)
     self.assertEqual(refusal["error"]["code"], "REPLACEMENT_REVIEW_STALE")
     self.assertEqual(refusal["non_admission"]["request_id"], stale["request_id"])
     self.assertEqual(refusal["non_admission"]["request_hash"], stale["EE_HASH"])
+    self.assertTrue(any(key[0] == REPLACEMENT_REFUSALS_HKEY for key in self.replay.state.public))
     # Lookup after a lost reply gets the same proof. Another escrow and another request ID do not.
     lookup = dict(job_id=31, request_id=stale["request_id"], kind="update", replacement_coordinator="oracle")
     self.assertEqual(self.api.get_deployment_status(lookup)["non_admission"], refusal["non_admission"])
@@ -496,12 +503,49 @@ class JobRepairHttpTests(unittest.TestCase):
     self.assertEqual(deployment_operation_phase(child), "finalizing")
     read = vault.bc.get_node_license_info
     vault.bc.get_node_license_info = lambda **kwargs: dict(read(**kwargs), owner="new-license-owner")
-    with self.assertRaises(RuntimeError):  # Only the custodian observes the transfer at this boundary.
-      coordinator._advance_deployment_operation(child)
+    coordinator._advance_deployment_operation(child)  # Only the custodian observes the transfer at this boundary.
+    self.assertEqual(deployment_operation_phase(child), "stopping_failed_rollout")
     self.assertEqual(coordinator._get_pipeline_from_cstore(31), self.replay.cid)
-    vault.bc.get_node_license_info = read
+
+  def test_capacity_purchase_during_upload_cleans_up_after_definite_first_refusal(self):
+    coordinator, state = self.replay.c, self.replay.state
+    accepted = self.api.repair_update_pipeline(self.replacement_request())
+    child = coordinator._operation_records()[accepted["operation_id"]]
     coordinator._advance_deployment_operation(child)
-    self.assertEqual(child["outcome"], "succeeded")
+    report(state, child, "deploy", "ready")
+    coordinator._advance_deployment_operation(child)
+    upload = coordinator._save_pipeline_to_r1fs
+
+    def purchase_during_upload(*args, **kwargs):
+      cid = upload(*args, **kwargs)
+      self.replay.job["numberOfNodesRequested"] += 1
+      return cid
+
+    with patch.object(coordinator, "_save_pipeline_to_r1fs", side_effect=purchase_during_upload):
+      coordinator._advance_deployment_operation(child)
+    self.assertEqual(deployment_operation_phase(child), "stopping_failed_rollout")
+    self.assertNotIn(("DAUTH_JOB_SECRETS", "31"), state.secrets)
+    report(state, child, "deploy", "stopped")
+    coordinator._advance_deployment_operation(child)
+    parent = coordinator._operation_records()[self.replay.oid]
+    coordinator._advance_serialized_operation(parent)
+    self.assertEqual((deployment_operation_phase(child), child["outcome"]), ("completed", "failed"))
+    self.assertNotEqual(coordinator._operation_records()[self.replay.oid]["phase"], "holding_for_repair")
+    self.assertEqual(coordinator._get_pipeline_from_cstore(31), self.replay.cid)
+
+  def test_custodian_chain_failure_is_not_a_definitive_refusal(self):
+    coordinator, vault = self.replay.c, self.replay.dauth
+    accepted = self.api.repair_update_pipeline(self.replacement_request())
+    child = coordinator._operation_records()[accepted["operation_id"]]
+    coordinator._advance_deployment_operation(child)
+    report(self.replay.state, child, "deploy", "ready")
+    coordinator._advance_deployment_operation(child)
+    with patch.object(vault.bc, "get_job_details", side_effect=ConnectionError("chain temporarily unavailable")):
+      with self.assertRaises(ConnectionError):  # This fixture calls dAuth in-process, without its HTTP error wrapper.
+        coordinator._advance_deployment_operation(child)
+    self.assertEqual(deployment_operation_phase(child), "finalizing")
+    self.assertTrue(child["replacement_publication_started"])
+    self.assertEqual(coordinator._get_pipeline_from_cstore(31), self.replay.cid)
 
   def test_failed_pipeline_upload_does_not_create_publication_intent(self):
     coordinator = self.replay.c

@@ -768,10 +768,11 @@ dAuth finds its signed bundle or signed pointer for that exact revision.
 Missing or inconclusive evidence leaves the operation blocked.
 When the first `commit` opts in with `report_prewrite_refusal: true`, dAuth
 can return the signed `publication_refused_before_write: true` with the exact
-CID if the paid term ended before any write. Only a confirmed response to that
-first send allows the coordinator to clean up the failed rollout. If the reply
-is lost, the saved intent remains ambiguous. ChainDist can close the expired
-job independently of this custody decision.
+CID if a successful chain read establishes that the paid term, paid slot count
+or verified license binding no longer matches before any write. Only a
+confirmed response to that first send allows the coordinator to clean up the
+failed rollout. A failed chain read or lost reply leaves the saved intent
+ambiguous. ChainDist can close an expired job independently.
 
 If a replica cannot confirm routing for a signed retry, it returns retryable
 `503 ADMISSION_UNAVAILABLE`. Keep the original request ID and payload until
@@ -788,10 +789,13 @@ the recovered public key against the reviewed coordinator address.
 After a reload, the editor sends the optional `replacement_coordinator`
 selector alongside `job_id`, `request_id` and `kind: "update"` to
 `get_deployment_status`. The authenticated escrow owner's refused request can
-return `non_admission` with status `synchronizing` for compatibility. A
-missing refusal on a replica is inconclusive. The browser only retains the
-non-secret request identity, verifies the same proof and uses a new request ID
-for the fresh review.
+return `non_admission` with status `synchronizing` for compatibility. When
+the serving oracle lacks the outcome, it can relay the authenticated lookup
+to the reviewed coordinator over the existing encrypted relay. The receiver
+authenticates the wallet again. A timed-out lookup stays inconclusive.
+An exact resend also retries replication of the original signed record. The
+browser only retains the non-secret request identity, verifies the same proof
+and uses a new request ID for the fresh review.
 
 Publish Core 7.7.363 before building Edge. Upgrade the target workers, the
 serving oracles, and dAuth before enabling the updated editor. Stateless
