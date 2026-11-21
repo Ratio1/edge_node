@@ -29,6 +29,7 @@ from .deeploy_const import DEEPLOY_KEYS, CONTAINERIZED_APPS_SIGNATURES, WORKER_A
 
 
 OPERATIONS_HKEY = "DEEPLOY_OPERATIONS"
+REPLACEMENT_REFUSALS_HKEY = "DEEPLOY_REPLACEMENT_REFUSALS"
 NODE_OPERATIONS_HKEY = "DEEPLOY_NODE_OPERATIONS"
 SECRET_REVISIONS_HKEY = "DAUTH_JOB_SECRET_REVISIONS"
 class DeploymentAuthenticationError(ValueError):
@@ -78,6 +79,14 @@ class ReplacementPlacementError(ValueError):
   """The replacement's paid job or license binding is no longer valid."""
 
 
+class ReplacementTermExpired(ReplacementPlacementError):
+  """The chain returned a paid term that has already ended."""
+
+
+class ReplacementPublicationRefused(ValueError):
+  """dAuth definitively refused the coordinator's first publication before any write."""
+
+
 def replacement_paid_slots(plugin, job_id, owner):
   """Read the paid capacity of a currently funded replacement job.
 
@@ -106,8 +115,10 @@ def replacement_paid_slots(plugin, job_id, owner):
     raise ReplacementPlacementError("The published job does not have an active paid placement under this CSP.")
   # The last execution epoch is the first epoch outside the paid interval.
   expires = job.get("lastExecutionEpoch")
-  if type(expires) is not int or expires <= plugin.netmon.epoch_manager.get_current_epoch():
-    raise ReplacementPlacementError("The job has no paid execution epochs remaining.")
+  if type(expires) is not int:
+    raise ReplacementPlacementError("The job's paid execution term could not be verified.")
+  if expires <= plugin.netmon.epoch_manager.get_current_epoch():
+    raise ReplacementTermExpired("The job has no paid execution epochs remaining.")
   return slots
 
 
@@ -924,6 +935,90 @@ class _DeploymentOperationsMixin:
       raise DeploymentConflictError("A deployment operation or recovery is already active for this job.")
     return None
 
+  @staticmethod
+  def _replacement_refusal_key(owner, job_id, request_id, coordinator):
+    """Index a terminal outcome by the same owner and job scope as admission."""
+    identity = [owner.lower(), str(job_id), request_id, coordinator]
+    return hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+
+  def _load_replacement_refusal(self, owner, job_id, request_id, coordinator):
+    """Read a terminal refusal from this oracle's local durable replica."""
+    key = self._replacement_refusal_key(owner, job_id, request_id, coordinator)
+    record = self.chainstore_hget(hkey=REPLACEMENT_REFUSALS_HKEY, key=key)
+    if record is None:
+      return None
+    if (not isinstance(record, dict) or record.get("EE_SENDER") != coordinator
+        or record.get("owner") != owner.lower()
+        or not self.bc.verify(record, return_full_info=True, log_hash_sign_fails=False).valid):
+      raise RuntimeError("Replacement refusal could not be verified.")
+    proof = record.get("proof")
+    if (not isinstance(proof, dict) or proof.get("network") != self.evm_network
+        or proof.get("coordinator") != coordinator or proof.get("job_id") != str(job_id)
+        or proof.get("request_id") != request_id):
+      raise RuntimeError("Replacement refusal identity mismatch.")
+    return proof
+
+  def _replacement_refusal_response(self, proof):
+    """Return the same definitive result for a refused submission or exact retry."""
+    return self._get_response({
+      "status_code": 409, "status": "error", "non_admission": proof,
+      "error": {"code": "REPLACEMENT_REVIEW_STALE", "retryable": False,
+                "message": "The reviewed job or its operation changed. Review replacement again."},
+    })
+
+  def _refused_replacement_request(self, request, owner):
+    """Reject reuse of a refused request ID before reserving a new operation."""
+    proof = self._load_replacement_refusal(owner, request["job_id"], request["request_id"], self.bc.address)
+    if proof and proof["request_hash"] != request["EE_HASH"]:
+      raise DeploymentConflictError("request_id was already used for different replacement input.")
+    return proof
+
+  def _refuse_replacement_request(self, request, owner, parent):
+    """Resolve a stale replacement against the coordinator's admission record.
+
+    Parameters
+    ----------
+    request : dict
+      Authenticated wallet request with its stable ID and signed payload hash.
+    owner : str
+      Authenticated escrow owner, also used to scope status lookups.
+    parent : str or None
+      The reviewed retirement, which does not count as a competing admission.
+
+    Returns
+    -------
+    dict
+      An existing acceptance or a durable, signed refusal for this request.
+
+    Examples
+    --------
+    >>> plugin._refuse_replacement_request(request, owner, parent)  # doctest: +SKIP
+    """
+    from .job_repair import HANDOFF_LOCK
+
+    with HANDOFF_LOCK:
+      existing = self._find_request_operation(request, owner, "update", repair_parent=parent)
+      if existing:
+        return self._accepted_operation_response(existing)
+      proof = self._refused_replacement_request(request, owner)
+      if proof is None:
+        # This small, domain-separated signature can be verified from the coordinator's node address.
+        job_id, request_id = str(request["job_id"]), request["request_id"]
+        fields = [self.evm_network, job_id, self.bc.address, request_id, request["EE_HASH"]]
+        message = "Ratio1 Deeploy replacement refusal v1\n" + json.dumps(
+          fields, ensure_ascii=False, separators=(",", ":"),
+        )
+        proof = dict(network=self.evm_network, job_id=job_id, coordinator=self.bc.address,
+                     request_id=request_id, request_hash=request["EE_HASH"],
+                     signature=self.bc.eth_sign_text(message, no_hash=True))
+        record = dict(owner=owner.lower(), proof=proof)
+        self.bc.sign(record, add_data=True, use_digest=True)
+        key = self._replacement_refusal_key(owner, job_id, request_id, self.bc.address)
+        if not self.chainstore_hset(hkey=REPLACEMENT_REFUSALS_HKEY, key=key, value=record, readonly=True,
+                                    **self._operation_write_kwargs()):
+          raise RuntimeError("Replacement refusal persistence is pending.")
+      return self._replacement_refusal_response(proof)
+
   def _accepted_operation_response(self, operation):
     """Return durable acceptance without implying workload readiness."""
     # A previous admission may have persisted locally before replication timed
@@ -1235,19 +1330,28 @@ class _DeploymentOperationsMixin:
     finished = threading.Event()
     self._deployment_preparations[operation_id] = finished
     try:
-      if repair or (replacement and operation.get("repair_parent")):
-        existing = self._hold_repair_parent(operation, repair or replacement)
+      if repair:
+        existing = self._hold_repair_parent(operation, repair)
         if existing:
           return self._accepted_operation_response(existing)
       elif replacement:
         from .job_repair import HANDOFF_LOCK
         with HANDOFF_LOCK:  # Serialize the short reservation, leaving chain and custody calls outside the lock.
-          existing = self._find_request_operation(request, owner, "update")
+          parent = (operation.get("repair_parent") or {}).get("operation_id")
+          existing = self._find_request_operation(request, owner, "update", repair_parent=parent)
           if existing:
             return self._accepted_operation_response(existing)
-          if self._get_pipeline_from_cstore(job_id) != operation["previous_pipeline_cid"]:
-            raise StaleReplacementReviewError("The published job changed during replacement review.")
-          self._save_operation(operation, message="Preparing stateless replacement.")
+          refusal = self._refused_replacement_request(request, owner)
+          if refusal:
+            return self._replacement_refusal_response(refusal)
+          if parent:
+            existing = self._hold_repair_parent(operation, replacement)
+            if existing:
+              return self._accepted_operation_response(existing)
+          else:
+            if self._get_pipeline_from_cstore(job_id) != operation["previous_pipeline_cid"]:
+              raise StaleReplacementReviewError("The published job changed during replacement review.")
+            self._save_operation(operation, message="Preparing stateless replacement.")
       else:
         self._save_operation(operation, message="Preparing durable deployment data.")
       self._deployment_secret_request(
@@ -1658,7 +1762,11 @@ class _DeploymentOperationsMixin:
               self._save_operation(operation)
             raise DeploymentCustodyError(message)
         else:
-          self._commit_operation_revision(operation, active_configs)
+          try:
+            self._commit_operation_revision(operation, active_configs)
+          except ReplacementPublicationRefused as exc:
+            self._fail_deployment_rollout(operation, "REPLACEMENT_PLACEMENT_CHANGED", str(exc))
+            return
         if (operation.get("error") or {}).get("code") in (
           "REPLACEMENT_PLACEMENT_CHANGED", "REPLACEMENT_PUBLICATION_UNCONFIRMED",
         ):
@@ -1934,6 +2042,8 @@ class _DeploymentOperationsMixin:
         required when neither selector above is given.
       - "kind" (str, optional): limits the lookup to "create", "update" or
         "delete" operations.
+      - "replacement_coordinator" (str, optional): adds a verified refusal
+        to a request lookup scoped by job ID and update kind.
       - "events_limit" (int, optional): page size for events, 1 to 128,
         default 64.
       - "after_event_cursor" (int, optional): return only events with a
@@ -1999,6 +2109,14 @@ class _DeploymentOperationsMixin:
         continue
       matches.append(record)
     if not matches:
+      # Only the owner's request lookup can return a stored refusal; missing replica state stays uncertain.
+      coordinator = request.get("replacement_coordinator")
+      if (request.get("kind") == "update" and isinstance(request.get("request_id"), str)
+          and 1 <= len(request["request_id"]) <= 128 and request.get("job_id") is not None
+          and isinstance(coordinator, str) and 1 <= len(coordinator) <= 128):
+        proof = self._load_replacement_refusal(owner, request["job_id"], request["request_id"], coordinator)
+        if proof:
+          return {"status": "synchronizing", "job_id": request["job_id"], "non_admission": proof}
       if not selector and request.get("job_id") is not None:
         pipeline = self.get_job_pipeline_from_cstore(
           request["job_id"], timeout=5, pin=False, raise_on_error=False, show_logs=False,

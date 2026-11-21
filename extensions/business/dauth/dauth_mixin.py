@@ -14,6 +14,7 @@ plugin to provide a complete decentralized authentication solution.
 
 """
 
+import hashlib
 # A private download folder for the helper-thread read of an old-style document (see _load_legacy_pipeline).
 import tempfile
 # Old-style pipeline documents are read on a helper thread (see _load_legacy_pipeline), so a
@@ -877,10 +878,22 @@ class _DauthMixin(object):
       binding = licenses.get(recipient)
       if not binding or replacement_license_binding(self.bc, recipient) != binding:
         raise ValueError("The recipient no longer owns the reviewed replacement license.")
-      # Use the current paid end date so an extension preserves access to this exact revision.
       owner = secret_bundle.get("replacement_owner")
-      if not isinstance(owner, str) or not owner or replacement_paid_slots(self, job_id, owner) != len(licenses):
+      paid = replacement_paid_slots(self, job_id, owner) if isinstance(owner, str) and owner else 0
+      if paid < len(licenses):
         raise ValueError("The reviewed replacement no longer has its paid placement.")
+      if paid > len(licenses):
+        # Only the already published revision keeps its grant when capacity exceeds its reviewed placement.
+        pointer = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=job_id)
+        coordinator = pointer.get("coordinator") if isinstance(pointer, dict) else None
+        specs = pipelines[recipient].get("DEEPLOY_SPECS", {})
+        if (not isinstance(coordinator, str) or not coordinator or pointer.get("EE_SENDER") != coordinator
+            or not revision.startswith(hashlib.sha256(coordinator.encode()).hexdigest()[:16] + "-")
+            or pointer.get("job_id") != job_id or pointer.get("deleted") is not False
+            or not revision.endswith(":deploy") or pointer.get("operation_id") != revision.removesuffix(":deploy")
+            or pointer.get("revision") != specs.get("revision")
+            or not self.bc.verify(pointer, return_full_info=True, log_hash_sign_fails=False).valid):
+          raise ValueError("The reviewed replacement no longer has its paid placement.")
     return {key: value for key, value in secret_bundle.items()
             if key not in (placements, "repair_grant", "repair_plan_cid", "replacement_licenses", "replacement_owner")}
 

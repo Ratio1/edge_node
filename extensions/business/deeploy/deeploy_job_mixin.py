@@ -159,9 +159,10 @@ class _DeeployJobMixin:
     --------
     >>> plugin.commit_deployment_revision(operation, pipeline)  # doctest: +SKIP
     """
-    from .deployment_operations import STATELESS_REPLACEMENT
+    from .deployment_operations import ReplacementPublicationRefused, STATELESS_REPLACEMENT
 
     replacing = operation.get("mutation") == STATELESS_REPLACEMENT
+    first_send = replacing and not operation.get("replacement_publication_started")
     pointer = operation.get("replacement_publication") if replacing else None
     if pointer is not None:
       # Reuse the signed CID even when the original reply or pointer replication was lost.
@@ -187,6 +188,12 @@ class _DeeployJobMixin:
     if replacing:
       operation.update(replacement_publication=pointer, replacement_publication_started=True)
       self._save_operation(operation)  # A failed R1FS upload never records a custody intent.
+    if first_send:
+      # Only the first dispatch can prove that a signed pre-write refusal leaves no earlier send in doubt.
+      result = self._deployment_secret_request("commit", operation, pointer=pointer, report_prewrite_refusal=True)
+      if result.get("publication_refused_before_write") is True:
+        raise ReplacementPublicationRefused("dAuth refused publication before writing because the job's paid term ended.")
+      return result
     return self._deployment_secret_request("commit", operation, pointer=pointer)
 
   def _load_dauth_job_secret_bundle(self, job_id):

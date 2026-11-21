@@ -13,7 +13,7 @@ from naeural_core.utils.plugins_base.plugin_base_utils import NestedDotDict
 from web3 import Web3
 
 from extensions.business.dauth.deployment_secrets import REVISIONS
-from extensions.business.deeploy.deployment_operations import OPERATIONS_HKEY, deployment_operation_phase
+from extensions.business.deeploy.deployment_operations import OPERATIONS_HKEY, REPLACEMENT_REFUSALS_HKEY, deployment_operation_phase
 from extensions.business.deeploy.repair_relay import _RELAY_KEY
 from extensions.business.deeploy.tests import test_update_requests as updates
 from extensions.business.deeploy.tests import test_job_repair as lifecycle
@@ -54,9 +54,14 @@ class JobRepairHttpTests(unittest.TestCase):
     self.api.check_node_available_resources = lambda node, inputs: {"status": True}
     # Replace the preparation fixture's admission recorder with the coordinator implementing the actual durable protocol.
     for name in ("_operation_records", "_find_request_operation", "_assess_job_repair", "_prepare_job_repair",
-                 "_admit_prepared_deployment", "_accepted_operation_response", "get_job_pipeline_from_cstore"):
+                 "_admit_prepared_deployment", "_accepted_operation_response", "get_job_pipeline_from_cstore",
+                 "_refused_replacement_request", "_refuse_replacement_request", "_load_replacement_refusal"):
       setattr(self.api, name, getattr(coordinator, name))
     self.api.bc = coordinator.bc
+    coordinator.bc.eth_sign_text = lambda message, **kwargs: Account.from_key(bytes([1]) * 32).sign_message(
+      encode_defunct(text=message),
+    ).signature.to_0x_hex()
+    coordinator._get_response = self.api._get_response
     self.api.evm_network = coordinator.evm_network
     self.domains = []
     def verify(request, request_type):
@@ -350,10 +355,30 @@ class JobRepairHttpTests(unittest.TestCase):
     request = self.replacement_request()
     stale = copy.deepcopy(request)
     stale["repair"]["proposal"]["pipeline_cid"] = "earlier-cid"
+    # A stale decision is provisional until the coordinator has stored it.
+    self.replay.state.fail_write = lambda hkey, key: "before" if hkey == REPLACEMENT_REFUSALS_HKEY else None
+    unavailable = self.api.repair_update_pipeline(stale)
+    self.assertEqual(unavailable["status_code"], 503, unavailable)
+    self.assertNotIn("non_admission", unavailable)
+    self.replay.state.fail_write = None
     refusal = self.api.repair_update_pipeline(stale)
     self.assertEqual(refusal["status_code"], 409, refusal)
     self.assertEqual(refusal["error"]["code"], "REPLACEMENT_REVIEW_STALE")
-    self.assertEqual(refusal["non_admission"], {"request_id": stale["request_id"], "request_hash": stale["EE_HASH"]})
+    self.assertEqual(refusal["non_admission"]["request_id"], stale["request_id"])
+    self.assertEqual(refusal["non_admission"]["request_hash"], stale["EE_HASH"])
+    # Lookup after a lost reply gets the same proof. Another escrow and another request ID do not.
+    lookup = dict(job_id=31, request_id=stale["request_id"], kind="update", replacement_coordinator="oracle")
+    self.assertEqual(self.api.get_deployment_status(lookup)["non_admission"], refusal["non_admission"])
+    self.assertNotIn("non_admission", self.api.get_deployment_status(dict(lookup, request_id="other")))
+    with patch.object(self.api, "deeploy_get_auth_result", return_value={"escrow_owner": "another-csp"}):
+      self.assertNotIn("non_admission", self.api.get_deployment_status(lookup))
+    # Even when the previously refused proposal is current again, the exact retry cannot enter custody.
+    monitor = self.replay.c
+    with patch.object(monitor, "_stateless_replacement_proposal",
+                      return_value=(stale["repair"]["proposal"], self.replay.stored)):
+      self.assertEqual(self.api.repair_update_pipeline(stale)["non_admission"], refusal["non_admission"])
+      self.assertEqual(set(monitor._operation_records()), {self.replay.oid})
+    request["request_id"] += "-new"
     self.replay.epoch = self.replay.job["lastExecutionEpoch"]  # The last execution epoch is already unpaid.
     preview = self.api.get_job_repair_preview(dict(self.read, replace_stateless=True))
     self.assertEqual(preview["status"], "blocked")
@@ -389,6 +414,49 @@ class JobRepairHttpTests(unittest.TestCase):
     bundle = vault._load_revision_runner_secret_bundle("31", reference, "newA")
     self.assertEqual(bundle["revision"], reference)
     self.assertNotIn("replacement_owner", bundle)
+
+  def test_published_replacement_grant_survives_a_capacity_purchase(self):
+    coordinator, state = self.replay.c, self.replay.state
+    accepted = self.api.repair_update_pipeline(self.replacement_request())
+    child = coordinator._operation_records()[accepted["operation_id"]]
+    reference = child["operation_id"] + ":deploy"
+    self.replay.job["numberOfNodesRequested"] += 1
+    with self.assertRaisesRegex(ValueError, "no longer has its paid placement"):
+      self.replay.dauth._load_revision_runner_secret_bundle("31", reference, child["nodes"][0])
+    self.replay.job["numberOfNodesRequested"] -= 1
+    coordinator._advance_deployment_operation(child)
+    report(state, child, "deploy", "ready")
+    coordinator._advance_deployment_operation(child)
+    coordinator._advance_deployment_operation(child)
+    self.assertEqual(child["outcome"], "succeeded")
+    cid = coordinator._get_pipeline_from_cstore(31)
+    self.replay.job["numberOfNodesRequested"] += 1
+    for node in child["nodes"]:
+      bundle = self.replay.dauth._load_revision_runner_secret_bundle("31", reference, node)
+      self.assertEqual(bundle["revision"], reference)
+    self.assertEqual(coordinator._get_pipeline_from_cstore(31), cid)
+    with self.assertRaisesRegex(ValueError, "not authorized"):
+      self.replay.dauth._load_revision_runner_secret_bundle("31", reference, "extra")
+
+  def test_first_signed_prewrite_refusal_starts_cleanup_when_payment_expires(self):
+    coordinator, state = self.replay.c, self.replay.state
+    accepted = self.api.repair_update_pipeline(self.replacement_request())
+    child = coordinator._operation_records()[accepted["operation_id"]]
+    coordinator._advance_deployment_operation(child)
+    report(state, child, "deploy", "ready")
+    coordinator._advance_deployment_operation(child)
+    save = coordinator._save_pipeline_to_r1fs
+
+    def expire_during_upload(*args, **kwargs):
+      cid = save(*args, **kwargs)
+      self.replay.epoch = self.replay.job["lastExecutionEpoch"]
+      return cid
+
+    with patch.object(coordinator, "_save_pipeline_to_r1fs", side_effect=expire_during_upload):
+      coordinator._advance_deployment_operation(child)
+    self.assertEqual(deployment_operation_phase(child), "stopping_failed_rollout")
+    self.assertNotIn(("DAUTH_JOB_SECRETS", "31"), state.secrets)
+    self.assertEqual(coordinator._get_pipeline_from_cstore(31), self.replay.cid)
 
   def test_stateless_replacement_rechecks_target_license_after_acceptance(self):
     request = self.replacement_request()

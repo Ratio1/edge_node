@@ -862,6 +862,10 @@ class DeeployManagerApiPlugin(
           request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], "create" if is_create else "update")
       if existing_operation:
         return self._accepted_operation_response(existing_operation)
+      if replacing:
+        refusal = self._refused_replacement_request(request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER])
+        if refusal:
+          return self._replacement_refusal_response(refusal)
       # Readiness is always reported by the node lifecycle service.
       inputs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE] = False
       inputs.chainstore_response = False
@@ -1214,20 +1218,13 @@ class DeeployManagerApiPlugin(
         configs=prepared_pipeline_configs, prior_pipeline=prior_pipeline,
         is_create=is_create, **({"repair": repair, "mutation": SAME_HOST_REPAIR} if repair_update else {}),
       )
-    except StaleReplacementReviewError as exc:
-      # A concurrent reservation takes precedence over a stale proposal. Unavailable records cannot prove nonadmission.
+    except StaleReplacementReviewError:
       try:
-        existing_operation = self._find_request_operation(
-          request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], "update",
-          repair_parent=(proposal.get("parent") or {}).get("operation_id"),
+        return self._refuse_replacement_request(
+          request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], (proposal.get("parent") or {}).get("operation_id"),
         )
-        if existing_operation:
-          return self._accepted_operation_response(existing_operation)
       except Exception:
         return self._deployment_admission_error(RuntimeError("Replacement acceptance could not be verified."))
-      result = {"status_code": 409, "status": "error",
-                "error": {"code": "REPLACEMENT_REVIEW_STALE", "message": str(exc), "retryable": False},
-                "non_admission": {"request_id": request["request_id"], "request_hash": request["EE_HASH"]}}
     except DeploymentConflictError as exc:
       result = {"status_code": 409, "status": "error",
                 "error": {"code": "DEPLOYMENT_CONFLICT", "message": str(exc), "retryable": False}}

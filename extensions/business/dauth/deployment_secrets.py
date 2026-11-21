@@ -5,7 +5,8 @@ import hashlib
 from .dauth_registry import dauth_registry_write_kwargs
 from .repair_tunnel import reconcile_restore_tunnel
 from extensions.business.deeploy.deployment_operations import (
-  check_replacement_placement, deployment_operation_phase, required_instances, SIGNATURE_KEYS, STATELESS_REPLACEMENT,
+  check_replacement_placement, deployment_operation_phase, required_instances, ReplacementTermExpired,
+  SIGNATURE_KEYS, STATELESS_REPLACEMENT,
 )
 from extensions.business.deeploy.relink_placement import relink_configs, relink_pipeline
 
@@ -775,6 +776,13 @@ class _DauthDeploymentSecretsMixin:
     elif action == "revoke":
       self._revoke_deployment_secret_revisions(job_id, operation, plan, body.get("active_attempt"))
     else:
-      self._publish_deployment_secrets(job_id, operation, plan, body.get("pointer"), deleted=action == "delete")
+      try:
+        self._publish_deployment_secrets(job_id, operation, plan, body.get("pointer"), deleted=action == "delete")
+      except ReplacementTermExpired:
+        if (action != "commit" or operation.get("mutation") != STATELESS_REPLACEMENT
+            or body.get("report_prewrite_refusal") is not True):
+          raise
+        # The checked placement failed before dAuth wrote either the bundle or pointer for this call.
+        result["publication_refused_before_write"] = True
       result["pipeline_cid"] = body["pointer"]["pipeline_cid"]
     return result

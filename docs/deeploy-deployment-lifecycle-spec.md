@@ -736,6 +736,10 @@ before dispatch and publication. dAuth independently verifies the license
 and current paid execution term before releasing replacement credentials. It
 verifies the full placement before publication. Preview and admission require a
 paid execution epoch. Extensions take effect at the next credential request.
+After the revision is published, buying additional slots preserves the exact
+licensed recipients of its grant. dAuth verifies the current signed publication
+before granting this exception. Staged grants and new placements still require
+the reviewed paid count.
 Existing app and component IDs are preserved. If the saved per-slot component
 IDs differ, replacement preview refuses the plan until there is an explicit
 mapping for those identities.
@@ -762,14 +766,31 @@ When readiness or placement can no longer be verified after a possible custody
 send, a finalizing `status` request can finish the same publication only if
 dAuth finds its signed bundle or signed pointer for that exact revision.
 Missing or inconclusive evidence leaves the operation blocked.
+When the first `commit` opts in with `report_prewrite_refusal: true`, dAuth
+can return the signed `publication_refused_before_write: true` with the exact
+CID if the paid term ended before any write. Only a confirmed response to that
+first send allows the coordinator to clean up the failed rollout. If the reply
+is lost, the saved intent remains ambiguous. ChainDist can close the expired
+job independently of this custody decision.
 
 If a replica cannot confirm routing for a signed retry, it returns retryable
 `503 ADMISSION_UNAVAILABLE`. Keep the original request ID and payload until
 the coordinator resolves it. An authoritative refusal of a stale replacement
-proposal returns `409 REPLACEMENT_REVIEW_STALE`. Its signed `non_admission`
-contains the exact `request_id` and the wallet-signed `request_hash`. The
-client can clear a pending resend when those fields and the coordinator signer
-match the original request. A fresh review uses a new request ID.
+proposal returns `409 REPLACEMENT_REVIEW_STALE`. The coordinator persists the
+refusal under the same admission lock so a delayed exact request cannot be
+admitted. Its `non_admission` contains the network, decimal-string job ID,
+coordinator, request ID, wallet payload hash and a signature. The signature
+is EIP-191 over `Ratio1 Deeploy replacement refusal v1\n` followed by the
+compact JSON array of those five fields in that order. The browser verifies
+the recovered public key against the reviewed coordinator address.
+
+After a reload, the editor sends the optional `replacement_coordinator`
+selector alongside `job_id`, `request_id` and `kind: "update"` to
+`get_deployment_status`. The authenticated escrow owner's refused request can
+return `non_admission` with status `synchronizing` for compatibility. A
+missing refusal on a replica is inconclusive. The browser only retains the
+non-secret request identity, verifies the same proof and uses a new request ID
+for the fresh review.
 
 Publish Core 7.7.363 before building Edge. Upgrade the target workers, the
 serving oracles, and dAuth before enabling the updated editor. Stateless
