@@ -808,11 +808,16 @@ class _DeeployMixin:
     return
 
 
-  def __check_allowed_wallet(self, inputs):
+  def __check_allowed_wallet(self, inputs, require_job_edit=False):
     sender = inputs.get(BASE_CT.BCctbase.ETH_SENDER)
     escrow_details = self.bc.get_user_escrow_details(sender)
     if not escrow_details.get('isActive', False):
       raise ValueError("Wallet {} has no active escrow".format(sender))
+    if require_job_edit and sender.lower() != escrow_details["escrowOwner"].lower():
+      # Match the delegate permission used by the Deeploy editor (CSP escrow bit 2).
+      permissions = escrow_details.get("permissions", 0)
+      if type(permissions) is not int or permissions < 0 or not permissions & (1 << 2):
+        raise ValueError("The active delegate lacks permission to edit this job.")
     inputs.wallet_escrow = escrow_details['escrowAddress']
     inputs.wallet_escrow_owner = escrow_details['escrowOwner']
     return inputs
@@ -2236,7 +2241,8 @@ class _DeeployMixin:
     if require_sender_is_oracle:
       self.__check_is_oracle(inputs)
     else:
-      self.__check_allowed_wallet(inputs)
+      requires_job_edit = request_type in ("get job repair preview", "repair update pipeline")
+      self.__check_allowed_wallet(inputs, require_job_edit=requires_job_edit)
 
     return sender, inputs
 

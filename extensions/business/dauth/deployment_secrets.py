@@ -4,7 +4,10 @@ import hashlib
 
 from .dauth_registry import dauth_registry_write_kwargs
 from .repair_tunnel import reconcile_restore_tunnel
-from extensions.business.deeploy.deployment_operations import required_instances, SIGNATURE_KEYS
+from extensions.business.deeploy.deployment_operations import (
+  check_replacement_placement, deployment_operation_phase, required_instances, ReplacementPlacementMismatch,
+  SIGNATURE_KEYS, STATELESS_REPLACEMENT,
+)
 from extensions.business.deeploy.relink_placement import relink_configs, relink_pipeline
 
 
@@ -108,12 +111,14 @@ class _DauthDeploymentSecretsMixin:
           type(operation.get("previous_revision")) is not int
           or not 0 <= operation["previous_revision"] < operation["target_revision"]))):
       raise ValueError("Invalid deployment operation identity.")
-    if operation.get("mutation") == "same_host_repair_v1":
-      phase = operation.get("phase")
-      if not isinstance(phase, str) or not phase.startswith("repair_v1_"):
+    if operation.get("mutation") in ("same_host_repair_v1", STATELESS_REPLACEMENT):
+      if not isinstance(operation.get("phase"), str):
+        raise ValueError("Invalid repair custody phase.")
+      phase = deployment_operation_phase(operation)
+      if phase == operation["phase"]:
         raise ValueError("Invalid repair custody phase.")
       # Normalize a private view only after authenticating the original signed snapshot above.
-      operation = dict(operation, phase=phase[len("repair_v1_"):])
+      operation = dict(operation, phase=phase)
     action, phase = body.get("action"), operation.get("phase")
     phases = {
       "prepare": {"preparing"}, "status": {"preparing"},
@@ -121,6 +126,8 @@ class _DauthDeploymentSecretsMixin:
       "revoke": {"preparing", "cleaning_up_preparation", "stopping_failed_rollout", "finalizing", "finalizing_recovery", "retiring_previous"},
       "delete": {"retiring_previous"},
     }
+    if operation.get("mutation") == STATELESS_REPLACEMENT:
+      phases["status"].add("finalizing")  # Reconcile the exact published attempt if the original reply was lost.
     if action not in phases or phase not in phases[action]:
       raise ValueError("Secret action does not match the deployment phase.")
     if (operation.get("kind") == "delete") != (action == "delete" or (action == "revoke" and phase == "retiring_previous")):
@@ -154,6 +161,8 @@ class _DauthDeploymentSecretsMixin:
     records = (self.chainstore_hgetall(hkey="DEEPLOY_OPERATIONS") or {}).values()
     if operation.get("mutation") == "same_host_repair_v1":
       self._verify_held_repair_parent(operation, body, plan, records)
+    elif operation.get("mutation") == STATELESS_REPLACEMENT and "repair_parent" in operation:
+      self._require_held_repair_parent(operation, records)
     for record in records:
       if (isinstance(record, dict) and record.get("operation_id") == operation_id
           and record.get("coordinator") == requester and record.get("EE_SENDER") == requester
@@ -161,6 +170,50 @@ class _DauthDeploymentSecretsMixin:
           and record.get("sequence", 0) > operation.get("sequence", 0)):
         raise RuntimeError("A newer deployment operation snapshot is available.")
     return job_id, operation, plan
+
+  def _require_held_repair_parent(self, operation, records):
+    """Resolve the latest authentic retirement hold for this exact child.
+
+    Parameters
+    ----------
+    operation : dict
+      Authenticated child operation.
+    records : iterable
+      Locally replicated coordinator snapshots.
+
+    Returns
+    -------
+    tuple
+      The signed parent and its reservation for this child.
+
+    Examples
+    --------
+    >>> parent, hold = plugin._require_held_repair_parent(child, replicas)  # doctest: +SKIP
+    """
+    parent_ref = operation.get("repair_parent")
+    if not isinstance(parent_ref, dict) or type(parent_ref.get("sequence")) is not int:
+      raise ValueError("The repair has no valid parent reference.")
+    requester = operation["coordinator"]
+    parents = [record for record in records if isinstance(record, dict)
+               and record.get("operation_id") == parent_ref.get("operation_id")
+               and record.get("EE_SENDER") == requester and record.get("coordinator") == requester
+               and type(record.get("sequence")) is int
+               and self.bc.verify(record, return_full_info=True, log_hash_sign_fails=False).valid]
+    if not parents:  # A dAuth with a lagging replica must wait for the authoritative hold.
+      raise RuntimeError("The original coordinator's repair hold is unavailable.")
+    parent = max(parents, key=lambda record: record["sequence"])
+    hold = parent.get("repair_child") or {}
+    if (parent.get("phase") != "holding_for_repair" or parent.get("mutation") != "node_relink"
+        or parent.get("kind") != "update" or operation["kind"] != "update"
+        or parent.get("plan_cid") != parent_ref.get("plan_cid")
+        or parent_ref["sequence"] != hold.get("base_sequence") or parent["sequence"] <= parent_ref["sequence"]
+        or hold.get("operation_id") != operation["operation_id"] or hold.get("request_hash") != operation["request_hash"]
+        or parent["operation_id"] == operation["operation_id"] or parent["target_revision"] >= operation["target_revision"]
+        or any(parent.get(key) != operation.get(key) for key in (
+          "app_id", "job_id", "network", "owner", "previous_pipeline_cid", "previous_revision",
+          "previous_secret_revision"))):
+      raise ValueError("The original operation has not authorized this repair.")
+    return parent, hold
 
   def _verify_held_repair_parent(self, operation, body, plan, records):
     """Bind a repair's custody actions to the original coordinator's held operation.
@@ -184,30 +237,10 @@ class _DauthDeploymentSecretsMixin:
     --------
     >>> plugin._verify_held_repair_parent(child, body, plan, replicas)  # doctest: +SKIP
     """
-    parent_ref = operation.get("repair_parent")
-    if not isinstance(parent_ref, dict) or type(parent_ref.get("sequence")) is not int:
-      raise ValueError("The repair has no valid parent reference.")
-    requester = operation["coordinator"]
-    parents = [record for record in records if isinstance(record, dict)
-               and record.get("operation_id") == parent_ref.get("operation_id")
-               and record.get("EE_SENDER") == requester and record.get("coordinator") == requester
-               and type(record.get("sequence")) is int
-               and self.bc.verify(record, return_full_info=True, log_hash_sign_fails=False).valid]
-    if not parents:  # A dAuth with a lagging replica must wait for the authoritative hold.
-      raise RuntimeError("The original coordinator's repair hold is unavailable.")
-    parent = max(parents, key=lambda record: record["sequence"])
-    hold = parent.get("repair_child") or {}
-    if (parent.get("phase") != "holding_for_repair" or parent.get("mutation") != "node_relink"
-        or parent.get("kind") != "update" or operation["kind"] != "update"
-        or parent.get("previous_revision") != 0 or parent.get("previous_operation_id") or parent.get("previous_secret_revision")
-        or parent.get("plan_cid") != parent_ref.get("plan_cid")
-        or parent_ref["sequence"] != hold.get("base_sequence") or parent["sequence"] <= parent_ref["sequence"]
-        or hold.get("operation_id") != operation["operation_id"] or hold.get("request_hash") != operation["request_hash"]
-        or parent["operation_id"] == operation["operation_id"] or parent["target_revision"] >= operation["target_revision"]
-        or any(parent.get(key) != operation.get(key) for key in (
-          "app_id", "job_id", "network", "owner", "previous_pipeline_cid", "previous_revision",
-          "previous_operation_id", "previous_secret_revision"))):
-      raise ValueError("The original operation has not authorized this repair.")
+    parent, hold = self._require_held_repair_parent(operation, records)
+    if (parent.get("previous_revision") != 0 or parent.get("previous_operation_id")
+        or parent.get("previous_secret_revision") or operation.get("previous_operation_id")):
+      raise ValueError("Same-host repair requires the original legacy revision.")
     pairs = hold.get("node_aliases")
     if (not isinstance(pairs, list) or not pairs
         or any(not isinstance(pair, (list, tuple)) or len(pair) != 2 or not all(isinstance(n, str) and n for n in pair)
@@ -348,6 +381,12 @@ class _DauthDeploymentSecretsMixin:
     # A relinked node takes over the old node's values, including its per-node secret paths.
     node_aliases = dict(body.get("node_aliases") or [])
     is_repair = operation.get("mutation") == "same_host_repair_v1"
+    replacing = operation.get("mutation") == STATELESS_REPLACEMENT
+    if replacing and set(operation.get("replacement_licenses", ())) != set(plan["configs"]):
+      raise ValueError("Replacement custody requires an exact license binding for every target.")
+    if prior_bundle and "replacement_pipelines" in prior_bundle:
+      # Later edits still inherit protected values from the committed replacement.
+      prior_bundle = dict(prior_bundle, pipelines=prior_bundle["replacement_pipelines"])
     if is_repair:
       # A legacy CID may combine plaintext connector fields and separately custodied environment values.
       canonical, inline = self._extract_and_redact_deeploy_dauth_secrets(prior_pipeline)
@@ -399,6 +438,11 @@ class _DauthDeploymentSecretsMixin:
       if is_repair:
         record["repair_plan_cid"] = operation["plan_cid"]  # Recovery status can verify the exact prepared plan.
         record["repair_grant"] = operation["_repair_grant"]  # Each direct fetch must still own the reviewed license.
+      if replacing:
+        # Earlier dAuth versions require the ordinary "pipelines" field and cannot grant this revision.
+        record["replacement_pipelines"] = record.pop("pipelines")
+        record["replacement_licenses"] = operation["replacement_licenses"]
+        record["replacement_owner"] = operation["owner"]
       records.append((reference, record))
     if is_repair:
       # An unapproved token change must never commit a restore plan that still uses a revoked connector.
@@ -438,6 +482,11 @@ class _DauthDeploymentSecretsMixin:
         # Report incomplete so the coordinator can finish that same cleanup.
         return False
       placements = "repair_pipelines" if operation.get("mutation") == "same_host_repair_v1" else "pipelines"
+      if operation.get("mutation") == STATELESS_REPLACEMENT:
+        placements = "replacement_pipelines"
+        if (record is None or record.get("replacement_licenses") != operation.get("replacement_licenses")
+            or record.get("replacement_owner") != operation["owner"]):
+          return False  # Recovery must not treat an ordinary grant as a scoped replacement grant.
       if (record is None or record.get(placements) != configs or
           (operation.get("mutation") == "same_host_repair_v1" and (
             record.get("repair_plan_cid") != operation["plan_cid"] or record.get("repair_grant") != operation["_repair_grant"]))):
@@ -449,7 +498,7 @@ class _DauthDeploymentSecretsMixin:
         raise RuntimeError("Deployment secret replication is pending.")
     return True
 
-  def _publish_deployment_secrets(self, job_id, operation, plan, pointer, deleted=False):
+  def _publish_deployment_secrets(self, job_id, operation, plan, pointer, deleted=False, resume_only=False):
     """
     Bind custodied secrets to a verified coordinator-signed final pointer.
 
@@ -482,11 +531,15 @@ class _DauthDeploymentSecretsMixin:
       True for a delete: the pointer must carry ``pipeline_cid`` None, the job's
       previous secret revision is revoked and an empty bundle is published in place
       of the prepared one. Default False.
+    resume_only : bool, optional
+      A replacement may finish only if an exact signed custody write or pointer
+      proves that publication already started.
 
     Returns
     -------
-    None
-      The bundle and the pointer are written to the chain store.
+    bool
+      True after publication. False when a resume-only call finds no proof of
+      an earlier write. A missing replica does not prove publication failed.
 
     Raises
     ------
@@ -517,12 +570,35 @@ class _DauthDeploymentSecretsMixin:
       raise ValueError("Invalid deployment publication pointer.")
     current = self.chainstore_hget(hkey=POINTERS, key=job_id)
     current_fields = {key: value for key, value in current.items() if key not in AUTH_FIELDS} if isinstance(current, dict) else current
+    replacing = operation.get("mutation") == STATELESS_REPLACEMENT
+    if replacing and pointer != operation.get("replacement_publication"):
+      raise ValueError("The replacement pointer must match the persisted publication intent.")
     already_published = current_fields == expected
+    if replacing and already_published:
+      # An unauthenticated replica cannot waive the exact placement check for a new publication.
+      already_published = (current.get("EE_SENDER") == operation["coordinator"]
+                           and self.bc.verify(current, return_full_info=True, log_hash_sign_fails=False).valid)
     if not already_published and (
       (isinstance(current, dict) and current.get("revision", 0) >= operation["target_revision"])
       or self._load_dauth_pipeline_cid(job_id) != operation.get("previous_pipeline_cid")
     ):
       raise ValueError("Deployment publication has been superseded.")
+    started = already_published
+    if replacing and not started:
+      # dAuth writes the signed current bundle before the public pointer. Either exact write can prove continuation.
+      previous_write = self._load_dauth_job_secret_bundle(job_id)
+      if isinstance(previous_write, dict) and all(
+        previous_write.get(key) == value for key, value in (
+          ("job_id", job_id), ("operation_id", operation["operation_id"]), ("coordinator", operation["coordinator"]),
+          ("deployment_revision", operation["target_revision"]), ("pipeline_cid", pointer["pipeline_cid"]), ("deleted", False),
+        )
+      ):
+        signature = self.bc.verify(previous_write, return_full_info=True, log_hash_sign_fails=False)
+        started = signature.valid and self.bc.is_dauth_oracle(
+          node_address_eth=self.bc.node_address_to_eth_address(signature.sender),
+        )
+    if resume_only and not started:
+      return False
     if deleted:
       self._revoke_deployment_secret_revisions(job_id, operation, plan, None)
       bundle = dict(job_id=job_id, job_secrets={})
@@ -541,14 +617,23 @@ class _DauthDeploymentSecretsMixin:
       reference = representative["DEEPLOY_SPECS"]["secret_revision"]
       record = self._deployment_secret_record(job_id, reference)
       placements = "repair_pipelines" if operation.get("mutation") == "same_host_repair_v1" else "pipelines"
+      if replacing:
+        placements = "replacement_pipelines"
+        if (record is None or record.get("replacement_licenses") != operation["replacement_licenses"]
+            or record.get("replacement_owner") != operation["owner"]):
+          raise ValueError("Replacement publication requires the reviewed credential grant.")
       if (record is None or record.get(placements) != configs or
           (operation.get("mutation") == "same_host_repair_v1" and record.get("repair_plan_cid") != operation["plan_cid"])):
         raise RuntimeError("Active deployment secrets are unavailable.")
-      bundle = {key: copy.deepcopy(value) for key, value in record.items() if key not in (placements, "repair_plan_cid", "repair_grant")}
+      bundle = {key: copy.deepcopy(value) for key, value in record.items()
+                if key not in (placements, "repair_plan_cid", "repair_grant", "replacement_licenses", "replacement_owner")}
     bundle.update(job_id=job_id, deployment_revision=operation["target_revision"],
                   operation_id=operation["operation_id"], coordinator=operation["coordinator"],
                   deleted=deleted, pipeline_cid=pointer["pipeline_cid"])
     self.bc.sign(bundle, add_data=True, use_digest=True)
+    if replacing and not started:
+      # Recheck after loading R1FS and immediately before the first write to custody.
+      check_replacement_placement(self, operation)
     if not self._write_dauth_job_secret_bundle(job_id, bundle):
       raise RuntimeError("Deployment secret publication is pending.")
     if not self._write_job_pipeline_cid(job_id, pointer):
@@ -556,6 +641,7 @@ class _DauthDeploymentSecretsMixin:
     previous_cid = operation.get("previous_pipeline_cid")
     if previous_cid and previous_cid != pointer["pipeline_cid"]:
       self._delete_pipeline_cid_from_r1fs(previous_cid)
+    return True
 
   def _revoke_deployment_secret_revisions(self, job_id, operation, plan, active_attempt):
     """
@@ -643,13 +729,19 @@ class _DauthDeploymentSecretsMixin:
       for attempt, key in (("deploy", "configs"), ("restore", "previous_configs")):
         if attempt != active_attempt and plan[key]:
           references.append(_revision_ref(operation, attempt))
-    if active_attempt and operation.get("mutation") == "same_host_repair_v1":
+    repair_parent = (operation.get("repair_parent") if operation.get("mutation")
+                     in ("same_host_repair_v1", STATELESS_REPLACEMENT) else None)
+    if active_attempt and repair_parent:
       if (pointer.get("coordinator") != operation["coordinator"] or pointer.get("EE_SENDER") != operation["coordinator"]
           or pointer.get("plan_cid") != operation["plan_cid"]
           or not self.bc.verify(pointer, return_full_info=True, log_hash_sign_fails=False).valid):
         raise ValueError("The repair publication is unauthenticated.")
       # The held parent's two grants remain valid until the child really publishes one of its plans.
-      parent_id = operation["repair_parent"]["operation_id"]
+    # A failed replacement that dispatched workers also supersedes the parent.
+    abandoned_parent = (operation.get("mutation") == STATELESS_REPLACEMENT and phase == "stopping_failed_rollout"
+                        and bool(operation["dispatched_nodes"]))
+    if repair_parent and (active_attempt or abandoned_parent):
+      parent_id = repair_parent["operation_id"]  # The custody context verified the held parent.
       references.extend((parent_id + ":deploy", parent_id + ":restore"))
     for reference in set(references):
       key = job_id + "|" + reference
@@ -673,10 +765,24 @@ class _DauthDeploymentSecretsMixin:
       self._prepare_deployment_secret_revisions(job_id, operation, plan, body)
       result["prepared"] = True
     elif action == "status":
-      result["prepared"] = self._deployment_secrets_prepared(job_id, operation, plan)
+      if operation.get("mutation") == STATELESS_REPLACEMENT and operation["phase"] == "finalizing":
+        # Old custodians refuse status in this phase, so none can start a fresh publication on this request.
+        pointer = body.get("pointer")
+        result["prepared"] = self._publish_deployment_secrets(job_id, operation, plan, pointer, resume_only=True)
+        result["publication_committed"] = result["prepared"]
+        result["pipeline_cid"] = pointer["pipeline_cid"]
+      else:
+        result["prepared"] = self._deployment_secrets_prepared(job_id, operation, plan)
     elif action == "revoke":
       self._revoke_deployment_secret_revisions(job_id, operation, plan, body.get("active_attempt"))
     else:
-      self._publish_deployment_secrets(job_id, operation, plan, body.get("pointer"), deleted=action == "delete")
+      try:
+        self._publish_deployment_secrets(job_id, operation, plan, body.get("pointer"), deleted=action == "delete")
+      except ReplacementPlacementMismatch:
+        if (action != "commit" or operation.get("mutation") != STATELESS_REPLACEMENT
+            or body.get("report_prewrite_refusal") is not True):
+          raise
+        # The checked placement failed before dAuth wrote either the bundle or pointer for this call.
+        result["publication_refused_before_write"] = True
       result["pipeline_cid"] = body["pointer"]["pipeline_cid"]
     return result
