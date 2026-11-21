@@ -1,0 +1,132 @@
+{
+ "computed": {
+  "same_as": "complete"
+ },
+ "intent_digest": "40d46d669bfbc518dd9bd80ee4752044fcbe42f5ca5e1b80bffe1decff0d3642",
+ "pack_view_sha256": "05300ce811ff9ece7160b94dfaeb21a905f50848765327052bf05665f9904c65",
+ "snapshot_envelope": {
+  "kind": "redmesh_framework_assessment",
+  "pack_id": "ro.dnsc.o1-2026",
+  "revision": 1,
+  "schema": "redmesh.framework_assessment.v1",
+  "schema_version": "1.0",
+  "snapshot": {
+   "artifact_kind": "self_assessment",
+   "assurance_level": "basic",
+   "claimant": {
+    "legal_name": "Example SRL",
+    "registration_id": "RO123",
+    "signer_name": "Ana Pop",
+    "signer_role": "Director"
+   },
+   "completion_date": "2026-10-06",
+   "country": "RO",
+   "dnsc_unique_id": "",
+   "external_supplier": "",
+   "level_provenance": {
+    "declared_by": "initial",
+    "kind": "risk_score",
+    "score": 42
+   },
+   "management_signoff": {
+    "date": "2026-10-06",
+    "name": "Ana Pop",
+    "role": "Director"
+   },
+   "manifest_version": null,
+   "missing_historical_provenance": true,
+   "pack_acts": [
+    "MO 712 bis/2026-08-27",
+    "MO 792/2026-09-18 (Ordin 2/2026)"
+   ],
+   "pack_hash": null,
+   "pack_id": "ro.dnsc.o1-2026",
+   "remediation": [],
+   "schema": "redmesh.framework_assessment.v1",
+   "sectoral_requirements": "",
+   "submission": {
+    "actor": "initial",
+    "fingerprint": "40d46d669bfbc518dd9bd80ee4752044fcbe42f5ca5e1b80bffe1decff0d3642",
+    "pack_acts": [
+     "MO 712 bis/2026-08-27",
+     "MO 792/2026-09-18 (Ordin 2/2026)"
+    ],
+    "request_id": "11111111-1111-4111-8111-111111111111",
+    "revision": 1,
+    "submitted_at": "2026-11-14T10:00:00Z"
+   },
+   "tenant_id": "tn_golden"
+  },
+  "tenant_id": "tn_golden"
+ },
+ "view": {
+  "archived": false,
+  "assessmentId": "default",
+  "assessmentRevision": 2,
+  "assuranceLevel": "basic",
+  "canManage": true,
+  "claimant": {
+   "legal_name": "Example SRL",
+   "registration_id": "RO123"
+  },
+  "completionDate": "2026-10-06",
+  "currentPackActs": [
+   "MO 712 bis/2026-08-27",
+   "MO 792/2026-09-18 (Ordin 2/2026)"
+  ],
+  "dnscUniqueId": "",
+  "externalSupplier": "",
+  "history": [
+   {
+    "actor": "initial",
+    "actorName": null,
+    "assuranceLevel": "basic",
+    "packActs": [
+     "MO 712 bis/2026-08-27",
+     "MO 792/2026-09-18 (Ordin 2/2026)"
+    ],
+    "revision": 1,
+    "submittedAt": "2026-11-14T10:00:00Z",
+    "verdict": {
+     "failing_categories": [],
+     "failing_key_measures": [],
+     "passed": true,
+     "total": 2.5,
+     "total_failed": false
+    }
+   }
+  ],
+  "latestRevision": 1,
+  "levelProvenance": {
+   "declared_by": "initial",
+   "kind": "risk_score",
+   "score": 42
+  },
+  "managementSignoff": {
+   "date": "2026-10-06",
+   "name": "Ana Pop",
+   "role": "Director"
+  },
+  "name": "",
+  "pack": null,
+  "packActs": [
+   "MO 712 bis/2026-08-27",
+   "MO 792/2026-09-18 (Ordin 2/2026)"
+  ],
+  "packId": "ro.dnsc.o1-2026",
+  "pending": null,
+  "persisted": true,
+  "remediation": [],
+  "reopenedFrom": null,
+  "sectoralRequirements": "",
+  "stale": {
+   "newerPackActs": false
+  },
+  "state": "submitted",
+  "submitErrors": [],
+  "tenantId": "tn_golden",
+  "updatedAt": "2026-11-14T10:00:00Z",
+  "updatedBy": "initial",
+  "updatedByName": null
+ }
+}

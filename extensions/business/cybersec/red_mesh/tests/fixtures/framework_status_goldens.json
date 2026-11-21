@@ -1,0 +1,103 @@
+[
+  {
+    "name": "empty",
+    "default_entry": null,
+    "entries": {},
+    "computed": {
+      "scoring": "compliance_status.v1",
+      "counts": {
+        "implemented": 0,
+        "partial": 0,
+        "not_implemented": 0,
+        "na": 0,
+        "unanswered": 161
+      },
+      "verdict": {
+        "passed": null
+      }
+    },
+    "submit_error_codes": [
+      "unscored"
+    ]
+  },
+  {
+    "name": "evidence_only",
+    "default_entry": null,
+    "entries": {
+      "0": {
+        "evidence_refs": [
+          "contract"
+        ]
+      }
+    },
+    "computed": {
+      "scoring": "compliance_status.v1",
+      "counts": {
+        "implemented": 0,
+        "partial": 0,
+        "not_implemented": 0,
+        "na": 0,
+        "unanswered": 161
+      },
+      "verdict": {
+        "passed": null
+      }
+    },
+    "submit_error_codes": [
+      "unscored"
+    ]
+  },
+  {
+    "name": "mixed",
+    "default_entry": {
+      "status": "implemented"
+    },
+    "entries": {
+      "0": {
+        "status": "partial"
+      },
+      "1": {
+        "status": "not_implemented"
+      },
+      "2": {
+        "status": "na",
+        "rationale": "Proportionate alternative documented under Article 2 and Recital 4."
+      }
+    },
+    "computed": {
+      "scoring": "compliance_status.v1",
+      "counts": {
+        "implemented": 158,
+        "partial": 1,
+        "not_implemented": 1,
+        "na": 1,
+        "unanswered": 0
+      },
+      "verdict": {
+        "passed": null
+      }
+    },
+    "submit_error_codes": []
+  },
+  {
+    "name": "complete",
+    "default_entry": {
+      "status": "implemented"
+    },
+    "entries": {},
+    "computed": {
+      "scoring": "compliance_status.v1",
+      "counts": {
+        "implemented": 161,
+        "partial": 0,
+        "not_implemented": 0,
+        "na": 0,
+        "unanswered": 0
+      },
+      "verdict": {
+        "passed": null
+      }
+    },
+    "submit_error_codes": []
+  }
+]

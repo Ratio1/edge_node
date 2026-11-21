@@ -10,6 +10,7 @@ from uuid import uuid4
 from extensions.business.cybersec.red_mesh.services import data_maintenance
 from .contract_fixture import install_contract
 from .test_execution_binding_models import binding_payload
+from .test_framework_manifest import static_dir
 from .test_tenant_administration import FakeAdministrationStore
 
 TENANCY = '["redmesh","tenancy",1,"deployment"]'
@@ -129,10 +130,60 @@ class TestDataMaintenance(unittest.TestCase):
 
   def assessment_row(self, tenant_id):
     return {"schemaVersion": 1, "namespace": "deployment", "kind": "framework_assessment", "ids": [tenant_id, "ro.dnsc.o1-2026"],
+            "row_format": 2,
             "tenant_id": tenant_id, "pack_id": "ro.dnsc.o1-2026", "pack_acts": [], "assurance_level": None,
             "level_provenance": None, "sectoral_requirements": "", "completion_date": "", "management_signoff": None,
             "remediation": [], "state": "draft", "assessment_revision": 1, "reopened_from": None, "pending": None,
             "scores": {}, "submissions": [], "created_by": "initial", "created_at": "t", "updated_by": "initial", "updated_at": "t"}
+
+  def test_profile_singleton_backup_restore_and_current_old_orphan_classification(self):
+    result = self.plugin.save_tenant_compliance_profile(self.actor, self.tenant, {"country": "DE"}, 0, str(uuid4()))
+    self.assertTrue(result["success"], result)
+    field = json.dumps(["compliance_profile", "deployment", self.tenant], separators=(",", ":"))
+    rows = self.scan()
+    current = rows[(COMPLIANCE, field)]
+    self.assertEqual(current["class"], "current")
+    self.assertEqual(current["cids"], [])
+    row = current["value"]
+    self.storage.data[(COMPLIANCE, field)] = None
+    restored = self.plugin.restore_redmesh_records(self.actor, [{"hkey": COMPLIANCE, "field": field, "value": row}])
+    self.assertTrue(restored["success"], restored)
+    self.assertEqual(restored["data"]["outcomes"][0]["outcome"], "written")
+    self.assertEqual(self.storage.data[(COMPLIANCE, field)], row)
+    tenant_key = json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":"))
+    tenant = self.storage.data[(TENANCY, tenant_key)]
+    tenant["active"] = False
+    self.assertEqual(self.scan()[(COMPLIANCE, field)]["class"], "current")
+    tenant["schemaVersion"] = 0
+    self.assertEqual(self.scan()[(COMPLIANCE, field)]["class"], "old")
+    self.storage.data[(TENANCY, tenant_key)] = None
+    orphan = self.scan()[(COMPLIANCE, field)]
+    self.assertEqual(orphan["class"], "orphan")
+    self.assertEqual(self.clean(orphan)[0]["outcome"], "deleted")
+    # Malformed singleton is recognized as old, rather than accidentally parsed as assessment ids.
+    row["revision"] = 0
+    self.put(COMPLIANCE, field, row)
+    self.assertEqual(self.scan()[(COMPLIANCE, field)]["class"], "old")
+
+  def test_review_rows_classify_current_old_orphan_and_carry_the_stored_value_hash(self):
+    def review(tenant, **extra):
+      return {"schemaVersion": 1, "namespace": "deployment", "kind": "framework_assessment_review",
+        "ids": [tenant, "ro.dnsc.o1-2026", "default", "1"], "tenant_id": tenant,
+        "pack_id": "ro.dnsc.o1-2026", "assessment_id": "default", "submitted_revision": 1,
+        "fingerprint": "a" * 64, "review_revision": 1, "history": [{"actor": "creator", "action": "submit",
+          "time": "2026-11-16T00:00:00Z", "revision": 1, "request_id": str(uuid4()),
+          "control_id": None, "comment": None, "self_approved": False}], **extra}
+    fields = {}
+    for tenant, extra in ((self.tenant, {}), ("tn_gone", {}), ("tn_bad", {"review_revision": 0})):
+      field = json.dumps(["framework_assessment_review", "deployment", tenant, "ro.dnsc.o1-2026", "default", "1"], separators=(",", ":"))
+      fields[tenant] = field
+      self.put(COMPLIANCE, field, review(tenant, **extra))
+    rows = self.scan()
+    for tenant, expected in ((self.tenant, "current"), ("tn_gone", "orphan"), ("tn_bad", "old")):
+      row = rows[(COMPLIANCE, fields[tenant])]
+      self.assertEqual(row["class"], expected)
+      self.assertIn("sha256", row)
+      self.assertEqual(row["sha256"], data_maintenance.row_sha256(self.storage.data[(COMPLIANCE, fields[tenant])]))
 
   def test_assessment_rows_are_registered_and_classified_by_their_tenant(self):
     field = lambda tenant_id: json.dumps(["framework_assessment", "deployment", tenant_id, "ro.dnsc.o1-2026"], separators=(",", ":"))
@@ -164,6 +215,22 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertEqual((gone["class"], gone["reason"]), ("orphan", "tenant_gone"))
     for key in (field("tn_bad", fa), field(self.tenant, "fa_bad"), field(self.tenant, fa, "x")):
       self.assertEqual((rows[(COMPLIANCE, key)]["class"], rows[(COMPLIANCE, key)]["reason"]), ("old", "unrecognized"), key)
+
+  def test_row_format_marker_pack_and_retirement_decide_the_assessment_class(self):
+    """RM-182 phase 4: no marker or an unknown pack is `old` / `unrecognized`; a retired pack stays `current`."""
+    field = lambda pack: json.dumps(["framework_assessment", "deployment", self.tenant, pack], separators=(",", ":"))
+    unmarked = {key: value for key, value in self.assessment_row(self.tenant).items() if key != "row_format"}
+    unknown = {**self.assessment_row(self.tenant), "pack_id": "cyfun.2025", "ids": [self.tenant, "cyfun.2025"]}
+    self.put(COMPLIANCE, field("ro.dnsc.o1-2026"), unmarked)
+    self.put(COMPLIANCE, field("cyfun.2025"), unknown)
+    rows = self.scan()
+    for pack in ("ro.dnsc.o1-2026", "cyfun.2025"):
+      self.assertEqual((rows[(COMPLIANCE, field(pack))]["class"], rows[(COMPLIANCE, field(pack))]["reason"]),
+                       ("old", "unrecognized"), pack)
+    self.put(COMPLIANCE, field("ro.dnsc.o1-2026"), self.assessment_row(self.tenant))
+    static_dir(self, edit=lambda manifest: manifest["packs"][0].__setitem__("status", "retired"))
+    rows = self.scan()
+    self.assertEqual(rows[(COMPLIANCE, field("ro.dnsc.o1-2026"))]["class"], "current")
 
   # -- authorization ----------------------------------------------------------------------------
 

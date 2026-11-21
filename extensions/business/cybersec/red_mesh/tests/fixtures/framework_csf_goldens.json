@@ -1,0 +1,11 @@
+{
+  "description": "Hand-authored CSF profile expectations. First three source IDs only; all other outcomes unanswered.",
+  "cases": [
+    {"name":"partial","scores":{"GV.OC-01":{"included":true,"current_rating":1}},"current_profile":[{"ref_id":"GV.OC-01","rating":1}],"target_profile":[],"gaps":[],"counts":{"included":1,"excluded":0,"unanswered":105,"gaps":0},"missing_first":{"ref_id":"GV.OC-01","fields":["target_rating"]}},
+    {"name":"positive","scores":{"GV.OC-01":{"included":true,"current_rating":1,"target_rating":5}},"current_profile":[{"ref_id":"GV.OC-01","rating":1}],"target_profile":[{"ref_id":"GV.OC-01","rating":5}],"gaps":[{"ref_id":"GV.OC-01","current_rating":1,"target_rating":5,"gap":4}],"counts":{"included":1,"excluded":0,"unanswered":105,"gaps":1}},
+    {"name":"zero","scores":{"GV.OC-01":{"included":true,"current_rating":3,"target_rating":3}},"current_profile":[{"ref_id":"GV.OC-01","rating":3}],"target_profile":[{"ref_id":"GV.OC-01","rating":3}],"gaps":[],"counts":{"included":1,"excluded":0,"unanswered":105,"gaps":0}},
+    {"name":"negative","scores":{"GV.OC-01":{"included":true,"current_rating":5,"target_rating":1}},"current_profile":[{"ref_id":"GV.OC-01","rating":5}],"target_profile":[{"ref_id":"GV.OC-01","rating":1}],"gaps":[],"counts":{"included":1,"excluded":0,"unanswered":105,"gaps":0}},
+    {"name":"excluded_retains","scores":{"GV.OC-01":{"included":false,"rationale":"Outside profile scope","current_rating":1,"target_rating":5}},"current_profile":[],"target_profile":[],"gaps":[],"counts":{"included":0,"excluded":1,"unanswered":105,"gaps":0}},
+    {"name":"evidence_only","scores":{"GV.OC-01":{"evidence_refs":["contract"]}},"current_profile":[],"target_profile":[],"gaps":[],"counts":{"included":0,"excluded":0,"unanswered":106,"gaps":0},"missing_first":{"ref_id":"GV.OC-01","fields":["included"]}}
+  ]
+}
