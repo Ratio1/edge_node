@@ -38,7 +38,7 @@ class TestWorstCaseRow(FrameworkAssessmentFixture):
         out[ref] = {"documentation": 5, "implementation": 5, "excluded": False, "evidence_refs": refs(),
                     "justification": {"documentation": wide, "implementation": wide}, "exclusion_justification": wide}
       else:
-        out[ref] = {"status": "implemented", "rationale": wide, "evidence_refs": refs()}
+        out[ref] = {"status": "criteria_met", "rationale": wide, "evidence_refs": refs()}
     return out
 
   def worst_draft(self, pack, level):

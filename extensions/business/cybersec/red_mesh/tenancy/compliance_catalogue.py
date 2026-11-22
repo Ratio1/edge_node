@@ -22,6 +22,7 @@ from ..references.framework_packs import (
 )
 from ..services.framework_scoring import scorer_for
 from . import compliance
+from .ports import TenantStoreError
 from .assets import canonical_uuid
 
 # `compliance` is only reached through the module at call time: it imports this module lazily, and
@@ -73,13 +74,35 @@ def status_of(row):
   return "draft" if row.get("scores") or row["submissions"] else "not_started"
 
 
-def _summary(row, names, can_manage):
+def _review_state(service, row):
+  """Review status and `self_approved` of the latest submitted revision, from one review-row read.
+  (None, None) before any submit, or when the review row is refused by the validator or bound to another
+  fingerprint: a bad review row never fails the list. A submission whose review row is not written yet
+  is "submitted", as the review read would rebuild it."""
+  from . import compliance_review as review
+  if not row["submissions"]:
+    return None, None
+  sub = row["submissions"][-1]
+  store, ids = compliance._store(service), review._ids(row, sub)
+  raw = store.raw_record(review.KIND, *ids)
+  try:
+    record = store.validate_record(raw, review.KIND, *ids) if raw is not None else None
+  except TenantStoreError:
+    return None, None
+  if record is not None and record["fingerprint"] != sub["fingerprint"]:
+    return None, None
+  return review.review_status(record["history"] if record else [], sub.get("review_return"))
+
+
+def _summary(service, row, names, can_manage):
+  review_status, self_approved = _review_state(service, row)
   return {
     "assessmentId": row.get("assessment_id") or compliance.DEFAULT_ID, "packId": row["pack_id"], "name": row.get("name") or "",
     "assuranceLevel": row.get("assurance_level"), "status": status_of(row),
     "latestRevision": compliance.latest_revision(row), "assessmentRevision": row["assessment_revision"],
     "archived": bool(row.get("archived")), "updatedBy": row["updated_by"], "updatedByName": names(row["updated_by"]),
     "updatedAt": row["updated_at"], "createdAt": row["created_at"], "canManage": can_manage,
+    "reviewStatus": review_status, "selfApproved": self_approved,
   }
 
 
@@ -95,7 +118,7 @@ def list_assessments(service, actor, tenant_id, pack_id="", include_archived=Fal
           if include_archived or not row.get("archived")]
   rows.sort(key=lambda row: (row["updated_at"], row.get("assessment_id") or compliance.DEFAULT_ID), reverse=True)
   unavailable.sort(key=lambda entry: (entry["packId"], entry["assessmentId"]))
-  return [_summary(row, names, can_manage) for row in rows] + unavailable
+  return [_summary(service, row, names, can_manage) for row in rows] + unavailable
 
 
 def list_packs(service, actor, tenant_id):

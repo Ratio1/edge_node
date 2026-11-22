@@ -3,9 +3,11 @@ from ..references.framework_packs import FrameworkPackError, pack_levels
 from .framework_entry_validation import AssessmentInvalid, bounded_text, normalize_evidence_refs
 
 SCORING_ID = "compliance_status.v1"
-STATUS_VALUES = ("implemented", "partial", "not_implemented", "na")
+STATUS_VALUES = ("insufficient_evidence", "criteria_met", "partly_met", "criteria_not_met")
+APPLICABILITY_VALUES = ("applies", "not_applicable")
 CAPS = {"rationale": 500, "evidence_refs": 5}
-_ENTRY_KEYS = frozenset({"status", "rationale", "evidence_refs", "updated_by", "updated_at"})
+# Stored entries keep this exact key set; `applicability` is always written (default "applies").
+_ENTRY_KEYS = frozenset({"status", "applicability", "rationale", "evidence_refs", "updated_by", "updated_at"})
 
 
 def check_pack(pack, text):
@@ -21,16 +23,21 @@ def _entry(entry, *, actor, now, rules):
   value = entry.get("status")
   if value is not None and (not isinstance(value, str) or value not in STATUS_VALUES):
     raise AssessmentInvalid("invalid_score_value")
+  applicability = entry.get("applicability", "applies")
+  if not isinstance(applicability, str) or applicability not in APPLICABILITY_VALUES:
+    raise AssessmentInvalid("invalid_score_value")
+  if applicability == "not_applicable" and value is not None:
+    raise AssessmentInvalid("invalid_score_value")
   rationale = bounded_text(entry.get("rationale"), CAPS["rationale"])
   try:
     rationale.encode("utf-8")
   except UnicodeEncodeError:
     raise AssessmentInvalid("invalid_request") from None
-  if value == "na" and rules.get("exclusion_reason_required", True) and not rationale:
+  if applicability == "not_applicable" and rules.get("exclusion_reason_required", True) and not rationale:
     raise AssessmentInvalid("exclusion_justification_missing")
-  if value is not None and value != "na" and rules.get("justification_required", False) and not rationale:
+  if applicability == "applies" and value is not None and rules.get("justification_required", False) and not rationale:
     raise AssessmentInvalid("justification_missing")
-  return {"status": value, "rationale": rationale,
+  return {"status": value, "applicability": applicability, "rationale": rationale,
           "evidence_refs": normalize_evidence_refs(entry.get("evidence_refs")),
           "updated_by": actor, "updated_at": now}
 
@@ -61,10 +68,14 @@ def validate_stored_entry(pack, ref_id, entry):
 
 
 def compute(pack, level, scores, *, context=None):
-  counts = {key: 0 for key in (*STATUS_VALUES, "unanswered")}
+  counts = {key: 0 for key in (*STATUS_VALUES, "not_applicable", "unanswered")}
   for control in pack["controls"]:
-    value = (scores.get(control["ref_id"]) or {}).get("status")
-    counts[value if value in STATUS_VALUES else "unanswered"] += 1
+    entry = scores.get(control["ref_id"]) or {}
+    value = entry.get("status")
+    if entry.get("applicability") == "not_applicable":
+      counts["not_applicable"] += 1
+    else:
+      counts[value if value in STATUS_VALUES else "unanswered"] += 1
   return {"scoring": SCORING_ID, "counts": counts, "verdict": {"passed": None}}
 
 
@@ -77,7 +88,8 @@ def validate_for_submit(pack, rules, level, draft):
     errors.extend(validate_stored_entry(pack, ref_id, entry))
   if errors:
     return errors, None
-  missing = [c["ref_id"] for c in pack["controls"] if (scores.get(c["ref_id"]) or {}).get("status") is None]
+  missing = [c["ref_id"] for c in pack["controls"]
+             if (e := scores.get(c["ref_id"]) or {}).get("applicability") != "not_applicable" and e.get("status") is None]
   if missing:
     errors.append({"code": "unscored", "ids": sorted(missing)})
   for ref_id, entry in scores.items():
@@ -91,7 +103,8 @@ def validate_for_submit(pack, rules, level, draft):
 
 
 def entry_schema(pack):
-  return {"fields": ["status", "rationale", "evidence_refs"], "values": [None, *STATUS_VALUES], "caps": dict(CAPS)}
+  return {"fields": ["status", "applicability", "rationale", "evidence_refs"], "values": [None, *STATUS_VALUES],
+          "applicability_values": list(APPLICABILITY_VALUES), "caps": dict(CAPS)}
 
 
 def verdict_summary(computed):
@@ -99,7 +112,7 @@ def verdict_summary(computed):
 
 
 def pack_view_extras(pack, text):
-  return {"status_values": list(STATUS_VALUES), "assessment_label": "Annex self-assessment"}
+  return {"status_values": list(STATUS_VALUES), "applicability_values": list(APPLICABILITY_VALUES), "assessment_label": "Annex self-assessment"}
 
 
 def capabilities():

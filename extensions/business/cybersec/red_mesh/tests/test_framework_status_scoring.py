@@ -22,7 +22,7 @@ class TestStatusScoring(unittest.TestCase):
   def expected_scores(inputs):
     """Stored form of each input entry: status/rationale default to None/"", refs become linked refs,
     and the actor and time are stamped by the normaliser."""
-    return {ref: {"status": entry.get("status"), "rationale": entry.get("rationale", ""),
+    return {ref: {"status": entry.get("status"), "applicability": entry.get("applicability", "applies"), "rationale": entry.get("rationale", ""),
                   "evidence_refs": [{"ref": r, "review_state": "linked"} for r in entry.get("evidence_refs", [])],
                   "updated_by": "initial", "updated_at": "2026-11-16T00:00:00Z"}
             for ref, entry in inputs.items()}
@@ -43,15 +43,18 @@ class TestStatusScoring(unittest.TestCase):
   def test_invalid_entries_and_caps(self):
     for entry in ({"status":"unknown"}, {"documentation":3}, {"status":[]},
                   {"rationale":"x"*501}, {"evidence_refs":["contract"]*6},
-                  {"status":"na", "rationale":"  "}):
+                  {"applicability":"not_applicable", "rationale":"  "},
+                  {"applicability":"not_applicable", "status":"criteria_met", "rationale":"why"},
+                  {"applicability":"sometimes"}, {"applicability":None}, {"status":"na"}):
       with self.subTest(entry=entry), self.assertRaises(AssessmentInvalid):
         self.normalise({self.ids[0]:entry})
-    good = self.normalise({self.ids[0]:{"status":"partial", "rationale":"x"*500, "evidence_refs":["contract"],
+    good = self.normalise({self.ids[0]:{"status":"partly_met", "rationale":"x"*500, "evidence_refs":["contract"],
                                        "updated_by":"forged", "updated_at":"forged"}})[self.ids[0]]
     self.assertEqual(good["updated_by"], "initial")
     self.assertEqual(good["updated_at"], "2026-11-16T00:00:00Z")
     self.assertEqual(status.validate_stored_entry(self.pack, self.ids[0], good), [])
-    for broken in ({**good,"extra":1}, {**good,"status":"wat"}, {**good,"rationale":" x "},
+    for broken in ({**good,"extra":1}, {**good,"status":"wat"}, {**good,"status":"criteria_met","applicability":"not_applicable"},
+                   {k:v for k,v in good.items() if k!="applicability"}, {**good,"rationale":" x "},
                    {**good,"evidence_refs":["contract"]}, {**good,"updated_by":None},
                    {k:v for k,v in good.items() if k!="updated_at"}):
       self.assertTrue(status.validate_stored_entry(self.pack,self.ids[0],broken))
@@ -63,8 +66,8 @@ class TestStatusScoring(unittest.TestCase):
     for surrogate in ("\ud800", "\udfff"):
       with self.subTest(codepoint=ord(surrogate)):
         with self.assertRaises(AssessmentInvalid):
-          self.normalise({ref: {"status": "partial", "rationale": surrogate}})
-        entry = {"status": "partial", "rationale": surrogate, "evidence_refs": [],
+          self.normalise({ref: {"status": "partly_met", "rationale": surrogate}})
+        entry = {"status": "partly_met", "applicability": "applies", "rationale": surrogate, "evidence_refs": [],
                  "updated_by": "initial", "updated_at": "2026-11-16T00:00:00Z"}
         self.assertTrue(status.validate_stored_entry(self.pack, ref, entry))
 
@@ -72,9 +75,9 @@ class TestStatusScoring(unittest.TestCase):
     ref = self.ids[0]
     with self.assertRaises(AssessmentInvalid):
       status.normalise_patch(self.pack, {**self.rules, "justification_required": True},
-                             {ref: {"status": "partial"}}, actor="initial", now="now")
+                             {ref: {"status": "partly_met"}}, actor="initial", now="now")
     scores = status.normalise_patch(self.pack, {**self.rules, "exclusion_reason_required": False},
-                                    {ref: {"status": "na"}}, actor="initial", now="now")
+                                    {ref: {"applicability": "not_applicable"}}, actor="initial", now="now")
     self.assertEqual(status.validate_stored_entry(self.pack, ref, scores[ref]), [])
     errors, _ = status.validate_for_submit(self.pack, self.rules, None, {"scores": scores})
     self.assertIn("exclusion_justification_missing", [e["code"] for e in errors])
@@ -84,4 +87,35 @@ class TestStatusScoring(unittest.TestCase):
     self.assertEqual(status.capabilities(), {"has_levels":False,"has_verdict":False,"has_remediation":False,"axes":[]})
     self.assertEqual(status.entry_schema(self.pack)["caps"], {"rationale":500,"evidence_refs":5})
     self.assertEqual(status.verdict_summary(status.compute(self.pack,None,{})),
-                     {"passed":None,"counts":{"implemented":0,"partial":0,"not_implemented":0,"na":0,"unanswered":161}})
+                     {"passed":None,"counts":{"insufficient_evidence":0,"criteria_met":0,"partly_met":0,"criteria_not_met":0,
+                                 "not_applicable":0,"unanswered":161}})
+
+  def test_submit_refuses_missing_entry_and_explicit_null_status(self):
+    full = self.normalise({ref: {"status": "criteria_met"} for ref in self.ids})
+    for label, scores in (("missing", {k: v for k, v in full.items() if k != self.ids[0]}),
+                          ("null", {**full, **self.normalise({self.ids[0]: {"status": None}})})):
+      with self.subTest(label):
+        errors, computed = status.validate_for_submit(self.pack, self.rules, None, {"scores": scores})
+        self.assertEqual(errors, [{"code": "unscored", "ids": [self.ids[0]]}])
+        self.assertEqual(computed["counts"]["unanswered"], 1)
+
+  def test_insufficient_evidence_is_a_gap_and_not_applicable_needs_no_status(self):
+    scores = self.normalise({ref: {"status": "criteria_met"} for ref in self.ids[2:]} |
+                            {self.ids[0]: {"status": "insufficient_evidence"},
+                             self.ids[1]: {"applicability": "not_applicable", "rationale": "Out of scope."}})
+    errors, computed = status.validate_for_submit(self.pack, self.rules, None, {"scores": scores})
+    self.assertEqual(errors, [])
+    self.assertEqual((computed["counts"]["insufficient_evidence"], computed["counts"]["not_applicable"]), (1, 1))
+    schema = status.entry_schema(self.pack)
+    self.assertEqual(schema["values"], [None, "insufficient_evidence", "criteria_met", "partly_met", "criteria_not_met"])
+    self.assertEqual(schema["applicability_values"], ["applies", "not_applicable"])
+    self.assertEqual(status.pack_view_extras(self.pack, "")["applicability_values"], ["applies", "not_applicable"])
+
+  def test_justification_required_only_for_applicable_controls_with_a_status(self):
+    rules = {**self.rules, "justification_required": True, "exclusion_reason_required": False}
+    scores = status.normalise_patch(self.pack, rules, {self.ids[0]: {"applicability": "not_applicable"},
+                                                       self.ids[1]: {"evidence_refs": ["contract"]}},
+                                    actor="initial", now="now")
+    self.assertEqual(set(scores), {self.ids[0], self.ids[1]})
+    with self.assertRaises(AssessmentInvalid):
+      status.normalise_patch(self.pack, rules, {self.ids[2]: {"status": "criteria_met"}}, actor="initial", now="now")

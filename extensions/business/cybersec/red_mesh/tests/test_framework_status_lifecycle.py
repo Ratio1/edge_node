@@ -19,7 +19,7 @@ class StatusLifecycleFixture(FrameworkAssessmentFixture):
     return self.plugin.submit_framework_assessment(self.admin,self.tenant,PACK,revision,request or str(uuid4()),None,aid)
 
   def full_scores(self):
-    return {c['ref_id']:{'status':'implemented'} for c in packs.load_framework_pack(PACK)['controls']}
+    return {c['ref_id']:{'status':'criteria_met'} for c in packs.load_framework_pack(PACK)['controls']}
 
 class TestStatusLifecycle(StatusLifecycleFixture):
   def test_eu27_country_catalogue_and_non_eu_rejection(self):
@@ -41,11 +41,11 @@ class TestStatusLifecycle(StatusLifecycleFixture):
     self.assertIsNone(saved['scores'][ref]['status'])
     self.assertEqual(saved['computed']['counts']['unanswered'],161)
     self.refused(self.submit_status(aid,saved['assessmentRevision']),400,'assessment_invalid')
-    for entry in ({'status':'na'},{'documentation':3},{'status':'wrong'}, {'evidence_refs':['job:foreign:1']}):
+    for entry in ({'status':'na'},{'applicability':'not_applicable'},{'documentation':3},{'status':'wrong'}, {'evidence_refs':['job:foreign:1']}):
       self.refused(self.save_status(aid,{'scores':{ref:entry}},saved['assessmentRevision']),400,'assessment_invalid')
     before=copy.deepcopy(self.storage.data)
     for surrogate in ("\ud800","\udfff"):  # lone surrogate rationale: refused, storage untouched
-      self.refused(self.save_status(aid,{'scores':{ref:{'status':'partial','rationale':surrogate}}},saved['assessmentRevision']),400,'assessment_invalid')
+      self.refused(self.save_status(aid,{'scores':{ref:{'status':'partly_met','rationale':surrogate}}},saved['assessmentRevision']),400,'assessment_invalid')
       self.assertEqual(self.storage.data,before)
     deleted=self.ok(self.save_status(aid,{'scores':{ref:None}},saved['assessmentRevision']))
     self.assertEqual(deleted['scores'],{})
@@ -53,11 +53,11 @@ class TestStatusLifecycle(StatusLifecycleFixture):
 
   def test_submit_freezes_then_review_return_and_resubmit(self):
     made=self.create_status();aid=made['assessmentId'];scores=self.full_scores();refs=list(scores)
-    scores[refs[0]]={'status':'na','rationale':'Proportionate alternative, Article 2/Recital 4.'}
-    scores[refs[1]]={'status':'partial'};scores[refs[2]]={'status':'not_implemented'}
+    scores[refs[0]]={'applicability':'not_applicable','rationale':'Proportionate alternative, Article 2/Recital 4.'}
+    scores[refs[1]]={'status':'partly_met'};scores[refs[2]]={'status':'criteria_not_met'}
     saved=self.ok(self.save_status(aid,{'scores':scores},1))
     self.assertEqual(saved['submitErrors'],[])
-    self.assertEqual(saved['computed']['counts'],dict(implemented=158,partial=1,not_implemented=1,na=1,unanswered=0))
+    self.assertEqual(saved['computed']['counts'],dict(insufficient_evidence=0,criteria_met=158,partly_met=1,criteria_not_met=1,not_applicable=1,unanswered=0))
     self.documents.fail=True;request=str(uuid4())
     self.refused(self.submit_status(aid,saved['assessmentRevision'],request),503,'unavailable')
     row=self.stored_row();frozen=copy.deepcopy(row['pending']['historical_context'])
@@ -81,3 +81,52 @@ class TestStatusLifecycle(StatusLifecycleFixture):
     self.assertIsNone(done['submissions'][1]['verdict']['passed'])
     self.ok(self.plugin.reopen_framework_assessment(self.admin,self.tenant,PACK,done['assessment_revision'],str(uuid4()),aid))
     self.assertEqual(self.stored_row()['state'],'draft')
+
+  def test_list_summary_carries_review_status_of_latest_submission(self):
+    made=self.create_status();aid=made['assessmentId']
+    def listed():
+      row=next(r for r in self.ok(self.plugin.list_framework_assessments(self.admin,self.tenant,PACK,False)) if r['assessmentId']==aid)
+      return row['reviewStatus'],row['selfApproved']
+    self.assertEqual(listed(),(None,None))
+    saved=self.ok(self.save_status(aid,{'scores':self.full_scores()},1))
+    self.ok(self.submit_status(aid,saved['assessmentRevision']))
+    self.assertEqual(listed(),('submitted',False))
+    self.ok(self.plugin.mutate_framework_assessment_review(self.creator,self.tenant,PACK,1,'return',1,str(uuid4()),None,None,aid))
+    self.assertEqual(listed(),('returned_for_changes',False))
+    self.ok(self.submit_status(aid,self.stored_row()['assessment_revision']))
+    self.assertEqual(listed(),('submitted',False))
+    self.ok(self.plugin.mutate_framework_assessment_review(self.creator,self.tenant,PACK,2,'approve',1,str(uuid4()),None,None,aid))
+    self.assertEqual(listed(),('internally_approved',False))
+    own=self.create_status('FR')['assessmentId']  # submitted and approved by the same reviewer: self-approved
+    saved=self.ok(self.plugin.save_framework_assessment_draft(self.creator,self.tenant,PACK,{'scores':self.full_scores()},1,own))
+    self.ok(self.plugin.submit_framework_assessment(self.creator,self.tenant,PACK,saved['assessmentRevision'],str(uuid4()),None,own))
+    self.ok(self.plugin.mutate_framework_assessment_review(self.creator,self.tenant,PACK,1,'approve',1,str(uuid4()),None,None,own))
+    row=next(r for r in self.ok(self.plugin.list_framework_assessments(self.admin,self.tenant,PACK,False)) if r['assessmentId']==own)
+    self.assertEqual((row['reviewStatus'],row['selfApproved']),('internally_approved',True))
+
+  def test_list_summary_survives_unusable_review_rows(self):
+    from extensions.business.cybersec.red_mesh.tenancy import compliance_review as r
+    aid=self.create_status('DE')['assessmentId'];other=self.create_status('FR')['assessmentId']
+    def listed(which):
+      return next(x for x in self.ok(self.plugin.list_framework_assessments(self.admin,self.tenant,PACK,False)) if x['assessmentId']==which)
+    for which in (aid,other):
+      saved=self.ok(self.save_status(which,{'scores':self.full_scores()},1))
+      self.ok(self.submit_status(which,saved['assessmentRevision']))
+    key=next(k for k,v in self.storage.data.items() if isinstance(v,dict) and v.get('kind')==r.KIND and v['ids'][2]==aid)
+    good=copy.deepcopy(self.storage.data[key])
+    self.storage.data[key]['history'][0]['action']='unknown'  # refused by the validator
+    self.assertEqual((listed(aid)['reviewStatus'],listed(aid)['selfApproved']),(None,None))
+    self.assertEqual(listed(other)['reviewStatus'],'submitted')
+    self.storage.data[key]={**good,'fingerprint':'b'*64}  # bound to another submission
+    self.assertIsNone(listed(aid)['reviewStatus'])
+    self.storage.data[key]=None  # review row not written yet: still submitted
+    self.assertEqual(listed(aid)['reviewStatus'],'submitted')
+    self.storage.data[key]=good
+    self.assertEqual(listed(aid)['reviewStatus'],'submitted')
+    self.ok(self.plugin.mutate_framework_assessment_review(self.creator,self.tenant,PACK,1,'return',1,str(uuid4()),None,None,aid))
+    returned=copy.deepcopy(self.storage.data[key])
+    self.storage.data[key]={**returned,'history':returned['history'][:1],'review_revision':1}  # receipt not yet copied
+    self.assertEqual((listed(aid)['reviewStatus'],listed(aid)['selfApproved']),('returned_for_changes',False))
+    self.storage.data[key]=None  # receipt alone, review row missing
+    self.assertEqual(listed(aid)['reviewStatus'],'returned_for_changes')
+

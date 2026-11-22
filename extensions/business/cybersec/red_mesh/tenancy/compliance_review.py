@@ -131,18 +131,25 @@ def _bound(service, actor, tenant_id, pack_id, revision, snapshot, assessment_id
   return tenant, account, row, sub, reconcile(service, row, sub, repaired), repaired
 
 
+def review_status(history, receipt=None):
+  """`(status, self_approved)` from the review history; a return `receipt` not yet in it counts as an event."""
+  events = list(history) + ([receipt] if receipt and receipt not in history else [])
+  decision = next((e for e in reversed(events) if e["action"] in ("approve", "return")), None)
+  if decision is None:
+    return "submitted", False
+  return ("internally_approved" if decision["action"] == "approve" else "returned_for_changes"), decision["self_approved"]
+
+
 def _view(service, tenant, account, row, review, snapshot, replayed=False, repaired=()):
   names = c.name_resolver(service)
-  decisions = [e for e in review["history"] if e["action"] in ("approve", "return")]
-  decision = decisions[-1] if decisions else None
+  status, self_approved = review_status(review["history"])
   active = (not row.get("archived") and row["state"] == "submitted"
             and c.latest_revision(row) == review["submitted_revision"])
   return {k: copy.deepcopy(review[k]) for k in ("tenant_id", "pack_id", "assessment_id", "submitted_revision",
       "fingerprint", "review_revision", "history")} | {
     "actor_names": {e["actor"]: names(e["actor"]) for e in review["history"] if names(e["actor"])},
-    "status": "internally_approved" if decision and decision["action"] == "approve" else
-              "returned_for_changes" if decision else "submitted",
-    "self_approved": bool(decision and decision["self_approved"]),
+    "status": status,
+    "self_approved": self_approved,
     "can_review": active and authorize_tenant_operation(account, REVIEW, TenantPolicyContext(
       tenant["tenant_id"], tenant["active"], tenant["allow_pentester"]),
       compliance_reviewer=service._compliance_reviewer(account)).allowed,
