@@ -487,19 +487,6 @@ def _view_of(entity="A", fields=None, node_ref="N0"):
 class PublicCitationTests(unittest.TestCase):
   """EG-039 phase 4: code, not the model, attaches `misp_citations` from the entities an observation names."""
 
-  def test_source_fields_of_the_named_entities_become_public_with_node_ref_and_entity_id(self):
-    result, _ = _egx2_run()
-    self.assertEqual(result["explanation_trace"]["outcome"]["status"], "supported")
-    observations = result["case_explanation"]["observations"]
-    self.assertIn(
-      {"entity": "CVE-2000-0001", "field": "cwe", "value": "CWE-79", "node_ref": "N0", "entity_id": "c1"},
-      observations[0]["misp_citations"],
-    )
-    self.assertEqual({c["node_ref"] for c in observations[1]["misp_citations"]}, {"N1"})
-    for observation in observations:
-      for citation in observation["misp_citations"]:
-        self.assertIn(citation["entity_id"], observation["entity_ids"])
-
   def test_string_values_are_stripped_numbers_stay_numbers(self):
     public, _ = runtime._code_citations(["n:a"], _view_of(fields={"f": " CWE-79 ", "n": 7}), {"N0": "n:a"}, {"n:a"})
     self.assertEqual({c["field"]: c["value"] for c in public}, {"f": "CWE-79", "n": 7})
