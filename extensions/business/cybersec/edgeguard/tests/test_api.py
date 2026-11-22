@@ -2675,6 +2675,51 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(plugin._explanation_dispatch_strategy(ranked, 0), "insight_brief")
     self.assertEqual(plugin._explanation_dispatch_strategy(ranked, 10, True), "insight_brief")
 
+  def test_ranked_result_with_more_than_three_identifiers_stays_on_egx2(self):
+    # EG-039 phase 7: EAB/1 rejects a brief naming >3 identifiers (`ioc_enumeration`).
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    from extensions.business.cybersec.edgeguard.edgeguard_api import RESULT_SHAPE_RANKED_PROJECTION as ranked
+
+    def evidence(*values):
+      return {"rows": [{"values": [{"type": "string", "value": v}]} for v in values]}
+
+    ids4 = evidence("T1059", "T1003", "T1566", "T1190")
+    ids3 = evidence("T1059", "t1059", "T1003", "T1566")  # 3 distinct, case-folded
+    names = evidence("APT28", "Lazarus Group", "Emotet", "Finance", "Energy")
+    self.assertEqual(plugin._explanation_dispatch_strategy(ranked, 4, False, ids4), "insight_brief")
+    self.assertEqual(plugin._explanation_dispatch_strategy(ranked, 4, False, ids3), "one_call")
+    self.assertEqual(plugin._explanation_dispatch_strategy(ranked, 5, False, names), "one_call")
+
+  def test_complete_id_ranking_gets_the_deterministic_brief_with_no_model_call(self):
+    payloads = []
+
+    def provider(payload):
+      payloads.append(payload)
+      return {"content": json.dumps({"text": "x"}), "finish_reason": "stop", "completion_tokens": 1}
+
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief", graph_first_provider=provider)
+    rows = [
+      _DriverRecord({"cve_id": f"CVE-2024-000{k}", "cvss_v31": 9.0 - k}, {"cve_id": f"CVE-2024-000{k}", "cvss_v31": 9.0 - k})
+      for k in range(1, 5)
+    ]
+    fake_driver, _session = _driver_with_results(_Result(rows, keys=["cve_id", "cvss_v31"]))
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687", scheme="bolt+s", username="neo4j", password="secret",
+          request="Which CVEs rank highest by CVSS?", explanation_rows=10,
+          cypher=(
+            "MATCH (c:CVE)-[:HAS_CVSS_v31]->(s:CVSSv31) WITH c, s ORDER BY s.base_score DESC "
+            "RETURN c.cve_id AS cve_id, s.base_score AS cvss_v31 LIMIT 5"
+          ),
+        )
+    self.assertEqual(payloads, [])
+    self.assertNotIn("analyst_brief", result)
+    self.assertEqual(result["explanation_trace"]["outcome"]["safe_code"], "tabular_result")
+    text = result["case_explanation"]["assessment"]["text"]
+    self.assertIn("tabular/scalar", text)
+    self.assertNotIn("Based on", text)
+
   def test_explain_graph_topology_surface_empty_result_carries_the_contract_reason(self):
     """Contract §6's own acceptance query, through `/explain_graph`: `Mission`
     is a topology-only label (review finding 4), so the zero-row result is
@@ -2847,10 +2892,9 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["explanation_trace"]["outcome"]["safe_code"], "empty_result")
     self.assertIn("returned no rows", result["case_explanation"]["assessment"]["text"])
 
-  def test_graph_cap_only_truncation_gets_no_row_sample_sentence(self):
+  def test_graph_cap_only_truncation_gets_the_graph_partial_sentence(self):
     # `packet.execution.truncated` is also set by the graph node/relationship cap, which
-    # leaves the row result complete. The sentence keys off the transport ROW cap only
-    # (`query_result["truncated"]`), so a complete 1-row result never claims "has more".
+    # leaves the row result complete: the row sentence never applies, the graph one does.
     captured = []
 
     def provider(payload):
@@ -2877,7 +2921,9 @@ class EdgeGuardApiTests(unittest.TestCase):
           )
     self.assertEqual(result.get("status"), "ok", str(result)[:600])
     self.assertTrue(result["packet"]["execution"]["truncated"])
-    self.assertNotIn("Based on the first", json.dumps(result["case_explanation"]))
+    text = result["case_explanation"]["assessment"]["text"]
+    self.assertTrue(text.endswith(" Based on part of the graph; the full result has more."), text)
+    self.assertNotIn("Based on the first", text)
     self.assertTrue(all("SAMPLE NOTICE" not in c["messages"][1]["content"] for c in captured))
 
   def test_explain_graph_ranked_projection_calls_the_model_under_insight_brief(self):

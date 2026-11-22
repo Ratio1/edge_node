@@ -292,6 +292,27 @@ class Egx2SampleRowsTests(unittest.TestCase):
     self.assertEqual(case["provenance"]["mode"], "deterministic_fallback")
     self.assertTrue(case["assessment"]["text"].endswith(self.SENTENCE))
 
+  def test_graph_partial_says_so_to_the_model_and_code_adds_the_sentence(self):
+    sentence = "Based on part of the graph; the full result has more."
+    graph = sample_graph()
+    brief = valid_brief(insights.build_insight_sheet(graph))
+    payloads = []
+
+    def provider(payload):
+      payloads.append(payload)
+      return {"finish_reason": "stop", "completion_tokens": 90, "content": json.dumps(brief)}
+
+    result = egx2.run_insight_brief(question="q", graph=graph, model=None, provider_call=provider, graph_partial=True)
+    self.assertIn("only part of the graph", payloads[0]["messages"][1]["content"])
+    self.assertTrue(result["case_explanation"]["assessment"]["text"].endswith(" " + sentence))
+    # the row cap wins when both apply
+    result = egx2.run_insight_brief(
+      question="q", graph=graph, model=None, provider_call=provider, graph_partial=True, sample_rows=25,
+    )
+    text = result["case_explanation"]["assessment"]["text"]
+    self.assertTrue(text.endswith(self.SENTENCE))
+    self.assertNotIn(sentence, text)
+
   def test_empty_result_is_a_deterministic_no_rows_brief_not_a_failure(self):
     def provider(payload):
       raise AssertionError("model must not be called for a 0-row result")
@@ -500,7 +521,7 @@ PINNED_CATALOG_SHA256 = "f33f8f417df901e2586fed9b9659b5acf883df78e13627a4b306fc6
 # the first 2026-10-06 text gave d04ea158...).
 # Re-pinned once more: the retry note asks for no citations (operator 2026-10-06 no-citations retry;
 # the previous text gave 1c8003cd...).
-PINNED_PROFILE_SHA256 = "0c43283a5ca88b39fbf2a55f14b102394f0cf7bac43ef12f31f45185eb3f2f10"
+PINNED_PROFILE_SHA256 = "6e82748635419d12a0735e542993ca6cdfd653997d95dfb52a0eb7ce07d4c6a0"
 
 
 def enrichment_graph():

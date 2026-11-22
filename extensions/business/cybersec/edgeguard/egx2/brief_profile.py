@@ -55,6 +55,14 @@ SAMPLE_ROWS_NOTE = (
     "never write \"N of M\" with an M the insights do not state."
 )
 
+# EG-039: appended only when the graph node/relationship cap trimmed the result and the
+# row cap was not hit. The sheet covers part of the graph, so no total for the whole.
+GRAPH_PARTIAL_NOTE = (
+    "\n\nPARTIAL NOTICE: the insights above cover only part of the graph; the full result "
+    "has more. Every count is a count within this part. Write no total for the full result "
+    "and never write \"N of M\" with an M the insights do not state."
+)
+
 
 def render_sheet(sheet):
     """One line per insight, exposing the real exemplar names the insight layer
@@ -86,7 +94,7 @@ def render_sheet(sheet):
     return "\n".join(lines)
 
 
-def build_brief_prompt(sheet, question, max_observations=2, max_next_checks=2, sample_rows=None):
+def build_brief_prompt(sheet, question, max_observations=2, max_next_checks=2, sample_rows=None, graph_partial=False):
     user = USER_TEMPLATE.format(
         sheet=render_sheet(sheet),
         question=question,
@@ -95,6 +103,8 @@ def build_brief_prompt(sheet, question, max_observations=2, max_next_checks=2, s
     )
     if sample_rows:
         user += SAMPLE_ROWS_NOTE.format(rows=sample_rows)
+    elif graph_partial:
+        user += GRAPH_PARTIAL_NOTE
     return {"system": SYSTEM, "user": user}
 
 

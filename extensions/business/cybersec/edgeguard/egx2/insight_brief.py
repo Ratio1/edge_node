@@ -96,6 +96,8 @@ RETRY_NOTE_TRUNCATED = (
 # EG-039: code adds this sentence after the gates when the result hit the transport row
 # cap. The query stops at the cap, so the true total is unknown and the model never writes it.
 SAMPLE_ROWS_SENTENCE = "Based on the first {rows} rows; the full result has more."
+# Same for a graph node/relationship cap that left the row result complete.
+GRAPH_PARTIAL_SENTENCE = "Based on part of the graph; the full result has more."
 
 PROFILE_MANIFEST = {
   "profile_id": PROFILE_ID,
@@ -103,7 +105,7 @@ PROFILE_MANIFEST = {
   # Bumped with deterministic insight-layer changes (primitives, sheet
   # rendering, gate set) so the profile hash reflects notation changes even
   # when the prompt text is unchanged.
-  "insights_version": 3,
+  "insights_version": 4,
   "case_explanation_schema_version": CASE_EXPLANATION_VERSION,
   "trace_schema_version": TRACE_VERSION,
   "catalog_sha256": fc.CATALOG_SHA256,
@@ -113,6 +115,8 @@ PROFILE_MANIFEST = {
   "retry_note_truncated": RETRY_NOTE_TRUNCATED,
   "sample_rows_note": brief_profile.SAMPLE_ROWS_NOTE,
   "sample_rows_sentence": SAMPLE_ROWS_SENTENCE,
+  "graph_partial_note": brief_profile.GRAPH_PARTIAL_NOTE,
+  "graph_partial_sentence": GRAPH_PARTIAL_SENTENCE,
   "enrichment_view_max_bytes": ENRICHMENT_VIEW_MAX_BYTES,
   # EG-039 phase 4: code, not the model, attaches MISP source fields and event references.
   "misp_attachment": "code",
@@ -534,24 +538,33 @@ DETERMINISTIC_REASON_TEXTS = {
 }
 
 
-def run_insight_brief(*, sample_rows: Optional[int] = None, **kwargs: Any) -> dict[str, Any]:
+def run_insight_brief(
+  *, sample_rows: Optional[int] = None, graph_partial: bool = False, **kwargs: Any
+) -> dict[str, Any]:
   """`sample_rows`: the result hit the transport row cap at this many rows. The model
   is told the rows are a sample, and every brief, model or fallback, ends its
-  assessment with the fixed sample sentence. `seconds_left`: job budget left; a
-  retry runs only with `MIN_CALL_SECONDS` left."""
-  result = _run_insight_brief(sample_rows=sample_rows, **kwargs)
-  if sample_rows:
+  assessment with the fixed sample sentence. `graph_partial`: the graph node or
+  relationship cap trimmed the result; same, with the graph sentence. The row cap
+  wins when both apply. `seconds_left`: job budget left; a retry runs only with
+  `MIN_CALL_SECONDS` left."""
+  result = _run_insight_brief(sample_rows=sample_rows, graph_partial=graph_partial, **kwargs)
+  sentence = (
+    SAMPLE_ROWS_SENTENCE.format(rows=sample_rows) if sample_rows
+    else GRAPH_PARTIAL_SENTENCE if graph_partial else None
+  )
+  if sentence:
     assessment = result["case_explanation"]["assessment"]
     text = assessment["text"].rstrip()
     if text and text[-1] not in ".!?":
       text += "."
-    assessment["text"] = f"{text} {SAMPLE_ROWS_SENTENCE.format(rows=sample_rows)}"
+    assessment["text"] = f"{text} {sentence}"
   return result
 
 
 def _run_insight_brief(
   *,
   sample_rows: Optional[int] = None,
+  graph_partial: bool = False,
   question: str,
   graph: Mapping[str, Any],
   model: Optional[str],
@@ -612,6 +625,7 @@ def _run_insight_brief(
     max_observations=max_observations,
     max_next_checks=max_next_checks,
     sample_rows=sample_rows,
+    graph_partial=graph_partial,
   )
   calls: list[dict[str, Any]] = []
   failure_code: Optional[str] = None

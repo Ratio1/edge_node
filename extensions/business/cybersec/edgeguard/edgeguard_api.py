@@ -95,7 +95,7 @@ from .graph_first_runtime import (
   run_graph_first_explanation,
 )
 from .result_digest import DIGEST_COVERAGE_SCHEMA_VERSION, build_projection_digest, build_result_digest
-from .analyst_brief import MAX_TOKENS as ANALYST_BRIEF_MAX_TOKENS, run_analyst_brief
+from .analyst_brief import IDENTIFIER_RE, MAX_TOKENS as ANALYST_BRIEF_MAX_TOKENS, run_analyst_brief
 from . import egx2
 from . import misp_enrichment
 from .labels import primary_label
@@ -1603,6 +1603,14 @@ def _node_caption(labels: list[str], properties: Dict[str, Any]) -> str:
     if _is_scalar(item) and item not in (None, ""):
       return _compact_text(item, 240)
   return primary_label(labels) or "Entity"
+
+
+def _distinct_identifier_count(query_result_evidence: Optional[Mapping[str, Any]]) -> int:
+  """Distinct `IDENTIFIER_RE` matches in the returned row values, the text the EAB/1
+  grounding gate checks a brief against (same lower-casing)."""
+  rows = (query_result_evidence or {}).get("rows") or []
+  text = json.dumps([row.get("values") for row in rows], ensure_ascii=False, default=str)
+  return len({match.group(0).lower() for match in IDENTIFIER_RE.finditer(text)})
 
 
 def _add_graph_node(value: Any, state: _GraphPacketState) -> Optional[str]:
@@ -5052,7 +5060,11 @@ class EdgeguardApiPlugin(BasePlugin):
     return value if value in {"one_call", "eel_compatibility", "insight_brief"} else "one_call"
 
   def _explanation_dispatch_strategy(
-    self, result_shape: Optional[str], returned_rows: Optional[int] = None, truncated: bool = False,
+    self,
+    result_shape: Optional[str],
+    returned_rows: Optional[int] = None,
+    truncated: bool = False,
+    query_result_evidence: Optional[Mapping[str, Any]] = None,
   ) -> str:
     """Contract §4.3: a `ranked_projection` result is explained by the digest
     analyst brief (EAB/1) even when `insight_brief` (EGX/2) is the configured
@@ -5073,6 +5085,12 @@ class EdgeguardApiPlugin(BasePlugin):
     gate rejects any total not backed by a sheet aggregate. Both end with the
     fixed sample sentence.
 
+    EG-039 phase 7: a complete ranked result whose returned values hold more than 3
+    distinct identifiers (`analyst_brief.IDENTIFIER_RE`: CVE IDs, technique IDs,
+    hashes, IPs, domains) stays on EGX/2 too. A brief naming them all fails the EAB/1
+    `ioc_enumeration` gate, so it gets the deterministic `tabular_result` brief with
+    no sample sentence and no model call.
+
     Review finding Q7: this reroutes `insight_brief` only. The legacy
     `eel_compatibility` strategy is not rerouted here — its own call sites
     (`_active_explanation_strategy() == "eel_compatibility"` checks
@@ -5080,7 +5098,8 @@ class EdgeguardApiPlugin(BasePlugin):
     ranked-projection result reaching it is out of this contract's scope."""
     strategy = self._active_explanation_strategy()
     if strategy == "insight_brief" and result_shape == RESULT_SHAPE_RANKED_PROJECTION and returned_rows != 0 and not truncated:
-      return "one_call"
+      if _distinct_identifier_count(query_result_evidence) <= 3:
+        return "one_call"
     return strategy
 
   @staticmethod
@@ -5290,6 +5309,7 @@ class EdgeguardApiPlugin(BasePlugin):
   ) -> Dict[str, Any]:
     # `sample_rows`: set only when the query stopped at the transport ROW cap (not a
     # graph node/relationship cap), so the brief may say "the full result has more".
+    # A graph cap alone (`packet.graph.truncated`) gets the graph-partial sentence instead.
     # Contract §7.3: `misp_enrichment` is a sibling of `result_digest`.
     # Explanation spec v0.2: it reaches `egx2.run_insight_brief` only after
     # the model-admission check; `misp_node_aliases` (packet node id ->
@@ -5338,6 +5358,7 @@ class EdgeguardApiPlugin(BasePlugin):
       allow_model=allow_model,
       deterministic_reason=deterministic_reason,
       sample_rows=sample_rows,
+      graph_partial=bool(graph.get("truncated")) and not sample_rows,
       mode=mode,
       misp_enrichment=misp_enrichment_block,
       event_url_template=misp_event_url_template,
@@ -6834,6 +6855,7 @@ class EdgeguardApiPlugin(BasePlugin):
     sample_rows = packet["execution"]["row_count"] if execution_result.get("truncated") else None
     effective_strategy = self._explanation_dispatch_strategy(
       result_shape, digest.get("counts", {}).get("returned_rows"), sample_rows is not None,
+      query_result_evidence,
     )
     if effective_strategy == "insight_brief":
       return self._run_insight_brief(
@@ -7451,6 +7473,7 @@ class EdgeguardApiPlugin(BasePlugin):
       sample_rows = packet["execution"]["row_count"] if query_result.get("truncated") else None
       effective_strategy = self._explanation_dispatch_strategy(
         result_shape, digest.get("counts", {}).get("returned_rows"), sample_rows is not None,
+        query_result_evidence,
       )
       if effective_strategy == "insight_brief":
         return self._run_insight_brief(
