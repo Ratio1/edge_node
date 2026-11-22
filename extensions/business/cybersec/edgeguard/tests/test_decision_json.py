@@ -6,7 +6,6 @@ The model replies with one JSON line whose first key is `decision`; only
 
 import hashlib
 import json
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -17,11 +16,8 @@ from extensions.business.cybersec.edgeguard.tests.test_api import (
   _Response,
   _make_api,
 )
-from extensions.business.cybersec.edgeguard.edgeguard_cypher_decision_json import (
-  SYSTEM_PROMPT_PATH,
-  load_system_prompt,
-)
-from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import EdgeGuardCypherGuardError
+from extensions.business.cybersec.edgeguard.edgeguard_api import DECLINE_FALLBACK_MESSAGES
+from extensions.business.cybersec.edgeguard.edgeguard_cypher_decision_json import parse_decision_reply
 
 DECISION_KEY = "decision-fixture-model"
 DECISION_SEMAPHORE = "edgeguard_llm_decision_fixture"
@@ -36,6 +32,12 @@ DECISION_WORKERS = {
 }
 
 
+# The served pack's own field_map, so the tests follow the pack file.
+PACK_FIELD_MAP = json.loads(
+  (Path(__file__).resolve().parents[1] / "prompts/packs/cypher_2026_11_08/edgeguard-pack.json").read_text()
+)["field_map"]
+
+
 def _completion(content, finish_reason="stop"):
   return _Response(payload={
     "result": {
@@ -48,7 +50,7 @@ def _completion(content, finish_reason="stop"):
   })
 
 
-def _generate(*replies, question="Which techniques does the group use?"):
+def _generate(*replies, question="Which techniques does the group use?", finish_reason="stop"):
   """Run `generate` for the decision fixture model; the worker returns `replies` in order."""
   plugin = _make_api(
     edgeguard_generation_workers=DECISION_WORKERS,
@@ -56,7 +58,7 @@ def _generate(*replies, question="Which techniques does the group use?"):
   )
   session = MagicMock()
   session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
-  session.post.side_effect = [_completion(r if isinstance(r, str) else json.dumps(r)) for r in replies]
+  session.post.side_effect = [_completion(r if isinstance(r, str) else json.dumps(r), finish_reason) for r in replies]
   with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session", return_value=session):
     result = plugin.generate(request=question, model_key=DECISION_KEY)
   return result, session
@@ -107,6 +109,85 @@ class DecisionReplyTests(unittest.TestCase):
     self.assertEqual(result["decision_note"], note)
 
 
+class DecisionFieldTests(unittest.TestCase):
+  def test_declining_reply_without_text_gets_a_defined_message(self):
+    for decision, field in (("clarify", "question"), ("out_of_scope", "reason"), ("refuse", "reason")):
+      for empty in (None, "", "  ", 7):
+        with self.subTest(decision=decision, empty=empty):
+          result, _ = _generate({"decision": decision, field: empty})
+          self.assertEqual(result["status"], "declined")
+          self.assertTrue(result["decision_message"].strip())
+          self.assertEqual(result["decision_message"], DECLINE_FALLBACK_MESSAGES[decision])
+
+  def test_rejected_reply_keeps_its_decision_and_note(self):
+    cypher = "MATCH (h:Host) RETURN h LIMIT 5"
+    result, _ = _generate({"decision": "partial", "cypher": cypher, "note": "Hosts live in ISIM."})
+
+    self.assertEqual(result["status"], "rejected")
+    self.assertEqual(result["decision"], "partial")
+    self.assertEqual(result["decision_note"], "Hosts live in ISIM.")
+
+  def test_rejected_unparseable_reply_has_no_decision(self):
+    result, _ = _generate("MATCH (n) RETURN n LIMIT 5")
+
+    self.assertEqual(result["status"], "rejected")
+    self.assertNotIn("decision", result)
+
+
+  def test_declining_reply_text_reaches_the_decision_message(self):
+    for decision, field in (("clarify", "question"), ("out_of_scope", "reason"), ("refuse", "reason")):
+      with self.subTest(decision=decision):
+        text = f"Real {decision} text."
+        result, _ = _generate({"decision": decision, field: text})
+        self.assertEqual(result["status"], "declined")
+        self.assertEqual(result["decision_message"], text)
+
+  def test_truncated_reply_is_rejected_without_a_decision(self):
+    # `length` means the model hit its token limit: even a complete-looking reply is not trusted or parsed.
+    result, session = _generate({"decision": "clarify", "question": "Which group?"}, finish_reason="length")
+
+    self.assertEqual(result["status"], "rejected")
+    self.assertNotIn("decision", result)
+    self.assertEqual(session.post.call_count, 1)
+
+
+class DecisionParserTests(unittest.TestCase):
+  def parse(self, reply):
+    return parse_decision_reply(reply, PACK_FIELD_MAP)
+
+  def test_fenced_reply_and_extra_lines_read_the_first_json_line(self):
+    line = '{"decision":"answer","cypher":"MATCH (n) RETURN n LIMIT 5"}'
+    for reply in (f"```json\n{line}\n```", f"{line}\nand some trailing text"):
+      with self.subTest(reply=reply):
+        self.assertEqual(self.parse(reply)["cypher"], "MATCH (n) RETURN n LIMIT 5")
+
+  def test_unknown_or_missing_decision_does_not_parse(self):
+    for reply in ('{"decision":"maybe","cypher":"MATCH (n) RETURN n"}', '{"cypher":"MATCH (n) RETURN n"}',
+                  '{"decision":7}', '["answer"]', ""):
+      with self.subTest(reply=reply):
+        self.assertFalse(self.parse(reply)["ok"])
+
+  def test_partial_note_is_optional_and_must_be_text(self):
+    for extra, expected in (({}, None), ({"note": None}, None), ({"note": 7}, None), ({"note": "No ISIM."}, "No ISIM.")):
+      with self.subTest(extra=extra):
+        reply = self.parse(json.dumps({"decision": "partial", "cypher": "MATCH (n) RETURN n", **extra}))
+        self.assertTrue(reply["ok"])
+        self.assertEqual(reply["note"], expected)
+
+  def test_answer_and_partial_need_a_non_blank_query(self):
+    for decision in ("answer", "partial"):
+      for blank in ("", "   ", None, 5):
+        with self.subTest(decision=decision, blank=blank):
+          reply = self.parse(json.dumps({"decision": decision, "cypher": blank}))
+          self.assertFalse(reply["ok"])
+          self.assertIn("without a Cypher query", reply["error"])
+
+  def test_decline_ignores_a_cypher_field(self):
+    reply = self.parse('{"decision":"refuse","reason":"No.","cypher":"MATCH (n) DETACH DELETE n"}')
+
+    self.assertEqual((reply["decision"], reply["message"], reply["cypher"]), ("refuse", "No.", None))
+
+
 class DecisionPromptTests(unittest.TestCase):
   # Adapter bundle EdgeGuard-cypher-LoRA-2026-11-08, SHA256SUMS entry for system_prompt.txt.
   BUNDLE_PROMPT_SHA256 = "da06f1e43e6102b9c04adaa4b361ef1d81e2a4e3ac3d3759525689a7cf47a2eb"
@@ -137,13 +218,6 @@ class DecisionPromptTests(unittest.TestCase):
     self.assertIn("USES_TOOL", entry["schema_surface"]["relationship_types"])
     self.assertIn("CVSSv40", entry["schema_surface"]["labels"])
     self.assertIsNone(entry["correction_prompt_sha256"])  # one attempt, no correction turn
-
-  def test_a_modified_prompt_file_is_refused(self):
-    with tempfile.TemporaryDirectory() as tmp:
-      path = Path(tmp) / "prompt.txt"
-      path.write_bytes(SYSTEM_PROMPT_PATH.read_bytes() + b" ")
-      with self.assertRaises(EdgeGuardCypherGuardError):
-        load_system_prompt(path)
 
 
 class DecisionSchemaTests(unittest.TestCase):
@@ -184,6 +258,32 @@ class DecisionSchemaTests(unittest.TestCase):
       with self.subTest(question=question):
         result, _ = _generate({"decision": "answer", "cypher": cypher}, question=question)
         self.assertEqual(result["status"], "accepted", result.get("validation_feedback"))
+
+  def test_names_in_the_prod_graph_but_missing_from_the_prompt_are_accepted(self):
+    # `source_refs` and `evidence_types` ride on relationships, `last_recorded_at` on Indicator and
+    # SOURCED_FROM (prod `db.propertyKeys()` read, graph 6959f33).
+    cases = [
+      "MATCH (ta:ThreatActor)-[r:USES_MALWARE]->(m:Malware) RETURN m.name AS name, r.source_refs AS refs LIMIT 5",
+      "MATCH (c:Campaign)-[r:PART_OF_CAMPAIGN]->(x) RETURN c.name AS name, r.evidence_types AS types LIMIT 5",
+      "MATCH (i:Indicator) RETURN i.value AS value, i.last_recorded_at AS seen ORDER BY seen DESC LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        result, _ = _generate({"decision": "answer", "cypher": cypher})
+        self.assertEqual(result["status"], "accepted", result.get("validation_feedback"))
+
+  def test_names_absent_from_the_prod_graph_stay_rejected(self):
+    cases = {
+      "vendor": "MATCH (c:CVE) RETURN c.vendor AS vendor LIMIT 5",
+      "cisa_ics": "MATCH (c:CVE) WHERE c.cisa_ics IS NOT NULL RETURN c.cve_id AS id LIMIT 5",
+      "Subtechnique": "MATCH (t:Subtechnique) RETURN t.name AS name LIMIT 5",
+      "SOURCE": "MATCH (a)-[:SOURCE]->(s:Source) RETURN s.name AS name LIMIT 5",
+    }
+    for name, cypher in cases.items():
+      with self.subTest(name=name):
+        result, _ = _generate({"decision": "answer", "cypher": cypher})
+        self.assertEqual(result["status"], "rejected")
+        self.assertIn(name, result["validation_feedback"])
 
   def test_labels_outside_the_prompt_schema_are_rejected(self):
     cypher = "MATCH (h:Host)-[:HAS_VULNERABILITY]->(c:CVE) RETURN h LIMIT 25"

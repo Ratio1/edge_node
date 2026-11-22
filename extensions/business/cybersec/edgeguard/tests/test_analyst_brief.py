@@ -793,5 +793,13 @@ class AnalystBriefEnrichmentTests(unittest.TestCase):
     self.assertNotIn("misp_enrichment", json.loads(calls[0]["messages"][1]["content"]))
 
 
+class AnalystBriefPromptTests(unittest.TestCase):
+  def test_system_prompt_states_the_identifier_limit_the_grounding_gate_enforces(self):
+    # EG-039: base Qwen listed every CVE of a 25-row result, ran past the token budget or failed
+    # `ioc_enumeration` (more than 3 identifiers). The prompt now states the same limit.
+    from extensions.business.cybersec.edgeguard import analyst_brief
+    self.assertIn("at most three identifiers", analyst_brief.SYSTEM_PROMPT)
+
+
 if __name__ == "__main__":
   unittest.main()

@@ -74,6 +74,18 @@ profile, public key, artifact, instance, and semaphore instead of repointing `ba
 - `POST /generate` accepts the user request and public model key, calls the selected worker at
   temperature `0`, validates every candidate, applies literal grounding, and performs at most two
   correction attempts.
+  A model served from a decision-JSON prompt pack (for example `cypher_2026_11_08`) makes one attempt
+  and replies with a `decision`. The fields it adds to the `/generate` response:
+
+  | `status` | HTTP | `decision` | other fields |
+  |---|---|---|---|
+  | `accepted` | 200 | `answer` or `partial` | `accepted_cypher`; `decision_note` (the `partial` note, else `null`) |
+  | `declined` | 200 | `clarify`, `out_of_scope` or `refuse` | `accepted: false`, `accepted_cypher: null`, `decision_message` |
+  | `rejected` | 200 | `answer` or `partial` only when the reply parsed; the key is absent when it did not parse | `decision_note` (same condition), `validation_feedback`; the guard refused the query or the reply was not valid |
+
+  `decision_message` is the model's question or reason. When the model sends no text it is a fixed
+  fallback for that decision, so it is never empty. Clients must not read every 200 as "Cypher present":
+  check `accepted` first. A `declined` reply runs no guard and sends nothing to Neo4j.
 - `POST /check_cypher` remains available as a standalone deterministic validator.
 - `POST /neo4j_test` and `POST /neo4j_query` use either the complete API default connection or a
   complete request override. Fields are never merged between those sources.

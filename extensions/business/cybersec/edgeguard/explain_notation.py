@@ -34,6 +34,8 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Mapping, Optional, Sequence
 
+from .labels import primary_label
+
 
 LIST_CAP = 10
 # Real-entity-name fallback chain (narrower than `explain_selection`'s
@@ -107,8 +109,7 @@ def _rel_key(rel: Mapping[str, Any], index: int) -> str:
 
 
 def _label_of(node: Mapping[str, Any]) -> str:
-  labels = node.get("labels") or []
-  return labels[0] if labels else "?"
+  return primary_label(node.get("labels")) or "?"
 
 
 def _assign_citation_ids(graph: Mapping[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
