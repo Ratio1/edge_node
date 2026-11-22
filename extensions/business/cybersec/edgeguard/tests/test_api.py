@@ -851,22 +851,17 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(plugin.model()["model_key"], PRIVATE_MODEL_KEY)
     self.assertEqual(len([m for m in warnings if "private_model" in m]), 1)
 
-  def test_unknown_prompt_profile_warns_once_and_falls_back(self):
+  def test_unknown_prompt_profile_is_refused_not_replaced_by_the_default(self):
     plugin = _make_api(edgeguard_generation_workers={
       "model-x": {"SEMAPHORE": "edgeguard_llm_private", "PROMPT_PROFILE": "direct-cypher"},
       "model-y": {"SEMAPHORE": "edgeguard_llm_base"},
     })
-    warnings = []
-    plugin.P = lambda message, *args, **kwargs: warnings.append(str(message))
 
-    first = plugin._prompt_profile("model-x")
-    plugin._prompt_profile("model-x")
-    silent = plugin._prompt_profile("model-y")
+    with self.assertRaises(ValueError) as raised:
+      plugin._prompt_profile("model-x")
 
-    self.assertEqual(first["name"], "schema_grounded")
-    self.assertEqual(silent["name"], "schema_grounded")
-    self.assertEqual(len([m for m in warnings if "direct-cypher" in m]), 1)
-    self.assertFalse(any("model-y" in m for m in warnings))
+    self.assertIn("direct-cypher", str(raised.exception))
+    self.assertEqual(plugin._prompt_profile("model-y")["name"], "schema_grounded")  # no profile: the default
 
   def test_generate_rejects_unconfigured_model_key(self):
     plugin = _make_api()

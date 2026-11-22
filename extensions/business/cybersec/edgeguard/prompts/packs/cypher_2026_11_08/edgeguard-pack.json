@@ -1,0 +1,34 @@
+{
+ "format_version": 1,
+ "pack_id": "cypher_2026_11_08",
+ "pack_version": "5e12777d5a",
+ "files": {
+  "schema.json": "9cef42c1a06cdb1bb2a0e6270a842a0c2faa1fd2d4beb6f8a5c1cb35a2619132",
+  "system_prompt.txt": "da06f1e43e6102b9c04adaa4b361ef1d81e2a4e3ac3d3759525689a7cf47a2eb"
+ },
+ "system_prompt": "system_prompt.txt",
+ "schema": "schema.json",
+ "schema_version": "edgeguard-v2026.11.6-prompt-5e12777d5a",
+ "max_tokens": 512,
+ "parser": "decision_json",
+ "field_map": {
+  "answer": {
+   "cypher": "cypher"
+  },
+  "partial": {
+   "cypher": "cypher",
+   "note": "note"
+  },
+  "clarify": {
+   "message": "question"
+  },
+  "out_of_scope": {
+   "message": "reason"
+  },
+  "refuse": {
+   "message": "reason"
+  }
+ },
+ "grounding": false,
+ "prompt_contract": "one JSON line with a decision; a read-only Cypher query for answer and partial"
+}

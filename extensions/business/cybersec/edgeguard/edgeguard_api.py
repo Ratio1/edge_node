@@ -56,12 +56,12 @@ from .edgeguard_cypher_guard_v0_13 import (
   build_v0_13_pattern_schema_system_prompt,
   load_v0_13_p6_system_prompt,
 )
-from .edgeguard_cypher_decision_json import (
-  DECISION_JSON_SCHEMA,
-  PROMPT_PROFILE_DECISION_JSON_2026_11_08,
-  SCHEMA_VERSION_DECISION_JSON,
-  load_system_prompt as load_decision_json_system_prompt,
-  parse_decision_reply,
+from .edgeguard_cypher_decision_json import parse_decision_reply
+from .edgeguard_prompt_pack import (
+  LEGACY_PROFILE_PACKS,
+  PARSER_DECISION_JSON,
+  PromptPackError,
+  load_pack,
 )
 from . import literal_classes
 
@@ -773,17 +773,6 @@ PROMPT_PROFILES = {
     "system_prompt_suffix": None,
     "single_user_message": False,
   },
-  # IICT-BAS adapter (2026-11-08): its own vendored system prompt, a JSON
-  # reply with a `decision`, no correction turns (see
-  # `edgeguard_cypher_decision_json`).
-  PROMPT_PROFILE_DECISION_JSON_2026_11_08: {
-    "prompt_profile_id": "edgeguard_decision_json_2026_11_08",
-    "template_version": "edgeguard-decision-json-5e12777d5a",
-    "prompt_contract": "one JSON line with a decision; a read-only Cypher query for answer and partial",
-    "system_prompt_suffix": None,
-    "single_user_message": False,
-    "max_tokens": 512,  # the adapter's trained decoding budget
-  },
 }
 
 # Contract §5.1/§5.2: which builder renders the system prompt / correction
@@ -798,7 +787,6 @@ PROMPT_PROFILES = {
 _V0_11_SYSTEM_PROMPT = build_v0_11_pattern_schema_system_prompt()
 _V0_13_SYSTEM_PROMPT = build_v0_13_pattern_schema_system_prompt()
 _V0_13_P6_SYSTEM_PROMPT = load_v0_13_p6_system_prompt()
-_DECISION_JSON_SYSTEM_PROMPT = load_decision_json_system_prompt()
 
 
 def _system_prompt_for_profile(profile_name: str) -> str:
@@ -808,8 +796,6 @@ def _system_prompt_for_profile(profile_name: str) -> str:
     return _V0_13_SYSTEM_PROMPT
   if profile_name == PROMPT_PROFILE_V0_13_P6:
     return _V0_13_P6_SYSTEM_PROMPT
-  if profile_name == PROMPT_PROFILE_DECISION_JSON_2026_11_08:
-    return _DECISION_JSON_SYSTEM_PROMPT
   return build_direct_cypher_system_prompt()
 
 
@@ -3552,7 +3538,25 @@ class EdgeguardApiPlugin(BasePlugin):
       explicit=self.cfg_edgeguard_explanation_model_token,
       env_name=self.cfg_edgeguard_explanation_model_token_env,
     )
+    self._validate_prompt_packs("refuses to start")
     return
+
+  def on_config(self):
+    # A live config update gets the same check first; the raise makes the framework roll the config
+    # back. The parent hook (tunnel engine switch, server reload) still runs for every good update.
+    self._validate_prompt_packs("refuses this config")
+    parent = getattr(super(), "on_config", None)
+    if parent is not None:
+      parent()
+
+  def _validate_prompt_packs(self, verdict: str) -> None:
+    """Load every model key's pack now (cached), so a bad pack or profile name never waits for a request."""
+    for model_key in self._configured_model_keys():
+      try:
+        self._prompt_pack(model_key)
+      except PromptPackError as exc:
+        self.P(f"EDGEGUARD_API {verdict}: {exc}", color="r")
+        raise
 
   def _setup_semaphore_env(self):
     """Set semaphore environment variables for paired UI/container plugins."""
@@ -4048,10 +4052,7 @@ class EdgeguardApiPlugin(BasePlugin):
     retry_limit: int = DEFAULT_SCHEMA_RETRY_LIMIT,
   ) -> list[Dict[str, str]]:
     profile = self._prompt_profile(model_key)
-    system_prompt = _system_prompt_for_profile(profile["name"])
-    suffix = profile.get("system_prompt_suffix")
-    if isinstance(suffix, str) and suffix:
-      system_prompt += suffix
+    system_prompt = self._profile_system_prompt(profile)
     if not retry_index:
       if profile.get("single_user_message"):
         return [{"role": "user", "content": f"{system_prompt}\n\nUser task:\n{normalized_request}"}]
@@ -4122,18 +4123,58 @@ class EdgeguardApiPlugin(BasePlugin):
       )
     return keys[0] if keys else None
 
+  def _prompt_pack(self, model_key: str):
+    """The validated prompt pack behind a model key, or None for a built-in profile.
+
+    A worker entry names a built-in `PROMPT_PROFILE` or a `PROMPT_PACK`, never
+    both, and an unknown profile name is an error, not a fallback. Raises
+    `PromptPackError`; `on_init` calls this for every key, so a bad entry stops
+    the plugin at startup.
+    """
+    worker, _err = self._generation_worker(model_key)
+    if not isinstance(worker, Mapping):
+      return None
+    name, source = worker.get("PROMPT_PROFILE"), worker.get("PROMPT_PACK")
+    label = f"model {model_key!r}"
+    if name is not None and source is not None:
+      raise PromptPackError(label, "declares both PROMPT_PROFILE and PROMPT_PACK; use one")
+    if isinstance(name, str) and name in LEGACY_PROFILE_PACKS:
+      source = LEGACY_PROFILE_PACKS[name]
+    elif source is None:
+      if name is not None and (not isinstance(name, str) or name not in PROMPT_PROFILES):
+        raise PromptPackError(label, f"unknown PROMPT_PROFILE {name!r}; known profiles are {sorted(PROMPT_PROFILES)}")
+      return None
+    cache = self.__dict__.setdefault("_prompt_packs", {})
+    cache_key = (model_key, json.dumps(source, sort_keys=True, default=str))
+    if cache_key not in cache:
+      # Same token source as the serving worker (`BaseLlmServing.hf_token`): the worker entry, then EE_HF_TOKEN.
+      token = worker.get("HF_TOKEN") or getattr(self, "os_environ", {}).get("EE_HF_TOKEN")
+      where = (source.get("repo") or os.path.basename(str(source.get("path") or "").rstrip("/"))) if isinstance(source, Mapping) else ""
+      cache[cache_key] = load_pack(source, label=f"{label} pack {where}", hf_token=token)
+    return cache[cache_key]
+
   def _prompt_profile(self, model_key: str) -> Dict[str, Any]:
+    pack = self._prompt_pack(model_key)
+    if pack is not None:
+      return {
+        "name": f"pack:{pack.pack_id}",
+        "prompt_profile_id": pack.pack_id,
+        "template_version": pack.template_version,
+        "prompt_contract": pack.prompt_contract,
+        "system_prompt_suffix": None,
+        "single_user_message": False,
+        "max_tokens": pack.max_tokens,
+        "pack": pack,
+      }
     worker, _err = self._generation_worker(model_key)
     name = worker.get("PROMPT_PROFILE") if isinstance(worker, Mapping) else None
-    if name is not None and name not in PROMPT_PROFILES:
-      self._warn_once(
-        f"_warned_prompt_profile_{model_key}",
-        f"Model '{model_key}' declares unknown PROMPT_PROFILE {name!r}; known profiles are "
-        f"{sorted(PROMPT_PROFILES)}. Falling back to '{DEFAULT_PROMPT_PROFILE}'.",
-      )
-    if not isinstance(name, str) or name not in PROMPT_PROFILES:
-      name = DEFAULT_PROMPT_PROFILE
-    return {"name": name, **PROMPT_PROFILES[name]}
+    return {"name": name or DEFAULT_PROMPT_PROFILE, **PROMPT_PROFILES[name or DEFAULT_PROMPT_PROFILE]}
+
+  def _profile_system_prompt(self, profile: Mapping[str, Any]) -> str:
+    pack = profile.get("pack")
+    system_prompt = pack.system_prompt if pack else _system_prompt_for_profile(profile["name"])
+    suffix = profile.get("system_prompt_suffix")
+    return system_prompt + suffix if isinstance(suffix, str) and suffix else system_prompt
 
   def _cypher_validation_profile(self, model_key: Optional[str]) -> Dict[str, Any]:
     """Contract §1/§4.1 (review finding 1, both rounds): the one place that
@@ -4153,21 +4194,22 @@ class EdgeguardApiPlugin(BasePlugin):
     `allow_limit_optional_graph=False`, `enforce_hop_bounds=False`.
     """
     artifact = None
-    profile_name = None
+    pack = None
     if isinstance(model_key, str) and model_key.strip():
-      profile_name = self._prompt_profile(model_key)["name"]
-      artifact = PATTERN_SCHEMA_ARTIFACTS.get(profile_name)
-    if profile_name == PROMPT_PROFILE_DECISION_JSON_2026_11_08:
+      profile = self._prompt_profile(model_key)
+      pack = profile.get("pack")
+      artifact = PATTERN_SCHEMA_ARTIFACTS.get(profile["name"])
+    if pack is not None and pack.schema_allowed is not None:
       # v0.10 rules (LIMIT required, no pattern-schema checks) against the
-      # schema the adapter's own system prompt describes.
+      # allowlist the pack ships (the schema its own system prompt describes).
       return {
         "use_v0_11": False,
         "schema_artifact": None,
-        "schema_allowed": DECISION_JSON_SCHEMA,
+        "schema_allowed": pack.schema_allowed,
         "allow_limit_optional_graph": False,
         "enforce_hop_bounds": False,
-        "schema_version": SCHEMA_VERSION_DECISION_JSON,
-        "schema_surface": {key: sorted(values) for key, values in DECISION_JSON_SCHEMA.items()},
+        "schema_version": pack.schema_version,
+        "schema_surface": {key: sorted(values) for key, values in pack.schema_allowed.items()},
       }
     use_v0_11 = artifact is not None
     return {
@@ -4495,7 +4537,8 @@ class EdgeguardApiPlugin(BasePlugin):
     guard_schema_allowed = validation_profile["schema_allowed"]
     response_schema_version = validation_profile["schema_version"]
     response_schema_surface = validation_profile["schema_surface"]
-    decision_json = self._prompt_profile(selected_key)["name"] == PROMPT_PROFILE_DECISION_JSON_2026_11_08
+    pack = self._prompt_profile(selected_key).get("pack")
+    decision_json = pack is not None and pack.parser == PARSER_DECISION_JSON
     try:
       for attempt_index in range(DEFAULT_SCHEMA_RETRY_LIMIT + 1):
         remaining = deadline - time.monotonic()
@@ -4515,7 +4558,7 @@ class EdgeguardApiPlugin(BasePlugin):
         model_reply = raw_output
         reply = None
         if decision_json and completion.get("finish_reason") == "stop":
-          reply = parse_decision_reply(raw_output)
+          reply = parse_decision_reply(raw_output, pack.field_map)
           if reply["ok"] and reply["cypher"] is None:
             total_ms = round((time.monotonic() - started) * 1000, 1)
             return {
@@ -4594,10 +4637,11 @@ class EdgeguardApiPlugin(BasePlugin):
               "within the output limit."
             ),
           }
-        elif not decision_json:
-          # The decision-JSON adapter maps question words to stored values its
-          # own prompt teaches ('Known', 'x509-fingerprint-sha1'); the v0.11
-          # synonym table does not know them, so literal grounding is skipped.
+        elif pack is None or pack.grounding:
+          # A pack decides whether literal grounding runs. The 2026-11-08 adapter
+          # maps question words to stored values its own prompt teaches ('Known',
+          # 'x509-fingerprint-sha1'); the v0.11 synonym table does not know them,
+          # so its pack turns grounding off.
           validation = self._apply_literal_grounding_guard(
             validation,
             guarded_output,
@@ -4695,8 +4739,8 @@ class EdgeguardApiPlugin(BasePlugin):
           }
         last_candidate = attempt["candidate_cypher"]
         last_feedback = attempt["validation_feedback"] or "The previous output failed validation."
-        if decision_json:
-          # The adapter was trained without correction turns: one attempt only.
+        if pack is not None:
+          # A pack carries no correction turn: one attempt only.
           break
     except _GenerationDeadlineExceeded:
       code = "generation_deadline_exceeded"
@@ -5697,6 +5741,20 @@ class EdgeguardApiPlugin(BasePlugin):
         "unexpected_failure",
       )
 
+  def _prompt_pack_summary(self) -> Dict[str, Dict[str, str]]:
+    """Pack id, version and manifest sha256 per model key that serves a pack."""
+    summary = {}
+    for model_key in self._configured_model_keys():
+      try:
+        pack = self._prompt_pack(model_key)
+      except PromptPackError:
+        continue  # refused at startup; health must not fail on it
+      if pack is not None:
+        summary[model_key] = {
+          "pack_id": pack.pack_id, "pack_version": pack.pack_version, "sha256": pack.manifest_sha256,
+        }
+    return summary
+
   @BasePlugin.endpoint(method="GET")
   def health(self) -> Dict[str, Any]:
     # /health is deliberately untracked and reads a locked snapshot; the
@@ -5728,6 +5786,7 @@ class EdgeguardApiPlugin(BasePlugin):
       "generation_models_configured": len(worker_readiness),
       "generation_orchestrator": "edgeguard_api",
       "generation_workers": worker_readiness,
+      "prompt_packs": self._prompt_pack_summary(),
       "generation_ready": generation_ready,
       "explanation_model_configured": bool(explanation_url),
       "explanation_model_config_valid": explanation_error is None,
@@ -5771,10 +5830,7 @@ class EdgeguardApiPlugin(BasePlugin):
       # Contract §5.4: `system_prompt_sha256` per profile, over the prompt
       # this profile actually serves (builder dispatch + its suffix), not
       # just the bare v0.10 template — every profile gets a real sha now.
-      system_prompt = _system_prompt_for_profile(profile["name"])
-      suffix = profile.get("system_prompt_suffix")
-      if isinstance(suffix, str) and suffix:
-        system_prompt += suffix
+      system_prompt = self._profile_system_prompt(profile)
       correction_prompt = _correction_prompt_for_profile(
         profile["name"],
         normalized_request="{normalized_request}",
@@ -5786,7 +5842,7 @@ class EdgeguardApiPlugin(BasePlugin):
       # The schema each profile actually validates against (v0.11/v0.13
       # artifacts, the decision-JSON prompt schema, or the v0.10 default).
       validation_profile = self._cypher_validation_profile(key)
-      single_attempt = profile["name"] == PROMPT_PROFILE_DECISION_JSON_2026_11_08
+      single_attempt = profile.get("pack") is not None
       profiles.append({
         "prompt_profile_id": profile["prompt_profile_id"],
         "prompt_profile": profile["name"],

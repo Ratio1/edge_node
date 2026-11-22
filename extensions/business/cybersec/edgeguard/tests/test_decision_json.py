@@ -6,9 +6,7 @@ The model replies with one JSON line whose first key is `decision`; only
 
 import hashlib
 import json
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 # test_api installs the naeural_core stubs at import time, so it comes first.
@@ -17,11 +15,6 @@ from extensions.business.cybersec.edgeguard.tests.test_api import (
   _Response,
   _make_api,
 )
-from extensions.business.cybersec.edgeguard.edgeguard_cypher_decision_json import (
-  SYSTEM_PROMPT_PATH,
-  load_system_prompt,
-)
-from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import EdgeGuardCypherGuardError
 
 DECISION_KEY = "decision-fixture-model"
 DECISION_SEMAPHORE = "edgeguard_llm_decision_fixture"
@@ -137,13 +130,6 @@ class DecisionPromptTests(unittest.TestCase):
     self.assertIn("USES_TOOL", entry["schema_surface"]["relationship_types"])
     self.assertIn("CVSSv40", entry["schema_surface"]["labels"])
     self.assertIsNone(entry["correction_prompt_sha256"])  # one attempt, no correction turn
-
-  def test_a_modified_prompt_file_is_refused(self):
-    with tempfile.TemporaryDirectory() as tmp:
-      path = Path(tmp) / "prompt.txt"
-      path.write_bytes(SYSTEM_PROMPT_PATH.read_bytes() + b" ")
-      with self.assertRaises(EdgeGuardCypherGuardError):
-        load_system_prompt(path)
 
 
 class DecisionSchemaTests(unittest.TestCase):
