@@ -133,6 +133,9 @@ class RedMeshOWASPTests(unittest.TestCase):
     with patch(
       "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get",
       return_value=resp,
+    ), patch(
+      "extensions.business.cybersec.red_mesh.worker.web.injection._raw_path_get",
+      return_value=resp,
     ):
       result = worker._web_test_path_traversal("example.com", 80)
     self._assert_has_finding(result, "Path traversal")
@@ -145,6 +148,9 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.headers = {"Content-Type": content_type}
     with patch(
       "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get",
+      return_value=resp,
+    ), patch(
+      "extensions.business.cybersec.red_mesh.worker.web.injection._raw_path_get",
       return_value=resp,
     ):
       result = worker._web_test_path_traversal("example.com", 80)

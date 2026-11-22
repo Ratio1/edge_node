@@ -7,7 +7,7 @@ import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
-from ...cve_db import check_cves
+from ...cve_db import check_cves, probe_cve_fields
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
 
@@ -1029,6 +1029,33 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           confidence="certain",
         ))
 
+    # CVE-2017-7494: a share the anonymous session may write to is the precondition SambaCry needs.
+    if shares and any("CVE-2017-7494" in (f.cve or ()) for f in findings):
+      access, access_error = self._smb_share_access(target, port, shares)
+      raw["share_access"] = {name: (f"0x{v:08x}" if isinstance(v, int) else v) for name, v in access.items()}
+      if access_error:
+        raw["share_access_error"] = access_error
+        self.P(f"SMB share access check failed on {target}:{port}: {access_error}", color='y')
+      writable = sorted(n for n, v in access.items() if isinstance(v, int) and v & self._SMB_WRITE_RIGHTS)
+      if writable:
+        findings.append(Finding(
+          severity=Severity.CRITICAL,
+          cvss_vector=V.UNAUTHENTICATED_READ_WRITE,
+          title="CVE-2017-7494: Samba writable share (SambaCry precondition)",
+          cve=("CVE-2017-7494",),
+          **probe_cve_fields("CVE-2017-7494"),
+          description=f"Samba {samba_version} is in the affected range and the anonymous session holds write "
+                      "rights on a share, the precondition for loading a shared library through it. "
+                      "No file was written and no module was loaded.",
+          evidence=f"Tree Connect maximal access, writable: {writable}; Samba {samba_version}",
+          remediation="Upgrade Samba to 4.6.4 or later; set 'nt pipe support = no'; "
+                      "remove anonymous write access and mount shares noexec.",
+          owasp_id="A06:2021",
+          cwe_id="CWE-94",
+          confidence="firm",
+          confidence_reason="behaviour_confirmed",
+        ))
+
     if not findings:
       findings.append(Finding(
         severity=Severity.MEDIUM,
@@ -1058,6 +1085,87 @@ class _ServiceInfraMixin(_ServiceProbeBase):
         return None
       buf += chunk
     return buf
+
+  # FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_ALL | GENERIC_WRITE (MS-SMB 2.2.4.7.2 access mask)
+  _SMB_WRITE_RIGHTS = 0x00000002 | 0x00000004 | 0x10000000 | 0x40000000
+
+  @staticmethod
+  def _smb_tree_max_access(resp):
+    """``(mask, None)`` from an extended Tree Connect AndX response, else ``(None, reason)``.
+
+    The frame must be an SMB1 Tree Connect AndX (`\\xffSMB`, command 0x75): a stray or leftover frame is not
+    parsed as a mask.
+    """
+    if len(resp) < 32 or resp[0:4] != b"\xffSMB" or resp[4] != 0x75:
+      return None, "unexpected response frame"
+    status = struct.unpack_from("<I", resp, 5)[0]
+    if status != 0:
+      return None, f"status 0x{status:08x}"
+    if len(resp) < 47 or resp[32] != 7:
+      return None, "short response"
+    return struct.unpack_from("<I", resp, 39)[0], None
+
+  def _smb_share_access(self, target, port, shares):
+    """Maximal access rights the null session holds on each disk share, from Tree Connect AndX only.
+
+    Read-only: negotiate, null Session Setup, one Tree Connect per share (extended response flag), no
+    open, write or upload. Returns ``({share: mask or {"error": reason}}, error)``; ``error`` is None or the exception text,
+    so a helper failure is not read as "no writable share".
+    """
+    access = {}
+    sock = None
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(self._target_timeout(4))
+      sock.connect((target, port))
+
+      def _exchange(cmd, words_and_bytes, uid=0, tid=0):
+        hdr = bytearray(32)
+        hdr[0:4] = b"\xffSMB"
+        hdr[4] = cmd
+        hdr[13] = 0x18
+        struct.pack_into("<H", hdr, 14, 0xC803)
+        struct.pack_into("<H", hdr, 24, tid)
+        struct.pack_into("<H", hdr, 28, uid)
+        payload = bytes(hdr) + words_and_bytes
+        sock.sendall(b"\x00" + struct.pack(">I", len(payload))[1:] + payload)
+        resp_hdr = self._smb_recv_exact(sock, 4)
+        if not resp_hdr:
+          return None
+        size = struct.unpack(">I", b"\x00" + resp_hdr[1:4])[0]
+        if size > 65536:
+          raise ValueError(f"SMB frame of {size} bytes exceeds the 65536 cap")  # unread bytes would desync
+        return self._smb_recv_exact(sock, size)
+
+      dialects = b"\x02NT LM 0.12\x00"
+      neg = _exchange(0x72, struct.pack("<BH", 0, len(dialects)) + dialects)
+      if not neg or len(neg) < 32:
+        return access, "negotiate failed"
+      words = struct.pack("<BBHHIHIHII", 13, 0xFF, 0, 0, 65535, 1, 0, 0, 0, 0) + struct.pack("<I", 0x000000D4)
+      sess = _exchange(0x73, words + struct.pack("<H", 1) + b"\x00")
+      if not sess or len(sess) < 32 or struct.unpack_from("<I", sess, 5)[0] not in (0, 0xC0000016):
+        return access, "null session refused"
+      uid = struct.unpack_from("<H", sess, 28)[0]
+      for share in shares[:16]:
+        name = share["name"]
+        if (share.get("type", 0) & 0xFF) != 0 or name.endswith("$"):
+          continue  # only disk shares; IPC$, printers and admin shares are not a SambaCry upload path
+        path = f"\\\\{target}\\{name}".encode("utf-16-le") + b"\x00\x00"
+        body = b"\x00" + path + b"?????\x00"
+        # wct 4: AndXCommand, reserved, AndXOffset, Flags (0x0008 = extended response), PasswordLength
+        words = struct.pack("<BBBHHH", 4, 0xFF, 0, 0, 0x0008, 1)
+        resp = _exchange(0x75, words + struct.pack("<H", len(body)) + body, uid=uid)
+        mask, reason = self._smb_tree_max_access(resp) if resp else (None, "no response")
+        access[name] = mask if mask is not None else {"error": reason}
+    except Exception as exc:
+      return access, str(exc)
+    finally:
+      if sock is not None:
+        try:
+          sock.close()
+        except Exception:
+          pass
+    return access, None
 
   def _smb_enum_shares(self, target, port):
     """Enumerate SMB shares via null session + IPC$ + srvsvc NetShareEnumAll.

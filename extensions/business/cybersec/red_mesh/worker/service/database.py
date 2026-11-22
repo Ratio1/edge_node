@@ -1025,6 +1025,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
               cwe_id="CWE-287",
               confidence="certain",
             ))
+            findings += self._pg_privilege_findings(sock, data, username, raw)
           elif auth_code == 3:
             # Send cleartext password
             pwd_bytes = password.encode() + b'\x00'
@@ -1049,6 +1050,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
                   authenticated_action=AUTHENTICATED_ACTION_NOT_APPLICABLE,
                 ))
                 findings += self._pg_extract_version_findings(resp)
+                findings += self._pg_privilege_findings(sock, resp, username, raw)
           elif auth_code == 5 and len(data) >= 13:
             # MD5 auth: server sends 4-byte salt at bytes 9:13
             import hashlib
@@ -1077,6 +1079,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
                   authenticated_action=AUTHENTICATED_ACTION_NOT_APPLICABLE,
                 ))
                 findings += self._pg_extract_version_findings(resp)
+                findings += self._pg_privilege_findings(sock, resp, username, raw)
         raw["tested_credentials"] += 1
         sock.close()
       except Exception:
@@ -1091,6 +1094,95 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       ))
 
     return probe_result(raw_data=raw, findings=findings)
+
+  # Read-only SELECT. Direct membership in pg_execute_server_program is looked up in the catalog because
+  # `pg_has_role` raises on PostgreSQL before 11, where that role does not exist.
+  _PG_PRIVILEGE_QUERY = (
+    "SELECT r.rolsuper, EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles p ON p.oid = m.roleid "
+    "WHERE p.rolname = 'pg_execute_server_program' AND m.member = r.oid) "
+    "FROM pg_roles r WHERE r.rolname = current_user"
+  )
+
+  @staticmethod
+  def _pg_read_until_ready(sock, buf):
+    """Backend messages from `buf` plus the socket up to and including ReadyForQuery, as (type, body)."""
+    messages = []
+    for _ in range(16):
+      while len(buf) >= 5:
+        length = struct.unpack('!I', buf[1:5])[0]
+        if len(buf) < 1 + length:
+          break
+        messages.append((buf[0:1], buf[5:1 + length]))
+        buf = buf[1 + length:]
+        if messages[-1][0] == b'Z':
+          return messages
+      chunk = sock.recv(4096)
+      if not chunk:
+        break
+      buf += chunk
+    return messages
+
+  @staticmethod
+  def _pg_error_text(messages):
+    """The `M` (message) field of the first ErrorResponse in `messages`, or None."""
+    for kind, body in messages:
+      if kind == b'E':
+        for field in body.split(b'\x00'):
+          if field[:1] == b'M':
+            return field[1:].decode('utf-8', errors='replace')
+    return None
+
+  def _pg_privilege_findings(self, sock, auth_reply, username, raw):
+    """CVE-2019-9193: read whether the accepted role may run server programs. Never runs COPY ... PROGRAM.
+
+    Runs once per probe call, only when the login-attempt gate is open and a credential was accepted (under
+    trust auth every pair is accepted). A failure is logged and recorded in `raw`, not read as "no privilege".
+    Only the role name is logged or reported, never the password.
+    """
+    if not self._login_attempts_allowed() or "role_privileges" in raw or "privilege_read_error" in raw:
+      return []
+    try:
+      self._pg_read_until_ready(sock, auth_reply)
+      query = self._PG_PRIVILEGE_QUERY.encode() + b'\x00'
+      sock.sendall(b'Q' + struct.pack('!I', len(query) + 4) + query)
+      reply = self._pg_read_until_ready(sock, b'')
+      rows = [body for kind, body in reply if kind == b'D']
+      if not rows:
+        error = self._pg_error_text(reply) or "no row for current_user"
+        self.P(f"PostgreSQL privilege read for role {username} returned no row: {error}", color='y')
+        raw["privilege_read_error"] = error
+        return []
+      ncols = struct.unpack('!H', rows[0][:2])[0]
+      pos, values = 2, []
+      for _ in range(ncols):
+        size = struct.unpack('!i', rows[0][pos:pos + 4])[0]
+        values.append(rows[0][pos + 4:pos + 4 + max(size, 0)] == b't')
+        pos += 4 + max(size, 0)
+    except Exception as exc:
+      self.P(f"PostgreSQL privilege read failed for role {username}: {exc}", color='y')
+      raw["privilege_read_error"] = str(exc)
+      return []
+    is_super, program_role = (values + [False, False])[:2]
+    raw["role_privileges"] = {"role": username, "rolsuper": is_super, "pg_execute_server_program": program_role}
+    if not (is_super or program_role):
+      return []
+    held = "superuser" if is_super else "pg_execute_server_program membership"
+    return [Finding(
+      severity=Severity.CRITICAL,
+      cvss_vector=V.UNAUTHENTICATED_READ_WRITE,
+      title=f"CVE-2019-9193: PostgreSQL role {username} may run server programs (COPY ... PROGRAM)",
+      cve=("CVE-2019-9193",),
+      **probe_cve_fields("CVE-2019-9193"),
+      description=f"The accepted role {username} holds {held}, which lets it run operating-system commands through "
+                  "COPY ... PROGRAM. The CVE is disputed by the vendor (documented behaviour); the risk is the "
+                  "reachable privileged role. A read-only catalog query was sent; COPY ... PROGRAM was not run.",
+      evidence=f"Catalog read for role {username}: rolsuper={is_super}, pg_execute_server_program={program_role}",
+      remediation="Change the default password, restrict the role, and revoke superuser and pg_execute_server_program.",
+      owasp_id="A01:2021",
+      cwe_id="CWE-78",
+      confidence="firm",
+      confidence_reason="behaviour_confirmed",
+    )]
 
   def _pg_extract_version_findings(self, data):
     """Parse ParameterStatus messages after PG auth success for version + CVEs."""
