@@ -160,6 +160,15 @@ class TestSambaMaximalAccess(unittest.TestCase):
     self.assertEqual(PentestLocalWorker._smb_tree_max_access(not_smb)[0], None)
     self.assertEqual(PentestLocalWorker._smb_tree_max_access(denied), (None, "status 0xc0000022"))
 
+  def test_cap_counts_disk_shares_only(self):
+    """16 excluded entries (IPC$, admin, printer) ahead of a writable disk share do not use up the 16-share cap."""
+    excluded = [{"name": "IPC$", "type": 3}] + [{"name": f"ADMIN{i}$", "type": 0} for i in range(10)] + \
+               [{"name": f"printer{i}", "type": 1} for i in range(5)]
+    replies = [_smb_reply(0x72, words=b"\x00" * 8), _smb_reply(0x73, uid=1), _tree_reply(0x001F01FF)]
+    with patch("socket.socket", return_value=_ScriptedSock(replies)):
+      access, error = _worker()._smb_share_access("10.0.0.1", 445, excluded + [{"name": "public", "type": 0}])
+    self.assertEqual((access, error), ({"public": 0x001F01FF}, None))
+
   def test_denied_share_is_recorded_per_share(self):
     replies = [_smb_reply(0x72, words=b"\x00" * 8), _smb_reply(0x73, uid=1),
                _tree_reply(0x001F01FF), _tree_reply(0, status=0xC0000022)]
@@ -247,7 +256,6 @@ class _SeqSock(_ScriptedSock):
 
 class TestPostgresPrivilegeRead(unittest.TestCase):
   READY = _pg(b"R", struct.pack("!I", 0)) + _pg(b"Z", b"I")
-  SECRET = "hunter2-secret"
 
   def _read(self, w, reply, raw=None):
     sock = _ScriptedSock([reply])
@@ -282,18 +290,24 @@ class TestPostgresPrivilegeRead(unittest.TestCase):
     self.assertTrue(any("permission denied for pg_roles" in str(c) for c in w.P.call_args_list))
 
   def test_cleartext_login_wires_one_finding_and_leaks_no_password(self):
-    """Probe level: three accepted pairs (as under trust auth) still give one finding, and the evidence,
-    description and log carry the role name only."""
-    ok = _pg(b"R", struct.pack("!I", 0)) + _pg(b"Z", b"I")
-    script = [_pg(b"R", struct.pack("!I", 3)), ok, _pg(b"T") + _datarow(True, True) + _pg(b"Z", b"I")]
+    """Probe level: the pair with a password is the accepted one, and the CVE finding and the log carry the role
+    name only, never that password."""
+    ask = _pg(b"R", struct.pack("!I", 3))
+    rejected = [ask, _pg(b"E", b"SFATAL\x00Mpassword authentication failed\x00\x00")]
+    accepted = [ask, _pg(b"R", struct.pack("!I", 0)) + _pg(b"Z", b"I"),
+                _pg(b"T") + _datarow(True, True) + _pg(b"Z", b"I")]
+    scripts = iter([rejected, rejected, accepted])  # ("postgres", ""), ("postgres", "postgres"), ("postgres", "password")
     w = _worker(None, ports=(5432,))
-    with patch("socket.socket", side_effect=lambda *a, **k: _SeqSock(script)), \
-         patch.object(PentestLocalWorker, "_login_attempts_allowed", return_value=True):
+    with patch("socket.socket", side_effect=lambda *a, **k: _SeqSock(next(scripts))):
       result = w._service_info_postgresql_creds("10.0.0.5", 5432)
+    self.assertEqual(result["accepted_credentials"], ["postgres:password"])
     hits = [f for f in result["findings"] if f["title"].startswith("CVE-2019-9193")]
     self.assertEqual(len(hits), 1)
     self.assertEqual(result["role_privileges"]["role"], "postgres")
-
+    for text in (hits[0]["title"], hits[0]["description"], hits[0]["evidence"]):
+      self.assertNotIn("password", text)
+    for call in w.P.call_args_list:
+      self.assertNotIn("password", str(call))
 
 if __name__ == "__main__":
   unittest.main()

@@ -1146,10 +1146,10 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       if not sess or len(sess) < 32 or struct.unpack_from("<I", sess, 5)[0] not in (0, 0xC0000016):
         return access, "null session refused"
       uid = struct.unpack_from("<H", sess, 28)[0]
-      for share in shares[:16]:
+      # only disk shares; IPC$, printers and admin shares are not a SambaCry upload path
+      disk_shares = [s for s in shares if (s.get("type", 0) & 0xFF) == 0 and not s["name"].endswith("$")]
+      for share in disk_shares[:16]:
         name = share["name"]
-        if (share.get("type", 0) & 0xFF) != 0 or name.endswith("$"):
-          continue  # only disk shares; IPC$, printers and admin shares are not a SambaCry upload path
         path = f"\\\\{target}\\{name}".encode("utf-16-le") + b"\x00\x00"
         body = b"\x00" + path + b"?????\x00"
         # wct 4: AndXCommand, reserved, AndXOffset, Flags (0x0008 = extended response), PasswordLength

@@ -14,7 +14,8 @@ from extensions.business.cybersec.red_mesh.worker.pentest_worker import PentestL
 _COMMON = "extensions.business.cybersec.red_mesh.worker.service.common"
 _DB = "extensions.business.cybersec.red_mesh.worker.service.database"
 _HARD = "extensions.business.cybersec.red_mesh.worker.web.hardening"
-_SKIP = AUTH_SKIPPED
+_DISC = "extensions.business.cybersec.red_mesh.worker.web.discovery"
+_API = "extensions.business.cybersec.red_mesh.worker.web.api_exposure"
 
 
 def _worker(enabled, ports=(21,)):
@@ -63,7 +64,7 @@ class TestGatedPathsSendNothing(unittest.TestCase):
       result = _worker(["_service_info_ssh"], ports=(22,))._service_info_ssh("example.com", 22)
     client.connect.assert_not_called()
     bypass.assert_not_called()
-    self.assertEqual(result["auth_control"], _SKIP)
+    self.assertEqual(result["auth_control"], AUTH_SKIPPED)
 
   def test_ftp_sends_no_credential(self):
     ftp = MagicMock()
@@ -76,7 +77,7 @@ class TestGatedPathsSendNothing(unittest.TestCase):
     self.assertTrue(ftp.login.call_args_list)
     for call in ftp.login.call_args_list:
       self.assertEqual((call.args, call.kwargs), ((), {}))
-    self.assertEqual(result["auth_control"], _SKIP)
+    self.assertEqual(result["auth_control"], AUTH_SKIPPED)
 
   def test_telnet_sends_no_credential(self):
     sock = MagicMock()
@@ -86,7 +87,7 @@ class TestGatedPathsSendNothing(unittest.TestCase):
     for call in sock.sendall.call_args_list:
       self.assertNotIn(b"admin", call.args[0])
       self.assertNotIn(b"root", call.args[0])
-    self.assertEqual(result["auth_control"], _SKIP)
+    self.assertEqual(result["auth_control"], AUTH_SKIPPED)
 
   def test_web_form_methods_post_nothing(self):
     w = _worker(["_web_test_account_enumeration", "_web_test_rate_limiting"], ports=(80,))
@@ -96,8 +97,37 @@ class TestGatedPathsSendNothing(unittest.TestCase):
     post.assert_not_called()
     get.assert_not_called()
     for r in (enum, rate):
-      self.assertEqual(r["auth_control"], _SKIP)
+      self.assertEqual(r["auth_control"], AUTH_SKIPPED)
       self.assertEqual(r["findings"], [])
+
+
+class TestAuthBypassRequestsGated(unittest.TestCase):
+  """An auth-bypass payload and a random-credential control are login attempts: only that request is skipped."""
+
+  def test_weblogic_cve_2020_14882_bypass_request(self):
+    def fake_get(url, **kwargs):
+      text = "WebLogic Server 12.2.1.3.0" if url.endswith("LoginForm.jsp") else ""
+      return MagicMock(ok=True, status_code=200, text=text)
+    for enabled, sent in ((["_web_test_java_servers"], False), (None, True)):
+      with patch(f"{_DISC}.requests.get", side_effect=fake_get) as get:
+        result = _worker(enabled, ports=(7001,))._web_test_java_servers("example.com", 7001)
+      urls = [c.args[0] for c in get.call_args_list]
+      self.assertEqual(any("console.portal" in u for u in urls), sent, enabled)
+      self.assertTrue(any(u.endswith("/console/") for u in urls))  # the rest of the probe still runs
+      self.assertEqual("auth_control" in result, not sent)
+      if not sent:
+        self.assertEqual(result["auth_control"], AUTH_SKIPPED)
+
+  def test_api_invalid_bearer_token_request(self):
+    for enabled, sent in ((["_web_test_api_auth_bypass"], False), (None, True)):
+      with patch(f"{_DISC}.requests.get", return_value=MagicMock(status_code=404)), \
+           patch(f"{_API}.requests.get", return_value=MagicMock(status_code=401)) as get:
+        result = _worker(enabled, ports=(80,))._web_test_api_auth_bypass("example.com", 80)
+      bearer = [c for c in get.call_args_list if (c.kwargs.get("headers") or {}).get("Authorization")]
+      self.assertEqual(bool(bearer), sent, enabled)
+      self.assertEqual("auth_control" in result, not sent)
+      if not sent:
+        self.assertEqual(result["auth_control"], AUTH_SKIPPED)
 
 
 def _handshake(version=b"5.5.20"):
