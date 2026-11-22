@@ -125,7 +125,7 @@
     },
     {
       "pack_id": "us.nist.csf-2.0",
-      "title": "NIST CSF 2.0 — RedMesh profile",
+      "title": "NIST CSF 2.0",
       "version": 2,
       "status": "active",
       "supersedes": null,
