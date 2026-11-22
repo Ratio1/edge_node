@@ -37,7 +37,7 @@ TENANT_ARTIFACT_READ_ROUTES = ("get_rulebook_artifact",)
 ACTOR_ONLY_READ_ROUTES = ("llm_health",)
 # Job-less reads with a required tenant (RM-081 Phase 3c added the selector; RM-084 P1 removed the
 # unscoped half). The selector is appended last, as stop_monitoring's is.
-TENANT_JOBLESS_READ_ROUTES = ("get_misp_export_config_status", "get_integration_status")
+TENANT_JOBLESS_READ_ROUTES = ("get_misp_export_config_status", "get_integration_status", "get_triage_rates")
 TENANT_JSON_EXPORT_ROUTES = ("export_misp_json", "export_stix_json", "export_siem_events_json")
 # RM-026 I1b B1: effect endpoints sharing the strict read transport.
 EFFECT_ROUTES = ("dry_run_opencti_export", "dry_run_taxii_export", "export_stix_bundle",
@@ -122,7 +122,11 @@ def _render_native(default_route=None):
     elif method.name in ACTOR_ONLY_READ_ROUTES:
       assert tuple(arg.arg for arg in method.args.args) == ("self", "request_actor")
     elif method.name in TENANT_JOBLESS_READ_ROUTES:
-      assert tuple(arg.arg for arg in method.args.args) == ("self", "request_actor", "tenant_id")
+      assert tuple(arg.arg for arg in method.args.args) == {
+        "get_misp_export_config_status": ("self", "request_actor", "tenant_id"),
+        "get_integration_status": ("self", "request_actor", "tenant_id"),
+        "get_triage_rates": ("self", "request_actor", "tenant_id", "engagement_id"),
+      }[method.name]
     elif method.name in TENANT_JSON_EXPORT_ROUTES:
       assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "pass_nr", "request_actor", "tenant_id")
     elif method.name in UNGUARDED_ROUTES:
