@@ -133,6 +133,11 @@ def _in_scope(row, changes):
   return True
 
 
+def _covered(row, changes, pass_cause):
+  """The pass tested this row: in scope (§3 step 1) and no gap for it (step 2)."""
+  return _in_scope(row, changes) and not _row_gap_cause(row, changes, pass_cause)
+
+
 def _pass_gap_cause(changes):
   """§3 step 2, the pass-level failures: every in-scope row of the pass is a gap row."""
   coverage = changes["coverage"]
@@ -223,14 +228,15 @@ def apply_pass(checkpoint, changes, *, asset_id, late=False, grace=DEFAULT_GRACE
     row = rows.get(key)
     if row is None:
       occurrence = int(key.rsplit(":", 1)[1])
-      tested = None if _row_gap_cause(finding, changes, pass_cause) else ref
-      rows[key] = {
+      row = rows[key] = {
         "finding_id": finding["finding_id"], "occurrence": occurrence, "scan_type": scan_type,
         "port": finding.get("port"), "probe": finding.get("probe"), "scenario_id": finding.get("scenario_id"),
-        "first_seen": ref, "episode_opened": ref, "last_seen": ref, "last_tested": tested,
+        "first_seen": ref, "episode_opened": ref, "last_seen": ref, "last_tested": None,
         "times_seen": 1, "job_ids": [ref["job_id"]], "missed_streak": 0, "not_observed_since": None,
         "last_coverage_gap": None, "reappeared_count": 0, "current_version": _version(finding, changes),
       }
+      if _covered(row, changes, pass_cause):
+        row["last_tested"] = ref
       events.append(_event(asset_id, "new", ref, key=key, alert=(key,), digest_only=late))
       continue
     row["times_seen"] += 1
@@ -243,8 +249,8 @@ def apply_pass(checkpoint, changes, *, asset_id, late=False, grace=DEFAULT_GRACE
         row["last_seen"] = ref
       continue
     row["last_seen"] = ref
-    if not _row_gap_cause(row, changes, pass_cause):
-      row["last_tested"] = ref  # a sighting on a gap pass is a sighting, not a covered pass (§2)
+    if _covered(row, changes, pass_cause):
+      row["last_tested"] = ref  # a sighting on a gap or out-of-scope pass is not a covered pass (§2)
     row["missed_streak"] = 0
     if row["not_observed_since"] is not None:
       row["not_observed_since"] = None

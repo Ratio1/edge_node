@@ -155,6 +155,12 @@ class TestWorkedCases(unittest.TestCase):
     state, _ = run(net("K", 1, 3, [G], abort_state=aborted), state=state)
     self.assertIsNone(state["rows"]["f2:0"]["last_tested"])  # first sighting on a gap pass
 
+  def test_7b_sighting_on_a_pass_out_of_scope_for_the_row_is_seen_but_not_tested(self):
+    state, _ = run(net("J", 2, 2, [F], port_range=(1, 1000)), state=self.base)
+    row = self.row(state)
+    self.assertEqual((row["last_seen"], row["times_seen"], row["last_tested"]),
+                     (ref("J", 2, 2), 2, ref("J", 1, 1)))
+
   def test_8_port_outside_the_configured_range_is_out_of_scope(self):
     state, events = run(net("J", 7, 7, port_range=(1, 1000)), state=self.base)
     self.assertEqual((state["rows"], state["gap"]), (self.base["rows"], self.base["gap"]))
@@ -1177,6 +1183,19 @@ class TestLedgerArtifactReadTimeout(unittest.TestCase):
     self.assertIsNone(artifact_loader(ArtifactRepository(owner))("Qm1"))
     self.assertEqual(calls, [("Qm1", {"timeout": ARTIFACT_READ_TIMEOUT})])
     self.assertLess(ARTIFACT_READ_TIMEOUT, 90)
+
+
+class TestCheckpointPassKeys(unittest.TestCase):
+
+  def test_skipped_and_lost_keys_must_name_a_job_and_an_integer_pass(self):
+    from extensions.business.cybersec.red_mesh.services.engagement_ledger import empty_checkpoint
+    from extensions.business.cybersec.red_mesh.services.engagement_ledger_store import validate_checkpoint
+    validate_checkpoint(dict(empty_checkpoint(), skipped=[["J", 1]], lost=[["J", 2]]))
+    for field, bad in (("lost", [["J", True]]), ("skipped", [["J", True]]), ("lost", [["", 1]]),
+                       ("skipped", [["J", 0]]), ("lost", ["J"])):
+      with self.subTest(field=field, bad=bad):
+        with self.assertRaises(LedgerStoreError):
+          validate_checkpoint(dict(empty_checkpoint(), **{field: bad}))
 
 
 if __name__ == "__main__":

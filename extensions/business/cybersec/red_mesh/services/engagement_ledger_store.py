@@ -53,11 +53,18 @@ def validate_pass_entry(entry):
   return entry
 
 
+def _pass_keys(value):
+  """A list of `[job_id, pass_nr]` keys; a bool is not a pass number (True == 1 would match pass 1)."""
+  return isinstance(value, list) and all(
+    isinstance(key, (list, tuple)) and len(key) == 2 and isinstance(key[0], str) and key[0]
+    and type(key[1]) is int and key[1] >= 1 for key in value)
+
+
 def validate_checkpoint(checkpoint):
   if (not isinstance(checkpoint, dict) or checkpoint.get("schema_version") != SCHEMA_VERSION
       or not isinstance(checkpoint.get("rows"), dict) or not isinstance(checkpoint.get("gap"), dict)
-      or not isinstance(checkpoint.get("included"), dict) or not isinstance(checkpoint.get("skipped"), list)
-      or not isinstance(checkpoint.get("lost", []), list)
+      or not isinstance(checkpoint.get("included"), dict) or not _pass_keys(checkpoint.get("skipped"))
+      or not _pass_keys(checkpoint.get("lost", []))
       or not (checkpoint.get("through") is None or _number(checkpoint.get("through")))
       or any(not isinstance(job, str) or type(nr) is not int or nr < 1 for job, nr in checkpoint["included"].items())):
     raise LedgerStoreError("Invalid ledger checkpoint")
