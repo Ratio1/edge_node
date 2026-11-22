@@ -17,7 +17,9 @@ SCHEMA_VERSION = 1
 LEDGER_SCAN_TYPES = ("network", "webapp")
 DEFAULT_GRACE = 1  # N: covered misses before `not_observed_since` (tenant setting, default 1)
 REPLAY_READ_CAP = 500  # R1FS reads per asset hkey per fold (§2.1)
-CORRELATION_PROBE = "_post_scan_correlate"
+# The flat walk (`_compute_risk_and_findings`, mixins/risk.py) names every correlation finding `_correlation`,
+# whatever probe id the worker stamped (`_post_scan_correlate`).
+CORRELATION_PROBE = "_correlation"
 _FINDING_FIELDS = ("finding_id", "finding_signature", "title", "severity", "port", "probe", "scenario_id")
 
 _ENGAGEMENT_ASSET_ID = re.compile(r"ea_[1-9][0-9]*")
@@ -47,7 +49,7 @@ def port_ranges(ports):
 
 def empty_checkpoint():
   return {"schema_version": SCHEMA_VERSION, "rows": {}, "gap": {}, "included": {}, "through": None,
-          "skipped": []}
+          "skipped": [], "lost": []}
 
 
 def row_key(finding_id, occurrence):
@@ -215,15 +217,17 @@ def apply_pass(checkpoint, changes, *, asset_id, late=False, grace=DEFAULT_GRACE
   scan_type = changes["scan_type"]
   events = []
   seen = set()
+  pass_cause = _pass_gap_cause(changes)
   for key, finding in _match(rows, changes["findings"]):
     seen.add(key)
     row = rows.get(key)
     if row is None:
       occurrence = int(key.rsplit(":", 1)[1])
+      tested = None if _row_gap_cause(finding, changes, pass_cause) else ref
       rows[key] = {
         "finding_id": finding["finding_id"], "occurrence": occurrence, "scan_type": scan_type,
         "port": finding.get("port"), "probe": finding.get("probe"), "scenario_id": finding.get("scenario_id"),
-        "first_seen": ref, "episode_opened": ref, "last_seen": ref, "last_tested": ref,
+        "first_seen": ref, "episode_opened": ref, "last_seen": ref, "last_tested": tested,
         "times_seen": 1, "job_ids": [ref["job_id"]], "missed_streak": 0, "not_observed_since": None,
         "last_coverage_gap": None, "reappeared_count": 0, "current_version": _version(finding, changes),
       }
@@ -239,7 +243,8 @@ def apply_pass(checkpoint, changes, *, asset_id, late=False, grace=DEFAULT_GRACE
         row["last_seen"] = ref
       continue
     row["last_seen"] = ref
-    row["last_tested"] = ref
+    if not _row_gap_cause(row, changes, pass_cause):
+      row["last_tested"] = ref  # a sighting on a gap pass is a sighting, not a covered pass (§2)
     row["missed_streak"] = 0
     if row["not_observed_since"] is not None:
       row["not_observed_since"] = None
@@ -249,15 +254,18 @@ def apply_pass(checkpoint, changes, *, asset_id, late=False, grace=DEFAULT_GRACE
     version = row["current_version"]
     if version["finding_signature"] != finding.get("finding_signature"):
       new_version = _version(finding, changes)
+      # §4: the replaced version stays one R1FS read away.
       events.append(_event(asset_id, "changed", ref, key=key, detail={
-        "old_severity": version["severity"], "new_severity": new_version["severity"]}))
+        "old_severity": version["severity"], "new_severity": new_version["severity"],
+        "old_finding_signature": version["finding_signature"],
+        "old_first_pass_report_cid": version["first_pass_report_cid"],
+        "old_last_pass_report_cid": version["last_pass_report_cid"]}))
       row["current_version"] = new_version
     else:
       version["last_pass_report_cid"] = changes["pass_report_cid"]
   if late:
     return state, events
 
-  pass_cause = _pass_gap_cause(changes)
   in_scope_rows = bool(seen)
   row_cause = None
   for key in sorted(rows):
@@ -320,12 +328,19 @@ def _overtaken(base, entries, run):
   return any(tuple(key) in entries and not entries[tuple(key)].get("skipped") for key in base["skipped"])
 
 
-def _apply_run(base, entries, run, load_changes, *, asset_id, grace, may_lose, overtaken_as_late=False):
+def _lost(checkpoint):
+  """The passes data maintenance declared lost, as `(job_id, pass_nr)` keys (older checkpoints: none)."""
+  return {tuple(key) for key in checkpoint.get("lost") or ()}
+
+
+def _apply_run(base, entries, run, load_changes, *, asset_id, grace, may_lose, declared, overtaken_as_late=False):
+  """`declared`: passes already declared lost; folded as skipped, their artifact never read again."""
   state = deepcopy(base)
+  state["lost"] = sorted([job_id, pass_nr] for job_id, pass_nr in declared)
   through = base["through"]
   events = {}
   lost = []
-  real = [key for key in run if not entries[key].get("skipped")]
+  real = [key for key in run if not entries[key].get("skipped") and key not in declared]
   real.sort(key=lambda key: (entries[key]["date_completed"], key[0], key[1]))
   for key in real:
     entry = entries[key]
@@ -348,6 +363,7 @@ def _apply_run(base, entries, run, load_changes, *, asset_id, grace, may_lose, o
     state["included"][job_id] = max(state["included"].get(job_id, 0), pass_nr)
     if entries[(job_id, pass_nr)].get("skipped") and [job_id, pass_nr] not in state["skipped"]:
       state["skipped"].append([job_id, pass_nr])
+  state["lost"] = sorted(state["lost"] + [list(key) for key in lost])
   return state, events, lost
 
 
@@ -359,22 +375,24 @@ def fold(checkpoint, entries, load_changes, *, asset_id, grace=DEFAULT_GRACE, re
   `read_cap` artifact reads is left pending (the result is the checkpoint plus the contiguous fold,
   with overtaken passes applied as late, and must not be written). An artifact that reads as None
   fails the fold (`LedgerFoldError`), unless `may_lose(entry)` (data maintenance only) declares it lost:
-  that pass is then folded as skipped and listed in `lost`.
+  that pass is then folded as skipped, listed in `lost` and kept in the checkpoint's `lost`, so every
+  later fold and replay skips it without reading its artifact.
   """
   base = checkpoint or empty_checkpoint()
+  declared = _lost(base)
   run = _contiguous(entries, base["included"])
   if not _overtaken(base, entries, run):
     state, events, lost = _apply_run(base, entries, run, load_changes, asset_id=asset_id, grace=grace,
-                                     may_lose=may_lose)
+                                     may_lose=may_lose, declared=declared)
     return FoldResult(state, events, False, False, tuple(lost))
   full = _contiguous(entries, {})
-  reads = sum(1 for key in full if not entries[key].get("skipped"))
+  reads = sum(1 for key in full if not entries[key].get("skipped") and key not in declared)
   if read_cap is None or reads <= read_cap:
     state, events, lost = _apply_run(empty_checkpoint(), entries, full, load_changes, asset_id=asset_id,
-                                     grace=grace, may_lose=may_lose)
+                                     grace=grace, may_lose=may_lose, declared=declared)
     return FoldResult(state, events, True, False, tuple(lost))
   state, events, lost = _apply_run(base, entries, run, load_changes, asset_id=asset_id, grace=grace,
-                                   may_lose=may_lose, overtaken_as_late=True)
+                                   may_lose=may_lose, declared=declared, overtaken_as_late=True)
   return FoldResult(state, events, False, True, tuple(lost))
 
 

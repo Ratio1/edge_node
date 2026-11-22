@@ -112,7 +112,10 @@ class TestWorkedCases(unittest.TestCase):
     self.assertEqual((row["first_seen"], row["episode_opened"], row["times_seen"]),
                      (ref("J", 1, 1), ref("J", 1, 1), 3))
     self.assertEqual(kinds(events[1]), ["changed"])
-    self.assertEqual(events[1][0]["detail"], {"old_severity": "HIGH", "new_severity": "CRITICAL"})
+    # §4: the replaced version, first and last pass report, stays one R1FS read away.
+    self.assertEqual(events[1][0]["detail"], {
+      "old_severity": "HIGH", "new_severity": "CRITICAL", "old_finding_signature": "s1",
+      "old_first_pass_report_cid": "pr-J-1", "old_last_pass_report_cid": "pr-J-2"})
 
   def test_4_covered_miss_with_n_1_sets_not_observed_since(self):
     state, events = run(net("J", 4, 4), state=self.base)
@@ -142,6 +145,15 @@ class TestWorkedCases(unittest.TestCase):
     self.assertEqual(row["last_coverage_gap"], ref("J", 6, 6))
     # An aborted pass is a gap cause (§3, §11 case 7), so the gap state starts.
     self.assertEqual(kinds(events[0]), ["coverage_gap"])
+
+  def test_7a_sighting_on_an_aborted_pass_is_seen_but_not_tested(self):
+    aborted = {"aborted": True, "abort_reason_class": "unknown"}
+    state, _ = run(net("J", 2, 2, [F], abort_state=aborted), state=self.base)
+    row = self.row(state)
+    self.assertEqual((row["last_seen"], row["times_seen"], row["job_ids"], row["last_tested"]),
+                     (ref("J", 2, 2), 2, ["J"], ref("J", 1, 1)))
+    state, _ = run(net("K", 1, 3, [G], abort_state=aborted), state=state)
+    self.assertIsNone(state["rows"]["f2:0"]["last_tested"])  # first sighting on a gap pass
 
   def test_8_port_outside_the_configured_range_is_out_of_scope(self):
     state, events = run(net("J", 7, 7, port_range=(1, 1000)), state=self.base)
@@ -271,9 +283,15 @@ class TestCoverageRule(unittest.TestCase):
     self.assertEqual(state["rows"], base["rows"])
 
   def test_correlation_finding_is_in_scope_on_every_completed_network_pass(self):
-    corr = finding(port=0, probe="_post_scan_correlate")
-    _, state, _ = self.after(net("J", 2, 2, excluded=(HTTP,)), base_pass=net("J", 1, 1, [corr]))
-    self.assertIsNotNone(state["rows"][F_KEY]["not_observed_since"])
+    from extensions.business.cybersec.red_mesh.mixins.risk import _RiskScoringMixin
+    # A real flat correlation finding, as the flat walk names it.
+    [corr] = type("Host", (_RiskScoringMixin,), {})()._compute_risk_and_findings({
+      "target": "192.0.2.10", "correlation_findings": [
+        {"title": "Honeypot indicator", "severity": "MEDIUM", "confidence": "firm"}]})[1]
+    key = f"{corr['finding_id']}:0"
+    _, state, events = self.after(net("J", 2, 2, excluded=(HTTP,)), base_pass=net("J", 1, 1, [corr]))
+    self.assertEqual(state["rows"][key]["not_observed_since"], ref("J", 2, 2))
+    self.assertEqual(kinds(events), ["not_observed"])
 
   def test_clean_graybox_pass_without_the_finding_is_a_covered_miss(self):
     _, state, events = self.after(web("W", 2, 2), base_pass=web("W", 1, 1, [gbx()]))
@@ -852,6 +870,16 @@ class TestListEngagementFindings(_EngagementPlugin):
     self.assertEqual(self.rows(), data)
     self.assertEqual((len(self.storage.writes), self.files.reads), (writes, reads))
 
+  def test_a_failed_repair_write_serves_the_folded_rows(self):
+    self.record(net("J", 1, 1, [F, G]))
+    self.record(net("K", 1, 3, [F]))
+    self.entry_only(net("J", 2, 2, [G]))  # overtaken: the read replays and tries the repair
+    stored = self.fields()["checkpoint"]
+    with patch.object(EngagementLedgerStore, "put_checkpoint", side_effect=LedgerStoreError("no")):
+      data = self.rows()
+    self.assertEqual([row["timesSeen"] for row in data["rows"]], [2, 2])
+    self.assertEqual(self.fields()["checkpoint"], stored)
+
   def test_a_replay_over_the_cap_is_reported_pending_writes_nothing_and_data_maintenance_runs_it(self):
     from extensions.business.cybersec.red_mesh.services import engagement_findings
     self.record(net("J", 1, 1, [F]))
@@ -978,10 +1006,21 @@ class TestLedgerDataMaintenance(_EngagementPlugin):
                      ({"J": 3}, 2))
     self.refused(self.plugin.maintain_redmesh_engagement_ledgers(self.actor, False), 400, "invalid_request")
 
+  def test_a_checkpoint_missing_a_nested_key_fails_that_asset_and_the_read_is_unavailable(self):
+    logs = []
+    self.plugin.P = lambda *args, **kwargs: logs.append(args[0])
+    store = self.record(net("J", 1, 1, [F]))
+    checkpoint = self.fields()["checkpoint"]
+    del checkpoint["rows"][F_KEY]["times_seen"]  # a malformed restore
+    self.plugin.chainstore_hset(hkey=store.hkey, key="checkpoint", value=checkpoint)
+    self.entry_only(net("J", 2, 2, [F]))
+    done = self.plugin.maintain_redmesh_engagement_ledgers(self.actor, True)
+    self.assertEqual(done["data"]["outcomes"], [{"hkey": store.hkey, "outcome": "failed", "skipped_filled": 0}])
+    self.assertIn(f"[LEDGER] {store.hkey}: maintenance failed (KeyError)", logs)
+    self.refused(self.read(), 503, "unavailable")
 
-class TestFixRound1(_EngagementPlugin):
-  """Findings round 1 (RM-121 phase 2)."""
 
+class TestLedgerKeyIncludesTenant(_EngagementPlugin):
   def test_the_same_engagement_id_in_two_tenants_keeps_two_ledgers(self):
     request = self.engagement[3:]  # the id derives from the request id: reuse it in tenant B
     other, same = self.other_tenant(request_id=request)
@@ -996,6 +1035,10 @@ class TestFixRound1(_EngagementPlugin):
     self.assertEqual({v for v in self.fields(self.store(tenant=other)).values()}, {None})
     self.assertEqual(self.fields()["checkpoint"]["rows"][F_KEY]["job_ids"], ["J"])
     self.assertEqual([r["jobIds"] for r in self.rows()["rows"]], [["J"]])
+
+
+class TestUnreadableArtifact(_EngagementPlugin):
+  """A pass-changes artifact R1FS answers None for: transient until data maintenance declares it lost."""
 
   def unreadable(self, changes):
     """A pass entry whose artifact R1FS answers None for (gone, or a transient failure); returns the CID
@@ -1043,6 +1086,21 @@ class TestFixRound1(_EngagementPlugin):
     self.assertEqual((checkpoint["included"], checkpoint["rows"][F_KEY]["times_seen"]), ({"J": 2}, 1))
     self.assertTrue(any("declared lost" in line for line in logs))
     self.assertEqual(self.rows()["replayPending"], [])  # unwedged
+
+  def test_a_lost_pass_stays_skipped_when_a_later_hook_replays_the_asset(self):
+    self.record(net("J", 1, 1, [F]))
+    self.unreadable(net("J", 2, 2, [F]))
+    self.plugin.time = lambda: 11 * 86400
+    self.plugin.maintain_redmesh_engagement_ledgers(self.actor, True)
+    self.assertEqual(self.fields()["checkpoint"]["lost"], [["J", 2]])
+    self.record(net("K", 1, 5, [F]))
+    self.entry_only(net("L", 1, 3, [G]))  # overtaken: `through` is 5, and its writer did not mark it late
+    reads = self.files.reads
+    self.record(net("M", 1, 6, [F]))      # the hook (may_lose None) replays the asset
+    self.assertEqual(self.files.reads - reads, 4)  # J/1, K/1, L/1, M/1: never the lost J/2
+    checkpoint = self.fields()["checkpoint"]
+    self.assertEqual(checkpoint["included"], {"J": 2, "K": 1, "L": 1, "M": 1})
+    self.assertEqual((checkpoint["lost"], checkpoint["rows"][F_KEY]["times_seen"]), ([["J", 2]], 3))
 
   def test_a_transient_artifact_read_error_still_fails_the_fold(self):
     from extensions.business.cybersec.red_mesh.services.engagement_ledger import LedgerFoldError
@@ -1101,10 +1159,6 @@ class TestHookPaths(unittest.TestCase):
     self.assertEqual(owner.ledger_fields(), before)
 
 
-if __name__ == "__main__":
-  unittest.main()
-
-
 class TestLedgerArtifactReadTimeout(unittest.TestCase):
 
   def test_ledger_artifact_reads_pass_a_short_r1fs_timeout(self):
@@ -1123,3 +1177,7 @@ class TestLedgerArtifactReadTimeout(unittest.TestCase):
     self.assertIsNone(artifact_loader(ArtifactRepository(owner))("Qm1"))
     self.assertEqual(calls, [("Qm1", {"timeout": ARTIFACT_READ_TIMEOUT})])
     self.assertLess(ARTIFACT_READ_TIMEOUT, 90)
+
+
+if __name__ == "__main__":
+  unittest.main()

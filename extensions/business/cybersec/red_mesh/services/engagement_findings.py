@@ -97,15 +97,19 @@ def _row(asset_id, row, triage):
 def _asset_state(owner, artifacts, namespace, tenant_id, engagement_id, asset_id):
   """`(checkpoint, pending)` of one asset: the stored checkpoint plus the fold of the entries it lacks.
   A replay within the cap is written once as the repair (that fold, not a second one); one over the
-  cap writes nothing. A pass-changes artifact that cannot be read (R1FS answers None on a transient
-  failure too) serves the stored checkpoint as pending, and writes nothing."""
+  cap writes nothing. A repair write that fails is logged and the folded result served. A pass-changes
+  artifact that cannot be read (R1FS answers None on a transient failure too) serves the stored
+  checkpoint as pending, and writes nothing."""
   store = EngagementLedgerStore(owner, namespace, tenant_id, engagement_id, asset_id)
   snapshot = store.read()
   try:
     result = fold(snapshot["checkpoint"], snapshot["entries"], artifact_loader(artifacts), asset_id=asset_id,
                   read_cap=REPLAY_READ_CAP)
     if result.replayed and snapshot["rebuilding"] is None:
-      EngagementLedgerRecorder(owner, store, None).fold_and_write(artifacts, folded=(snapshot, result))
+      try:
+        EngagementLedgerRecorder(owner, store, None).fold_and_write(artifacts, folded=(snapshot, result))
+      except LedgerStoreError as exc:
+        owner.P(f"[LEDGER] {store.hkey}: repair write failed ({exc}); serving the folded result", color='y')
   except LedgerFoldError:
     owner.P(f"[LEDGER] {store.hkey}: a pass-changes artifact is unreadable; serving the stored checkpoint",
             color='y')
@@ -185,8 +189,9 @@ def list_engagement_findings(owner, namespace, engagement, *, engagement_asset_i
       if len(rows) > limit:
         break
     page = [_row(asset_id, row, triage.get(host, row["finding_id"])) for asset_id, host, row in rows[:limit]]
-  except LedgerStoreError as exc:
-    owner.P(f"[LEDGER] Engagement findings of {engagement_id} unavailable: {exc}", color='r')
+  except (LedgerStoreError, KeyError, TypeError, ValueError) as exc:
+    # A malformed checkpoint or artifact (a restore) fails the fold or the row build: unavailable, not a 500.
+    owner.P(f"[LEDGER] Engagement findings of {engagement_id} unavailable: {type(exc).__name__}", color='r')
     return _error(503, "unavailable")
   next_cursor = (_encode_cursor((page[-1]["engagementAssetId"], page[-1]["findingId"], page[-1]["occurrence"]))
                  if len(rows) > limit else None)

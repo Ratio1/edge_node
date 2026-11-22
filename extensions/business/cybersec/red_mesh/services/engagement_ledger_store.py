@@ -57,6 +57,7 @@ def validate_checkpoint(checkpoint):
   if (not isinstance(checkpoint, dict) or checkpoint.get("schema_version") != SCHEMA_VERSION
       or not isinstance(checkpoint.get("rows"), dict) or not isinstance(checkpoint.get("gap"), dict)
       or not isinstance(checkpoint.get("included"), dict) or not isinstance(checkpoint.get("skipped"), list)
+      or not isinstance(checkpoint.get("lost", []), list)
       or not (checkpoint.get("through") is None or _number(checkpoint.get("through")))
       or any(not isinstance(job, str) or type(nr) is not int or nr < 1 for job, nr in checkpoint["included"].items())):
     raise LedgerStoreError("Invalid ledger checkpoint")

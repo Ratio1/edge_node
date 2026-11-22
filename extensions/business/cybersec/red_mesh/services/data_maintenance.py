@@ -888,7 +888,9 @@ def maintain_ledgers(owner, inventory, artifacts, now):
     try:
       filled, written = EngagementLedgerRecorder(owner, store, None).maintain(artifacts, now)
       outcome = "folded" if written else "current"
-    except (LedgerStoreError, LedgerFoldError):
+    except (LedgerStoreError, LedgerFoldError, KeyError, TypeError, ValueError) as exc:
+      # A malformed restored checkpoint or artifact fails this asset only. Type and hkey, no values.
+      owner.P(f"[LEDGER] {hkey}: maintenance failed ({type(exc).__name__})", color='r')
       filled, outcome = 0, "failed"
     outcomes.append({"hkey": hkey, "outcome": outcome, "skipped_filled": filled})
   return {"outcomes": outcomes}
