@@ -29,6 +29,8 @@ from ..tenancy.compliance import KIND as ASSESSMENT_KIND
 from ..tenancy.adapters.cstore_identity import CstoreAuthAccountReader
 from ..tenancy.execution import BINDING_SCHEMA_VERSION, ExecutionBinding
 from ..tenancy.super_tenant_integrations import KIND as INTEGRATION_OVERRIDE_KIND, withheld_for_backup
+from .engagement_ledger import LedgerFoldError
+from .engagement_ledger_store import EngagementLedgerRecorder, EngagementLedgerStore, LedgerStoreError, valid_field
 from .integration_status import _STATUS_BUILDERS
 
 
@@ -152,6 +154,7 @@ class Inventory:
     # them readable and the row's file list complete for the retry.
     self._containers = set()
     self._tenants = None
+    self._ledgers = None
     # Files this request deleted: another old row that shares one does not delete it again.
     self.deleted = set()
 
@@ -233,6 +236,27 @@ class Inventory:
     self._tenants = sorted(item for item in found if _TENANT_STATUS_HKEY.match(f":integrations:{item}"))
     return self._tenants
 
+  def ledgers(self):
+    """RM-121: `{hkey: (tenant_id, engagement_id, engagement_asset_id)}`, the finding-ledger hkey of
+    every asset of every stored engagement row (hkey names cannot be listed). Fixed for the request,
+    as `tenant_ids`."""
+    if self._ledgers is None:
+      self._ledgers = {}
+      for _, kind, ids, value in self._tenancy_fields():
+        if kind != "engagement" or len(ids) != 2 or not isinstance(value, dict):
+          continue
+        for entry in value["assets"] if isinstance(value.get("assets"), list) else ():
+          asset_id = entry.get("engagement_asset_id") if isinstance(entry, dict) else None
+          try:
+            hkey = EngagementLedgerStore(self._owner, self._namespace, ids[0], ids[1], asset_id).hkey
+          except LedgerStoreError:
+            continue
+          self._ledgers[hkey] = (ids[0], ids[1], asset_id)
+    return self._ledgers
+
+  def namespace(self):
+    return self._namespace
+
   def hkeys(self):
     """The registry, in a stable order. The index into it is the export's paging cursor."""
     names = [self._instance] + [self._instance + suffix for suffix, _, _ in _PER_JOB]
@@ -243,6 +267,7 @@ class Inventory:
     # RM-127: each node's self-published public IP, keyed by the node's address.
     names.append(f"{self._instance}:node_info")
     names.extend([self._tenancy_hkey, self._compliance_hkey, self._account_hkey])
+    names.extend(sorted(self.ledgers()))
     return names
 
   def accepts(self, hkey):
@@ -460,7 +485,21 @@ class Inventory:
       return self._triage_class(*triage, field, value)
     if hkey == f"{self._instance}:node_info":
       return (CURRENT, "") if isinstance(value, dict) and set(value) == {"ip", "published_at"} else (OLD, "unrecognized")
+    if hkey in self.ledgers():
+      return self._ledger_class(hkey, field, value)
     raise MaintenanceError(400, "invalid_request")
+
+  def _ledger_class(self, hkey, field, value):
+    """RM-121: a finding-ledger field is current while the adapter would read it and its tenant is
+    live; its pass entries' pass-changes files are then kept (`files`)."""
+    if not valid_field(field, value):
+      return OLD, "unrecognized"
+    tenant_id = self.ledgers()[hkey][0]
+    if tenant_id not in self._live_tenants():
+      known = any(k == "tenant" and i == [tenant_id] and v is not None
+                  for _, k, i, v in self._tenancy_fields())
+      return (OLD, "old_tenant") if known else (ORPHAN, "tenant_gone")
+    return CURRENT, ""
 
   def _compliance_class(self, field, value):
     """RM-120: an assessment row is current while its validator passes and its tenant is live;
@@ -497,7 +536,12 @@ class Inventory:
     if key in self._files:
       return self._files[key]
     found, complete = {}, True
-    if value is not None and hkey != self._account_hkey:
+    if hkey in self.ledgers():
+      # RM-121: a pass entry owns its pass-changes file only; the pass report it also names is the job's.
+      cid = value.get("pass_changes_cid") if isinstance(value, dict) and str(field).startswith("pass:") else None
+      if valid_cid(cid):
+        found[cid] = "pass_changes_cid"
+    elif value is not None and hkey != self._account_hkey:
       for cid, role in references(value):
         found.setdefault(cid, role)
       self._withheld |= fallback_key_files(value)
@@ -832,6 +876,24 @@ def _clean_row(owner, inventory, target, delete_file, job_id=None):
   return result
 
 
+def maintain_ledgers(owner, inventory, artifacts, now):
+  """RM-121 (continuous-monitoring.md §2.1): for each finding ledger of a live tenant, fill the
+  `skipped` entries a dead launcher left out (24 hours after a later pass of the job) and run the folds
+  and replays the post-pass hook and the reads left pending, with no replay cap."""
+  outcomes = []
+  for hkey, (tenant_id, engagement_id, asset_id) in sorted(inventory.ledgers().items()):
+    if tenant_id not in inventory._live_tenants():
+      continue
+    store = EngagementLedgerStore(owner, inventory.namespace(), tenant_id, engagement_id, asset_id)
+    try:
+      filled, written = EngagementLedgerRecorder(owner, store, None).maintain(artifacts, now)
+      outcome = "folded" if written else "current"
+    except (LedgerStoreError, LedgerFoldError):
+      filled, outcome = 0, "failed"
+    outcomes.append({"hkey": hkey, "outcome": outcome, "skipped_filled": filled})
+  return {"outcomes": outcomes}
+
+
 def _is_pruned_triage_audit(owner, inventory, listed, hkey, field):
   """A triage audit entry the prune tombstoned: the field is listed but reads None. A backup taken before the
   prune must not bring it back outside the kept window."""
@@ -916,6 +978,10 @@ def run(owner, namespace, operation, **arguments):
       data = write_stored_file(ipfs_home=ipfs_home(), **arguments)
     elif operation == "restore_records":
       data = restore_records(owner, inventory(), arguments["rows"])
+    elif operation == "maintain_ledgers":
+      if arguments.pop("confirm", None) is not True:
+        raise MaintenanceError(400, "invalid_request")
+      data = maintain_ledgers(owner, inventory(), owner._get_artifact_repository(), owner.time())
     else:
       raise MaintenanceError(400, "invalid_request")
   except MaintenanceError as exc:

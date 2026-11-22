@@ -357,17 +357,18 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
   return {"status": "success", "job_id": job_id, "cids_deleted": deleted, "cids_total": len(cids)}
 
 
-def _collect_cids_from_raw(payload):
-  """Walk a raw CStore payload and yield every value stored under a `*_cid` key."""
+def _collect_cids_from_raw(payload, skip=()):
+  """Walk a raw CStore payload and yield every value stored under a `*_cid` key not named in `skip`."""
   if isinstance(payload, dict):
     for key, value in payload.items():
       if isinstance(key, str) and key.endswith("_cid") and isinstance(value, str) and value:
-        yield value
+        if key not in skip:
+          yield value
       else:
-        yield from _collect_cids_from_raw(value)
+        yield from _collect_cids_from_raw(value, skip)
   elif isinstance(payload, (list, tuple)):
     for item in payload:
-      yield from _collect_cids_from_raw(item)
+      yield from _collect_cids_from_raw(item, skip)
 
 
 def _collect_rulebook_submission_cids(payload):
@@ -402,7 +403,9 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
   Formal submission pointers remain retryable unless R1FS acknowledges deletion;
   other legacy artifacts retain the existing best-effort force-wipe behavior.
   """
-  cids = {c for c in _collect_cids_from_raw(raw_payload) if isinstance(c, str)}
+  # RM-121: a pass's engagement-ledger artifact belongs to the engagement asset, not the job: a job
+  # purge never deletes it (tenant delete does, continuous-monitoring.md §2.1).
+  cids = {c for c in _collect_cids_from_raw(raw_payload, skip=("pass_changes_cid",)) if isinstance(c, str)}
   submission_hkey = f"{owner.cfg_instance_id}:rulebook_review:submissions"
   try:
     submission_rows = owner.chainstore_hgetall(hkey=submission_hkey) or {}
