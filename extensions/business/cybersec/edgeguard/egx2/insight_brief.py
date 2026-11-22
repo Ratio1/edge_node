@@ -542,7 +542,10 @@ def run_insight_brief(*, sample_rows: Optional[int] = None, **kwargs: Any) -> di
   result = _run_insight_brief(sample_rows=sample_rows, **kwargs)
   if sample_rows:
     assessment = result["case_explanation"]["assessment"]
-    assessment["text"] = f"{assessment['text']} {SAMPLE_ROWS_SENTENCE.format(rows=sample_rows)}"
+    text = assessment["text"].rstrip()
+    if text and text[-1] not in ".!?":
+      text += "."
+    assessment["text"] = f"{text} {SAMPLE_ROWS_SENTENCE.format(rows=sample_rows)}"
   return result
 
 

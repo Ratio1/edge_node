@@ -272,6 +272,14 @@ class Egx2SampleRowsTests(unittest.TestCase):
     self.assertTrue(case["assessment"]["text"].endswith(self.SENTENCE))
     self.assertEqual(case["assessment"]["text"].count(self.SENTENCE), 1)
 
+  def test_sentence_follows_an_assessment_without_a_final_period(self):
+    def no_period(brief):
+      brief["assessment"] = brief["assessment"].rstrip(".")
+
+    result, _ = self._run(brief_edit=no_period)
+    text = result["case_explanation"]["assessment"]["text"]
+    self.assertTrue(text.endswith(". " + self.SENTENCE), text)
+
   def test_n_of_total_claim_is_still_rejected_and_falls_back_with_the_sentence(self):
     def claim(brief):
       brief["observations"][0]["text"] = "2 of 50 indicators indicate \"quietsieve\"."
