@@ -6667,6 +6667,76 @@ class EdgeGuardExplainJobTests(unittest.TestCase):
     self.assertIn("Traceback", text)
     self.assertNotIn("cfg-secret-pw", text)
 
+  def _run_gated_brief_job(self, plugin, block, before_brief=None):
+    """Run a real explain job whose brief step waits on a gate; returns the
+    status seen before the MISP step, the status seen during the brief, and
+    the finished status."""
+    in_brief = threading.Event()
+    gate = threading.Event()
+    seen_before_misp = []
+    final_result = {"status": "ok", "ok": True, "explained": True, "marker": "final"}
+
+    def gated_brief(**_kwargs):
+      in_brief.set()
+      assert gate.wait(10)
+      return final_result
+
+    original = plugin._set_explain_job_phase
+
+    def record(job_id, phase, detail):
+      if phase == "misp":
+        seen_before_misp.append(plugin.explain_graph_status(job_id=job_id))
+      return original(job_id, phase, detail)
+
+    plugin._set_explain_job_phase = record
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      fake_driver, _ = _driver_with_results(_Result([_graph_path_record()], keys=["p"]))
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver), \
+          patch.object(plugin, "_misp_enrichment_for_response", return_value=block), \
+          patch.object(plugin, "_explanation_dispatch_strategy", return_value="insight_brief"), \
+          patch.object(plugin, "_run_insight_brief", side_effect=gated_brief):
+        job_id = plugin.explain_graph_start(**self._body())["job_id"]
+        self.assertTrue(in_brief.wait(10))
+        during = plugin.explain_graph_status(job_id=job_id)
+        gate.set()
+        final = self._wait_done(plugin, job_id)
+    return seen_before_misp[0], during, final, final_result
+
+  def test_partial_appears_after_misp_with_the_bounded_block_and_final_is_unchanged(self):
+    from .test_misp_enrichment import _valid_block
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    block = _valid_block()
+    before, during, final, final_result = self._run_gated_brief_job(plugin, block)
+    self.assertNotIn("partial", before)
+    self.assertFalse(during["done"])
+    self.assertEqual(set(during["partial"]), {"packet", "result_digest", "misp_enrichment"})
+    self.assertEqual(during["partial"]["misp_enrichment"], block)
+    self.assertTrue(during["partial"]["packet"]["graph"]["nodes"])
+    self.assertIn("schema_version", during["partial"]["result_digest"])
+    self.assertNotIn("partial", final)
+    self.assertEqual(final["result"], final_result)
+
+  def test_partial_drops_a_misp_block_the_model_admission_rejects(self):
+    from .test_misp_enrichment import _valid_block
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.misp_enrichment.contains_raw_misp_payload",
+      side_effect=lambda block, *_args: block is not None,
+    ):
+      _before, during, _final, _result = self._run_gated_brief_job(plugin, _valid_block())
+    self.assertEqual(set(during["partial"]), {"packet", "result_digest"})
+    self.assertEqual(plugin._misp_enrichment_error_count, 0)  # the brief step counts it, not the partial
+
+  def test_partial_drops_a_misp_block_over_the_response_size_bound(self):
+    from .test_misp_enrichment import _valid_block
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    _before, small, _final, _result = self._run_gated_brief_job(plugin, _valid_block())
+    _before, big, _final, _result = self._run_gated_brief_job(
+      _make_api(edgeguard_explanation_strategy="insight_brief"), _valid_block(50, padded=True),
+    )
+    self.assertIn("misp_enrichment", small["partial"])
+    self.assertEqual(set(big["partial"]), {"packet", "result_digest"})
+
   def test_one_call_path_reports_brief_attempt_one_then_done(self):
     plugin = _make_api(edgeguard_explanation_strategy="one_call")
     phases = []

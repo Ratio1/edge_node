@@ -1062,6 +1062,18 @@ def _emit_progress(progress, phase: str, detail: Optional[Dict[str, Any]] = None
     pass
 
 
+def _emit_partial(progress, partial: Optional[Dict[str, Any]]) -> None:
+  """Publish the EG-039 job partial through the progress callback's optional
+  `partial` hook; fail-open like `_emit_progress`."""
+  hook = getattr(progress, "partial", None)
+  if hook is None or partial is None:
+    return
+  try:
+    hook(partial)
+  except Exception:  # noqa: BLE001 - observability only.
+    pass
+
+
 def _unwrap_endpoint_result(response: Any) -> tuple[Any, int]:
   """Split a `_wrapper_safe_error` envelope into (result, HTTP status); a bare
   dict is a 200."""
@@ -4987,6 +4999,7 @@ class EdgeguardApiPlugin(BasePlugin):
     packet: Mapping[str, Any],
     block: Optional[Mapping[str, Any]],
     event_url_template: str = misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE,
+    record: bool = True,
   ) -> Optional[Mapping[str, Any]]:
     """Explanation spec v0.2 §4: runs before any EAB/1 or EGX/2 model call.
     Re-validates the block that would be admitted, computes
@@ -5005,11 +5018,34 @@ class EdgeguardApiPlugin(BasePlugin):
     errors: list[Dict[str, str]] = []
     _validate_packet_redaction(model_redaction, errors)
     if any(error.get("code") == "raw_misp_payload_not_allowed" for error in errors):
-      with self._metrics_lock:
-        self._misp_enrichment_error_count += 1
-        self._misp_enrichment_last_error = "model_admission"
+      if record:  # the job partial re-checks a block the brief step will count itself
+        with self._metrics_lock:
+          self._misp_enrichment_error_count += 1
+          self._misp_enrichment_last_error = "model_admission"
       return None
     return block
+
+  def _explain_job_partial(
+    self,
+    packet: Mapping[str, Any],
+    digest: Mapping[str, Any],
+    block: Optional[Mapping[str, Any]],
+    event_url_template: str,
+  ) -> Optional[Dict[str, Any]]:
+    """EG-039 phase 5: `{packet, result_digest, misp_enrichment?}` published
+    while the brief runs. The MISP block passes the same model admission and
+    the same `_bounded_graph_first_success` size bound as the final result, so
+    a block the admission rejects is absent here too; bounded on its own, the
+    partial can keep a block the larger final result drops for size. `None`
+    when even the block-free partial is over the byte cap."""
+    admitted = self._admit_misp_enrichment_for_model(packet, block, event_url_template, record=False)
+    partial: Dict[str, Any] = {"packet": dict(packet), "result_digest": dict(digest)}
+    if admitted is not None:
+      partial["misp_enrichment"] = dict(admitted)
+    try:
+      return self._bounded_graph_first_success(partial)
+    except GraphFirstRuntimeError:
+      return None
 
   def _active_explanation_strategy(self) -> str:
     value = getattr(self, "cfg_edgeguard_explanation_strategy", "one_call")
@@ -7380,6 +7416,8 @@ class EdgeguardApiPlugin(BasePlugin):
       )
       if misp_event_url_template is None:
         misp_event_url_template = misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE
+      if progress is not None:
+        _emit_partial(progress, self._explain_job_partial(packet, digest, misp_block, misp_event_url_template))
       # EG-039 I-211: under `insight_brief` a truncated result goes to EGX/2 as a
       # sample (rankings too, see _explanation_dispatch_strategy); the brief says so.
       # On this explain_graph path the other strategies keep the deterministic
@@ -7581,9 +7619,19 @@ class EdgeguardApiPlugin(BasePlugin):
         job["advanced"] = True
         job["settled"].set()
 
+  def _set_explain_job_partial(self, job_id: str, partial: Dict[str, Any]) -> None:
+    state = self._explain_job_state()
+    with state["lock"]:
+      job = state["jobs"].get(job_id)
+      if job is None or job["done"]:
+        return
+      job["partial"] = partial
+
   def _run_explain_job(self, job_id: str, params: Dict[str, Any]) -> None:
     def progress(phase: str, detail: Optional[Dict[str, Any]] = None) -> None:
       self._set_explain_job_phase(job_id, phase, detail)
+
+    progress.partial = lambda partial: self._set_explain_job_partial(job_id, partial)
 
     try:
       response = self._explain_graph_impl(progress=progress, **params)
@@ -7620,6 +7668,7 @@ class EdgeguardApiPlugin(BasePlugin):
       if status_code >= 400 or _is_failed_endpoint_response(result):
         with self._metrics_lock:
           self._error_count += 1
+      job.pop("partial", None)
       job.update(
         phase="done", detail=None, done=True, result=result, status_code=status_code,
         finished_at=time.monotonic(),
@@ -7723,7 +7772,8 @@ class EdgeguardApiPlugin(BasePlugin):
 
   @BasePlugin.endpoint(method="GET")
   def explain_graph_status(self, job_id: str = "") -> Dict[str, Any]:
-    """`{phase, detail, done}`; once done also `result` (exactly what
+    """`{phase, detail, done}`, plus `partial` (`{packet, result_digest,
+    misp_enrichment?}`) from the end of the MISP step while not done; once done also `result` (exactly what
     `/explain_graph` returned) and `result_status_code` (its HTTP status).
     Unknown or expired ids get 404."""
     state = self._explain_job_state()
@@ -7734,6 +7784,8 @@ class EdgeguardApiPlugin(BasePlugin):
         snapshot = None
       else:
         snapshot = {"phase": job["phase"], "detail": job["detail"], "done": job["done"]}
+        if not job["done"] and job.get("partial") is not None:
+          snapshot["partial"] = job["partial"]
         if job["done"]:
           snapshot["result"] = job["result"]
           snapshot["result_status_code"] = job["status_code"]
