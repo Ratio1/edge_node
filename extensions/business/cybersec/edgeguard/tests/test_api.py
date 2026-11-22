@@ -2330,7 +2330,7 @@ class EdgeGuardApiTests(unittest.TestCase):
       validation={"accepted": True},
       live_retry={},
       request="Explain.",
-      deadline=time.monotonic() + 259,
+      deadline=time.monotonic() + 199,
     )
 
     self.assertEqual(calls, 0)
@@ -2338,6 +2338,26 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["analyst_brief"]["diagnostics"]["reason"], "insufficient_deadline_budget")
     self.assertEqual(result["explanation_trace"]["outcome"]["attempted_calls"], 0)
     self.assertEqual(result["explanation_trace"]["outcome"]["completed_calls"], 0)
+
+  def test_brief_call_waits_for_the_job_budget_left_capped_at_420_seconds(self):
+    # EG-039 phase 4: EGX/2 and EAB/1 calls wait min(420, job budget left); none starts with under 1 s.
+    plugin = _make_api()
+    plugin._graph_first_provider_for_tests = None  # exercise the real HTTP path
+    plugin._explanation_url = lambda path=None: ("http://127.0.0.1:1/chat", None)
+    plugin._explanation_worker_ready = lambda: True
+    for budget, expected in ((900, 420), (300, 300)):
+      with self.subTest(budget=budget):
+        with patch(
+          "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+          side_effect=requests.exceptions.Timeout(),
+        ) as post:
+          with self.assertRaises(GraphFirstRuntimeError) as raised:
+            plugin._brief_provider_call(time.monotonic() + budget)({"messages": []})
+        self.assertEqual(raised.exception.code, "provider_timeout")
+        self.assertAlmostEqual(post.call_args.kwargs["timeout"], expected, delta=2)
+    with self.assertRaises(GraphFirstRuntimeError) as raised:
+      plugin._brief_provider_call(time.monotonic())({"messages": []})
+    self.assertEqual(raised.exception.code, "insufficient_deadline_budget")
 
   def test_api_owned_complete_evidence_dispatches_balanced_map_map_synthesis_to_base_qwen(self):
     from extensions.business.cybersec.edgeguard.graph_first_explanation import resolve_mode

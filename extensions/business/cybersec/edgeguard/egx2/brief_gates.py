@@ -239,8 +239,9 @@ def confidence_comparisons(brief, sheet, enrichment=None):
 
 
 def _grounding_findings(brief, sheet, enrichment=None):
-    """`[(code, detail)]` for `enrichment_grounding`: one entry per failed
-    citation check, plus the shared lexical code if any. The code is a fixed
+    """`[(code, detail)]` for `enrichment_grounding`: the shared lexical code, if
+    any (the model writes no `misp_citations` since EG-039 phase 4; code attaches
+    them). The code is a fixed
     string chosen here (never built from model output); the detail is the
     human text that feeds the retry note only."""
     nodes = enrichment_nodes(enrichment)
@@ -249,21 +250,6 @@ def _grounding_findings(brief, sheet, enrichment=None):
     for o in brief.get("observations", []) or []:
         about = {str(e).strip().lower() for e in o.get("exemplar_entities", []) or []}
         claims.append((o.get("text", ""), about))
-        for c in o.get("misp_citations", []) or []:
-            entity = str(c.get("entity", "")).strip().lower()
-            field = c.get("field")
-            value = c.get("value")
-            node = nodes.get(entity)
-            if entity not in about:
-                findings.append(("citation_entity_not_exemplar", f"citation entity '{c.get('entity')}' is not an exemplar of its observation"))
-            elif node is None:
-                findings.append(("citation_entity_no_enrichment", f"citation entity '{c.get('entity')}' has no enrichment"))
-            elif field != "misp_event_ids" and field not in (node.get("fields") or {}):
-                findings.append(("citation_field_not_in_node", f"field '{field}' is not in the enrichment of '{c.get('entity')}'"))
-            else:
-                items = (node.get("misp_event_ids") or []) if field == "misp_event_ids" else node["fields"][field]
-                if not any(str(item) == str(value).strip() for item in (items if isinstance(items, list) else [items])):
-                    findings.append(("citation_value_mismatch", f"cited value is not the enrichment {field} of '{c.get('entity')}'"))
     other_texts = [brief.get("assessment", ""), brief.get("why_it_matters", "")]
     other_texts += [c.get("text", "") for c in brief.get("next_checks", []) or []]
     other_texts.append((brief.get("confidence") or {}).get("basis", ""))
@@ -287,10 +273,6 @@ def _grounding_findings(brief, sheet, enrichment=None):
 def enrichment_grounding(brief, sheet, enrichment=None):
     """Explanation spec v0.2 §5. Fail-closed:
 
-    - every `misp_citations` entry names an entity listed in the same
-      observation's `exemplar_entities` (the entity the claim is about),
-      that entity has a node in the enrichment view, and the cited value is
-      that node's value for the cited field (verbatim, or one item of it);
     - the shared lexical rules (`misp_enrichment.enrichment_grounding_error`):
       every brief text is about each sheet or view entity it mentions, and an
       observation also about all of its exemplar entities, enriched or not;
@@ -299,7 +281,7 @@ def enrichment_grounding(brief, sheet, enrichment=None):
     problems = [detail for _code, detail in _grounding_findings(brief, sheet, enrichment)]
     if problems:
         return False, "; ".join(sorted(set(problems))[:3])
-    return True, "enrichment citations, URLs and CWE ids resolve"
+    return True, "URLs and CWE ids resolve, no enrichment value on the wrong entity"
 
 
 HARD_GATES = {

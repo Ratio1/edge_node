@@ -647,6 +647,12 @@ DECLINE_FALLBACK_MESSAGES = {
 }
 
 EDGEGUARD_REQUEST_TIMEOUT_SECONDS = 600
+# EG-039 phase 4: a brief model call (EGX/2 or EAB/1) waits for min(this, job budget left).
+# Slow is acceptable on a 4-core host; the job budget above is the real limit.
+EDGEGUARD_BRIEF_CALL_MAX_SECONDS = 420
+# EAB/1 starts only with this much job budget left: one call of about 2,000 prompt
+# tokens and 256 reply tokens measured about 150 s cold on a 4-core host, plus margin.
+EDGEGUARD_ANALYST_BRIEF_MIN_SECONDS = 200
 
 # EG-013 P4: non-success endpoint outcomes for the /health request metrics.
 # A deterministic guard rejection counts as a failed request; plain metadata
@@ -3453,9 +3459,10 @@ _CONFIG = {
   "EDGEGUARD_EXPLANATION_OUTPUT_MODE": None,
   "EDGEGUARD_EXPLANATION_STRATEGY": "one_call",
   # Admission floor for the EGX/2 insight-brief model call: skip the model (and
-  # degrade deterministically) unless this much request budget remains. Sized
-  # from the measured GPU-serving throughput; re-measure on hardware change.
-  "EDGEGUARD_INSIGHT_BRIEF_ADMISSION_SECONDS": 240,
+  # degrade deterministically) unless this much request budget remains: the worst-case
+  # cold call on a 4-core CPU host after the EG-039 phase 4 cut (see
+  # `egx2.MIN_CALL_SECONDS`); re-measure on hardware change.
+  "EDGEGUARD_INSIGHT_BRIEF_ADMISSION_SECONDS": egx2.MIN_CALL_SECONDS,
   # Public model key -> worker address (SEMAPHORE/PATH) plus catalog metadata.
   # The shipped defaults describe public models only. A deployment adds the
   # models it wants to run (for example a private fine-tuned GGUF) here, in the
@@ -3872,7 +3879,16 @@ class EdgeguardApiPlugin(BasePlugin):
       raise GraphFirstRuntimeError("tokenizer_path", "configuration", "graph-first tokenizer path is invalid")
     return production_token_counter(path)
 
-  def _call_graph_first_provider(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+  def _brief_provider_call(self, deadline: float):
+    """`provider_call` for a brief: each call waits `min(420, job budget left)` seconds."""
+    def call(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+      wait = min(EDGEGUARD_BRIEF_CALL_MAX_SECONDS, deadline - time.monotonic())
+      if wait < 1:
+        raise GraphFirstRuntimeError("insufficient_deadline_budget", "completion", "no request budget left for the brief call")
+      return self._call_graph_first_provider(payload, timeout=wait)
+    return call
+
+  def _call_graph_first_provider(self, payload: Mapping[str, Any], timeout: Optional[float] = None) -> Mapping[str, Any]:
     override = getattr(self, "_graph_first_provider_for_tests", None)
     if callable(override):
       return override(payload)
@@ -3889,7 +3905,7 @@ class EdgeguardApiPlugin(BasePlugin):
         url,
         headers=self._explanation_headers(),
         json=dict(payload),
-        timeout=min(230, int(self.cfg_request_timeout_seconds)),
+        timeout=min(230, int(self.cfg_request_timeout_seconds)) if timeout is None else timeout,
       )
     except requests.exceptions.Timeout as exc:
       raise GraphFirstRuntimeError("provider_timeout", "provider", "graph-first provider timed out") from exc
@@ -5135,17 +5151,17 @@ class EdgeguardApiPlugin(BasePlugin):
         raise GraphFirstRuntimeError(
           "model_not_ready", "configuration", "analyst brief model is still starting",
         )
-      if deadline - time.monotonic() < 260:
+      if deadline - time.monotonic() < EDGEGUARD_ANALYST_BRIEF_MIN_SECONDS:
         raise GraphFirstRuntimeError(
           "insufficient_deadline_budget",
           "completion",
-          "one-call analyst brief requires 260 seconds of remaining request budget",
+          f"one-call analyst brief requires {EDGEGUARD_ANALYST_BRIEF_MIN_SECONDS} seconds of remaining request budget",
         )
       brief = run_analyst_brief(
         question=request,
         digest=digest,
         model=getattr(self, "cfg_edgeguard_explanation_model", None),
-        provider_call=self._call_graph_first_provider,
+        provider_call=self._brief_provider_call(deadline),
         projection_digest=projection_digest,
         misp_enrichment=misp_enrichment_block,
         event_url_template=misp_event_url_template,
@@ -5261,17 +5277,17 @@ class EdgeguardApiPlugin(BasePlugin):
       if explanation_err or not self._explanation_worker_ready():
         allow_model = False
       else:
-        admission = getattr(self, "cfg_edgeguard_insight_brief_admission_seconds", 240)
+        admission = getattr(self, "cfg_edgeguard_insight_brief_admission_seconds", egx2.MIN_CALL_SECONDS)
         if deadline - time.monotonic() < admission:
           allow_model = False
-    provider_call = self._call_graph_first_provider
+    provider_call = self._brief_provider_call(deadline)
     if progress is not None:
       # EG-028: the attempt number comes from counting provider calls, so
       # `egx2/insight_brief.py` stays untouched. `brief` = model call running,
       # `checks` = the deterministic gates that follow that call.
       attempts = [0]
 
-      def provider_call(payload, _call=self._call_graph_first_provider):
+      def provider_call(payload, _call=provider_call):
         attempts[0] += 1
         _emit_progress(progress, "brief", {"attempt": attempts[0]})
         completion = _call(payload)
@@ -5292,6 +5308,7 @@ class EdgeguardApiPlugin(BasePlugin):
       misp_node_ids={
         node_ref: packet_id for packet_id, node_ref in (misp_node_aliases or {}).items()
       },
+      seconds_left=lambda: deadline - time.monotonic(),
     )
     if progress is not None and (
       (result["case_explanation"].get("provenance") or {}).get("mode") == "deterministic_fallback"
@@ -5303,9 +5320,6 @@ class EdgeguardApiPlugin(BasePlugin):
     if result.get("citation_drops"):
       with self._metrics_lock:
         self._misp_citation_drop_count += int(result["citation_drops"])
-    if result.get("misp_ref_drops"):
-      with self._metrics_lock:
-        self._misp_ref_drop_count += sum(result["misp_ref_drops"].values())
     if result.get("misp_ref_withheld"):
       with self._metrics_lock:
         self._misp_ref_withheld_count += int(result["misp_ref_withheld"])
