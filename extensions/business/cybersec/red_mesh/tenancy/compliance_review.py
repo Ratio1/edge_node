@@ -151,8 +151,7 @@ def latest_status(service, row):
   sub = row["submissions"][-1]
   store, ids = c._store(service), _ids(row, sub)
   try:
-    raw = store.raw_record(KIND, *ids)
-    record = store.validate_record(raw, KIND, *ids) if raw is not None else None
+    record = store.get(KIND, *ids)  # None only when absent; a stored non-object is refused
   except (TenantStoreError, TypeError, ValueError):  # corrupt stored data (e.g. a lone surrogate) is unreadable, not fatal
     return None, None
   if record is not None and record["fingerprint"] != sub["fingerprint"]:

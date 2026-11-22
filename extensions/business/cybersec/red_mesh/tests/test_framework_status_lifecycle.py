@@ -119,6 +119,9 @@ class TestStatusLifecycle(StatusLifecycleFixture):
     self.assertEqual(listed(other)['reviewStatus'],'submitted')
     self.storage.data[key]={**good,'fingerprint':'b'*64}  # bound to another submission
     self.assertIsNone(listed(aid)['reviewStatus'])
+    for scalar in ([],'null',7):  # a stored non-object is corrupt, not absent
+      self.storage.data[key]=scalar
+      self.assertIsNone(listed(aid)['reviewStatus'])
     self.storage.data[key]=None  # review row not written yet: still submitted
     self.assertEqual(listed(aid)['reviewStatus'],'submitted')
     self.storage.data[key]=good
@@ -141,19 +144,19 @@ class TestStatusLifecycle(StatusLifecycleFixture):
     for which in (aid,other):
       saved=self.ok(self.save_status(which,{'scores':self.full_scores()},1))
       self.ok(self.submit_status(which,saved['assessmentRevision']))
-    original=S.raw_record
+    original=S.get
     def flaky(store,kind,*ids):
       if kind==r.KIND and ids[2]==aid:
         raise TenantStoreError('Compliance storage cannot be read')
       return original(store,kind,*ids)
-    with mock.patch.object(S,'raw_record',flaky):
+    with mock.patch.object(S,'get',flaky):
       self.assertEqual((listed(aid)['reviewStatus'],listed(aid)['selfApproved']),(None,None))
       self.assertEqual(listed(other)['reviewStatus'],'submitted')
 
   def test_list_summary_ignores_a_malformed_return_receipt(self):
     from types import SimpleNamespace
     from extensions.business.cybersec.red_mesh.tenancy import compliance_review as r
-    service=SimpleNamespace(compliance=SimpleNamespace(raw_record=lambda *ids:None))  # no review row yet
+    service=SimpleNamespace(compliance=SimpleNamespace(get=lambda *ids:None))  # no review row yet
     sub={'revision':1,'fingerprint':'a'*64,'request_id':'q','actor':'u','submitted_at':'t'}
     row={'tenant_id':'t','pack_id':'p','assessment_id':'default','submissions':[sub]}
     good={'actor':'u2','action':'return','time':'t','revision':1,'request_id':'r','control_id':None,'comment':None,'self_approved':False}
@@ -165,5 +168,5 @@ class TestStatusLifecycle(StatusLifecycleFixture):
     self.assertEqual(r.latest_status(service,row),('returned_for_changes',False))
     def refuse(*_):
       raise UnicodeEncodeError('utf-8','\ud800',0,1,'surrogates not allowed')  # a lone surrogate in a stored comment
-    bad=SimpleNamespace(compliance=SimpleNamespace(raw_record=lambda *ids:{'x':1},validate_record=refuse))
+    bad=SimpleNamespace(compliance=SimpleNamespace(get=refuse))
     self.assertEqual(r.latest_status(bad,row),(None,None))
