@@ -191,10 +191,9 @@ def get_triage_rates(owner, tenant_id: str, engagement_id: str = "", *, checked_
 
   Every record of the tenant's host-triage hash is joined to the raw archive of its writer job, which gives the
   reason and the engagement (never the merged read, which stamps a confirmed finding `triage_confirmed`). A record
-  whose writer job is outside the snapshot, or whose finding is not in that archive, is `unattributed`. A malformed
-  record, a scope mismatch or more than MAX_ARTIFACT_FETCHES writer archives make the read unavailable, never partial.
-  `unattributed` counts the records without archive evidence (writer job outside the snapshot, or finding not in its
-  archive). Such a record has no known engagement, so with `engagement_id` set the count is `None`, not computed.
+  whose writer job is outside the snapshot, or whose finding is not in that archive, is `unattributed`; it has no
+  known engagement, so with `engagement_id` set the count is `None`. A deleted row (value None) is skipped. A malformed
+  record or job, a scope mismatch or more than MAX_ARTIFACT_FETCHES writer archives make the read unavailable.
   """
   validate_snapshot_mode(snapshot_mode, snapshot_supplied=True)
   try:
@@ -203,6 +202,8 @@ def get_triage_rates(owner, tenant_id: str, engagement_id: str = "", *, checked_
     stored_records = owner.chainstore_hgetall(hkey=repo.host_triage_hkey(tenant_id)) or {}
     counts, unattributed, archives = {}, 0, {}
     for key, stored in stored_records.items():
+      if stored is None:  # a deleted row: the purge sweep writes None and hgetall still lists it
+        continue
       host, _, finding_id = key.partition("\x1f")
       state = FindingTriageState.from_dict(stored)
       if key != repo.host_triage_key(host, finding_id) or not _names_key(stored, tenant_id, host, finding_id):

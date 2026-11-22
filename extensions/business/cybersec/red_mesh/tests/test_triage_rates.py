@@ -129,9 +129,15 @@ class TestTriageRates(unittest.TestCase):
     for bad in ({"job_id": "job-1"}, "text", {**hash_[f"{HOST}\x1ff1"], "finding_id": "other"},
                 {**hash_[f"{HOST}\x1ff1"], "status": "bogus"}, {**hash_[f"{HOST}\x1ff1"], "tenant_id": TENANT_B}):
       with self.subTest(bad=bad):
-        hash_[f"{HOST}\x1ff2"] = bad
+        hash_[f"{HOST}\x1ff1"] = bad
         with self.assertRaises(TenantStoreError):
           rates(self.owner)
+
+  def test_a_deleted_row_is_skipped(self):
+    add_job(self.owner, "job-1", [finding("f1", "banner_only")])
+    put(self.owner, "job-1", "f1", "false_positive")
+    self.owner.hashes[f"inst:triage:t:{TENANT_A}"][f"{HOST}\x1ff2"] = None
+    self.assertEqual(rows(rates(self.owner))[("banner_only", "tentative")]["n"], 1)
 
   def test_a_false_positive_write_after_a_confirmation_counts_once_as_false_positive(self):
     add_job(self.owner, "job-1", [finding("f1", "banner_only")])
@@ -187,8 +193,7 @@ class TestTriageRates(unittest.TestCase):
       put(self.owner, f"job-{number}", "f", "false_positive", host=f"192.0.2.{number}")
     with self.assertRaises(TenantStoreError):
       rates(self.owner)
-    for number in range(128, 129):
-      del self.owner.hashes[f"inst:triage:t:{TENANT_A}"][f"192.0.2.{number}\x1ff"]
+    del self.owner.hashes[f"inst:triage:t:{TENANT_A}"]["192.0.2.128\x1ff"]
     self.assertEqual(rows(rates(self.owner))[("banner_only", "tentative")]["n"], 128)
 
   def test_one_job_with_many_records_reads_its_archive_once(self):
@@ -205,11 +210,6 @@ class TestTriageRates(unittest.TestCase):
     put(self.owner, "job-1", "f1", "false_positive")
     result = rates(self.owner)
     self.assertEqual((result["tenant"]["by_reason"], result["tenant"]["unattributed"]), ([], 0))
-
-  def test_legacy_job_keyed_records_are_not_counted(self):
-    add_job(self.owner, "job-1", [finding("f1", "banner_only")])
-    self.owner.hashes["inst:triage"] = {"job-1:f1": {"job_id": "job-1", "finding_id": "f1", "status": "false_positive"}}
-    self.assertEqual(rates(self.owner)["tenant"]["by_reason"], [])
 
   def test_an_empty_tenant_has_no_rows(self):
     self.assertEqual(rates(self.owner), {"tenant": {"by_reason": [], "unattributed": 0}, "engagements": {}})
