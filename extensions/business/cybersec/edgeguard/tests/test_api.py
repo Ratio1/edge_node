@@ -875,6 +875,23 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(_graph_first_payload(result)["diagnostics"]["code"], "unsupported_model")
     post.assert_not_called()
 
+  def test_single_model_lineup_lists_one_model_and_refuses_removed_keys(self):
+    # EG-039: the playground serves only cypher_2026_11_08; the base Qwen worker stays configured as the
+    # brief worker (EDGEGUARD_EXPLANATION_WORKER) but is not a selectable generation model.
+    plugin = _make_api(
+      edgeguard_generation_workers={"cypher_2026_11_08": {"SEMAPHORE": "edgeguard_llm_cypher_2026_11_08"}},
+      edgeguard_default_model="cypher_2026_11_08",
+      edgeguard_explanation_worker={"SEMAPHORE": "edgeguard_llm_base", "PATH": "/create_chat_completion"},
+    )
+
+    catalog = plugin.models()
+    self.assertEqual([item["model_key"] for item in catalog["models"]], ["cypher_2026_11_08"])
+    self.assertEqual(catalog["default_model_key"], "cypher_2026_11_08")
+    # The brief worker's model is not a generation model: naming it is the same 400 as any unknown key.
+    result = plugin.generate(request="Show indicators", model_key="base_qwen3_4b")
+    self.assertEqual(result["status_code"], 400)
+    self.assertEqual(_graph_first_payload(result)["diagnostics"]["code"], "unsupported_model")
+
   def test_edgeguard_api_owns_generation_endpoint(self):
     self.assertTrue(hasattr(EdgeguardApiPlugin, "generate"))
 
