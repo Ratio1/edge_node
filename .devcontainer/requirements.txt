@@ -8,8 +8,6 @@ ngrok
 paramiko
 pymisp
 sqlfluff
-# Test runner: about 30 red_mesh test modules import pytest; without it they fail to import.
-pytest
 neo4j>=5.28,<6
 websocket-client>=1.8,<2
 
