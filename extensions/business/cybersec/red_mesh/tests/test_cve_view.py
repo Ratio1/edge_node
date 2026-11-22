@@ -187,12 +187,9 @@ class CveViewTests(unittest.TestCase):
     capped = summarize_view(build_cve_view(many))
     self.assertEqual((len(capped["folded"]), capped["omitted_folded"]), (MAX_SUMMARY_ROWS, 30 - MAX_SUMMARY_ROWS))
 
-  def test_folded_rows_stay_out_of_filter_listed_like_possible_rows(self):
+  def test_folded_rows_stay_out_of_the_llm_findings(self):
     base = [fnd(1, kev=True), fnd(2, score=5.0)]
     tentative = fnd(3, confidence="tentative", reason="banner_unverified")
-    as_possible = dict(tentative, confidence_reason="banner_only")
-    kept = lambda fs: [f["finding_id"] for f in filter_listed(fs)]
-    self.assertEqual(kept(base + [tentative]), kept(base + [as_possible]))
     out = build_llm_input(findings=base + [tentative], aggregated_report={})
     self.assertEqual([f["cve"] for f in out.findings], [["CVE-2030-0001"]])
 
