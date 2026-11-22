@@ -10,6 +10,7 @@ from datetime import datetime
 
 import paramiko
 
+from ...constants import AUTH_SKIPPED
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
 from ...cve_db import (
@@ -1080,6 +1081,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         ))
 
     # --- 6. Default credential check ---
+    if not self._login_attempts_allowed():
+      result["auth_control"] = dict(AUTH_SKIPPED)
+      return probe_result(raw_data=result, findings=findings)
     accepted_creds = []
     proofs = {}
     for user, passwd in _FTP_DEFAULT_CREDS:
@@ -1224,66 +1228,70 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     # --- 3. Default credential check ---
     accepted_creds = []
     proofs = {}
+    login_attempts = self._login_attempts_allowed()
+    control = CONTROL_NOT_RUN
 
-    for username, password in _SSH_DEFAULT_CREDS:
+    if not login_attempts:
+      result["auth_control"] = dict(AUTH_SKIPPED)
+    else:
+      for username, password in _SSH_DEFAULT_CREDS:
+        try:
+          client = paramiko.SSHClient()
+          client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+          client.connect(
+            target, port=port,
+            username=username, password=password,
+            timeout=self._target_timeout(3), auth_timeout=self._target_timeout(3),
+            look_for_keys=False, allow_agent=False,
+          )
+          cred = f"{username}:{password}"
+          accepted_creds.append(cred)
+          proofs[cred] = _ssh_authenticated_action(client, self._target_timeout(3))
+          client.close()
+        except paramiko.AuthenticationException:
+          continue
+        except Exception:
+          break  # connection issue, stop trying
+
+      # --- 4. Arbitrary credential acceptance test ---
+      # Doubles as the negative control for step 3: a service that accepts a
+      # random pair has not demonstrated a default credential in use, whatever
+      # it said to the defaults (RM-069).
+      random_user = f"probe_{random.randint(10000, 99999)}"
+      random_pass = f"rnd_{random.randint(10000, 99999)}"
       try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(
           target, port=port,
-          username=username, password=password,
+          username=random_user, password=random_pass,
           timeout=self._target_timeout(3), auth_timeout=self._target_timeout(3),
           look_for_keys=False, allow_agent=False,
         )
-        cred = f"{username}:{password}"
-        accepted_creds.append(cred)
-        proofs[cred] = _ssh_authenticated_action(client, self._target_timeout(3))
+        # The generated pair goes to raw_data, not into the finding. `evidence` is
+        # a content-hash field (models/finding_identity._CONTENT_FIELDS), so a
+        # value that differs every run gave this finding a new finding_signature
+        # on every scan and on every worker: change detection reported a change
+        # each pass and the aggregate carried one copy per worker.
+        result["arbitrary_credentials_accepted"] = f"{random_user}:{random_pass}"
+        control = CONTROL_ACCEPTED
+        findings.append(Finding(
+          severity=Severity.CRITICAL,
+          cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
+          title="SSH accepts arbitrary credentials",
+          description="Random credentials were accepted, indicating a dangerous misconfiguration or deceptive service.",
+          evidence="Randomly generated credentials were accepted by the SSH service.",
+          remediation="Investigate immediately — authentication is non-functional.",
+          owasp_id="A07:2021",
+          cwe_id="CWE-287",
+          confidence="certain",
+        ))
         client.close()
       except paramiko.AuthenticationException:
-        continue
+        control = CONTROL_REJECTED
       except Exception:
-        break  # connection issue, stop trying
-
-    # --- 4. Arbitrary credential acceptance test ---
-    # Doubles as the negative control for step 3: a service that accepts a
-    # random pair has not demonstrated a default credential in use, whatever
-    # it said to the defaults (RM-069).
-    control = CONTROL_NOT_RUN
-    random_user = f"probe_{random.randint(10000, 99999)}"
-    random_pass = f"rnd_{random.randint(10000, 99999)}"
-    try:
-      client = paramiko.SSHClient()
-      client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-      client.connect(
-        target, port=port,
-        username=random_user, password=random_pass,
-        timeout=self._target_timeout(3), auth_timeout=self._target_timeout(3),
-        look_for_keys=False, allow_agent=False,
-      )
-      # The generated pair goes to raw_data, not into the finding. `evidence` is
-      # a content-hash field (models/finding_identity._CONTENT_FIELDS), so a
-      # value that differs every run gave this finding a new finding_signature
-      # on every scan and on every worker: change detection reported a change
-      # each pass and the aggregate carried one copy per worker.
-      result["arbitrary_credentials_accepted"] = f"{random_user}:{random_pass}"
-      control = CONTROL_ACCEPTED
-      findings.append(Finding(
-        severity=Severity.CRITICAL,
-        cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
-        title="SSH accepts arbitrary credentials",
-        description="Random credentials were accepted, indicating a dangerous misconfiguration or deceptive service.",
-        evidence="Randomly generated credentials were accepted by the SSH service.",
-        remediation="Investigate immediately — authentication is non-functional.",
-        owasp_id="A07:2021",
-        cwe_id="CWE-287",
-        confidence="certain",
-      ))
-      client.close()
-    except paramiko.AuthenticationException:
-      control = CONTROL_REJECTED
-    except Exception:
-      pass  # the control did not run; stays CONTROL_NOT_RUN
-    result["auth_control"] = {"random_credentials": control}
+        pass  # the control did not run; stays CONTROL_NOT_RUN
+      result["auth_control"] = {"random_credentials": control}
 
     if accepted_creds:
       result["accepted_credentials"] = accepted_creds
@@ -1318,7 +1326,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         findings += check_cves(ssh_lib, ssh_version, package=package, banner_verified=verified)
 
         # --- 7. libssh auth bypass (CVE-2018-10933) ---
-        if ssh_lib == "libssh":
+        if ssh_lib == "libssh" and login_attempts:
           bypass = self._ssh_check_libssh_bypass(target, port)
           if bypass:
             findings.append(bypass)
@@ -2061,6 +2069,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       except Exception:
         return False, None, None
 
+    if not self._login_attempts_allowed():
+      result["auth_control"] = dict(AUTH_SKIPPED)
+      return probe_result(raw_data=result, findings=findings)
     system_info_captured = False
     accepted_creds = []
     proofs = {}

@@ -123,7 +123,7 @@ FEATURE_CATALOG = [
   {
     "id": "active_auth",
     "label": "Credential testing",
-    "description": "Test default/weak credentials on database and remote access services. May trigger account lockout.",
+    "description": "Send login attempts: default/weak credential guesses on SSH, FTP, Telnet, databases and HTTP Basic, random-credential controls, authentication-bypass payloads, and web login-form POSTs. Turn off to send no login attempt. May trigger account lockout.",
     "category": "service",
     "methods": ["_service_info_mysql_creds", "_service_info_postgresql_creds", "_service_info_http_basic_auth"]
   },
@@ -154,6 +154,16 @@ NETWORK_FEATURE_REGISTRY = {
   )
   for category in NETWORK_FEATURE_CATEGORIES
 }
+# Methods of the `active_auth` group. Its presence in a job's enabled methods is the
+# one switch for every credential guess (see PentestLocalWorker._login_attempts_allowed).
+ACTIVE_AUTH_METHODS = tuple(
+  method
+  for item in FEATURE_CATALOG
+  if item.get("id") == "active_auth"
+  for method in item.get("methods", [])
+)
+# Raw-result record left by a login-attempt path that the closed gate skipped.
+AUTH_SKIPPED = {"skipped": "active_auth disabled"}
 NETWORK_FEATURE_METHODS = tuple(
   method
   for category in NETWORK_FEATURE_CATEGORIES
