@@ -188,9 +188,11 @@ CVE_DATABASE: list = [
   # ── Apache httpd ───────────────────────────────────────────────────
   CveEntry("apache", ">=2.4.0,<2.4.60",  "CVE-2024-38475", Severity.CRITICAL, "mod_rewrite escaping flaw — SSRF / RCE", "CWE-116"),
   CveEntry("apache", ">=2.4.0,<2.4.60",  "CVE-2024-38476", Severity.CRITICAL, "Backend header exploit — SSRF / local script exec", "CWE-829"),
-  CveEntry("apache", ">=2.4.49,<2.4.51", "CVE-2021-41773", Severity.CRITICAL, "Path traversal + RCE", "CWE-22"),
+  CveEntry("apache", ">=2.4.49,<2.4.50", "CVE-2021-41773", Severity.CRITICAL, "Path traversal + RCE", "CWE-22"),
   CveEntry("apache", ">=2.4.0,<2.4.52",  "CVE-2021-44790", Severity.CRITICAL, "mod_lua buffer overflow", "CWE-787"),
-  CveEntry("apache", ">=2.4.0,<2.4.62",  "CVE-2024-40725", Severity.MEDIUM, "HTTP request smuggling via mod_proxy", "CWE-444"),
+  CveEntry("apache", ">=2.4.60,<2.4.62", "CVE-2024-40725", Severity.MEDIUM, "Source code disclosure with handlers configured via AddType", "CWE-668"),
+  CveEntry("apache", ">=2.4.60,<2.4.69", "CVE-2026-42356", Severity.LOW, "Limited RCE for some internal redirects to non-CGI files in CGI directories", "CWE-430"),
+  CveEntry("apache", ">=2.4.68,<2.4.69", "CVE-2026-56449", Severity.HIGH, "mod_proxy_html crash in dump_content", "CWE-787"),
   CveEntry("apache", "<2.4.49",           "CVE-2021-40438", Severity.CRITICAL, "mod_proxy SSRF", "CWE-918"),
   CveEntry("apache", "<2.2.34",           "CVE-2017-7679", Severity.CRITICAL, "mod_mime buffer overread", "CWE-126"),
 

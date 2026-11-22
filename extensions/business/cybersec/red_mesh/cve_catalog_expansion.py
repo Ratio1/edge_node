@@ -62,7 +62,10 @@ EXPANDED_CVE_ROWS = (
   ("apache", ">=2.4.55,<2.4.58", "CVE-2023-43622", "HIGH", "HTTP/2 initial window blocking DoS", "CWE-400"),
   ("apache", ">=2.4.17,<2.4.59", "CVE-2024-27316", "HIGH", "HTTP/2 header buffering resource exhaustion", "CWE-770"),
   ("apache", ">=2.4.0,<2.4.60", "CVE-2024-38477", "HIGH", "mod_proxy NULL pointer dereference", "CWE-476"),
-  ("apache", "<2.4.62", "CVE-2024-40898", "HIGH", "Windows mod_rewrite SSRF", "CWE-918"),
+  # RM-204: Windows-only (the vulndb overlay marks them platform_dependent; this static catalog has no platform field).
+  ("apache", ">=2.4.0,<2.4.60", "CVE-2024-38472", "HIGH", "Windows UNC SSRF (NTLM hash leak)", "CWE-918"),
+  ("apache", ">=2.4.0,<2.4.66", "CVE-2025-59775", "HIGH", "Windows NTLM leakage through UNC SSRF", "CWE-918"),
+  ("apache", ">=2.4.0,<2.4.69", "CVE-2026-59685", "HIGH", "Windows ap_directory_walk() out-of-bounds write", "CWE-787"),
 
   # OpenSSH
   ("openssh", ">=2.0,<3.1", "CVE-2002-0083", "CRITICAL", "Channel code off-by-one memory corruption", "CWE-193"),
