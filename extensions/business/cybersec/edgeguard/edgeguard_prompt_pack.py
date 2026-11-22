@@ -46,7 +46,7 @@ _VENDORED_DIR = Path(__file__).resolve().parent / "prompts" / "packs" / "cypher_
 LEGACY_PROFILE_PACKS = {
   "decision_json_v2026_11_08": {
     "path": str(_VENDORED_DIR),
-    "sha256": "9815f8ccc6eacdbac6bf7fee9517975bad621486488ca1e5e89e520a080cc30e",
+    "sha256": "d9dd19253002fd45e3e906cb2adcae2fd004de08303e440bafda020f6af72913",
   },
 }
 

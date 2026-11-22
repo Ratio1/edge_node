@@ -15,6 +15,7 @@ from extensions.business.cybersec.edgeguard.tests.test_api import (
   _Response,
   _make_api,
 )
+from extensions.business.cybersec.edgeguard.edgeguard_api import DECLINE_FALLBACK_MESSAGES
 
 DECISION_KEY = "decision-fixture-model"
 DECISION_SEMAPHORE = "edgeguard_llm_decision_fixture"
@@ -100,6 +101,31 @@ class DecisionReplyTests(unittest.TestCase):
     self.assertEqual(result["decision_note"], note)
 
 
+class DecisionFieldTests(unittest.TestCase):
+  def test_declining_reply_without_text_gets_a_defined_message(self):
+    for decision, field in (("clarify", "question"), ("out_of_scope", "reason"), ("refuse", "reason")):
+      for empty in (None, "", "  ", 7):
+        with self.subTest(decision=decision, empty=empty):
+          result, _ = _generate({"decision": decision, field: empty})
+          self.assertEqual(result["status"], "declined")
+          self.assertTrue(result["decision_message"].strip())
+          self.assertEqual(result["decision_message"], DECLINE_FALLBACK_MESSAGES[decision])
+
+  def test_rejected_reply_keeps_its_decision_and_note(self):
+    cypher = "MATCH (h:Host) RETURN h LIMIT 5"
+    result, _ = _generate({"decision": "partial", "cypher": cypher, "note": "Hosts live in ISIM."})
+
+    self.assertEqual(result["status"], "rejected")
+    self.assertEqual(result["decision"], "partial")
+    self.assertEqual(result["decision_note"], "Hosts live in ISIM.")
+
+  def test_rejected_unparseable_reply_has_no_decision(self):
+    result, _ = _generate("MATCH (n) RETURN n LIMIT 5")
+
+    self.assertEqual(result["status"], "rejected")
+    self.assertNotIn("decision", result)
+
+
 class DecisionPromptTests(unittest.TestCase):
   # Adapter bundle EdgeGuard-cypher-LoRA-2026-11-08, SHA256SUMS entry for system_prompt.txt.
   BUNDLE_PROMPT_SHA256 = "da06f1e43e6102b9c04adaa4b361ef1d81e2a4e3ac3d3759525689a7cf47a2eb"
@@ -170,6 +196,32 @@ class DecisionSchemaTests(unittest.TestCase):
       with self.subTest(question=question):
         result, _ = _generate({"decision": "answer", "cypher": cypher}, question=question)
         self.assertEqual(result["status"], "accepted", result.get("validation_feedback"))
+
+  def test_names_in_the_prod_graph_but_missing_from_the_prompt_are_accepted(self):
+    # `source_refs` and `evidence_types` ride on relationships, `last_recorded_at` on Indicator and
+    # SOURCED_FROM (prod `db.propertyKeys()` read, graph 6959f33).
+    cases = [
+      "MATCH (ta:ThreatActor)-[r:USES_MALWARE]->(m:Malware) RETURN m.name AS name, r.source_refs AS refs LIMIT 5",
+      "MATCH (c:Campaign)-[r:PART_OF_CAMPAIGN]->(x) RETURN c.name AS name, r.evidence_types AS types LIMIT 5",
+      "MATCH (i:Indicator) RETURN i.value AS value, i.last_recorded_at AS seen ORDER BY seen DESC LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        result, _ = _generate({"decision": "answer", "cypher": cypher})
+        self.assertEqual(result["status"], "accepted", result.get("validation_feedback"))
+
+  def test_names_absent_from_the_prod_graph_stay_rejected(self):
+    cases = {
+      "vendor": "MATCH (c:CVE) RETURN c.vendor AS vendor LIMIT 5",
+      "cisa_ics": "MATCH (c:CVE) WHERE c.cisa_ics IS NOT NULL RETURN c.cve_id AS id LIMIT 5",
+      "Subtechnique": "MATCH (t:Subtechnique) RETURN t.name AS name LIMIT 5",
+      "SOURCE": "MATCH (a)-[:SOURCE]->(s:Source) RETURN s.name AS name LIMIT 5",
+    }
+    for name, cypher in cases.items():
+      with self.subTest(name=name):
+        result, _ = _generate({"decision": "answer", "cypher": cypher})
+        self.assertEqual(result["status"], "rejected")
+        self.assertIn(name, result["validation_feedback"])
 
   def test_labels_outside_the_prompt_schema_are_rejected(self):
     cypher = "MATCH (h:Host)-[:HAS_VULNERABILITY]->(c:CVE) RETURN h LIMIT 25"

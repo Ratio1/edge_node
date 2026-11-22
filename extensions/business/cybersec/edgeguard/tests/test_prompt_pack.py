@@ -199,7 +199,7 @@ class PluginWiringTests(unittest.TestCase):
       health = plugin.health()
 
     self.assertEqual(health["prompt_packs"], {MODEL_KEY: {
-      "pack_id": "cypher_2026_11_08", "pack_version": "5e12777d5a", "sha256": VENDORED_SHA,
+      "pack_id": "cypher_2026_11_08", "pack_version": "5e12777d5a.1", "sha256": VENDORED_SHA,
     }})
 
   def test_raw_cypher_pack_makes_one_attempt_with_the_pack_prompt(self):
@@ -226,11 +226,34 @@ class ParityTests(unittest.TestCase):
   def setUpClass(cls):
     cls.golden = json.loads(FIXTURE_PATH.read_text())
 
+  # The two deliberate differences from the pre-pack code (EG-037 phase 2); the rest stays frozen. The
+  # schema digest moved because three prod-graph property names joined the allowlist: the golden value is
+  # replaced by the expected new one, so a further change to the schema surface still fails here.
+  OLD_SCHEMA_DIGEST = "e8dfc616cfffc0ab8177d3b3b0c124019da09f06474a9daabe97801dfceebd2b"
+  NEW_SCHEMA_DIGEST = "a9a57ba60dcb4a2dad8c532ae3e95e155bc4c8e3fd29ec7b698ce19d31407c65"
+
+  @staticmethod
+  def _drop_rejected_decision_fields(value):
+    """The actual output only: a rejected response now carries `decision`/`decision_note`."""
+    if isinstance(value, dict):
+      if value.get("status") == "rejected":
+        value = {k: v for k, v in value.items() if k not in ("decision", "decision_note")}
+      return {k: ParityTests._drop_rejected_decision_fields(v) for k, v in value.items()}
+    return value
+
+  @staticmethod
+  def _expected_from_golden(value):
+    """The golden only: the old schema digest becomes the expected new one."""
+    if isinstance(value, dict):
+      return {k: ParityTests._expected_from_golden(v) for k, v in value.items()}
+    return ParityTests.NEW_SCHEMA_DIGEST if value == ParityTests.OLD_SCHEMA_DIGEST else value
+
   def _assert_parity(self, worker):
-    actual = capture(worker)
-    for section in self.golden:
+    actual = self._drop_rejected_decision_fields(capture(worker))
+    golden = self._expected_from_golden(self.golden)
+    for section in golden:
       with self.subTest(section=section):
-        self.assertEqual(actual[section], self.golden[section])
+        self.assertEqual(actual[section], golden[section])
 
   def test_pack_worker_entry_reproduces_the_golden_output(self):
     self._assert_parity(_worker(PROMPT_PACK=LEGACY_PROFILE_PACKS["decision_json_v2026_11_08"]))

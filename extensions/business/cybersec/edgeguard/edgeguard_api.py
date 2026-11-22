@@ -638,6 +638,12 @@ STATUS_TIMEOUT = "timeout"
 # The model chose not to write a query (decision-JSON profile: clarify,
 # out_of_scope, refuse); `decision_message` carries its question or reason.
 STATUS_DECLINED = "declined"
+# Shown when a declining reply carries no text (the model sent `null`, a non-string or an empty string).
+DECLINE_FALLBACK_MESSAGES = {
+  "clarify": "The model needs more detail to answer. Add specifics to the question and ask again.",
+  "out_of_scope": "The model says this question is outside what the EdgeGuard graph covers.",
+  "refuse": "The model declined to answer this question.",
+}
 
 EDGEGUARD_REQUEST_TIMEOUT_SECONDS = 600
 
@@ -4201,7 +4207,8 @@ class EdgeguardApiPlugin(BasePlugin):
       artifact = PATTERN_SCHEMA_ARTIFACTS.get(profile["name"])
     if pack is not None and pack.schema_allowed is not None:
       # v0.10 rules (LIMIT required, no pattern-schema checks) against the
-      # allowlist the pack ships (the schema its own system prompt describes).
+      # allowlist the pack ships (`schema.json`: the schema its system prompt describes, plus the
+      # prod-graph names the pack adds on purpose).
       return {
         "use_v0_11": False,
         "schema_artifact": None,
@@ -4566,7 +4573,7 @@ class EdgeguardApiPlugin(BasePlugin):
               "accepted": False,
               "accepted_cypher": None,
               "decision": reply["decision"],
-              "decision_message": reply["message"],
+              "decision_message": (reply["message"] or "").strip() or DECLINE_FALLBACK_MESSAGES[reply["decision"]],
               "attempts": [{
                 "attempt": attempt_index,
                 "kind": "initial",
@@ -4757,7 +4764,12 @@ class EdgeguardApiPlugin(BasePlugin):
     else:
       total_ms = round((time.monotonic() - started) * 1000, 1)
       llm_ms = round(sum(item["timing_ms"] for item in attempts), 1)
+      # A guard-rejected `answer`/`partial` keeps the model's decision and note; a reply that did not parse has none.
+      decision_fields = (
+        {"decision": reply["decision"], "decision_note": reply["note"]} if reply and reply["ok"] else {}
+      )
       return {
+        **decision_fields,
         "status": STATUS_REJECTED,
         "accepted": False,
         "accepted_cypher": None,
