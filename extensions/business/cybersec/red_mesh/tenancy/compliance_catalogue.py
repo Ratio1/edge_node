@@ -21,7 +21,7 @@ from ..references.framework_packs import (
   pack_rules,
 )
 from ..services.framework_scoring import scorer_for
-from . import compliance, compliance_review
+from . import compliance
 from .assets import canonical_uuid
 
 # `compliance` is only reached through the module at call time: it imports this module lazily, and
@@ -74,6 +74,7 @@ def status_of(row):
 
 
 def _summary(service, row, names, can_manage):
+  from . import compliance_review  # lazy: compliance_review imports compliance, which loads this module's peers
   review_status, self_approved = compliance_review.latest_status(service, row)
   return {
     "assessmentId": row.get("assessment_id") or compliance.DEFAULT_ID, "packId": row["pack_id"], "name": row.get("name") or "",

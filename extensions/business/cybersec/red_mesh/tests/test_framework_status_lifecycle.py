@@ -157,9 +157,13 @@ class TestStatusLifecycle(StatusLifecycleFixture):
     sub={'revision':1,'fingerprint':'a'*64,'request_id':'q','actor':'u','submitted_at':'t'}
     row={'tenant_id':'t','pack_id':'p','assessment_id':'default','submissions':[sub]}
     good={'actor':'u2','action':'return','time':'t','revision':1,'request_id':'r','control_id':None,'comment':None,'self_approved':False}
-    for label,receipt in (('wrong action',{**good,'action':'approve'}),('extra key',{**good,'x':1}),('revision',{**good,'revision':2})):
+    for label,receipt in (('wrong action',{**good,'action':'approve'}),('extra key',{**good,'x':1}),('revision',{**good,'revision':2}),('list action',{**good,'action':['return']})):
       with self.subTest(label):
         row['submissions']=[{**sub,'review_return':receipt}]
         self.assertEqual(r.latest_status(service,row),('submitted',False))
     row['submissions']=[{**sub,'review_return':good}]
     self.assertEqual(r.latest_status(service,row),('returned_for_changes',False))
+    def refuse(*_):
+      raise UnicodeEncodeError('utf-8','\ud800',0,1,'surrogates not allowed')  # a lone surrogate in a stored comment
+    bad=SimpleNamespace(compliance=SimpleNamespace(raw_record=lambda *ids:{'x':1},validate_record=refuse))
+    self.assertEqual(r.latest_status(bad,row),(None,None))

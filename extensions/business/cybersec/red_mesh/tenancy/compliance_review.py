@@ -153,14 +153,16 @@ def latest_status(service, row):
   try:
     raw = store.raw_record(KIND, *ids)
     record = store.validate_record(raw, KIND, *ids) if raw is not None else None
-  except TenantStoreError:
+  except (TenantStoreError, TypeError, ValueError):  # corrupt stored data (e.g. a lone surrogate) is unreadable, not fatal
     return None, None
   if record is not None and record["fingerprint"] != sub["fingerprint"]:
     return None, None
   receipt = sub.get("review_return")
-  if receipt is not None and not (_event_valid(receipt, sub["revision"]) and receipt["action"] == "return"):
-    receipt = None
-  return review_status(record["history"] if record else [], receipt)
+  try:
+    receipt_ok = receipt is not None and _event_valid(receipt, sub["revision"]) and receipt["action"] == "return"
+  except (TypeError, ValueError, KeyError):  # the assessment validator does not check the receipt's shape
+    receipt_ok = False
+  return review_status(record["history"] if record else [], receipt if receipt_ok else None)
 
 
 def _view(service, tenant, account, row, review, snapshot, replayed=False, repaired=()):
