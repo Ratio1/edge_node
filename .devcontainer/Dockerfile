@@ -88,5 +88,7 @@ ENV EE_EVM_NET=devnet
 
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir --no-deps --upgrade naeural_core
+# Dev only: about 30 red_mesh test modules import pytest. Kept out of the runtime requirements.txt.
+RUN pip install --no-cache-dir pytest
 
 CMD ["python3","device.py"]
