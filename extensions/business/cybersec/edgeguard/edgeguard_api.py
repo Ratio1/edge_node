@@ -1608,9 +1608,23 @@ def _node_caption(labels: list[str], properties: Dict[str, Any]) -> str:
 def _distinct_identifier_count(query_result_evidence: Optional[Mapping[str, Any]]) -> int:
   """Distinct `IDENTIFIER_RE` matches in the returned row values, the text the EAB/1
   grounding gate checks a brief against (same lower-casing)."""
-  rows = (query_result_evidence or {}).get("rows") or []
-  text = json.dumps([row.get("values") for row in rows], ensure_ascii=False, default=str)
-  return len({match.group(0).lower() for match in IDENTIFIER_RE.finditer(text)})
+  # Raw strings, not JSON text: escaping ("\n" becomes "\\n") puts a word character
+  # before an identifier and hides it from `\b`.
+  strings: list[str] = []
+
+  def collect(value: Any) -> None:
+    if isinstance(value, Mapping):
+      for item in value.values():
+        collect(item)
+    elif isinstance(value, (list, tuple)):
+      for item in value:
+        collect(item)
+    elif value is not None:
+      strings.append(str(value))
+
+  for row in (query_result_evidence or {}).get("rows") or []:
+    collect(row.get("values"))
+  return len({match.group(0).lower() for text in strings for match in IDENTIFIER_RE.finditer(text)})
 
 
 def _add_graph_node(value: Any, state: _GraphPacketState) -> Optional[str]:

@@ -2686,7 +2686,9 @@ class EdgeGuardApiTests(unittest.TestCase):
     ids4 = evidence("T1059", "T1003", "T1566", "T1190")
     ids3 = evidence("T1059", "t1059", "T1003", "T1566")  # 3 distinct, case-folded
     names = evidence("APT28", "Lazarus Group", "Emotet", "Finance", "Energy")
+    escaped = evidence("\nT1059", "\tT1003", "\nT1566", "\nT1190")  # JSON escaping must not hide them
     self.assertEqual(plugin._explanation_dispatch_strategy(ranked, 4, False, ids4), "insight_brief")
+    self.assertEqual(plugin._explanation_dispatch_strategy(ranked, 4, False, escaped), "insight_brief")
     self.assertEqual(plugin._explanation_dispatch_strategy(ranked, 4, False, ids3), "one_call")
     self.assertEqual(plugin._explanation_dispatch_strategy(ranked, 5, False, names), "one_call")
 
