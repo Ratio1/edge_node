@@ -98,6 +98,7 @@ from .result_digest import DIGEST_COVERAGE_SCHEMA_VERSION, build_projection_dige
 from .analyst_brief import MAX_TOKENS as ANALYST_BRIEF_MAX_TOKENS, run_analyst_brief
 from . import egx2
 from . import misp_enrichment
+from .labels import primary_label
 from .misp_enrichment import FORBIDDEN_PACKET_PROPERTY_RE
 
 try:
@@ -1583,7 +1584,7 @@ def _node_caption(labels: list[str], properties: Dict[str, Any]) -> str:
   for item in properties.values():
     if _is_scalar(item) and item not in (None, ""):
       return _compact_text(item, 240)
-  return labels[0] if labels else "Entity"
+  return primary_label(labels) or "Entity"
 
 
 def _add_graph_node(value: Any, state: _GraphPacketState) -> Optional[str]:
@@ -4998,7 +4999,9 @@ class EdgeguardApiPlugin(BasePlugin):
     value = getattr(self, "cfg_edgeguard_explanation_strategy", "one_call")
     return value if value in {"one_call", "eel_compatibility", "insight_brief"} else "one_call"
 
-  def _explanation_dispatch_strategy(self, result_shape: Optional[str]) -> str:
+  def _explanation_dispatch_strategy(
+    self, result_shape: Optional[str], returned_rows: Optional[int] = None, truncated: bool = False,
+  ) -> str:
     """Contract §4.3: a `ranked_projection` result is explained by the digest
     analyst brief (EAB/1) even when `insight_brief` (EGX/2) is the configured
     strategy. EGX/2's insight sheet derives everything from `packet.graph`,
@@ -5007,13 +5010,24 @@ class EdgeguardApiPlugin(BasePlugin):
     never the model. `other` (scalar, non-ranked) keeps its existing strategy
     and fallback behaviour unchanged.
 
+    EG-039 I-211: a 0-row ranked result stays on EGX/2, whose deterministic
+    "the query returned no rows" brief is a valid answer; EAB/1 has no brief
+    state for it (`no_graph_evidence`, shown as a failure).
+
+    EG-039 I-211: a truncated ranked result stays on EGX/2 too, never EAB/1 (whose
+    grounding has no totals gate). Without graph nodes EGX/2 answers with the
+    deterministic `tabular_result` brief (no model call); with graph nodes the
+    model sees the retained rows as a sample and the unchanged `count_claims`
+    gate rejects any total not backed by a sheet aggregate. Both end with the
+    fixed sample sentence.
+
     Review finding Q7: this reroutes `insight_brief` only. The legacy
     `eel_compatibility` strategy is not rerouted here — its own call sites
     (`_active_explanation_strategy() == "eel_compatibility"` checks
     elsewhere) already special-case it independently of this function, and a
     ranked-projection result reaching it is out of this contract's scope."""
     strategy = self._active_explanation_strategy()
-    if strategy == "insight_brief" and result_shape == RESULT_SHAPE_RANKED_PROJECTION:
+    if strategy == "insight_brief" and result_shape == RESULT_SHAPE_RANKED_PROJECTION and returned_rows != 0 and not truncated:
       return "one_call"
     return strategy
 
@@ -5152,6 +5166,15 @@ class EdgeguardApiPlugin(BasePlugin):
         "model": getattr(self, "cfg_edgeguard_explanation_model", None),
       })
     except GraphFirstRuntimeError as exc:
+      # EG-039 I-211: the response carries only the safe code, so a grounding
+      # failure ("brief grounding failed: <rule>") is otherwise untraceable.
+      # Value-free by construction: only the safe code and, for a grounding failure,
+      # the rule code (`^[a-z_]+$`). `exc.detail` is never logged, it may carry model or graph text.
+      rule = exc.detail.rpartition(": ")[2] if exc.code == "brief_grounding_failed" else None
+      self.P("EDGEGUARD_ANALYST_BRIEF_FAILURE " + json.dumps({
+        "reason": exc.code,
+        "rule": rule if rule and re.fullmatch(r"[a-z_]{1,48}", rule) else None,
+      }))
       trace = exc.trace or {
         "schema_version": "edgeguard.analyst_brief_trace.v1",
         "profile": {"id": "EAB/1"},
@@ -5211,7 +5234,10 @@ class EdgeguardApiPlugin(BasePlugin):
     misp_node_aliases: Optional[Mapping[str, str]] = None,
     misp_event_url_template: str = misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE,
     progress=None,
+    sample_rows: Optional[int] = None,
   ) -> Dict[str, Any]:
+    # `sample_rows`: set only when the query stopped at the transport ROW cap (not a
+    # graph node/relationship cap), so the brief may say "the full result has more".
     # Contract §7.3: `misp_enrichment` is a sibling of `result_digest`.
     # Explanation spec v0.2: it reaches `egx2.run_insight_brief` only after
     # the model-admission check; `misp_node_aliases` (packet node id ->
@@ -5224,6 +5250,8 @@ class EdgeguardApiPlugin(BasePlugin):
     deterministic_reason = None
     if not graph.get("nodes") and isinstance(returned_rows, int) and returned_rows > 0:
       deterministic_reason = "tabular_result"
+    elif returned_rows == 0:
+      deterministic_reason = egx2.EMPTY_RESULT_REASON
     allow_model = bool(graph.get("nodes")) and returned_rows != 0
     if allow_model:
       try:
@@ -5257,6 +5285,7 @@ class EdgeguardApiPlugin(BasePlugin):
       provider_call=provider_call,
       allow_model=allow_model,
       deterministic_reason=deterministic_reason,
+      sample_rows=sample_rows,
       mode=mode,
       misp_enrichment=misp_enrichment_block,
       event_url_template=misp_event_url_template,
@@ -6752,7 +6781,10 @@ class EdgeguardApiPlugin(BasePlugin):
       broadening_cypher=plan["broadening"].get("cypher") if broadened else None,
     )
     result_shape = (plan.get("validation") or {}).get("result_shape")
-    effective_strategy = self._explanation_dispatch_strategy(result_shape)
+    sample_rows = packet["execution"]["row_count"] if execution_result.get("truncated") else None
+    effective_strategy = self._explanation_dispatch_strategy(
+      result_shape, digest.get("counts", {}).get("returned_rows"), sample_rows is not None,
+    )
     if effective_strategy == "insight_brief":
       return self._run_insight_brief(
         digest=digest,
@@ -6764,6 +6796,7 @@ class EdgeguardApiPlugin(BasePlugin):
         deadline=deadline,
         mode=mode_plan.mode if mode_plan is not None else None,
         progress=progress,
+        sample_rows=sample_rows,
       )
     if effective_strategy == "one_call":
       _emit_progress(progress, "brief", {"attempt": 1})
@@ -7333,34 +7366,12 @@ class EdgeguardApiPlugin(BasePlugin):
       )
       if misp_event_url_template is None:
         misp_event_url_template = misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE
-      if packet["execution"]["truncated"]:
+      # EG-039 I-211: under `insight_brief` a truncated result goes to EGX/2 as a
+      # sample (rankings too, see _explanation_dispatch_strategy); the brief says so.
+      # On this explain_graph path the other strategies keep the deterministic
+      # transport_truncated failure (the prepared path is unchanged).
+      if packet["execution"]["truncated"] and self._active_explanation_strategy() != "insight_brief":
         _emit_progress(progress, "fallback", {"reason": "transport_truncated"})
-        if self._active_explanation_strategy() == "insight_brief":
-          result = egx2.run_insight_brief(
-            question=request,
-            graph=packet.get("graph") or {},
-            model=getattr(self, "cfg_edgeguard_explanation_model", None),
-            provider_call=self._call_graph_first_provider,
-            allow_model=False,
-            deterministic_reason="transport_truncated",
-            mode=mode_plan.mode if mode_plan is not None else None,
-          )
-          return self._bounded_graph_first_success({
-            "status": STATUS_OK,
-            "ok": True,
-            "executed": True,
-            "explained": False,
-            "packet": dict(packet),
-            "packet_meta": dict(packet_meta),
-            "result_digest": dict(digest),
-            **({"misp_enrichment": dict(misp_block)} if misp_block is not None else {}),
-            "case_explanation": result["case_explanation"],
-            "explanation_trace": result["explanation_trace"],
-            "validation": analysis,
-            "live_retry": dict(live_retry),
-            "provider": "local",
-            "model": getattr(self, "cfg_edgeguard_explanation_model", None),
-          })
         failure = self._graph_first_failure_transport(
           GraphFirstRuntimeError(
             "transport_truncated",
@@ -7383,7 +7394,12 @@ class EdgeguardApiPlugin(BasePlugin):
           misp_enrichment_block=misp_block,
         )
       result_shape = analysis.get("result_shape")
-      effective_strategy = self._explanation_dispatch_strategy(result_shape)
+      # Only the transport ROW cap makes the result a sample; a graph node or
+      # relationship cap alone also sets `packet.execution.truncated`.
+      sample_rows = packet["execution"]["row_count"] if query_result.get("truncated") else None
+      effective_strategy = self._explanation_dispatch_strategy(
+        result_shape, digest.get("counts", {}).get("returned_rows"), sample_rows is not None,
+      )
       if effective_strategy == "insight_brief":
         return self._run_insight_brief(
           digest=digest,
@@ -7398,6 +7414,7 @@ class EdgeguardApiPlugin(BasePlugin):
           misp_node_aliases=misp_node_aliases,
           misp_event_url_template=misp_event_url_template,
           progress=progress,
+          sample_rows=sample_rows,
         )
       if effective_strategy == "one_call":
         _emit_progress(progress, "brief", {"attempt": 1})

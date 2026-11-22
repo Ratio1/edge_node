@@ -1382,9 +1382,10 @@ class ResponsePathsCarryTheBlockTests(unittest.TestCase):
       target="extensions.business.cybersec.edgeguard.edgeguard_api.egx2.run_insight_brief",
     )
     self.assertEqual(spy.call_count, 1)
-    # The transport-truncated EGX/2 path is deterministic (no model call),
-    # so it still never receives the block.
-    _assert_no_block_leak(self, spy)
+    # EG-039: a truncated result is a sample the model may brief, so the admitted
+    # block reaches it like any other EGX/2 call (the row cap is passed on).
+    self.assertEqual(spy.call_args.kwargs["sample_rows"], 1)
+    self.assertIsNotNone(spy.call_args.kwargs["misp_enrichment"])
     self.assertEqual(result["status"], "ok")
     self.assertIn("misp_enrichment", result)
     self.assertEqual(result["misp_enrichment"]["nodes"][0]["misp_event_ids"], ["901"])

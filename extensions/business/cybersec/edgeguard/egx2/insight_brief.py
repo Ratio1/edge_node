@@ -84,13 +84,17 @@ RETRY_NOTE_TRUNCATED = (
 RETRY_NOTE_TRUNCATED_CITATIONS = ", with no misp_citations"
 RETRY_NOTE_TRUNCATED_REFS = ", and keep the misp_refs rules above"
 
+# EG-039: code adds this sentence after the gates when the result hit the transport row
+# cap. The query stops at the cap, so the true total is unknown and the model never writes it.
+SAMPLE_ROWS_SENTENCE = "Based on the first {rows} rows; the full result has more."
+
 PROFILE_MANIFEST = {
   "profile_id": PROFILE_ID,
   "strategy": STRATEGY,
   # Bumped with deterministic insight-layer changes (primitives, sheet
   # rendering, gate set) so the profile hash reflects notation changes even
   # when the prompt text is unchanged.
-  "insights_version": 2,
+  "insights_version": 3,
   "case_explanation_schema_version": CASE_EXPLANATION_VERSION,
   "trace_schema_version": TRACE_VERSION,
   "catalog_sha256": fc.CATALOG_SHA256,
@@ -100,6 +104,8 @@ PROFILE_MANIFEST = {
   "retry_note_truncated": RETRY_NOTE_TRUNCATED,
   "retry_note_truncated_citations": RETRY_NOTE_TRUNCATED_CITATIONS,
   "retry_note_truncated_refs": RETRY_NOTE_TRUNCATED_REFS,
+  "sample_rows_note": brief_profile.SAMPLE_ROWS_NOTE,
+  "sample_rows_sentence": SAMPLE_ROWS_SENTENCE,
   "enrichment_template": brief_profile.ENRICHMENT_TEMPLATE,
   "enrichment_system_sentence": brief_profile.ENRICHMENT_SYSTEM_SENTENCE,
   "enrichment_view_max_bytes": ENRICHMENT_VIEW_MAX_BYTES,
@@ -576,12 +582,9 @@ def _trace(calls: list[Mapping[str, Any]], status: str, safe_code: Optional[str]
   }
 
 
+EMPTY_RESULT_REASON = "empty_result"
+
 DETERMINISTIC_REASON_TEXTS = {
-  "transport_truncated": (
-    "Deterministic brief: the transport row cap was reached before result "
-    "exhaustion, so the model was not consulted; the precomputed insights "
-    "below summarize the transported rows only."
-  ),
   "tabular_result": (
     "Deterministic brief: the query returned tabular/scalar rows with no graph "
     "entities, so the model was not consulted; the complete result digest "
@@ -590,8 +593,20 @@ DETERMINISTIC_REASON_TEXTS = {
 }
 
 
-def run_insight_brief(
+def run_insight_brief(*, sample_rows: Optional[int] = None, **kwargs: Any) -> dict[str, Any]:
+  """`sample_rows`: the result hit the transport row cap at this many rows. The model
+  is told the rows are a sample, and every brief, model or fallback, ends its
+  assessment with the fixed sample sentence."""
+  result = _run_insight_brief(sample_rows=sample_rows, **kwargs)
+  if sample_rows:
+    assessment = result["case_explanation"]["assessment"]
+    assessment["text"] = f"{assessment['text']} {SAMPLE_ROWS_SENTENCE.format(rows=sample_rows)}"
+  return result
+
+
+def _run_insight_brief(
   *,
+  sample_rows: Optional[int] = None,
   question: str,
   graph: Mapping[str, Any],
   model: Optional[str],
@@ -605,6 +620,13 @@ def run_insight_brief(
 ) -> dict[str, Any]:
   sheet = insights.build_insight_sheet(graph)
   substantive = [ins for ins in sheet if ins.get("kind") != "confidence"]
+  if deterministic_reason == EMPTY_RESULT_REASON:
+    # EG-039 I-211: a 0-row answer is a valid result, not a failure; say so plainly.
+    case = _deterministic_case(
+      sheet, graph, "deterministic_no_pattern",
+      "The query returned no rows, so there is nothing to summarize.",
+    )
+    return {"case_explanation": case, "explanation_trace": _trace([], "deterministic", EMPTY_RESULT_REASON)}
   if deterministic_reason is not None:
     text = DETERMINISTIC_REASON_TEXTS.get(
       deterministic_reason,
@@ -635,6 +657,7 @@ def run_insight_brief(
     max_next_checks=max_next_checks,
     enrichment=_render_enrichment(enrichment_view),
     misp_references=[ref["line"] for ref in references],
+    sample_rows=sample_rows,
   )
   calls: list[dict[str, Any]] = []
   failure_code: Optional[str] = None

@@ -104,6 +104,11 @@ def group_by_aggregation(graph):
 # P2: convergence / co-targeting (shared-neighbor >= 2, same source type)
 # --------------------------------------------------------------------------
 
+def _noun(label: str) -> str:
+    """`ThreatActor` -> `threat actor`: the node type as prose."""
+    return _re.sub(r"(?<=[a-z])(?=[A-Z])", " ", label).lower()
+
+
 def _plural_verb(rel: str, count: int) -> str:
     """`INDICATES` -> `indicate` for a plural subject; leaves phrases like
     `sourced from` untouched (only a trailing `s` on the first word drops)."""
@@ -145,7 +150,7 @@ def convergence(graph):
         if fc.label_of(target) == "Sector":
             continue
         verb = _plural_verb(rel, len(uniq))
-        hint = f"{len(uniq)} {src_label.lower()}s {verb} {fc.label_of(target).lower()} \"{_display(target)}\""
+        hint = f"{len(uniq)} {_noun(src_label)}s {verb} {_noun(fc.label_of(target))} \"{_display(target)}\""
         group_confidence = _member_confidence(uniq)
         if group_confidence is not None:
             hint += f" (member source-data confidence mean {group_confidence:.2f})"
@@ -200,9 +205,9 @@ def shared_origin_chains(graph):
         verb1 = _plural_verb(rel1, len(members))
         verb2 = _plural_verb(rel2, len(members))
         hint = (
-            f"{len(members)} {src_label.lower()}s both {verb1} "
-            f"{fc.label_of(target1).lower()} \"{_display(target1)}\" and {verb2} "
-            f"{fc.label_of(target2).lower()} \"{_display(target2)}\""
+            f"{len(members)} {_noun(src_label)}s both {verb1} "
+            f"{_noun(fc.label_of(target1))} \"{_display(target1)}\" and {verb2} "
+            f"{_noun(fc.label_of(target2))} \"{_display(target2)}\""
         )
         out.append(_insight(
             "chain", "relationship", hint,

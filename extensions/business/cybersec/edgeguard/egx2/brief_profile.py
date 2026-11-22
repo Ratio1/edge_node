@@ -58,6 +58,15 @@ USER_TEMPLATE = (
 )
 
 
+# EG-039: appended to the user message only when the result hit the transport row
+# cap, so a complete result keeps the exact prompt above. The true total is unknown,
+# so the model gets no total to quote.
+SAMPLE_ROWS_NOTE = (
+    "\n\nSAMPLE NOTICE: the rows above are only the first {rows} rows of a larger result. "
+    "Every count in the insights is a count within this sample. Write no total for the "
+    "full result and never write \"N of M\" with an M the insights do not state."
+)
+
 # Explanation spec v0.2 §6: appended to the system prompt only when a
 # `misp_enrichment` view is sent, so no-block prompts stay byte-identical.
 ENRICHMENT_SYSTEM_SENTENCE = (
@@ -137,7 +146,7 @@ def render_sheet(sheet):
     return "\n".join(lines)
 
 
-def build_brief_prompt(sheet, question, max_observations=2, max_next_checks=2, enrichment=None, misp_references=None):
+def build_brief_prompt(sheet, question, max_observations=2, max_next_checks=2, enrichment=None, misp_references=None, sample_rows=None):
     user = USER_TEMPLATE.format(
         sheet=render_sheet(sheet),
         question=question,
@@ -145,6 +154,8 @@ def build_brief_prompt(sheet, question, max_observations=2, max_next_checks=2, e
         max_next_checks=max_next_checks,
     )
     system = SYSTEM
+    if sample_rows:
+        user += SAMPLE_ROWS_NOTE.format(rows=sample_rows)
     if enrichment is not None:
         user += ENRICHMENT_TEMPLATE.format(enrichment=enrichment)
         if misp_references:

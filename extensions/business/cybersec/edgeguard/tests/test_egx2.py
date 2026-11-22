@@ -159,24 +159,125 @@ class Egx2GateTests(unittest.TestCase):
     self.assertEqual(tier, "hard")
 
 
-if __name__ == "__main__":
-  unittest.main()
+def _node(node_id, labels, **properties):
+  return {"id": node_id, "labels": labels, "properties": properties}
 
 
-class Egx2TruncationTests(unittest.TestCase):
-  def test_deterministic_reason_skips_model_and_carries_safe_code(self):
+class Egx2SectorLabelTests(unittest.TestCase):
+  """EG-039 I-210: a sector label first in `labels` must not name the node type."""
+
+  def _texts(self, graph):
+    return " | ".join(ins["text_hint"] for ins in insights.build_insight_sheet(graph))
+
+  def test_sector_label_first_still_reads_as_the_schema_type(self):
+    # Indicator (type breakdown), ThreatActor source + Malware target (convergence).
+    indicators = [_node(f"i{k}", ["Finance", "Indicator"], value=f"198.51.100.{k}", indicator_type="ipv4", confidence_score=0.4) for k in range(3)]
+    actors = [_node(f"a{k}", ["Energy", "ThreatActor"], name=f"actor{k}") for k in range(3)]
+    malware = _node("m1", ["Healthcare", "Malware"], name="kyber")
+    rels = [{"id": f"r{k}", "type": "USES", "startNodeId": f"a{k}", "endNodeId": "m1", "properties": {}} for k in range(3)]
+    text = self._texts({"nodes": indicators + actors + [malware], "relationships": rels})
+    self.assertIn("3 indicators", text)
+    self.assertIn("3 threat actors use malware \"kyber\"", text)
+    for sector_noun in ("energys", "finances", "healthcares", "energy \"", "finance \""):
+      self.assertNotIn(sector_noun, text)
+
+  def test_sector_label_first_cve_and_technique_are_still_detected(self):
+    cves = [_node("c1", ["Energy", "CVE"], cve_id="CVE-2024-0001", cvss_score=9.8, severity="CRITICAL", cisa_exploit_add="2024-01-01")]
+    techniques = [
+      _node("t1", ["Energy", "Technique"], name="Phishing", tactic_phases=["initial-access"]),
+      _node("t2", ["Energy", "Technique"], name="Exec", tactic_phases=["execution"]),
+    ]
+    text = self._texts({"nodes": cves + techniques, "relationships": []})
+    self.assertIn("CVEs", text)  # cve_notability ran
+    self.assertIn("ATT&CK tactics", text)  # tactic_spread ran
+
+  def test_sector_label_first_chain_source_and_targets_read_as_types(self):
+    members = [_node(f"a{k}", ["Energy", "ThreatActor"], name=f"actor{k}") for k in range(2)]
+    targets = [_node("m1", ["Finance", "Malware"], name="kyber"), _node("m2", ["Finance", "Malware"], name="other")]
+    rels = [
+      {"id": f"r{k}{t}", "type": "USES", "startNodeId": f"a{k}", "endNodeId": t, "properties": {}}
+      for k in range(2) for t in ("m1", "m2")
+    ]
+    text = self._texts({"nodes": members + targets, "relationships": rels})
+    self.assertIn("2 threat actors both use malware \"kyber\" and use malware \"other\"", text)
+
+
+class Egx2SampleRowsTests(unittest.TestCase):
+  """EG-039 I-211: a result that hit the transport row cap is a sample."""
+
+  SENTENCE = "Based on the first 25 rows; the full result has more."
+
+  def _run(self, brief_edit=None, **kwargs):
+    graph = sample_graph()
+    sheet = insights.build_insight_sheet(graph)
+    brief = valid_brief(sheet)
+    if brief_edit:
+      brief_edit(brief)
+    payloads = []
+
     def provider(payload):
-      raise AssertionError("model must not be called for a truncated result")
+      payloads.append(payload)
+      return {"finish_reason": "stop", "completion_tokens": 90, "content": json.dumps(brief)}
 
-    result = egx2.run_insight_brief(
-      question="q", graph=sample_graph(), model=None, provider_call=provider,
-      deterministic_reason="transport_truncated",
-    )
+    result = egx2.run_insight_brief(question="q", graph=graph, model=None, provider_call=provider, sample_rows=25, **kwargs)
+    return result, payloads
+
+  def test_truncated_packet_calls_the_model_and_says_the_rows_are_a_sample(self):
+    result, payloads = self._run()
+    self.assertEqual(len(payloads), 1)
+    self.assertIn("only the first 25 rows", payloads[0]["messages"][1]["content"])
+    self.assertEqual(result["case_explanation"]["provenance"]["mode"], "model")
+
+  def test_complete_result_prompt_is_unchanged(self):
+    graph = sample_graph()
+    payloads = []
+
+    def provider(payload):
+      payloads.append(payload)
+      return {"finish_reason": "stop", "completion_tokens": 90, "content": json.dumps(valid_brief(insights.build_insight_sheet(graph)))}
+
+    egx2.run_insight_brief(question="q", graph=graph, model=None, provider_call=provider)
+    self.assertNotIn("SAMPLE NOTICE", payloads[0]["messages"][1]["content"])
+
+  def test_sample_counts_pass_the_gates_and_code_adds_the_sentence(self):
+    # "2 indicators" is a count the sheet states, within the sample.
+    result, _ = self._run()
+    case = result["case_explanation"]
+    self.assertEqual(result["explanation_trace"]["outcome"]["status"], "supported")
+    self.assertTrue(case["assessment"]["text"].endswith(self.SENTENCE))
+    self.assertEqual(case["assessment"]["text"].count(self.SENTENCE), 1)
+
+  def test_n_of_total_claim_is_still_rejected_and_falls_back_with_the_sentence(self):
+    def claim(brief):
+      brief["observations"][0]["text"] = "2 of 50 indicators indicate \"quietsieve\"."
+
+    result, payloads = self._run(brief_edit=claim)
+    self.assertEqual(len(payloads), 2)  # rejected, retried once
+    outcome = result["explanation_trace"]["outcome"]
+    self.assertEqual(outcome["safe_code"], "deterministic_validation_failed")
     case = result["case_explanation"]
     self.assertEqual(case["provenance"]["mode"], "deterministic_fallback")
-    self.assertIn("transport row cap", case["assessment"]["text"])
-    outcome = result["explanation_trace"]["outcome"]
-    self.assertEqual(outcome, {"status": "fallback", "attempted_calls": 0, "completed_calls": 0, "safe_code": "transport_truncated"})
+    self.assertTrue(case["assessment"]["text"].endswith(self.SENTENCE))
+
+  def test_empty_result_is_a_deterministic_no_rows_brief_not_a_failure(self):
+    def provider(payload):
+      raise AssertionError("model must not be called for a 0-row result")
+
+    result = egx2.run_insight_brief(
+      question="q", graph={"nodes": [], "relationships": []}, model=None, provider_call=provider,
+      deterministic_reason=egx2.EMPTY_RESULT_REASON,
+    )
+    case = result["case_explanation"]
+    self.assertEqual(case["provenance"]["mode"], "deterministic_no_pattern")
+    self.assertIn("returned no rows", case["assessment"]["text"])
+    self.assertEqual(
+      result["explanation_trace"]["outcome"],
+      {"status": "deterministic", "attempted_calls": 0, "completed_calls": 0, "safe_code": "empty_result"},
+    )
+
+
+if __name__ == "__main__":
+  unittest.main()
 
 
 def chain_graph():
@@ -343,9 +444,9 @@ class Egx2ModeBudgetTests(unittest.TestCase):
 
     result = egx2.run_insight_brief(
       question="q", graph=sample_graph(), model=None, provider_call=provider,
-      allow_model=False, deterministic_reason="transport_truncated", mode="thorough",
+      allow_model=False, deterministic_reason="tabular_result", mode="thorough",
     )
-    self.assertEqual(result["explanation_trace"]["outcome"]["safe_code"], "transport_truncated")
+    self.assertEqual(result["explanation_trace"]["outcome"]["safe_code"], "tabular_result")
 
 
 # --------------------------------------------------------------------------
@@ -366,7 +467,7 @@ PINNED_CATALOG_SHA256 = "f33f8f417df901e2586fed9b9659b5acf883df78e13627a4b306fc6
 # the first 2026-10-06 text gave d04ea158...).
 # Re-pinned once more: the retry note asks for no citations (operator 2026-10-06 no-citations retry;
 # the previous text gave 1c8003cd...).
-PINNED_PROFILE_SHA256 = "32a1ad553a38c0b14909229aef5ccac256401301e3c686c1d5b1c956c540a3a7"
+PINNED_PROFILE_SHA256 = "56dbaac53aaa4af9fce57110b90739b3ae83ca255b6a847dcdffcf3841716681"
 
 
 def enrichment_graph():

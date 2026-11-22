@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from ..labels import primary_label
 
 # --------------------------------------------------------------------------
 # Catalog: label -> {field: (role, human meaning)}. Order is display order.
@@ -198,8 +199,7 @@ def _scan_json_object(s):
 # --------------------------------------------------------------------------
 
 def label_of(node):
-    labels = node.get("labels") or []
-    return labels[0] if labels else "?"
+    return primary_label(node.get("labels")) or "?"
 
 
 _HEXISH = re.compile(r"^[0-9a-fA-F]{32,}$")
