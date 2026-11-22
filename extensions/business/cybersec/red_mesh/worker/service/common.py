@@ -201,6 +201,9 @@ _HTTP_SERVER_RE = _re.compile(
     r'(Apache|nginx)[/ ]+(\d+(?:\.\d+)+)', _re.IGNORECASE,
 )
 _HTTP_PRODUCT_MAP = {'apache': 'apache', 'nginx': 'nginx'}
+# RM-204: the one positive upstream-build marker: a header that starts `Apache/x (Unix)`, followed only by `Name/version` module tokens.
+# A vendor word, a distro marker or no parenthesised token is not the marker; absence of a distro marker never is.
+_APACHE_UPSTREAM_RE = _re.compile(r'\s*Apache/\d+(?:\.\d+)+ \(Unix\)(?:\s+[\w.-]+/[\w.+~-]+)*\s*$')
 
 
 # --- SSH KEXINIT: the server's own algorithm offer (RM-200) ---------------------------------------
@@ -413,7 +416,8 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         if _m:
           _cve_product = _HTTP_PRODUCT_MAP.get(_m.group(1).lower())
           if _cve_product:
-            findings += check_cves(_cve_product, _m.group(2))
+            findings += check_cves(_cve_product, _m.group(2),
+                                   upstream_build=bool(_APACHE_UPSTREAM_RE.match(result["server"])))
         # Apache `ServerTokens Full` and some nginx builds disclose the
         # bundled OpenSSL package version in the Server header (e.g.
         # `Apache/2.4.50 (Unix) OpenSSL/1.0.2k`). Extract it as a separate
@@ -699,7 +703,8 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         if _m:
           _cve_product = _HTTP_PRODUCT_MAP.get(_m.group(1).lower())
           if _cve_product:
-            findings += check_cves(_cve_product, _m.group(2))
+            findings += check_cves(_cve_product, _m.group(2),
+                                   upstream_build=bool(_APACHE_UPSTREAM_RE.match(raw["server"])))
         # Co-disclosed OpenSSL package version in the HTTPS Server header
         # (e.g. ``Apache/2.4.50 (Unix) OpenSSL/1.0.2k``) — common with
         # ``ServerTokens Full`` and some nginx builds.

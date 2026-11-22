@@ -490,6 +490,9 @@ BACKPORT_NOT_AFFECTED = "not_affected"
 # The banner announced no distribution package at all, so there is nothing to
 # assess. Stated rather than left as "" so a report can always print a state.
 BACKPORT_UNKNOWN_NO_PACKAGE = "unknown_no_package"
+# `generated` only: the banner carries a positive upstream-build marker (`Apache/x (Unix)`, RM-204), so no
+# distribution backport applies. Set by the caller through `check_cves(upstream_build=True)`, never inferred here.
+BACKPORT_UPSTREAM_BUILD = "upstream_build"
 
 
 def _backport_row(product: str, cve_id: str, package):
@@ -644,6 +647,7 @@ def check_cves(
   package=None,
   inferred_span=None,
   banner_verified=BANNER_NOT_ASSESSABLE,
+  upstream_build=False,
 ) -> list:
   """Match version against CVE database. Returns list of Findings.
 
@@ -666,6 +670,9 @@ def check_cves(
   ``BANNER_NOT_ASSESSABLE``. Omitted: no check exists for the product and nothing changes. ``None``: the check
   could not run, so a database-firm row is tentative ``banner_only``. ``True``: unchanged. ``False``: every row is
   tentative ``banner_unverified``, under ``static`` too.
+
+  ``upstream_build`` is True when the banner carries a positive upstream-build marker (RM-204). Under ``generated``
+  and with no package, a backported product's rows lose the ``banner_only`` reason. ``static`` ignores it.
   """
   if dynamic_cache is None:
     dynamic_cache = get_dynamic_reference_cache()
@@ -681,6 +688,8 @@ def check_cves(
           _record_not_applicable(match, product, version, package, NOT_APPLICABLE_CLIENT_SIDE)
         continue
       status, verdict = _backport_state(product, match.cve_id, package)
+      if upstream_build and status == BACKPORT_UNKNOWN_NO_PACKAGE:
+        status = BACKPORT_UPSTREAM_BUILD
       # A banner proven false (an emulator) cannot vouch for a distribution's verdict: the table does not drop the row, it
       # stays tentative `banner_unverified`. An overlay row (`verdict` None) keeps dropping, as before.
       if status in (BACKPORT_FIXED, BACKPORT_NOT_AFFECTED) and not (verdict and banner_verified is False):
@@ -808,7 +817,7 @@ def _confidence_reason(backport_status: str, match, product: str, banner_verifie
     reasons.add("platform_dependent")
   if _local_vector_only(match):
     reasons.add("local_vector")
-  if product in _BACKPORTED_PRODUCTS and backport_status != BACKPORT_NOT_FIXED:
+  if product in _BACKPORTED_PRODUCTS and backport_status not in (BACKPORT_NOT_FIXED, BACKPORT_UPSTREAM_BUILD):
     reasons.add("backport_unknown" if backport_status == BACKPORT_UNKNOWN else "banner_only")
   if match.confidence == "tentative":
     reasons.add(match.reason)  # a reason this node does not know passes through (readers ignore it)
@@ -818,6 +827,8 @@ def _confidence_reason(backport_status: str, match, product: str, banner_verifie
   if banner_verified is None and match.confidence != "tentative":
     # A database-firm row rests on the announced version alone: unproven for a banner no probe could check.
     return "tentative", "banner_only"
+  if backport_status == BACKPORT_UPSTREAM_BUILD:
+    return match.confidence, "upstream_build"
   return match.confidence, match.reason
 
 
@@ -921,6 +932,8 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
       " The distribution package is below the revision that carries the fix, "
       "so the backport does not apply."
     )
+  elif backport_status == BACKPORT_UPSTREAM_BUILD:
+    backport_note = " The banner announces an upstream build with no distribution package, so no backport applies."
   elif backport_status == BACKPORT_UNKNOWN:
     backport_note = (
       " Backport status unknown: a distribution package was detected but no "
