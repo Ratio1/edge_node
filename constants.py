@@ -7,6 +7,7 @@ from naeural_core.constants import ADMIN_PIPELINE, ADMIN_PIPELINE_FILTER, ADMIN_
 ADMIN_PIPELINE_FILTER = [
   *ADMIN_PIPELINE_FILTER,
   "ORACLE_SYNC_01",
+  "DEEPLOY_MANAGER_API",  # Receive encrypted repair requests and replies on the existing admin listener.
 ]
 
 
