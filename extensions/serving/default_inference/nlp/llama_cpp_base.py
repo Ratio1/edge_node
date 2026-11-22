@@ -383,8 +383,9 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
         'repeat_penalty': repetition_penalty,
         'response_format': response_format,
       }
-      if self._get_stop():
-        predict_kwargs['stop'] = self._get_stop()
+      stop = self._get_stop()
+      if stop:
+        predict_kwargs['stop'] = stop
       predict_kwargs = self.process_predict_kwargs(predict_kwargs)
       if not isinstance(messages, list):
         msg = f"Each input must have a list of messages. Received {type(messages)}: {self.shorten_str(inp)}"

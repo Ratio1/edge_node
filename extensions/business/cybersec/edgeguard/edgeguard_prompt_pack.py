@@ -202,9 +202,9 @@ def load_pack(
   max_tokens = manifest.get("max_tokens")
   if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or not 0 < max_tokens <= MAX_TOKENS_LIMIT:
     raise PromptPackError(label, f"max_tokens must be an integer from 1 to {MAX_TOKENS_LIMIT}")
-  grounding = manifest.get("grounding", False)
+  grounding = manifest.get("grounding")
   if not isinstance(grounding, bool):
-    raise PromptPackError(label, "grounding must be true or false")
+    raise PromptPackError(label, "grounding is required and must be true or false")
   contract = manifest.get("prompt_contract")
   if not isinstance(contract, str) or not contract:
     raise PromptPackError(label, "prompt_contract must be a non-empty string")

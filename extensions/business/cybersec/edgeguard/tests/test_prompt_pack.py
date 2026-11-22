@@ -83,6 +83,9 @@ class PackLoaderTests(unittest.TestCase):
     del field_map["refuse"]
     self._refused(_write_pack(self.root, field_map=field_map), "no entry for decision 'refuse'")
 
+  def test_manifest_without_grounding_is_refused(self):
+    self._refused(_write_pack(self.root, grounding=None), "grounding is required")
+
   def test_missing_file_is_refused(self):
     source = _write_pack(self.root)
     (self.root / "schema.json").unlink()
