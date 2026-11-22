@@ -5088,8 +5088,10 @@ class EdgeguardApiPlugin(BasePlugin):
     EG-039 phase 7: a complete ranked result whose returned values hold more than 3
     distinct identifiers (`analyst_brief.IDENTIFIER_RE`: CVE IDs, technique IDs,
     hashes, IPs, domains) stays on EGX/2 too. A brief naming them all fails the EAB/1
-    `ioc_enumeration` gate, so it gets the deterministic `tabular_result` brief with
-    no sample sentence and no model call.
+    `ioc_enumeration` gate. Without graph nodes it gets the deterministic
+    `tabular_result` brief (no model call, no sample sentence); with graph nodes the
+    EGX/2 model writes the brief. Only returned values count: a ranking that returns
+    nodes carries node refs, not identifiers, and keeps EAB/1.
 
     Review finding Q7: this reroutes `insight_brief` only. The legacy
     `eel_compatibility` strategy is not rerouted here — its own call sites
