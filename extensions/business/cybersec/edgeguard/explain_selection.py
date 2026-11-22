@@ -35,6 +35,8 @@ import copy
 import re
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+from .labels import primary_label
+
 
 FORBIDDEN_PROPERTY_TOKENS = ("embedding", "vector", "raw_data")
 # Corpus-measured noise (EGM-047 P1 property-dominance audit): identifier and
@@ -288,8 +290,7 @@ def stage_c_structural(graph: Mapping[str, Any], question: str = "") -> tuple[li
 
 
 def _label_of(node: Mapping[str, Any]) -> str:
-  labels = node.get("labels") or []
-  return labels[0] if labels else "?"
+  return primary_label(node.get("labels")) or "?"
 
 
 # --------------------------------------------------------------------------
