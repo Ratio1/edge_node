@@ -311,7 +311,7 @@ class TestAssessmentCatalogue(FrameworkAssessmentFixture):
     row = self.rows()[0]
     self.assertEqual(set(row), {"assessmentId", "packId", "name", "assuranceLevel", "status", "latestRevision",
                                 "assessmentRevision", "archived", "updatedBy", "updatedByName", "updatedAt",
-                                "createdAt", "canManage"})
+                                "createdAt", "canManage", "reviewStatus", "selfApproved"})
     self.assertEqual((row["assessmentId"], row["packId"], row["name"], row["assuranceLevel"], row["status"],
                       row["latestRevision"], row["archived"], row["canManage"]),
                      (created["assessmentId"], PACK, "Evaluare 2026", "basic", "not_started", 0, False, True))

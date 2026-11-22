@@ -4,7 +4,9 @@ A tenant's finalized scans reach the suggester only through the tenant read seam
 jobs and passes, never a finding title or a target; they change no score; `job:` evidence refs on
 a draft must name a scan the tenant owns and has finalized.
 """
+import json
 import unittest
+from pathlib import Path
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -100,6 +102,24 @@ class TestFrameworkEvidenceSuggestions(FrameworkAssessmentFixture):
                "description": "token=supersecret leaks", "cwe_id": "CWE-306", "status": "vulnerable"}
   LOW_TLS = {"finding_id": "f-tls", "severity": "LOW", "title": "TLS certificate expires soon", "category": "tls",
              "status": "vulnerable"}
+
+  def test_complete_responses_at_all_levels_match_pre_refactor_goldens(self):
+    fixture = json.loads((Path(__file__).parent / 'fixtures/framework_evidence_dnsc.json').read_text())
+    # Stored as an entry table plus per-control key lists; rebuild each full response, list order kept.
+    expected = {level: {**spec['meta'],
+                        'overriding': [{'control_id': c, **spec['overriding']['template']}
+                                       for c in spec['overriding']['control_ids']],
+                        'suggestions': {c: [fixture['entries'][k] for k in keys]
+                                        for c, keys in spec['suggestions'].items()}}
+                for level, spec in fixture['levels'].items()}
+    self.job('job-open', findings=[self.HIGH_AUTH, self.LOW_TLS], soc={'last_status': 'sent'}, completed=1770000300)
+    self.job('job-clean', completed=1770000600)
+    self.job('job-other', findings=[self.HIGH_AUTH], completed=1770000000, target='https://other.test')
+    for level in ('basic', 'important', 'essential'):
+      self.ok(self.save({'assurance_level': level}, self.ok(self.get())['assessmentRevision']))
+      with patch.object(framework_evidence.time, 'time', return_value=1770000900):
+        self.assertEqual(self.ok(self.suggest()), expected[level])
+
 
   # -- suggestions ------------------------------------------------------------------------------
 
