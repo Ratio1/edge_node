@@ -109,7 +109,7 @@ FEATURE_CATALOG = [
   {
     "id": "web_auth_design",
     "label": "Authentication & design flaws",
-    "description": "Detect account enumeration, missing rate limiting, and IDOR indicators (OWASP A04).",
+    "description": "Detect account enumeration, missing rate limiting, and IDOR indicators (OWASP A04). The account-enumeration and rate-limit tests send login attempts and run only when Credential testing is on.",
     "category": "web",
     "methods": ["_web_test_account_enumeration", "_web_test_rate_limiting", "_web_test_idor_indicators"]
   },
