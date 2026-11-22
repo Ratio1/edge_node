@@ -130,3 +130,36 @@ class TestStatusLifecycle(StatusLifecycleFixture):
     self.storage.data[key]=None  # receipt alone, review row missing
     self.assertEqual(listed(aid)['reviewStatus'],'returned_for_changes')
 
+  def test_list_summary_survives_a_review_read_error(self):
+    from unittest import mock
+    from extensions.business.cybersec.red_mesh.tenancy import compliance_review as r
+    from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_compliance import CstoreComplianceStore as S
+    from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
+    aid=self.create_status('DE')['assessmentId'];other=self.create_status('FR')['assessmentId']
+    def listed(which):
+      return next(x for x in self.ok(self.plugin.list_framework_assessments(self.admin,self.tenant,PACK,False)) if x['assessmentId']==which)
+    for which in (aid,other):
+      saved=self.ok(self.save_status(which,{'scores':self.full_scores()},1))
+      self.ok(self.submit_status(which,saved['assessmentRevision']))
+    original=S.raw_record
+    def flaky(store,kind,*ids):
+      if kind==r.KIND and ids[2]==aid:
+        raise TenantStoreError('Compliance storage cannot be read')
+      return original(store,kind,*ids)
+    with mock.patch.object(S,'raw_record',flaky):
+      self.assertEqual((listed(aid)['reviewStatus'],listed(aid)['selfApproved']),(None,None))
+      self.assertEqual(listed(other)['reviewStatus'],'submitted')
+
+  def test_list_summary_ignores_a_malformed_return_receipt(self):
+    from types import SimpleNamespace
+    from extensions.business.cybersec.red_mesh.tenancy import compliance_review as r
+    service=SimpleNamespace(compliance=SimpleNamespace(raw_record=lambda *ids:None))  # no review row yet
+    sub={'revision':1,'fingerprint':'a'*64,'request_id':'q','actor':'u','submitted_at':'t'}
+    row={'tenant_id':'t','pack_id':'p','assessment_id':'default','submissions':[sub]}
+    good={'actor':'u2','action':'return','time':'t','revision':1,'request_id':'r','control_id':None,'comment':None,'self_approved':False}
+    for label,receipt in (('wrong action',{**good,'action':'approve'}),('extra key',{**good,'x':1}),('revision',{**good,'revision':2})):
+      with self.subTest(label):
+        row['submissions']=[{**sub,'review_return':receipt}]
+        self.assertEqual(r.latest_status(service,row),('submitted',False))
+    row['submissions']=[{**sub,'review_return':good}]
+    self.assertEqual(r.latest_status(service,row),('returned_for_changes',False))

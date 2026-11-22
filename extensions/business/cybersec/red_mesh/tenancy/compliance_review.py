@@ -140,6 +140,29 @@ def review_status(history, receipt=None):
   return ("internally_approved" if decision["action"] == "approve" else "returned_for_changes"), decision["self_approved"]
 
 
+def latest_status(service, row):
+  """`(status, self_approved)` of the latest submitted revision, from one review-row read, for the list.
+  (None, None) before any submit, when the read or validation of the review row fails, or when it is
+  bound to another fingerprint: a bad review row never fails the list. A submission whose review row is
+  not written yet is ("submitted", False). A `review_return` receipt counts only when it passes the check
+  `reconcile` applies."""
+  if not row["submissions"]:
+    return None, None
+  sub = row["submissions"][-1]
+  store, ids = c._store(service), _ids(row, sub)
+  try:
+    raw = store.raw_record(KIND, *ids)
+    record = store.validate_record(raw, KIND, *ids) if raw is not None else None
+  except TenantStoreError:
+    return None, None
+  if record is not None and record["fingerprint"] != sub["fingerprint"]:
+    return None, None
+  receipt = sub.get("review_return")
+  if receipt is not None and not (_event_valid(receipt, sub["revision"]) and receipt["action"] == "return"):
+    receipt = None
+  return review_status(record["history"] if record else [], receipt)
+
+
 def _view(service, tenant, account, row, review, snapshot, replayed=False, repaired=()):
   names = c.name_resolver(service)
   status, self_approved = review_status(review["history"])

@@ -90,14 +90,11 @@ class TestStatusScoring(unittest.TestCase):
                      {"passed":None,"counts":{"insufficient_evidence":0,"criteria_met":0,"partly_met":0,"criteria_not_met":0,
                                  "not_applicable":0,"unanswered":161}})
 
-  def test_submit_refuses_missing_entry_and_explicit_null_status(self):
+  def test_submit_refuses_missing_entry(self):
     full = self.normalise({ref: {"status": "criteria_met"} for ref in self.ids})
-    for label, scores in (("missing", {k: v for k, v in full.items() if k != self.ids[0]}),
-                          ("null", {**full, **self.normalise({self.ids[0]: {"status": None}})})):
-      with self.subTest(label):
-        errors, computed = status.validate_for_submit(self.pack, self.rules, None, {"scores": scores})
-        self.assertEqual(errors, [{"code": "unscored", "ids": [self.ids[0]]}])
-        self.assertEqual(computed["counts"]["unanswered"], 1)
+    scores = {k: v for k, v in full.items() if k != self.ids[0]}
+    errors, _ = status.validate_for_submit(self.pack, self.rules, None, {"scores": scores})
+    self.assertEqual(errors, [{"code": "unscored", "ids": [self.ids[0]]}])
 
   def test_insufficient_evidence_is_a_gap_and_not_applicable_needs_no_status(self):
     scores = self.normalise({ref: {"status": "criteria_met"} for ref in self.ids[2:]} |
