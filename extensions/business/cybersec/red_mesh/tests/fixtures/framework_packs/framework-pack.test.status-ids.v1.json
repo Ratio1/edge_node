@@ -1,0 +1,25 @@
+{
+ "pack_id": "test.status-ids.v1",
+ "catalogue": "Synthetic tier-less status pack (test fixture)",
+ "scoring": "test_status.v1",
+ "language": "en",
+ "levels": [],
+ "controls": [
+  {
+   "ref_id": "ST-01",
+   "order": 1
+  },
+  {
+   "ref_id": "ST-02",
+   "order": 2
+  },
+  {
+   "ref_id": "ST-03",
+   "order": 3
+  },
+  {
+   "ref_id": "ST-04",
+   "order": 4
+  }
+ ]
+}

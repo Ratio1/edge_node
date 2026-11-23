@@ -36,7 +36,7 @@ _ROLE_OPERATIONS = {
     "tenants:delete",
     # RM-120. Framework maturity self-assessment: governance data, read by the tenant roles that
     # hold reports:view except the pentesters (owner, 2026-10-06), written by the admins.
-    "compliance_assessments:view", "compliance_assessments:manage",
+    "compliance_assessments:view", "compliance_assessments:manage", "compliance_assessments:review",
     # RM-125. Registers, edits, archives and deletes the tenant's assets (owner, 2026-10-09).
     "assets:manage",
   }),
@@ -51,7 +51,7 @@ _ROLE_OPERATIONS = {
     "node_failure_policy:update",
     "tenant_users:manage", "attestation_keys:manage",
     "reports:view", "reports:export", "audit:view",
-    "compliance_assessments:view", "compliance_assessments:manage",
+    "compliance_assessments:view", "compliance_assessments:manage", "compliance_assessments:review",
     # RM-155 (owner, 2026-11-03): a Tenant Admin may review under the same conditions as the others:
     # the Super-Tenant Admin's designation and the tenant's Allow Pentester switch.
     "reports:review", "findings:triage",
@@ -165,6 +165,7 @@ def authorize_tenant_operation(
   *,
   asset_tenant_ids: tuple[str | None, ...] = (),
   report_reviewer: bool = False,
+  compliance_reviewer: bool | None = None,
 ) -> PolicyDecision:
   """Evaluate supplied facts; use ``decision.allowed``, not the decision object's truthiness.
 
@@ -189,6 +190,10 @@ def authorize_tenant_operation(
   # RM-155: the role and the switch are not enough; the account must also be designated a reviewer.
   if operation == "reports:review" and report_reviewer is not True:
     return PolicyDecision(False, 403, "reviewer_not_designated")
+  if operation == "compliance_assessments:review":
+    enabled = compliance_reviewer if compliance_reviewer is not None else "super_tenant_admin" in roles
+    if enabled is not True:
+      return PolicyDecision(False, 403, "reviewer_not_designated")
   # RM-084 P3 binds authorization:upload for every role: the document exists to authorize a pentest,
   # so a tenant with pentesting off has nothing to file one against.
   if operation == "authorization:upload" and tenant.allow_pentester is not True:

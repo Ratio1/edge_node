@@ -12,8 +12,8 @@ host checkout is bind-mounted at `/edge_node`; source files are not copied into 
   not enabled by the checked-in configuration.
 - The Dockerfile follows the mutable `ratio1/base_edge_node_amd64_cpu:latest` base image used by the
   runtime Dockerfiles. A rebuild can therefore change the environment even without a repository diff.
-- The Dockerfile installs the root `requirements.txt`, upgrades `naeural_core`, and adds development
-  tools including Kubo, Cloudflared, Ninja, and Codex.
+- The Dockerfile installs the root `requirements.txt`, upgrades `naeural_core`, installs `pytest`
+  for the test suites, and adds development tools including Kubo, Cloudflared, Ninja, and Codex.
 - `.devcontainer/requirements.txt` is currently unused by both `devcontainer.json` and the Dockerfile.
   Changing it alone does not change the image.
 

@@ -1,0 +1,1031 @@
+{
+  "source": "https://publications.europa.eu/resource/cellar/28f15de8-8ce9-11ef-a130-01aa75ed71a1.0006.03/DOC_1",
+  "version": "OJ L, 2024/2690, 18.10.2024 (original English)",
+  "last_refreshed": "2026-11-16",
+  "pack_id": "eu.ec.ir-2024-2690",
+  "language": "en",
+  "provenance": {
+    "generated_by": "project-red-mesh:workbooks/redmesh-framework-pack/scripts/build_framework_pack.py",
+    "generated_on": "2026-11-16",
+    "sources": {
+      "annex": {
+        "file": "annex-en.xhtml",
+        "sha256": "1d10f42c31a2b3c6b929b4696a04093ee1d84a298c0c0437a22f8718a9ffb3cd",
+        "pinned": true
+      }
+    },
+    "parser": "nis2-annex.v1",
+    "source_retrieved_on": "2026-11-16",
+    "correction_chain_checked_on": "2026-11-16",
+    "corrections": [
+      "2025/90225 (Polish)",
+      "2025/90331 (Swedish)",
+      "2026/90675 (Dutch)"
+    ],
+    "correction_findings": "No English correction or amendment relationship in retrieved official work RDF; consolidated English rendering unavailable for comparison.",
+    "attribution": "European Commission, Implementing Regulation (EU) 2024/2690, Annex, original English OJ edition, 18 October 2024.",
+    "licence": "Reuse under EUR-Lex legal notice; source attributed, extraction/reformatting identified.",
+    "transformation": "XHTML extraction; whitespace normalized; numbered bodies and operative 5.2/12.5 retained with lettered lists.",
+    "coverage": {
+      "numbered_bodies": 159,
+      "operative_groups": [
+        "5.2",
+        "12.5"
+      ],
+      "annex_paragraphs": 658,
+      "uncovered_operative_paragraphs": 0
+    }
+  },
+  "catalogue": "Implementing Regulation (EU) 2024/2690, Annex",
+  "scoring": "compliance_status.v1",
+  "levels": [],
+  "acts": [
+    "Commission Implementing Regulation (EU) 2024/2690"
+  ],
+  "counts": {
+    "controls": 161,
+    "by_section": [
+      8,
+      11,
+      22,
+      14,
+      8,
+      31,
+      3,
+      8,
+      3,
+      10,
+      21,
+      13,
+      9
+    ]
+  },
+  "controls": [
+    {
+      "ref_id": "1.1.1",
+      "order": 1,
+      "category": "1",
+      "subcategory": "1.1"
+    },
+    {
+      "ref_id": "1.1.2",
+      "order": 2,
+      "category": "1",
+      "subcategory": "1.1"
+    },
+    {
+      "ref_id": "1.2.1",
+      "order": 3,
+      "category": "1",
+      "subcategory": "1.2"
+    },
+    {
+      "ref_id": "1.2.2",
+      "order": 4,
+      "category": "1",
+      "subcategory": "1.2"
+    },
+    {
+      "ref_id": "1.2.3",
+      "order": 5,
+      "category": "1",
+      "subcategory": "1.2"
+    },
+    {
+      "ref_id": "1.2.4",
+      "order": 6,
+      "category": "1",
+      "subcategory": "1.2"
+    },
+    {
+      "ref_id": "1.2.5",
+      "order": 7,
+      "category": "1",
+      "subcategory": "1.2"
+    },
+    {
+      "ref_id": "1.2.6",
+      "order": 8,
+      "category": "1",
+      "subcategory": "1.2"
+    },
+    {
+      "ref_id": "2.1.1",
+      "order": 9,
+      "category": "2",
+      "subcategory": "2.1"
+    },
+    {
+      "ref_id": "2.1.2",
+      "order": 10,
+      "category": "2",
+      "subcategory": "2.1"
+    },
+    {
+      "ref_id": "2.1.3",
+      "order": 11,
+      "category": "2",
+      "subcategory": "2.1"
+    },
+    {
+      "ref_id": "2.1.4",
+      "order": 12,
+      "category": "2",
+      "subcategory": "2.1"
+    },
+    {
+      "ref_id": "2.2.1",
+      "order": 13,
+      "category": "2",
+      "subcategory": "2.2"
+    },
+    {
+      "ref_id": "2.2.2",
+      "order": 14,
+      "category": "2",
+      "subcategory": "2.2"
+    },
+    {
+      "ref_id": "2.2.3",
+      "order": 15,
+      "category": "2",
+      "subcategory": "2.2"
+    },
+    {
+      "ref_id": "2.3.1",
+      "order": 16,
+      "category": "2",
+      "subcategory": "2.3"
+    },
+    {
+      "ref_id": "2.3.2",
+      "order": 17,
+      "category": "2",
+      "subcategory": "2.3"
+    },
+    {
+      "ref_id": "2.3.3",
+      "order": 18,
+      "category": "2",
+      "subcategory": "2.3"
+    },
+    {
+      "ref_id": "2.3.4",
+      "order": 19,
+      "category": "2",
+      "subcategory": "2.3"
+    },
+    {
+      "ref_id": "3.1.1",
+      "order": 20,
+      "category": "3",
+      "subcategory": "3.1"
+    },
+    {
+      "ref_id": "3.1.2",
+      "order": 21,
+      "category": "3",
+      "subcategory": "3.1"
+    },
+    {
+      "ref_id": "3.1.3",
+      "order": 22,
+      "category": "3",
+      "subcategory": "3.1"
+    },
+    {
+      "ref_id": "3.2.1",
+      "order": 23,
+      "category": "3",
+      "subcategory": "3.2"
+    },
+    {
+      "ref_id": "3.2.2",
+      "order": 24,
+      "category": "3",
+      "subcategory": "3.2"
+    },
+    {
+      "ref_id": "3.2.3",
+      "order": 25,
+      "category": "3",
+      "subcategory": "3.2"
+    },
+    {
+      "ref_id": "3.2.4",
+      "order": 26,
+      "category": "3",
+      "subcategory": "3.2"
+    },
+    {
+      "ref_id": "3.2.5",
+      "order": 27,
+      "category": "3",
+      "subcategory": "3.2"
+    },
+    {
+      "ref_id": "3.2.6",
+      "order": 28,
+      "category": "3",
+      "subcategory": "3.2"
+    },
+    {
+      "ref_id": "3.2.7",
+      "order": 29,
+      "category": "3",
+      "subcategory": "3.2"
+    },
+    {
+      "ref_id": "3.3.1",
+      "order": 30,
+      "category": "3",
+      "subcategory": "3.3"
+    },
+    {
+      "ref_id": "3.3.2",
+      "order": 31,
+      "category": "3",
+      "subcategory": "3.3"
+    },
+    {
+      "ref_id": "3.4.1",
+      "order": 32,
+      "category": "3",
+      "subcategory": "3.4"
+    },
+    {
+      "ref_id": "3.4.2",
+      "order": 33,
+      "category": "3",
+      "subcategory": "3.4"
+    },
+    {
+      "ref_id": "3.5.1",
+      "order": 34,
+      "category": "3",
+      "subcategory": "3.5"
+    },
+    {
+      "ref_id": "3.5.2",
+      "order": 35,
+      "category": "3",
+      "subcategory": "3.5"
+    },
+    {
+      "ref_id": "3.5.3",
+      "order": 36,
+      "category": "3",
+      "subcategory": "3.5"
+    },
+    {
+      "ref_id": "3.5.4",
+      "order": 37,
+      "category": "3",
+      "subcategory": "3.5"
+    },
+    {
+      "ref_id": "3.5.5",
+      "order": 38,
+      "category": "3",
+      "subcategory": "3.5"
+    },
+    {
+      "ref_id": "3.6.1",
+      "order": 39,
+      "category": "3",
+      "subcategory": "3.6"
+    },
+    {
+      "ref_id": "3.6.2",
+      "order": 40,
+      "category": "3",
+      "subcategory": "3.6"
+    },
+    {
+      "ref_id": "3.6.3",
+      "order": 41,
+      "category": "3",
+      "subcategory": "3.6"
+    },
+    {
+      "ref_id": "4.1.1",
+      "order": 42,
+      "category": "4",
+      "subcategory": "4.1"
+    },
+    {
+      "ref_id": "4.1.2",
+      "order": 43,
+      "category": "4",
+      "subcategory": "4.1"
+    },
+    {
+      "ref_id": "4.1.3",
+      "order": 44,
+      "category": "4",
+      "subcategory": "4.1"
+    },
+    {
+      "ref_id": "4.1.4",
+      "order": 45,
+      "category": "4",
+      "subcategory": "4.1"
+    },
+    {
+      "ref_id": "4.2.1",
+      "order": 46,
+      "category": "4",
+      "subcategory": "4.2"
+    },
+    {
+      "ref_id": "4.2.2",
+      "order": 47,
+      "category": "4",
+      "subcategory": "4.2"
+    },
+    {
+      "ref_id": "4.2.3",
+      "order": 48,
+      "category": "4",
+      "subcategory": "4.2"
+    },
+    {
+      "ref_id": "4.2.4",
+      "order": 49,
+      "category": "4",
+      "subcategory": "4.2"
+    },
+    {
+      "ref_id": "4.2.5",
+      "order": 50,
+      "category": "4",
+      "subcategory": "4.2"
+    },
+    {
+      "ref_id": "4.2.6",
+      "order": 51,
+      "category": "4",
+      "subcategory": "4.2"
+    },
+    {
+      "ref_id": "4.3.1",
+      "order": 52,
+      "category": "4",
+      "subcategory": "4.3"
+    },
+    {
+      "ref_id": "4.3.2",
+      "order": 53,
+      "category": "4",
+      "subcategory": "4.3"
+    },
+    {
+      "ref_id": "4.3.3",
+      "order": 54,
+      "category": "4",
+      "subcategory": "4.3"
+    },
+    {
+      "ref_id": "4.3.4",
+      "order": 55,
+      "category": "4",
+      "subcategory": "4.3"
+    },
+    {
+      "ref_id": "5.1.1",
+      "order": 56,
+      "category": "5",
+      "subcategory": "5.1"
+    },
+    {
+      "ref_id": "5.1.2",
+      "order": 57,
+      "category": "5",
+      "subcategory": "5.1"
+    },
+    {
+      "ref_id": "5.1.3",
+      "order": 58,
+      "category": "5",
+      "subcategory": "5.1"
+    },
+    {
+      "ref_id": "5.1.4",
+      "order": 59,
+      "category": "5",
+      "subcategory": "5.1"
+    },
+    {
+      "ref_id": "5.1.5",
+      "order": 60,
+      "category": "5",
+      "subcategory": "5.1"
+    },
+    {
+      "ref_id": "5.1.6",
+      "order": 61,
+      "category": "5",
+      "subcategory": "5.1"
+    },
+    {
+      "ref_id": "5.1.7",
+      "order": 62,
+      "category": "5",
+      "subcategory": "5.1"
+    },
+    {
+      "ref_id": "5.2",
+      "order": 63,
+      "category": "5",
+      "subcategory": "5.2"
+    },
+    {
+      "ref_id": "6.1.1",
+      "order": 64,
+      "category": "6",
+      "subcategory": "6.1"
+    },
+    {
+      "ref_id": "6.1.2",
+      "order": 65,
+      "category": "6",
+      "subcategory": "6.1"
+    },
+    {
+      "ref_id": "6.1.3",
+      "order": 66,
+      "category": "6",
+      "subcategory": "6.1"
+    },
+    {
+      "ref_id": "6.2.1",
+      "order": 67,
+      "category": "6",
+      "subcategory": "6.2"
+    },
+    {
+      "ref_id": "6.2.2",
+      "order": 68,
+      "category": "6",
+      "subcategory": "6.2"
+    },
+    {
+      "ref_id": "6.2.3",
+      "order": 69,
+      "category": "6",
+      "subcategory": "6.2"
+    },
+    {
+      "ref_id": "6.2.4",
+      "order": 70,
+      "category": "6",
+      "subcategory": "6.2"
+    },
+    {
+      "ref_id": "6.3.1",
+      "order": 71,
+      "category": "6",
+      "subcategory": "6.3"
+    },
+    {
+      "ref_id": "6.3.2",
+      "order": 72,
+      "category": "6",
+      "subcategory": "6.3"
+    },
+    {
+      "ref_id": "6.3.3",
+      "order": 73,
+      "category": "6",
+      "subcategory": "6.3"
+    },
+    {
+      "ref_id": "6.4.1",
+      "order": 74,
+      "category": "6",
+      "subcategory": "6.4"
+    },
+    {
+      "ref_id": "6.4.2",
+      "order": 75,
+      "category": "6",
+      "subcategory": "6.4"
+    },
+    {
+      "ref_id": "6.4.3",
+      "order": 76,
+      "category": "6",
+      "subcategory": "6.4"
+    },
+    {
+      "ref_id": "6.4.4",
+      "order": 77,
+      "category": "6",
+      "subcategory": "6.4"
+    },
+    {
+      "ref_id": "6.5.1",
+      "order": 78,
+      "category": "6",
+      "subcategory": "6.5"
+    },
+    {
+      "ref_id": "6.5.2",
+      "order": 79,
+      "category": "6",
+      "subcategory": "6.5"
+    },
+    {
+      "ref_id": "6.5.3",
+      "order": 80,
+      "category": "6",
+      "subcategory": "6.5"
+    },
+    {
+      "ref_id": "6.6.1",
+      "order": 81,
+      "category": "6",
+      "subcategory": "6.6"
+    },
+    {
+      "ref_id": "6.6.2",
+      "order": 82,
+      "category": "6",
+      "subcategory": "6.6"
+    },
+    {
+      "ref_id": "6.7.1",
+      "order": 83,
+      "category": "6",
+      "subcategory": "6.7"
+    },
+    {
+      "ref_id": "6.7.2",
+      "order": 84,
+      "category": "6",
+      "subcategory": "6.7"
+    },
+    {
+      "ref_id": "6.7.3",
+      "order": 85,
+      "category": "6",
+      "subcategory": "6.7"
+    },
+    {
+      "ref_id": "6.8.1",
+      "order": 86,
+      "category": "6",
+      "subcategory": "6.8"
+    },
+    {
+      "ref_id": "6.8.2",
+      "order": 87,
+      "category": "6",
+      "subcategory": "6.8"
+    },
+    {
+      "ref_id": "6.8.3",
+      "order": 88,
+      "category": "6",
+      "subcategory": "6.8"
+    },
+    {
+      "ref_id": "6.9.1",
+      "order": 89,
+      "category": "6",
+      "subcategory": "6.9"
+    },
+    {
+      "ref_id": "6.9.2",
+      "order": 90,
+      "category": "6",
+      "subcategory": "6.9"
+    },
+    {
+      "ref_id": "6.10.1",
+      "order": 91,
+      "category": "6",
+      "subcategory": "6.10"
+    },
+    {
+      "ref_id": "6.10.2",
+      "order": 92,
+      "category": "6",
+      "subcategory": "6.10"
+    },
+    {
+      "ref_id": "6.10.3",
+      "order": 93,
+      "category": "6",
+      "subcategory": "6.10"
+    },
+    {
+      "ref_id": "6.10.4",
+      "order": 94,
+      "category": "6",
+      "subcategory": "6.10"
+    },
+    {
+      "ref_id": "7.1",
+      "order": 95,
+      "category": "7",
+      "subcategory": "7"
+    },
+    {
+      "ref_id": "7.2",
+      "order": 96,
+      "category": "7",
+      "subcategory": "7"
+    },
+    {
+      "ref_id": "7.3",
+      "order": 97,
+      "category": "7",
+      "subcategory": "7"
+    },
+    {
+      "ref_id": "8.1.1",
+      "order": 98,
+      "category": "8",
+      "subcategory": "8.1"
+    },
+    {
+      "ref_id": "8.1.2",
+      "order": 99,
+      "category": "8",
+      "subcategory": "8.1"
+    },
+    {
+      "ref_id": "8.1.3",
+      "order": 100,
+      "category": "8",
+      "subcategory": "8.1"
+    },
+    {
+      "ref_id": "8.2.1",
+      "order": 101,
+      "category": "8",
+      "subcategory": "8.2"
+    },
+    {
+      "ref_id": "8.2.2",
+      "order": 102,
+      "category": "8",
+      "subcategory": "8.2"
+    },
+    {
+      "ref_id": "8.2.3",
+      "order": 103,
+      "category": "8",
+      "subcategory": "8.2"
+    },
+    {
+      "ref_id": "8.2.4",
+      "order": 104,
+      "category": "8",
+      "subcategory": "8.2"
+    },
+    {
+      "ref_id": "8.2.5",
+      "order": 105,
+      "category": "8",
+      "subcategory": "8.2"
+    },
+    {
+      "ref_id": "9.1",
+      "order": 106,
+      "category": "9",
+      "subcategory": "9"
+    },
+    {
+      "ref_id": "9.2",
+      "order": 107,
+      "category": "9",
+      "subcategory": "9"
+    },
+    {
+      "ref_id": "9.3",
+      "order": 108,
+      "category": "9",
+      "subcategory": "9"
+    },
+    {
+      "ref_id": "10.1.1",
+      "order": 109,
+      "category": "10",
+      "subcategory": "10.1"
+    },
+    {
+      "ref_id": "10.1.2",
+      "order": 110,
+      "category": "10",
+      "subcategory": "10.1"
+    },
+    {
+      "ref_id": "10.1.3",
+      "order": 111,
+      "category": "10",
+      "subcategory": "10.1"
+    },
+    {
+      "ref_id": "10.2.1",
+      "order": 112,
+      "category": "10",
+      "subcategory": "10.2"
+    },
+    {
+      "ref_id": "10.2.2",
+      "order": 113,
+      "category": "10",
+      "subcategory": "10.2"
+    },
+    {
+      "ref_id": "10.2.3",
+      "order": 114,
+      "category": "10",
+      "subcategory": "10.2"
+    },
+    {
+      "ref_id": "10.3.1",
+      "order": 115,
+      "category": "10",
+      "subcategory": "10.3"
+    },
+    {
+      "ref_id": "10.3.2",
+      "order": 116,
+      "category": "10",
+      "subcategory": "10.3"
+    },
+    {
+      "ref_id": "10.4.1",
+      "order": 117,
+      "category": "10",
+      "subcategory": "10.4"
+    },
+    {
+      "ref_id": "10.4.2",
+      "order": 118,
+      "category": "10",
+      "subcategory": "10.4"
+    },
+    {
+      "ref_id": "11.1.1",
+      "order": 119,
+      "category": "11",
+      "subcategory": "11.1"
+    },
+    {
+      "ref_id": "11.1.2",
+      "order": 120,
+      "category": "11",
+      "subcategory": "11.1"
+    },
+    {
+      "ref_id": "11.1.3",
+      "order": 121,
+      "category": "11",
+      "subcategory": "11.1"
+    },
+    {
+      "ref_id": "11.2.1",
+      "order": 122,
+      "category": "11",
+      "subcategory": "11.2"
+    },
+    {
+      "ref_id": "11.2.2",
+      "order": 123,
+      "category": "11",
+      "subcategory": "11.2"
+    },
+    {
+      "ref_id": "11.2.3",
+      "order": 124,
+      "category": "11",
+      "subcategory": "11.2"
+    },
+    {
+      "ref_id": "11.3.1",
+      "order": 125,
+      "category": "11",
+      "subcategory": "11.3"
+    },
+    {
+      "ref_id": "11.3.2",
+      "order": 126,
+      "category": "11",
+      "subcategory": "11.3"
+    },
+    {
+      "ref_id": "11.3.3",
+      "order": 127,
+      "category": "11",
+      "subcategory": "11.3"
+    },
+    {
+      "ref_id": "11.4.1",
+      "order": 128,
+      "category": "11",
+      "subcategory": "11.4"
+    },
+    {
+      "ref_id": "11.4.2",
+      "order": 129,
+      "category": "11",
+      "subcategory": "11.4"
+    },
+    {
+      "ref_id": "11.5.1",
+      "order": 130,
+      "category": "11",
+      "subcategory": "11.5"
+    },
+    {
+      "ref_id": "11.5.2",
+      "order": 131,
+      "category": "11",
+      "subcategory": "11.5"
+    },
+    {
+      "ref_id": "11.5.3",
+      "order": 132,
+      "category": "11",
+      "subcategory": "11.5"
+    },
+    {
+      "ref_id": "11.5.4",
+      "order": 133,
+      "category": "11",
+      "subcategory": "11.5"
+    },
+    {
+      "ref_id": "11.6.1",
+      "order": 134,
+      "category": "11",
+      "subcategory": "11.6"
+    },
+    {
+      "ref_id": "11.6.2",
+      "order": 135,
+      "category": "11",
+      "subcategory": "11.6"
+    },
+    {
+      "ref_id": "11.6.3",
+      "order": 136,
+      "category": "11",
+      "subcategory": "11.6"
+    },
+    {
+      "ref_id": "11.6.4",
+      "order": 137,
+      "category": "11",
+      "subcategory": "11.6"
+    },
+    {
+      "ref_id": "11.7.1",
+      "order": 138,
+      "category": "11",
+      "subcategory": "11.7"
+    },
+    {
+      "ref_id": "11.7.2",
+      "order": 139,
+      "category": "11",
+      "subcategory": "11.7"
+    },
+    {
+      "ref_id": "12.1.1",
+      "order": 140,
+      "category": "12",
+      "subcategory": "12.1"
+    },
+    {
+      "ref_id": "12.1.2",
+      "order": 141,
+      "category": "12",
+      "subcategory": "12.1"
+    },
+    {
+      "ref_id": "12.1.3",
+      "order": 142,
+      "category": "12",
+      "subcategory": "12.1"
+    },
+    {
+      "ref_id": "12.2.1",
+      "order": 143,
+      "category": "12",
+      "subcategory": "12.2"
+    },
+    {
+      "ref_id": "12.2.2",
+      "order": 144,
+      "category": "12",
+      "subcategory": "12.2"
+    },
+    {
+      "ref_id": "12.2.3",
+      "order": 145,
+      "category": "12",
+      "subcategory": "12.2"
+    },
+    {
+      "ref_id": "12.3.1",
+      "order": 146,
+      "category": "12",
+      "subcategory": "12.3"
+    },
+    {
+      "ref_id": "12.3.2",
+      "order": 147,
+      "category": "12",
+      "subcategory": "12.3"
+    },
+    {
+      "ref_id": "12.3.3",
+      "order": 148,
+      "category": "12",
+      "subcategory": "12.3"
+    },
+    {
+      "ref_id": "12.4.1",
+      "order": 149,
+      "category": "12",
+      "subcategory": "12.4"
+    },
+    {
+      "ref_id": "12.4.2",
+      "order": 150,
+      "category": "12",
+      "subcategory": "12.4"
+    },
+    {
+      "ref_id": "12.4.3",
+      "order": 151,
+      "category": "12",
+      "subcategory": "12.4"
+    },
+    {
+      "ref_id": "12.5",
+      "order": 152,
+      "category": "12",
+      "subcategory": "12.5"
+    },
+    {
+      "ref_id": "13.1.1",
+      "order": 153,
+      "category": "13",
+      "subcategory": "13.1"
+    },
+    {
+      "ref_id": "13.1.2",
+      "order": 154,
+      "category": "13",
+      "subcategory": "13.1"
+    },
+    {
+      "ref_id": "13.1.3",
+      "order": 155,
+      "category": "13",
+      "subcategory": "13.1"
+    },
+    {
+      "ref_id": "13.2.1",
+      "order": 156,
+      "category": "13",
+      "subcategory": "13.2"
+    },
+    {
+      "ref_id": "13.2.2",
+      "order": 157,
+      "category": "13",
+      "subcategory": "13.2"
+    },
+    {
+      "ref_id": "13.2.3",
+      "order": 158,
+      "category": "13",
+      "subcategory": "13.2"
+    },
+    {
+      "ref_id": "13.3.1",
+      "order": 159,
+      "category": "13",
+      "subcategory": "13.3"
+    },
+    {
+      "ref_id": "13.3.2",
+      "order": 160,
+      "category": "13",
+      "subcategory": "13.3"
+    },
+    {
+      "ref_id": "13.3.3",
+      "order": 161,
+      "category": "13",
+      "subcategory": "13.3"
+    }
+  ]
+}
