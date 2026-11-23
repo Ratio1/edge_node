@@ -315,7 +315,7 @@ class TestFtpActionGate(unittest.TestCase):
 
 
 class _FakeAnonymousFtp(_FakeFtp):
-  """Accepts anonymous login; records any STOR or DELE the probe sends."""
+  """Accepts anonymous login; records any write command the probe sends (ftplib write methods and raw commands)."""
   stored = []
 
   def login(self, user="", passwd=""):
@@ -335,10 +335,19 @@ class _FakeAnonymousFtp(_FakeFtp):
     _FakeAnonymousFtp.stored.append(cmd)
     raise ftplib.error_perm("502 not implemented")
 
+  _WRITE_VERBS = ("STOR", "STOU", "APPE", "DELE", "MKD", "RMD", "RNFR", "SITE")
+
   def sendcmd(self, cmd):
-    if cmd.split(" ", 1)[0].upper() in ("STOR", "APPE", "DELE", "MKD", "RNFR"):
+    if cmd.split(" ", 1)[0].upper() in self._WRITE_VERBS:
       _FakeAnonymousFtp.stored.append(cmd)
     raise ftplib.error_perm("502 not implemented")
+
+  voidcmd = putcmd = sendcmd
+  ntransfercmd = transfercmd
+
+  def rmd(self, name):
+    _FakeAnonymousFtp.stored.append("RMD " + name)
+    return "250 ok"
 
   def delete(self, name):
     _FakeAnonymousFtp.stored.append("DELE " + name)
