@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 from .conftest import mock_plugin_modules
 
 TEST_CHANNEL_TOKEN = "test-model-token-material-at-least-32-bytes"
-EXPECTED_ENDPOINTS = 155  # +3 compliance review/read/designation (RM-183); +1 list_framework_packs (RM-182 phase 4); +3 framework assessment list, create, archive (RM-120 phase 10b); +6 framework assessment (RM-120 phases 3 and 5); +7 account profile, reviewer designation and certificates (RM-155 phase 1); +1 super-tenant provider read for every account's reports; +2 STA deployment integrations, -3 tenant integrations (RM-139); +2 Demo attestation bridge (RM-141); +2 public branding for the sign-in page; +3 super-tenant branding (RM-134); +1 list_deployment_nodes (RM-126); +5 data maintenance (RM-108, temporary); +3 tenant contract (RM-095 phase 1); +6 engagements (RM-095 phase 2); +1 delete_tenant, -4 tenant assets (RM-107); +7 tenant drafts (RM-109 phase 2); +3 draft release/close and tenant document download (RM-109 phase 3); +8 engagement drafts (RM-109 phase 4); +3 super-tenant profile and generated pack (RM-110 phase 1); +6 tenant assets (RM-125); +1 retry_job_attestation (RM-221)
+EXPECTED_ENDPOINTS = 157  # +2 engagement findings list and ledger maintenance (RM-121 phase 2); +3 compliance review/read/designation (RM-183); +1 list_framework_packs (RM-182 phase 4); +3 framework assessment list, create, archive (RM-120 phase 10b); +6 framework assessment (RM-120 phases 3 and 5); +7 account profile, reviewer designation and certificates (RM-155 phase 1); +1 super-tenant provider read for every account's reports; +2 STA deployment integrations, -3 tenant integrations (RM-139); +2 Demo attestation bridge (RM-141); +2 public branding for the sign-in page; +3 super-tenant branding (RM-134); +1 list_deployment_nodes (RM-126); +5 data maintenance (RM-108, temporary); +3 tenant contract (RM-095 phase 1); +6 engagements (RM-095 phase 2); +1 delete_tenant, -4 tenant assets (RM-107); +7 tenant drafts (RM-109 phase 2); +3 draft release/close and tenant document download (RM-109 phase 3); +8 engagement drafts (RM-109 phase 4); +3 super-tenant profile and generated pack (RM-110 phase 1); +6 tenant assets (RM-125); +1 retry_job_attestation (RM-221)
 TOKEN_ENDPOINTS = {"launch_model_test", "preflight_model_test_provider"}
 LAUNCH_ENDPOINTS = ("launch_network_scan", "launch_webapp_scan", "launch_test", "launch_model_test")
 # Pre-RM-075 public positional contract; account actor fields are appended to launches.
@@ -111,6 +111,9 @@ ENDPOINT_FIRST_ARGS = {
   'cleanup_redmesh_old_data': 'actor',
   'restore_redmesh_file': 'actor',
   'restore_redmesh_records': 'actor',
+  # RM-121: the engagement finding ledger's data maintenance, and its read.
+  'maintain_redmesh_engagement_ledgers': 'actor',
+  'list_engagement_findings': 'actor',
   'upload_engagement_document': 'actor',
   'create_engagement': 'actor',
   'list_engagements': 'actor',

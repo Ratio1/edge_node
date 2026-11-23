@@ -99,9 +99,13 @@ class PassReportRef:
   pass_nr: int
   report_cid: str
   risk_score: float = 0
+  pass_changes_cid: str = None  # RM-121: the pass's engagement-ledger artifact; absent outside an engagement
 
   def to_dict(self) -> dict:
-    return asdict(self)
+    d = asdict(self)
+    if d["pass_changes_cid"] is None:
+      d.pop("pass_changes_cid")
+    return d
 
   @classmethod
   def from_dict(cls, d: dict) -> PassReportRef:
@@ -109,6 +113,7 @@ class PassReportRef:
       pass_nr=d["pass_nr"],
       report_cid=d["report_cid"],
       risk_score=d.get("risk_score", 0),
+      pass_changes_cid=d.get("pass_changes_cid"),
     )
 
 

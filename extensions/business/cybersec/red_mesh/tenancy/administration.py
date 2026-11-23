@@ -1547,7 +1547,21 @@ class TenantAdministrationService:
       self.store.put("tenant", tenant_id, record=tenant)
     return {"tenantId": tenant_id, "accountId": account.account_id,
             "marked": isinstance(tenant.get("deleting"), dict),
-            "documentRefs": self._tenant_document_refs(tenant)}
+            "documentRefs": self._tenant_document_refs(tenant),
+            "engagementAssets": self._tenant_engagement_assets(tenant_id)}
+
+  def _tenant_engagement_assets(self, tenant_id):
+    """RM-121: `[{engagementId, engagementAssetId}]` of every engagement row of the tenant, read raw
+    like the document refs: the delete purges each asset's finding ledger before the rows go. An id
+    no ledger can be keyed by (an older row) has none."""
+    found = []
+    for ids in self.store.tenant_record_ids("engagement", tenant_id):
+      row = self.store.raw_record("engagement", *ids) or {}
+      for entry in row.get("assets") if isinstance(row.get("assets"), list) else ():
+        if (valid_engagement_id(ids[-1]) and isinstance(entry, dict)
+            and valid_engagement_asset_id(entry.get("engagement_asset_id"))):
+          found.append({"engagementId": ids[-1], "engagementAssetId": entry["engagement_asset_id"]})
+    return found
 
   @_endpoint
   def abort_tenant_delete(self, actor, tenant_id):
@@ -3158,3 +3172,4 @@ class TenantAdministrationService:
 # RM-120: imported last on purpose. `compliance` pulls in `services/`, whose package init imports
 # this module for `AdministrationDenied`; by here that name exists, so the cycle resolves.
 from . import compliance, compliance_catalogue  # noqa: E402
+from ..services.engagement_ledger import valid_engagement_asset_id  # noqa: E402  (RM-121, same reason)
