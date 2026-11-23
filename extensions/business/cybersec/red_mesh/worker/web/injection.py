@@ -22,6 +22,19 @@ _ACTUATOR_KEYS = frozenset({
 _ACTUATOR_HEALTH_STATES = frozenset({"UP", "DOWN", "OUT_OF_SERVICE", "UNKNOWN"})
 
 
+_JAVA_MARKERS = ("jsessionid", "whitelabel error page", "apache tomcat", "apache-coyote",
+                 "org.springframework")
+
+
+def _has_java_evidence(*resps):
+  """True when a response shows Java/Spring: JSESSIONID, Whitelabel page, Tomcat/Spring fingerprint."""
+  for resp in resps:
+    seen = (" ".join(str(v) for v in (getattr(resp, "headers", None) or {}).values()) + " " + str(resp.text)).lower()
+    if any(m in seen for m in _JAVA_MARKERS):
+      return True
+  return False
+
+
 def _looks_like_actuator_body(text):
   """True for a JSON object shaped like a Spring Actuator or Jolokia response.
 
@@ -1188,7 +1201,8 @@ class _WebInjectionMixin(_InjectionTestBase):
           verify=False,
         )
         if (resp_urls.status_code in (400, 500) and
-            resp_urls_ctrl.status_code == 200):
+            resp_urls_ctrl.status_code == 200 and
+            _has_java_evidence(resp_control, resp_cl, resp_urls)):
           # Spring tried to bind classLoader.URLs[0] and got a type error,
           # while the control was ignored — confirms Spring binding
           findings_list.append(Finding(
@@ -1215,7 +1229,9 @@ class _WebInjectionMixin(_InjectionTestBase):
           timeout=self._target_timeout(3),
           verify=False,
         )
-        if resp2.status_code == 200:
+        # Java/Spring evidence first: a PHP 500 on URLs[0] is not a binding error
+        java_ok = _has_java_evidence(resp_control, resp_cl, resp2)
+        if resp2.status_code == 200 and java_ok:
           findings_list.append(Finding(
             severity=Severity.HIGH,
             cvss_vector=V.RCE_UNCONFIRMED,
@@ -1231,7 +1247,7 @@ class _WebInjectionMixin(_InjectionTestBase):
             cwe_id="CWE-94",
             confidence="tentative",
           ))
-        elif resp2.status_code in (400, 500):
+        elif resp2.status_code in (400, 500) and java_ok:
           # 400/500 = Spring tried to bind classLoader but failed on type
           # conversion — stronger evidence than silent acceptance
           findings_list.append(Finding(

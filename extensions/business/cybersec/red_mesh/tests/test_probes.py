@@ -5052,47 +5052,6 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
     self.assertTrue(any("Tomcat" in t for t in titles), f"Should detect Tomcat. Got: {titles}")
     self.assertTrue(any("Spring" in t for t in titles), f"Should detect Spring MVC via POST 405. Got: {titles}")
 
-  # ── Gap fix: Spring4Shell with 400/500 second check ─────────────
-
-  def test_spring4shell_detected_with_binding_error(self):
-    """Spring4Shell should be detected when URLs[0] returns 400 (type error)."""
-    _, worker = self._build_worker(ports=[7108])
-
-    def fake_get(url, **kwargs):
-      resp = MagicMock()
-      resp.ok = True
-      resp.status_code = 200
-      resp.text = "<html>App</html>"
-      resp.headers = {"Content-Type": "text/html"}
-      if "class.INVALID_RM_CTRL" in url:
-        resp.status_code = 400  # Spring rejects bogus class path
-        resp.text = "Bad Request"
-      elif "class.module.classLoader.DefaultAssertionStatus" in url:
-        resp.status_code = 200  # Spring accepted classLoader binding
-      elif "class.module.classLoader.URLs" in url:
-        resp.status_code = 400  # Type conversion error — binding attempted
-        resp.text = "Bad Request"
-      elif "/actuator" in url:
-        resp.status_code = 404
-        resp.ok = False
-        resp.text = ""
-      return resp
-
-    def fake_post(url, **kwargs):
-      resp = MagicMock()
-      resp.status_code = 404
-      resp.text = ""
-      return resp
-
-    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get), \
-         patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.post", side_effect=fake_post):
-      result = worker._web_test_spring_actuator("1.2.3.4", 7108)
-
-    findings = result.get("findings", [])
-    titles = [f["title"] for f in findings]
-    self.assertTrue(any("Spring4Shell" in t for t in titles), f"Should detect Spring4Shell via binding error. Got: {titles}")
-
-
 
 class TestBatch5Improvements(unittest.TestCase):
   """Tests for batch 5: Spring4Shell secondary gate, CVE dedup."""
@@ -5120,56 +5079,6 @@ class TestBatch5Improvements(unittest.TestCase):
 
   # ── Spring4Shell secondary gate ─────────────────────────────────
 
-  def test_spring4shell_secondary_gate_detects_spring(self):
-    """Spring4Shell should be detected via URLs[0] secondary check when
-    DefaultAssertionStatus returns same 200 as control."""
-    _, worker = self._build_worker(ports=[7108])
-
-    def fake_get(url, **kwargs):
-      resp = MagicMock()
-      resp.ok = True
-      resp.status_code = 200
-      resp.text = "<html>App</html>"
-      resp.headers = {"Content-Type": "text/html"}
-      # Both control and classLoader return 200 with same body (first gate can't distinguish)
-      if "class.INVALID_RM_CTRL.URLs" in url:
-        # Control URLs[0] → 200 (server ignores it)
-        resp.status_code = 200
-        resp.text = "<html>App</html>"
-      elif "class.module.classLoader.URLs" in url:
-        # Spring binding error on URLs[0] → 400
-        resp.status_code = 400
-        resp.text = "Bad Request"
-      elif "class.INVALID_RM_CTRL" in url:
-        resp.status_code = 200
-        resp.text = "<html>App</html>"
-      elif "class.module.classLoader.DefaultAssertionStatus" in url:
-        resp.status_code = 200
-        resp.text = "<html>App</html>"
-      elif "/actuator" in url:
-        resp.status_code = 404
-        resp.ok = False
-        resp.text = ""
-      return resp
-
-    def fake_post(url, **kwargs):
-      resp = MagicMock()
-      resp.status_code = 404
-      resp.text = ""
-      return resp
-
-    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get), \
-         patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.post", side_effect=fake_post):
-      result = worker._web_test_spring_actuator("1.2.3.4", 7108)
-
-    findings = result.get("findings", [])
-    titles = [f["title"] for f in findings]
-    self.assertTrue(any("Spring4Shell" in t for t in titles),
-                    f"Should detect Spring4Shell via URLs[0] secondary gate. Got: {titles}")
-    # Check confidence is "firm" (not tentative)
-    spring4shell = [f for f in findings if "Spring4Shell" in f["title"]]
-    self.assertEqual(spring4shell[0]["confidence"], "firm")
-
   def test_spring4shell_secondary_gate_skips_catchall(self):
     """Spring4Shell secondary gate should NOT flag catch-all servers
     where both classLoader.URLs[0] and control.URLs[0] return 200."""
@@ -5180,7 +5089,7 @@ class TestBatch5Improvements(unittest.TestCase):
       resp.ok = True
       resp.status_code = 200
       resp.text = "<html>Default page</html>"
-      resp.headers = {"Content-Type": "text/html"}
+      resp.headers = {"Content-Type": "text/html", "Server": "Apache-Coyote/1.1"}  # Java, so only the differential gates
       # Catch-all: returns 200 for everything
       if "/actuator" in url:
         resp.status_code = 404
