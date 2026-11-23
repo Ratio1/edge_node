@@ -203,6 +203,20 @@ _HTTP_SERVER_RE = _re.compile(
 _HTTP_PRODUCT_MAP = {'apache': 'apache', 'nginx': 'nginx'}
 
 
+_EHLO_LABEL = _re.compile(r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
+
+
+_DEFAULT_EHLO_DOMAIN = "probe.redmesh.local"
+
+
+def _ehlo_domain(identity):
+  """Return identity when it is a valid hostname (RFC 1123), else the default EHLO domain."""
+  if (isinstance(identity, str) and 0 < len(identity) <= 253
+      and all(_EHLO_LABEL.match(label) for label in identity.split("."))):
+    return identity
+  return _DEFAULT_EHLO_DOMAIN
+
+
 def _server_package(server, version):
   """The distro package of a Server header, only when it names the version `check_cves` matches (RM-240)."""
   package = parse_distro_package(server)
@@ -352,7 +366,7 @@ def _smtp_banner_verdict(mta, ehlo_features):
   """`(verified, why)` for an SMTP banner from the EHLO reply lines. Only judged when an EHLO 250 reply was read.
 
   Exim always ends its EHLO reply with HELP; mailoney's reply has none. Other MTAs have no check: not assessable,
-  even when EHLO was refused (a scanner identity that is not a domain gets 501 from OpenSMTPD).
+  even when EHLO was refused.
   """
   if mta != "exim":
     return BANNER_NOT_ASSESSABLE, ""
@@ -1617,7 +1631,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       return probe_error(target, port, "SMTP", e)
 
     # --- 2. EHLO — server capabilities ---
-    identity = getattr(self, 'scanner_identity', 'probe.redmesh.local')
+    identity = _ehlo_domain(getattr(self, 'scanner_identity', _DEFAULT_EHLO_DOMAIN))
     ehlo_features = []
     try:
       code, msg = smtp.ehlo(identity)
