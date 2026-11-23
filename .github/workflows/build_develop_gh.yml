@@ -1,0 +1,66 @@
+name: Build develop images on GitHub runners (probe)
+
+# Probe: checks that the develop images build on standard GitHub-hosted
+# runners, without Docker Build Cloud. Nothing is pushed (push: false).
+# The GPU images run twice: as-is, and after freeing runner disk space,
+# to show whether the large GPU base image fits.
+
+on:
+  push:
+    branches:
+      - "ci/gh-build-probe"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.net }} ${{ matrix.flavor }}${{ matrix.free_disk && ' (free disk)' || '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { net: devnet,  flavor: cpu, free_disk: false, base: ratio1/base_edge_node_amd64_cpu:latest }
+          - { net: testnet, flavor: cpu, free_disk: false, base: ratio1/base_edge_node_amd64_cpu:latest }
+          - { net: devnet,  flavor: gpu, free_disk: false, base: ratio1/base_edge_node_amd64_gpu:latest }
+          - { net: testnet, flavor: gpu, free_disk: false, base: ratio1/base_edge_node_amd64_gpu:latest }
+          - { net: devnet,  flavor: gpu, free_disk: true,  base: ratio1/base_edge_node_amd64_gpu:latest }
+          - { net: testnet, flavor: gpu, free_disk: true,  base: ratio1/base_edge_node_amd64_gpu:latest }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Disk before
+        run: df -h /
+
+      - name: Free runner disk space
+        if: matrix.free_disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift
+          sudo docker image prune -af
+          df -h /
+
+      - name: Fetch pinned vulndb
+        uses: ./.github/actions/fetch-vulndb
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.net }} ${{ matrix.flavor }} image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: ./Dockerfile_${{ matrix.net }}
+          build-args: |
+            BASE_IMAGE=${{ matrix.base }}
+          push: false
+
+      - name: Disk after
+        if: always()
+        run: |
+          df -h /
+          docker buildx du --builder "${{ steps.buildx.outputs.name }}" | tail -3 || true
