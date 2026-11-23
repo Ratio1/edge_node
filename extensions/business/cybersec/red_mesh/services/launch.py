@@ -89,6 +89,9 @@ def _launch_network_jobs(
     # computed above are discarded: no reshuffle and no current worker count.
     batches = [list(payload["initial_ports"]) for payload in restored]
 
+  # This node's whole port set (after a resume: the saved batches), without exceptions. A probe
+  # that follows a port the target names stays inside it, whichever worker's batch holds the port.
+  job_ports = sorted({p for batch in batches for p in batch} - set(exceptions))
   local_jobs = {}
   for index, batch in enumerate(batches):
     local_id_prefix = str(restored[index]["local_id_prefix"]) if restored else str(index + 1)
@@ -110,6 +113,7 @@ def _launch_network_jobs(
         initiator=launcher,
         exceptions=exceptions,
         worker_target_ports=batch,
+        job_ports=job_ports,
         excluded_features=excluded_features,
         enabled_features=enabled_features,
         scan_min_delay=scan_min_delay,

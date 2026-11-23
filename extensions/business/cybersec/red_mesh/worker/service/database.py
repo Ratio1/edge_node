@@ -1,9 +1,12 @@
+import hashlib
+import random
 import re as _re
 import socket
 import struct
 
 import requests
 
+from ...constants import AUTH_SKIPPED
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
 from ...cve_db import check_cves, probe_cve_fields
@@ -1641,4 +1644,153 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
     if not findings:
       findings.append(Finding(Severity.INFO, "InfluxDB probe clean", "No issues detected."))
+    return probe_result(raw_data=raw, findings=findings)
+
+  # ── Erlang distribution (epmd and the node's dist port) ─────────
+
+  _ERLANG_DEADLINE = 10  # seconds for epmd NAMES, or for the whole handshake
+  _ERLANG_DEFAULT_COOKIE = "monster"  # CouchDB's published default (CVE-2022-24706)
+  # EXTENDED_REFERENCES, FUN_TAGS, NEW_FUN_TAGS, EXTENDED_PIDS_PORTS, EXPORT_PTR_TAG, BIT_BINARIES,
+  # NEW_FLOATS, UTF8_ATOMS, MAP_TAG, BIG_CREATION. Not PUBLISHED: the node joins as a hidden peer.
+  _ERLANG_DIST_FLAGS = 0x4 | 0x10 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800 | 0x10000 | 0x20000 | 0x40000
+
+  def _erlang_recv_packet(self, sock, max_len, deadline):
+    """Read one 2-byte-length-prefixed handshake packet; None on EOF or a length above `max_len`."""
+    def read(size):
+      out = b""
+      while len(out) < size:
+        chunk = self._recv_by(sock, size - len(out), deadline)
+        if not chunk:
+          return None
+        out += chunk
+      return out
+    head = read(2)
+    want = struct.unpack(">H", head)[0] if head else None
+    if want is None or want > max_len:
+      return None
+    return read(want)
+
+  def _erlang_handshake(self, target, dist_port, cookie):
+    """
+    Run the distribution handshake as far as the challenge_ack check, then close.
+
+    Returns one of: "authenticated", "bad_digest", "not_allowed", "alive", "nok", "unsupported",
+    "timeout", "error". Sends no RPC and no tick.
+    OTP 23 and 24 answer our old-style 'n' challenge. OTP 25 and later reject a peer that does not
+    offer HANDSHAKE_23, so the outcome there is "nok" or "error" and the default cookie goes undetected.
+    """
+    deadline = self._deadline_in(self._ERLANG_DEADLINE)
+    sock = None
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(self._target_timeout(3))
+      sock.connect((target, dist_port))
+      name = b"redmesh@probe"
+      send_name = b"n" + struct.pack(">HI", 5, self._ERLANG_DIST_FLAGS) + name
+      sock.sendall(struct.pack(">H", len(send_name)) + send_name)
+      status = self._erlang_recv_packet(sock, 32, deadline)
+      if status is None:
+        return "error"
+      if status == b"snot_allowed":
+        return "not_allowed"
+      if status == b"salive":
+        return "alive"
+      if status[:1] != b"s" or status[1:3] != b"ok":
+        return "nok"
+      challenge = self._erlang_recv_packet(sock, 300, deadline)
+      if challenge is None or challenge[:1] != b"n" or len(challenge) < 11:
+        return "unsupported"  # not the old-style 'n' challenge
+      their_challenge = struct.unpack(">I", challenge[7:11])[0]
+      my_challenge = random.getrandbits(32)
+      digest = hashlib.md5(cookie.encode() + str(their_challenge).encode()).digest()
+      reply = b"r" + struct.pack(">I", my_challenge) + digest
+      sock.sendall(struct.pack(">H", len(reply)) + reply)
+      ack = self._erlang_recv_packet(sock, 17, deadline)
+      if ack is None:
+        return "error"
+      expected = hashlib.md5(cookie.encode() + str(my_challenge).encode()).digest()
+      return "authenticated" if ack == b"a" + expected else "bad_digest"
+    except socket.timeout:
+      return "timeout"
+    except Exception:
+      return "error"
+    finally:
+      if sock:
+        sock.close()
+
+  @register_probe(
+    display_name="Erlang distribution default cookie (CouchDB)",
+    description=(
+      "epmd NAMES to list nodes; for a CouchDB node, the distribution handshake with the "
+      "published default cookie, stopping after the challenge_ack. Gated by credential testing."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(1188,),
+    default_owasp=("A07:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
+  def _service_info_erlang_dist(self, target, port):  # default port: 4369 (epmd)
+    """
+    epmd NAMES (ungated), then the default-cookie handshake against a CouchDB node when
+    `_login_attempts_allowed()`. The dist port is whatever epmd reports.
+    """
+    raw = {"epmd_nodes": []}
+    sock = None
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(self._target_timeout(3))
+      sock.connect((target, port))
+      sock.sendall(b"\x00\x01n")
+      data, deadline = b"", self._deadline_in(self._ERLANG_DEADLINE)
+      while len(data) < 4096:
+        chunk = self._recv_by(sock, 1024, deadline)
+        if not chunk:
+          break
+        data += chunk
+    except Exception as exc:
+      raw["epmd_error"] = str(exc)[:120]
+      return probe_result(raw_data=raw, findings=[])
+    finally:
+      if sock:
+        sock.close()
+
+    for line in data[4:].decode("utf-8", errors="replace").splitlines():
+      match = _re.match(r"name (\S+) at port (\d+)", line)
+      if match:
+        raw["epmd_nodes"].append({"name": match.group(1), "port": int(match.group(2))})
+    couch = [n for n in raw["epmd_nodes"] if n["name"] == "couchdb"]
+    if not couch:
+      return probe_result(raw_data=raw, findings=[])
+    if not self._login_attempts_allowed():
+      raw["auth_control"] = dict(AUTH_SKIPPED)  # the cookie is a credential
+      return probe_result(raw_data=raw, findings=[])
+
+    # epmd names the port, so the target (not the operator) chose it: stay inside the job's scope.
+    scope = getattr(self, "job_ports", None)
+    if scope is not None and couch[0]["port"] not in scope:
+      outcome = "out_of_scope"
+    else:
+      outcome = self._erlang_handshake(target, couch[0]["port"], self._ERLANG_DEFAULT_COOKIE)
+    raw["erlang_handshake"] = {"dist_port": couch[0]["port"], "outcome": outcome}
+    findings = []
+    if outcome == "authenticated":
+      findings.append(Finding(
+        severity=Severity.CRITICAL,
+        cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
+        title="CouchDB Erlang default cookie accepted (CVE-2022-24706)",
+        cve=("CVE-2022-24706",),
+        **probe_cve_fields("CVE-2022-24706"),
+        description=f"The CouchDB node on {target} (distribution port {couch[0]['port']}) accepted the "
+                    "published default Erlang cookie. Any peer with this cookie can run code on the node. "
+                    "The check stopped after the handshake: no RPC and no tick were sent. A completed "
+                    "handshake joins the node as a hidden peer for a moment.",
+        evidence=f"Distribution handshake with the default cookie completed; challenge_ack digest verified "
+                 f"(node couchdb, port {couch[0]['port']})",
+        remediation="Upgrade CouchDB to 3.2.2 or later; set a unique cookie in vm.args; "
+                    "do not expose epmd (4369) or the distribution ports.",
+        owasp_id="A07:2021",
+        cwe_id="CWE-1188",
+        confidence="certain",
+        confidence_reason="behaviour_confirmed",
+      ))
     return probe_result(raw_data=raw, findings=findings)

