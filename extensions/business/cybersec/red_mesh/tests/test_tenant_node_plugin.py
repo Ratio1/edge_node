@@ -127,7 +127,7 @@ class TestTenantNodePlugin(unittest.TestCase):
       self.assertEqual(self.plugin.get_tenant_nodes(platform, self.tenant)["status_code"], 404)
       config.assert_not_called()
 
-  def test_reads_and_removal_do_not_evaluate_plugin_peer_property(self):
+  def test_unreadable_peers_read_answers_removal_skips_assignment_refuses(self):
     self.plugin.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True)
     with patch.object(self.Plugin, "cfg_chainstore_peers", new_callable=PropertyMock,
                       create=True, side_effect=RuntimeError("private configuration")) as config:
