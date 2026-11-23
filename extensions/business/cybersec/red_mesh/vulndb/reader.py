@@ -12,6 +12,7 @@ import sqlite3
 import sys
 from bisect import bisect_left, bisect_right
 from collections import namedtuple
+from functools import cmp_to_key
 from pathlib import Path
 
 from ..cve_db import _compare_debian_revision, _compare_versions, _parse_version
@@ -75,7 +76,7 @@ def _lower_at_or_above(clauses, oldest):
 
 
 # Debian release by the `debNNuM` marker of a revision. bullseye maps to a name the table has no rows for (no tracker data).
-_DEBIAN_RELEASES = {"11": "bullseye", "12": "bookworm", "13": "trixie"}
+_DEBIAN_RELEASES = {"10": "buster", "11": "bullseye", "12": "bookworm", "13": "trixie"}
 _DEB_MARK = re.compile(r"deb(\d+)u\d")
 # The meta key that proves the file carries rows of a distribution (schema 1.0.1); without it the table, if any, is not data.
 _DISTRO_SNAPSHOT = {"ubuntu": "snapshot_oval", "debian": "snapshot_debian"}
@@ -91,6 +92,20 @@ def _split_version(full):
 def _compare_full(a, b):
   """-1, 0 or 1 for two `(upstream, revision)` pairs: the upstreams first, the revisions only when those are equal."""
   return _compare_debian_revision(a[0], b[0]) or _compare_debian_revision(a[1], b[1])
+
+
+def _own_upstreams(distro, release, versions):
+  """Upstreams a release itself shipped (RM-240): its own `debNNu` fixes, and its highest unmarked fixed version (release day).
+
+  Lower unmarked versions predate the release (sid-derived `2.4.38-3` in bookworm); Ubuntu has no marker.
+  """
+  marked = [v for v in versions if distro == "debian" and _DEB_MARK.search(v)]
+  own = {_split_version(v)[0] for v in marked if _DEBIAN_RELEASES.get(_DEB_MARK.search(v).group(1)) == release}
+  try:
+    top = max((_split_version(v) for v in versions if v not in marked), key=cmp_to_key(_compare_full), default=None)
+  except ValueError:  # a version dpkg-compare cannot read: no release-day upstream
+    top = None
+  return own | ({top[0]} if top else set())
 
 
 def _holds(op, cmp):
@@ -119,10 +134,16 @@ class VulndbReader:
     self._exact_sorted = {}  # product -> [(key, affected row)] sorted by key, built on the first span query
     self._distro = {}  # (distro, product) -> {cve_id: [(release, package, status, fixed_version, source)]}
     self._distro_releases = {}  # (distro, product) -> {upstream: {release}}, from the rows that name a fixed version
+    by_release = {}  # (distro, product, release) -> fixed versions of the release's rows
     for d, release, product, package, cve_id, status, fixed, source in distro or ():
       self._distro.setdefault((d, product), {}).setdefault(cve_id, []).append((release, package, status, fixed, source))
       if fixed:
         self._distro_releases.setdefault((d, product), {}).setdefault(_split_version(fixed)[0], set()).add(release)
+        by_release.setdefault((d, product, release), []).append(fixed)
+    self._shipped = {}  # (distro, product) -> {upstream: {release}}: upstreams a release itself shipped (revisionless banners)
+    for (d, product, release), versions in by_release.items():
+      for upstream in _own_upstreams(d, release, versions):
+        self._shipped.setdefault((d, product), {}).setdefault(upstream, set()).add(release)
     rows_by_cve = {}   # (product, cve_id) -> [clauses or None (unparsed), affected row], for the end-of-life rules
     cache = {}
     for row in rows:
@@ -161,7 +182,9 @@ class VulndbReader:
     mark = _DEB_MARK.search(package.revision) if package.distro == "debian" else None
     if mark:
       return _DEBIAN_RELEASES.get(mark.group(1))
-    releases = self._distro_releases.get((package.distro, product), {}).get(_split_version(package.upstream)[0], ())
+    # Without a revision only the upstreams a release itself shipped name it; any fixed version may name a revisioned one.
+    by_upstream = self._distro_releases if package.revision else self._shipped
+    releases = by_upstream.get((package.distro, product), {}).get(_split_version(package.upstream)[0], ())
     return next(iter(releases)) if len(releases) == 1 else None
 
   def distro_status(self, product, cve_id, package):
@@ -199,7 +222,7 @@ class VulndbReader:
     """`(state, fixed revision, source)` of the rows of one CVE and release for the node's package, or None.
 
     `open` wins; else the highest fixed version decides, compared as a whole `upstream-revision` (a backport can move the
-    upstream part too); else `not_affected`.
+    upstream part too); else `not_affected`. A package without a revision compares upstream parts only: equal gives None.
     """
     for r in rows:
       if r[2] == "open":
@@ -210,7 +233,14 @@ class VulndbReader:
       for cand, src in fixed[1:]:
         if _compare_full(cand, top) > 0:
           top, source = cand, src
-      state = "fixed" if _compare_full((package.upstream, package.revision), top) >= 0 else "not_fixed"
+      if package.revision:
+        state = "fixed" if _compare_full((package.upstream, package.revision), top) >= 0 else "not_fixed"
+      else:
+        # A banner without a revision cannot say whether the fix landed: only the upstream parts can be compared (RM-240).
+        side = _compare_debian_revision(package.upstream, top[0])
+        if side == 0:
+          return None
+        state = "fixed" if side > 0 else "not_fixed"
       return state, top[1], source
     if any(r[2] == "not_affected" for r in rows):
       return "not_affected", "", rows[0][4]

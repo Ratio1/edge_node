@@ -137,7 +137,8 @@ class CallSiteTests(unittest.TestCase):
     self.assertEqual(up["CVE-2030-1002"], ("tentative", "platform_dependent"))
     self.assertEqual(up["CVE-2030-1005"], ("tentative", "banner_only"))  # co-disclosed OpenSSL unchanged
     down = self.reasons(probe, "Apache/2.4.49 (Debian)", port)
-    self.assertEqual(down["CVE-2030-1001"], ("tentative", "banner_only"))
+    # RM-240: `(Debian)` now names a package with no revision: the reason is `backport_unknown`, not `banner_only`
+    self.assertEqual(down["CVE-2030-1001"], ("tentative", "backport_unknown"))
 
   def test_http_call_site(self):
     self.check("_service_info_http", 80)

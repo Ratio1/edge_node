@@ -413,22 +413,34 @@ _DISTRO_PACKAGE_RE = re.compile(
 )
 
 
+# `Apache/2.4.38 (Debian)`: the distribution marker without a package revision (RM-240).
+_DISTRO_NO_REVISION_RE = re.compile(r"[_\s/](?P<upstream>\d[\w.]*?)\s+\((?P<distro>Ubuntu|Debian)\)", re.IGNORECASE)
+
+
+_DISTRO_PARSE_LIMIT = 256
+
+
 def parse_distro_package(text):
   """The distribution package a banner or version string announces, or None.
 
-  None means "no distribution suffix": an upstream build, or a distribution
-  that does not stamp its revision into the banner. It does not mean
-  "not backported"; that state is `unknown` below.
+  None means "no distribution marker": an upstream build. It does not mean
+  "not backported"; that state is `unknown` below. A bare `(Debian)` or
+  `(Ubuntu)` after the version gives `revision=""`: the distribution is
+  known, the revision is not.
   """
   if not isinstance(text, str):
     return None
+  cut = len(text) > _DISTRO_PARSE_LIMIT
+  text = text[:_DISTRO_PARSE_LIMIT]  # a hostile banner must not set the regex cost
   m = _DISTRO_PACKAGE_RE.search(text)
   if not m:
+    m = _DISTRO_NO_REVISION_RE.search(text)
+  if not m or (cut and m.end() == len(text)):  # a match that ends at the cut may have lost the rest of its revision
     return None
   return DistroPackage(
     distro=m.group("distro").lower(),
     upstream=m.group("upstream"),
-    revision=m.group("revision"),
+    revision=m.groupdict().get("revision") or "",
   )
 
 
@@ -522,6 +534,8 @@ def _backport_state(product: str, cve_id: str, package):
   if package is None:
     return BACKPORT_UNKNOWN_NO_PACKAGE, None
   row = _backport_row(product, cve_id, package)
+  if row is not None and not package.revision:
+    return BACKPORT_UNKNOWN, None  # a row matches by upstream: without a revision an equal upstream cannot say fixed or not
   if row is None:
     verdict = _distro_verdict(product, cve_id, package)
     if verdict is None:
@@ -584,7 +598,7 @@ def _record_not_applicable(entry, product: str, version: str, package, reason: s
     "title": entry.title,
     "product": product,
     "version": version,
-    "package": f"{package.distro} {package.upstream}-{package.revision}" if package else "",
+    "package": (f"{package.distro} {package.upstream}" + (f"-{package.revision}" if package.revision else "")) if package else "",
     "port": port,
     "reason": reason,
     "advisory": row[2] if row else "",
