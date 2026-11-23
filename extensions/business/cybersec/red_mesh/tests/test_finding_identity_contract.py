@@ -492,6 +492,72 @@ class TestRewordingSurvivesTheRealBlackboxPath(unittest.TestCase):
     )
 
 
+class TestTheSignaturePayloadCarriesEveryContentField(unittest.TestCase):
+  """RM-258: `_CONTENT_FIELDS` names enrichment, so the worker payload must carry it."""
+
+  def test_identity_payload_has_every_content_field(self):
+    from extensions.business.cybersec.red_mesh.findings import Finding, Severity
+    from extensions.business.cybersec.red_mesh.models.finding_identity import _CONTENT_FIELDS
+
+    payload = Finding(severity=Severity.LOW, title="t", description="d")._identity_payload("p")
+    # Failing input: kev, epss_score, cvss_score_env, cvss_vector_env, references
+    self.assertEqual(set(_CONTENT_FIELDS) - set(payload), set())
+
+  def test_kev_none_and_false_are_different_content(self):
+    from extensions.business.cybersec.red_mesh.findings import Finding, Severity
+
+    def sig(kev):
+      return Finding(severity=Severity.LOW, title="t", description="d", kev=kev).compute_signature(probe_id="p")
+
+    self.assertEqual(len({sig(None), sig(False), sig(True)}), 3)
+
+
+class TestEpssEntersTheSignatureAsABand(unittest.TestCase):
+  """RM-258: bands <0.01, 0.01-0.1, 0.1-0.5, >=0.5; lower bound inclusive; None is its own state."""
+
+  def test_non_numeric_epss_counts_as_unknown(self):
+    from extensions.business.cybersec.red_mesh.findings import epss_band
+    for bad in (float("nan"), float("inf"), "0.05", True):
+      self.assertIsNone(epss_band(bad))
+
+  def test_band_edges(self):
+    from extensions.business.cybersec.red_mesh.findings import epss_band
+
+    # Failing input: 0.1 must land in "0.1-0.5", 0.5 in ">=0.5".
+    self.assertEqual(
+      [epss_band(v) for v in (None, 0.0, 0.005, 0.01, 0.099, 0.1, 0.499, 0.5, 1.0)],
+      [None, "<0.01", "<0.01", "0.01-0.1", "0.01-0.1", "0.1-0.5", "0.1-0.5", ">=0.5", ">=0.5"],
+    )
+
+  def test_unknown_epss_differs_from_a_low_score(self):
+    from extensions.business.cybersec.red_mesh.findings import Finding, Severity
+
+    def sig(epss):
+      return Finding(severity=Severity.LOW, title="t", description="d", epss_score=epss).compute_signature(probe_id="p")
+
+    self.assertNotEqual(sig(None), sig(0.005))  # failing input: None vs 0.005
+    self.assertEqual(sig(0.2), sig(0.4))
+
+  def test_the_unstamped_flat_fallback_hashes_the_same_band(self):
+    from extensions.business.cybersec.red_mesh.mixins.risk import _RiskScoringMixin
+
+    def sig(epss):
+      class MockHost(_RiskScoringMixin):
+        pass
+
+      _risk, flat = MockHost()._compute_risk_and_findings({
+        "target": "app.test",
+        "port_protocols": {"443": "https"},
+        "service_info": {"443": {"_service_info_http": {"findings": [
+          {"title": "t", "description": "d", "severity": "LOW", "epss_score": epss}]}}},
+      })
+      return flat[0]["finding_signature"]
+
+    # Failing input: 0.2 vs 0.4 (one band) must match; 0.05 vs 0.2 must differ.
+    self.assertEqual(sig(0.2), sig(0.4))
+    self.assertNotEqual(sig(0.05), sig(0.2))
+
+
 class TestTheCveMatcherStampsOneIdentityNotTwo(unittest.TestCase):
   """`asset_canonical` exists for exactly one caller, and it was not wired.
 

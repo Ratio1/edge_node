@@ -21,6 +21,7 @@ from ..models.finding_identity import (
   dedup_key as _dedup_key,
   parse_cwe_list as _parse_cwe_list,
 )
+from ..findings import epss_band
 from ..cve_view import apply_triage, build_cve_view, drop_closed, is_view_finding, view_members
 from ..constants import (
   RISK_SEVERITY_WEIGHTS,
@@ -257,7 +258,7 @@ class _RiskScoringMixin:
       )
       item["finding_signature"] = (
         item.get("finding_signature") or item.get("content_hash")
-        or _content_hash(item)
+        or _content_hash({**item, "epss_score": epss_band(item.get("epss_score"))})
       )
       item.pop("dedup_key", None)
       item.pop("content_hash", None)
