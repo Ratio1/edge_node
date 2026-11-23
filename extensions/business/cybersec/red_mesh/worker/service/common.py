@@ -1087,7 +1087,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         pass
 
     # --- 6. Arbitrary credential acceptance test ---
-    # Doubles as the negative control for step 6 (RM-069); the default-credential
+    # Doubles as the negative control for step 5 (RM-069); the default-credential
     # findings are built after it so they can be gated on its outcome.
     control = CONTROL_NOT_RUN
     import string as _string
