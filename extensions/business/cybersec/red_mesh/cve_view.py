@@ -19,6 +19,7 @@ LISTED_CVSS = 9.0
 CLOSED_STATUSES = frozenset({"false_positive", "remediated"})
 # A tentative row with this reason failed the banner check (RM-205): it folds into a count, not a possible row.
 FOLD_REASON = "banner_unverified"
+EOL_FOLD_REASON = "eol_unassessed"  # folds under the service's `unsupported` finding, unless KEV (RM-207)
 
 # The matched constraint and the product are read from the finding text `cve_db._build_finding` writes
 # (`evidence`: "Detected version: V, affected: C"; `description`: "P V is vulnerable to CVE."); a test pins both.
@@ -199,7 +200,8 @@ def build_cve_view(findings, not_applicable=(), triage=None, now=None):
   `not_applicable`: the scan-local records of CVEs matched and skipped (client side, backport fixed), counted as
   `dropped`. `triage`: finding_id -> status or `{status, review_at}`; a closed member is counted in `closed` only.
   Conservation: `listed + rolled_up + possible + folded + closed + dropped == raw` (`possible_kev` rows are inside `possible`).
-  `folded`: tentative rows whose reason is `banner_unverified`, a count per service (RM-205); a closed one counts as closed.
+  `folded`: tentative rows whose reason is `banner_unverified`, or `eol_unassessed` on a service with an `unsupported`
+  finding and not KEV (RM-207), a count per service (RM-205); a closed one counts as closed.
 
   Notes: with only `not_applicable` records and no generated finding the result is None (no view, no counts). In a
   mixed job every collector record counts as `dropped`, whichever source made it. A finding whose description does
@@ -224,8 +226,15 @@ def build_cve_view(findings, not_applicable=(), triage=None, now=None):
   totals = {"listed": 0, "rolled_up": 0, "possible": 0, "folded": 0}
   for (port, product), members in sorted(groups.items(), key=lambda kv: _service_order(*kv[0])):
     firm = sorted((f for f in members if f.get("confidence") != "tentative"), key=_rank)
-    unverified = [f for f in members if f.get("confidence") == "tentative" and f.get("confidence_reason") == FOLD_REASON]
-    tentative = [f for f in members if f.get("confidence") == "tentative" and f.get("confidence_reason") != FOLD_REASON]
+    unsupported = eol.get((port, product))
+    tentative, unverified = [], []
+    for f in members:
+      if f.get("confidence") != "tentative":
+        continue
+      reason = f.get("confidence_reason")
+      # An end-of-life row folds only when the unsupported-version finding exists; a KEV one stays possible.
+      folds = reason == FOLD_REASON or (reason == EOL_FOLD_REASON and unsupported and not effective_kev(f))
+      (unverified if folds else tentative).append(f)
     candidates = [f for f in firm if _is_listed(f)]
     listed, overflow = candidates[:MAX_LISTED], candidates[MAX_LISTED:]
     rest = [f for f in firm if not _is_listed(f)] + overflow
@@ -239,7 +248,7 @@ def build_cve_view(findings, not_applicable=(), triage=None, now=None):
       "possible": _possible(tentative) if tentative else None,
       "folded": _folded(unverified) if unverified else None,
       "possible_kev": [f["finding_id"] for f in kev_possible],
-      "unsupported": eol.get((port, product)),  # the end-of-life finding, outside `raw`
+      "unsupported": unsupported,  # the end-of-life finding, outside `raw`
     })
     totals["listed"] += len(listed)
     totals["rolled_up"] += len(rest)

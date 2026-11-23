@@ -162,6 +162,29 @@ class CveViewTests(unittest.TestCase):
     self.assertLessEqual({"id0003", "id0004"}, view_members(view)[1])
     self.assertEqual([f["finding_id"] for f in filter_listed(findings)], ["id0001", "id0007"])
 
+  def test_eol_unassessed_folds_only_under_the_unsupported_finding_and_not_kev(self):
+    eol = {"finding_id": "eol1", "port": 2700, "vulndb_build_id": "b1", "tags": ["vulndb_eol", "mongodb"]}
+    rows = [fnd(1, confidence="tentative", reason="eol_unassessed", port=2700, product="mongodb"),
+            fnd(2, confidence="tentative", reason="eol_unassessed", port=2700, product="mongodb"),
+            fnd(3, confidence="tentative", reason="banner_unverified", port=2700, product="mongodb"),
+            fnd(4, confidence="tentative", reason="eol_unassessed", port=2700, product="mongodb", kev=True),
+            fnd(5, confidence="tentative", reason="eol_unassessed", port=9, product="other")]
+    view = build_cve_view(rows + [eol])
+    conserved(self, view)
+    other, mongo = sorted(view["services"], key=lambda s: s["port"])
+    self.assertEqual(mongo["unsupported"], "eol1")
+    self.assertEqual(mongo["folded"], {"count": 3, "reasons": {"banner_unverified": 1, "eol_unassessed": 2},
+                                       "member_finding_ids": ["id0001", "id0002", "id0003"]})
+    self.assertEqual(mongo["possible"]["member_finding_ids"], ["id0004"])  # KEV stays possible
+    self.assertEqual(mongo["possible_kev"], ["id0004"])
+    self.assertIsNone(other["unsupported"])  # no pointer: stays possible
+    self.assertEqual((other["possible"]["reasons"], other["folded"]), ({"eol_unassessed": 1}, None))
+    self.assertEqual(view["counts"], {"raw": 5, "listed": 0, "rolled_up": 0, "possible": 2, "folded": 3,
+                                      "closed": 0, "dropped": 0})
+    closed = build_cve_view(rows + [eol], triage={"id0001": "false_positive"})
+    conserved(self, closed)
+    self.assertEqual((closed["counts"]["folded"], closed["counts"]["closed"]), (2, 1))
+
   def test_a_service_with_only_folded_rows_and_closed_wins(self):
     findings = [fnd(1, confidence="tentative", reason="banner_unverified"),
                 fnd(2, confidence="tentative", reason="banner_unverified")]
