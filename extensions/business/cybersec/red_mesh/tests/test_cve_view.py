@@ -175,6 +175,8 @@ class CveViewTests(unittest.TestCase):
     self.assertEqual(mongo["unsupported"], "eol1")
     self.assertEqual(mongo["folded"], {"count": 3, "reasons": {"banner_unverified": 1, "eol_unassessed": 2},
                                        "member_finding_ids": ["id0001", "id0002", "id0003"]})
+    self.assertEqual(summarize_view(view)["folded"], [{"port": 2700, "product": "mongodb", "version": "1.5", "count": 3,
+                                                       "reasons": {"banner_unverified": 1, "eol_unassessed": 2}}])
     self.assertEqual(mongo["possible"]["member_finding_ids"], ["id0004"])  # KEV stays possible
     self.assertEqual(mongo["possible_kev"], ["id0004"])
     self.assertIsNone(other["unsupported"])  # no pointer: stays possible
@@ -202,7 +204,8 @@ class CveViewTests(unittest.TestCase):
     findings = [fnd(1, confidence="tentative", reason="banner_unverified", port=22, product="openssh", ver="7.4"),
                 fnd(2, confidence="tentative", reason="banner_unverified", port=22, product="openssh", ver="7.4")]
     summary = summarize_view(build_cve_view(findings))
-    self.assertEqual(summary["folded"], [{"port": 22, "product": "openssh", "version": "7.4", "count": 2}])
+    self.assertEqual(summary["folded"], [{"port": 22, "product": "openssh", "version": "7.4", "count": 2,
+                                          "reasons": {"banner_unverified": 2}}])
     self.assertEqual((summary["possible"], summary["omitted_folded"], summary["counts"]["folded"]), ([], 0, 2))
     unequal = [fnd(1, confidence="tentative", reason="banner_unverified", port=22, product="openssh", ver="7.4"),
                fnd(2, confidence="tentative", reason="banner_unverified", port=443, product="nginx", ver="1.0"),

@@ -288,7 +288,7 @@ def filter_listed(findings, not_applicable=(), triage=None, view=None):
 
 
 def summarize_view(view):
-  """The view as the LLM input carries it: counts, one line per rollup, the possible summary and the folded count per service."""
+  """The view as the LLM input carries it: counts, one line per rollup, the possible summary and the folded count and reasons per service."""
   rollups, possible, folded = [], [], []
   for service in view["services"]:
     where = {"port": service["port"], "product": service["product"]}
@@ -299,7 +299,8 @@ def summarize_view(view):
       p = service["possible"]
       possible.append({**where, "count": p["count"], "reasons": p["reasons"], "top": p["top"]})
     if service.get("folded"):
-      folded.append({**where, "version": service["version"], "count": service["folded"]["count"]})
+      folded.append({**where, "version": service["version"], "count": service["folded"]["count"],
+                   "reasons": service["folded"]["reasons"]})
   # Bounded across services, so a large scan cannot exhaust the model's input: KEV, then highest CVSS, first.
   rollups.sort(key=lambda r: (-r["kev_count"], -(r["max_cvss"]["score"] or -1), -r["cve_count"]))
   possible.sort(key=lambda p: (-max((t["score"] or -1 for t in p["top"]), default=-1), -p["count"]))
