@@ -200,7 +200,7 @@ def build_cve_view(findings, not_applicable=(), triage=None, now=None):
   `not_applicable`: the scan-local records of CVEs matched and skipped (client side, backport fixed), counted as
   `dropped`. `triage`: finding_id -> status or `{status, review_at}`; a closed member is counted in `closed` only.
   Conservation: `listed + rolled_up + possible + folded + closed + dropped == raw` (`possible_kev` rows are inside `possible`).
-  `folded`: tentative rows whose reason is `banner_unverified`, or `eol_unassessed` on a service with an `unsupported`
+  `folded`: tentative rows whose reason is `banner_unverified`, or `eol_unassessed` on a service with an open `unsupported`
   finding and not KEV (RM-207), a count per service (RM-205); a closed one counts as closed.
 
   Notes: with only `not_applicable` records and no generated finding the result is None (no view, no counts). In a
