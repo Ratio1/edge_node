@@ -335,6 +335,11 @@ def validate_engagement(row, ids):
       or not _documents_valid(row.get("documents"))
       or not ("supersedes" not in row
               or (valid_engagement_id(row["supersedes"]) and row["supersedes"] != ids[1]))
+      # RM-248: the replacement link, outside the hash like revoke; `revoke_superseded` rides on a replacement.
+      or not ("superseded_by" not in row
+              or (valid_engagement_id(row["superseded_by"]) and row["superseded_by"] != ids[1]))
+      or not ("revoke_superseded" not in row
+              or (type(row["revoke_superseded"]) is bool and "supersedes" in row))
       # Shape only for the context: `EngagementContext` may gain fields; the hash covers the content.
       or not isinstance(row.get("context"), dict)
       or not isinstance(assets, list) or not 1 <= len(assets) <= MAX_ENGAGEMENT_ASSETS

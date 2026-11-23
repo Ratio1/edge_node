@@ -289,6 +289,11 @@ class TestEngagementValidator(unittest.TestCase):
       "revoked without reason": record(active=False, revoked_by="creator", revoked_at="2026-10-02T00:00:00+00:00"),
       "window not canonical": record(valid_from="2026-10-01T00:00:00+00:00"),
       "self supersedes": record(supersedes=ENGAGEMENT),
+      # RM-248: the replacement link and the revoke option.
+      "superseded by itself": record(superseded_by=ENGAGEMENT),
+      "superseded by a non-id": record(superseded_by="bad"),
+      "revoke option without supersedes": record(revoke_superseded=True),
+      "revoke option not a bool": record(supersedes="en_" + "2" * 8 + "-2222-4222-8222-" + "2" * 12, revoke_superseded="yes"),
       "contract ref instead of hash": record(contract_sha256={"ref": "doc-1"}),
       "no contract": record(contract_sha256=None),
       "document ids out of order": record(documents=[document(2, SHA_A)]),

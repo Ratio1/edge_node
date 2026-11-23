@@ -1125,7 +1125,7 @@ class TenantAdministrationService:
       "documents": [{"documentId": document["document_id"], "kind": document["kind"],
                      "title": document["title"], "comment": document["comment"],
                      **self._engagement_document(document)} for document in row["documents"]],
-      "supersedes": row.get("supersedes"), "context": row["context"],
+      "supersedes": row.get("supersedes"), "supersededBy": row.get("superseded_by"), "context": row["context"],
       "assets": assets, "engagementHash": row["engagement_hash"],
       # No registry function anchors an arbitrary hash yet (owner, 2026-09-28): always pending.
       "anchor": {"status": "pending"},
@@ -1278,11 +1278,14 @@ class TenantAdministrationService:
           or existing["created_by"] != account.account_id):
         raise AdministrationDenied(409, "conflict")
       return {**self._engagement_row(existing, tenant), "replayed": True}
-    if supersedes is not None and (supersedes == engagement_id
-                                   or self.store.get("engagement", tenant_id, supersedes) is None):
-      raise AdministrationDenied(400, "supersedes_invalid")
+    if supersedes is not None:
+      if supersedes == engagement_id:
+        raise AdministrationDenied(400, "supersedes_invalid")
+      # RM-248: a direct replacement is refused and linked as a draft one is (Phase 4 refuses it).
+      self._replaceable(tenant_id, supersedes, engagement_id)
     record = self._with_assets(record, self._engagement_assets(request["assets"], {"tenant_id": tenant_id}))
     self.store.put("engagement", tenant_id, engagement_id, record=record)
+    self._finish_replacement(record)
     # `replayed` says whether this call wrote, decided under the lock (the plugin audits on it).
     return {**self._engagement_row(self.store.get("engagement", tenant_id, engagement_id), tenant),
             "replayed": False}
@@ -2561,7 +2564,9 @@ class TenantAdministrationService:
     return self.store.get("engagement_draft", row["engagement_draft_id"])
 
   @_endpoint
-  def create_engagement_draft(self, actor, parent, request_id, display_name):
+  def create_engagement_draft(self, actor, parent, request_id, display_name, supersedes=None):
+    """RM-248: with `supersedes`, an engagement of the parent tenant nobody replaced yet, the draft is
+    its replacement: it starts from the engagement's asset copies and carried documents."""
     account = self._actor(actor, creator=True)
     engagement_draft_id = engagement_drafts.engagement_draft_id_for(_request_id(request_id))
     existing = self.store.get("engagement_draft", engagement_draft_id)
@@ -2574,6 +2579,14 @@ class TenantAdministrationService:
                                         datetime.now(timezone.utc).isoformat())
     except engagement_drafts.EngagementDraftInvalid as exc:
       raise AdministrationDenied(400, exc.code) from None
+    if supersedes not in (None, ""):
+      if not valid_engagement_id(supersedes) or "tenant_id" not in parent:
+        raise AdministrationDenied(400, "supersedes_invalid")
+      row = engagement_drafts.replacing(row, self._replaceable(parent["tenant_id"], supersedes))
+      # The carried references are checked as activation binds them, beside up to two packs.
+      refs = engagement_drafts.carried_refs(row)
+      if len(refs) + 2 > MAX_ENGAGEMENT_DOCUMENTS or not all(valid_doc_ref(ref, labels=True) for ref in refs):
+        raise AdministrationDenied(400, "document_invalid")
     self.store.put("engagement_draft", engagement_draft_id, record=row)
     return self.store.get("engagement_draft", engagement_draft_id)
 
@@ -2596,6 +2609,9 @@ class TenantAdministrationService:
     """Answers the row and the refs whose files the plugin deletes after this write."""
     account = self._actor(actor, creator=True)
     previous = self._unlocked_engagement_draft(engagement_draft_id)
+    # RM-248: carried documents are removed only before the pack is signed (owner ruling).
+    if isinstance(changes, dict) and engagement_drafts.CARRIED in changes and previous["document"]["state"] == "signed":
+      raise AdministrationDenied(409, "already_signed")
     if isinstance(changes, dict) and "assets" in changes:
       changes = {**changes, "assets": self._draft_assets(changes["assets"], previous["parent"], previous["assets"])}
     try:
@@ -2919,8 +2935,45 @@ class TenantAdministrationService:
     """The stored ref inside a `generated` block (what `resolve_engagement_pack` answers for it)."""
     return None if generated is None else {key: generated[key] for key in drafts.DOC_REF_KEYS}
 
+  def _replaceable(self, tenant_id, engagement_id, replacement=None):
+    """RM-248: the stored engagement a replacement names. One already replaced is refused, also when
+    only the replacement row was written (a crash before the link): any row but `replacement` that
+    `supersedes` it counts."""
+    old = self.store.get("engagement", tenant_id, engagement_id)
+    if old is None:
+      raise AdministrationDenied(400, "supersedes_invalid")
+    if old.get("superseded_by") is not None or any(
+        row.get("supersedes") == engagement_id and row["engagement_id"] != replacement
+        for row in self.store.list_engagements(tenant_id)):
+      raise AdministrationDenied(409, "engagement_superseded")
+    return old
+
+  def _finish_replacement(self, new):
+    """RM-248: the steps after the replacement row `new` is written, each skipped once done, so a
+    replayed activation finishes what a crash left. The old engagement gets `superseded_by` and,
+    with `revoke_superseded`, is revoked "Replaced by <new id>" in the same write (a revoke ends a
+    suspend). Answers the old row's read when it carries this replacement's revoke (the plugin audits
+    it): a replay after a crash before the draft delete audits it again, at least once overall."""
+    tenant_id, new_id = new["tenant_id"], new["engagement_id"]
+    old = self.store.get("engagement", tenant_id, new["supersedes"]) if "supersedes" in new else None
+    if old is None or old.get("superseded_by") not in (None, new_id):
+      return None
+    wanted, reason = new.get("revoke_superseded") is True, "Replaced by " + new_id
+    if old.get("superseded_by") == new_id and not (wanted and old["active"]):
+      return self._engagement_row(old) if wanted and old.get("revoke_reason") == reason else None
+    # Read again just before the write: a revoke that landed meanwhile is kept, never written back active.
+    old = self.store.get("engagement", tenant_id, old["engagement_id"])
+    revoke = wanted and old["active"]
+    record = {**old, "superseded_by": new_id}
+    if revoke:
+      record = {**{key: value for key, value in record.items() if key not in SUSPEND_STATE_KEYS},
+                "active": False, "revoked_by": new["created_by"], "revoked_at": datetime.now(timezone.utc).isoformat(),
+                "revoke_reason": reason}
+    self.store.put("engagement", tenant_id, old["engagement_id"], record=record)
+    return self._engagement_row(self.store.get("engagement", tenant_id, old["engagement_id"])) if revoke else None
+
   @_endpoint
-  def activate_engagement_draft(self, actor, engagement_draft_id, documents=None):
+  def activate_engagement_draft(self, actor, engagement_draft_id, documents=None, revoke_superseded=False):
     """One locked step, no marker. `documents` are the draft's packs (`signed`, `generated`) as
     `resolve_engagement_pack` verified them outside this lock, each bound to this draft and the
     pack slot; this method never reads the document store.
@@ -2931,6 +2984,11 @@ class TenantAdministrationService:
     draft's, the draft complete, then the engagement is created from the draft alone with the signed
     pack as its `agreement` document and the generated pack, when there is one, as a second `other`
     document, and the row deleted (the files are the engagement's).
+
+    RM-248: a draft that `supersedes` an engagement also binds its carried documents, after the
+    packs. Crash order: the new row (with `supersedes` and `revoke_superseded`), then the old row
+    (`superseded_by`, revoked when asked), then the draft deleted; the replay finishes the steps
+    still missing, as the stored `revoke_superseded` says. `revoke_superseded` needs `engagements:revoke`.
     """
     account = self._actor(actor, creator=True)
     row = self._engagement_draft(engagement_draft_id)
@@ -2940,9 +2998,13 @@ class TenantAdministrationService:
     engagement_id = engagement_id_for(request_id)
     existing = self.store.get("engagement", tenant_id, engagement_id)
     if existing is not None:
+      revoked = self._finish_replacement(existing)
       self.store.delete("engagement_draft", engagement_draft_id)
       return {"engagementId": engagement_id, "tenantId": tenant_id, "replayed": True,
-              "engagementHash": existing["engagement_hash"], "actor": account.account_id}
+              "engagementHash": existing["engagement_hash"], "actor": account.account_id, "revoked": revoked}
+    supersedes = row.get(engagement_drafts.SUPERSEDES)
+    if type(revoke_superseded) is not bool or (revoke_superseded and supersedes is None):
+      raise AdministrationDenied(400, "invalid_request")
     slot = row["document"]
     stored = {"signed": slot["document"], "generated": self._generated_ref(slot["generated"])}
     resolved = documents if isinstance(documents, dict) else {}
@@ -2953,13 +3015,17 @@ class TenantAdministrationService:
       raise AdministrationDenied(409, "draft_incomplete", missing=completeness["missing"],
                                  reasons=completeness["reasons"])
     tenant, account = self._authorized_tenant(actor, tenant_id, "engagements:create")
+    if revoke_superseded:
+      self._authorized_tenant(actor, tenant_id, "engagements:revoke")
+    if supersedes is not None:
+      self._replaceable(tenant_id, supersedes)
     # RM-133: the draft's pick, checked again now (the contract may have gone since the pick).
     contract_sha256 = self._tenant_contract_sha256(tenant, engagement_drafts.contract_pick(row))
     generated = slot["generated"]
     packs = [{**stored["signed"], "kind": "agreement", "title": "Engagement pack",
               "comment": "" if generated is None else "baseline sha256 " + generated["sha256"]}]
     if generated is not None:
-      packs.append({**stored["generated"], "kind": "other", "title": "Generated engagement pack (unsigned)",
+      packs.append({**stored["generated"], "kind": "other", "title": engagement_drafts.GENERATED_PACK_TITLE,
                     "comment": "snapshot sha256 " + generated["snapshot_sha256"]})
     # Instead of "uploader equals creator": each pack's uploader holds the platform role now, as the
     # tenant documents (`_first_preparation_documents`).
@@ -2971,16 +3037,21 @@ class TenantAdministrationService:
       bound = other.get("documents") if isinstance(other.get("documents"), list) else []
       if any(isinstance(document, dict) and document.get("ref") == stored["signed"]["ref"] for document in bound):
         raise AdministrationDenied(409, "contract_in_use")
+    # RM-248: the carried documents are the old engagement's files, bound as they were.
+    packs += engagement_drafts.carried_refs(row)
     request = self._engagement_request(
       row["display_name"], row["valid_from"], row["valid_until"],
-      row["context"], engagement_drafts.asset_requests(row["assets"]), packs, None, None)
-    record = self._engagement_record(account, tenant_id, request_id, request, contract_sha256, packs, None)
+      row["context"], engagement_drafts.asset_requests(row["assets"]), packs, supersedes, None)
+    record = self._engagement_record(account, tenant_id, request_id, request, contract_sha256, packs, supersedes)
     # The draft's own copies (already validated by `completeness`); the library is not read.
     record = self._with_assets(record, normalize_engagement_assets(row["assets"]))
+    if supersedes is not None:
+      record["revoke_superseded"] = revoke_superseded
     self.store.put("engagement", tenant_id, engagement_id, record=record)
+    revoked = self._finish_replacement(record)
     self.store.delete("engagement_draft", engagement_draft_id)
     return {"engagementId": engagement_id, "tenantId": tenant_id, "replayed": False,
-            "engagementHash": record["engagement_hash"], "actor": account.account_id}
+            "engagementHash": record["engagement_hash"], "actor": account.account_id, "revoked": revoked}
 
   # RM-133 step 2: contract drafts, a tenant's further contracts prepared on the active tenant. A
   # full-portfolio Super-Tenant Admin only, after the tenant check (as `get_tenant_contract`). The

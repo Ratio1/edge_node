@@ -7,11 +7,13 @@ completeness rule and the DTO; no storage I/O (contract: `onboarding-drafts.md` 
 Its id (`ted_<uuid>`) is never a tenant or an engagement id; activation creates engagement
 `en_<uuid>` with the same uuid, which is what makes a replay recognizable.
 """
+import re
+
 from .assets import normalize_name
 from .drafts import ITEM_STATES, _UUID, _nonempty_text, valid_draft_id, valid_generated
 from .engagements import (EngagementInvalid, MAX_ENGAGEMENT_ASSETS, _asset_entry_valid, normalize_context,
                           normalize_engagement_assets, normalize_instant, normalize_window,
-                          valid_doc_ref)
+                          valid_doc_ref, valid_engagement_id)
 from .tenant_contracts import valid_contract_id
 
 # The `create_engagement` argument set, in the order `missing[]` reports them.
@@ -23,6 +25,15 @@ DTO_FIELDS = ("engagement_draft_id", "parent", *FIELDS, "document", "created_by"
 # RM-133: the contract the engagement binds to at activation (`c_<n>`), or None for `c_1`; a row
 # written before the key existed reads as None.
 CONTRACT_PICK = "contract_id"
+# RM-248: a draft that replaces an engagement names it (`supersedes`, set at creation only) and carries
+# its third-party consent and other documents, stored as on the engagement (`ed_<n>` of the old one).
+# A row without the keys reads as no replacement and no carried document.
+SUPERSEDES = "supersedes"
+CARRIED = "carried_documents"
+CARRIED_KINDS = ("third_party_consent", "other")
+# The title activation gives the generated pack; an old engagement's generated pack is not carried.
+GENERATED_PACK_TITLE = "Generated engagement pack (unsigned)"
+_DOCUMENT_ID = re.compile(r"ed_[1-9][0-9]*")
 
 
 
@@ -106,6 +117,32 @@ def contract_pick(row):
   return row.get(CONTRACT_PICK)
 
 
+def carried(row):
+  return row.get(CARRIED, [])
+
+
+def replacing(row, engagement):
+  """RM-248: a new draft `row` made a replacement of the stored `engagement`: its asset copies (the
+  library is not read) and its third-party consent and other documents, without its packs."""
+  return {**row, SUPERSEDES: engagement["engagement_id"], "assets": [dict(entry) for entry in engagement["assets"]],
+          CARRIED: [dict(document) for document in engagement["documents"] if document["kind"] in CARRIED_KINDS
+                    and document["title"] != GENERATED_PACK_TITLE]}
+
+
+def carried_refs(row):
+  """The carried documents as activation binds them: the references without the old `ed_<n>`."""
+  return [{key: value for key, value in document.items() if key != "document_id"} for document in carried(row)]
+
+
+def _kept_documents(held, kept):
+  """RM-248: a carried-documents change only removes: the `ed_<n>` ids to keep, each held once."""
+  ids = [document["document_id"] for document in held]
+  if (not isinstance(kept, list) or not all(isinstance(item, str) for item in kept)
+      or len(set(kept)) != len(kept) or not set(kept) <= set(ids)):
+    raise EngagementDraftInvalid()
+  return [document for document in held if document["document_id"] in kept]
+
+
 def _contract_pick(value):
   """RM-133: `c_<n>` or empty (None, `""`) for `c_1`; the format only, the administration checks
   that the tenant holds it (`contract_unknown`)."""
@@ -124,7 +161,7 @@ def apply_changes(row, changes):
   keeps `generated`), `awaiting_signature` only without a file; `signed` is set by an upload alone
   and `generated` by `store_generated_document` alone.
   """
-  if not isinstance(changes, dict) or any(key not in (*FIELDS, "document", CONTRACT_PICK) for key in changes):
+  if not isinstance(changes, dict) or any(key not in (*FIELDS, "document", CONTRACT_PICK, CARRIED) for key in changes):
     raise EngagementDraftInvalid()
   row = {**row, "document": dict(row["document"])}
   dropped = []
@@ -133,6 +170,8 @@ def apply_changes(row, changes):
       row[field] = _NORMALIZE[field](changes[field])
   if CONTRACT_PICK in changes:
     row[CONTRACT_PICK] = _contract_pick(changes[CONTRACT_PICK])
+  if CARRIED in changes:
+    row[CARRIED] = _kept_documents(carried(row), changes[CARRIED])
   _check_window(row)
   if "document" in changes:
     change = changes["document"]
@@ -195,7 +234,8 @@ def completeness(row):
 
 
 def draft_dto(row):
-  return {**{key: row[key] for key in DTO_FIELDS}, CONTRACT_PICK: contract_pick(row), "completeness": completeness(row)}
+  return {**{key: row[key] for key in DTO_FIELDS}, CONTRACT_PICK: contract_pick(row),
+          SUPERSEDES: row.get(SUPERSEDES), CARRIED: carried(row), "completeness": completeness(row)}
 
 
 def draft_list_row(row):
@@ -223,6 +263,17 @@ def _stored_assets_valid(assets):
           and len({entry["asset_id"] for entry in assets}) == len(assets))
 
 
+def _carried_valid(documents):
+  # As stored on the old engagement; a removal leaves gaps in its `ed_<n>` ids.
+  return (isinstance(documents, list)
+          and all(isinstance(document, dict) and document.get("kind") in CARRIED_KINDS
+                  and isinstance(document.get("document_id"), str) and _DOCUMENT_ID.fullmatch(document["document_id"])
+                  and valid_doc_ref({key: value for key, value in document.items() if key != "document_id"},
+                                    labels=True, stored=True)
+                  for document in documents)
+          and len({document["document_id"] for document in documents}) == len(documents))
+
+
 def validate_engagement_draft(row, ids):
   """Refuse a stored engagement draft the operations could not have written. Unknown fields are kept."""
   slot = row.get("document")
@@ -241,6 +292,8 @@ def validate_engagement_draft(row, ids):
                                             or slot["document"]["mime"] != "application/pdf"))
       or not valid_generated(slot["generated"])
       or not (contract_pick(row) is None or valid_contract_id(contract_pick(row)))
+      or not (row.get(SUPERSEDES) is None or valid_engagement_id(row[SUPERSEDES]))
+      or not _carried_valid(carried(row))
       or not all(_nonempty_text(row.get(key)) for key in ("created_by", "created_at", "updated_by", "updated_at"))):
     raise ValueError("Invalid engagement draft record")
   try:

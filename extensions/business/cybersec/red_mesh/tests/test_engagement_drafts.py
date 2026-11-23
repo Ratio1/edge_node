@@ -834,6 +834,245 @@ class TestTenantDraftCascade(_EngagementDraftCase):
     refused(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id), 404, "not_found")
 
 
+NOTES_PDF = b"%PDF-1.7\n%fixture scope notes\n%%EOF\n"
+
+
+class TestEngagementReplacement(_EngagementDraftCase):
+  """RM-248 phase 3: an engagement is replaced through an engagement draft that `supersedes` it."""
+
+  def setUp(self):
+    super().setUp()
+    _, self.tenant_id = self.active_tenant()
+    refs = [ok(self, self.plugin.upload_engagement_document(
+              self.actor, self.tenant_id, "doc.pdf", base64.b64encode(raw).decode("ascii"), kind, title, comment))["ref"]
+            for raw, kind, title, comment in ((PACK_PDF, "agreement", "Signed", ""),
+                                              (SCHEDULE_PDF, "third_party_consent", "Hosting consent", "ticket 42"),
+                                              (NOTES_PDF, "other", "Scope notes", ""))]
+    self.old_id = ok(self, self.plugin.create_engagement(
+      self.actor, self.tenant_id, str(uuid4()), "Q4 external", COMPLETE["valid_from"], COMPLETE["valid_until"],
+      COMPLETE["context"], [pick(self.asset_in(self.tenant_id))], refs))["engagementId"]
+    self.old = self.repo.get("engagement", self.tenant_id, self.old_id)
+
+  def replacement(self, sign=True):
+    engagement_draft_id = ok(self, self.plugin.create_engagement_draft(
+      self.actor, self.tenant_id, str(uuid4()), "Q4 replaced", supersedes=self.old_id))["engagement_draft_id"]
+    if sign:
+      self.fill(engagement_draft_id)
+      ok(self, self.upload_pack(engagement_draft_id))
+    return engagement_draft_id
+
+  def read(self, engagement_id):
+    return ok(self, self.plugin.get_engagement(self.actor, self.tenant_id, engagement_id))["engagement"]
+
+  def engagement(self, engagement_id):
+    return self.repo.get("engagement", self.tenant_id, engagement_id)
+
+  def active_ids(self):
+    return sorted(row["engagement_id"] for row in self.engagement_rows() if row["active"])
+
+  def test_the_draft_carries_the_asset_copies_and_documents_and_keeps_them_after_an_archive(self):
+    engagement_draft_id = self.replacement(sign=False)
+    draft = ok(self, self.plugin.get_engagement_draft(self.actor, engagement_draft_id))
+    self.assertEqual((draft["supersedes"], draft["assets"]), (self.old_id, self.old["assets"]))
+    self.assertEqual(draft["carried_documents"], self.old["documents"][1:])
+    asset_id = self.asset_in(self.tenant_id)
+    ok(self, self.plugin.update_tenant_asset(self.actor, asset_id, {"display_name": "Renamed"}))
+    ok(self, self.plugin.archive_tenant_asset(self.actor, asset_id, True))
+    # A save that names the held asset keeps the copy; the archived library row is not read.
+    self.fill(engagement_draft_id)
+    ok(self, self.upload_pack(engagement_draft_id))
+    pack = self.stored_child(engagement_draft_id)["document"]["document"]["ref"]
+    ok(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id))
+    new = self.engagement("en_" + engagement_draft_id[4:])
+    self.assertEqual((new["assets"], new["supersedes"]), (self.old["assets"], self.old_id))
+    labels = lambda doc: (doc["kind"], doc["ref"], doc["title"], doc["comment"])
+    self.assertEqual([labels(doc) for doc in new["documents"]],
+                     [("agreement", pack, "Engagement pack", "")] + [labels(doc) for doc in self.old["documents"][1:]])
+    self.assertEqual([doc["document_id"] for doc in new["documents"]], ["ed_1", "ed_2", "ed_3"])
+
+  def test_the_old_generated_pack_is_not_carried(self):
+    # A replacement activated with a generated pack holds that pack beside the carried documents.
+    first = self.replacement(sign=False)
+    self.fill(first)
+    self.generate_pack(first)
+    ok(self, self.upload_pack(first))
+    ok(self, self.plugin.activate_engagement_draft(self.actor, first))
+    first_id = "en_" + first[4:]
+    titles = [doc["title"] for doc in self.engagement(first_id)["documents"]]
+    self.assertIn("Generated engagement pack (unsigned)", titles)
+    draft = ok(self, self.plugin.create_engagement_draft(self.actor, self.tenant_id, str(uuid4()), "Again",
+                                                         supersedes=first_id))
+    self.assertEqual([(doc["kind"], doc["title"]) for doc in draft["carried_documents"]],
+                     [("third_party_consent", "Hosting consent"), ("other", "Scope notes")])
+
+  def test_carried_documents_can_be_removed_before_signing_and_their_files_stay(self):
+    engagement_draft_id = self.replacement(sign=False)
+    draft = ok(self, self.update_child(engagement_draft_id, {"carried_documents": ["ed_3"]}))
+    self.assertEqual([doc["document_id"] for doc in draft["carried_documents"]], ["ed_3"])
+    # Only a removal: an id the draft does not hold, or a duplicate, is refused.
+    for kept in (["ed_2"], ["ed_3", "ed_3"], ["ed_1"], "ed_3"):
+      with self.subTest(kept=kept):
+        refused(self, self.update_child(engagement_draft_id, {"carried_documents": kept}), 400, "invalid_request")
+    self.fill(engagement_draft_id)
+    ok(self, self.upload_pack(engagement_draft_id))
+    # Only before signing: the signed pack covers what the draft held when it was signed.
+    refused(self, self.update_child(engagement_draft_id, {"carried_documents": []}), 409, "already_signed")
+    ok(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id))
+    self.assertEqual([doc["kind"] for doc in self.engagement("en_" + engagement_draft_id[4:])["documents"]],
+                     ["agreement", "other"])
+    self.assertEqual(self.documents.deleted, [])
+
+  def test_a_replacement_whose_documents_would_exceed_the_limit_is_refused_at_create(self):
+    from extensions.business.cybersec.red_mesh.tenancy import administration
+    writes = len(self.store.writes)
+    # Two carried documents and up to two packs do not fit under a limit of three.
+    with patch.object(administration, "MAX_ENGAGEMENT_DOCUMENTS", 3):
+      refused(self, self.plugin.create_engagement_draft(self.actor, self.tenant_id, str(uuid4()), "X",
+                                                        supersedes=self.old_id), 400, "document_invalid")
+    self.assertEqual(len(self.store.writes), writes)
+
+  def test_without_revoke_the_old_engagement_stays_active_and_links_its_replacement(self):
+    engagement_draft_id = self.replacement()
+    new_id = "en_" + engagement_draft_id[4:]
+    self.events.clear()
+    ok(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id))
+    old, new = self.read(self.old_id), self.read(new_id)
+    self.assertEqual((old["active"], old["supersededBy"], old["engagementHash"]),
+                     (True, new_id, self.old["engagement_hash"]))
+    self.assertEqual((new["supersedes"], new["supersededBy"]), (self.old_id, None))
+    self.assertEqual([event for event, _ in self.events], ["engagement_created"])
+
+  def test_with_revoke_the_old_engagement_is_revoked_in_the_same_call_and_audited(self):
+    ok(self, self.plugin.suspend_engagement(self.actor, self.tenant_id, self.old_id, "hold"))
+    engagement_draft_id = self.replacement()
+    new_id = "en_" + engagement_draft_id[4:]
+    refused(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id, revoke_superseded="yes"),
+            400, "invalid_request")
+    self.events.clear()
+    ok(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id, revoke_superseded=True))
+    old = self.read(self.old_id)
+    self.assertEqual((old["active"], old["status"], old["suspended"], old["supersededBy"], old["revokeReason"],
+                      old["revokedBy"]), (False, "revoked", False, new_id, "Replaced by " + new_id, "creator"))
+    self.assertIs(self.engagement(new_id)["revoke_superseded"], True)
+    self.assertEqual([(event, details["engagement_id"], details.get("reason")) for event, details in self.events],
+                     [("engagement_created", new_id, None), ("engagement_revoked", self.old_id, "Replaced by " + new_id)])
+
+  def test_revoke_needs_the_revoke_permission_and_a_draft_that_supersedes(self):
+    from extensions.business.cybersec.red_mesh.tenancy import policy
+    engagement_draft_id = self.replacement()
+    writes = len(self.store.writes)
+    without = policy._ROLE_OPERATIONS["super_tenant_admin"] - {"engagements:revoke"}
+    with patch.dict(policy._ROLE_OPERATIONS, {"super_tenant_admin": without}):
+      refused(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id, revoke_superseded=True),
+              403, "forbidden")
+    self.assertEqual(len(self.store.writes), writes)
+    plain = self.child(self.tenant_id)["engagement_draft_id"]
+    self.fill(plain)
+    ok(self, self.upload_pack(plain))
+    refused(self, self.plugin.activate_engagement_draft(self.actor, plain, revoke_superseded=True), 400, "invalid_request")
+
+  def test_an_activation_interrupted_after_the_new_row_ends_after_replay_with_one_active_engagement(self):
+    engagement_draft_id, second = self.replacement(), self.replacement()
+    new_id = "en_" + engagement_draft_id[4:]
+    real_put = CstoreTenantAdministrationStore.put
+
+    def put(store, kind, *ids, record):
+      if kind == "engagement" and ids[-1] == self.old_id:
+        raise TenantStoreError("crash between the new row and the revoke of the old one")
+      return real_put(store, kind, *ids, record=record)
+    self.events.clear()
+    with patch.object(CstoreTenantAdministrationStore, "put", put):
+      refused(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id, revoke_superseded=True),
+              503, "unavailable")
+    self.assertEqual(self.active_ids(), sorted([self.old_id, new_id]))
+    self.assertIsNotNone(self.stored_child(engagement_draft_id))
+    # The interrupted replacement already counts: another replacement of the old engagement is refused.
+    refused(self, self.plugin.activate_engagement_draft(self.actor, second), 409, "engagement_superseded")
+    # The replay finishes the missing steps, whoever calls and whatever it asks.
+    result = ok(self, self.plugin.activate_engagement_draft({"account_id": "other-sta"}, engagement_draft_id))
+    self.assertEqual(result, {"engagementId": new_id, "replayed": True})
+    self.assertEqual(self.active_ids(), [new_id])
+    self.assertEqual(self.read(self.old_id)["supersededBy"], new_id)
+    self.assertIsNone(self.stored_child(engagement_draft_id))
+    # The replay audits the revoke it wrote but not `engagement_created`: a known gap, kept as it is.
+    self.assertEqual([(event, details["engagement_id"]) for event, details in self.events],
+                     [("engagement_revoked", self.old_id)])
+
+  def test_a_crash_before_the_draft_delete_is_audited_by_the_replay(self):
+    engagement_draft_id = self.replacement()
+    new_id = "en_" + engagement_draft_id[4:]
+    real_delete = CstoreTenantAdministrationStore.delete
+
+    def delete(store, kind, *ids):
+      if kind == "engagement_draft":
+        raise TenantStoreError("crash between the revoke of the old row and the draft delete")
+      return real_delete(store, kind, *ids)
+    self.events.clear()
+    with patch.object(CstoreTenantAdministrationStore, "delete", delete):
+      refused(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id, revoke_superseded=True),
+              503, "unavailable")
+    self.assertEqual((self.read(self.old_id)["active"], self.events), (False, []))
+    ok(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id))
+    self.assertEqual([(event, details["engagement_id"], details.get("reason")) for event, details in self.events],
+                     [("engagement_revoked", self.old_id, "Replaced by " + new_id)])
+
+  def test_a_revoke_that_lands_before_the_link_write_is_kept(self):
+    engagement_draft_id = self.replacement()
+    new_id = "en_" + engagement_draft_id[4:]
+    real_get, real_put = CstoreTenantAdministrationStore.get, CstoreTenantAdministrationStore.put
+    landed = []
+
+    def get(store, kind, *ids):
+      row = real_get(store, kind, *ids)
+      # Once the new row exists, a manual revoke lands right after this read of the old row.
+      if (kind == "engagement" and ids[-1] == self.old_id and not landed
+          and real_get(store, "engagement", self.tenant_id, new_id) is not None):
+        landed.append(True)
+        real_put(store, kind, *ids, record={**row, "active": False, "revoked_by": "creator",
+                                            "revoked_at": "2026-11-23T00:00:00+00:00", "revoke_reason": "manual"})
+      return row
+    with patch.object(CstoreTenantAdministrationStore, "get", get):
+      ok(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id))
+    old = self.read(self.old_id)
+    self.assertEqual((landed, old["active"], old["revokeReason"], old["supersededBy"]), ([True], False, "manual", new_id))
+
+  def test_a_direct_create_with_supersedes_links_and_is_refused_once_replaced(self):
+    replaced = self.replacement()
+    ok(self, self.plugin.activate_engagement_draft(self.actor, replaced))
+    new_id = "en_" + replaced[4:]
+    create = lambda supersedes: self.plugin.create_engagement(
+      self.actor, self.tenant_id, str(uuid4()), "Direct", COMPLETE["valid_from"], COMPLETE["valid_until"],
+      COMPLETE["context"], [pick(self.asset_in(self.tenant_id))], None, supersedes=supersedes)
+    refused(self, create(self.old_id), 409, "engagement_superseded")
+    direct = ok(self, create(new_id))["engagementId"]
+    self.assertEqual((self.read(new_id)["active"], self.read(new_id)["supersededBy"]), (True, direct))
+
+  def test_a_second_replacement_of_the_same_engagement_is_refused(self):
+    first, second = self.replacement(), self.replacement()
+    ok(self, self.plugin.activate_engagement_draft(self.actor, first))
+    writes = len(self.store.writes)
+    refused(self, self.plugin.activate_engagement_draft(self.actor, second), 409, "engagement_superseded")
+    self.assertEqual(len(self.store.writes), writes)
+    refused(self, self.plugin.create_engagement_draft(self.actor, self.tenant_id, str(uuid4()), "Again",
+                                                      supersedes=self.old_id), 409, "engagement_superseded")
+
+  def test_supersedes_names_an_engagement_of_the_parent_tenant(self):
+    draft_parent = self.create()["draft_id"]
+    # A real engagement row under another tenant.
+    from extensions.business.cybersec.red_mesh.tenancy.engagements import engagement_hash
+    request_id = str(uuid4())
+    other_tenant, elsewhere = "tn_" + str(uuid4()), "en_" + request_id
+    row = {**{key: value for key, value in self.old.items() if key not in ("schemaVersion", "namespace", "kind", "ids")},
+           "tenant_id": other_tenant, "engagement_id": elsewhere, "request_id": request_id}
+    self.repo.put("engagement", other_tenant, elsewhere, record={**row, "engagement_hash": engagement_hash(row)})
+    self.assertIsNotNone(self.repo.get("engagement", other_tenant, elsewhere))
+    for parent, supersedes in ((self.tenant_id, "en_" + str(uuid4())), (self.tenant_id, "bad"),
+                               (draft_parent, self.old_id), (self.tenant_id, elsewhere)):
+      with self.subTest(parent=parent, supersedes=supersedes):
+        refused(self, self.plugin.create_engagement_draft(self.actor, parent, str(uuid4()), "X", supersedes=supersedes),
+                400, "supersedes_invalid")
+
+
 class TestEngagementDraftIdsNeverResolve(_EngagementDraftCase):
   def test_an_engagement_draft_id_is_neither_a_tenant_nor_an_engagement_id(self):
     from extensions.business.cybersec.red_mesh.tenancy.administration import AdministrationDenied
