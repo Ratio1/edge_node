@@ -851,22 +851,17 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(plugin.model()["model_key"], PRIVATE_MODEL_KEY)
     self.assertEqual(len([m for m in warnings if "private_model" in m]), 1)
 
-  def test_unknown_prompt_profile_warns_once_and_falls_back(self):
+  def test_unknown_prompt_profile_is_refused_not_replaced_by_the_default(self):
     plugin = _make_api(edgeguard_generation_workers={
       "model-x": {"SEMAPHORE": "edgeguard_llm_private", "PROMPT_PROFILE": "direct-cypher"},
       "model-y": {"SEMAPHORE": "edgeguard_llm_base"},
     })
-    warnings = []
-    plugin.P = lambda message, *args, **kwargs: warnings.append(str(message))
 
-    first = plugin._prompt_profile("model-x")
-    plugin._prompt_profile("model-x")
-    silent = plugin._prompt_profile("model-y")
+    with self.assertRaises(ValueError) as raised:
+      plugin._prompt_profile("model-x")
 
-    self.assertEqual(first["name"], "schema_grounded")
-    self.assertEqual(silent["name"], "schema_grounded")
-    self.assertEqual(len([m for m in warnings if "direct-cypher" in m]), 1)
-    self.assertFalse(any("model-y" in m for m in warnings))
+    self.assertIn("direct-cypher", str(raised.exception))
+    self.assertEqual(plugin._prompt_profile("model-y")["name"], "schema_grounded")  # no profile: the default
 
   def test_generate_rejects_unconfigured_model_key(self):
     plugin = _make_api()
@@ -879,6 +874,23 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["status_code"], 400)
     self.assertEqual(_graph_first_payload(result)["diagnostics"]["code"], "unsupported_model")
     post.assert_not_called()
+
+  def test_single_model_lineup_lists_one_model_and_refuses_removed_keys(self):
+    # EG-039: the playground serves only cypher_2026_11_08; the base Qwen worker stays configured as the
+    # brief worker (EDGEGUARD_EXPLANATION_WORKER) but is not a selectable generation model.
+    plugin = _make_api(
+      edgeguard_generation_workers={"cypher_2026_11_08": {"SEMAPHORE": "edgeguard_llm_cypher_2026_11_08"}},
+      edgeguard_default_model="cypher_2026_11_08",
+      edgeguard_explanation_worker={"SEMAPHORE": "edgeguard_llm_base", "PATH": "/create_chat_completion"},
+    )
+
+    catalog = plugin.models()
+    self.assertEqual([item["model_key"] for item in catalog["models"]], ["cypher_2026_11_08"])
+    self.assertEqual(catalog["default_model_key"], "cypher_2026_11_08")
+    # The brief worker's model is not a generation model: naming it is the same 400 as any unknown key.
+    result = plugin.generate(request="Show indicators", model_key="base_qwen3_4b")
+    self.assertEqual(result["status_code"], 400)
+    self.assertEqual(_graph_first_payload(result)["diagnostics"]["code"], "unsupported_model")
 
   def test_edgeguard_api_owns_generation_endpoint(self):
     self.assertTrue(hasattr(EdgeguardApiPlugin, "generate"))
@@ -2258,7 +2270,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["status"], "ok")
     self.assertTrue(result["explained"])
     self.assertEqual(result["analyst_brief"]["strategy"], "one_call")
-    self.assertEqual(result["analyst_brief"]["configured_max_tokens"], 127)
+    self.assertEqual(result["analyst_brief"]["configured_max_tokens"], 256)
     self.assertEqual(
       result["analyst_brief"]["group_ids"],
       [item["id"] for item in result["result_digest"]["groups"]],
@@ -2318,7 +2330,7 @@ class EdgeGuardApiTests(unittest.TestCase):
       validation={"accepted": True},
       live_retry={},
       request="Explain.",
-      deadline=time.monotonic() + 259,
+      deadline=time.monotonic() + 199,
     )
 
     self.assertEqual(calls, 0)
@@ -2326,6 +2338,26 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["analyst_brief"]["diagnostics"]["reason"], "insufficient_deadline_budget")
     self.assertEqual(result["explanation_trace"]["outcome"]["attempted_calls"], 0)
     self.assertEqual(result["explanation_trace"]["outcome"]["completed_calls"], 0)
+
+  def test_brief_call_waits_for_the_job_budget_left_capped_at_420_seconds(self):
+    # EG-039 phase 4: EGX/2 and EAB/1 calls wait min(420, job budget left); none starts with under 1 s.
+    plugin = _make_api()
+    plugin._graph_first_provider_for_tests = None  # exercise the real HTTP path
+    plugin._explanation_url = lambda path=None: ("http://127.0.0.1:1/chat", None)
+    plugin._explanation_worker_ready = lambda: True
+    for budget, expected in ((900, 420), (300, 300)):
+      with self.subTest(budget=budget):
+        with patch(
+          "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+          side_effect=requests.exceptions.Timeout(),
+        ) as post:
+          with self.assertRaises(GraphFirstRuntimeError) as raised:
+            plugin._brief_provider_call(time.monotonic() + budget)({"messages": []})
+        self.assertEqual(raised.exception.code, "provider_timeout")
+        self.assertAlmostEqual(post.call_args.kwargs["timeout"], expected, delta=2)
+    with self.assertRaises(GraphFirstRuntimeError) as raised:
+      plugin._brief_provider_call(time.monotonic())({"messages": []})
+    self.assertEqual(raised.exception.code, "insufficient_deadline_budget")
 
   def test_api_owned_complete_evidence_dispatches_balanced_map_map_synthesis_to_base_qwen(self):
     from extensions.business.cybersec.edgeguard.graph_first_explanation import resolve_mode
@@ -2530,7 +2562,7 @@ class EdgeGuardApiTests(unittest.TestCase):
       "edgeguard.result_digest_coverage.v2",
     )
     self.assertEqual(contract["strategy"], "one_call")
-    self.assertEqual(contract["max_tokens"], 127)
+    self.assertEqual(contract["max_tokens"], 256)
     self.assertEqual(contract["resolved_mode"]["map_call_cap"], 0)
     self.assertEqual(contract["resolved_mode"]["row_limit"], 25)
     self.assertEqual(result["accepted_cypher"], result["executed_cypher"])
@@ -2614,6 +2646,81 @@ class EdgeGuardApiTests(unittest.TestCase):
     # `empty_reason` too, not just `/neo4j_query`. SOURCED_FROM is a
     # populated-surface relationship type, so this is a legitimate no-match.
     self.assertEqual(result["validation"]["empty_reason"], "no_match")
+
+  def test_explain_graph_empty_result_under_insight_brief_is_a_deterministic_brief(self):
+    # EG-039 I-211: a 0-row answer is a brief ("returned no rows"), not `no_graph_evidence`.
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    fake_driver, _fake_session = _driver_with_results(_Result([], keys=["p"]))
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher="MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 10",
+        )
+
+    self.assertEqual(result["status"], "ok")
+    self.assertNotIn("analyst_brief", result)
+    self.assertEqual(result["case_explanation"]["provenance"]["mode"], "deterministic_no_pattern")
+    self.assertIn("returned no rows", result["case_explanation"]["assessment"]["text"])
+    self.assertEqual(result["explanation_trace"]["outcome"]["safe_code"], "empty_result")
+
+  def test_ranked_result_dispatches_to_eab_unless_it_is_empty_or_truncated(self):
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    from extensions.business.cybersec.edgeguard.edgeguard_api import RESULT_SHAPE_RANKED_PROJECTION as ranked
+    self.assertEqual(plugin._explanation_dispatch_strategy(ranked, 10), "one_call")
+    self.assertEqual(plugin._explanation_dispatch_strategy(ranked, 0), "insight_brief")
+    self.assertEqual(plugin._explanation_dispatch_strategy(ranked, 10, True), "insight_brief")
+
+  def test_ranked_result_with_more_than_three_identifiers_stays_on_egx2(self):
+    # EG-039 phase 7: EAB/1 rejects a brief naming >3 identifiers (`ioc_enumeration`).
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    from extensions.business.cybersec.edgeguard.edgeguard_api import RESULT_SHAPE_RANKED_PROJECTION as ranked
+
+    def evidence(*values):
+      return {"rows": [{"values": [{"type": "string", "value": v}]} for v in values]}
+
+    ids4 = evidence("T1059", "T1003", "T1566", "T1190")
+    ids3 = evidence("T1059", "t1059", "T1003", "T1566")  # 3 distinct, case-folded
+    names = evidence("APT28", "Lazarus Group", "Emotet", "Finance", "Energy")
+    escaped = evidence("\nT1059", "\tT1003", "\nT1566", "\nT1190")  # JSON escaping must not hide them
+    self.assertEqual(plugin._explanation_dispatch_strategy(ranked, 4, False, ids4), "insight_brief")
+    self.assertEqual(plugin._explanation_dispatch_strategy(ranked, 4, False, escaped), "insight_brief")
+    self.assertEqual(plugin._explanation_dispatch_strategy(ranked, 4, False, ids3), "one_call")
+    self.assertEqual(plugin._explanation_dispatch_strategy(ranked, 5, False, names), "one_call")
+
+  def test_complete_id_ranking_gets_the_deterministic_brief_with_no_model_call(self):
+    payloads = []
+
+    def provider(payload):
+      payloads.append(payload)
+      return {"content": json.dumps({"text": "x"}), "finish_reason": "stop", "completion_tokens": 1}
+
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief", graph_first_provider=provider)
+    rows = [
+      _DriverRecord({"cve_id": f"CVE-2024-000{k}", "cvss_v31": 9.0 - k}, {"cve_id": f"CVE-2024-000{k}", "cvss_v31": 9.0 - k})
+      for k in range(1, 5)
+    ]
+    fake_driver, _session = _driver_with_results(_Result(rows, keys=["cve_id", "cvss_v31"]))
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687", scheme="bolt+s", username="neo4j", password="secret",
+          request="Which CVEs rank highest by CVSS?", explanation_rows=10,
+          cypher=(
+            "MATCH (c:CVE)-[:HAS_CVSS_v31]->(s:CVSSv31) WITH c, s ORDER BY s.base_score DESC "
+            "RETURN c.cve_id AS cve_id, s.base_score AS cvss_v31 LIMIT 5"
+          ),
+        )
+    self.assertEqual(payloads, [])
+    self.assertNotIn("analyst_brief", result)
+    self.assertEqual(result["explanation_trace"]["outcome"]["safe_code"], "tabular_result")
+    text = result["case_explanation"]["assessment"]["text"]
+    self.assertIn("tabular/scalar", text)
+    self.assertNotIn("Based on", text)
 
   def test_explain_graph_topology_surface_empty_result_carries_the_contract_reason(self):
     """Contract §6's own acceptance query, through `/explain_graph`: `Mission`
@@ -2712,6 +2819,114 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["case_explanation"]["provenance"]["mode"], "deterministic_fallback")
     self.assertIn("tabular/scalar", result["case_explanation"]["assessment"]["text"])
     self.assertEqual(fake_session.run.call_count, 1)
+
+  def _ranked_truncated(self, text, log=None, explanation_rows=1):
+    # Two ranked rows with a 1-row cap: the transport ROW cap is hit.
+    payloads = []
+
+    def provider(payload):
+      payloads.append(payload)
+      return {"content": json.dumps({"text": text}), "finish_reason": "stop", "completion_tokens": 20}
+
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief", graph_first_provider=provider)
+    if log is not None:
+      plugin.P = lambda message, *args, **kwargs: log.append(str(message))
+    fake_driver, _session = _driver_with_results(_Result(
+      [
+        _DriverRecord({"cve_id": "CVE-2024-0001", "cvss_v31": 9.8}, {"cve_id": "CVE-2024-0001", "cvss_v31": 9.8}),
+        _DriverRecord({"cve_id": "CVE-2024-0002", "cvss_v31": 7.5}, {"cve_id": "CVE-2024-0002", "cvss_v31": 7.5}),
+      ],
+      keys=["cve_id", "cvss_v31"],
+    ))
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687", scheme="bolt+s", username="neo4j", password="secret",
+          request="Which CVE ranks highest by CVSS?", explanation_rows=explanation_rows,
+          cypher=(
+            "MATCH (c:CVE)-[:HAS_CVSS_v31]->(s:CVSSv31) WITH c, s ORDER BY s.base_score DESC "
+            "RETURN c.cve_id AS cve_id, s.base_score AS cvss_v31 LIMIT 5"
+          ),
+        )
+    return result, payloads
+
+  def test_truncated_ranked_result_gets_the_deterministic_sample_brief_with_no_model_call(self):
+    # EG-039 I-211: no model call, so no invented total ("Of the 120 CVEs ...") can be written.
+    result, payloads = self._ranked_truncated("Of the 120 CVEs, CVE-2024-0001 ranks highest.")
+    self.assertEqual(result["validation"]["result_shape"], "ranked_projection")
+    self.assertEqual(payloads, [])
+    self.assertNotIn("analyst_brief", result)
+    self.assertFalse(result["explained"])
+    case = result["case_explanation"]
+    self.assertEqual(case["provenance"]["mode"], "deterministic_fallback")
+    self.assertTrue(case["assessment"]["text"].endswith(" Based on the first 1 rows; the full result has more."))
+    outcome = result["explanation_trace"]["outcome"]
+    self.assertEqual(outcome["safe_code"], "tabular_result")
+    self.assertEqual(outcome["attempted_calls"], 0)
+
+  def test_complete_ranked_result_still_calls_the_model_and_logs_a_grounding_rule(self):
+    log = []
+    result, payloads = self._ranked_truncated("CVE-2099-9999 ranks highest.", log, explanation_rows=10)
+    self.assertEqual(len(payloads), 1)
+    self.assertEqual(result["analyst_brief"]["diagnostics"]["reason"], "brief_grounding_failed")
+    failure = [line for line in log if line.startswith("EDGEGUARD_ANALYST_BRIEF_FAILURE")]
+    self.assertEqual(
+      json.loads(failure[0].split(" ", 1)[1]),
+      {"reason": "brief_grounding_failed", "rule": "unknown_identifier"},
+    )
+
+  def test_explain_graph_ranked_zero_row_result_is_a_deterministic_brief(self):
+    # EG-039 I-211: the shape behind sector-02/05/08 (ranked, 0 rows), not `no_graph_evidence`.
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    fake_driver, _session = _driver_with_results(_Result([], keys=["cve_id", "cvss_v31"]))
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687", scheme="bolt+s", username="neo4j", password="secret",
+          request="Which CVE ranks highest by CVSS?",
+          cypher=(
+            "MATCH (c:CVE)-[:HAS_CVSS_v31]->(s:CVSSv31) WITH c, s ORDER BY s.base_score DESC "
+            "RETURN c.cve_id AS cve_id, s.base_score AS cvss_v31 LIMIT 5"
+          ),
+        )
+    self.assertEqual(result["validation"]["result_shape"], "ranked_projection")
+    self.assertNotIn("analyst_brief", result)
+    self.assertEqual(result["explanation_trace"]["outcome"]["safe_code"], "empty_result")
+    self.assertIn("returned no rows", result["case_explanation"]["assessment"]["text"])
+
+  def test_graph_cap_only_truncation_gets_the_graph_partial_sentence(self):
+    # `packet.execution.truncated` is also set by the graph node/relationship cap, which
+    # leaves the row result complete: the row sentence never applies, the graph one does.
+    captured = []
+
+    def provider(payload):
+      captured.append(payload)
+      return {"content": "{", "finish_reason": "length", "completion_tokens": 768}
+
+    from extensions.business.cybersec.edgeguard import edgeguard_api as api_module
+    real_build = api_module._build_graph_evidence_packet
+
+    def build_with_graph_cap(**kwargs):
+      packet, meta = real_build(**kwargs)
+      packet["execution"]["truncated"] = True
+      packet["graph"]["truncated"] = True
+      return packet, meta
+
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief", graph_first_provider=provider)
+    fake_driver, _session = _driver_with_results(_Result([_graph_path_record()], keys=["p"]))
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(api_module, "_build_graph_evidence_packet", side_effect=build_with_graph_cap):
+        with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+          result = plugin.explain_graph(
+            uri="example.com:7687", scheme="bolt+s", username="neo4j", password="secret",
+            request="Explain.", cypher="MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 10",
+          )
+    self.assertEqual(result.get("status"), "ok", str(result)[:600])
+    self.assertTrue(result["packet"]["execution"]["truncated"])
+    text = result["case_explanation"]["assessment"]["text"]
+    self.assertTrue(text.endswith(" Based on part of the graph; the full result has more."), text)
+    self.assertNotIn("Based on the first", text)
+    self.assertTrue(all("SAMPLE NOTICE" not in c["messages"][1]["content"] for c in captured))
 
   def test_explain_graph_ranked_projection_calls_the_model_under_insight_brief(self):
     # Contract §4.2-§4.4: a `ranked_projection` result has no graph nodes
@@ -6499,6 +6714,76 @@ class EdgeGuardExplainJobTests(unittest.TestCase):
     text = "\n".join(logged)
     self.assertIn("Traceback", text)
     self.assertNotIn("cfg-secret-pw", text)
+
+  def _run_gated_brief_job(self, plugin, block, before_brief=None):
+    """Run a real explain job whose brief step waits on a gate; returns the
+    status seen before the MISP step, the status seen during the brief, and
+    the finished status."""
+    in_brief = threading.Event()
+    gate = threading.Event()
+    seen_before_misp = []
+    final_result = {"status": "ok", "ok": True, "explained": True, "marker": "final"}
+
+    def gated_brief(**_kwargs):
+      in_brief.set()
+      assert gate.wait(10)
+      return final_result
+
+    original = plugin._set_explain_job_phase
+
+    def record(job_id, phase, detail):
+      if phase == "misp":
+        seen_before_misp.append(plugin.explain_graph_status(job_id=job_id))
+      return original(job_id, phase, detail)
+
+    plugin._set_explain_job_phase = record
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      fake_driver, _ = _driver_with_results(_Result([_graph_path_record()], keys=["p"]))
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver), \
+          patch.object(plugin, "_misp_enrichment_for_response", return_value=block), \
+          patch.object(plugin, "_explanation_dispatch_strategy", return_value="insight_brief"), \
+          patch.object(plugin, "_run_insight_brief", side_effect=gated_brief):
+        job_id = plugin.explain_graph_start(**self._body())["job_id"]
+        self.assertTrue(in_brief.wait(10))
+        during = plugin.explain_graph_status(job_id=job_id)
+        gate.set()
+        final = self._wait_done(plugin, job_id)
+    return seen_before_misp[0], during, final, final_result
+
+  def test_partial_appears_after_misp_with_the_bounded_block_and_final_is_unchanged(self):
+    from .test_misp_enrichment import _valid_block
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    block = _valid_block()
+    before, during, final, final_result = self._run_gated_brief_job(plugin, block)
+    self.assertNotIn("partial", before)
+    self.assertFalse(during["done"])
+    self.assertEqual(set(during["partial"]), {"packet", "result_digest", "misp_enrichment"})
+    self.assertEqual(during["partial"]["misp_enrichment"], block)
+    self.assertTrue(during["partial"]["packet"]["graph"]["nodes"])
+    self.assertIn("schema_version", during["partial"]["result_digest"])
+    self.assertNotIn("partial", final)
+    self.assertEqual(final["result"], final_result)
+
+  def test_partial_drops_a_misp_block_the_model_admission_rejects(self):
+    from .test_misp_enrichment import _valid_block
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.misp_enrichment.contains_raw_misp_payload",
+      side_effect=lambda block, *_args: block is not None,
+    ):
+      _before, during, _final, _result = self._run_gated_brief_job(plugin, _valid_block())
+    self.assertEqual(set(during["partial"]), {"packet", "result_digest"})
+    self.assertEqual(plugin._misp_enrichment_error_count, 0)  # the brief step counts it, not the partial
+
+  def test_partial_drops_a_misp_block_over_the_response_size_bound(self):
+    from .test_misp_enrichment import _valid_block
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    _before, small, _final, _result = self._run_gated_brief_job(plugin, _valid_block())
+    _before, big, _final, _result = self._run_gated_brief_job(
+      _make_api(edgeguard_explanation_strategy="insight_brief"), _valid_block(50, padded=True),
+    )
+    self.assertIn("misp_enrichment", small["partial"])
+    self.assertEqual(set(big["partial"]), {"packet", "result_digest"})
 
   def test_one_call_path_reports_brief_attempt_one_then_done(self):
     plugin = _make_api(edgeguard_explanation_strategy="one_call")

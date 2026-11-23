@@ -1,0 +1,73 @@
+{
+ "pack_id": "test.cyfun-like.v1",
+ "catalogue": "Synthetic two-axis pack with its own levels and thresholds (test fixture)",
+ "scoring": "maturity_two_axis.v1",
+ "language": "en",
+ "levels": [
+  "base",
+  "extended"
+ ],
+ "thresholds": {
+  "base": {
+   "key_measure_min": 2.0,
+   "category_min": null,
+   "total_min": 2.0,
+   "excluded_value": 2.0,
+   "max_excluded": 2
+  },
+  "extended": {
+   "key_measure_min": 2.5,
+   "category_min": 2.5,
+   "total_min": 3.0,
+   "excluded_value": 2.5,
+   "max_excluded": 1
+  }
+ },
+ "controls": [
+  {
+   "ref_id": "TC.A-01.1",
+   "category": "TC.A",
+   "subcategory": "TC.A-01",
+   "entry_level": "base",
+   "key_measure": true,
+   "management_aspect": false,
+   "order": 1
+  },
+  {
+   "ref_id": "TC.A-01.2",
+   "category": "TC.A",
+   "subcategory": "TC.A-01",
+   "entry_level": "base",
+   "key_measure": false,
+   "management_aspect": false,
+   "order": 2
+  },
+  {
+   "ref_id": "TC.B-01.1",
+   "category": "TC.B",
+   "subcategory": "TC.B-01",
+   "entry_level": "base",
+   "key_measure": true,
+   "management_aspect": false,
+   "order": 3
+  },
+  {
+   "ref_id": "TC.B-02.1",
+   "category": "TC.B",
+   "subcategory": "TC.B-02",
+   "entry_level": "extended",
+   "key_measure": true,
+   "management_aspect": false,
+   "order": 4
+  },
+  {
+   "ref_id": "TC.B-02.2",
+   "category": "TC.B",
+   "subcategory": "TC.B-02",
+   "entry_level": "extended",
+   "key_measure": false,
+   "management_aspect": false,
+   "order": 5
+  }
+ ]
+}

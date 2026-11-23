@@ -1,0 +1,684 @@
+{
+  "source": "https://raw.githubusercontent.com/usnistgov/oscal-content/5006f18c8047643eaa70e35dd0d20a58bcc41856/nist.gov/CSF/v2.0/json/NIST_CSF_v2.0_catalog.json",
+  "version": "CSF 2.0",
+  "last_refreshed": "2026-11-16",
+  "pack_id": "us.nist.csf-2.0",
+  "language": "en",
+  "provenance": {
+    "generated_by": "project-red-mesh:workbooks/redmesh-framework-pack/scripts/build_framework_pack.py",
+    "generated_on": "2026-11-16",
+    "sources": {
+      "core": {
+        "file": "NIST_CSF_v2.0_catalog.json",
+        "sha256": "0ac12904a4bcd877ec91be8e7ddc27278c88b0088c7db77d60ee24918e2563e2",
+        "pinned": true
+      }
+    },
+    "parser": "csf-oscal.v1",
+    "source_commit": "5006f18c8047643eaa70e35dd0d20a58bcc41856",
+    "content_version": "1.2.1",
+    "source_retrieved_on": "2026-11-16",
+    "attribution": "Courtesy of the National Institute of Standards and Technology (NIST), The NIST Cybersecurity Framework (CSF) 2.0, https://doi.org/10.6028/NIST.CSWP.29. Extracted and reformatted from the official OSCAL Core. NIST public-domain text; OSCAL repository CC0. No NIST endorsement implied.",
+    "licence": "Public domain NIST text; OSCAL repository CC0-1.0",
+    "transformation": "Active Core only; withdrawn parents/children omitted; full outcome/example prose and source order retained; no informative references.",
+    "tier_source": "https://doi.org/10.6028/NIST.CSWP.29, final Appendix B (pages 24–25)"
+  },
+  "catalogue": "NIST Cybersecurity Framework 2.0",
+  "scoring": "csf_profile.v1",
+  "levels": [],
+  "acts": [
+    "NIST CSWP 29, February 2024"
+  ],
+  "counts": {
+    "controls": 106,
+    "functions": 6,
+    "categories": 22,
+    "implementation_examples": 363,
+    "by_function": {
+      "GV": 31,
+      "ID": 21,
+      "PR": 22,
+      "DE": 11,
+      "RS": 13,
+      "RC": 8
+    }
+  },
+  "controls": [
+    {
+      "ref_id": "GV.OC-01",
+      "order": 1,
+      "category": "GV",
+      "subcategory": "GV.OC"
+    },
+    {
+      "ref_id": "GV.OC-02",
+      "order": 2,
+      "category": "GV",
+      "subcategory": "GV.OC"
+    },
+    {
+      "ref_id": "GV.OC-03",
+      "order": 3,
+      "category": "GV",
+      "subcategory": "GV.OC"
+    },
+    {
+      "ref_id": "GV.OC-04",
+      "order": 4,
+      "category": "GV",
+      "subcategory": "GV.OC"
+    },
+    {
+      "ref_id": "GV.OC-05",
+      "order": 5,
+      "category": "GV",
+      "subcategory": "GV.OC"
+    },
+    {
+      "ref_id": "GV.OV-01",
+      "order": 6,
+      "category": "GV",
+      "subcategory": "GV.OV"
+    },
+    {
+      "ref_id": "GV.OV-02",
+      "order": 7,
+      "category": "GV",
+      "subcategory": "GV.OV"
+    },
+    {
+      "ref_id": "GV.OV-03",
+      "order": 8,
+      "category": "GV",
+      "subcategory": "GV.OV"
+    },
+    {
+      "ref_id": "GV.PO-01",
+      "order": 9,
+      "category": "GV",
+      "subcategory": "GV.PO"
+    },
+    {
+      "ref_id": "GV.PO-02",
+      "order": 10,
+      "category": "GV",
+      "subcategory": "GV.PO"
+    },
+    {
+      "ref_id": "GV.RM-01",
+      "order": 11,
+      "category": "GV",
+      "subcategory": "GV.RM"
+    },
+    {
+      "ref_id": "GV.RM-02",
+      "order": 12,
+      "category": "GV",
+      "subcategory": "GV.RM"
+    },
+    {
+      "ref_id": "GV.RM-03",
+      "order": 13,
+      "category": "GV",
+      "subcategory": "GV.RM"
+    },
+    {
+      "ref_id": "GV.RM-04",
+      "order": 14,
+      "category": "GV",
+      "subcategory": "GV.RM"
+    },
+    {
+      "ref_id": "GV.RM-05",
+      "order": 15,
+      "category": "GV",
+      "subcategory": "GV.RM"
+    },
+    {
+      "ref_id": "GV.RM-06",
+      "order": 16,
+      "category": "GV",
+      "subcategory": "GV.RM"
+    },
+    {
+      "ref_id": "GV.RM-07",
+      "order": 17,
+      "category": "GV",
+      "subcategory": "GV.RM"
+    },
+    {
+      "ref_id": "GV.RR-01",
+      "order": 18,
+      "category": "GV",
+      "subcategory": "GV.RR"
+    },
+    {
+      "ref_id": "GV.RR-02",
+      "order": 19,
+      "category": "GV",
+      "subcategory": "GV.RR"
+    },
+    {
+      "ref_id": "GV.RR-03",
+      "order": 20,
+      "category": "GV",
+      "subcategory": "GV.RR"
+    },
+    {
+      "ref_id": "GV.RR-04",
+      "order": 21,
+      "category": "GV",
+      "subcategory": "GV.RR"
+    },
+    {
+      "ref_id": "GV.SC-01",
+      "order": 22,
+      "category": "GV",
+      "subcategory": "GV.SC"
+    },
+    {
+      "ref_id": "GV.SC-02",
+      "order": 23,
+      "category": "GV",
+      "subcategory": "GV.SC"
+    },
+    {
+      "ref_id": "GV.SC-03",
+      "order": 24,
+      "category": "GV",
+      "subcategory": "GV.SC"
+    },
+    {
+      "ref_id": "GV.SC-04",
+      "order": 25,
+      "category": "GV",
+      "subcategory": "GV.SC"
+    },
+    {
+      "ref_id": "GV.SC-05",
+      "order": 26,
+      "category": "GV",
+      "subcategory": "GV.SC"
+    },
+    {
+      "ref_id": "GV.SC-06",
+      "order": 27,
+      "category": "GV",
+      "subcategory": "GV.SC"
+    },
+    {
+      "ref_id": "GV.SC-07",
+      "order": 28,
+      "category": "GV",
+      "subcategory": "GV.SC"
+    },
+    {
+      "ref_id": "GV.SC-08",
+      "order": 29,
+      "category": "GV",
+      "subcategory": "GV.SC"
+    },
+    {
+      "ref_id": "GV.SC-09",
+      "order": 30,
+      "category": "GV",
+      "subcategory": "GV.SC"
+    },
+    {
+      "ref_id": "GV.SC-10",
+      "order": 31,
+      "category": "GV",
+      "subcategory": "GV.SC"
+    },
+    {
+      "ref_id": "ID.AM-01",
+      "order": 32,
+      "category": "ID",
+      "subcategory": "ID.AM"
+    },
+    {
+      "ref_id": "ID.AM-02",
+      "order": 33,
+      "category": "ID",
+      "subcategory": "ID.AM"
+    },
+    {
+      "ref_id": "ID.AM-03",
+      "order": 34,
+      "category": "ID",
+      "subcategory": "ID.AM"
+    },
+    {
+      "ref_id": "ID.AM-04",
+      "order": 35,
+      "category": "ID",
+      "subcategory": "ID.AM"
+    },
+    {
+      "ref_id": "ID.AM-05",
+      "order": 36,
+      "category": "ID",
+      "subcategory": "ID.AM"
+    },
+    {
+      "ref_id": "ID.AM-07",
+      "order": 37,
+      "category": "ID",
+      "subcategory": "ID.AM"
+    },
+    {
+      "ref_id": "ID.AM-08",
+      "order": 38,
+      "category": "ID",
+      "subcategory": "ID.AM"
+    },
+    {
+      "ref_id": "ID.IM-01",
+      "order": 39,
+      "category": "ID",
+      "subcategory": "ID.IM"
+    },
+    {
+      "ref_id": "ID.IM-02",
+      "order": 40,
+      "category": "ID",
+      "subcategory": "ID.IM"
+    },
+    {
+      "ref_id": "ID.IM-03",
+      "order": 41,
+      "category": "ID",
+      "subcategory": "ID.IM"
+    },
+    {
+      "ref_id": "ID.IM-04",
+      "order": 42,
+      "category": "ID",
+      "subcategory": "ID.IM"
+    },
+    {
+      "ref_id": "ID.RA-01",
+      "order": 43,
+      "category": "ID",
+      "subcategory": "ID.RA"
+    },
+    {
+      "ref_id": "ID.RA-02",
+      "order": 44,
+      "category": "ID",
+      "subcategory": "ID.RA"
+    },
+    {
+      "ref_id": "ID.RA-03",
+      "order": 45,
+      "category": "ID",
+      "subcategory": "ID.RA"
+    },
+    {
+      "ref_id": "ID.RA-04",
+      "order": 46,
+      "category": "ID",
+      "subcategory": "ID.RA"
+    },
+    {
+      "ref_id": "ID.RA-05",
+      "order": 47,
+      "category": "ID",
+      "subcategory": "ID.RA"
+    },
+    {
+      "ref_id": "ID.RA-06",
+      "order": 48,
+      "category": "ID",
+      "subcategory": "ID.RA"
+    },
+    {
+      "ref_id": "ID.RA-07",
+      "order": 49,
+      "category": "ID",
+      "subcategory": "ID.RA"
+    },
+    {
+      "ref_id": "ID.RA-08",
+      "order": 50,
+      "category": "ID",
+      "subcategory": "ID.RA"
+    },
+    {
+      "ref_id": "ID.RA-09",
+      "order": 51,
+      "category": "ID",
+      "subcategory": "ID.RA"
+    },
+    {
+      "ref_id": "ID.RA-10",
+      "order": 52,
+      "category": "ID",
+      "subcategory": "ID.RA"
+    },
+    {
+      "ref_id": "PR.AA-01",
+      "order": 53,
+      "category": "PR",
+      "subcategory": "PR.AA"
+    },
+    {
+      "ref_id": "PR.AA-02",
+      "order": 54,
+      "category": "PR",
+      "subcategory": "PR.AA"
+    },
+    {
+      "ref_id": "PR.AA-03",
+      "order": 55,
+      "category": "PR",
+      "subcategory": "PR.AA"
+    },
+    {
+      "ref_id": "PR.AA-04",
+      "order": 56,
+      "category": "PR",
+      "subcategory": "PR.AA"
+    },
+    {
+      "ref_id": "PR.AA-05",
+      "order": 57,
+      "category": "PR",
+      "subcategory": "PR.AA"
+    },
+    {
+      "ref_id": "PR.AA-06",
+      "order": 58,
+      "category": "PR",
+      "subcategory": "PR.AA"
+    },
+    {
+      "ref_id": "PR.AT-01",
+      "order": 59,
+      "category": "PR",
+      "subcategory": "PR.AT"
+    },
+    {
+      "ref_id": "PR.AT-02",
+      "order": 60,
+      "category": "PR",
+      "subcategory": "PR.AT"
+    },
+    {
+      "ref_id": "PR.DS-01",
+      "order": 61,
+      "category": "PR",
+      "subcategory": "PR.DS"
+    },
+    {
+      "ref_id": "PR.DS-02",
+      "order": 62,
+      "category": "PR",
+      "subcategory": "PR.DS"
+    },
+    {
+      "ref_id": "PR.DS-10",
+      "order": 63,
+      "category": "PR",
+      "subcategory": "PR.DS"
+    },
+    {
+      "ref_id": "PR.DS-11",
+      "order": 64,
+      "category": "PR",
+      "subcategory": "PR.DS"
+    },
+    {
+      "ref_id": "PR.IR-01",
+      "order": 65,
+      "category": "PR",
+      "subcategory": "PR.IR"
+    },
+    {
+      "ref_id": "PR.IR-02",
+      "order": 66,
+      "category": "PR",
+      "subcategory": "PR.IR"
+    },
+    {
+      "ref_id": "PR.IR-03",
+      "order": 67,
+      "category": "PR",
+      "subcategory": "PR.IR"
+    },
+    {
+      "ref_id": "PR.IR-04",
+      "order": 68,
+      "category": "PR",
+      "subcategory": "PR.IR"
+    },
+    {
+      "ref_id": "PR.PS-01",
+      "order": 69,
+      "category": "PR",
+      "subcategory": "PR.PS"
+    },
+    {
+      "ref_id": "PR.PS-02",
+      "order": 70,
+      "category": "PR",
+      "subcategory": "PR.PS"
+    },
+    {
+      "ref_id": "PR.PS-03",
+      "order": 71,
+      "category": "PR",
+      "subcategory": "PR.PS"
+    },
+    {
+      "ref_id": "PR.PS-04",
+      "order": 72,
+      "category": "PR",
+      "subcategory": "PR.PS"
+    },
+    {
+      "ref_id": "PR.PS-05",
+      "order": 73,
+      "category": "PR",
+      "subcategory": "PR.PS"
+    },
+    {
+      "ref_id": "PR.PS-06",
+      "order": 74,
+      "category": "PR",
+      "subcategory": "PR.PS"
+    },
+    {
+      "ref_id": "DE.AE-02",
+      "order": 75,
+      "category": "DE",
+      "subcategory": "DE.AE"
+    },
+    {
+      "ref_id": "DE.AE-03",
+      "order": 76,
+      "category": "DE",
+      "subcategory": "DE.AE"
+    },
+    {
+      "ref_id": "DE.AE-04",
+      "order": 77,
+      "category": "DE",
+      "subcategory": "DE.AE"
+    },
+    {
+      "ref_id": "DE.AE-06",
+      "order": 78,
+      "category": "DE",
+      "subcategory": "DE.AE"
+    },
+    {
+      "ref_id": "DE.AE-07",
+      "order": 79,
+      "category": "DE",
+      "subcategory": "DE.AE"
+    },
+    {
+      "ref_id": "DE.AE-08",
+      "order": 80,
+      "category": "DE",
+      "subcategory": "DE.AE"
+    },
+    {
+      "ref_id": "DE.CM-01",
+      "order": 81,
+      "category": "DE",
+      "subcategory": "DE.CM"
+    },
+    {
+      "ref_id": "DE.CM-02",
+      "order": 82,
+      "category": "DE",
+      "subcategory": "DE.CM"
+    },
+    {
+      "ref_id": "DE.CM-03",
+      "order": 83,
+      "category": "DE",
+      "subcategory": "DE.CM"
+    },
+    {
+      "ref_id": "DE.CM-06",
+      "order": 84,
+      "category": "DE",
+      "subcategory": "DE.CM"
+    },
+    {
+      "ref_id": "DE.CM-09",
+      "order": 85,
+      "category": "DE",
+      "subcategory": "DE.CM"
+    },
+    {
+      "ref_id": "RS.AN-03",
+      "order": 86,
+      "category": "RS",
+      "subcategory": "RS.AN"
+    },
+    {
+      "ref_id": "RS.AN-06",
+      "order": 87,
+      "category": "RS",
+      "subcategory": "RS.AN"
+    },
+    {
+      "ref_id": "RS.AN-07",
+      "order": 88,
+      "category": "RS",
+      "subcategory": "RS.AN"
+    },
+    {
+      "ref_id": "RS.AN-08",
+      "order": 89,
+      "category": "RS",
+      "subcategory": "RS.AN"
+    },
+    {
+      "ref_id": "RS.CO-02",
+      "order": 90,
+      "category": "RS",
+      "subcategory": "RS.CO"
+    },
+    {
+      "ref_id": "RS.CO-03",
+      "order": 91,
+      "category": "RS",
+      "subcategory": "RS.CO"
+    },
+    {
+      "ref_id": "RS.MA-01",
+      "order": 92,
+      "category": "RS",
+      "subcategory": "RS.MA"
+    },
+    {
+      "ref_id": "RS.MA-02",
+      "order": 93,
+      "category": "RS",
+      "subcategory": "RS.MA"
+    },
+    {
+      "ref_id": "RS.MA-03",
+      "order": 94,
+      "category": "RS",
+      "subcategory": "RS.MA"
+    },
+    {
+      "ref_id": "RS.MA-04",
+      "order": 95,
+      "category": "RS",
+      "subcategory": "RS.MA"
+    },
+    {
+      "ref_id": "RS.MA-05",
+      "order": 96,
+      "category": "RS",
+      "subcategory": "RS.MA"
+    },
+    {
+      "ref_id": "RS.MI-01",
+      "order": 97,
+      "category": "RS",
+      "subcategory": "RS.MI"
+    },
+    {
+      "ref_id": "RS.MI-02",
+      "order": 98,
+      "category": "RS",
+      "subcategory": "RS.MI"
+    },
+    {
+      "ref_id": "RC.CO-03",
+      "order": 99,
+      "category": "RC",
+      "subcategory": "RC.CO"
+    },
+    {
+      "ref_id": "RC.CO-04",
+      "order": 100,
+      "category": "RC",
+      "subcategory": "RC.CO"
+    },
+    {
+      "ref_id": "RC.RP-01",
+      "order": 101,
+      "category": "RC",
+      "subcategory": "RC.RP"
+    },
+    {
+      "ref_id": "RC.RP-02",
+      "order": 102,
+      "category": "RC",
+      "subcategory": "RC.RP"
+    },
+    {
+      "ref_id": "RC.RP-03",
+      "order": 103,
+      "category": "RC",
+      "subcategory": "RC.RP"
+    },
+    {
+      "ref_id": "RC.RP-04",
+      "order": 104,
+      "category": "RC",
+      "subcategory": "RC.RP"
+    },
+    {
+      "ref_id": "RC.RP-05",
+      "order": 105,
+      "category": "RC",
+      "subcategory": "RC.RP"
+    },
+    {
+      "ref_id": "RC.RP-06",
+      "order": 106,
+      "category": "RC",
+      "subcategory": "RC.RP"
+    }
+  ]
+}

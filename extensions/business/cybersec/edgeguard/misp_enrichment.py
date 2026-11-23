@@ -24,6 +24,8 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
+from .labels import primary_label
+
 try:  # pragma: no cover - neo4j is an optional runtime dependency in tests.
   from neo4j import Query
 except Exception:  # noqa: BLE001 - exercised by the test suite (no neo4j installed).
@@ -75,9 +77,6 @@ EVENT_ID_RE = re.compile(r"^(?:0|[1-9]\d{0,9})$")
 # Contract §7.3: nodes with neither a MISP id nor a `SOURCED_FROM` edge
 # (Campaign, per the phase-3 probe) are omitted from the block entirely.
 _SKIPPED_LABELS = {"Campaign"}
-_KNOWN_LABEL_PRIORITY = (
-  "CVE", "Indicator", "Malware", "ThreatActor", "Technique", "Tactic", "Tool", "Campaign",
-)
 
 # Contract §7.2: whitelist keyed by (label, `Source.source_id`), lower-cased.
 # Sources not listed here (`abuseipdb`, `ssl_blacklist`, `feodo_tracker`,
@@ -390,17 +389,6 @@ def _normalize_field_value(field_name: str, value: Any) -> Any:
   return _clean_scalar(value)
 
 
-def _primary_label(labels: Any) -> Optional[str]:
-  label_set = set(labels or [])
-  for candidate in _KNOWN_LABEL_PRIORITY:
-    if candidate in label_set:
-      return candidate
-  for label in labels or []:
-    if isinstance(label, str) and label:
-      return label
-  return None
-
-
 def build_misp_enrichment_block(
   rows: Sequence[Mapping[str, Any]],
   node_ref_by_element_id: Mapping[str, str],
@@ -427,7 +415,7 @@ def build_misp_enrichment_block(
     element_id = row.get("element_id")
     if element_id is None or element_id not in node_ref_by_element_id:
       continue
-    label = _primary_label(row.get("labels"))
+    label = primary_label(row.get("labels"))
     if label is None or label in _SKIPPED_LABELS:
       continue
     misp_event_ids = _clean_event_ids(row.get("misp_event_ids"))

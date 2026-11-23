@@ -1,0 +1,564 @@
+{
+ "entries": {
+  "assessment_performed:supported:job-clean:2:0-0": {
+   "completed_at": "2026-02-02T02:50:00Z",
+   "counts": {
+    "gap": 0,
+    "review": 0
+   },
+   "job_id": "job-clean",
+   "pass_nr": 2,
+   "ref": "job:job-clean:2",
+   "signal_kind": "assessment_performed",
+   "status": "supported",
+   "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+  },
+  "assessment_performed:supported:job-open:2:0-0": {
+   "completed_at": "2026-02-02T02:45:00Z",
+   "counts": {
+    "gap": 0,
+    "review": 0
+   },
+   "job_id": "job-open",
+   "pass_nr": 2,
+   "ref": "job:job-open:2",
+   "signal_kind": "assessment_performed",
+   "status": "supported",
+   "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+  },
+  "assessment_performed:supported:job-other:2:0-0": {
+   "completed_at": "2026-02-02T02:40:00Z",
+   "counts": {
+    "gap": 0,
+    "review": 0
+   },
+   "job_id": "job-other",
+   "pass_nr": 2,
+   "ref": "job:job-other:2",
+   "signal_kind": "assessment_performed",
+   "status": "supported",
+   "summary": "Finalized scan pass 2 is retained as technical assessment evidence."
+  },
+  "auth_access_findings:gap:job-open:2:1-0": {
+   "completed_at": "2026-02-02T02:45:00Z",
+   "counts": {
+    "gap": 1,
+    "review": 0
+   },
+   "job_id": "job-open",
+   "pass_nr": 2,
+   "ref": "job:job-open:2",
+   "signal_kind": "auth_access_findings",
+   "status": "gap",
+   "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+  },
+  "auth_access_findings:gap:job-other:2:1-0": {
+   "completed_at": "2026-02-02T02:40:00Z",
+   "counts": {
+    "gap": 1,
+    "review": 0
+   },
+   "job_id": "job-other",
+   "pass_nr": 2,
+   "ref": "job:job-other:2",
+   "signal_kind": "auth_access_findings",
+   "status": "gap",
+   "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+  },
+  "auth_access_findings:supported:job-clean:2:0-0": {
+   "completed_at": "2026-02-02T02:50:00Z",
+   "counts": {
+    "gap": 0,
+    "review": 0
+   },
+   "job_id": "job-clean",
+   "pass_nr": 2,
+   "ref": "job:job-clean:2",
+   "signal_kind": "auth_access_findings",
+   "status": "supported",
+   "summary": "No unresolved matching finding in pass 2."
+  },
+  "crypto_transport_findings:needs_review:job-open:2:0-1": {
+   "completed_at": "2026-02-02T02:45:00Z",
+   "counts": {
+    "gap": 0,
+    "review": 1
+   },
+   "job_id": "job-open",
+   "pass_nr": 2,
+   "ref": "job:job-open:2",
+   "signal_kind": "crypto_transport_findings",
+   "status": "needs_review",
+   "summary": "1 lower-severity or inconclusive finding(s) in pass 2 need interpretation."
+  },
+  "crypto_transport_findings:supported:job-clean:2:0-0": {
+   "completed_at": "2026-02-02T02:50:00Z",
+   "counts": {
+    "gap": 0,
+    "review": 0
+   },
+   "job_id": "job-clean",
+   "pass_nr": 2,
+   "ref": "job:job-clean:2",
+   "signal_kind": "crypto_transport_findings",
+   "status": "supported",
+   "summary": "No unresolved matching finding in pass 2."
+  },
+  "crypto_transport_findings:supported:job-other:2:0-0": {
+   "completed_at": "2026-02-02T02:40:00Z",
+   "counts": {
+    "gap": 0,
+    "review": 0
+   },
+   "job_id": "job-other",
+   "pass_nr": 2,
+   "ref": "job:job-other:2",
+   "signal_kind": "crypto_transport_findings",
+   "status": "supported",
+   "summary": "No unresolved matching finding in pass 2."
+  },
+  "soc_incident_evidence:needs_review:job-clean:2:0-0": {
+   "completed_at": "2026-02-02T02:50:00Z",
+   "counts": {
+    "gap": 0,
+    "review": 0
+   },
+   "job_id": "job-clean",
+   "pass_nr": 2,
+   "ref": "job:job-clean:2",
+   "signal_kind": "soc_incident_evidence",
+   "status": "needs_review",
+   "summary": "No completed SOC export or detection correlation is recorded for this job."
+  },
+  "soc_incident_evidence:needs_review:job-other:2:0-0": {
+   "completed_at": "2026-02-02T02:40:00Z",
+   "counts": {
+    "gap": 0,
+    "review": 0
+   },
+   "job_id": "job-other",
+   "pass_nr": 2,
+   "ref": "job:job-other:2",
+   "signal_kind": "soc_incident_evidence",
+   "status": "needs_review",
+   "summary": "No completed SOC export or detection correlation is recorded for this job."
+  },
+  "soc_incident_evidence:supported:job-open:2:0-0": {
+   "completed_at": "2026-02-02T02:45:00Z",
+   "counts": {
+    "gap": 0,
+    "review": 0
+   },
+   "job_id": "job-open",
+   "pass_nr": 2,
+   "ref": "job:job-open:2",
+   "signal_kind": "soc_incident_evidence",
+   "status": "supported",
+   "summary": "SOC export or detection correlation completed for this job."
+  },
+  "vulnerability_management:gap:job-open:2:1-1": {
+   "completed_at": "2026-02-02T02:45:00Z",
+   "counts": {
+    "gap": 1,
+    "review": 1
+   },
+   "job_id": "job-open",
+   "pass_nr": 2,
+   "ref": "job:job-open:2",
+   "signal_kind": "vulnerability_management",
+   "status": "gap",
+   "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+  },
+  "vulnerability_management:gap:job-other:2:1-0": {
+   "completed_at": "2026-02-02T02:40:00Z",
+   "counts": {
+    "gap": 1,
+    "review": 0
+   },
+   "job_id": "job-other",
+   "pass_nr": 2,
+   "ref": "job:job-other:2",
+   "signal_kind": "vulnerability_management",
+   "status": "gap",
+   "summary": "1 unresolved medium-or-higher finding(s) in pass 2 match this control."
+  },
+  "vulnerability_management:supported:job-clean:2:0-0": {
+   "completed_at": "2026-02-02T02:50:00Z",
+   "counts": {
+    "gap": 0,
+    "review": 0
+   },
+   "job_id": "job-clean",
+   "pass_nr": 2,
+   "ref": "job:job-clean:2",
+   "signal_kind": "vulnerability_management",
+   "status": "supported",
+   "summary": "No unresolved matching finding in pass 2."
+  }
+ },
+ "levels": {
+  "basic": {
+   "meta": {
+    "assuranceLevel": "basic",
+    "generatedAt": "2026-02-02T02:55:00Z",
+    "jobsAvailable": 3,
+    "jobsConsidered": 3,
+    "jobsSkipped": 0,
+    "packId": "ro.dnsc.o1-2026",
+    "reason": null
+   },
+   "overriding": {
+    "control_ids": [
+     "ID.AM-08.2",
+     "ID.RA-01.1",
+     "PR.AA-01.1",
+     "PR.AA-03.2",
+     "PR.AA-05.3",
+     "PR.AA-05.4"
+    ],
+    "template": {
+     "job_id": "job-other",
+     "pass_nr": 2,
+     "ref": "job:job-other:2",
+     "severities": {
+      "HIGH": 1
+     }
+    }
+   },
+   "suggestions": {
+    "DE.AE-03.1": [
+     "soc_incident_evidence:needs_review:job-clean:2:0-0",
+     "soc_incident_evidence:supported:job-open:2:0-0",
+     "soc_incident_evidence:needs_review:job-other:2:0-0"
+    ],
+    "ID.AM-08.2": [
+     "vulnerability_management:supported:job-clean:2:0-0",
+     "vulnerability_management:gap:job-open:2:1-1",
+     "vulnerability_management:gap:job-other:2:1-0"
+    ],
+    "ID.RA-01.1": [
+     "vulnerability_management:supported:job-clean:2:0-0",
+     "vulnerability_management:gap:job-open:2:1-1",
+     "vulnerability_management:gap:job-other:2:1-0"
+    ],
+    "ID.RA-05.1": [
+     "assessment_performed:supported:job-clean:2:0-0",
+     "assessment_performed:supported:job-open:2:0-0",
+     "assessment_performed:supported:job-other:2:0-0"
+    ],
+    "PR.AA-01.1": [
+     "auth_access_findings:supported:job-clean:2:0-0",
+     "auth_access_findings:gap:job-open:2:1-0",
+     "auth_access_findings:gap:job-other:2:1-0"
+    ],
+    "PR.AA-03.2": [
+     "auth_access_findings:supported:job-clean:2:0-0",
+     "auth_access_findings:gap:job-open:2:1-0",
+     "auth_access_findings:gap:job-other:2:1-0"
+    ],
+    "PR.AA-05.3": [
+     "auth_access_findings:supported:job-clean:2:0-0",
+     "auth_access_findings:gap:job-open:2:1-0",
+     "auth_access_findings:gap:job-other:2:1-0"
+    ],
+    "PR.AA-05.4": [
+     "auth_access_findings:supported:job-clean:2:0-0",
+     "auth_access_findings:gap:job-open:2:1-0",
+     "auth_access_findings:gap:job-other:2:1-0"
+    ]
+   }
+  },
+  "essential": {
+   "meta": {
+    "assuranceLevel": "essential",
+    "generatedAt": "2026-02-02T02:55:00Z",
+    "jobsAvailable": 3,
+    "jobsConsidered": 3,
+    "jobsSkipped": 0,
+    "packId": "ro.dnsc.o1-2026",
+    "reason": null
+   },
+   "overriding": {
+    "control_ids": [
+     "ID.AM-08.2",
+     "ID.RA-01.1",
+     "ID.RA-01.2",
+     "ID.RA-01.3",
+     "ID.RA-01.6",
+     "ID.RA-08.1",
+     "ID.RA-08.2",
+     "PR.AA-01.1",
+     "PR.AA-01.2",
+     "PR.AA-01.4",
+     "PR.AA-03.2",
+     "PR.AA-05.3",
+     "PR.AA-05.4",
+     "PR.AA-05.7",
+     "PR.AA-05.9"
+    ],
+    "template": {
+     "job_id": "job-other",
+     "pass_nr": 2,
+     "ref": "job:job-other:2",
+     "severities": {
+      "HIGH": 1
+     }
+    }
+   },
+   "suggestions": {
+    "DE.AE-02.2": [
+     "soc_incident_evidence:needs_review:job-clean:2:0-0",
+     "soc_incident_evidence:supported:job-open:2:0-0",
+     "soc_incident_evidence:needs_review:job-other:2:0-0"
+    ],
+    "DE.AE-03.1": [
+     "soc_incident_evidence:needs_review:job-clean:2:0-0",
+     "soc_incident_evidence:supported:job-open:2:0-0",
+     "soc_incident_evidence:needs_review:job-other:2:0-0"
+    ],
+    "DE.AE-03.3": [
+     "assessment_performed:supported:job-clean:2:0-0",
+     "assessment_performed:supported:job-open:2:0-0",
+     "assessment_performed:supported:job-other:2:0-0"
+    ],
+    "DE.CM-09.1": [
+     "soc_incident_evidence:needs_review:job-clean:2:0-0",
+     "soc_incident_evidence:supported:job-open:2:0-0",
+     "soc_incident_evidence:needs_review:job-other:2:0-0"
+    ],
+    "ID.AM-08.2": [
+     "vulnerability_management:supported:job-clean:2:0-0",
+     "vulnerability_management:gap:job-open:2:1-1",
+     "vulnerability_management:gap:job-other:2:1-0"
+    ],
+    "ID.IM-02.1": [
+     "assessment_performed:supported:job-clean:2:0-0",
+     "assessment_performed:supported:job-open:2:0-0",
+     "assessment_performed:supported:job-other:2:0-0"
+    ],
+    "ID.RA-01.1": [
+     "vulnerability_management:supported:job-clean:2:0-0",
+     "vulnerability_management:gap:job-open:2:1-1",
+     "vulnerability_management:gap:job-other:2:1-0"
+    ],
+    "ID.RA-01.2": [
+     "vulnerability_management:supported:job-clean:2:0-0",
+     "vulnerability_management:gap:job-open:2:1-1",
+     "vulnerability_management:gap:job-other:2:1-0"
+    ],
+    "ID.RA-01.3": [
+     "vulnerability_management:supported:job-clean:2:0-0",
+     "vulnerability_management:gap:job-open:2:1-1",
+     "vulnerability_management:gap:job-other:2:1-0"
+    ],
+    "ID.RA-01.5": [
+     "assessment_performed:supported:job-clean:2:0-0",
+     "assessment_performed:supported:job-open:2:0-0",
+     "assessment_performed:supported:job-other:2:0-0"
+    ],
+    "ID.RA-01.6": [
+     "vulnerability_management:supported:job-clean:2:0-0",
+     "vulnerability_management:gap:job-open:2:1-1",
+     "vulnerability_management:gap:job-other:2:1-0"
+    ],
+    "ID.RA-05.1": [
+     "assessment_performed:supported:job-clean:2:0-0",
+     "assessment_performed:supported:job-open:2:0-0",
+     "assessment_performed:supported:job-other:2:0-0"
+    ],
+    "ID.RA-05.2": [
+     "assessment_performed:supported:job-clean:2:0-0",
+     "assessment_performed:supported:job-open:2:0-0",
+     "assessment_performed:supported:job-other:2:0-0"
+    ],
+    "ID.RA-08.1": [
+     "vulnerability_management:supported:job-clean:2:0-0",
+     "vulnerability_management:gap:job-open:2:1-1",
+     "vulnerability_management:gap:job-other:2:1-0"
+    ],
+    "ID.RA-08.2": [
+     "vulnerability_management:supported:job-clean:2:0-0",
+     "vulnerability_management:gap:job-open:2:1-1",
+     "vulnerability_management:gap:job-other:2:1-0"
+    ],
+    "PR.AA-01.1": [
+     "auth_access_findings:supported:job-clean:2:0-0",
+     "auth_access_findings:gap:job-open:2:1-0",
+     "auth_access_findings:gap:job-other:2:1-0"
+    ],
+    "PR.AA-01.2": [
+     "auth_access_findings:supported:job-clean:2:0-0",
+     "auth_access_findings:gap:job-open:2:1-0",
+     "auth_access_findings:gap:job-other:2:1-0"
+    ],
+    "PR.AA-01.4": [
+     "auth_access_findings:supported:job-clean:2:0-0",
+     "auth_access_findings:gap:job-open:2:1-0",
+     "auth_access_findings:gap:job-other:2:1-0"
+    ],
+    "PR.AA-03.2": [
+     "auth_access_findings:supported:job-clean:2:0-0",
+     "auth_access_findings:gap:job-open:2:1-0",
+     "auth_access_findings:gap:job-other:2:1-0"
+    ],
+    "PR.AA-03.4": [
+     "crypto_transport_findings:supported:job-clean:2:0-0",
+     "crypto_transport_findings:needs_review:job-open:2:0-1",
+     "crypto_transport_findings:supported:job-other:2:0-0"
+    ],
+    "PR.AA-05.3": [
+     "auth_access_findings:supported:job-clean:2:0-0",
+     "auth_access_findings:gap:job-open:2:1-0",
+     "auth_access_findings:gap:job-other:2:1-0"
+    ],
+    "PR.AA-05.4": [
+     "auth_access_findings:supported:job-clean:2:0-0",
+     "auth_access_findings:gap:job-open:2:1-0",
+     "auth_access_findings:gap:job-other:2:1-0"
+    ],
+    "PR.AA-05.7": [
+     "auth_access_findings:supported:job-clean:2:0-0",
+     "auth_access_findings:gap:job-open:2:1-0",
+     "auth_access_findings:gap:job-other:2:1-0"
+    ],
+    "PR.AA-05.9": [
+     "auth_access_findings:supported:job-clean:2:0-0",
+     "auth_access_findings:gap:job-open:2:1-0",
+     "auth_access_findings:gap:job-other:2:1-0"
+    ],
+    "PR.DS-02.2": [
+     "crypto_transport_findings:supported:job-clean:2:0-0",
+     "crypto_transport_findings:needs_review:job-open:2:0-1",
+     "crypto_transport_findings:supported:job-other:2:0-0"
+    ]
+   }
+  },
+  "important": {
+   "meta": {
+    "assuranceLevel": "important",
+    "generatedAt": "2026-02-02T02:55:00Z",
+    "jobsAvailable": 3,
+    "jobsConsidered": 3,
+    "jobsSkipped": 0,
+    "packId": "ro.dnsc.o1-2026",
+    "reason": null
+   },
+   "overriding": {
+    "control_ids": [
+     "ID.AM-08.2",
+     "ID.RA-01.1",
+     "ID.RA-01.2",
+     "ID.RA-01.3",
+     "ID.RA-01.6",
+     "ID.RA-08.1",
+     "PR.AA-01.1",
+     "PR.AA-01.2",
+     "PR.AA-03.2",
+     "PR.AA-05.3",
+     "PR.AA-05.4",
+     "PR.AA-05.7"
+    ],
+    "template": {
+     "job_id": "job-other",
+     "pass_nr": 2,
+     "ref": "job:job-other:2",
+     "severities": {
+      "HIGH": 1
+     }
+    }
+   },
+   "suggestions": {
+    "DE.AE-03.1": [
+     "soc_incident_evidence:needs_review:job-clean:2:0-0",
+     "soc_incident_evidence:supported:job-open:2:0-0",
+     "soc_incident_evidence:needs_review:job-other:2:0-0"
+    ],
+    "DE.CM-09.1": [
+     "soc_incident_evidence:needs_review:job-clean:2:0-0",
+     "soc_incident_evidence:supported:job-open:2:0-0",
+     "soc_incident_evidence:needs_review:job-other:2:0-0"
+    ],
+    "ID.AM-08.2": [
+     "vulnerability_management:supported:job-clean:2:0-0",
+     "vulnerability_management:gap:job-open:2:1-1",
+     "vulnerability_management:gap:job-other:2:1-0"
+    ],
+    "ID.IM-02.1": [
+     "assessment_performed:supported:job-clean:2:0-0",
+     "assessment_performed:supported:job-open:2:0-0",
+     "assessment_performed:supported:job-other:2:0-0"
+    ],
+    "ID.RA-01.1": [
+     "vulnerability_management:supported:job-clean:2:0-0",
+     "vulnerability_management:gap:job-open:2:1-1",
+     "vulnerability_management:gap:job-other:2:1-0"
+    ],
+    "ID.RA-01.2": [
+     "vulnerability_management:supported:job-clean:2:0-0",
+     "vulnerability_management:gap:job-open:2:1-1",
+     "vulnerability_management:gap:job-other:2:1-0"
+    ],
+    "ID.RA-01.3": [
+     "vulnerability_management:supported:job-clean:2:0-0",
+     "vulnerability_management:gap:job-open:2:1-1",
+     "vulnerability_management:gap:job-other:2:1-0"
+    ],
+    "ID.RA-01.5": [
+     "assessment_performed:supported:job-clean:2:0-0",
+     "assessment_performed:supported:job-open:2:0-0",
+     "assessment_performed:supported:job-other:2:0-0"
+    ],
+    "ID.RA-01.6": [
+     "vulnerability_management:supported:job-clean:2:0-0",
+     "vulnerability_management:gap:job-open:2:1-1",
+     "vulnerability_management:gap:job-other:2:1-0"
+    ],
+    "ID.RA-05.1": [
+     "assessment_performed:supported:job-clean:2:0-0",
+     "assessment_performed:supported:job-open:2:0-0",
+     "assessment_performed:supported:job-other:2:0-0"
+    ],
+    "ID.RA-05.2": [
+     "assessment_performed:supported:job-clean:2:0-0",
+     "assessment_performed:supported:job-open:2:0-0",
+     "assessment_performed:supported:job-other:2:0-0"
+    ],
+    "ID.RA-08.1": [
+     "vulnerability_management:supported:job-clean:2:0-0",
+     "vulnerability_management:gap:job-open:2:1-1",
+     "vulnerability_management:gap:job-other:2:1-0"
+    ],
+    "PR.AA-01.1": [
+     "auth_access_findings:supported:job-clean:2:0-0",
+     "auth_access_findings:gap:job-open:2:1-0",
+     "auth_access_findings:gap:job-other:2:1-0"
+    ],
+    "PR.AA-01.2": [
+     "auth_access_findings:supported:job-clean:2:0-0",
+     "auth_access_findings:gap:job-open:2:1-0",
+     "auth_access_findings:gap:job-other:2:1-0"
+    ],
+    "PR.AA-03.2": [
+     "auth_access_findings:supported:job-clean:2:0-0",
+     "auth_access_findings:gap:job-open:2:1-0",
+     "auth_access_findings:gap:job-other:2:1-0"
+    ],
+    "PR.AA-05.3": [
+     "auth_access_findings:supported:job-clean:2:0-0",
+     "auth_access_findings:gap:job-open:2:1-0",
+     "auth_access_findings:gap:job-other:2:1-0"
+    ],
+    "PR.AA-05.4": [
+     "auth_access_findings:supported:job-clean:2:0-0",
+     "auth_access_findings:gap:job-open:2:1-0",
+     "auth_access_findings:gap:job-other:2:1-0"
+    ],
+    "PR.AA-05.7": [
+     "auth_access_findings:supported:job-clean:2:0-0",
+     "auth_access_findings:gap:job-open:2:1-0",
+     "auth_access_findings:gap:job-other:2:1-0"
+    ]
+   }
+  }
+ }
+}

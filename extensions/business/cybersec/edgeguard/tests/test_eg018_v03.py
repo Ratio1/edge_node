@@ -191,7 +191,7 @@ class ModelExposureTests(unittest.TestCase):
 
 # Re-pin only when the EGX/2 prompt or profile changes on purpose (EG-018 phase 4
 # prompt wording); any other change to this value means the no-block request bytes moved.
-PRE_CHANGE_NO_BLOCK_SHA = "79a32e4840ba69e09043efbca9bb82506a5f9309211f4f54aa1654aeb431f70d"
+PRE_CHANGE_NO_BLOCK_SHA = "a081591f559d82081859828549082cde2b5040940d7562f43dfd56e1841a0692"
 
 
 def _egx2_run(brief_factory=None, *, block="default", node_ids=None, template=None, graph=None):
@@ -387,8 +387,8 @@ class ApiTemplateTests(unittest.TestCase):
       self._explain(plugin)
     self.assertEqual(plugin._misp_citation_drop_count, 2)
 
-  def test_ref_drop_counter_is_reported(self):
-    # Spec v0.4 §4.2: the value-free drop map folds into one plugin counter.
+  def test_ref_withheld_counter_is_reported(self):
+    # Code-attached refs never drop one by one (EG-039 phase 4); only a whole withheld feature counts.
     plugin = self._plugin(misp.DEFAULT_EVENT_URL_TEMPLATE, "insight_brief")
     result = egx2.run_insight_brief(
       question="q", graph=egx2_tests.enrichment_graph(), model=None, provider_call=lambda _payload: {},
@@ -396,10 +396,10 @@ class ApiTemplateTests(unittest.TestCase):
     )
     with patch(
       "extensions.business.cybersec.edgeguard.edgeguard_api.egx2.run_insight_brief",
-      return_value={**result, "misp_ref_drops": {"ref_unknown": 2, "ref_over_cap": 1}, "misp_ref_withheld": 2},
+      return_value={**result, "misp_ref_withheld": 2},
     ):
       self._explain(plugin)
-    self.assertEqual(plugin._misp_ref_drop_count, 3)
+    self.assertEqual(plugin._misp_ref_drop_count, 0)
     self.assertEqual(plugin._misp_ref_withheld_count, 2)
 
   def test_prepared_execution_path_carries_no_block_and_no_citations(self):
@@ -454,14 +454,14 @@ class SharedCitationVectorTests(unittest.TestCase):
         self.assertIs(runtime.public_citation_is_valid(case["citation"], entity_ids, graph_ids), case["valid"])
 
   def test_list_cases_follow_the_server_cap(self):
-    view = {"nodes": [{"entity": "CVE-2000-0001", "node_ref": "N0"}]}
     for case in self.vector["list_cases"]:
       with self.subTest(case=case["name"]):
-        item = {"misp_citations": [
-          {"entity": "CVE-2000-0001", "field": "cwe", "value": f"CWE-{i}"} for i in range(case["count"])
-        ]}
-        public, dropped = runtime._public_citations(item, ["c1"], view, {"N0": "c1"}, {"c1"})
-        self.assertEqual((len(public), dropped), (min(case["count"], runtime.MAX_PUBLIC_CITATIONS), 0))
+        view = {"nodes": [{
+          "entity": "CVE-2000-0001", "node_ref": "N0", "misp_event_ids": [],
+          "fields": {"cwe": [f"CWE-{i}" for i in range(case["count"])]},
+        }]}
+        public, dropped = runtime._code_citations(["c1"], view, {"N0": "c1"}, {"c1"})
+        self.assertEqual((len(public), dropped), (min(case["count"], runtime.ATTACHED_CITATIONS_PER_OBSERVATION), 0))
         # A list the client accepts is non-empty and at most the cap; the server never emits more.
         self.assertEqual(case["valid"], 1 <= case["count"] <= runtime.MAX_PUBLIC_CITATIONS)
 
@@ -480,146 +480,136 @@ def _graph_with_same_name():
   return graph
 
 
-class PublicCitationTests(unittest.TestCase):
-  def _case(self, **kwargs):
-    result, payloads = _egx2_run(**kwargs)
-    return result, payloads
+def _view_of(entity="A", fields=None, node_ref="N0"):
+  return {"nodes": [{"entity": entity, "node_ref": node_ref, "misp_event_ids": [], "fields": fields or {}}]}
 
-  def test_graded_citation_becomes_public_with_node_ref_and_entity_id(self):
-    result, _ = self._case()
-    self.assertEqual(result["explanation_trace"]["outcome"]["status"], "supported")
-    observations = result["case_explanation"]["observations"]
-    self.assertEqual(observations[0]["misp_citations"], [
-      {"entity": "CVE-2000-0001", "field": "cwe", "value": "CWE-79", "node_ref": "N0", "entity_id": "c1"},
-    ])
-    self.assertEqual(observations[1]["misp_citations"][0]["node_ref"], "N1")
-    self.assertEqual(observations[1]["misp_citations"][0]["entity_id"], "i1")
-    for observation in observations:
-      for citation in observation["misp_citations"]:
-        self.assertIn(citation["entity_id"], observation["entity_ids"])
+
+class PublicCitationTests(unittest.TestCase):
+  """EG-039 phase 4: code, not the model, attaches `misp_citations` from the entities an observation names."""
 
   def test_string_values_are_stripped_numbers_stay_numbers(self):
-    brief = lambda sheet: egx2_tests.enrichment_brief(  # noqa: E731
-      sheet, cve_citation={"entity": "CVE-2000-0001", "field": "cwe", "value": " CWE-79 "},
-    )
-    result, _ = _egx2_run(brief)
-    self.assertEqual(result["case_explanation"]["observations"][0]["misp_citations"][0]["value"], "CWE-79")
-    cited = runtime._public_citations(
-      {"misp_citations": [{"entity": "A", "field": "n", "value": 7}]},
-      ["n:a"], {"nodes": [{"entity": "A", "node_ref": "N0"}]}, {"N0": "n:a"}, {"n:a"},
-    )
-    self.assertEqual(cited[0][0]["value"], 7)
-    self.assertIsInstance(cited[0][0]["value"], int)
+    public, _ = runtime._code_citations(["n:a"], _view_of(fields={"f": " CWE-79 ", "n": 7}), {"N0": "n:a"}, {"n:a"})
+    self.assertEqual({c["field"]: c["value"] for c in public}, {"f": "CWE-79", "n": 7})
+    self.assertIsInstance(next(c["value"] for c in public if c["field"] == "n"), int)
 
-  def test_list_valued_citation_yields_one_per_item_and_dedupes(self):
-    brief = lambda sheet: egx2_tests.enrichment_brief(  # noqa: E731
-      sheet, cve_citation={"entity": "CVE-2000-0001", "field": "cwe", "value": ["CWE-79", "CWE-79"]},
+  def test_list_valued_field_yields_one_per_item_and_dedupes(self):
+    public, dropped = runtime._code_citations(
+      ["n:a"], _view_of(fields={"cwe": ["CWE-79", "CWE-79", "cwe-79"]}), {"N0": "n:a"}, {"n:a"},
     )
-    result, _ = _egx2_run(brief)
-    self.assertEqual(len(result["case_explanation"]["observations"][0]["misp_citations"]), 1)
-
-  def test_over_eight_is_cut_after_dedupe_in_model_order(self):
-    entries = [{"entity": "A", "field": "f", "value": f"v{i % 10}"} for i in range(12)]
-    entries.insert(1, {"entity": "a", "field": "f", "value": "V0"})  # duplicate, case-insensitive
-    public, dropped = runtime._public_citations(
-      {"misp_citations": entries}, ["n:a"], {"nodes": [{"entity": "A", "node_ref": "N0"}]},
-      {"N0": "n:a"}, {"n:a"},
-    )
-    self.assertEqual([c["value"] for c in public], [f"v{i}" for i in range(8)])
+    self.assertEqual([c["value"] for c in public], ["CWE-79"])  # dedupe is case-insensitive
     self.assertEqual(dropped, 0)
 
-  def test_no_citation_no_key_and_no_block_is_byte_identical(self):
-    brief = lambda sheet: {  # noqa: E731
-      **egx2_tests.enrichment_brief(sheet),
-      "observations": [
-        {k: v for k, v in o.items() if k != "misp_citations"} for o in egx2_tests.enrichment_brief(sheet)["observations"]
-      ],
-    }
-    result, _ = _egx2_run(brief)
-    self.assertNotIn("misp_citations", json.dumps(result["case_explanation"]))
-    self.assertNotIn("citation_drops", result)
-    plain, _ = _egx2_run(egx2_tests.enrichment_brief, block=None)
-    self.assertEqual(plain["explanation_trace"]["outcome"]["status"], "fallback")  # ungrounded without a view
-    self.assertNotIn("misp_citations", json.dumps(plain["case_explanation"]))
+  def test_an_entity_with_only_bookkeeping_fields_gets_its_event_citation(self):
+    # The model view drops first/last_seen_at_source and last_imported_from (UI-only), so an actor or tool
+    # node arrives with no fields; its event membership is still cited, in the shape the model used to write.
+    view = {"nodes": [{"entity": "menupass", "node_ref": "N0", "misp_event_ids": ["300", "301"], "fields": {}}]}
+    public, dropped = runtime._code_citations(["n:a"], view, {"N0": "n:a"}, {"n:a"})
+    self.assertEqual(public, [
+      {"entity": "menupass", "field": "misp_event_ids", "value": "300", "node_ref": "N0", "entity_id": "n:a"},
+    ])
+    self.assertEqual(dropped, 0)
 
-  def test_failed_attempt_citations_never_appear(self):
+  def test_cap_is_four_filled_round_robin_across_the_named_entities(self):
+    view = {"nodes": [
+      {"entity": "A", "node_ref": "N0", "misp_event_ids": ["1"], "fields": {"cwe": ["CWE-1"], "source": "nvd"}},
+      {"entity": "B", "node_ref": "N1", "misp_event_ids": ["2"], "fields": {"cwe": ["CWE-2"], "source": "nvd"}},
+    ]}
+    public, _ = runtime._code_citations(["n:a", "n:b"], view, {"N0": "n:a", "N1": "n:b"}, {"n:a", "n:b"})
+    self.assertEqual(
+      [(c["entity"], c["field"]) for c in public],
+      [("A", "misp_event_ids"), ("B", "misp_event_ids"), ("A", "cwe"), ("B", "cwe")],
+    )
+
+  def test_cve_entity_order_is_event_then_fields_with_the_long_tail_last(self):
+    fields = {
+      "affected_products": ["p1"], "reference_urls": ["https://x.test/1"],
+      "cwe": ["CWE-79"], "cisa_exploit_add": "2026-01-01",
+    }
+    view = {"nodes": [{"entity": "CVE-1", "node_ref": "N0", "misp_event_ids": ["9"], "fields": fields}]}
+    public, dropped = runtime._code_citations(["n:a"], view, {"N0": "n:a"}, {"n:a"})
+    self.assertEqual([c["field"] for c in public], ["misp_event_ids", "cisa_exploit_add", "cwe", "affected_products"])
+    self.assertEqual(dropped, 0)
+
+  def test_an_observation_naming_no_enriched_entity_gets_no_key(self):
+    public, dropped = runtime._code_citations(["other"], _view_of(fields={"cwe": ["CWE-79"]}), {"N0": "n:a"}, {"n:a", "other"})
+    self.assertEqual((public, dropped), ([], 0))
+
+  def test_no_block_means_no_citation_keys(self):
+    plain, _ = _egx2_run(egx2_tests.valid_enrichment_free_brief, block=None)
+    self.assertEqual(plain["explanation_trace"]["outcome"]["status"], "supported")
+    self.assertNotIn("misp_citations", json.dumps(plain["case_explanation"]))
+    self.assertNotIn("misp_refs", json.dumps(plain["case_explanation"]))
+    self.assertNotIn("citation_drops", plain)
+
+  def test_failed_attempt_text_never_appears_and_the_retry_is_attached_by_code(self):
     attempts = []
 
     def brief(sheet):
       attempts.append(1)
       good = egx2_tests.enrichment_brief(sheet)
-      if len(attempts) == 1:  # bad value on attempt one
-        return egx2_tests.enrichment_brief(
-          sheet, cve_citation={"entity": "CVE-2000-0001", "field": "cwe", "value": "CWE-1111"},
-        )
-      return {**good, "observations": [
-        {k: v for k, v in o.items() if k != "misp_citations"} for o in good["observations"]
-      ]}
+      if len(attempts) == 1:
+        good["observations"][0]["text"] = "CVE-2000-0001 is CWE-1111."  # ungrounded CWE id
+      return good
 
     result, payloads = _egx2_run(brief)
     self.assertEqual(len(payloads), 2)
     self.assertEqual(result["explanation_trace"]["outcome"]["status"], "supported")
     self.assertNotIn("CWE-1111", json.dumps(result["case_explanation"]))
-    self.assertNotIn("misp_citations", json.dumps(result["case_explanation"]))
+    self.assertIn("misp_citations", result["case_explanation"]["observations"][0])
 
-  def test_fallback_after_two_failed_attempts_has_no_citations(self):
-    brief = lambda sheet: egx2_tests.enrichment_brief(  # noqa: E731
-      sheet, cve_citation={"entity": "CVE-2000-0001", "field": "cwe", "value": "CWE-1111"},
-    )
+  def test_deterministic_fallback_carries_code_attached_citations_too(self):
+    def brief(sheet):
+      good = egx2_tests.enrichment_brief(sheet)
+      good["observations"][0]["text"] = "CVE-2000-0001 is CWE-1111."
+      return good
+
     result, _ = _egx2_run(brief)
+    case = result["case_explanation"]
     self.assertEqual(result["explanation_trace"]["outcome"]["status"], "fallback")
-    self.assertNotIn("misp_citations", json.dumps(result["case_explanation"]))
+    self.assertEqual(case["provenance"]["mode"], "deterministic_fallback")
+    cited = [o for o in case["observations"] if o.get("misp_citations")]
+    self.assertTrue(cited)
+    for observation in cited:
+      for citation in observation["misp_citations"]:
+        self.assertIn(citation["entity_id"], observation["entity_ids"])
+    self.assertNotIn("CWE-1111", json.dumps(case))
 
-  def test_same_name_nodes_with_disagreeing_ids_drop_the_citation_keep_the_observation(self):
+  def test_same_name_nodes_with_disagreeing_ids_attach_nothing_to_the_unmatched_observation(self):
     graph = _graph_with_same_name()
     # entity_ids come from the first graph node named CVE-2000-0001 (c1); the view resolved N0 to c2.
     result, _ = _egx2_run(graph=graph, node_ids={"N0": "c2", "N1": "i1"})
     self.assertEqual(result["explanation_trace"]["outcome"]["status"], "supported")
     first = result["case_explanation"]["observations"][0]
     self.assertEqual(first["entity_ids"], ["c1"])
-    self.assertIn("text", first)
     self.assertNotIn("misp_citations", first)
     self.assertIn("misp_citations", result["case_explanation"]["observations"][1])
-    self.assertEqual(result["citation_drops"], 1)
     agreeing, _ = _egx2_run(graph=graph, node_ids={"N0": "c1", "N1": "i1"})
     self.assertEqual(agreeing["case_explanation"]["observations"][0]["misp_citations"][0]["entity_id"], "c1")
-    self.assertNotIn("citation_drops", agreeing)
 
   def test_each_client_rule_drops_the_citation_not_the_observation(self):
-    view = {"nodes": [{"entity": "A", "node_ref": "N0"}]}
     cases = {
-      "entity_too_long": ({"entity": "A" * 257, "field": "cwe", "value": "x"}, {"nodes": [{"entity": "A" * 257, "node_ref": "N0"}]}),
-      "field_uppercase": ({"entity": "A", "field": "Cwe", "value": "x"}, view),
-      "field_too_long": ({"entity": "A", "field": "f" * 65, "value": "x"}, view),
-      "value_too_long": ({"entity": "A", "field": "cwe", "value": "v" * 501}, view),
-      "value_non_finite": ({"entity": "A", "field": "cwe", "value": float("inf")}, view),
-      "bad_node_ref": ({"entity": "A", "field": "cwe", "value": "x"}, {"nodes": [{"entity": "A", "node_ref": "n0"}]}),
+      "entity_too_long": _view_of("A" * 257, {"cwe": "x"}),
+      "field_uppercase": _view_of(fields={"Cwe": "x"}),
+      "field_too_long": _view_of(fields={"f" * 65: "x"}),
+      "value_too_long": _view_of(fields={"cwe": "v" * 501}),
+      "value_non_finite": _view_of(fields={"cwe": float("inf")}),
+      "bad_node_ref": _view_of(fields={"cwe": "x"}, node_ref="n0"),
     }
-    for name, (citation, node_view) in cases.items():
+    for name, view in cases.items():
       with self.subTest(name=name):
-        node_ref = node_view["nodes"][0]["node_ref"]
-        public, dropped = runtime._public_citations(
-          {"misp_citations": [citation]}, ["n:a"], node_view, {node_ref: "n:a"}, {"n:a"},
-        )
+        public, dropped = runtime._code_citations(["n:a"], view, {view["nodes"][0]["node_ref"]: "n:a"}, {"n:a"})
         self.assertEqual((public, dropped), ([], 1))
-    for name, ids, graph_ids in (("entity_id_not_in_graph", ["n:a"], set()), ("entity_id_not_in_observation", [], {"n:a"})):
-      with self.subTest(name=name):
-        public, dropped = runtime._public_citations(
-          {"misp_citations": [{"entity": "A", "field": "cwe", "value": "x"}]}, ids, view, {"N0": "n:a"}, graph_ids,
-        )
-        self.assertEqual((public, dropped), ([], 1))
-    public, dropped = runtime._public_citations(
-      {"misp_citations": [{"entity": "A", "field": "cwe", "value": "x"}]}, ["n:a"], view, {}, {"n:a"},
-    )
-    self.assertEqual((public, dropped), ([], 1))  # node_ref has no packet id
+    public, dropped = runtime._code_citations(["n:a"], _view_of(fields={"cwe": "x"}), {"N0": "n:a"}, set())
+    self.assertEqual((public, dropped), ([], 1))  # entity id not in the graph
 
-  def test_deterministic_cases_carry_none(self):
+  def test_deterministic_cases_carry_code_attached_citations(self):
     graph = egx2_tests.enrichment_graph()
     result = egx2.run_insight_brief(
       question="q", graph=graph, model=None, provider_call=lambda p: {}, allow_model=False,
       misp_enrichment=egx2_tests.enrichment_block(), misp_node_ids=egx2_tests.ENRICHMENT_NODE_IDS,
     )
-    self.assertNotIn("misp_citations", json.dumps(result["case_explanation"]))
+    self.assertEqual(result["case_explanation"]["provenance"]["mode"], "deterministic_fallback")
+    self.assertIn("misp_citations", json.dumps(result["case_explanation"]))
 
 
 def _failing_brief(sheet, **kwargs):
@@ -639,30 +629,6 @@ class GateFailureCodeTests(unittest.TestCase):
     view = egx2_tests._view(None if block == "default" else block)
     return brief, sheet, view, brief_gates.failure_codes(brief, sheet, view)
 
-  def test_citation_entity_not_exemplar(self):
-    def edit(brief):
-      brief["observations"][0]["misp_citations"][0]["entity"] = "203.0.113.7"
-    _b, _s, _v, codes = self._codes(edit)
-    self.assertIn("citation_entity_not_exemplar", codes["enrichment_grounding"])
-
-  def test_citation_entity_no_enrichment(self):
-    def edit(brief):
-      brief["observations"][1]["misp_citations"][0]["entity"] = "quietsieve"
-    _b, _s, _v, codes = self._codes(edit)
-    self.assertIn("citation_entity_no_enrichment", codes["enrichment_grounding"])
-
-  def test_citation_field_not_in_node(self):
-    def edit(brief):
-      brief["observations"][1]["misp_citations"][0]["field"] = "pulse_tlp"
-    _b, _s, _v, codes = self._codes(edit)
-    self.assertIn("citation_field_not_in_node", codes["enrichment_grounding"])
-
-  def test_citation_value_mismatch(self):
-    def edit(brief):
-      brief["observations"][0]["misp_citations"][0]["value"] = "CWE-80"
-    _b, _s, _v, codes = self._codes(edit)
-    self.assertIn("citation_value_mismatch", codes["enrichment_grounding"])
-
   def test_lexical_codes(self):
     cases = {
       "unsafe_url_scheme": "Open javascript:alert(1) to triage this.",
@@ -674,21 +640,16 @@ class GateFailureCodeTests(unittest.TestCase):
       with self.subTest(code=code):
         def edit(brief, text=text):
           brief["observations"][0]["text"] = text
-          brief["observations"][0]["misp_citations"] = []
         _b, _s, _v, codes = self._codes(edit)
         self.assertEqual(codes["enrichment_grounding"], [code])
 
   def test_codes_are_sorted_deduped_and_value_free(self):
     def edit(brief):
-      brief["observations"][0]["misp_citations"] = [
-        {"entity": SENTINEL_ENTITY, "field": "cwe", "value": SENTINEL_VALUE},
-        {"entity": SENTINEL_ENTITY, "field": "cwe", "value": SENTINEL_VALUE + "2"},
-        {"entity": "CVE-2000-0001", "field": "cwe", "value": SENTINEL_VALUE},
-      ]
+      brief["observations"][0]["text"] = f"CVE-2000-0001 is CWE-999 and see https://{SENTINEL_VALUE}.test/x"
+      brief["observations"][1]["text"] = "203.0.113.7 is CWE-998."
     _b, _s, _v, codes = self._codes(edit)
-    self.assertEqual(codes["enrichment_grounding"], ["citation_entity_not_exemplar", "citation_value_mismatch"])
-    rendered = json.dumps(codes)
-    self.assertNotIn("SENTINEL", rendered)
+    self.assertEqual(len(codes["enrichment_grounding"]), 1)  # one lexical code at most
+    self.assertNotIn("SENTINEL", json.dumps(codes))
     self.assertLessEqual(len(codes["enrichment_grounding"]), brief_gates.MAX_FAILURE_CODES_PER_GATE)
 
   def test_other_gates_each_have_one_fixed_code(self):
@@ -719,10 +680,7 @@ class GateFailureCodeTests(unittest.TestCase):
     fixtures.append((good, sheet, view))
     fixtures.append((good, sheet, None))
     for edit in (
-      lambda b: b["observations"][0]["misp_citations"][0].update(value="CWE-80"),
-      lambda b: b["observations"][0]["misp_citations"][0].update(entity="203.0.113.7"),
-      lambda b: b["observations"][1]["misp_citations"][0].update(field="pulse_tlp"),
-      lambda b: b["observations"][1]["misp_citations"][0].update(entity="quietsieve"),
+      lambda b: b["observations"][0].update(text="CVE-2000-0001 is listed in Synthetic Pulse Alpha."),
       lambda b: b["observations"][0].update(text="CWE-999 appears at https://x.example.test/a"),
       lambda b: b["observations"][0].update(insight_ids=["I999"]),
       lambda b: b["observations"][0].update(exemplar_entities=["nobody"]),
@@ -741,7 +699,7 @@ class GateFailureCodeTests(unittest.TestCase):
         hard_failed = {name for name, (passed, _detail, tier) in results.items() if tier == "hard" and not passed}
         failing += bool(hard_failed)
         self.assertEqual(hard_failed, set(brief_gates.failure_codes(brief, fixture_sheet, fixture_view)))
-    self.assertGreaterEqual(failing, 6)
+    self.assertGreaterEqual(failing, 5)
 
   def test_grade_output_shape_is_unchanged(self):
     sheet = insights.build_insight_sheet(egx2_tests.sample_graph())
@@ -761,16 +719,15 @@ class TraceGateFailureTests(unittest.TestCase):
     def brief(sheet):
       attempts.append(1)
       if len(attempts) == 1:
-        return egx2_tests.enrichment_brief(
-          sheet, cve_citation={"entity": SENTINEL_ENTITY, "field": "cwe", "value": SENTINEL_VALUE},
-        )
-      good = egx2_tests.enrichment_brief(sheet)
-      return good
+        bad = egx2_tests.enrichment_brief(sheet)
+        bad["observations"][0]["text"] = f"CVE-2000-0001 is CWE-999 per {SENTINEL_VALUE}."
+        return bad
+      return egx2_tests.enrichment_brief(sheet)
 
     result, _ = _egx2_run(brief)
     calls = result["explanation_trace"]["calls"]
     self.assertEqual([c["status"] for c in calls], ["failed", "supported"])
-    self.assertEqual(calls[0]["gate_failures"], {"enrichment_grounding": ["citation_entity_not_exemplar"]})
+    self.assertEqual(calls[0]["gate_failures"], {"enrichment_grounding": ["ungrounded_cwe"]})
     self.assertNotIn("gate_failures", calls[1])
     self.assertEqual(calls[0]["gates"]["enrichment_grounding"], False)
     self.assertNotIn("SENTINEL", json.dumps(result["explanation_trace"]))

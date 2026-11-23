@@ -206,6 +206,8 @@ def _make_llama_cpp_process(**overrides):
     "cfg_model_revision": None,
     "cfg_model_n_ctx": 1024,
     "cfg_chat_format": None,
+    "cfg_chat_template_kwargs": None,
+    "cfg_stop": None,
     "cfg_draft_model": None,
     "cfg_n_gpu_layers": 0,
     "cfg_n_threads": 4,
@@ -443,6 +445,55 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertEqual(preprocessed[0][0]["temperature"], 0.7)
     self.assertNotIn("seed", preprocessed[0][0])
     self.assertEqual(preprocessed[2], [{"REQUEST_ID": None}])
+
+  def test_generic_llama_cpp_forwards_stop_only_when_configured(self):
+    for stop, expected in ((None, False), (["<|im_end|>"], True)):
+      process = _make_llama_cpp_process(cfg_stop=stop)
+      process.check_relevant_input = lambda _input: True
+      process.maybe_add_context_to_messages = lambda messages, context: messages
+      process.get_default_response_format = lambda: None
+      process.process_predict_kwargs = lambda kwargs: kwargs
+
+      kwargs = process._pre_process({"DATA": [{"JEEVES_CONTENT": {"MESSAGES": [{"role": "user", "content": "q"}]}}]})[0][0]
+
+      self.assertEqual("stop" in kwargs, expected)
+      if expected:
+        self.assertEqual(kwargs["stop"], ["<|im_end|>"])
+
+  def test_generic_llama_cpp_passes_chat_template_kwargs_to_the_chat_handler(self):
+    seen = []
+    inner = lambda **kwargs: seen.append(kwargs) or "completion"
+    model = types.SimpleNamespace(chat_handler=None, _chat_handlers={"chat_template.default": inner}, chat_format="chat_template.default")
+
+    untouched = _make_llama_cpp_process()
+    untouched.model = model
+    untouched._apply_chat_template_kwargs()
+    self.assertIsNone(model.chat_handler)
+
+    process = _make_llama_cpp_process(cfg_chat_template_kwargs={"enable_thinking": False})
+    process.model = model
+    process._apply_chat_template_kwargs()
+
+    self.assertEqual(model.chat_handler(messages=["m"], max_tokens=5), "completion")
+    self.assertEqual(seen, [{"enable_thinking": False, "messages": ["m"], "max_tokens": 5}])
+    bad_configs = [
+      ["not", "a", "mapping"],
+      {"grammar": "x"},  # a handler parameter, not a template variable
+      {"add_generation_prompt": False},  # set by the Jinja formatter itself
+      {"enable_thinking": False},  # with a non-template chat format, see below
+    ]
+    for config in bad_configs:
+      process.cfg_chat_template_kwargs = config
+      if config == bad_configs[3]:
+        process.model = types.SimpleNamespace(chat_handler=None, _chat_handlers={}, chat_format="chatml")
+      with self.assertRaises(ValueError):
+        process._apply_chat_template_kwargs()
+
+  def test_generic_llama_cpp_refuses_a_stop_that_is_not_strings(self):
+    process = _make_llama_cpp_process(cfg_stop=[1, 2])
+
+    with self.assertRaises(ValueError):
+      process._get_stop()
 
   def test_generic_llama_cpp_retries_invalid_output_and_logs_raw_text(self):
     process = _make_llama_cpp_process()

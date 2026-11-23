@@ -1,0 +1,34 @@
+{
+ "pack_id": "test.cyfun-like.v1",
+ "language": "en",
+ "hierarchy": [
+  {
+   "id": "TC",
+   "parent": null,
+   "label": "Test family"
+  },
+  {
+   "id": "TC.A",
+   "parent": "TC",
+   "label": "Area A"
+  },
+  {
+   "id": "TC.A-01",
+   "parent": "TC.A",
+   "label": "Topic A1"
+  },
+  {
+   "id": "TC.B",
+   "parent": "TC",
+   "label": "Area B"
+  }
+ ],
+ "controls": {
+  "TC.A-01.1": {
+   "requirement": "Synthetic requirement text."
+  },
+  "TC.B-01.1": {
+   "guidance": "Synthetic guidance only."
+  }
+ }
+}
