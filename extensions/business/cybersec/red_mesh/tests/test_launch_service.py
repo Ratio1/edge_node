@@ -98,6 +98,7 @@ class TestLaunchService(unittest.TestCase):
           "scan_type": "network",
           "nr_local_workers": 2,
           "port_order": PORT_ORDER_SEQUENTIAL,
+          "exceptions": [3],
         }),
       )
 
@@ -107,6 +108,8 @@ class TestLaunchService(unittest.TestCase):
       sorted(len(worker.worker_target_ports) for worker in local_jobs.values()),
       [2, 2],
     )
+    # Each worker's probe scope is the node's whole port set minus exceptions, not its own batch.
+    self.assertEqual([w.kwargs["job_ports"] for w in local_jobs.values()], [[1, 2, 4], [1, 2, 4]])
 
   def _restored_launch(self, restored, **overrides):
     owner = DummyOwner()
@@ -143,6 +146,7 @@ class TestLaunchService(unittest.TestCase):
     self.assertEqual(jobs["worker-1"].kwargs["comparison_ports"], [443])
     self.assertIsNone(jobs["worker-3"].kwargs["comparison_ports"])
     self.assertEqual(jobs["worker-3"].kwargs["checkpoint_context"], {"pass_nr": 1})
+    self.assertEqual(jobs["worker-3"].kwargs["job_ports"], [2, 4, 9, 17, 30])  # the saved batches
 
   def test_without_restored_workers_are_not_restored(self):
     jobs = self._restored_launch(None)

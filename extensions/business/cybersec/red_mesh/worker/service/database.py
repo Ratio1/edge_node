@@ -1742,11 +1742,16 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       sock.connect((target, port))
       sock.sendall(b"\x00\x01n")
       data, deadline = b"", self._deadline_in(self._ERLANG_DEADLINE)
-      while len(data) < 4096:
-        chunk = self._recv_by(sock, 1024, deadline)
-        if not chunk:
-          break
-        data += chunk
+      try:
+        while len(data) < 4096:
+          chunk = self._recv_by(sock, 1024, deadline)
+          if not chunk:
+            break
+          data += chunk
+      except socket.timeout:
+        if not data:
+          raise
+        data = data[:data.rfind(b"\n") + 1]  # keep the complete node lines; a cut line could misread its port
     except Exception as exc:
       raw["epmd_error"] = str(exc)[:120]
       return probe_result(raw_data=raw, findings=[])

@@ -30,7 +30,7 @@ class FakeSock:
     self.sent += data
 
   def recv(self, n):
-    if self.error:
+    if self.error and not self.inbound:  # serve the scripted bytes, then fail
       raise self.error
     out, self.inbound = self.inbound[:n], self.inbound[n:]
     return out
@@ -98,11 +98,16 @@ class AjpErlangProbeTests(unittest.TestCase):
     return w.state["port_protocols"][1024]
 
   # ── fingerprints ──
-  def test_fingerprint_cpong_is_ajp13(self):
-    self.assertEqual(self._fingerprint({b"\x12\x34\x00\x01\x0a": b"AB\x00\x01\x09"}), "ajp13")
-
-  def test_fingerprint_epmd_names_is_epmd(self):
-    self.assertEqual(self._fingerprint({b"\x00\x01n": _epmd_answer(("couchdb", 40000))}), "epmd")
+  def test_fingerprint_ajp13_and_epmd(self):
+    cping, names = b"\x12\x34\x00\x01\x0a", b"\x00\x01n"
+    for answer_for, protocol in (
+      ({cping: b"AB\x00\x01\x09"}, "ajp13"),
+      ({names: _epmd_answer(("couchdb", 40000))}, "epmd"),
+      ({names: struct.pack(">I", 1024)}, "epmd"),  # empty node list: only the port, the one connected to
+      ({cping: b"AB\x00\x01\x08", names: struct.pack(">I", 4369)}, "unknown"),  # not CPONG; another port
+    ):
+      with self.subTest(protocol=protocol, answer_for=answer_for):
+        self.assertEqual(self._fingerprint(answer_for), protocol)
 
   # ── Ghostcat ──
   def _ajp(self, sock):
@@ -119,6 +124,7 @@ class AjpErlangProbeTests(unittest.TestCase):
     self.assertEqual(finding["confidence"], "certain")
     self.assertIn(b"/WEB-INF/web.xml", sock.sent)
     self.assertIn(b"javax.servlet.include.path_info", sock.sent)
+    self.assertIn(b"/redmesh-ajp", sock.sent)  # a URI that cannot reach the JSP servlet
     self.assertNotIn("SECRET-APP-NAME", json.dumps(result))
 
   def test_ajp_no_finding_without_marker(self):
@@ -131,17 +137,13 @@ class AjpErlangProbeTests(unittest.TestCase):
     self.assertEqual(result["findings"], [])
     self.assertGreater(len(sock.inbound), 0)  # the packet cap ended the read, not EOF
 
-  def test_ajp_uses_a_uri_that_cannot_reach_the_jsp_servlet(self):
-    sock = FakeSock(_ajp_answer(b"x"))
-    self._ajp(sock)
-    self.assertIn(b"/redmesh-ajp", sock.sent)
-
   def test_ajp_timeout_gives_no_finding(self):
     self.assertEqual(self._ajp(FakeSock(error=socket.timeout()))["findings"], [])
 
   # ── CouchDB Erlang cookie ──
-  def _erlang(self, dist_answer, allowed=True, dist_error=None):
-    factory = _factory(FakeSock(_epmd_answer(("couchdb", 40000))), FakeSock(dist_answer, error=dist_error))
+  def _erlang(self, dist_answer, allowed=True, dist_error=None, epmd=_epmd_answer(("couchdb", 40000)),
+              epmd_error=None):
+    factory = _factory(FakeSock(epmd, error=epmd_error), FakeSock(dist_answer, error=dist_error))
     with patch(f"{DB}.socket.socket", side_effect=factory), \
          patch(f"{DB}.random.getrandbits", return_value=MY_CHALLENGE), \
          patch.object(self.worker, "_login_attempts_allowed", return_value=allowed):
@@ -182,16 +184,21 @@ class AjpErlangProbeTests(unittest.TestCase):
     self.assertEqual(result["erlang_handshake"]["outcome"], "out_of_scope")
     self.assertEqual(len(socks), 1)
 
-  def test_erlang_dist_port_in_another_workers_batch_is_in_scope(self):
-    self.worker.initial_ports = [8009]  # this worker's batch; the job scope holds 40000
-    result, socks = self._erlang(_handshake_answer())
+  def test_erlang_epmd_timeout_keeps_the_complete_node_lines(self):
+    epmd = _epmd_answer(("couchdb", 40000)) + b"name half at port 4"  # the last line is cut off
+    result, _ = self._erlang(_handshake_answer(), epmd=epmd, epmd_error=socket.timeout())
+    self.assertNotIn("epmd_error", result)
+    self.assertEqual(result["epmd_nodes"], [{"name": "couchdb", "port": 40000}])
     self.assertEqual(result["erlang_handshake"]["outcome"], "authenticated")
-    self.assertEqual(len(socks), 2)
 
   def test_erlang_refused_statuses_give_no_finding(self):
-    for status, outcome in ((b"snot_allowed", "not_allowed"), (b"salive", "alive"), (b"snok", "nok")):
-      with self.subTest(status=status):
-        result, _ = self._erlang(_handshake_answer(status))
+    new_style = _pkt16(b"sok") + _pkt16(b"N" + bytes(20))  # an OTP 25+ challenge, not the old 'n'
+    for answer, outcome in (
+      (_handshake_answer(b"snot_allowed"), "not_allowed"), (_handshake_answer(b"salive"), "alive"),
+      (_handshake_answer(b"snok"), "nok"), (new_style, "unsupported"),
+    ):
+      with self.subTest(outcome=outcome):
+        result, _ = self._erlang(answer)
         self.assertEqual(result["findings"], [])
         self.assertEqual(result["erlang_handshake"]["outcome"], outcome)
 
