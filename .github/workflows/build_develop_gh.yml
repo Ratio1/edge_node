@@ -58,6 +58,7 @@ jobs:
           build-args: |
             BASE_IMAGE=${{ matrix.base }}
           push: false
+          outputs: type=image,push=false
 
       - name: Disk after
         if: always()
