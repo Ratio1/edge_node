@@ -89,6 +89,15 @@ class TestGatedPathsSendNothing(unittest.TestCase):
       self.assertNotIn(b"root", call.args[0])
     self.assertEqual(result["auth_control"], AUTH_SKIPPED)
 
+  def test_snmp_sends_no_datagram(self):
+    sock = MagicMock()
+    with patch("extensions.business.cybersec.red_mesh.worker.service.infrastructure.socket.socket",
+               return_value=sock):
+      result = _worker(["_service_info_snmp"], ports=(161,))._service_info_snmp("example.com", 161)
+    sock.sendto.assert_not_called()
+    self.assertIsNone(result["banner"])
+    self.assertEqual(result["auth_control"], AUTH_SKIPPED)
+
   def test_web_form_methods_post_nothing(self):
     w = _worker(["_web_test_account_enumeration", "_web_test_rate_limiting"], ports=(80,))
     with patch(f"{_HARD}.requests.post") as post, patch(f"{_HARD}.requests.get") as get:

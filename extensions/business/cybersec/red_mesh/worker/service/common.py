@@ -856,8 +856,8 @@ class _ServiceCommonMixin(_ServiceProbeBase):
   @register_probe(
     display_name="FTP service detection",
     description=(
-      "FTP banner / features / anonymous-login / write-access probes. "
-      "Detects exposed FTP, anonymous read/write, missing FTPS."
+      "FTP banner / features / anonymous-login probes. "
+      "Detects exposed FTP, anonymous login, missing FTPS."
     ),
     category=CATEGORY_SERVICE_INFO,
     default_cwe=(287, 319),
@@ -867,17 +867,16 @@ class _ServiceCommonMixin(_ServiceProbeBase):
   def _service_info_ftp(self, target, port):  # default port: 21
     """
     Assess FTP service security: banner, anonymous access, default creds,
-    server fingerprint, TLS support, write access, and credential validation.
+    server fingerprint, TLS support, and credential validation.
 
     Checks performed (in order):
 
     1. Banner grab and SYST/FEAT fingerprint.
     2. Anonymous login attempt.
-    3. Write access test (STOR) after anonymous login.
-    4. Directory listing and traversal.
-    5. TLS support check (AUTH TLS).
-    6. Default credential check.
-    7. Arbitrary credential acceptance test.
+    3. Directory listing and traversal.
+    4. TLS support check (AUTH TLS).
+    5. Default credential check.
+    6. Arbitrary credential acceptance test.
 
     Parameters
     ----------
@@ -897,7 +896,6 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       "server_type": None,
       "features": [],
       "anonymous_access": False,
-      "write_access": False,
       "tls_supported": False,
       "accepted_credentials": [],
       "directory_listing": None,
@@ -942,8 +940,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         owasp_id="A07:2021",
         cwe_id="CWE-287",
         confidence="certain",
-        # The upload test below always runs (RM-128); when it succeeds its own
-        # finding says `performed`, and "any performed" wins in the report.
+        # Anonymous login only; write access is never tested (RM-256).
         authenticated_action=AUTHENTICATED_ACTION_ATTEMPTED,
       ))
     except Exception:
@@ -997,34 +994,6 @@ class _ServiceCommonMixin(_ServiceProbeBase):
                 ))
             except (ValueError, TypeError):
               pass
-      except Exception:
-        pass
-
-    # --- 3. Write access test (only if anonymous login succeeded) ---
-    if ftp and result["anonymous_access"]:
-      import io
-      try:
-        ftp.set_pasv(True)
-        test_data = io.BytesIO(b"RedMesh write access probe")
-        resp = ftp.storbinary("STOR __redmesh_probe.txt", test_data)
-        if resp and resp.startswith("226"):
-          result["write_access"] = True
-          findings.append(Finding(
-            severity=Severity.CRITICAL,
-            cvss_vector=V.UNAUTHENTICATED_READ_WRITE,
-            title="FTP anonymous write access enabled (file upload possible).",
-            description="Anonymous users can upload files to the FTP server.",
-            evidence="STOR command succeeded with anonymous session.",
-            remediation="Remove write permissions for anonymous FTP users.",
-            owasp_id="A01:2021",
-            cwe_id="CWE-434",
-            confidence="certain",
-            authenticated_action=AUTHENTICATED_ACTION_PERFORMED,
-          ))
-          try:
-            ftp.delete("__redmesh_probe.txt")
-          except Exception:
-            pass
       except Exception:
         pass
 

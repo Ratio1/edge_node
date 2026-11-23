@@ -5,6 +5,7 @@ import struct
 
 import requests
 
+from ...constants import AUTH_SKIPPED
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
 from ...cve_db import check_cves, probe_cve_fields
@@ -193,8 +194,8 @@ class _ServiceInfraMixin(_ServiceProbeBase):
   @register_probe(
     display_name="SNMP service detection",
     description=(
-      "SNMP v1/v2c/v3 detection with default-community probes "
-      "(public/private). Walks system MIB to detect ICS/SCADA "
+      "SNMP v1/v2c/v3 detection with the default community probe "
+      "(public), sent only when active_auth is on. Walks system MIB to detect ICS/SCADA "
       "indicators and leaked interface IPs."
     ),
     category=CATEGORY_SERVICE_INFO,
@@ -218,6 +219,8 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     dict
       Structured findings.
     """
+    if not self._login_attempts_allowed():
+      return probe_result(raw_data={"banner": None, "auth_control": dict(AUTH_SKIPPED)}, findings=[])
     findings = []
     raw = {"banner": None}
     sock = None

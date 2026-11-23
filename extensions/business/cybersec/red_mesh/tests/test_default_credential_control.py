@@ -315,7 +315,7 @@ class TestFtpActionGate(unittest.TestCase):
 
 
 class _FakeAnonymousFtp(_FakeFtp):
-  """Accepts anonymous login and uploads; records every STOR."""
+  """Accepts anonymous login; records any STOR or DELE the probe sends."""
   stored = []
 
   def login(self, user="", passwd=""):
@@ -328,11 +328,12 @@ class _FakeAnonymousFtp(_FakeFtp):
     return "226 Transfer complete"
 
   def delete(self, name):
+    _FakeAnonymousFtp.stored.append("DELE " + name)
     return "250 ok"
 
 
 class TestFtpAnonymousWriteGate(unittest.TestCase):
-  """RM-128: the anonymous upload test always runs."""
+  """RM-256: the probe never uploads or deletes over anonymous FTP."""
 
   def _run(self):
     _FakeAnonymousFtp.stored = []
@@ -341,11 +342,13 @@ class TestFtpAnonymousWriteGate(unittest.TestCase):
     with patch(base + "ftplib.FTP", _FakeAnonymousFtp), patch(base + "check_cves", return_value=[]):
       return worker._service_info_ftp("example.com", 21)
 
-  def test_the_upload_test_always_runs(self):
+  def test_no_stor_or_dele_ever(self):
     result = self._run()
-    self.assertEqual(_FakeAnonymousFtp.stored, ["STOR __redmesh_probe.txt"])
-    self.assertIn("FTP anonymous write access enabled (file upload possible).",
-                  [f["title"] for f in result["findings"]])
+    self.assertEqual(_FakeAnonymousFtp.stored, [])
+    titles = [f["title"] for f in result["findings"]]
+    self.assertIn("FTP allows anonymous login.", titles)
+    self.assertNotIn("FTP anonymous write access enabled (file upload possible).", titles)
+    self.assertNotIn("write_access", result)
 
 
 class _FakeTelnet:
