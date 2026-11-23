@@ -289,6 +289,31 @@ def _utc(value):
   return isinstance(value, str) and datetime.fromisoformat(value).tzinfo == timezone.utc
 
 
+# RM-248: suspend is a state like revoke, outside the hash. `suspended` is absent on a legacy row.
+SUSPEND_FIELDS = ("suspended_by", "suspended_at", "suspend_reason")
+RESUME_FIELDS = ("resumed_by", "resumed_at")
+SUSPEND_STATE_KEYS = ("suspended", *SUSPEND_FIELDS, *RESUME_FIELDS)
+
+
+def _valid_attribution(row, by, at):
+  return (bool(row.get(by)) and canonical_account_id(row[by]) == row[by] and _utc(row.get(at)))
+
+
+def _suspend_state_valid(row):
+  """RM-248: the shape of the suspend and resume fields; a revoked row carries none of them."""
+  if not row["active"]:
+    return not any(key in row for key in SUSPEND_STATE_KEYS)
+  if "suspended" in row and type(row["suspended"]) is not bool:
+    return False
+  if row.get("suspended") is True:
+    return (_valid_attribution(row, "suspended_by", "suspended_at")
+            and normalize_name(row.get("suspend_reason"), 500) == row["suspend_reason"]
+            and not any(key in row for key in RESUME_FIELDS))
+  if any(key in row for key in SUSPEND_FIELDS):
+    return False
+  return not any(key in row for key in RESUME_FIELDS) or _valid_attribution(row, "resumed_by", "resumed_at")
+
+
 def validate_engagement(row, ids):
   """Refuse any stored engagement that creation and revoke could not have written.
 
@@ -331,4 +356,6 @@ def validate_engagement(row, ids):
         or not _utc(row.get("revoked_at"))
         or normalize_name(row.get("revoke_reason"), 500) != row["revoke_reason"]):
     raise ValueError("Invalid engagement revoke")
+  if not _suspend_state_valid(row):
+    raise ValueError("Invalid engagement suspend state")
   canonical_digest(row)

@@ -414,7 +414,7 @@ class TestEngagementsPickAContract(_ContractSetCase):
     request_id = str(uuid4())
     second = ok(self, self.engagement(tenant_id, request_id, contract_id=contract_id))
     self.assertEqual(second["contractSha256"], tenant["contracts"][contract_id]["contract"]["sha256"])
-    self.assertNotIn("contractId", second)
+    self.assertEqual(second["contractId"], contract_id)  # RM-248: the read names the contract
     # Replays: the intent carries the pick only when it was sent.
     self.assertEqual(ok(self, self.engagement(tenant_id, request_id, contract_id=contract_id))["replayed"], True)
     refused(self, self.engagement(tenant_id, request_id), 409, "conflict")

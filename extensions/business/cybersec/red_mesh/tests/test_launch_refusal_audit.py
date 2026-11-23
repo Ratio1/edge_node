@@ -94,6 +94,17 @@ def test_expired_engagement_is_audited():
     assert [row["reason"] for row in rows(fixture.owner_plugin)] == ["engagement_expired"]
 
 
+def test_suspended_and_not_yet_valid_engagements_are_audited():
+  # RM-248
+  with launch_fixture() as fixture:
+    fixture.service.clock = lambda: datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert launch(fixture)["error"] == "engagement_not_yet_valid"
+    fixture.service.clock = lambda: datetime(2026, 10, 15, tzinfo=timezone.utc)
+    fixture.service.suspend_engagement(fixture.actor, fixture.tenant, fixture.engagement_id, "hold")
+    assert launch(fixture)["error"] == "engagement_suspended"
+    assert [row["reason"] for row in rows(fixture.owner_plugin)] == ["engagement_not_yet_valid", "engagement_suspended"]
+
+
 def test_target_is_truncated():
   with launch_fixture() as fixture:
     launch(fixture, target="x" * 1000, engagement_asset_id="ea_2")

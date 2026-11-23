@@ -319,6 +319,7 @@ class TestTenantEngagements(unittest.TestCase):
 
   def test_list_is_newest_first_and_filters_on_active(self):
     with patch("extensions.business.cybersec.red_mesh.tenancy.administration.datetime") as clock:
+      clock.fromisoformat.side_effect = datetime.fromisoformat  # RM-248: the read parses the window
       ids = []
       for day in (1, 3, 2):
         clock.now.return_value = datetime(2026, 9, day, tzinfo=timezone.utc)
@@ -329,6 +330,123 @@ class TestTenantEngagements(unittest.TestCase):
     active = self.service.list_engagements(self.actor, self.tenant, active=True)["data"]["engagements"]
     self.assertEqual([row["engagementId"] for row in active], [ids[1], ids[2]])
     self.refused(self.service.list_engagements(self.actor, self.tenant, active="yes"), 400, "invalid_request")
+
+
+class TestEngagementSuspend(unittest.TestCase):
+  """RM-248: suspend is a reversible state on the row, outside the engagement hash."""
+  setUp_engagements = TestTenantEngagements.setUp
+  new_tenant = TestTenantEngagements.new_tenant
+  fields = TestTenantEngagements.fields
+  default_assets = TestTenantEngagements.default_assets
+  create = TestTenantEngagements.create
+  view = TestTenantEngagements.view
+  refused = TestTenantEngagements.refused
+
+  def setUp(self):
+    self.setUp_engagements()
+    self.service.clock = lambda: datetime(2026, 10, 15, tzinfo=timezone.utc)
+    self.engagement = self.create()["data"]
+    self.id = self.engagement["engagementId"]
+
+  def read(self):
+    return self.service.get_engagement(self.actor, self.tenant, self.id)["data"]["engagement"]
+
+  def test_suspend_and_resume_keep_the_hash_and_replay_without_a_write(self):
+    suspended = self.service.suspend_engagement(self.actor, self.tenant, self.id, " Contract amended ")
+    self.assertTrue(suspended["success"], suspended)
+    data = suspended["data"]
+    self.assertEqual((data["status"], data["suspended"], data["suspendedBy"], data["suspendReason"], data["replayed"]),
+                     ("suspended", True, "creator", "Contract amended", False))
+    self.assertTrue(data["active"])
+    self.assertEqual(data["engagementHash"], self.engagement["engagementHash"])
+    writes = len(self.owner.writes)
+    again = self.service.suspend_engagement(self.actor, self.tenant, self.id, "again")
+    self.assertIs(again["data"]["replayed"], True)
+    self.assertEqual(len(self.owner.writes), writes)
+    resumed = self.service.resume_engagement(self.actor, self.tenant, self.id, "Amendment signed")
+    self.assertTrue(resumed["success"], resumed)
+    data = resumed["data"]
+    self.assertEqual((data["status"], data["suspended"], data["resumedBy"], data["replayed"]),
+                     ("active", False, "creator", False))
+    self.assertNotIn("suspendedBy", data)
+    self.assertEqual(data["engagementHash"], self.engagement["engagementHash"])
+    writes = len(self.owner.writes)
+    self.assertIs(self.service.resume_engagement(self.actor, self.tenant, self.id, "again")["data"]["replayed"], True)
+    self.assertEqual(len(self.owner.writes), writes)
+
+  def test_a_reason_is_required_and_the_engagement_must_exist(self):
+    self.refused(self.service.suspend_engagement(self.actor, self.tenant, self.id, " "), 400, "invalid_request")
+    self.refused(self.service.resume_engagement(self.actor, self.tenant, self.id, None), 400, "invalid_request")
+    self.refused(self.service.suspend_engagement(self.actor, self.tenant, "en_" + str(uuid4()), "x"), 404, "not_found")
+
+  def test_a_revoked_engagement_is_refused_and_a_revoke_ends_the_suspend_state(self):
+    self.assertTrue(self.service.suspend_engagement(self.actor, self.tenant, self.id, "Hold")["success"])
+    self.assertTrue(self.service.revoke_engagement(self.actor, self.tenant, self.id, "Done")["success"])
+    revoked = self.read()
+    self.assertEqual((revoked["status"], revoked["suspended"]), ("revoked", False))
+    self.refused(self.service.suspend_engagement(self.actor, self.tenant, self.id, "x"), 400, "engagement_revoked")
+    self.refused(self.service.resume_engagement(self.actor, self.tenant, self.id, "x"), 400, "engagement_revoked")
+
+  def test_a_revoke_landing_before_the_write_is_not_undone(self):
+    real_get, reads = self.store.get, []
+
+    def get(kind, *ids):
+      row = real_get(kind, *ids)
+      if kind == "engagement":
+        reads.append(1)
+        if len(reads) == 2:  # the re-read before the put: another node revoked meanwhile
+          row = {**row, "active": False, "revoked_by": "other", "revoked_at": "2026-10-15T00:00:00+00:00",
+                 "revoke_reason": "Done"}
+      return row
+    self.store.get = get
+    self.refused(self.service.suspend_engagement(self.actor, self.tenant, self.id, "Hold"), 400, "engagement_revoked")
+    self.store.get = real_get
+    self.assertFalse(self.read()["suspended"])
+
+  def test_status_on_a_frozen_clock(self):
+    def status(day, month=10):
+      self.service.clock = lambda: datetime(2026, month, day, tzinfo=timezone.utc)
+      return self.read()["status"]
+    self.assertEqual((status(15), status(30), status(1, 9)), ("active", "active", "scheduled"))
+    self.assertEqual(status(31), "expired")
+    self.service.suspend_engagement(self.actor, self.tenant, self.id, "Hold")
+    # Revoked beats expired beats scheduled beats suspended, in that order.
+    self.assertEqual((status(15), status(1, 9), status(31)), ("suspended", "scheduled", "expired"))
+    self.service.revoke_engagement(self.actor, self.tenant, self.id, "Done")
+    self.assertEqual(status(31), "revoked")
+
+  def test_the_read_and_the_list_name_the_contract_and_its_replacement(self):
+    listed = self.service.list_engagements(self.actor, self.tenant)["data"]["engagements"][0]
+    self.assertEqual((listed["contractId"], listed["contractSupersededBy"]), ("c_1", None))
+    row = self.store.get("tenant", self.tenant)
+    self.store.put("tenant", self.tenant, record={**row, "contract_superseded_by": "c_2"})
+    for engagement in (self.read(), self.service.list_engagements(self.actor, self.tenant)["data"]["engagements"][0]):
+      self.assertEqual((engagement["contractId"], engagement["contractSupersededBy"]), ("c_1", "c_2"))
+      self.assertEqual(engagement["status"], "active")
+
+  def test_a_legacy_row_reads_as_not_suspended(self):
+    stored = self.store.get("engagement", self.tenant, self.id)
+    self.assertNotIn("suspended", stored)
+    read = self.read()
+    self.assertEqual((read["suspended"], read["status"]), (False, "active"))
+    self.assertNotIn("suspendedBy", read)
+
+  def test_the_validator_refuses_a_malformed_suspend_state(self):
+    from extensions.business.cybersec.red_mesh.tenancy.engagements import validate_engagement
+    row = self.store.get("engagement", self.tenant, self.id)
+    ids = (self.tenant, self.id)
+    at = "2026-10-15T00:00:00+00:00"
+    suspended = {**row, "suspended": True, "suspended_by": "creator", "suspended_at": at, "suspend_reason": "Hold"}
+    validate_engagement(suspended, ids)
+    validate_engagement({**row, "suspended": False, "resumed_by": "creator", "resumed_at": at}, ids)
+    for bad in ({**row, "suspended": "yes"},
+                {**suspended, "suspend_reason": " "},
+                {**suspended, "resumed_by": "creator", "resumed_at": at},
+                {**row, "suspended_by": "creator"},
+                {**row, "resumed_by": "creator"},
+                {**suspended, "active": False, "revoked_by": "creator", "revoked_at": at, "revoke_reason": "Done"}):
+      with self.subTest(bad=bad), self.assertRaises(ValueError):
+        validate_engagement(bad, ids)
 
 
 class TestEngagementTargetGrammar(unittest.TestCase):

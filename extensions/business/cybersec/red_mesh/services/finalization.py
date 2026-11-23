@@ -245,6 +245,7 @@ def _stop_if_engagement_ended(owner, job_specs, *, due):
   if not isinstance(result, dict) or result.get("error"):
     return False
   checks.pop(job_id, None)
+  (getattr(owner, "_pass_holds", None) or {}).pop(job_id, None)
   owner._log_audit_event("continuous_stopped_engagement_ended", {
     "job_id": job_id, "engagement_id": engagement_id, "reason": reason, "pass_nr": job_specs.get("job_pass", 1),
   })
@@ -552,7 +553,9 @@ def maybe_finalize_pass(owner):
 
     new_pass_due = bool(all_finished and next_pass_at and owner.time() >= next_pass_at)
     if (run_mode == RUN_MODE_CONTINUOUS_MONITORING and not (all_finished and next_pass_at is None)
-        and _stop_if_engagement_ended(owner, job_specs, due=new_pass_due)):
+        # RM-248: a held pass is checked on the running-pass cadence, not on every tick.
+        and _stop_if_engagement_ended(owner, job_specs, due=new_pass_due and job_id not in (
+          getattr(owner, "_pass_holds", None) or {}))):
       continue
 
     if all_finished and next_pass_at is None:
@@ -1061,7 +1064,23 @@ def maybe_finalize_pass(owner):
 
     elif run_mode == RUN_MODE_CONTINUOUS_MONITORING and all_finished and next_pass_at and owner.time() >= next_pass_at:
       job_config = owner._get_job_config(job_specs, resolve_secrets=False)
-      if not _execution_operation_allowed(owner, job_specs, operation="new_pass", config=job_config):
+      # RM-248: a pass held for a suspension is re-checked at most once a minute, like a running pass.
+      holds = getattr(owner, "_pass_holds", None)
+      if not isinstance(holds, dict):
+        holds = owner._pass_holds = {}
+      if owner.time() - holds.get(job_id, float("-inf")) < ENGAGEMENT_RECHECK_SECONDS:
+        continue
+      denial = _execution_denial_reason(owner, job_specs, operation="new_pass", config=job_config)
+      holds.pop(job_id, None)
+      if denial is not None:
+        # RM-248: a suspended engagement holds the next pass (the job is neither stopped nor failed);
+        # the first held tick leaves one timeline entry, and the pass starts after the resume.
+        if denial == "engagement_suspended":
+          holds[job_id] = owner.time()
+          held = len(job_specs.get("timeline") or [])
+          _record_execution_denied(owner, job_specs, operation="new_pass", reason=denial, pass_nr=job_pass)
+          if len(job_specs["timeline"]) > held:
+            _write_job_record(owner, job_key, job_specs, context="continuous_hold")
         continue
       job_specs["job_pass"] = job_pass + 1
       job_specs["next_pass_at"] = None

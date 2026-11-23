@@ -23,7 +23,7 @@ from .nodes import NODE_ASSIGNMENT_MODES, node_assignment_mode, valid_node_addre
 from .deployment_nodes import named_entry, node_readiness
 from .assets import canonical_digest, normalize_name, valid_digest
 from .integrations import integration_ids, valid_integration_id
-from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, EngagementInvalid, document_id_for, engagement_hash,
+from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, SUSPEND_STATE_KEYS, EngagementInvalid, document_id_for, engagement_hash,
                           engagement_id_for, normalize_asset_requests, normalize_context,
                           build_engagement_assets, normalize_engagement_assets, normalize_window, valid_doc_ref, valid_engagement_id)
 from . import (account_profile, drafts, engagement_drafts, super_tenant_branding, super_tenant_integrations, super_tenant_profile,
@@ -865,9 +865,14 @@ class TenantAdministrationService:
     """
     if row["active"] is not True:
       raise AdministrationDenied(400, "engagement_revoked")
+    # RM-248: revoked, not yet valid, expired, then suspended.
     now = self.clock()
-    if not (datetime.fromisoformat(row["valid_from"]) <= now < datetime.fromisoformat(row["valid_until"])):
+    if now < datetime.fromisoformat(row["valid_from"]):
+      raise AdministrationDenied(400, "engagement_not_yet_valid")
+    if now >= datetime.fromisoformat(row["valid_until"]):
       raise AdministrationDenied(400, "engagement_expired")
+    if row.get("suspended") is True:
+      raise AdministrationDenied(400, "engagement_suspended")
     contract, legal = tenant.get("contract"), tenant.get("legal")
     # RM-133: the engagement was created under one of the tenant's contracts (`c_1` or a further
     # one, superseded included); the contract cannot change after creation (there is no attach
@@ -938,13 +943,15 @@ class TenantAdministrationService:
     except (ValueError, TypeError, RecursionError) as exc:
       raise TenantStoreError("Invalid stored execution facts") from exc
 
-  def reauthorize_execution(self, binding, *, worker_node=None):
+  def reauthorize_execution(self, binding, *, worker_node=None, new_pass=False):
     """Re-read original execution authority; preserve every field in the saved binding.
 
     RM-107: authority is the engagement entry the job was bound to, unchanged (same hash, same
     target), plus `tasks:launch` and Allow Pentester. The engagement's window and revoke are not
     checked here: the engagement-end hard stop (`engagement_end_reason`) owns them, so a stop's own
     finalization is never refused. A schema-1 binding (a tenant asset row) is never reauthorized.
+    RM-248: with `new_pass`, a suspended engagement is refused (`engagement_suspended`): the job holds
+    its next pass. The current pass's checks never pass it, so a running pass is not cut off.
     """
     try:
       saved = (binding if isinstance(binding, ExecutionBinding) else ExecutionBinding(binding)).to_dict()
@@ -962,6 +969,8 @@ class TenantAdministrationService:
     current = self._entry_facts(row, entry)
     if any(current[key] != saved[key] for key in current):
       raise AdministrationDenied(409, "invalid_execution_binding")
+    if new_pass and row.get("suspended") is True:
+      raise AdministrationDenied(409, "engagement_suspended")
     # RM-102: eligibility here includes a draining row (no job check); a stale job view on this
     # backend node must never cut off a job that is actually still running.
     eligible = self._reauth_eligible_nodes(saved["tenant_id"])
@@ -1078,9 +1087,33 @@ class TenantAdministrationService:
     return {"sha256": ref["sha256"], "filename": ref["filename"], "mime": ref["mime"],
             "sizeBytes": ref["size_bytes"], "uploadedAt": ref["uploaded_at"]}
 
-  def _engagement_row(self, row):
+  def _engagement_status(self, row):
+    """RM-248: the lifecycle state on the backend clock: revoked, expired, scheduled, suspended, active."""
+    now = self.clock()
+    if not row["active"]:
+      return "revoked"
+    if now >= datetime.fromisoformat(row["valid_until"]):
+      return "expired"
+    if now < datetime.fromisoformat(row["valid_from"]):
+      return "scheduled"
+    return "suspended" if row.get("suspended") is True else "active"
+
+  @staticmethod
+  def _engagement_contract(tenant, sha256):
+    """RM-248: `(contract id, its superseded_by)` of the contract with this sha256, `c_1` first."""
+    contract = tenant.get("contract")
+    if _valid_contract(contract) and contract["sha256"] == sha256:
+      return tenant_contracts.FIRST_CONTRACT_ID, tenant.get("contract_superseded_by")
+    for contract_id, block in _contract_blocks(tenant).items():
+      if block["contract"]["sha256"] == sha256:
+        return contract_id, block["superseded_by"]
+    return None, None
+
+  def _engagement_row(self, row, tenant=None):
     if row is None:
       raise TenantStoreError("Engagement readback is unavailable")
+    contract_id, superseded_by = self._engagement_contract(
+      tenant or self.store.get("tenant", row["tenant_id"]) or {}, row["contract_sha256"])
     assets = [{"engagementAssetId": entry["engagement_asset_id"], "assetId": entry["asset_id"],
                "displayName": entry["display_name"], "kind": entry["kind"], "target": entry["target"],
                "targetDigest": entry["target_digest"]} for entry in row["assets"]]
@@ -1097,6 +1130,11 @@ class TenantAdministrationService:
       # No registry function anchors an arbitrary hash yet (owner, 2026-09-28): always pending.
       "anchor": {"status": "pending"},
       "active": row["active"], "createdBy": row["created_by"], "createdAt": row["created_at"],
+      "status": self._engagement_status(row), "contractId": contract_id, "contractSupersededBy": superseded_by,
+      "suspended": row.get("suspended") is True,
+      **({"suspendedBy": row["suspended_by"], "suspendedAt": row["suspended_at"],
+          "suspendReason": row["suspend_reason"]} if row.get("suspended") is True else {}),
+      **({"resumedBy": row["resumed_by"], "resumedAt": row["resumed_at"]} if "resumed_by" in row else {}),
       **({"revokedBy": row["revoked_by"], "revokedAt": row["revoked_at"],
           "revokeReason": row["revoke_reason"]} if not row["active"] else {}),
     }
@@ -1239,14 +1277,15 @@ class TenantAdministrationService:
       if (existing["create_intent_digest"] != record["create_intent_digest"]
           or existing["created_by"] != account.account_id):
         raise AdministrationDenied(409, "conflict")
-      return {**self._engagement_row(existing), "replayed": True}
+      return {**self._engagement_row(existing, tenant), "replayed": True}
     if supersedes is not None and (supersedes == engagement_id
                                    or self.store.get("engagement", tenant_id, supersedes) is None):
       raise AdministrationDenied(400, "supersedes_invalid")
     record = self._with_assets(record, self._engagement_assets(request["assets"], {"tenant_id": tenant_id}))
     self.store.put("engagement", tenant_id, engagement_id, record=record)
     # `replayed` says whether this call wrote, decided under the lock (the plugin audits on it).
-    return {**self._engagement_row(self.store.get("engagement", tenant_id, engagement_id)), "replayed": False}
+    return {**self._engagement_row(self.store.get("engagement", tenant_id, engagement_id), tenant),
+            "replayed": False}
 
   def _engagement_assets(self, requests, parent, kept=()):
     """RM-125 phase 2b: the stored entries for normalized request entries, each copied from the
@@ -1302,7 +1341,7 @@ class TenantAdministrationService:
     rows = [row for row in self.store.list_engagements(tenant_id) if active is None or row["active"] is active]
     rows.sort(key=lambda row: row["engagement_id"])
     rows.sort(key=lambda row: row["created_at"], reverse=True)
-    return {"tenantId": tenant_id, "engagements": [self._engagement_row(row) for row in rows],
+    return {"tenantId": tenant_id, "engagements": [self._engagement_row(row, tenant) for row in rows],
             "canCreateEngagements": self._permission(account, tenant, "engagements:create"),
             "canRevokeEngagements": self._permission(account, tenant, "engagements:revoke")}
 
@@ -1312,13 +1351,13 @@ class TenantAdministrationService:
     row = self.store.get("engagement", tenant_id, self._engagement_id(engagement_id))
     if row is None:
       raise AdministrationDenied(404, "not_found")
-    return {"engagement": self._engagement_row(row),
+    return {"engagement": self._engagement_row(row, tenant),
             "canRevokeEngagements": self._permission(account, tenant, "engagements:revoke"),
             "canDownloadDocuments": self._permission(account, tenant, "engagements:documents")}
 
   @_endpoint
   def revoke_engagement(self, actor, tenant_id, engagement_id, reason):
-    _, account = self._authorized_tenant(actor, tenant_id, "engagements:revoke")
+    tenant, account = self._authorized_tenant(actor, tenant_id, "engagements:revoke")
     engagement_id = self._engagement_id(engagement_id)
     try:
       reason = normalize_name(reason, 500)
@@ -1328,11 +1367,55 @@ class TenantAdministrationService:
     if row is None:
       raise AdministrationDenied(404, "not_found")
     if not row["active"]:
-      return {**self._engagement_row(row), "replayed": True}
+      return {**self._engagement_row(row, tenant), "replayed": True}
+    # RM-248: a revoke ends the suspend state with the engagement.
     self.store.put("engagement", tenant_id, engagement_id, record={
-      **row, "active": False, "revoked_by": account.account_id,
+      **{key: value for key, value in row.items() if key not in SUSPEND_STATE_KEYS},
+      "active": False, "revoked_by": account.account_id,
       "revoked_at": datetime.now(timezone.utc).isoformat(), "revoke_reason": reason})
-    return {**self._engagement_row(self.store.get("engagement", tenant_id, engagement_id)), "replayed": False}
+    return {**self._engagement_row(self.store.get("engagement", tenant_id, engagement_id), tenant),
+            "replayed": False}
+
+  def _change_suspension(self, actor, tenant_id, engagement_id, reason, suspend):
+    """RM-248: suspend or resume an engagement (`engagements:revoke`, a Super-Tenant Admin, D-02).
+
+    Replay-safe: suspending a suspended engagement, or resuming one that is not, writes nothing. A
+    revoked engagement is refused. The state is outside the engagement hash.
+    """
+    tenant, account = self._authorized_tenant(actor, tenant_id, "engagements:revoke")
+    engagement_id = self._engagement_id(engagement_id)
+    try:
+      reason = normalize_name(reason, 500)
+    except (ValueError, TypeError):
+      raise AdministrationDenied(400, "invalid_request") from None
+    row = self.store.get("engagement", tenant_id, engagement_id)
+    if row is None:
+      raise AdministrationDenied(404, "not_found")
+    if not row["active"]:
+      raise AdministrationDenied(400, "engagement_revoked")
+    if (row.get("suspended") is True) is suspend:
+      return {**self._engagement_row(row, tenant), "replayed": True}
+    # Read again just before the write: a revoke from another node that landed meanwhile is not undone.
+    # The rest of the window (a write that races this put) is last-writer-wins, a known limit.
+    row = self.store.get("engagement", tenant_id, engagement_id)
+    if row is None or not row["active"]:
+      raise AdministrationDenied(400, "engagement_revoked")
+    now = datetime.now(timezone.utc).isoformat()
+    kept = {key: value for key, value in row.items() if key not in SUSPEND_STATE_KEYS}
+    self.store.put("engagement", tenant_id, engagement_id, record={
+      **kept, **({"suspended": True, "suspended_by": account.account_id, "suspended_at": now,
+                  "suspend_reason": reason} if suspend else
+                 {"suspended": False, "resumed_by": account.account_id, "resumed_at": now})})
+    return {**self._engagement_row(self.store.get("engagement", tenant_id, engagement_id), tenant),
+            "replayed": False}
+
+  @_endpoint
+  def suspend_engagement(self, actor, tenant_id, engagement_id, reason):
+    return self._change_suspension(actor, tenant_id, engagement_id, reason, True)
+
+  @_endpoint
+  def resume_engagement(self, actor, tenant_id, engagement_id, reason):
+    return self._change_suspension(actor, tenant_id, engagement_id, reason, False)
 
   @_endpoint
   def engagement_document_ref(self, actor, tenant_id, engagement_id, document_id):
