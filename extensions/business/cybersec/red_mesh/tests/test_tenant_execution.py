@@ -254,7 +254,8 @@ class TestTenantExecution(unittest.TestCase):
     # written back in (release once more, then a fresh assignment).
     self.service.tenant_node_jobs_reader = lambda tenant_id, node_address: False
     self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"],
-                     [{"nodeAddress": "node-b", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None}])
+                     [{"nodeAddress": "node-b", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None,
+                       "readiness": {"online": None, "lastSeen": None, "inDeployment": True, "state": "unknown"}}])
 
   def test_the_launch_set_of_a_node_less_contract_is_its_active_assignments(self):
     """RM-211: a released row leaves the set and is refused `not_assigned`; a draining row stays listed,

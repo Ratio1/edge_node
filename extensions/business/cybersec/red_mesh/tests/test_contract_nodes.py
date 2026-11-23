@@ -265,7 +265,7 @@ class TestEngagementLaunchNodes(_ContractSetCase):
                      [("Node-A", True, None)])
     self.assertEqual([(n["nodeAddress"], n["eligible"], n["reason"]) for n in self.launch_nodes(tenant_id, second)],
                      [("Node-B", True, None)])
-    self.assertEqual(set(self.launch_nodes(tenant_id, first)[0]), {"nodeAddress", "alias", "tags", "eligible", "reason"})
+    self.assertEqual(set(self.launch_nodes(tenant_id, first)[0]), {"nodeAddress", "alias", "tags", "readiness", "eligible", "reason"})
     self.assertEqual(self.admitted(tenant_id, first), ["Node-A"])
     self.assertEqual(self.admitted(tenant_id, first, []), ["Node-A"])
     self.assertEqual(self.admitted(tenant_id, second), ["Node-B"])
@@ -305,6 +305,18 @@ class TestEngagementLaunchNodes(_ContractSetCase):
     self.assertEqual(self.refusal(tenant_id, first, ["Node-B"]), [{"nodeAddress": "Node-B", "reason": "not_in_contract", "alias": None}])
     self.assertEqual(self.refusal(tenant_id, first, ["Node-C"]), [{"nodeAddress": "Node-C", "reason": "not_assigned"}])
     self.assertEqual(self.admitted(tenant_id, second), ["Node-B"])
+
+  def test_the_launch_nodes_carry_readiness_from_the_peer_set_and_the_monitor(self):
+    """RM-212: a listed node that is not a peer reads `not_in_deployment` (the ven4 case) even when online."""
+    tenant_id, first, _ = self.amended()
+    self.service.node_directory_reader = lambda addresses: {
+      address: {"alias": None, "tags": [], "ip": None, "online": True, "last_seen": "2026-11-23T01:00:00+00:00"}
+      for address in addresses}
+    self.assertEqual(self.launch_nodes(tenant_id, first)[0]["readiness"], {
+      "online": True, "lastSeen": "2026-11-23T01:00:00+00:00", "inDeployment": True, "state": "ready"})
+    self.service.configured_peers_reader = lambda: ["Node-B"]
+    self.assertEqual(self.launch_nodes(tenant_id, first)[0]["readiness"], {
+      "online": True, "lastSeen": "2026-11-23T01:00:00+00:00", "inDeployment": False, "state": "not_in_deployment"})
 
   def test_the_refusal_names_an_alias_only_inside_the_contract_and_the_assignments(self):
     tenant_id, first, _ = self.amended()

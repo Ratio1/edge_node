@@ -20,7 +20,7 @@ from .policy import (PLATFORM_ROLES, TENANT_LOCAL_ROLES, TenantPolicyContext, au
 from .execution import CurrentExecutionFacts, ExecutionBinding, ResolvedExecutionContext
 from .ports import TenantStoreError
 from .nodes import NODE_ASSIGNMENT_MODES, node_assignment_mode, valid_node_address
-from .deployment_nodes import named_entry
+from .deployment_nodes import named_entry, node_readiness
 from .assets import canonical_digest, normalize_name, valid_digest
 from .integrations import integration_ids, valid_integration_id
 from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, EngagementInvalid, document_id_for, engagement_hash,
@@ -162,7 +162,7 @@ def _contract_nodes(tenant):
 
 
 # RM-211: what `_engagement_launch_set` read: see its docstring.
-LaunchSet = namedtuple("LaunchSet", "considered reasons fixed others active")
+LaunchSet = namedtuple("LaunchSet", "considered reasons fixed others active peers")
 
 
 def _contract_sha256s(tenant):
@@ -799,7 +799,7 @@ class TenantAdministrationService:
     active assignments minus every node another contract of the tenant lists, so an amended tenant
     never lends `c_2`-only nodes to a `c_1` engagement. Returns a `LaunchSet`: the addresses listed,
     `{address: reason or None}`, whether the contract lists nodes, the other contracts' addresses and
-    the active assignment addresses (the one assignment read)."""
+    the active assignment addresses (the one assignment read) and the configured peers (the one peer read)."""
     blocks = _contract_blocks(tenant)
     by_sha = {tenant["contract"]["sha256"]: tenant_contracts.FIRST_CONTRACT_ID,
               **{block["contract"]["sha256"]: contract_id for contract_id, block in blocks.items()}}
@@ -822,7 +822,7 @@ class TenantAdministrationService:
         return "draining"
       return None if address in peers else "not_a_peer"
     return LaunchSet(considered, {address: reason(address) for address in considered}, fixed, others,
-                     {address for address, assignment in assigned.items() if assignment["active"]})
+                     {address for address, assignment in assigned.items() if assignment["active"]}, peers)
 
   def _launch_refusal_nodes(self, launch, refused):
     """RM-211: `[{nodeAddress, reason[, alias]}]` for the refused addresses. The alias is added only
@@ -842,8 +842,9 @@ class TenantAdministrationService:
   @_endpoint
   def get_engagement_launch_nodes(self, actor, tenant_id, engagement_id):
     """RM-211: the launch set of one engagement, for the new-task picker: its contract's nodes, each
-    `{nodeAddress, alias, tags, eligible, reason}`; a node-less contract lists the assignments it
-    considered. Assigned nodes outside the contract are not listed. Same checks as admission."""
+    `{nodeAddress, alias, tags, eligible, reason, readiness}` (readiness: RM-212); a node-less contract
+    lists the assignments it considered. Assigned nodes outside the contract are not listed. Same
+    checks as admission."""
     tenant, _, row, _ = self._execution_entry_for_account(
       self._actor(actor), tenant_id, engagement_id, None, with_entry=False)
     self._execution_engagement(tenant, row, None)
@@ -853,6 +854,7 @@ class TenantAdministrationService:
     return {"tenantId": tenant_id, "engagementId": row["engagement_id"],
             "nodes": [{"nodeAddress": address, **{key: value for key, value in named_entry(directory, address).items()
                                                   if key != "ip"},
+                       "readiness": node_readiness(directory, address, address in launch.peers),
                        "eligible": reasons[address] is None, "reason": reasons[address]} for address in considered]}
 
   def _execution_engagement(self, tenant, row, entry):
@@ -1035,8 +1037,15 @@ class TenantAdministrationService:
     directory = self._node_directory(node["nodeAddress"] for node in nodes)
     # RM-127: a tenant whose contract lists its nodes keeps them; amendments will change them.
     fixed = bool(_contract_nodes(tenant))
+    # RM-212: readiness; an unreadable peer list leaves `inDeployment` null, it does not fail the read.
+    try:
+      peers = self._configured_peers()
+    except TenantStoreError:
+      peers = None
     return {"tenantId": tenant_id,
-            "nodes": [{**node, **named_entry(directory, node["nodeAddress"])} for node in nodes],
+            "nodes": [{**node, **named_entry(directory, node["nodeAddress"]), "readiness": node_readiness(
+              directory, node["nodeAddress"], None if peers is None else node["nodeAddress"] in peers)}
+                      for node in nodes],
             "canManageAssignments": not fixed and authorize_tenant_operation(
               account, "node_assignments:manage", TenantPolicyContext(
                 tenant_id, tenant["active"], tenant["allow_pentester"])).allowed,
@@ -1051,7 +1060,8 @@ class TenantAdministrationService:
     self._actor(actor, creator=True)
     peers = self._configured_peer_list()
     directory = self._node_directory(peers)
-    return {"nodes": [{"nodeAddress": peer, **named_entry(directory, peer)} for peer in peers]}
+    return {"nodes": [{"nodeAddress": peer, **named_entry(directory, peer), "readiness": node_readiness(
+      directory, peer, True)} for peer in peers]}
 
   @staticmethod
   def _permission(account, tenant, operation):

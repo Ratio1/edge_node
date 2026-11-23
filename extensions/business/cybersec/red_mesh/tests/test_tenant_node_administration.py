@@ -12,6 +12,10 @@ from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
 from .contract_fixture import contract_terms
 
 
+# RM-212: no network monitor behind the service here, so a configured peer reads as `unknown`.
+UNKNOWN = {"online": None, "lastSeen": None, "inDeployment": True, "state": "unknown"}
+
+
 def assignment_location(*ids):
   # Independent contract fixture: do not derive physical corruption keys from the adapter.
   return ('["redmesh","tenancy",1,"deployment"]',
@@ -31,6 +35,20 @@ class TestTenantNodeAdministration(unittest.TestCase):
                                               tenant_node_jobs_reader=self.has_running_job)
     self.actor = {"account_id": "creator"}
     self.tenant = self.create_tenant("one")
+
+  def test_a_peer_list_that_cannot_be_read_leaves_in_deployment_null_and_the_read_answers(self):
+    """RM-212: `get_tenant_nodes` does not fail with the peer list; readiness goes `unknown`."""
+    self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True)
+    self.service.node_directory_reader = lambda addresses: {
+      address: {"alias": None, "tags": [], "ip": None, "online": True, "last_seen": None} for address in addresses}
+
+    def explode():
+      raise RuntimeError("peers")
+    self.service.configured_peers_reader = explode
+    result = self.service.get_tenant_nodes(self.actor, self.tenant)
+    self.assertTrue(result["success"], result)
+    self.assertEqual(result["data"]["nodes"][0]["readiness"],
+                     {"online": True, "lastSeen": None, "inDeployment": None, "state": "unknown"})
 
   def has_running_job(self, tenant_id, node_address):
     return self.jobs.get((tenant_id, node_address), False)
@@ -56,12 +74,12 @@ class TestTenantNodeAdministration(unittest.TestCase):
       self.assertEqual(result["data"], {"tenantId": self.tenant, "nodeAddress": address, "active": True,
                                         "mode": "shared", "state": "assigned"})
     self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"],
-                     [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None},
-                      {"nodeAddress": "Node-B", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None}])
+                     [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None, "readiness": UNKNOWN},
+                      {"nodeAddress": "Node-B", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None, "readiness": UNKNOWN}])
     self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-B", False)
     view = self.service.get_tenant_nodes({"account_id": "initial"}, self.tenant)["data"]
     self.assertEqual(view, {"tenantId": self.tenant,
-                            "nodes": [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None}],
+                            "nodes": [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None, "readiness": UNKNOWN}],
                             "canManageAssignments": False, "nodesFixed": False})
 
   def test_activation_requires_lazy_valid_current_config_even_on_retry(self):
@@ -114,7 +132,7 @@ class TestTenantNodeAdministration(unittest.TestCase):
                   ["tenant_node", "foreign", self.tenant, None]):
       # Noncanonical whitespace, malformed IDs and payload are foreign to this projection.
       self.owner.data[(hkey, json.dumps(field))] = "private corrupt data"
-    expected = [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None}]
+    expected = [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None, "readiness": UNKNOWN}]
     self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"], expected)
     for ids in ((self.tenant,), (self.tenant, "Node-B", "extra"), (self.tenant, None)):
       with self.subTest(ids=ids):
@@ -168,7 +186,9 @@ class TestTenantNodeAdministration(unittest.TestCase):
         self.service.configured_peers_reader = reader
         view = self.service.get_tenant_nodes(member, self.tenant)
         self.assertEqual(view["data"]["canManageAssignments"], role == "super_tenant_admin")
-        reader.assert_not_called()
+        # RM-212: the authorized read now reads the peers once, for `readiness.inDeployment`.
+        reader.assert_called_once()
+        reader.reset_mock()
         before = len(self.owner.writes)
         result = self.service.set_tenant_node_assignment(member, self.tenant, "Node-A", True)
         self.assertEqual(result["status_code"], 200 if role == "super_tenant_admin" else 403)
@@ -238,7 +258,7 @@ class TestTenantNodeAdministration(unittest.TestCase):
     second_owner.data = self.owner.data
     second_service = TenantAdministrationService(CstoreAuthAccountReader(second_owner),
       CstoreTenantAdministrationStore(second_owner, "deployment"),
-      tenant_node_jobs_reader=self.has_running_job)
+      configured_peers_reader=lambda: self.peers, tenant_node_jobs_reader=self.has_running_job)
     for tenant in (self.tenant, other):
       self.assertEqual(second_service.get_tenant_nodes(self.actor, tenant),
                        self.service.get_tenant_nodes(self.actor, tenant))
@@ -321,7 +341,7 @@ class TestTenantNodeAdministration(unittest.TestCase):
     del row["mode"]
     self.store.put("tenant_node", self.tenant, "Node-A", record=row)
     view = self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"]
-    self.assertEqual(view, [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None}])
+    self.assertEqual(view, [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None, "readiness": UNKNOWN}])
     other = self.create_tenant("other")
     # The legacy row is offered for a shared request (idempotent for its own tenant, additive for
     # another) and blocks a private one, exactly as a `mode: "shared"` row would.
@@ -366,7 +386,7 @@ class TestTenantNodeAdministration(unittest.TestCase):
     self.jobs[(self.tenant, "Node-A")] = True
     self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["success"])
     self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"],
-                     [{"nodeAddress": "Node-A", "mode": "shared", "state": "draining", "alias": None, "tags": [], "ip": None}])
+                     [{"nodeAddress": "Node-A", "mode": "shared", "state": "draining", "alias": None, "tags": [], "ip": None, "readiness": UNKNOWN}])
     for mode in ("shared", "private"):
       self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True, mode)["error"],
                        "node_draining")
@@ -381,7 +401,7 @@ class TestTenantNodeAdministration(unittest.TestCase):
     leftover = {**self.store.get("tenant_node", self.tenant, "Node-A"), "active": False}
     self.owner.data[assignment_location(self.tenant, "Node-A")] = leftover
     self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"],
-                     [{"nodeAddress": "Node-B", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None}])
+                     [{"nodeAddress": "Node-B", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None, "readiness": UNKNOWN}])
     self.assertEqual(self.service._reauth_eligible_nodes(self.tenant), ["Node-B"])
     before = len(self.owner.writes)
     self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["data"]["state"],
