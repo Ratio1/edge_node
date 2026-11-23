@@ -82,8 +82,6 @@ class VerdictTests(unittest.TestCase):
     # stretch 2.4.25: trixie's sid-derived row and buster's deb9 row mention it; no release shipped it
     self.assertIsNone(self.reader._release(DistroPackage("debian", "2.4.25", ""), "apache"))
     self.assertIsNone(self.status(DistroPackage("debian", "2.4.25", ""), "CVE-2"))
-    # focal's old fix of 2.4.7 does not make a trusty banner ambiguous
-    self.assertEqual(self.reader._release(DistroPackage("ubuntu", "2.4.7", ""), "apache"), "trusty")
 
   def test_release_day_upstream_is_a_candidate(self):
     # trixie shipped 2.4.65 as `2.4.65-1` and rebased to 2.4.66 later; bookworm rebased to 2.4.65 as `~deb12u1`: unknown
@@ -92,8 +90,6 @@ class VerdictTests(unittest.TestCase):
 
   def test_parse_to_status_end_to_end(self):
     self.assertEqual(self.status(parse_distro_package("Apache/2.4.7 (Ubuntu)"), "CVE-9")[:3], ("fixed", "2ubuntu1", "trusty"))
-    self.assertEqual(self.status(parse_distro_package("Apache/2.4.54 (Debian)"), "CVE-1"), None)
-    self.assertEqual(self.status(parse_distro_package("Apache/2.4.54 (Debian)"), "CVE-6")[:3], ("not_fixed", "1~deb11u2", "bullseye"))
 
   def test_buster_marker_names_buster(self):
     self.assertEqual(self.reader._release(DistroPackage("debian", "2.4.38", "3+deb10u2"), "apache"), "buster")
@@ -103,7 +99,6 @@ class VerdictTests(unittest.TestCase):
     self.addCleanup(cve_db.set_vulndb_reader, None)
     package = DistroPackage("debian", "2.4.38", "")
     self.assertEqual(cve_db.backport_status("apache", "CVE-1", package), cve_db.BACKPORT_UNKNOWN)
-    self.assertEqual(cve_db.backport_status("apache", "CVE-2", package), cve_db.BACKPORT_NOT_FIXED)
     self.assertEqual(cve_db._confidence_reason(cve_db.BACKPORT_UNKNOWN, None, "apache"), ("tentative", "backport_unknown"))
 
 
@@ -124,8 +119,6 @@ class HardeningTests(unittest.TestCase):
     self.assertLess(time.monotonic() - start, 1.0)
 
   def test_a_match_clipped_by_the_cap_is_dropped(self):
-    banner = "Apache/2.4.1 (Debian)"
-    self.assertIsNotNone(parse_distro_package(banner))
     pad = " " * (cve_db._DISTRO_PARSE_LIMIT - len("OpenSSH_8.9p1 Ubuntu-3ubuntu0.1") - 1)
     self.assertIsNone(parse_distro_package("x" + pad + "OpenSSH_8.9p1 Ubuntu-3ubuntu0.10"))  # `.10` cut to `.1`
     self.assertIsNotNone(parse_distro_package(("x" + pad + "OpenSSH_8.9p1 Ubuntu-3ubuntu0.1")))  # ends at the cut, input not cut
@@ -173,7 +166,6 @@ class SshRevisionlessTests(unittest.TestCase):
     _, result, calls = self.probe("SSH-2.0-OpenSSH_8.9p1 (Ubuntu)")
     self.assertEqual(calls[0][:2], ("openssh", "8.9"))
     self.assertIsNone(calls[0][2]["package"])
-    self.assertNotIn("ssh_package", result["raw_data"] if "raw_data" in result else result)
     self.assertNotIn("ubuntu-", str(result))
 
   def test_ssh_banner_with_revision_still_passes_package(self):

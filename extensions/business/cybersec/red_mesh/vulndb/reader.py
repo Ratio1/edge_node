@@ -75,7 +75,7 @@ def _lower_at_or_above(clauses, oldest):
   return any(_compare_versions(t, oldest) >= 0 for t in lowers)
 
 
-# Debian release by the `debNNuM` marker of a revision. bullseye maps to a name the table has no rows for (no tracker data).
+# Debian release by the `debNNuM` marker of a revision: a marked fix counts as a release's own upstream only when its marker names that release.
 _DEBIAN_RELEASES = {"10": "buster", "11": "bullseye", "12": "bookworm", "13": "trixie"}
 _DEB_MARK = re.compile(r"deb(\d+)u\d")
 # The meta key that proves the file carries rows of a distribution (schema 1.0.1); without it the table, if any, is not data.
@@ -99,10 +99,10 @@ def _own_upstreams(distro, release, versions):
 
   Lower unmarked versions predate the release (sid-derived `2.4.38-3` in bookworm); Ubuntu has no marker.
   """
-  marked = [v for v in versions if distro == "debian" and _DEB_MARK.search(v)]
-  own = {_split_version(v)[0] for v in marked if _DEBIAN_RELEASES.get(_DEB_MARK.search(v).group(1)) == release}
+  marks = {v: m.group(1) for v in versions if (m := _DEB_MARK.search(v))} if distro == "debian" else {}
+  own = {_split_version(v)[0] for v, mark in marks.items() if _DEBIAN_RELEASES.get(mark) == release}
   try:
-    top = max((_split_version(v) for v in versions if v not in marked), key=cmp_to_key(_compare_full), default=None)
+    top = max((_split_version(v) for v in versions if v not in marks), key=cmp_to_key(_compare_full), default=None)
   except ValueError:  # a version dpkg-compare cannot read: no release-day upstream
     top = None
   return own | ({top[0]} if top else set())
