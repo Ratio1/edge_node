@@ -222,6 +222,7 @@ def build_cve_view(findings, not_applicable=(), triage=None, now=None):
   eol = {(f.get("port"), f["tags"][1]): f["finding_id"] for f in findings
          if isinstance(f, dict) and f.get("vulndb_build_id") and f.get("finding_id")
          and len(f.get("tags") or ()) > 1 and f["tags"][0] == "vulndb_eol"}
+  eol_closed = {fid for fid in eol.values() if _is_closed({"finding_id": fid}, triage, now)}
   services = []
   totals = {"listed": 0, "rolled_up": 0, "possible": 0, "folded": 0}
   for (port, product), members in sorted(groups.items(), key=lambda kv: _service_order(*kv[0])):
@@ -232,8 +233,9 @@ def build_cve_view(findings, not_applicable=(), triage=None, now=None):
       if f.get("confidence") != "tentative":
         continue
       reason = f.get("confidence_reason")
-      # An end-of-life row folds only when the unsupported-version finding exists; a KEV one stays possible.
-      folds = reason == FOLD_REASON or (reason == EOL_FOLD_REASON and unsupported and not effective_kev(f))
+      # An end-of-life row folds only under an open unsupported-version finding; a KEV one stays possible.
+      folds = reason == FOLD_REASON or (reason == EOL_FOLD_REASON and unsupported and not effective_kev(f)
+                                        and unsupported not in eol_closed)
       (unverified if folds else tentative).append(f)
     candidates = [f for f in firm if _is_listed(f)]
     listed, overflow = candidates[:MAX_LISTED], candidates[MAX_LISTED:]

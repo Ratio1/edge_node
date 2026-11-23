@@ -184,6 +184,9 @@ class CveViewTests(unittest.TestCase):
     closed = build_cve_view(rows + [eol], triage={"id0001": "false_positive"})
     conserved(self, closed)
     self.assertEqual((closed["counts"]["folded"], closed["counts"]["closed"]), (2, 1))
+    eol_closed = build_cve_view(rows + [eol], triage={"eol1": "false_positive"})  # a closed pointer folds nothing
+    conserved(self, eol_closed)
+    self.assertEqual(eol_closed["counts"]["folded"], 1)  # the banner_unverified row only
 
   def test_a_service_with_only_folded_rows_and_closed_wins(self):
     findings = [fnd(1, confidence="tentative", reason="banner_unverified"),
