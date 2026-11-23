@@ -1076,6 +1076,11 @@ class _ServiceInfraMixin(_ServiceProbeBase):
         confidence="certain",
       ))
 
+    if not shares and protocol_id == b"\xfeSMB":
+      # The enumeration is SMBv1 only (I-226 adds SMB2): say what was observed instead of reporting nothing.
+      raw["shares_error"] = "SMB2 negotiated; SMBv1 share enumeration returned no shares"
+      self.P(f"SMB share enumeration on {target}:{port}: {raw['shares_error']}", color='y')
+
     return probe_result(raw_data=raw, findings=findings)
 
   @staticmethod
