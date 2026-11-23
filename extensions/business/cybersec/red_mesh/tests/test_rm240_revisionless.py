@@ -160,3 +160,23 @@ class ProbePackageTests(unittest.TestCase):
   def test_both_probes_pass_the_package(self):
     for probe, port in (("_service_info_http", 80), ("_service_info_https", 443)):
       self.assertEqual(self.seen(probe, port), [DistroPackage("debian", "2.4.38", "")], probe)
+
+
+class SshRevisionlessTests(unittest.TestCase):
+  def probe(self, banner):
+    from .test_rm200_banner_authenticity import SshProbeWiringTests
+    helper = SshProbeWiringTests()
+    return helper.run_probe(banner, None)
+
+  def test_ssh_banner_without_revision_passes_no_package(self):
+    # failing input: `SSH-2.0-OpenSSH_8.9p1 (Ubuntu)` gave package `ubuntu-` and `ssh_package` "8.9p1 ubuntu-"
+    _, result, calls = self.probe("SSH-2.0-OpenSSH_8.9p1 (Ubuntu)")
+    self.assertEqual(calls[0][:2], ("openssh", "8.9"))
+    self.assertIsNone(calls[0][2]["package"])
+    self.assertNotIn("ssh_package", result["raw_data"] if "raw_data" in result else result)
+    self.assertNotIn("ubuntu-", str(result))
+
+  def test_ssh_banner_with_revision_still_passes_package(self):
+    _, result, calls = self.probe("SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.10")
+    self.assertEqual(calls[0][2]["package"], DistroPackage("ubuntu", "8.9p1", "3ubuntu0.10"))
+    self.assertEqual(result["ssh_package"], "8.9p1 ubuntu-3ubuntu0.10")

@@ -1332,6 +1332,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         # returning the bare upstream version the matcher compares; the
         # package is what decides whether a matched CVE was backported (RM-070).
         package = parse_distro_package(result["banner"])
+        if package is not None and not package.revision:
+          # `OpenSSH_8.9p1 (Ubuntu)` names no revision: behave as if no package was parsed.
+          package = None
         if package is not None:
           result["ssh_package"] = f"{package.upstream} {package.distro}-{package.revision}"
         # Does the KEXINIT fit the implementation the banner names? An emulator announces a real
