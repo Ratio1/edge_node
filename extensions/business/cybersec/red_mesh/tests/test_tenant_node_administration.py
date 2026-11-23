@@ -382,7 +382,6 @@ class TestTenantNodeAdministration(unittest.TestCase):
     self.owner.data[assignment_location(self.tenant, "Node-A")] = leftover
     self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"],
                      [{"nodeAddress": "Node-B", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None}])
-    self.assertEqual(self.service._launch_eligible_nodes(self.tenant), ["Node-B"])
     self.assertEqual(self.service._reauth_eligible_nodes(self.tenant), ["Node-B"])
     before = len(self.owner.writes)
     self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["data"]["state"],
@@ -453,10 +452,9 @@ class TestTenantNodeAdministration(unittest.TestCase):
     self.assertEqual(len(self.owner.writes), before)
     self.assertEqual(self.store.get("tenant_node", self.tenant, "Node-A"), before_row)
 
-  def test_launch_eligibility_excludes_a_draining_row_while_reauth_eligibility_keeps_it(self):
+  def test_reauth_eligibility_keeps_a_draining_row(self):
     self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True)["success"])
     self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-B", True)["success"])
     self.jobs[(self.tenant, "Node-A")] = True
     self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["success"])
-    self.assertEqual(self.service._launch_eligible_nodes(self.tenant), ["Node-B"])
     self.assertEqual(self.service._reauth_eligible_nodes(self.tenant), ["Node-A", "Node-B"])

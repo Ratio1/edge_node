@@ -7,6 +7,7 @@ distributed consistency limitations still apply.
 """
 from datetime import datetime, timezone
 from functools import wraps
+from collections import namedtuple
 import copy
 import json
 import re
@@ -158,6 +159,10 @@ def _contract_nodes(tenant):
         seen.add(entry["node_address"])
         nodes.append(dict(entry))
   return nodes
+
+
+# RM-211: what `_engagement_launch_set` read: see its docstring.
+LaunchSet = namedtuple("LaunchSet", "considered reasons fixed others active")
 
 
 def _contract_sha256s(tenant):
@@ -706,8 +711,9 @@ class TenantAdministrationService:
     return self._resolve_execution_admission_for_account(self._actor(actor), tenant_id, engagement_id,
       engagement_asset_id, selected_peers)
 
-  def _execution_entry_for_account(self, account, tenant_id, engagement_id, engagement_asset_id):
-    """RM-107: the engagement row and the asset entry a job runs on; the entry is the target."""
+  def _execution_entry_for_account(self, account, tenant_id, engagement_id, engagement_asset_id, with_entry=True):
+    """RM-107: the engagement row and the asset entry a job runs on; the entry is the target.
+    RM-211: `with_entry=False` is the launch-node read, which names no asset (the entry is `None`)."""
     tenant, account = self.authorize_tenant_for_account(account, tenant_id)
     policy = TenantPolicyContext(tenant_id, tenant["active"], tenant["allow_pentester"])
     _, denial = resolve_operation_roles(account, "tasks:launch", policy)
@@ -716,7 +722,8 @@ class TenantAdministrationService:
     if not account.account_generation:
       raise AdministrationDenied(409, "account_changed")
     engagement_id = self._engagement_id(engagement_id)
-    if not isinstance(engagement_asset_id, str) or not re.fullmatch(r"ea_[1-9][0-9]*", engagement_asset_id):
+    if with_entry and (not isinstance(engagement_asset_id, str)
+                       or not re.fullmatch(r"ea_[1-9][0-9]*", engagement_asset_id)):
       raise AdministrationDenied(400, "invalid_request")
     row = self.store.get("engagement", tenant_id, engagement_id)
     if row is None:
@@ -724,6 +731,8 @@ class TenantAdministrationService:
     decision = authorize_tenant_operation(account, "tasks:launch", policy, asset_tenant_ids=(row["tenant_id"],))
     if not decision.allowed:
       raise AdministrationDenied(decision.status_code, decision.error)
+    if not with_entry:
+      return tenant, account, row, None
     entry = next((item for item in row["assets"] if item["engagement_asset_id"] == engagement_asset_id), None)
     if entry is None:
       raise AdministrationDenied(400, "engagement_asset_not_locked")
@@ -776,19 +785,75 @@ class TenantAdministrationService:
       return {}
     return directory if isinstance(directory, dict) else {}
 
-  def _launch_eligible_nodes(self, tenant_id):
-    """RM-102: a launch never starts on a draining row, whatever a (possibly stale) job check
-    would say -- it is the reauthorization path that must never cut off a running job, not this one."""
-    assignments = self.store.list_node_assignments(tenant_id)
-    eligible = {row["node_address"] for row in assignments if row["active"] and not row.get("draining")}
-    return sorted(eligible & self._configured_peers())
-
   def _reauth_eligible_nodes(self, tenant_id):
     """RM-102: reauthorization keeps a draining row eligible, with no job check -- a stale local
     job view must never be the reason a still-running job is cut off."""
     assignments = self.store.list_node_assignments(tenant_id)
     eligible = {row["node_address"] for row in assignments if row["active"]}
     return sorted(eligible & self._configured_peers())
+
+  def _engagement_launch_set(self, tenant, row):
+    """RM-211: the nodes an engagement may launch on: its own contract's nodes, the tenant's active
+    non-draining assignments and the configured peers. The contract is the one whose sha256 the
+    engagement carries. A contract with no node list (one-step tenant, pack before RM-127) lends its
+    active assignments minus every node another contract of the tenant lists, so an amended tenant
+    never lends `c_2`-only nodes to a `c_1` engagement. Returns a `LaunchSet`: the addresses listed,
+    `{address: reason or None}`, whether the contract lists nodes, the other contracts' addresses and
+    the active assignment addresses (the one assignment read)."""
+    blocks = _contract_blocks(tenant)
+    by_sha = {tenant["contract"]["sha256"]: tenant_contracts.FIRST_CONTRACT_ID,
+              **{block["contract"]["sha256"]: contract_id for contract_id, block in blocks.items()}}
+    own_id = by_sha[row["contract_sha256"]]
+    listed = {contract_id: [entry["node_address"] for entry in self._contract_lineage(tenant, contract_id)[2]]
+              for contract_id in (tenant_contracts.FIRST_CONTRACT_ID, *blocks)}
+    others = {address for contract_id, addresses in listed.items() if contract_id != own_id for address in addresses}
+    assigned = {assignment["node_address"]: assignment
+                for assignment in self.store.list_node_assignments(tenant["tenant_id"])}
+    peers = self._configured_peers()
+    fixed = bool(listed[own_id])
+    considered = listed[own_id] if fixed else sorted(
+      address for address, assignment in assigned.items() if assignment["active"] and address not in others)
+
+    def reason(address):
+      assignment = assigned.get(address)
+      if assignment is None or not assignment["active"]:
+        return "not_assigned"
+      if assignment.get("draining"):
+        return "draining"
+      return None if address in peers else "not_a_peer"
+    return LaunchSet(considered, {address: reason(address) for address in considered}, fixed, others,
+                     {address for address, assignment in assigned.items() if assignment["active"]})
+
+  def _launch_refusal_nodes(self, launch, refused):
+    """RM-211: `[{nodeAddress, reason[, alias]}]` for the refused addresses. The alias is added only
+    for an address of the engagement contract or the tenant's active assignments: a caller-supplied
+    address never gets a deployment peer named (`list_deployment_nodes` is Super-Tenant Admin only)."""
+    known = launch.active | set(launch.considered)
+    directory = self._node_directory(address for address in refused if address in known)
+    nodes = []
+    for address in refused:
+      node = {"nodeAddress": address, "reason": launch.reasons.get(address) or (
+        "not_in_contract" if launch.fixed or address in launch.others else "not_assigned")}
+      if address in known:
+        node["alias"] = named_entry(directory, address)["alias"]
+      nodes.append(node)
+    return nodes
+
+  @_endpoint
+  def get_engagement_launch_nodes(self, actor, tenant_id, engagement_id):
+    """RM-211: the launch set of one engagement, for the new-task picker: its contract's nodes, each
+    `{nodeAddress, alias, tags, eligible, reason}`; a node-less contract lists the assignments it
+    considered. Assigned nodes outside the contract are not listed. Same checks as admission."""
+    tenant, _, row, _ = self._execution_entry_for_account(
+      self._actor(actor), tenant_id, engagement_id, None, with_entry=False)
+    self._execution_engagement(tenant, row, None)
+    launch = self._engagement_launch_set(tenant, row)
+    considered, reasons = launch.considered, launch.reasons
+    directory = self._node_directory(considered)
+    return {"tenantId": tenant_id, "engagementId": row["engagement_id"],
+            "nodes": [{"nodeAddress": address, **{key: value for key, value in named_entry(directory, address).items()
+                                                  if key != "ip"},
+                       "eligible": reasons[address] is None, "reason": reasons[address]} for address in considered]}
 
   def _execution_engagement(self, tenant, row, entry):
     """The launch gate's engagement facts, from the stored row (never the DTO, which has no refs).
@@ -851,14 +916,17 @@ class TenantAdministrationService:
     tenant, account, row, entry = self._execution_entry_for_account(
       account, tenant_id, engagement_id, engagement_asset_id)
     engagement = self._execution_engagement(tenant, row, entry)
-    eligible = self._launch_eligible_nodes(tenant_id)
+    launch = self._engagement_launch_set(tenant, row)
+    eligible = {address for address, reason in launch.reasons.items() if reason is None}
     if selected_peers is not None and (not isinstance(selected_peers, list)
         or any(not valid_node_address(peer) for peer in selected_peers)
         or len(set(selected_peers)) != len(selected_peers)):
       raise AdministrationDenied(400, "invalid_request")
     selected = list(selected_peers) if selected_peers else sorted(eligible)
     if not selected or not set(selected).issubset(eligible):
-      raise AdministrationDenied(400, "ineligible_node")
+      # RM-211: the refusal names the nodes, so the caller can tell which one is wrong.
+      raise AdministrationDenied(400, "ineligible_node", nodes=self._launch_refusal_nodes(
+        launch, [address for address in selected if address not in eligible]))
     try:
       return ResolvedExecutionContext({"namespace": self.store.namespace, "tenant_id": tenant_id,
         **self._entry_facts(row, entry), "actor_id": account.account_id,

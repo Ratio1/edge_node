@@ -79,6 +79,14 @@ def test_each_audited_reason_writes_one_row_with_the_specified_fields_and_no_bod
     assert [row["reason"] for row in rows(owner)] == ["engagement_revoked"]
 
 
+def test_ineligible_node_refusal_body_names_the_nodes_without_widening_the_audit_row():
+  with launch_fixture() as fixture:
+    result = launch(fixture, selected_peers=["node-a", "node-zzz"], target="192.0.2.10")
+    assert result["error"] == "ineligible_node" and result["status_code"] == 400 and result["success"] is False
+    assert result["nodes"] == [{"nodeAddress": "node-zzz", "reason": "not_assigned"}]
+    assert set(rows(fixture.owner_plugin)[0]) == ROW_FIELDS
+
+
 def test_expired_engagement_is_audited():
   with launch_fixture() as fixture:
     fixture.service.clock = lambda: datetime(2026, 12, 1, tzinfo=timezone.utc)
