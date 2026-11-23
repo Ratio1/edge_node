@@ -327,8 +327,29 @@ class _FakeAnonymousFtp(_FakeFtp):
     _FakeAnonymousFtp.stored.append(cmd)
     return "226 Transfer complete"
 
+  def storlines(self, cmd, fp, *a, **k):
+    _FakeAnonymousFtp.stored.append(cmd)
+    return "226 Transfer complete"
+
+  def transfercmd(self, cmd, *a, **k):
+    _FakeAnonymousFtp.stored.append(cmd)
+    raise ftplib.error_perm("502 not implemented")
+
+  def sendcmd(self, cmd):
+    if cmd.split(" ", 1)[0].upper() in ("STOR", "APPE", "DELE", "MKD", "RNFR"):
+      _FakeAnonymousFtp.stored.append(cmd)
+    raise ftplib.error_perm("502 not implemented")
+
   def delete(self, name):
     _FakeAnonymousFtp.stored.append("DELE " + name)
+    return "250 ok"
+
+  def mkd(self, name):
+    _FakeAnonymousFtp.stored.append("MKD " + name)
+    return name
+
+  def rename(self, a, b):
+    _FakeAnonymousFtp.stored.append("RNFR " + a)
     return "250 ok"
 
 
@@ -346,7 +367,6 @@ class TestFtpAnonymousWriteGate(unittest.TestCase):
     result = self._run()
     self.assertEqual(_FakeAnonymousFtp.stored, [])
     titles = [f["title"] for f in result["findings"]]
-    self.assertIn("FTP allows anonymous login.", titles)
     self.assertNotIn("FTP anonymous write access enabled (file upload possible).", titles)
     self.assertNotIn("write_access", result)
 

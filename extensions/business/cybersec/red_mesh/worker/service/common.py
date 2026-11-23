@@ -997,7 +997,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       except Exception:
         pass
 
-    # --- 4. Directory listing and traversal ---
+    # --- 3. Directory listing and traversal ---
     if ftp:
       try:
         pwd = ftp.pwd()
@@ -1041,7 +1041,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       except Exception:
         pass
 
-    # --- 5. TLS support check ---
+    # --- 4. TLS support check ---
     try:
       ftp_tls = _ftp_connect()
       resp = ftp_tls.sendcmd("AUTH TLS")
@@ -1064,7 +1064,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
           confidence="certain",
         ))
 
-    # --- 6. Default credential check ---
+    # --- 5. Default credential check ---
     if not self._login_attempts_allowed():
       result["auth_control"] = dict(AUTH_SKIPPED)
       return probe_result(raw_data=result, findings=findings)
@@ -1086,7 +1086,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       except Exception:
         pass
 
-    # --- 7. Arbitrary credential acceptance test ---
+    # --- 6. Arbitrary credential acceptance test ---
     # Doubles as the negative control for step 6 (RM-069); the default-credential
     # findings are built after it so they can be gated on its outcome.
     control = CONTROL_NOT_RUN
