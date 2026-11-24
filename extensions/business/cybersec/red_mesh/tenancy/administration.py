@@ -3388,7 +3388,7 @@ class TenantAdministrationService:
       try:
         self._activate_draft(actor, draft_id, copies.get(draft_id), True, amendment=True, preflight=True)
       except AdministrationDenied as exc:
-        raise AdministrationDenied(exc.status_code, exc.error, **{**exc.details, "engagementDraftId": draft_id}) from None
+        raise AdministrationDenied(exc.status_code, exc.error, **{**exc.details, "engagementDraftId": draft_id, "reason": exc.error}) from None
 
   def _amendment_writes(self, actor, account, tenant_id, contract_id, copies, write=True):
     """Steps 2-4, then every move derived from the rows. A contract no longer in force (`write` false)

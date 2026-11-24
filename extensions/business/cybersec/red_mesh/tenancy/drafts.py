@@ -227,9 +227,10 @@ def normalize_applicability(value):
 
 
 def normalize_note(value):
-  """RM-249: the amendment note, none or up to `_NOTE_MAX` characters (blank is none); no control characters."""
+  """RM-249: the amendment note, none or up to `_NOTE_MAX` characters (blank is none); no control, format or lone-surrogate characters, no line or paragraph separators."""
   if value is not None and (not isinstance(value, str) or len(value.strip()) > _NOTE_MAX
-                            or any(unicodedata.category(ch) in ("Cc", "Cf") and ch not in "\n\t" for ch in value)):
+                            or any((unicodedata.category(ch) in ("Cc", "Cf") and ch not in "\n\t") or unicodedata.category(ch) in ("Cs", "Zl", "Zp")
+                                   for ch in value)):
     raise DraftInvalid()
   return None if value is None else value.strip() or None
 

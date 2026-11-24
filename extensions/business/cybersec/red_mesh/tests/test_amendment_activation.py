@@ -66,6 +66,8 @@ class TestAmendmentNote(_AmendmentCase):
     ok(self, self.plugin.revoke_engagement(self.actor, tenant_id, old_id, "ended"))
     contract_id = ok(self, self.contract_draft(tenant_id))["contract_id"]
     refused(self, self.update_contract(tenant_id, contract_id, {"note": "x" * 2001}), 400, "invalid_request")
+    for bad in ("a\u2028b", "a\u2029b", "a\ud800b", "a\u202eb", "a\rb"):
+      refused(self, self.update_contract(tenant_id, contract_id, {"note": bad}), 400, "invalid_request")
     ok(self, self.update_contract(tenant_id, contract_id, {"effective_from": "2027-01-01", "note": NOTE}))
     plan = self.stored_contract(tenant_id, contract_id)["nodes"]
     # The pack prints the note: a snapshot of another note is not of this draft.
@@ -129,6 +131,16 @@ class TestGuard(_AmendmentCase):
     self.assertEqual(sorted((entry["engagementId"], entry["reason"]) for entry in result["engagements"]),
                      sorted([(active, "copy_unsigned"), (suspended, "two_copies"), (scheduled, "no_copy")]))
     self.assertEqual(len(self.store.writes), writes)
+
+
+  def test_a_copy_refused_by_the_preflight_is_named_with_its_code(self):
+    tenant_id, old_id = self.scenario()
+    second = self.ready_contract(tenant_id, [SHARED_C])
+    copy_id = self.copy(tenant_id, old_id, second)
+    with patch.object(self.service, "_replaceable", side_effect=AdministrationDenied(409, "engagement_superseded")):
+      result = self.activate_contract(tenant_id, second)
+    refused(self, result, 409, "engagement_superseded")
+    self.assertEqual((result["engagementDraftId"], result["reason"]), (copy_id, "engagement_superseded"))
 
 
 class TestMovesAndCrashes(_AmendmentCase):
