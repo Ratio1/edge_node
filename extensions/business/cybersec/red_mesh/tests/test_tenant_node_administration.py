@@ -83,8 +83,8 @@ class TestTenantNodeAdministration(unittest.TestCase):
                             "canManageAssignments": False, "nodesFixed": False})
 
   def test_the_drift_read_lists_held_non_peer_nodes_with_their_tenants(self):
-    """RM-213: assigned and draining count (node-less `c_1` tenants too); released rows, peers and a tenant
-    being deleted do not."""
+    """RM-213: assigned and draining count (node-less `c_1` tenants too); a held peer, released rows and a
+    tenant being deleted do not."""
     other, leaving = self.create_tenant("two"), self.create_tenant("three")
     for tenant, address in ((self.tenant, "Node-A"), (self.tenant, "Node-B"), (other, "Node-A"), (other, "Node-B"),
                             (leaving, "Node-A")):
@@ -92,7 +92,7 @@ class TestTenantNodeAdministration(unittest.TestCase):
     self.jobs[(other, "Node-A")] = True
     self.service.set_tenant_node_assignment(self.actor, other, "Node-A", False)
     self.service.set_tenant_node_assignment(self.actor, other, "Node-B", False)
-    self.peers = ["Node-C"]
+    self.peers = ["Node-B", "Node-C"]  # Node-B is held and a peer: in the deployment, not listed
     listed = self.store.list_tenants
     # The row `begin_tenant_delete(mark=True)` leaves: inactive, marked deleting, its node rows still there.
     marked = lambda: [{**row, "active": False, "deleting": {"by": "creator", "at": "x", "deleted_refs": []}}
@@ -102,8 +102,7 @@ class TestTenantNodeAdministration(unittest.TestCase):
     self.assertEqual(held, [
       {"nodeAddress": "Node-A", "alias": None, "tenants": sorted(
         [{"tenantId": self.tenant, "state": "assigned"}, {"tenantId": other, "state": "draining"}],
-        key=lambda entry: entry["tenantId"])},
-      {"nodeAddress": "Node-B", "alias": None, "tenants": [{"tenantId": self.tenant, "state": "assigned"}]}])
+        key=lambda entry: entry["tenantId"])}])
 
   def test_activation_requires_lazy_valid_current_config_even_on_retry(self):
     result = self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True)
