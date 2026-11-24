@@ -664,6 +664,25 @@ class TestOriginCountryAndComparisonAggregate(unittest.TestCase):
     self.assertEqual(comp["0xCN"]["status"], "failed")
     self.assertEqual(comp["0xCN"]["country"], "UN")
 
+  def test_node_timeout_status_requires_zero_responsive_outcomes(self):
+    host = _AggHost()
+    base = self._latest_pass()
+    base["worker_scan_metrics"] = {
+      "0xA": {"scan_metrics": {"connection_outcomes": {"connected": 0, "timeout": 9}}},
+      "0xB": {"scan_metrics": {"connection_outcomes": {"refused": 3, "timeout": 9}}},
+      "0xC": {"scan_metrics": {"connection_outcomes": {"reset": 1, "timeout": 9}}},
+      "0xD": {"scan_metrics": {"connection_outcomes": {"connected": 0, "timeout": 0, "error": 9}}},
+    }
+    base["worker_reports"] = {}
+    cfg = {"scan_type": "network", "comparison_mode": True,
+           "selected_peers": [], "comparison_ports": [80]}
+    ui = host._compute_ui_aggregate([base], {"open_ports": [], "service_info": {}}, job_config=cfg)
+    comp = {e["address"]: e["status"] for e in ui.to_dict()["node_comparison"]}
+    self.assertEqual(comp["0xA"], "timeout")
+    self.assertEqual(comp["0xB"], "reached")
+    self.assertEqual(comp["0xC"], "reached")
+    self.assertEqual(comp["0xD"], "reached")
+
 
 if __name__ == '__main__':
   unittest.main()
