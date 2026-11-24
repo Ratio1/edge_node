@@ -856,8 +856,8 @@ class TenantAdministrationService:
   def _execution_engagement(self, tenant, row, entry):
     """The launch gate's engagement facts, from the stored row (never the DTO, which has no refs).
 
-    Refusals follow the engagements contract. RM-107: the authorization is the tenant contract the
-    engagement was created under, so it is read from the tenant and must still be it.
+    Refusals follow the engagements contract. RM-107/RM-255: the authorization is the contract the
+    engagement is bound to, read from the tenant, and it must be the contract in force.
     """
     if row["active"] is not True:
       raise AdministrationDenied(400, "engagement_revoked")
@@ -877,14 +877,17 @@ class TenantAdministrationService:
     if (not _valid_contract(contract) or not isinstance(legal, dict)
         or row["contract_sha256"] not in _contract_sha256s(tenant)):
       raise TenantStoreError("Engagement contract does not match its tenant")
-    if self._engagement_contract(tenant, row["contract_sha256"])[0] != _contract_in_force(tenant):
+    contract_id = self._engagement_contract(tenant, row["contract_sha256"])[0]
+    if contract_id != _contract_in_force(tenant):
       raise AdministrationDenied(409, "contract_archived")
+    if contract_id != tenant_contracts.FIRST_CONTRACT_ID:
+      contract = _contract_blocks(tenant)[contract_id]["contract"]
     facts = {
       "engagement_id": row["engagement_id"], "engagement_hash": row["engagement_hash"],
       "contract_sha256": row["contract_sha256"],
       "context": row["context"],
       # `AuthorizationRef` shape, so reports, exports and SIEM hooks read the job snapshot as
-      # before. The signed basis is the tenant contract, signed by the tenant's legal signer. No
+      # before. The signed basis is the engagement's contract, signed by the tenant's legal signer. No
       # document reference: the job is readable under `reports:view`, while the contract itself is
       # Super-Tenant Admin only (`download_tenant_contract`).
       "authorization": {

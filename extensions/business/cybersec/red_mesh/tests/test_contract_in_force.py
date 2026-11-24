@@ -17,8 +17,9 @@ class TestContractInForce(_ContractSetCase):
     self.store.grant("acme.admin", tenant_id)
     first = ok(self, self.engagement(tenant_id))
     self.service = self.admission_service()
-    binding = self.service.resolve_execution_admission(
-      self.actor, tenant_id, first["engagementId"], "ea_1").build_binding("coordinator", ["Node-A"])
+    admission = self.service.resolve_execution_admission(self.actor, tenant_id, first["engagementId"], "ea_1")
+    self.before = admission.to_dict()["engagement"]
+    binding = admission.build_binding("coordinator", ["Node-A"])
     ok(self, self.activate_contract(tenant_id, self.ready_contract(tenant_id, [SHARED_A, PRIVATE_B])))
     return tenant_id, first, binding, ok(self, self.engagement(tenant_id, contract_id="c_2"))
 
@@ -36,7 +37,15 @@ class TestContractInForce(_ContractSetCase):
     # The running pass is never refused: finalization, analysis and events reauthorize without `new_pass`.
     self.service.reauthorize_execution(binding)
     self.assertIs(ok(self, self.plugin.get_engagement(self.actor, tenant_id, first["engagementId"]))["engagement"]["contractArchived"], True)
-    self.service.resolve_execution_admission(self.actor, tenant_id, second["engagementId"], "ea_1")
+    # RM-255: the job's authorization block cites the engagement's own contract, not `c_1`.
+    after = self.service.resolve_execution_admission(self.actor, tenant_id, second["engagementId"], "ea_1").to_dict()["engagement"]
+    signed = self.repo.get("tenant", tenant_id)["contracts"]["c_2"]["contract"]
+    self.assertEqual(after["authorization"]["document_sha256"], after["contract_sha256"])
+    self.assertEqual({key: after["authorization"]["document_" + key] for key in ("filename", "size_bytes")},
+                     {key: signed[key] for key in ("filename", "size_bytes")})
+    # A job admitted before the amendment keeps its stored `c_1` snapshot.
+    self.assertEqual(self.before["authorization"]["document_sha256"], self.repo.get("tenant", tenant_id)["contract"]["sha256"])
+    self.assertNotEqual(self.before["authorization"]["document_sha256"], after["contract_sha256"])
 
   def test_the_older_of_two_contracts_added_side_by_side_is_archived(self):
     """Rows written before the deploy: `c_2` and `c_3` both nobody replaced. `c_3`, the higher, is in force."""
