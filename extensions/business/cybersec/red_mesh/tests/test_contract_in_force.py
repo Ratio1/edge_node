@@ -86,6 +86,18 @@ class TestContractInForce(_ContractSetCase):
     ok(self, self.plugin.set_tenant_node_assignment(self.actor, tenant_id, "Node-A", False))
     self.assertEqual([node["nodeAddress"] for node in ok(self, self.plugin.get_tenant_nodes(self.actor, tenant_id))["nodes"]], ["Node-B"])
 
+  def test_a_retired_node_is_not_a_held_node_in_the_drift_read(self):
+    """RM-213: Node-A (retired) and Node-B (assigned) are both off the peer list; only Node-B is held."""
+    _, tenant_id = self.tenant("acme", nodes=[SHARED_A], fixed=True)
+    ok(self, self.activate_contract(tenant_id, self.ready_contract(tenant_id, [PRIVATE_B])))
+    self.repo.put("tenant_node", tenant_id, "Node-A", record={
+      "tenant_id": tenant_id, "node_address": "Node-A", "active": True, "mode": "shared", "draining": False,
+      "changed_by": "creator", "changed_at": "2026-11-01T00:00:00+00:00"})
+    self.plugin.cfg_chainstore_peers = ["Node-C"]
+    held = ok(self, self.plugin.list_deployment_nodes(self.actor))["notInDeployment"]
+    self.assertEqual(held, [{"nodeAddress": "Node-B", "alias": None,
+                             "tenants": [{"tenantId": tenant_id, "state": "assigned"}]}])
+
   def test_activating_a_draft_with_no_supersedes_on_a_tenant_with_a_contract_is_refused(self):
     _, tenant_id = self.tenant("acme", nodes=[SHARED_A], fixed=True)
     contract_id = self.ready_contract(tenant_id, [PRIVATE_B])

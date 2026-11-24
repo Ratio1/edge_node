@@ -1045,19 +1045,21 @@ class TenantAdministrationService:
       state = "assigned"
     return {"nodeAddress": row["node_address"], "mode": node_assignment_mode(row), "state": state}
 
+  def _live_nodes(self, tenant):
+    """RM-213: the tenant's live rows, sorted. A node the contract in force does not list is retired
+    (RM-249): derived on read, never launch-eligible. `assigned` and `draining` rows are held."""
+    tenant_id = tenant["tenant_id"]
+    nodes = [self._tenant_node_row(tenant_id, row) for row in
+             sorted(self.store.list_node_assignments(tenant_id), key=lambda row: row["node_address"])]
+    listed = {entry["node_address"] for entry in _contract_nodes(tenant)}
+    return [{**node, "state": "retired", "reason": f"not in {_contract_in_force(tenant)}"}
+            if listed and node["state"] == "assigned" and node["nodeAddress"] not in listed else node
+            for node in nodes if node is not None]
+
   @_endpoint
   def get_tenant_nodes(self, actor, tenant_id):
     tenant, account = self._authorized_tenant(actor, tenant_id)
-    assignments = self.store.list_node_assignments(tenant_id)
-    nodes = [self._tenant_node_row(tenant_id, row) for row in
-             sorted(assignments, key=lambda row: row["node_address"])]
-    nodes = [node for node in nodes if node is not None]
-    # RM-249: a node the contract in force does not list is retired: derived on read, never launch-eligible.
-    listed = {entry["node_address"] for entry in _contract_nodes(tenant)}
-    in_force = _contract_in_force(tenant)
-    nodes = [{**node, "state": "retired", "reason": f"not in {in_force}"}
-             if listed and node["state"] == "assigned" and node["nodeAddress"] not in listed else node
-             for node in nodes]
+    nodes = self._live_nodes(tenant)
     # RM-126: the tenant's own nodes carry their name and tags, under the read the caller already has.
     directory = self._node_directory(node["nodeAddress"] for node in nodes)
     # RM-127: a tenant whose contract lists its nodes keeps them; amendments will change them.
@@ -1085,8 +1087,20 @@ class TenantAdministrationService:
     self._actor(actor, creator=True)
     peers = self._configured_peer_list()
     directory = self._node_directory(peers)
+    # RM-213: held nodes of any tenant that are not configured peers, for the operator to replace.
+    held = {}
+    for tenant in self.store.list_tenants():
+      if tenant.get("active") is not True:  # a tenant being deleted holds nothing (get_tenant_nodes 404s)
+        continue
+      for node in self._live_nodes(tenant):
+        if node["state"] != "retired" and node["nodeAddress"] not in peers:
+          held.setdefault(node["nodeAddress"], []).append({"tenantId": tenant["tenant_id"], "state": node["state"]})
+    names = self._node_directory(held)
     return {"nodes": [{"nodeAddress": peer, **named_entry(directory, peer), "readiness": node_readiness(
-      directory, peer, True)} for peer in peers]}
+      directory, peer, True)} for peer in peers],
+            "notInDeployment": [{"nodeAddress": address, "alias": named_entry(names, address)["alias"],
+                                 "tenants": sorted(held[address], key=lambda t: t["tenantId"])}
+                                for address in sorted(held)]}
 
   @staticmethod
   def _permission(account, tenant, operation):

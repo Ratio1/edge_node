@@ -201,7 +201,7 @@ class TestDeploymentNodeReads(unittest.TestCase):
     self.assertEqual(self.service.list_deployment_nodes(self.actor), {"success": True, "status_code": 200, "data": {
       "nodes": [{"nodeAddress": "0xai_rm4", "alias": None, "tags": [], "ip": None, "readiness": UNKNOWN},
                 {"nodeAddress": "0xai_rm3", "alias": "rm3", "tags": ["KYB", "DC:google", "CT:BE"], "ip": None,
-                 "readiness": UNKNOWN}]}})
+                 "readiness": UNKNOWN}], "notInDeployment": []}})
 
   def test_the_deployment_list_carries_readiness_from_the_monitor(self):
     netmon = LiveNetmon({"0xai_rm3": (True, 10), "0xai_rm4": (False, 700)})
@@ -219,6 +219,7 @@ class TestDeploymentNodeReads(unittest.TestCase):
       result = self.service.list_deployment_nodes({"account_id": account})
       self.assertFalse(result["success"], account)
       self.assertNotIn("nodes", result)
+      self.assertNotIn("notInDeployment", result)
       self.assertNotIn("0xai_rm3", str(result))
 
   def test_a_malformed_or_failing_configuration_is_unavailable_and_an_empty_one_lists_nothing(self):
@@ -230,7 +231,7 @@ class TestDeploymentNodeReads(unittest.TestCase):
     self.service.configured_peers_reader = explode
     self.assertEqual(self.service.list_deployment_nodes(self.actor)["status_code"], 503)
     self.service.configured_peers_reader = lambda: []
-    self.assertEqual(self.service.list_deployment_nodes(self.actor)["data"], {"nodes": []})
+    self.assertEqual(self.service.list_deployment_nodes(self.actor)["data"], {"nodes": [], "notInDeployment": []})
 
   def test_a_missing_or_failing_directory_names_nothing_but_never_fails_the_read(self):
     def explode(addresses):
