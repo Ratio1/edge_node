@@ -27,7 +27,7 @@ from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, SUSPEND_STATE_KEYS, Engageme
                           engagement_id_for, normalize_asset_requests, normalize_context,
                           build_engagement_assets, normalize_engagement_assets, normalize_window, valid_doc_ref, valid_engagement_id)
 from . import (account_profile, drafts, engagement_drafts, super_tenant_branding, super_tenant_integrations, super_tenant_profile,
-               tenant_assets, tenant_contracts)
+               supporting_documents, tenant_assets, tenant_contracts)
 
 
 _ADMINISTRATION_LOCK = RLock()
@@ -1472,6 +1472,102 @@ class TenantAdministrationService:
     return {"store": ref["store"], "ref": ref["ref"], "sha256": ref["sha256"], "filename": ref["filename"],
             "size_bytes": ref["size_bytes"], "engagement_hash": row["engagement_hash"]}
 
+  # RM-261: supporting documents of an engagement, a contract or a contract draft: one store row each,
+  # outside every hash. Add and withdraw are the Super-Tenant Admin's; an engagement's follow the
+  # engagement-document rules, a contract's the contract rule (platform-wide Super-Tenant Admin only).
+
+  def _supporting_owner(self, actor, tenant_id, owner_id, operation):
+    """`(tenant, account)` once the caller holds `operation` on the owner, authorized before it is looked up."""
+    if tenant_contracts.valid_contract_id(owner_id):
+      tenant, account = self._platform_tenant(actor, tenant_id)
+      found = (owner_id == tenant_contracts.FIRST_CONTRACT_ID and tenant.get("contract") is not None
+               or owner_id in _contract_blocks(tenant)
+               or self.store.get("tenant_contract_draft", tenant_id, owner_id) is not None)
+    elif valid_engagement_id(owner_id):
+      tenant, account = self._authorized_tenant(actor, tenant_id, operation)
+      found = self.store.get("engagement", tenant_id, owner_id) is not None
+    else:
+      raise AdministrationDenied(400, "invalid_request")
+    if not found:
+      raise AdministrationDenied(404, "not_found")
+    return tenant, account
+
+  def _supporting_row(self, tenant_id, owner_id, document_id):
+    if not supporting_documents.valid_document_id(document_id):
+      raise AdministrationDenied(400, "invalid_request")
+    row = self.store.get("supporting_document", tenant_id, owner_id, document_id)
+    if row is None:
+      raise AdministrationDenied(404, "not_found")
+    return row
+
+  def _supporting_refs(self, tenant_id, owner_id):
+    return [row["ref"] for row in self.store.list_supporting_documents(tenant_id, owner_id)]
+
+  @_endpoint
+  def authorize_supporting_document(self, actor, tenant_id, owner_id, request_id):
+    """Before the file is stored: the caller may add. `existing` is the row this request already wrote (a
+    replay), so the plugin stores nothing."""
+    _, account = self._supporting_owner(actor, tenant_id, owner_id, "engagements:create")
+    document_id = supporting_documents.document_id_for(_request_id(request_id))
+    existing = self.store.get("supporting_document", tenant_id, owner_id, document_id)
+    return {"accountId": account.account_id, "existingRef": None if existing is None else existing["ref"],
+            "existing": None if existing is None else supporting_documents.dto(existing, True, True)}
+
+  @_endpoint
+  def add_supporting_document(self, actor, tenant_id, owner_id, request_id, document):
+    """Write the row for a stored file (`document`: its reference and labels, as `store_engagement_document`
+    answers plus `store`). A replay answers the stored row; `ref` is the file the row holds, so the plugin
+    discards a second file of the same request."""
+    _, account = self._supporting_owner(actor, tenant_id, owner_id, "engagements:create")
+    document_id = supporting_documents.document_id_for(_request_id(request_id))
+    row = self.store.get("supporting_document", tenant_id, owner_id, document_id)
+    if row is not None:
+      return {"document": supporting_documents.dto(row, True, True), "replayed": True, "ref": row["ref"]}
+    if not valid_doc_ref(document, labels=True) or document["uploaded_by"] != account.account_id:
+      raise AdministrationDenied(400, "document_invalid")
+    if len(self.store.list_supporting_documents(tenant_id, owner_id)) >= supporting_documents.MAX_PER_OWNER:
+      raise AdministrationDenied(409, "document_limit")
+    try:
+      row = supporting_documents.new_row(tenant_id, owner_id, document_id, document)
+    except ValueError:
+      raise AdministrationDenied(400, "document_invalid") from None
+    self.store.put("supporting_document", tenant_id, owner_id, document_id, record=row)
+    return {"document": supporting_documents.dto(self.store.get("supporting_document", tenant_id, owner_id, document_id), True, True),
+            "replayed": False, "ref": row["ref"]}
+
+  @_endpoint
+  def withdraw_supporting_document(self, actor, tenant_id, owner_id, document_id, reason):
+    """Withdraw once: a repeat answers the row and the plugin audits nothing. The file stays."""
+    _, account = self._supporting_owner(actor, tenant_id, owner_id, "engagements:create")
+    row = self._supporting_row(tenant_id, owner_id, document_id)
+    replayed = row["withdrawn"] is not None
+    if not replayed:
+      try:
+        withdrawn = supporting_documents.withdraw(row, reason, account.account_id, datetime.now(timezone.utc).isoformat())
+      except (ValueError, TypeError):
+        raise AdministrationDenied(400, "invalid_request") from None
+      self.store.put("supporting_document", tenant_id, owner_id, document_id, record=withdrawn)
+      row = self.store.get("supporting_document", tenant_id, owner_id, document_id)
+    return {"document": supporting_documents.dto(row, True, True), "replayed": replayed}
+
+  @_endpoint
+  def list_supporting_documents(self, actor, tenant_id, owner_id):
+    """Every tenant role reads an engagement's list, without references; the file facts and comment go to the
+    engagement-documents roles, the uploader to the Super-Tenant Admin alone. A contract's list is the
+    platform-wide Super-Tenant Admin's."""
+    tenant, account = self._supporting_owner(actor, tenant_id, owner_id, "reports:view")
+    manager = holds_platform_role(account)
+    detail = manager or self._permission(account, tenant, "engagements:documents")
+    return {"documents": [supporting_documents.dto(row, detail, manager)
+                          for row in self.store.list_supporting_documents(tenant_id, owner_id)], "can_manage": manager}
+
+  @_endpoint
+  def supporting_document_ref(self, actor, tenant_id, owner_id, document_id):
+    """The stored reference for a download (`engagements:documents`, or the contract rule), read against the row."""
+    self._supporting_owner(actor, tenant_id, owner_id, "engagements:documents")
+    row = self._supporting_row(tenant_id, owner_id, document_id)
+    return {key: row[key] for key in ("store", "ref", "sha256", "filename", "size_bytes")}
+
   def _assignment_conflict(self, tenant_id, node_address, mode):
     """RM-102 conflict precedence for (tenant, node, mode), over every tenant's live row for the
     node: own row draining; own live row, same mode (`assigned`, idempotent); own live row, the other
@@ -1691,7 +1787,8 @@ class TenantAdministrationService:
   # the document deletes (`record_tenant_documents_deleted`), `finish_tenant_delete`.
   # RM-133: the tenant's contract drafts go with it (their files are in `_tenant_document_refs`).
   # RM-139: the retired tenant `integration` rows are deleted at plugin start, not here.
-  _DELETABLE_KINDS = ("engagement", "tenant_node", "tenant_contract_draft")
+  # RM-261: the supporting documents of its engagements and contracts go with it, rows and files.
+  _DELETABLE_KINDS = ("engagement", "tenant_node", "tenant_contract_draft", "supporting_document")
 
   def _tenant_for_delete(self, actor, tenant_id):
     account = self._actor(actor)
@@ -1734,6 +1831,8 @@ class TenantAdministrationService:
       row = self.store.raw_record("engagement", *ids) or {}
       documents = row.get("documents") if isinstance(row.get("documents"), list) else []
       refs.extend(documents)
+    for ids in self.store.tenant_record_ids("supporting_document", tenant["tenant_id"]):
+      refs.append(self.store.raw_record("supporting_document", *ids) or {})
     # RM-120: revision snapshots of the tenant's framework assessments, from the compliance rows.
     refs.extend(compliance.document_refs(self, tenant["tenant_id"]))
     done = set(tenant.get("deleting", {}).get("deleted_refs", []))
@@ -2624,10 +2723,14 @@ class TenantAdministrationService:
     if supersedes not in (None, ""):
       if not valid_engagement_id(supersedes) or "tenant_id" not in parent:
         raise AdministrationDenied(400, "supersedes_invalid")
-      row = engagement_drafts.replacing(row, self._replaceable(parent["tenant_id"], supersedes))
+      row = engagement_drafts.replacing(row, self._replaceable(parent["tenant_id"], supersedes),
+        [(entry["document_id"], supporting_documents.doc_ref(entry))
+         for entry in self.store.list_supporting_documents(parent["tenant_id"], supersedes) if entry["withdrawn"] is None])
       # The carried references are checked as activation binds them, beside up to two packs.
       refs = engagement_drafts.carried_refs(row)
-      if len(refs) + 2 > MAX_ENGAGEMENT_DOCUMENTS or not all(valid_doc_ref(ref, labels=True) for ref in refs):
+      if len(refs) + 2 > MAX_ENGAGEMENT_DOCUMENTS:
+        raise AdministrationDenied(409, "document_limit", count=len(refs))
+      if not all(valid_doc_ref(ref, labels=True) for ref in refs):
         raise AdministrationDenied(400, "document_invalid")
     self.store.put("engagement_draft", engagement_draft_id, record=row)
     return self.store.get("engagement_draft", engagement_draft_id)
@@ -2780,6 +2883,37 @@ class TenantAdministrationService:
     row = {**previous, "document": {**slot, "state": "signed", "document": dict(document)}}
     return {"draft": self._write_engagement_out(row, account),
             "replaced": slot["document"]["ref"] if slot["document"] is not None else None}
+
+  def _refuse_added_upload(self, row):
+    """RM-261: documents are added to a draft of an active tenant (the envelope names it) and before the pack is signed."""
+    tenant_id = row["parent"].get("tenant_id")
+    tenant = None if tenant_id is None else self.store.get("tenant", tenant_id)
+    if tenant is None or tenant.get("active") is not True:
+      raise AdministrationDenied(409, "parent_not_active")
+    if row["document"]["state"] == "signed":
+      raise AdministrationDenied(409, "already_signed")
+
+  @_endpoint
+  def authorize_engagement_draft_added_upload(self, actor, engagement_draft_id):
+    account = self._actor(actor, creator=True)
+    row = self._unlocked_engagement_draft(engagement_draft_id)
+    self._refuse_added_upload(row)
+    return {"accountId": account.account_id, "tenantId": row["parent"]["tenant_id"]}
+
+  @_endpoint
+  def attach_engagement_draft_added_document(self, actor, engagement_draft_id, document):
+    """RM-261: add an uploaded `store_engagement_document` file to the draft's `carried_documents`, marked
+    `added`; no `ed_<n>` until activation binds it. The packs, carried and added documents fit the limit."""
+    account = self._actor(actor, creator=True)
+    previous = self._unlocked_engagement_draft(engagement_draft_id)
+    self._refuse_added_upload(previous)
+    held = engagement_drafts.carried(previous)
+    if (not valid_doc_ref(document, labels=True) or document["kind"] not in engagement_drafts.CARRIED_KINDS
+        or document["uploaded_by"] != account.account_id or len(held) + 1 + 2 > MAX_ENGAGEMENT_DOCUMENTS):
+      raise AdministrationDenied(400, "document_invalid")
+    number = max([int(entry["document_id"][3:]) for entry in engagement_drafts.added_documents(previous)] or [0]) + 1
+    entry = {"document_id": "ad_%d" % number, **document, "added": True}
+    return {"draft": self._write_engagement_out({**previous, engagement_drafts.CARRIED: [*held, entry]}, account)}
 
   @_endpoint
   def engagement_draft_document_ref(self, actor, engagement_draft_id):
@@ -3171,7 +3305,9 @@ class TenantAdministrationService:
     slot = row["document"]
     stored = {"signed": slot["document"], "generated": self._generated_ref(slot["generated"])}
     resolved = documents if isinstance(documents, dict) else {}
-    if {key: resolved.get(key) for key in stored} != stored:
+    # RM-261: the files added to the draft, read again by the plugin, are the ones the draft names.
+    if ({key: resolved.get(key) for key in stored} != stored
+        or (resolved.get("added") or []) != engagement_drafts.added_refs(row)):
       raise AdministrationDenied(409, "draft_changed")
     completeness = engagement_drafts.completeness(self._engagement_out(row))
     if not completeness["complete"]:
@@ -3192,7 +3328,7 @@ class TenantAdministrationService:
                     "comment": "snapshot sha256 " + generated["snapshot_sha256"]})
     # Instead of "uploader equals creator": each pack's uploader holds the platform role now, as the
     # tenant documents (`_first_preparation_documents`).
-    for pack in packs:
+    for pack in (*packs, *engagement_drafts.added_refs(row)):
       uploader = self.accounts.get_account(pack["uploaded_by"])
       if uploader is None or not uploader.active or not holds_platform_role(uploader):
         raise AdministrationDenied(400, "document_invalid")
@@ -3200,6 +3336,13 @@ class TenantAdministrationService:
       bound = other.get("documents") if isinstance(other.get("documents"), list) else []
       if any(isinstance(document, dict) and document.get("ref") == stored["signed"]["ref"] for document in bound):
         raise AdministrationDenied(409, "contract_in_use")
+    # RM-261: a carried supporting document whose source row was withdrawn since the draft was made is
+    # removed from the draft first.
+    for entry in engagement_drafts.carried(row):
+      source = entry.get(engagement_drafts.SOURCE)
+      held = None if source is None else self.store.get("supporting_document", tenant_id, supersedes, source)
+      if source is not None and (held is None or held["withdrawn"] is not None):
+        raise AdministrationDenied(409, "carried_withdrawn", document=entry["document_id"])
     # RM-248: the carried documents are the old engagement's files, bound as they were.
     packs += engagement_drafts.carried_refs(row)
     request = self._engagement_request(
@@ -3377,15 +3520,18 @@ class TenantAdministrationService:
       raise AdministrationDenied(409, "draft_has_signed_documents")
     if self._draft_named(tenant_id, contract_id):
       raise AdministrationDenied(409, "contract_draft_in_use")
-    return {"accountId": account.account_id, "documentRefs": tenant_contracts.document_refs(row)}
+    return {"accountId": account.account_id,
+            "documentRefs": [*tenant_contracts.document_refs(row), *self._supporting_refs(tenant_id, contract_id)]}
 
   @_endpoint
   def finish_tenant_contract_draft_delete(self, actor, tenant_id, contract_id, deleted_refs):
     """As `finish_engagement_draft_delete`: the row goes once both its files are gone."""
     self._platform_tenant(actor, tenant_id)
     row = self._open_contract_draft(tenant_id, contract_id)
-    if not set(tenant_contracts.document_refs(row)) <= set(deleted_refs):
+    if not {*tenant_contracts.document_refs(row), *self._supporting_refs(tenant_id, contract_id)} <= set(deleted_refs):
       raise AdministrationDenied(409, "conflict")
+    for entry in self.store.list_supporting_documents(tenant_id, contract_id):
+      self.store.delete("supporting_document", tenant_id, contract_id, entry["document_id"])
     self.store.delete("tenant_contract_draft", tenant_id, contract_id)
     return {"contract_id": contract_id}
 

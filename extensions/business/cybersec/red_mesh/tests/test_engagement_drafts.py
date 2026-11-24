@@ -993,7 +993,7 @@ class TestEngagementReplacement(_EngagementDraftCase):
     # Two carried documents and up to two packs do not fit under a limit of three.
     with patch.object(administration, "MAX_ENGAGEMENT_DOCUMENTS", 3):
       refused(self, self.plugin.create_engagement_draft(self.actor, self.tenant_id, str(uuid4()), "X",
-                                                        supersedes=self.old_id), 400, "document_invalid")
+                                                        supersedes=self.old_id), 409, "document_limit")
     self.assertEqual(len(self.store.writes), writes)
 
   def test_without_revoke_the_old_engagement_stays_active_and_links_its_replacement(self):

@@ -37,12 +37,15 @@ SOURCE_NODES = "pack_source_nodes"
 # A row without the keys reads as no replacement and no carried document.
 SUPERSEDES = "supersedes"
 CARRIED = "carried_documents"
+# RM-261: a carried supporting document names the `sd_<uuid>` row it was copied from.
+SOURCE = "supporting_source"
 CARRIED_KINDS = ("third_party_consent", "other")
 # The title activation gives the generated pack; an old engagement's generated pack is not carried.
 GENERATED_PACK_TITLE = "Generated engagement pack (unsigned)"
 # The signed pack's comment names the generated pack it was signed from (activation writes it).
 BASELINE_PREFIX = "baseline sha256 "
-_DOCUMENT_ID = re.compile(r"ed_[1-9][0-9]*")
+# RM-261: a document added to the draft (`added: true`, id `ad_<n>`) has no `ed_<n>` until activation binds it.
+_DOCUMENT_ID = re.compile(r"(ed|ad)_[1-9][0-9]*")
 
 
 
@@ -135,22 +138,41 @@ def carried(row):
   return row.get(CARRIED, [])
 
 
-def replacing(row, engagement):
+def replacing(row, engagement, supporting=()):
   """RM-248: a new draft `row` made a replacement of the stored `engagement`: its asset copies (the
-  library is not read) and its third-party consent and other documents, without its packs."""
+  library is not read) and its third-party consent and other documents, without its packs. RM-261: and
+  its live supporting documents (`supporting`: `(sd_<uuid>, reference)` pairs), numbered after the
+  engagement's own ids, each remembering its source row (`SOURCE`) for the check at activation."""
   documents = engagement["documents"]
   # The old generated pack is known by provenance, never by its title alone: the `other` document
   # whose hash the signed pack's comment names. An operator's file with the same title is carried.
   baselines = {document["comment"][len(BASELINE_PREFIX):] for document in documents
                if document["kind"] == "agreement" and document["comment"].startswith(BASELINE_PREFIX)}
+  top = max([int(document["document_id"][3:]) for document in documents] or [0])
   return {**row, SUPERSEDES: engagement["engagement_id"], "assets": [dict(entry) for entry in engagement["assets"]],
           CARRIED: [dict(document) for document in documents if document["kind"] in CARRIED_KINDS
-                    and not (document["title"] == GENERATED_PACK_TITLE and document["sha256"] in baselines)]}
+                    and not (document["title"] == GENERATED_PACK_TITLE and document["sha256"] in baselines)]
+                   + [{"document_id": "ed_%d" % (top + number), SOURCE: source, **entry}
+                      for number, (source, entry) in enumerate(supporting, 1)]}
 
 
 def carried_refs(row):
   """The carried documents as activation binds them: the references without the old `ed_<n>`."""
-  return [{key: value for key, value in document.items() if key != "document_id"} for document in carried(row)]
+  return [_bound(document) for document in carried(row)]
+
+
+def _bound(document):
+  return {key: value for key, value in document.items() if key not in ("document_id", "added", SOURCE)}
+
+
+def added_documents(row):
+  """RM-261: the documents uploaded into the draft (`added: true`), in order."""
+  return [document for document in carried(row) if document.get("added")]
+
+
+def added_refs(row):
+  """The added documents as activation binds them, which the plugin verifies outside the lock."""
+  return [_bound(document) for document in added_documents(row)]
 
 
 def _kept_documents(held, kept):
@@ -190,7 +212,10 @@ def apply_changes(row, changes):
   if CONTRACT_PICK in changes:
     row[CONTRACT_PICK] = _contract_pick(changes[CONTRACT_PICK])
   if CARRIED in changes:
-    row[CARRIED] = _kept_documents(carried(row), changes[CARRIED])
+    kept = _kept_documents(carried(row), changes[CARRIED])
+    # RM-261: an added file is the draft's own and goes with its entry; a carried file never does.
+    dropped.extend(document["ref"] for document in added_documents(row) if document not in kept)
+    row[CARRIED] = kept
   _check_window(row)
   if "document" in changes:
     change = changes["document"]
@@ -209,8 +234,9 @@ def apply_changes(row, changes):
 
 
 def document_refs(row):
-  """The signed and the generated file, whichever exist."""
-  return [block["ref"] for block in (row["document"]["document"], row["document"]["generated"]) if block is not None]
+  """The signed and the generated file, whichever exist, then RM-261 the added files (never the carried ones)."""
+  return [block["ref"] for block in (row["document"]["document"], row["document"]["generated"]) if block is not None
+          ] + [document["ref"] for document in added_documents(row)]
 
 
 def asset_requests(assets):
@@ -291,10 +317,14 @@ def _stored_assets_valid(assets):
 
 
 def _carried_valid(documents):
-  # As stored on the old engagement; a removal leaves gaps in its `ed_<n>` ids.
+  # As stored on the old engagement (a removal leaves gaps in its `ed_<n>` ids), or RM-261 added to the draft.
   return (isinstance(documents, list)
           and all(isinstance(document, dict) and document.get("kind") in CARRIED_KINDS
                   and isinstance(document.get("document_id"), str) and _DOCUMENT_ID.fullmatch(document["document_id"])
+                  and ("added" not in document or document["added"] is True)
+                  and document["document_id"].startswith("ad_") == (document.get("added") is True)
+                  and (SOURCE not in document or (isinstance(document[SOURCE], str) and document[SOURCE].startswith("sd_")
+                                                  and "added" not in document))
                   and valid_doc_ref({key: value for key, value in document.items() if key != "document_id"},
                                     labels=True, stored=True)
                   for document in documents)
