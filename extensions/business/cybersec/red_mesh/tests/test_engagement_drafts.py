@@ -13,7 +13,8 @@ from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administratio
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
 from .asset_fixture import pick, register_asset
 from .contract_fixture import envelope
-from .test_tenant_drafts import GENERATED_AT, PNG, SCHEDULE_PDF, SNAPSHOT, TENANCY_HKEY, _ActivationCase, ok, refused
+from .test_tenant_drafts import (GENERATED_AT, PLAN, PNG, SCHEDULE_PDF, TENANCY_HKEY, _ActivationCase, ok, refused,
+                                 snapshot_of)
 
 PACK_PDF = b"%PDF-1.7\n%fixture signed engagement pack\n%%EOF\n"
 GENERATED_PDF = b"%PDF-1.7\n%fixture generated engagement pack\n%%EOF\n"
@@ -24,7 +25,9 @@ COMPLETE = {"display_name": " Q4 external ",
             "context": {"client_name": "Example"}}
 LIST_KEYS = {"engagement_draft_id", "parent", "display_name", "assets_count", "document_state", "created_at",
              "updated_at", "contract_id", "supersedes"}
-SNAPSHOT_SHA256 = hashlib.sha256(SNAPSHOT.encode("utf-8")).hexdigest()
+# RM-252: an engagement pack's snapshot also names the contract it was printed for (`c_1` for a tenant draft's child).
+PACK_SNAPSHOT = snapshot_of(PLAN, contractId="c_1")
+SNAPSHOT_SHA256 = hashlib.sha256(PACK_SNAPSHOT.encode("utf-8")).hexdigest()
 
 
 class _EngagementDraftCase(_ActivationCase):
@@ -64,8 +67,25 @@ class _EngagementDraftCase(_ActivationCase):
     ok(self, self.activate(draft_id, request_id))
     return draft_id, self.finish(draft_id, request_id)
 
-  def generate_pack(self, engagement_draft_id, raw=GENERATED_PDF, actor=None, snapshot=SNAPSHOT):
+  def pack_snapshot(self, engagement_draft_id, **extra):
+    """The snapshot the Navigator sends: the draft's binding (`c_1` for none) and the nodes it holds now."""
+    row = self.stored_child(engagement_draft_id)
+    parent = row["parent"]
+    if "draft_id" in parent:
+      return snapshot_of(self.stored(parent["draft_id"])["nodes"], contractId="c_1", **extra)
+    tenant = self.repo.get("tenant", parent["tenant_id"])
+    contract_id = row.get("contract_id") or "c_1"
+    pending = self.repo.get("tenant_contract_draft", parent["tenant_id"], contract_id)
+    nodes = (pending or {}).get("nodes") if pending else (
+      (tenant.get("contract_generated") or {}).get("nodes") if contract_id == "c_1" else tenant["contracts"][contract_id]["nodes"])
+    return snapshot_of(nodes or [], contractId=contract_id, **extra)
+
+  def generate_pack_raw(self, engagement_draft_id, snapshot):
+    return self.generate(None, engagement_draft_id=engagement_draft_id, document_kind="engagement_pack", snapshot=snapshot)
+
+  def generate_pack(self, engagement_draft_id, raw=GENERATED_PDF, actor=None, snapshot=None):
     """RM-110 `store_generated_document` on the pack slot; answers the `generated` block."""
+    snapshot = self.pack_snapshot(engagement_draft_id) if snapshot is None else snapshot
     draft = ok(self, self.generate(None, raw=raw, snapshot=snapshot, actor=actor, document_kind="engagement_pack",
                                    engagement_draft_id=engagement_draft_id))
     return draft["document"]["generated"]
@@ -267,7 +287,7 @@ class TestEngagementDraftRoles(_EngagementDraftCase):
       "activate": lambda actor: self.plugin.activate_engagement_draft(actor, engagement_draft_id),
       "generate": lambda actor: self.plugin.store_generated_document(
         actor, engagement_draft_id=engagement_draft_id, document_kind="engagement_pack", filename="g.pdf",
-        content_b64=base64.b64encode(GENERATED_PDF).decode("ascii"), snapshot=SNAPSHOT, generated_at=GENERATED_AT),
+        content_b64=base64.b64encode(GENERATED_PDF).decode("ascii"), snapshot=PACK_SNAPSHOT, generated_at=GENERATED_AT),
     }
     data, puts, deleted = copy.deepcopy(self.store.data), len(self.documents.puts), list(self.documents.deleted)
     actors = {"tenant account": {"account_id": "initial"}, "super pentester": {"account_id": "pentester"},
@@ -372,10 +392,36 @@ class TestEngagementDraftDocuments(_EngagementDraftCase):
     refused(self, self.upload_pack(engagement_draft_id), 503, "unavailable")
     self.assertEqual(self.stored_child(engagement_draft_id)["document"]["state"], "missing")
 
+  def test_a_failed_source_read_writes_nothing(self):
+    # RM-252: the pack source is read before the write, so a 503 never leaves a written row behind.
+    from extensions.business.cybersec.red_mesh.tenancy.administration import TenantAdministrationService
+    engagement_draft_id = self.child(self.create()["draft_id"])["engagement_draft_id"]
+    before = self.stored_child(engagement_draft_id)
+    with patch.object(TenantAdministrationService, "_pack_source", side_effect=TenantStoreError("unreadable")):
+      refused(self, self.update_child(engagement_draft_id, {"display_name": "Renamed"}), 503, "unavailable")
+    self.assertEqual(self.stored_child(engagement_draft_id), before)
+
+  def test_a_tenant_draft_plan_change_after_the_pack_makes_it_stale_and_a_pack_of_another_plan_is_refused(self):
+    parent = self.create()["draft_id"]
+    engagement_draft_id = self.child(parent)["engagement_draft_id"]
+    other = [{"node_address": "Node-Z", "mode": "private"}]
+    refused(self, self.generate_pack_raw(engagement_draft_id, snapshot_of(other, contractId="c_1")), 409, "draft_changed")
+    refused(self, self.generate_pack_raw(engagement_draft_id, snapshot_of(PLAN, contractId="c_2")), 409, "draft_changed")
+    refused(self, self.generate_pack_raw(engagement_draft_id, snapshot_of(PLAN)), 409, "draft_changed")
+    self.generate_pack(engagement_draft_id)
+    row = self.stored_child(engagement_draft_id)
+    self.assertEqual((row["pack_contract_id"], row["pack_nodes"]), ("c_1", PLAN))
+    stale = "item:engagement_pack_stale"
+    self.assertNotIn(stale, ok(self, self.plugin.get_engagement_draft(self.actor, engagement_draft_id))["completeness"]["missing"])
+    ok(self, self.update(parent, {"nodes": other}))
+    self.assertIn(stale, ok(self, self.plugin.get_engagement_draft(self.actor, engagement_draft_id))["completeness"]["missing"])
+    self.generate_pack(engagement_draft_id)
+    self.assertNotIn(stale, ok(self, self.plugin.get_engagement_draft(self.actor, engagement_draft_id))["completeness"]["missing"])
+
   def test_generation_stores_the_pack_with_its_snapshot_in_the_pack_envelope(self):
     parent = self.create()["draft_id"]
     engagement_draft_id = self.child(parent)["engagement_draft_id"]
-    draft = ok(self, self.generate(None, raw=GENERATED_PDF, engagement_draft_id=engagement_draft_id,
+    draft = ok(self, self.generate(None, raw=GENERATED_PDF, engagement_draft_id=engagement_draft_id, snapshot=PACK_SNAPSHOT,
                                    document_kind="engagement_pack", actor={"account_id": "other-sta"}))
     slot = draft["document"]
     self.assertEqual((slot["state"], slot["document"]), ("generated", None))
@@ -386,7 +432,7 @@ class TestEngagementDraftDocuments(_EngagementDraftCase):
     stored, = self.documents.puts
     self.assertEqual((stored["kind"], stored["schema_version"], stored["document_kind"], stored["engagement_draft_id"],
                       stored["role"], stored["snapshot"]),
-                     ("redmesh_tenant_contract", "1.1", "engagement_pack", engagement_draft_id, "generated", SNAPSHOT))
+                     ("redmesh_tenant_contract", "1.1", "engagement_pack", engagement_draft_id, "generated", PACK_SNAPSHOT))
     self.assertNotIn("draft_id", stored)
     self.assertNotIn("tenant_id", stored)
     self.assertEqual(self.stored_child(engagement_draft_id)["document"]["generated"], generated)
@@ -396,7 +442,7 @@ class TestEngagementDraftDocuments(_EngagementDraftCase):
     refused(self, self.plugin.download_engagement_draft_document(self.actor, engagement_draft_id), 404, "not_found")
     for raw in (PNG, b""):
       with self.subTest(raw=raw):
-        refused(self, self.generate(None, raw=raw, engagement_draft_id=engagement_draft_id,
+        refused(self, self.generate(None, raw=raw, engagement_draft_id=engagement_draft_id, snapshot=PACK_SNAPSHOT,
                                     document_kind="engagement_pack"), 400, "document_invalid")
 
   def test_the_generated_bytes_may_be_uploaded_as_the_signed_copy(self):
@@ -611,7 +657,7 @@ class TestEngagementDraftActivation(_EngagementDraftCase):
     # The baseline readers (RM-111, RM-068) find the snapshot in the second document's envelope.
     baseline = self.documents.get(engagement["documents"][1]["ref"])
     self.assertEqual((baseline["role"], baseline["snapshot"], baseline["engagement_draft_id"]),
-                     ("generated", SNAPSHOT, engagement_draft_id))
+                     ("generated", PACK_SNAPSHOT, engagement_draft_id))
     self.assertEqual(hashlib.sha256(baseline["snapshot"].encode("utf-8")).hexdigest(), SNAPSHOT_SHA256)
     self.assertEqual([item["engagement_draft_id"] for item in ok(self, self.plugin.list_engagement_drafts(self.actor, tenant_id))], [])
 

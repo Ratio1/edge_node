@@ -90,7 +90,7 @@ class TestNodesBeforeTheContract(_ContractNodesCase):
   def test_an_engagement_pack_is_generated_without_nodes(self):
     draft_id = self.create()["draft_id"]
     child = self.child(draft_id)["engagement_draft_id"]
-    generated = self.generate_pack(child, snapshot='{"v":1}')
+    generated = self.generate_pack(child)
     self.assertNotIn("nodes", generated)
 
 

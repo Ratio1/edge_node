@@ -2621,7 +2621,7 @@ class TenantAdministrationService:
   @_endpoint
   def get_engagement_draft(self, actor, engagement_draft_id):
     self._actor(actor, creator=True)
-    return self._engagement_draft(engagement_draft_id)
+    return self._engagement_out(self._engagement_draft(engagement_draft_id))
 
   @_endpoint
   def list_engagement_drafts(self, actor, parent):
@@ -2673,7 +2673,7 @@ class TenantAdministrationService:
               raise AdministrationDenied(400, "contract_unknown") if amends is None else AdministrationDenied(409, "contract_superseded")
         else:
           self._tenant_contract_sha256(tenant, pick)
-    return {"draft": self._write_engagement_draft(row, account, previous), "dropped": dropped}
+    return {"draft": self._write_engagement_out(row, account, previous), "dropped": dropped}
 
   def _pending_pick(self, tenant_id, pick):
     """RM-249: whether `pick` names a contract draft (an amendment not fully activated). No pick
@@ -2685,10 +2685,45 @@ class TenantAdministrationService:
             and self.store.get("tenant_contract_draft", tenant_id, pick) is not None)
 
   def _draft_named(self, tenant_id, contract_id, signed=False):
-    """RM-249: does an engagement draft (with `signed`, one holding its signed pack) pick this contract draft."""
-    return any(row["parent"].get("tenant_id") == tenant_id and engagement_drafts.contract_pick(row) == contract_id
-               and (not signed or row["document"]["state"] == "signed")
+    """RM-249: does an engagement draft (with `signed`, one holding its signed pack) pick this contract draft.
+    RM-252: with `signed`, one whose generated pack names it counts too, whatever its pick is now."""
+    return any(row["parent"].get("tenant_id") == tenant_id
+               and (engagement_drafts.contract_pick(row) == contract_id and (not signed or row["document"]["state"] == "signed")
+                    or signed and engagement_drafts.pack_contract(row) == contract_id)
                for row in self.store.list_engagement_drafts())
+
+  @staticmethod
+  def _plan(nodes):
+    return [{"node_address": entry["node_address"], "mode": entry["mode"]} for entry in nodes]
+
+  def _pack_source(self, row):
+    """RM-252: the contract an engagement draft's pack must name and the nodes that contract holds now
+    (None when unreadable): the pick (`c_1` for none) in force or, for an amendment, its draft's plan; a
+    tenant draft's child names `c_1` and the parent's plan."""
+    parent = row["parent"]
+    if "draft_id" in parent:
+      found = self.store.get("tenant_draft", parent["draft_id"])
+      return tenant_contracts.FIRST_CONTRACT_ID, None if found is None else self._plan(found["nodes"])
+    pick = engagement_drafts.contract_pick(row) or tenant_contracts.FIRST_CONTRACT_ID
+    tenant = self.store.get("tenant", parent["tenant_id"])
+    if tenant is None:
+      return pick, None
+    if self._pending_pick(parent["tenant_id"], pick):
+      return pick, self._plan(self.store.get("tenant_contract_draft", parent["tenant_id"], pick)["nodes"])
+    if pick == tenant_contracts.FIRST_CONTRACT_ID:
+      return pick, self._plan((tenant.get("contract_generated") or {}).get("nodes") or ())
+    block = _contract_blocks(tenant).get(pick)
+    return pick, None if block is None else self._plan(block["nodes"])
+
+  def _engagement_out(self, row):
+    """RM-252: a row as answered, with the nodes its source holds now beside it for the stale item."""
+    return {**row, engagement_drafts.SOURCE_NODES: self._pack_source(row)[1]}
+
+  def _write_engagement_out(self, row, account, previous=None):
+    """`_write_engagement_draft` answered as `_engagement_out`, the source read BEFORE the write, so a
+    failed read writes nothing (the plugin then discards an uploaded file the row would reference)."""
+    source = self._pack_source(row)[1]
+    return {**self._write_engagement_draft(row, account, previous), engagement_drafts.SOURCE_NODES: source}
 
   def _draft_assets(self, requests, parent, previous):
     """RM-125 phase 2b: an `assets` change as stored entries (an empty list clears them). An asset
@@ -2719,7 +2754,7 @@ class TenantAdministrationService:
       raise AdministrationDenied(400, "document_invalid")
     slot = previous["document"]
     row = {**previous, "document": {**slot, "state": "signed", "document": dict(document)}}
-    return {"draft": self._write_engagement_draft(row, account),
+    return {"draft": self._write_engagement_out(row, account),
             "replaced": slot["document"]["ref"] if slot["document"] is not None else None}
 
   @_endpoint
@@ -2933,7 +2968,7 @@ class TenantAdministrationService:
     if slot["state"] == "signed":
       raise AdministrationDenied(409, "already_signed")
     if engagement_draft_id:
-      return {"accountId": account.account_id}
+      return {"accountId": account.account_id, **self._pack_snapshot(row, snapshot)}
     # RM-127: the contract prints the node plan, so it needs one, and the snapshot must be of it.
     if not row["nodes"]:
       raise AdministrationDenied(409, "draft_incomplete", missing=["field:nodes"])
@@ -2945,6 +2980,16 @@ class TenantAdministrationService:
     if nodes != row["nodes"] or (contract_id and note != row.get("note")):
       raise AdministrationDenied(409, "draft_changed")
     return {"accountId": account.account_id, "nodes": nodes, "note": note}
+
+  def _pack_snapshot(self, row, snapshot):
+    """RM-252: the contract and nodes an engagement pack's snapshot printed, refused (`draft_changed`)
+    unless they are what the draft's binding names now."""
+    contract_id = json.loads(snapshot).get("contractId")
+    nodes = self._snapshot_nodes(snapshot)
+    source = self._pack_source(row)
+    if contract_id != source[0] or (source[1] is not None and nodes != source[1]):
+      raise AdministrationDenied(409, "draft_changed")
+    return {"contractId": contract_id, "nodes": nodes}
 
   @staticmethod
   def _snapshot_nodes(snapshot):
@@ -2959,7 +3004,8 @@ class TenantAdministrationService:
 
   @_endpoint
   def attach_generated_document(self, actor, draft_id, engagement_draft_id, document_kind, document, snapshot_sha256,
-                                generated_at, nodes=None, tenant_id=None, contract_id=None, note=None):
+                                generated_at, nodes=None, tenant_id=None, contract_id=None, note=None,
+                                pack_contract=None):
     """Write the `generated` block (the stored ref plus the baseline stamps; `uploaded_by` and
     `generated_by` are the generating admin) and set the item `generated`, from `missing`,
     `generated` or `awaiting_signature` (never from `signed`). Answers the row and the ref of the
@@ -2982,6 +3028,10 @@ class TenantAdministrationService:
     if slot["state"] == "signed":
       raise AdministrationDenied(409, "already_signed")
     # RM-127: the plan may have changed since `authorize_generated_document` read the snapshot's.
+    if engagement_draft_id:
+      source = self._pack_source(previous)
+      if pack_contract != source[0] or (source[1] is not None and nodes != source[1]):
+        raise AdministrationDenied(409, "draft_changed")
     if with_nodes and (nodes != previous["nodes"] or (contract_id and note != previous.get("note"))):
       raise AdministrationDenied(409, "draft_changed")
     replaced = slot["generated"]["ref"] if slot["generated"] is not None else None
@@ -2991,7 +3041,10 @@ class TenantAdministrationService:
     elif contract_id:
       row = self._write_tenant_contract_draft({**previous, "state": "generated", "generated": generated}, account)
     else:
-      row = self._write_engagement_draft({**previous, "document": {**slot, "state": "generated", "generated": generated}}, account)
+      # RM-252: the pack is stored with the contract and nodes its snapshot printed.
+      row = self._write_engagement_out(
+        {**previous, engagement_drafts.PACK_PICK: pack_contract, engagement_drafts.PACK_NODES: nodes,
+         "document": {**slot, "state": "generated", "generated": generated}}, account)
     return {"draft": row, "replaced": replaced}
 
   @staticmethod
@@ -3094,7 +3147,7 @@ class TenantAdministrationService:
     resolved = documents if isinstance(documents, dict) else {}
     if {key: resolved.get(key) for key in stored} != stored:
       raise AdministrationDenied(409, "draft_changed")
-    completeness = engagement_drafts.completeness(row)
+    completeness = engagement_drafts.completeness(self._engagement_out(row))
     if not completeness["complete"]:
       raise AdministrationDenied(409, "draft_incomplete", missing=completeness["missing"],
                                  reasons=completeness["reasons"])
@@ -3384,7 +3437,8 @@ class TenantAdministrationService:
     for engagement in sorted(self.store.list_engagements(tenant_id), key=lambda item: item["engagement_id"]):
       found = [draft for draft in drafts_ if draft[engagement_drafts.SUPERSEDES] == engagement["engagement_id"]]
       reason = ("no_copy" if not found else "two_copies" if len(found) > 1 else
-                None if engagement_drafts.completeness(found[0])["complete"] else "copy_unsigned")
+                None if (gaps := engagement_drafts.completeness(self._engagement_out(found[0])))["complete"]
+                else "copy_stale" if f"item:{engagement_drafts.DOCUMENT_KIND}_stale" in gaps["missing"] else "copy_unsigned")
       if reason is not None and self._engagement_status(engagement) not in ("revoked", "expired"):
         to_move.append({"engagementId": engagement["engagement_id"], "reason": reason})
     if to_move:

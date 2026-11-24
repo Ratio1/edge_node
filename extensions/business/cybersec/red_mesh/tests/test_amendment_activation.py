@@ -370,3 +370,74 @@ class TestActivationAuthorization(_AmendmentCase):
     refused(self, self.update_child(foreign, {"contract_id": second}), 400, "contract_unknown")
     ok(self, self.activate_contract(tenant_id, second))
     self.assertEqual(self.live_ids(tenant_id), ["en_" + copy_id[4:]])
+
+
+class TestGeneratedPackBindsItsContract(_AmendmentCase):
+  """RM-252: the pack is stored with the contract it was made for."""
+
+  def stale(self, draft_id):
+    return "item:engagement_pack_stale" in ok(self, self.plugin.get_engagement_draft(self.actor, draft_id))["completeness"]["missing"]
+
+  def test_a_pick_change_after_generation_makes_the_pack_stale_until_a_new_one_and_an_old_row_is_not_stale(self):
+    tenant_id, old_id = self.scenario()
+    unsigned = ok(self, self.contract_draft(tenant_id))["contract_id"]
+    copy_id = self.copy(tenant_id, old_id, unsigned, sign=False)
+    self.generate_pack(copy_id)
+    self.assertEqual(self.stored_child(copy_id)["pack_contract_id"], unsigned)
+    self.assertFalse(self.stale(copy_id))
+    ok(self, self.update_child(copy_id, {"contract_id": None}))
+    self.assertTrue(self.stale(copy_id))
+    self.generate_pack(copy_id)
+    self.assertEqual(self.stored_child(copy_id)["pack_contract_id"], "c_1")
+    self.assertFalse(self.stale(copy_id))
+    row = self.stored_child(copy_id)
+    del row["pack_contract_id"]
+    self.repo.put("engagement_draft", copy_id, record=row)
+    ok(self, self.update_child(copy_id, {"contract_id": unsigned}))
+    self.assertFalse(self.stale(copy_id))
+
+  def test_a_contract_draft_named_by_a_generated_pack_keeps_its_nodes_and_note(self):
+    tenant_id, old_id = self.scenario()
+    unsigned = ok(self, self.contract_draft(tenant_id))["contract_id"]
+    copy_id = self.copy(tenant_id, old_id, unsigned, sign=False)
+    ok(self, self.update_contract(tenant_id, unsigned, {"note": NOTE}))
+    self.generate_pack(copy_id)
+    refused(self, self.update_contract(tenant_id, unsigned, {"nodes": [SHARED_C, PRIVATE_B]}), 409, "contract_draft_in_use")
+    refused(self, self.update_contract(tenant_id, unsigned, {"note": "Other."}), 409, "contract_draft_in_use")
+    ok(self, self.update_contract(tenant_id, unsigned, {"effective_from": "2027-02-01"}))
+    # The lock holds whatever the draft's pick is now: away and back, the pack still names it.
+    ok(self, self.update_child(copy_id, {"contract_id": None}))
+    refused(self, self.update_contract(tenant_id, unsigned, {"nodes": [SHARED_C, PRIVATE_B]}), 409, "contract_draft_in_use")
+    refused(self, self.update_contract(tenant_id, unsigned, {"note": "Other."}), 409, "contract_draft_in_use")
+    ok(self, self.update_child(copy_id, {"contract_id": unsigned}))
+    refused(self, self.update_contract(tenant_id, unsigned, {"note": "Other."}), 409, "contract_draft_in_use")
+
+  def test_a_pack_of_another_contract_or_nodes_is_refused_at_authorization_and_again_at_attach(self):
+    tenant_id, old_id = self.scenario()
+    unsigned = ok(self, self.contract_draft(tenant_id))["contract_id"]
+    ok(self, self.update_contract(tenant_id, unsigned, {"nodes": [SHARED_C]}))
+    copy_id = self.copy(tenant_id, old_id, unsigned, sign=False)
+    refused(self, self.generate_pack_raw(copy_id, snapshot_of([SHARED_C], contractId="c_1")), 409, "draft_changed")
+    refused(self, self.generate_pack_raw(copy_id, snapshot_of([SHARED_A], contractId=unsigned)), 409, "draft_changed")
+    real, calls = self.service._pack_source, []
+
+    def moved(row):
+      calls.append(1)
+      return real(row) if len(calls) == 1 else ("c_1", [])
+    # The binding moves between the authorization and the attach.
+    with patch.object(self.service, "_pack_source", side_effect=moved):
+      refused(self, self.generate_pack_raw(copy_id, self.pack_snapshot(copy_id)), 409, "draft_changed")
+    self.assertIsNone(self.stored_child(copy_id)["document"]["generated"])
+    self.generate_pack(copy_id)
+    self.assertEqual(self.stored_child(copy_id)["pack_nodes"], [SHARED_C])
+
+  def test_a_copy_with_a_stale_pack_is_named_copy_stale_by_the_guard(self):
+    tenant_id, old_id = self.scenario()
+    second = self.ready_contract(tenant_id, [SHARED_C])
+    copy_id = self.copy(tenant_id, old_id, second, sign=False)
+    self.generate_pack(copy_id)
+    row = self.stored_child(copy_id)
+    self.repo.put("engagement_draft", copy_id, record={**row, "pack_nodes": [SHARED_A]})
+    result = self.activate_contract(tenant_id, second)
+    refused(self, result, 409, "engagements_to_move")
+    self.assertEqual(result["engagements"], [{"engagementId": old_id, "reason": "copy_stale"}])

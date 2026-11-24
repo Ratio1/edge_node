@@ -14,7 +14,7 @@ from .drafts import ITEM_STATES, _UUID, _nonempty_text, valid_draft_id, valid_ge
 from .engagements import (EngagementInvalid, MAX_ENGAGEMENT_ASSETS, _asset_entry_valid, normalize_context,
                           normalize_engagement_assets, normalize_instant, normalize_window,
                           valid_doc_ref, valid_engagement_id)
-from .tenant_contracts import valid_contract_id
+from .tenant_contracts import FIRST_CONTRACT_ID, valid_contract_id
 
 # The `create_engagement` argument set, in the order `missing[]` reports them.
 FIELDS = ("display_name", "valid_from", "valid_until", "context", "assets")
@@ -25,6 +25,13 @@ DTO_FIELDS = ("engagement_draft_id", "parent", *FIELDS, "document", "created_by"
 # RM-133: the contract the engagement binds to at activation (`c_<n>`), or None for `c_1`; a row
 # written before the key existed reads as None.
 CONTRACT_PICK = "contract_id"
+# RM-252: the contract the generated pack was made for (`c_1` for no pick), stored with the pack; a row
+# written before the key existed reads as not stale.
+PACK_PICK = "pack_contract_id"
+# RM-252: the nodes that pack printed (normalized, from its snapshot), and the nodes its source holds now,
+# set on a row the service answers (never stored) so `completeness` can compare the two.
+PACK_NODES = "pack_nodes"
+SOURCE_NODES = "pack_source_nodes"
 # RM-248: a draft that replaces an engagement names it (`supersedes`, set at creation only) and carries
 # its third-party consent and other documents, stored as on the engagement (`ed_<n>` of the old one).
 # A row without the keys reads as no replacement and no carried document.
@@ -117,6 +124,11 @@ def new_draft(engagement_draft_id, parent, display_name, actor_id, now):
 
 def contract_pick(row):
   return row.get(CONTRACT_PICK)
+
+
+def pack_contract(row):
+  """RM-252: the contract the row's generated pack names, None when it has none or predates the key."""
+  return row.get(PACK_PICK) if row["document"]["generated"] is not None else None
 
 
 def carried(row):
@@ -237,6 +249,12 @@ def completeness(row):
     gap("assets", exc.code)
   if row["document"]["state"] != "signed":
     missing.append(f"item:{DOCUMENT_KIND}")
+  # RM-252: the binding or the source's nodes moved after the pack was generated; an old row has no stored keys.
+  source_nodes = row.get(SOURCE_NODES)
+  if pack_contract(row) is not None and (
+      pack_contract(row) != (contract_pick(row) or FIRST_CONTRACT_ID)
+      or (PACK_NODES in row and source_nodes is not None and row[PACK_NODES] != source_nodes)):
+    missing.append(f"item:{DOCUMENT_KIND}_stale")
   return {"complete": not missing, "missing": missing, "reasons": reasons}
 
 
