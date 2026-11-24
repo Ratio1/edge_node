@@ -378,6 +378,16 @@ class TestGeneratedPackBindsItsContract(_AmendmentCase):
   def stale(self, draft_id):
     return "item:engagement_pack_stale" in ok(self, self.plugin.get_engagement_draft(self.actor, draft_id))["completeness"]["missing"]
 
+  def test_no_pack_is_generated_for_an_archived_contract(self):
+    # The backend refuses it too, not only the console: an archived default `c_1` or explicit pick.
+    _, tenant_id = self.tenant("acme", nodes=[SHARED_A], fixed=True)
+    ok(self, self.activate_contract(tenant_id, self.ready_contract(tenant_id, [SHARED_A])))
+    draft_id = self.child(tenant_id)["engagement_draft_id"]
+    refused(self, self.generate_pack_raw(draft_id, self.pack_snapshot(draft_id)), 409, "contract_superseded")
+    ok(self, self.update_child(draft_id, {"contract_id": "c_2"}))
+    self.generate_pack(draft_id)
+    self.assertEqual(self.stored_child(draft_id)["pack_contract_id"], "c_2")
+
   def test_a_pick_change_after_generation_makes_the_pack_stale_until_a_new_one_and_an_old_row_is_not_stale(self):
     tenant_id, old_id = self.scenario()
     unsigned = ok(self, self.contract_draft(tenant_id))["contract_id"]

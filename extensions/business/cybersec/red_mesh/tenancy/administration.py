@@ -2715,6 +2715,16 @@ class TenantAdministrationService:
     block = _contract_blocks(tenant).get(pick)
     return pick, None if block is None else self._plan(block["nodes"])
 
+  def _refuse_archived_source(self, row, contract_id):
+    """RM-252: a pack is never generated for an archived contract (an explicit pick, or `c_1` by
+    default, that is not the contract in force); a tenant draft's child or an amendment draft is not."""
+    parent = row["parent"]
+    if "tenant_id" not in parent or self._pending_pick(parent["tenant_id"], contract_id):
+      return
+    tenant = self.store.get("tenant", parent["tenant_id"])
+    if tenant is not None and contract_id != _contract_in_force(tenant):
+      raise AdministrationDenied(409, "contract_superseded")
+
   def _engagement_out(self, row):
     """RM-252: a row as answered, with the nodes its source holds now beside it for the stale item."""
     return {**row, engagement_drafts.SOURCE_NODES: self._pack_source(row)[1]}
@@ -2987,6 +2997,7 @@ class TenantAdministrationService:
     contract_id = json.loads(snapshot).get("contractId")
     nodes = self._snapshot_nodes(snapshot)
     source = self._pack_source(row)
+    self._refuse_archived_source(row, source[0])
     if contract_id != source[0] or (source[1] is not None and nodes != source[1]):
       raise AdministrationDenied(409, "draft_changed")
     return {"contractId": contract_id, "nodes": nodes}
@@ -3030,6 +3041,7 @@ class TenantAdministrationService:
     # RM-127: the plan may have changed since `authorize_generated_document` read the snapshot's.
     if engagement_draft_id:
       source = self._pack_source(previous)
+      self._refuse_archived_source(previous, source[0])
       if pack_contract != source[0] or (source[1] is not None and nodes != source[1]):
         raise AdministrationDenied(409, "draft_changed")
     if with_nodes and (nodes != previous["nodes"] or (contract_id and note != previous.get("note"))):
