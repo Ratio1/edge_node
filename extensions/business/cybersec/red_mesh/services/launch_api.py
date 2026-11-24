@@ -730,6 +730,23 @@ def resolve_enabled_features(owner, excluded_features, scan_type=ScanType.NETWOR
   return excluded_features, enabled_features
 
 
+def unknown_feature_error(owner, requested):
+  """I-185: an exclusion the request names that the node does not know, for any scan type, is refused,
+  not dropped. The console sends exclusions from the all-types catalog, so another type's method is
+  known (and dropped later by `resolve_enabled_features`). Config exclusions (cfg_excluded_features) are
+  not checked here: a stale one is logged and dropped."""
+  all_features = owner._get_all_features(scan_type=None)
+  unknown = [str(f)[:64] for f in (requested or []) if f not in all_features]
+  if not unknown:
+    return None
+  unknown = unknown[:20]  # a bounded echo of the request
+  return {
+    "error": "unknown_feature", "status_code": 400,
+    "message": f"Unknown excluded feature(s): {', '.join(unknown)}.",
+    "features": unknown,
+  }
+
+
 def resolve_active_peers(owner, selected_peers):
   """Validate selected peers against chainstore peers and return active peers."""
   chainstore_peers = owner.cfg_chainstore_peers
@@ -1133,6 +1150,9 @@ def announce_launch(
   if release_error:
     return release_error
   comparison_mode = bool(comparison_mode)
+  feature_error = unknown_feature_error(owner, excluded_features)
+  if feature_error:
+    return feature_error
   excluded_features, enabled_features = resolve_enabled_features(
     owner,
     excluded_features,
@@ -1448,6 +1468,8 @@ def launch_network_scan(
     return scan_mode_error
   start_port = int(start_port)
   end_port = int(end_port)
+  if not (1 <= start_port <= 65535 and 1 <= end_port <= 65535):
+    return validation_error("start_port and end_port must be between 1 and 65535")
   if start_port > end_port:
     return validation_error("start_port must be less than end_port")
 

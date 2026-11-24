@@ -490,6 +490,38 @@ class TestPhase1ConfigCID(unittest.TestCase):
           self.assertNotIn("error", launch(plugin, run_mode=run_mode))
           self.assertEqual(self._latest_job_config(plugin)["run_mode"], expected)
 
+  def test_a_port_outside_1_to_65535_is_refused(self):
+    # I-117: both bounds are checked before anything is stored.
+    for start, end in ((0, 100), (1, 65536), (-5, 10), (70000, 80000)):
+      with self.subTest(start=start, end=end):
+        plugin = self._build_mock_plugin(job_id="port-range")
+        result = self._launch_network(plugin, start_port=start, end_port=end)
+        self.assertEqual(result["error"], "validation_error", result)
+        plugin.r1fs.add_json.assert_not_called()
+
+  def test_an_unknown_request_exclusion_is_refused_by_name_on_every_launch_path(self):
+    # I-185: catalogue ids such as `graybox` are not feature names; no alias, no silent drop.
+    for name, launch in (("network", self._launch_network), ("webapp", self._launch_webapp)):
+      with self.subTest(name):
+        plugin = self._build_mock_plugin(job_id="unknown-feature")
+        result = launch(plugin, excluded_features=["graybox", "no_such_test"])
+        self._refused(plugin, result, "unknown_feature", features=["graybox", "no_such_test"])
+        self.assertIn("graybox", result["message"])
+
+  def test_another_scan_types_method_is_a_known_exclusion(self):
+    # The console sends exclusions from the all-types catalog, so a webapp method on a network launch
+    # (and the reverse) is known, not refused.
+    for name, launch, other in (("network", self._launch_network, "_graybox_weak_auth"),
+                                ("webapp", self._launch_webapp, "_service_info_http")):
+      with self.subTest(name):
+        self.assertNotIn("error", launch(self._build_mock_plugin(job_id="cross-" + name), excluded_features=[other]))
+
+  def test_a_stale_config_exclusion_is_dropped_and_does_not_refuse_the_launch(self):
+    plugin = self._build_mock_plugin(job_id="stale-config-exclusion")
+    plugin.cfg_excluded_features = ["removed_test"]
+    self.assertNotIn("error", self._launch_network(plugin))
+    self.assertEqual(self._latest_job_config(plugin)["excluded_features"], [])
+
   def test_engagement_comparison_mode_still_launches_a_webapp(self):
     # Comparison mode force-enables the graybox bundle; no test allow-list gates it (RM-125).
     plugin = self._build_mock_plugin(job_id="engagement-bundle")
