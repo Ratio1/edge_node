@@ -244,7 +244,9 @@ def draft_list_row(row):
           "document_state": row["document"]["state"], "created_at": row["created_at"],
           "updated_at": row["updated_at"],
           # RM-133: the contract pick, so the Documents page groups a draft under its contract.
-          CONTRACT_PICK: contract_pick(row)}
+          CONTRACT_PICK: contract_pick(row),
+          # RM-248: the engagement it replaces, so the console reopens that draft instead of making another.
+          SUPERSEDES: row.get(SUPERSEDES)}
 
 
 def _same(normalize, value):

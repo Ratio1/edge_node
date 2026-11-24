@@ -220,8 +220,6 @@ class TestTenantEngagements(unittest.TestCase):
       ({"documents": [doc(SHA_ROE, "roe"), doc(SHA_ROE, "roe-again")]}, "document_invalid"),
       ({"documents": [doc("%064x" % index, "d%d" % index) for index in range(21)]}, "document_invalid"),
       ({"documents": "roe"}, "document_invalid"),
-      ({"supersedes": "en_nope"}, "supersedes_invalid"),
-      ({"supersedes": "en_" + str(uuid4())}, "supersedes_invalid"),
       ({"request_id": "not-a-uuid"}, "invalid_request"),
     ]
     for changes, error in cases:
@@ -293,12 +291,14 @@ class TestTenantEngagements(unittest.TestCase):
     ref = self.service.engagement_document_ref(self.actor, self.tenant, engagement, "ed_2")["data"]
     self.assertEqual((ref["store"], ref["ref"], ref["sha256"]), ("r1fs", "auth", SHA_AUTH))
 
-  def test_supersedes_links_without_revoking(self):
+  def test_supersedes_is_refused_outside_a_draft(self):
+    # RM-248: a replacement goes through an engagement draft and its signed pack, never a direct create.
     first = self.create()["data"]["engagementId"]
-    second = self.create(request_id=str(uuid4()), supersedes=first)["data"]
-    self.assertEqual(second["supersedes"], first)
+    writes = len(self.owner.writes)
+    for supersedes in (first, "en_nope"):
+      self.refused(self.create(request_id=str(uuid4()), supersedes=supersedes), 400, "supersedes_via_draft")
+    self.assertEqual(len(self.owner.writes), writes)
     self.assertTrue(self.service.get_engagement(self.actor, self.tenant, first)["data"]["engagement"]["active"])
-    self.refused(self.create(request_id=first[3:], supersedes=first), 409, "conflict")
 
   def test_revoke_is_final_and_idempotent(self):
     engagement = self.create()["data"]

@@ -23,7 +23,7 @@ COMPLETE = {"display_name": " Q4 external ",
             "valid_from": "2026-10-01T00:00:00Z", "valid_until": "2026-10-31T00:00:00+00:00",
             "context": {"client_name": "Example"}}
 LIST_KEYS = {"engagement_draft_id", "parent", "display_name", "assets_count", "document_state", "created_at",
-             "updated_at", "contract_id"}
+             "updated_at", "contract_id", "supersedes"}
 SNAPSHOT_SHA256 = hashlib.sha256(SNAPSHOT.encode("utf-8")).hexdigest()
 
 
@@ -870,6 +870,11 @@ class TestEngagementReplacement(_EngagementDraftCase):
   def active_ids(self):
     return sorted(row["engagement_id"] for row in self.engagement_rows() if row["active"])
 
+  def test_the_list_row_names_the_engagement_a_draft_replaces(self):
+    engagement_draft_id = self.replacement(sign=False)
+    rows = {row["engagement_draft_id"]: row for row in ok(self, self.plugin.list_engagement_drafts(self.actor, self.tenant_id))}
+    self.assertEqual(rows[engagement_draft_id]["supersedes"], self.old_id)
+
   def test_the_draft_carries_the_asset_copies_and_documents_and_keeps_them_after_an_archive(self):
     engagement_draft_id = self.replacement(sign=False)
     draft = ok(self, self.plugin.get_engagement_draft(self.actor, engagement_draft_id))
@@ -1035,17 +1040,6 @@ class TestEngagementReplacement(_EngagementDraftCase):
       ok(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id))
     old = self.read(self.old_id)
     self.assertEqual((landed, old["active"], old["revokeReason"], old["supersededBy"]), ([True], False, "manual", new_id))
-
-  def test_a_direct_create_with_supersedes_links_and_is_refused_once_replaced(self):
-    replaced = self.replacement()
-    ok(self, self.plugin.activate_engagement_draft(self.actor, replaced))
-    new_id = "en_" + replaced[4:]
-    create = lambda supersedes: self.plugin.create_engagement(
-      self.actor, self.tenant_id, str(uuid4()), "Direct", COMPLETE["valid_from"], COMPLETE["valid_until"],
-      COMPLETE["context"], [pick(self.asset_in(self.tenant_id))], None, supersedes=supersedes)
-    refused(self, create(self.old_id), 409, "engagement_superseded")
-    direct = ok(self, create(new_id))["engagementId"]
-    self.assertEqual((self.read(new_id)["active"], self.read(new_id)["supersededBy"]), (True, direct))
 
   def test_a_second_replacement_of_the_same_engagement_is_refused(self):
     first, second = self.replacement(), self.replacement()

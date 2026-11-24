@@ -1260,8 +1260,11 @@ class TenantAdministrationService:
                         valid_until, context, assets, documents=None, supersedes=None, contract_id=None):
     """`documents` are the references `services.engagement_documents.resolve_engagement_document`
     verified outside this lock, in the order they are numbered (`ed_1`, `ed_2`, ...). RM-133:
-    `contract_id` picks one of the tenant's contracts; absent, `c_1` as before."""
+    `contract_id` picks one of the tenant's contracts; absent, `c_1` as before. RM-248: a replacement
+    (`supersedes`) goes through an engagement draft and its signed pack, never this call."""
     tenant, account = self._authorized_tenant(actor, tenant_id, "engagements:create")
+    if supersedes is not None:
+      raise AdministrationDenied(400, "supersedes_via_draft")
     contract_id = None if contract_id in (None, "") else contract_id
     contract_sha256 = self._tenant_contract_sha256(tenant, contract_id)
     request_id = _request_id(request_id)
@@ -1278,14 +1281,8 @@ class TenantAdministrationService:
           or existing["created_by"] != account.account_id):
         raise AdministrationDenied(409, "conflict")
       return {**self._engagement_row(existing, tenant), "replayed": True}
-    if supersedes is not None:
-      if supersedes == engagement_id:
-        raise AdministrationDenied(400, "supersedes_invalid")
-      # RM-248: a direct replacement is refused and linked as a draft one is (Phase 4 refuses it).
-      self._replaceable(tenant_id, supersedes, engagement_id)
     record = self._with_assets(record, self._engagement_assets(request["assets"], {"tenant_id": tenant_id}))
     self.store.put("engagement", tenant_id, engagement_id, record=record)
-    self._finish_replacement(record)
     # `replayed` says whether this call wrote, decided under the lock (the plugin audits on it).
     return {**self._engagement_row(self.store.get("engagement", tenant_id, engagement_id), tenant),
             "replayed": False}
@@ -2935,16 +2932,14 @@ class TenantAdministrationService:
     """The stored ref inside a `generated` block (what `resolve_engagement_pack` answers for it)."""
     return None if generated is None else {key: generated[key] for key in drafts.DOC_REF_KEYS}
 
-  def _replaceable(self, tenant_id, engagement_id, replacement=None):
+  def _replaceable(self, tenant_id, engagement_id):
     """RM-248: the stored engagement a replacement names. One already replaced is refused, also when
-    only the replacement row was written (a crash before the link): any row but `replacement` that
-    `supersedes` it counts."""
+    only the replacement row was written (a crash before the link): any row that `supersedes` it counts."""
     old = self.store.get("engagement", tenant_id, engagement_id)
     if old is None:
       raise AdministrationDenied(400, "supersedes_invalid")
     if old.get("superseded_by") is not None or any(
-        row.get("supersedes") == engagement_id and row["engagement_id"] != replacement
-        for row in self.store.list_engagements(tenant_id)):
+        row.get("supersedes") == engagement_id for row in self.store.list_engagements(tenant_id)):
       raise AdministrationDenied(409, "engagement_superseded")
     return old
 
