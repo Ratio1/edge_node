@@ -10,7 +10,9 @@ spec: `docs/resources/edgeguard-models/specs/edgeguard-explain-v2-egx2.md`.
 from .field_catalog import CATALOG_SHA256
 from .insight_brief import (
   CASE_EXPLANATION_VERSION,
+  EMPTY_RESULT_REASON,
   MAX_TOKENS,
+  MIN_CALL_SECONDS,
   PROFILE_ID,
   PROFILE_SHA256,
   STRATEGY,
@@ -21,7 +23,9 @@ from .insight_brief import (
 __all__ = [
   "CASE_EXPLANATION_VERSION",
   "CATALOG_SHA256",
+  "EMPTY_RESULT_REASON",
   "MAX_TOKENS",
+  "MIN_CALL_SECONDS",
   "PROFILE_ID",
   "PROFILE_SHA256",
   "STRATEGY",

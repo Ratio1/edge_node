@@ -1,0 +1,193 @@
+"""Forward signed Deeploy repairs to the oracle that owns the blocked deployment."""
+
+import json
+import time
+from itertools import chain
+from uuid import uuid4
+
+
+_RELAY_KEY = "DEEPLOY_REPAIR_RELAY_V1"
+_RELAY_TIMEOUT = 45
+_RELAY_MAX_PENDING = 32
+_RELAY_MAX_PENDING_STATUS = 4
+_RELAY_MAX_PER_TICK = 32
+_RELAY_MAX_BACKLOG = 64
+_RELAY_REQUEST_BYTES = 256 * 1024
+
+
+class _RepairRelayMixin:
+  """Deliver a repair and its reply over the existing encrypted admin listener."""
+
+  def _forward_job_repair(self, request, owner, method):
+    # These entry points have already checked the signed wallet request and escrow.
+    proposal = request["repair"]["proposal"] if method == "update" else request
+    coordinator = proposal.get("coordinator")
+    parent_id = (proposal.get("parent") or {}).get("operation_id") if method == "update" else None
+    replacing = method == "update" and request["repair"].get("replace_stateless") is True
+    if not isinstance(coordinator, str) or (method == "update" and not replacing and not isinstance(parent_id, str)):
+      return None
+    if not self._is_repair_relay_oracle(coordinator):
+      return None  # Only a currently registered coordinator can receive the signed wallet envelope.
+    records = self._operation_records(job_id=request["job_id"])
+    # A signed operation determines the destination. Retried updates can name a parent already superseded.
+    matches = [record for record in records.values()
+               if record["coordinator"] == coordinator and str(record["job_id"]) == str(request["job_id"])
+               and record["owner"].lower() == owner.lower() and record.get("mutation") == "node_relink"
+               and (record["operation_id"] == parent_id if method == "update"
+                    else record["phase"] == "retiring_previous")]
+    if replacing and parent_id is None:
+      # An exact retry may be looking up an already admitted replacement. Match only the verified owner and job.
+      admitted = [record for record in records.values()
+                  if record["coordinator"] == coordinator and record.get("request_id") == request.get("request_id")
+                  and str(record["job_id"]) == str(request["job_id"]) and record["owner"].lower() == owner.lower()]
+      if not admitted:
+        try:
+          current, _ = self._stateless_replacement_proposal(request["job_id"], owner)
+        except ValueError:
+          return self._repair_relay_unavailable(method)  # This ingress cannot decide whether the coordinator admitted it.
+        if current["coordinator"] != coordinator:
+          return self._repair_relay_unavailable(method)
+        # The verified current owner can distinguish a stale proposal from an exact accepted retry.
+    elif len(matches) != 1:
+      return self._repair_relay_unavailable(method)  # A missing replica is not a confirmed rejection.
+    return self._queue_job_repair_request(request, coordinator, method)
+
+  def _forward_replacement_status(self, request, coordinator):
+    if not self._is_repair_relay_oracle(coordinator):
+      return self._repair_relay_unavailable("status")
+    # Forward the authenticated read envelope and selectors only. The coordinator rechecks escrow access.
+    fields = ("nonce", "EE_ETH_SIGN", "EE_ETH_SENDER", "job_id", "request_id", "kind", "replacement_coordinator")
+    return self._queue_job_repair_request({key: request[key] for key in fields}, coordinator, "status")
+
+  def _queue_job_repair_request(self, request, coordinator, method):
+    if len(json.dumps(request, ensure_ascii=False).encode()) > _RELAY_REQUEST_BYTES:
+      raise ValueError("The signed repair is too large to forward.")
+    # Never cache a wallet payload or credentials in the relay's pending state.
+    now = time.monotonic()
+    for relay_id, pending in list(self._repair_relay_pending.items()):
+      if pending["deadline"] <= now:
+        del self._repair_relay_pending[relay_id]
+    if len(self._repair_relay_pending) >= _RELAY_MAX_PENDING:
+      return self._repair_relay_unavailable(method)
+    if (method == "status" and sum(item.get("method") == "status" for item in self._repair_relay_pending.values())
+        >= _RELAY_MAX_PENDING_STATUS):
+      return self._repair_relay_unavailable(method)  # Keep most relay slots available for mutations.
+    relay_id = uuid4().hex
+    timeout = min(_RELAY_TIMEOUT, 10) if method == "status" else _RELAY_TIMEOUT
+    self._repair_relay_pending[relay_id] = {"coordinator": coordinator, "deadline": now + timeout, "method": method}
+    try:
+      self.send_encrypted_payload(node_addr=coordinator, **{_RELAY_KEY: {
+        "id": relay_id, "method": method, "valid_until": int(self.time()) + timeout, "request": request,
+      }})
+    except Exception:
+      self._repair_relay_pending.pop(relay_id, None)  # A send failure may occur after enqueueing.
+      return self._repair_relay_unavailable(method)
+    return self.create_postponed_request(self._wait_job_repair_reply, {"relay_id": relay_id, "method": method})
+
+  def _repair_relay_unavailable(self, method):
+    if method == "preview":
+      return self._get_response({"status": "blocked", "reason": "The repair coordinator did not respond. Try Review repair again."})
+    if method == "status":
+      return self._get_response({"status_code": 503, "status": "synchronizing", "poll_after_ms": 2000})
+    # The client treats a retryable 503 as uncertain and keeps the original signed request ID.
+    return self._get_response({"status_code": 503, "status": "error", "error": {
+      "code": "ADMISSION_UNAVAILABLE", "message": "Repair acceptance is uncertain. Retry with the same request_id.",
+      "retryable": True,
+    }})
+
+  def _wait_job_repair_reply(self, relay_id, method):
+    # Postpone on the FastAPI loop so other HTTP requests and incoming peer messages can advance.
+    pending = self._repair_relay_pending.get(relay_id)
+    if pending is None or pending["deadline"] <= time.monotonic():
+      self._repair_relay_pending.pop(relay_id, None)
+      return self._repair_relay_unavailable(method)
+    if "result" in pending:
+      del self._repair_relay_pending[relay_id]
+      return pending["result"]
+    return self.create_postponed_request(self._wait_job_repair_reply, {"relay_id": relay_id, "method": method})
+
+  def _process_job_repair_relay(self):
+    fields = self.const.PAYLOAD_DATA  # Use the actual Core wire keys, including EE_DEST.
+    backlog = getattr(self, "_repair_relay_backlog", ())
+    inputs = self.dataapi_struct_datas(as_list=True)
+    registered = None
+    handled = 0
+    overflow = []
+    for payload in chain(backlog, inputs):
+      if not isinstance(payload, dict) or payload.get(fields.EE_IS_ENCRYPTED) is not True:
+        continue
+      path = payload.get(fields.EE_PAYLOAD_PATH)
+      if not isinstance(path, list) or len(path) != 4 or str(path[2]).upper() != "DEEPLOY_MANAGER_API":
+        continue
+      ciphertext = payload.get(fields.EE_ENCRYPTED_DATA)
+      if (payload.get(fields.EE_DESTINATION) != self.bc.address or not isinstance(ciphertext, str)
+          or len(ciphertext) > 2 * _RELAY_REQUEST_BYTES):
+        continue
+      if registered is None:
+        try:
+          registered = {address.lower() for address in self.bc.get_eth_oracles()}
+        except Exception:
+          self.P("Could not authenticate Deeploy repair relay peers.", color="y")
+          return  # Keep authenticated overflow and retry it when authority is available.
+      try:
+        if not self._is_repair_relay_oracle(payload.get(fields.EE_SENDER), registered):
+          continue
+        if not self.bc.verify(payload, return_full_info=True).valid:
+          continue
+        # Only authenticated traffic may use the dispatch budget or the bounded overflow buffer.
+        if handled >= _RELAY_MAX_PER_TICK:
+          if len(overflow) < _RELAY_MAX_BACKLOG:
+            overflow.append(payload)
+          continue
+        handled += 1
+        self._handle_job_repair_peer(payload, registered=registered, authenticated=True)
+      except Exception:
+        # Never log incoming payloads, decrypted data, or exception text that could echo them.
+        self.P("Could not process a Deeploy repair relay message.", color="y")
+    self._repair_relay_backlog = overflow
+
+  def _is_repair_relay_oracle(self, node, registered=None):
+    # Resolve the address directly from its public key, independently of the local heartbeat roster.
+    if not isinstance(node, str):
+      return False
+    try:
+      eth_address = self.bc.node_address_to_eth_address(node).lower()
+      roster = registered if registered is not None else {address.lower() for address in self.bc.get_eth_oracles()}
+      return eth_address in roster
+    except (AttributeError, TypeError, ValueError):
+      return False
+
+  def _handle_job_repair_peer(self, payload, registered=None, authenticated=False):
+    sender = payload.get(self.const.PAYLOAD_DATA.EE_SENDER)
+    if not authenticated and (
+      not self._is_repair_relay_oracle(sender, registered) or not self.bc.verify(payload, return_full_info=True).valid
+    ):
+      return
+    message = self.receive_and_decrypt_payload(payload).get(_RELAY_KEY)
+    if not isinstance(message, dict) or not isinstance(message.get("id"), str) or len(message["id"]) != 32:
+      return
+    relay_id, method = message["id"], message.get("method")
+    if method == "reply":
+      pending = self._repair_relay_pending.get(relay_id)
+      result = message.get("result")
+      if (pending and pending["coordinator"] == sender and pending["deadline"] > time.monotonic()
+          and "result" not in pending and isinstance(result, dict)):
+        pending["result"] = result  # Preserve the original coordinator's signed API response.
+      return
+    valid_until, request = message.get("valid_until"), message.get("request")
+    if type(valid_until) is not int or not 0 < valid_until - self.time() <= 2 * _RELAY_TIMEOUT or not isinstance(request, dict):
+      return
+    # Accept only requests naming this receiver. The local public handlers reverify the wallet and job authorization.
+    if method == "preview" and request.get("coordinator") == self.bc.address:
+      result = self.get_job_repair_preview(request)
+    elif method == "status" and request.get("replacement_coordinator") == self.bc.address:
+      # This exact receiver is the coordinator, so its public handler cannot forward the lookup again.
+      result = self.get_deployment_status(request)
+    elif method == "update" and isinstance(request.get("repair"), dict):
+      proposal = request["repair"].get("proposal")
+      if not isinstance(proposal, dict) or proposal.get("coordinator") != self.bc.address:
+        return
+      result = self.repair_update_pipeline(request)
+    else:
+      return
+    self.send_encrypted_payload(node_addr=sender, **{_RELAY_KEY: {"id": relay_id, "method": "reply", "result": result}})

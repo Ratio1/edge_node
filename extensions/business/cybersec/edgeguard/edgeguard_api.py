@@ -56,12 +56,12 @@ from .edgeguard_cypher_guard_v0_13 import (
   build_v0_13_pattern_schema_system_prompt,
   load_v0_13_p6_system_prompt,
 )
-from .edgeguard_cypher_decision_json import (
-  DECISION_JSON_SCHEMA,
-  PROMPT_PROFILE_DECISION_JSON_2026_11_08,
-  SCHEMA_VERSION_DECISION_JSON,
-  load_system_prompt as load_decision_json_system_prompt,
-  parse_decision_reply,
+from .edgeguard_cypher_decision_json import parse_decision_reply
+from .edgeguard_prompt_pack import (
+  LEGACY_PROFILE_PACKS,
+  PARSER_DECISION_JSON,
+  PromptPackError,
+  load_pack,
 )
 from . import literal_classes
 
@@ -95,9 +95,10 @@ from .graph_first_runtime import (
   run_graph_first_explanation,
 )
 from .result_digest import DIGEST_COVERAGE_SCHEMA_VERSION, build_projection_digest, build_result_digest
-from .analyst_brief import MAX_TOKENS as ANALYST_BRIEF_MAX_TOKENS, run_analyst_brief
+from .analyst_brief import IDENTIFIER_RE, MAX_TOKENS as ANALYST_BRIEF_MAX_TOKENS, run_analyst_brief
 from . import egx2
 from . import misp_enrichment
+from .labels import primary_label
 from .misp_enrichment import FORBIDDEN_PACKET_PROPERTY_RE
 
 try:
@@ -638,8 +639,20 @@ STATUS_TIMEOUT = "timeout"
 # The model chose not to write a query (decision-JSON profile: clarify,
 # out_of_scope, refuse); `decision_message` carries its question or reason.
 STATUS_DECLINED = "declined"
+# Shown when a declining reply carries no text (the model sent `null`, a non-string or an empty string).
+DECLINE_FALLBACK_MESSAGES = {
+  "clarify": "The model needs more detail to answer. Add specifics to the question and ask again.",
+  "out_of_scope": "The model says this question is outside what the EdgeGuard graph covers.",
+  "refuse": "The model declined to answer this question.",
+}
 
 EDGEGUARD_REQUEST_TIMEOUT_SECONDS = 600
+# EG-039 phase 4: a brief model call (EGX/2 or EAB/1) waits for min(this, job budget left).
+# Slow is acceptable on a 4-core host; the job budget above is the real limit.
+EDGEGUARD_BRIEF_CALL_MAX_SECONDS = 420
+# EAB/1 starts only with this much job budget left: one call of about 2,000 prompt
+# tokens and 256 reply tokens measured about 150 s cold on a 4-core host, plus margin.
+EDGEGUARD_ANALYST_BRIEF_MIN_SECONDS = 200
 
 # EG-013 P4: non-success endpoint outcomes for the /health request metrics.
 # A deterministic guard rejection counts as a failed request; plain metadata
@@ -773,17 +786,6 @@ PROMPT_PROFILES = {
     "system_prompt_suffix": None,
     "single_user_message": False,
   },
-  # IICT-BAS adapter (2026-11-08): its own vendored system prompt, a JSON
-  # reply with a `decision`, no correction turns (see
-  # `edgeguard_cypher_decision_json`).
-  PROMPT_PROFILE_DECISION_JSON_2026_11_08: {
-    "prompt_profile_id": "edgeguard_decision_json_2026_11_08",
-    "template_version": "edgeguard-decision-json-5e12777d5a",
-    "prompt_contract": "one JSON line with a decision; a read-only Cypher query for answer and partial",
-    "system_prompt_suffix": None,
-    "single_user_message": False,
-    "max_tokens": 512,  # the adapter's trained decoding budget
-  },
 }
 
 # Contract §5.1/§5.2: which builder renders the system prompt / correction
@@ -798,7 +800,6 @@ PROMPT_PROFILES = {
 _V0_11_SYSTEM_PROMPT = build_v0_11_pattern_schema_system_prompt()
 _V0_13_SYSTEM_PROMPT = build_v0_13_pattern_schema_system_prompt()
 _V0_13_P6_SYSTEM_PROMPT = load_v0_13_p6_system_prompt()
-_DECISION_JSON_SYSTEM_PROMPT = load_decision_json_system_prompt()
 
 
 def _system_prompt_for_profile(profile_name: str) -> str:
@@ -808,8 +809,6 @@ def _system_prompt_for_profile(profile_name: str) -> str:
     return _V0_13_SYSTEM_PROMPT
   if profile_name == PROMPT_PROFILE_V0_13_P6:
     return _V0_13_P6_SYSTEM_PROMPT
-  if profile_name == PROMPT_PROFILE_DECISION_JSON_2026_11_08:
-    return _DECISION_JSON_SYSTEM_PROMPT
   return build_direct_cypher_system_prompt()
 
 
@@ -1060,6 +1059,18 @@ def _emit_progress(progress, phase: str, detail: Optional[Dict[str, Any]] = None
   try:
     progress(phase, detail)
   except Exception:  # noqa: BLE001 - progress is observability only.
+    pass
+
+
+def _emit_partial(progress, partial: Optional[Dict[str, Any]]) -> None:
+  """Publish the EG-039 job partial through the progress callback's optional
+  `partial` hook; fail-open like `_emit_progress`."""
+  hook = getattr(progress, "partial", None)
+  if hook is None or partial is None:
+    return
+  try:
+    hook(partial)
+  except Exception:  # noqa: BLE001 - observability only.
     pass
 
 
@@ -1591,7 +1602,29 @@ def _node_caption(labels: list[str], properties: Dict[str, Any]) -> str:
   for item in properties.values():
     if _is_scalar(item) and item not in (None, ""):
       return _compact_text(item, 240)
-  return labels[0] if labels else "Entity"
+  return primary_label(labels) or "Entity"
+
+
+def _distinct_identifier_count(query_result_evidence: Optional[Mapping[str, Any]]) -> int:
+  """Distinct `IDENTIFIER_RE` matches in the returned row values, the text the EAB/1
+  grounding gate checks a brief against (same lower-casing)."""
+  # Raw strings, not JSON text: escaping ("\n" becomes "\\n") puts a word character
+  # before an identifier and hides it from `\b`.
+  strings: list[str] = []
+
+  def collect(value: Any) -> None:
+    if isinstance(value, Mapping):
+      for item in value.values():
+        collect(item)
+    elif isinstance(value, (list, tuple)):
+      for item in value:
+        collect(item)
+    elif value is not None:
+      strings.append(str(value))
+
+  for row in (query_result_evidence or {}).get("rows") or []:
+    collect(row.get("values"))
+  return len({match.group(0).lower() for text in strings for match in IDENTIFIER_RE.finditer(text)})
 
 
 def _add_graph_node(value: Any, state: _GraphPacketState) -> Optional[str]:
@@ -3460,9 +3493,10 @@ _CONFIG = {
   "EDGEGUARD_EXPLANATION_OUTPUT_MODE": None,
   "EDGEGUARD_EXPLANATION_STRATEGY": "one_call",
   # Admission floor for the EGX/2 insight-brief model call: skip the model (and
-  # degrade deterministically) unless this much request budget remains. Sized
-  # from the measured GPU-serving throughput; re-measure on hardware change.
-  "EDGEGUARD_INSIGHT_BRIEF_ADMISSION_SECONDS": 240,
+  # degrade deterministically) unless this much request budget remains: the worst-case
+  # cold call on a 4-core CPU host after the EG-039 phase 4 cut (see
+  # `egx2.MIN_CALL_SECONDS`); re-measure on hardware change.
+  "EDGEGUARD_INSIGHT_BRIEF_ADMISSION_SECONDS": egx2.MIN_CALL_SECONDS,
   # Public model key -> worker address (SEMAPHORE/PATH) plus catalog metadata.
   # The shipped defaults describe public models only. A deployment adds the
   # models it wants to run (for example a private fine-tuned GGUF) here, in the
@@ -3552,7 +3586,25 @@ class EdgeguardApiPlugin(BasePlugin):
       explicit=self.cfg_edgeguard_explanation_model_token,
       env_name=self.cfg_edgeguard_explanation_model_token_env,
     )
+    self._validate_prompt_packs("refuses to start")
     return
+
+  def on_config(self):
+    # A live config update gets the same check first; the raise makes the framework roll the config
+    # back. The parent hook (tunnel engine switch, server reload) still runs for every good update.
+    self._validate_prompt_packs("refuses this config")
+    parent = getattr(super(), "on_config", None)
+    if parent is not None:
+      parent()
+
+  def _validate_prompt_packs(self, verdict: str) -> None:
+    """Load every model key's pack now (cached), so a bad pack or profile name never waits for a request."""
+    for model_key in self._configured_model_keys():
+      try:
+        self._prompt_pack(model_key)
+      except PromptPackError as exc:
+        self.P(f"EDGEGUARD_API {verdict}: {exc}", color="r")
+        raise
 
   def _setup_semaphore_env(self):
     """Set semaphore environment variables for paired UI/container plugins."""
@@ -3861,7 +3913,16 @@ class EdgeguardApiPlugin(BasePlugin):
       raise GraphFirstRuntimeError("tokenizer_path", "configuration", "graph-first tokenizer path is invalid")
     return production_token_counter(path)
 
-  def _call_graph_first_provider(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+  def _brief_provider_call(self, deadline: float):
+    """`provider_call` for a brief: each call waits `min(420, job budget left)` seconds."""
+    def call(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+      wait = min(EDGEGUARD_BRIEF_CALL_MAX_SECONDS, deadline - time.monotonic())
+      if wait < 1:
+        raise GraphFirstRuntimeError("insufficient_deadline_budget", "completion", "no request budget left for the brief call")
+      return self._call_graph_first_provider(payload, timeout=wait)
+    return call
+
+  def _call_graph_first_provider(self, payload: Mapping[str, Any], timeout: Optional[float] = None) -> Mapping[str, Any]:
     override = getattr(self, "_graph_first_provider_for_tests", None)
     if callable(override):
       return override(payload)
@@ -3878,7 +3939,7 @@ class EdgeguardApiPlugin(BasePlugin):
         url,
         headers=self._explanation_headers(),
         json=dict(payload),
-        timeout=min(230, int(self.cfg_request_timeout_seconds)),
+        timeout=min(230, int(self.cfg_request_timeout_seconds)) if timeout is None else timeout,
       )
     except requests.exceptions.Timeout as exc:
       raise GraphFirstRuntimeError("provider_timeout", "provider", "graph-first provider timed out") from exc
@@ -4048,10 +4109,7 @@ class EdgeguardApiPlugin(BasePlugin):
     retry_limit: int = DEFAULT_SCHEMA_RETRY_LIMIT,
   ) -> list[Dict[str, str]]:
     profile = self._prompt_profile(model_key)
-    system_prompt = _system_prompt_for_profile(profile["name"])
-    suffix = profile.get("system_prompt_suffix")
-    if isinstance(suffix, str) and suffix:
-      system_prompt += suffix
+    system_prompt = self._profile_system_prompt(profile)
     if not retry_index:
       if profile.get("single_user_message"):
         return [{"role": "user", "content": f"{system_prompt}\n\nUser task:\n{normalized_request}"}]
@@ -4122,18 +4180,58 @@ class EdgeguardApiPlugin(BasePlugin):
       )
     return keys[0] if keys else None
 
+  def _prompt_pack(self, model_key: str):
+    """The validated prompt pack behind a model key, or None for a built-in profile.
+
+    A worker entry names a built-in `PROMPT_PROFILE` or a `PROMPT_PACK`, never
+    both, and an unknown profile name is an error, not a fallback. Raises
+    `PromptPackError`; `on_init` calls this for every key, so a bad entry stops
+    the plugin at startup.
+    """
+    worker, _err = self._generation_worker(model_key)
+    if not isinstance(worker, Mapping):
+      return None
+    name, source = worker.get("PROMPT_PROFILE"), worker.get("PROMPT_PACK")
+    label = f"model {model_key!r}"
+    if name is not None and source is not None:
+      raise PromptPackError(label, "declares both PROMPT_PROFILE and PROMPT_PACK; use one")
+    if isinstance(name, str) and name in LEGACY_PROFILE_PACKS:
+      source = LEGACY_PROFILE_PACKS[name]
+    elif source is None:
+      if name is not None and (not isinstance(name, str) or name not in PROMPT_PROFILES):
+        raise PromptPackError(label, f"unknown PROMPT_PROFILE {name!r}; known profiles are {sorted(PROMPT_PROFILES)}")
+      return None
+    cache = self.__dict__.setdefault("_prompt_packs", {})
+    cache_key = (model_key, json.dumps(source, sort_keys=True, default=str))
+    if cache_key not in cache:
+      # Same token source as the serving worker (`BaseLlmServing.hf_token`): the worker entry, then EE_HF_TOKEN.
+      token = worker.get("HF_TOKEN") or getattr(self, "os_environ", {}).get("EE_HF_TOKEN")
+      where = (source.get("repo") or os.path.basename(str(source.get("path") or "").rstrip("/"))) if isinstance(source, Mapping) else ""
+      cache[cache_key] = load_pack(source, label=f"{label} pack {where}", hf_token=token)
+    return cache[cache_key]
+
   def _prompt_profile(self, model_key: str) -> Dict[str, Any]:
+    pack = self._prompt_pack(model_key)
+    if pack is not None:
+      return {
+        "name": f"pack:{pack.pack_id}",
+        "prompt_profile_id": pack.pack_id,
+        "template_version": pack.template_version,
+        "prompt_contract": pack.prompt_contract,
+        "system_prompt_suffix": None,
+        "single_user_message": False,
+        "max_tokens": pack.max_tokens,
+        "pack": pack,
+      }
     worker, _err = self._generation_worker(model_key)
     name = worker.get("PROMPT_PROFILE") if isinstance(worker, Mapping) else None
-    if name is not None and name not in PROMPT_PROFILES:
-      self._warn_once(
-        f"_warned_prompt_profile_{model_key}",
-        f"Model '{model_key}' declares unknown PROMPT_PROFILE {name!r}; known profiles are "
-        f"{sorted(PROMPT_PROFILES)}. Falling back to '{DEFAULT_PROMPT_PROFILE}'.",
-      )
-    if not isinstance(name, str) or name not in PROMPT_PROFILES:
-      name = DEFAULT_PROMPT_PROFILE
-    return {"name": name, **PROMPT_PROFILES[name]}
+    return {"name": name or DEFAULT_PROMPT_PROFILE, **PROMPT_PROFILES[name or DEFAULT_PROMPT_PROFILE]}
+
+  def _profile_system_prompt(self, profile: Mapping[str, Any]) -> str:
+    pack = profile.get("pack")
+    system_prompt = pack.system_prompt if pack else _system_prompt_for_profile(profile["name"])
+    suffix = profile.get("system_prompt_suffix")
+    return system_prompt + suffix if isinstance(suffix, str) and suffix else system_prompt
 
   def _cypher_validation_profile(self, model_key: Optional[str]) -> Dict[str, Any]:
     """Contract §1/§4.1 (review finding 1, both rounds): the one place that
@@ -4153,21 +4251,23 @@ class EdgeguardApiPlugin(BasePlugin):
     `allow_limit_optional_graph=False`, `enforce_hop_bounds=False`.
     """
     artifact = None
-    profile_name = None
+    pack = None
     if isinstance(model_key, str) and model_key.strip():
-      profile_name = self._prompt_profile(model_key)["name"]
-      artifact = PATTERN_SCHEMA_ARTIFACTS.get(profile_name)
-    if profile_name == PROMPT_PROFILE_DECISION_JSON_2026_11_08:
+      profile = self._prompt_profile(model_key)
+      pack = profile.get("pack")
+      artifact = PATTERN_SCHEMA_ARTIFACTS.get(profile["name"])
+    if pack is not None and pack.schema_allowed is not None:
       # v0.10 rules (LIMIT required, no pattern-schema checks) against the
-      # schema the adapter's own system prompt describes.
+      # allowlist the pack ships (`schema.json`: the schema its system prompt describes, plus the
+      # prod-graph names the pack adds on purpose).
       return {
         "use_v0_11": False,
         "schema_artifact": None,
-        "schema_allowed": DECISION_JSON_SCHEMA,
+        "schema_allowed": pack.schema_allowed,
         "allow_limit_optional_graph": False,
         "enforce_hop_bounds": False,
-        "schema_version": SCHEMA_VERSION_DECISION_JSON,
-        "schema_surface": {key: sorted(values) for key, values in DECISION_JSON_SCHEMA.items()},
+        "schema_version": pack.schema_version,
+        "schema_surface": {key: sorted(values) for key, values in pack.schema_allowed.items()},
       }
     use_v0_11 = artifact is not None
     return {
@@ -4495,7 +4595,8 @@ class EdgeguardApiPlugin(BasePlugin):
     guard_schema_allowed = validation_profile["schema_allowed"]
     response_schema_version = validation_profile["schema_version"]
     response_schema_surface = validation_profile["schema_surface"]
-    decision_json = self._prompt_profile(selected_key)["name"] == PROMPT_PROFILE_DECISION_JSON_2026_11_08
+    pack = self._prompt_profile(selected_key).get("pack")
+    decision_json = pack is not None and pack.parser == PARSER_DECISION_JSON
     try:
       for attempt_index in range(DEFAULT_SCHEMA_RETRY_LIMIT + 1):
         remaining = deadline - time.monotonic()
@@ -4515,7 +4616,7 @@ class EdgeguardApiPlugin(BasePlugin):
         model_reply = raw_output
         reply = None
         if decision_json and completion.get("finish_reason") == "stop":
-          reply = parse_decision_reply(raw_output)
+          reply = parse_decision_reply(raw_output, pack.field_map)
           if reply["ok"] and reply["cypher"] is None:
             total_ms = round((time.monotonic() - started) * 1000, 1)
             return {
@@ -4523,7 +4624,7 @@ class EdgeguardApiPlugin(BasePlugin):
               "accepted": False,
               "accepted_cypher": None,
               "decision": reply["decision"],
-              "decision_message": reply["message"],
+              "decision_message": (reply["message"] or "").strip() or DECLINE_FALLBACK_MESSAGES[reply["decision"]],
               "attempts": [{
                 "attempt": attempt_index,
                 "kind": "initial",
@@ -4594,10 +4695,11 @@ class EdgeguardApiPlugin(BasePlugin):
               "within the output limit."
             ),
           }
-        elif not decision_json:
-          # The decision-JSON adapter maps question words to stored values its
-          # own prompt teaches ('Known', 'x509-fingerprint-sha1'); the v0.11
-          # synonym table does not know them, so literal grounding is skipped.
+        elif pack is None or pack.grounding:
+          # A pack decides whether literal grounding runs. The 2026-11-08 adapter
+          # maps question words to stored values its own prompt teaches ('Known',
+          # 'x509-fingerprint-sha1'); the v0.11 synonym table does not know them,
+          # so its pack turns grounding off.
           validation = self._apply_literal_grounding_guard(
             validation,
             guarded_output,
@@ -4695,8 +4797,8 @@ class EdgeguardApiPlugin(BasePlugin):
           }
         last_candidate = attempt["candidate_cypher"]
         last_feedback = attempt["validation_feedback"] or "The previous output failed validation."
-        if decision_json:
-          # The adapter was trained without correction turns: one attempt only.
+        if pack is not None:
+          # A pack carries no correction turn: one attempt only.
           break
     except _GenerationDeadlineExceeded:
       code = "generation_deadline_exceeded"
@@ -4713,7 +4815,12 @@ class EdgeguardApiPlugin(BasePlugin):
     else:
       total_ms = round((time.monotonic() - started) * 1000, 1)
       llm_ms = round(sum(item["timing_ms"] for item in attempts), 1)
+      # A guard-rejected `answer`/`partial` keeps the model's decision and note; a reply that did not parse has none.
+      decision_fields = (
+        {"decision": reply["decision"], "decision_note": reply["note"]} if reply and reply["ok"] else {}
+      )
       return {
+        **decision_fields,
         "status": STATUS_REJECTED,
         "accepted": False,
         "accepted_cypher": None,
@@ -4914,6 +5021,7 @@ class EdgeguardApiPlugin(BasePlugin):
     packet: Mapping[str, Any],
     block: Optional[Mapping[str, Any]],
     event_url_template: str = misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE,
+    record: bool = True,
   ) -> Optional[Mapping[str, Any]]:
     """Explanation spec v0.2 §4: runs before any EAB/1 or EGX/2 model call.
     Re-validates the block that would be admitted, computes
@@ -4932,17 +5040,46 @@ class EdgeguardApiPlugin(BasePlugin):
     errors: list[Dict[str, str]] = []
     _validate_packet_redaction(model_redaction, errors)
     if any(error.get("code") == "raw_misp_payload_not_allowed" for error in errors):
-      with self._metrics_lock:
-        self._misp_enrichment_error_count += 1
-        self._misp_enrichment_last_error = "model_admission"
+      if record:  # the job partial re-checks a block the brief step will count itself
+        with self._metrics_lock:
+          self._misp_enrichment_error_count += 1
+          self._misp_enrichment_last_error = "model_admission"
       return None
     return block
+
+  def _explain_job_partial(
+    self,
+    packet: Mapping[str, Any],
+    digest: Mapping[str, Any],
+    block: Optional[Mapping[str, Any]],
+    event_url_template: str,
+  ) -> Optional[Dict[str, Any]]:
+    """EG-039 phase 5: `{packet, result_digest, misp_enrichment?}` published
+    while the brief runs. The MISP block passes the same model admission and
+    the same `_bounded_graph_first_success` size bound as the final result, so
+    a block the admission rejects is absent here too; bounded on its own, the
+    partial can keep a block the larger final result drops for size. `None`
+    when even the block-free partial is over the byte cap."""
+    admitted = self._admit_misp_enrichment_for_model(packet, block, event_url_template, record=False)
+    partial: Dict[str, Any] = {"packet": dict(packet), "result_digest": dict(digest)}
+    if admitted is not None:
+      partial["misp_enrichment"] = dict(admitted)
+    try:
+      return self._bounded_graph_first_success(partial)
+    except GraphFirstRuntimeError:
+      return None
 
   def _active_explanation_strategy(self) -> str:
     value = getattr(self, "cfg_edgeguard_explanation_strategy", "one_call")
     return value if value in {"one_call", "eel_compatibility", "insight_brief"} else "one_call"
 
-  def _explanation_dispatch_strategy(self, result_shape: Optional[str]) -> str:
+  def _explanation_dispatch_strategy(
+    self,
+    result_shape: Optional[str],
+    returned_rows: Optional[int] = None,
+    truncated: bool = False,
+    query_result_evidence: Optional[Mapping[str, Any]] = None,
+  ) -> str:
     """Contract §4.3: a `ranked_projection` result is explained by the digest
     analyst brief (EAB/1) even when `insight_brief` (EGX/2) is the configured
     strategy. EGX/2's insight sheet derives everything from `packet.graph`,
@@ -4951,14 +5088,34 @@ class EdgeguardApiPlugin(BasePlugin):
     never the model. `other` (scalar, non-ranked) keeps its existing strategy
     and fallback behaviour unchanged.
 
+    EG-039 I-211: a 0-row ranked result stays on EGX/2, whose deterministic
+    "the query returned no rows" brief is a valid answer; EAB/1 has no brief
+    state for it (`no_graph_evidence`, shown as a failure).
+
+    EG-039 I-211: a truncated ranked result stays on EGX/2 too, never EAB/1 (whose
+    grounding has no totals gate). Without graph nodes EGX/2 answers with the
+    deterministic `tabular_result` brief (no model call); with graph nodes the
+    model sees the retained rows as a sample and the unchanged `count_claims`
+    gate rejects any total not backed by a sheet aggregate. Both end with the
+    fixed sample sentence.
+
+    EG-039 phase 7: a complete ranked result whose returned values hold more than 3
+    distinct identifiers (`analyst_brief.IDENTIFIER_RE`: CVE IDs, technique IDs,
+    hashes, IPs, domains) stays on EGX/2 too. A brief naming them all fails the EAB/1
+    `ioc_enumeration` gate. Without graph nodes it gets the deterministic
+    `tabular_result` brief (no model call, no sample sentence); with graph nodes the
+    EGX/2 model writes the brief. Only returned values count: a ranking that returns
+    nodes carries node refs, not identifiers, and keeps EAB/1.
+
     Review finding Q7: this reroutes `insight_brief` only. The legacy
     `eel_compatibility` strategy is not rerouted here — its own call sites
     (`_active_explanation_strategy() == "eel_compatibility"` checks
     elsewhere) already special-case it independently of this function, and a
     ranked-projection result reaching it is out of this contract's scope."""
     strategy = self._active_explanation_strategy()
-    if strategy == "insight_brief" and result_shape == RESULT_SHAPE_RANKED_PROJECTION:
-      return "one_call"
+    if strategy == "insight_brief" and result_shape == RESULT_SHAPE_RANKED_PROJECTION and returned_rows != 0 and not truncated:
+      if _distinct_identifier_count(query_result_evidence) <= 3:
+        return "one_call"
     return strategy
 
   @staticmethod
@@ -5065,17 +5222,17 @@ class EdgeguardApiPlugin(BasePlugin):
         raise GraphFirstRuntimeError(
           "model_not_ready", "configuration", "analyst brief model is still starting",
         )
-      if deadline - time.monotonic() < 260:
+      if deadline - time.monotonic() < EDGEGUARD_ANALYST_BRIEF_MIN_SECONDS:
         raise GraphFirstRuntimeError(
           "insufficient_deadline_budget",
           "completion",
-          "one-call analyst brief requires 260 seconds of remaining request budget",
+          f"one-call analyst brief requires {EDGEGUARD_ANALYST_BRIEF_MIN_SECONDS} seconds of remaining request budget",
         )
       brief = run_analyst_brief(
         question=request,
         digest=digest,
         model=getattr(self, "cfg_edgeguard_explanation_model", None),
-        provider_call=self._call_graph_first_provider,
+        provider_call=self._brief_provider_call(deadline),
         projection_digest=projection_digest,
         misp_enrichment=misp_enrichment_block,
         event_url_template=misp_event_url_template,
@@ -5096,6 +5253,15 @@ class EdgeguardApiPlugin(BasePlugin):
         "model": getattr(self, "cfg_edgeguard_explanation_model", None),
       })
     except GraphFirstRuntimeError as exc:
+      # EG-039 I-211: the response carries only the safe code, so a grounding
+      # failure ("brief grounding failed: <rule>") is otherwise untraceable.
+      # Value-free by construction: only the safe code and, for a grounding failure,
+      # the rule code (`^[a-z_]+$`). `exc.detail` is never logged, it may carry model or graph text.
+      rule = exc.detail.rpartition(": ")[2] if exc.code == "brief_grounding_failed" else None
+      self.P("EDGEGUARD_ANALYST_BRIEF_FAILURE " + json.dumps({
+        "reason": exc.code,
+        "rule": rule if rule and re.fullmatch(r"[a-z_]{1,48}", rule) else None,
+      }))
       trace = exc.trace or {
         "schema_version": "edgeguard.analyst_brief_trace.v1",
         "profile": {"id": "EAB/1"},
@@ -5155,7 +5321,11 @@ class EdgeguardApiPlugin(BasePlugin):
     misp_node_aliases: Optional[Mapping[str, str]] = None,
     misp_event_url_template: str = misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE,
     progress=None,
+    sample_rows: Optional[int] = None,
   ) -> Dict[str, Any]:
+    # `sample_rows`: set only when the query stopped at the transport ROW cap (not a
+    # graph node/relationship cap), so the brief may say "the full result has more".
+    # A graph cap alone (`packet.graph.truncated`) gets the graph-partial sentence instead.
     # Contract §7.3: `misp_enrichment` is a sibling of `result_digest`.
     # Explanation spec v0.2: it reaches `egx2.run_insight_brief` only after
     # the model-admission check; `misp_node_aliases` (packet node id ->
@@ -5168,6 +5338,8 @@ class EdgeguardApiPlugin(BasePlugin):
     deterministic_reason = None
     if not graph.get("nodes") and isinstance(returned_rows, int) and returned_rows > 0:
       deterministic_reason = "tabular_result"
+    elif returned_rows == 0:
+      deterministic_reason = egx2.EMPTY_RESULT_REASON
     allow_model = bool(graph.get("nodes")) and returned_rows != 0
     if allow_model:
       try:
@@ -5177,17 +5349,17 @@ class EdgeguardApiPlugin(BasePlugin):
       if explanation_err or not self._explanation_worker_ready():
         allow_model = False
       else:
-        admission = getattr(self, "cfg_edgeguard_insight_brief_admission_seconds", 240)
+        admission = getattr(self, "cfg_edgeguard_insight_brief_admission_seconds", egx2.MIN_CALL_SECONDS)
         if deadline - time.monotonic() < admission:
           allow_model = False
-    provider_call = self._call_graph_first_provider
+    provider_call = self._brief_provider_call(deadline)
     if progress is not None:
       # EG-028: the attempt number comes from counting provider calls, so
       # `egx2/insight_brief.py` stays untouched. `brief` = model call running,
       # `checks` = the deterministic gates that follow that call.
       attempts = [0]
 
-      def provider_call(payload, _call=self._call_graph_first_provider):
+      def provider_call(payload, _call=provider_call):
         attempts[0] += 1
         _emit_progress(progress, "brief", {"attempt": attempts[0]})
         completion = _call(payload)
@@ -5201,12 +5373,15 @@ class EdgeguardApiPlugin(BasePlugin):
       provider_call=provider_call,
       allow_model=allow_model,
       deterministic_reason=deterministic_reason,
+      sample_rows=sample_rows,
+      graph_partial=bool(graph.get("truncated")) and not sample_rows,
       mode=mode,
       misp_enrichment=misp_enrichment_block,
       event_url_template=misp_event_url_template,
       misp_node_ids={
         node_ref: packet_id for packet_id, node_ref in (misp_node_aliases or {}).items()
       },
+      seconds_left=lambda: deadline - time.monotonic(),
     )
     if progress is not None and (
       (result["case_explanation"].get("provenance") or {}).get("mode") == "deterministic_fallback"
@@ -5218,9 +5393,6 @@ class EdgeguardApiPlugin(BasePlugin):
     if result.get("citation_drops"):
       with self._metrics_lock:
         self._misp_citation_drop_count += int(result["citation_drops"])
-    if result.get("misp_ref_drops"):
-      with self._metrics_lock:
-        self._misp_ref_drop_count += sum(result["misp_ref_drops"].values())
     if result.get("misp_ref_withheld"):
       with self._metrics_lock:
         self._misp_ref_withheld_count += int(result["misp_ref_withheld"])
@@ -5697,6 +5869,20 @@ class EdgeguardApiPlugin(BasePlugin):
         "unexpected_failure",
       )
 
+  def _prompt_pack_summary(self) -> Dict[str, Dict[str, str]]:
+    """Pack id, version and manifest sha256 per model key that serves a pack."""
+    summary = {}
+    for model_key in self._configured_model_keys():
+      try:
+        pack = self._prompt_pack(model_key)
+      except PromptPackError:
+        continue  # refused at startup; health must not fail on it
+      if pack is not None:
+        summary[model_key] = {
+          "pack_id": pack.pack_id, "pack_version": pack.pack_version, "sha256": pack.manifest_sha256,
+        }
+    return summary
+
   @BasePlugin.endpoint(method="GET")
   def health(self) -> Dict[str, Any]:
     # /health is deliberately untracked and reads a locked snapshot; the
@@ -5728,6 +5914,7 @@ class EdgeguardApiPlugin(BasePlugin):
       "generation_models_configured": len(worker_readiness),
       "generation_orchestrator": "edgeguard_api",
       "generation_workers": worker_readiness,
+      "prompt_packs": self._prompt_pack_summary(),
       "generation_ready": generation_ready,
       "explanation_model_configured": bool(explanation_url),
       "explanation_model_config_valid": explanation_error is None,
@@ -5771,10 +5958,7 @@ class EdgeguardApiPlugin(BasePlugin):
       # Contract §5.4: `system_prompt_sha256` per profile, over the prompt
       # this profile actually serves (builder dispatch + its suffix), not
       # just the bare v0.10 template — every profile gets a real sha now.
-      system_prompt = _system_prompt_for_profile(profile["name"])
-      suffix = profile.get("system_prompt_suffix")
-      if isinstance(suffix, str) and suffix:
-        system_prompt += suffix
+      system_prompt = self._profile_system_prompt(profile)
       correction_prompt = _correction_prompt_for_profile(
         profile["name"],
         normalized_request="{normalized_request}",
@@ -5786,7 +5970,7 @@ class EdgeguardApiPlugin(BasePlugin):
       # The schema each profile actually validates against (v0.11/v0.13
       # artifacts, the decision-JSON prompt schema, or the v0.10 default).
       validation_profile = self._cypher_validation_profile(key)
-      single_attempt = profile["name"] == PROMPT_PROFILE_DECISION_JSON_2026_11_08
+      single_attempt = profile.get("pack") is not None
       profiles.append({
         "prompt_profile_id": profile["prompt_profile_id"],
         "prompt_profile": profile["name"],
@@ -6684,7 +6868,11 @@ class EdgeguardApiPlugin(BasePlugin):
       broadening_cypher=plan["broadening"].get("cypher") if broadened else None,
     )
     result_shape = (plan.get("validation") or {}).get("result_shape")
-    effective_strategy = self._explanation_dispatch_strategy(result_shape)
+    sample_rows = packet["execution"]["row_count"] if execution_result.get("truncated") else None
+    effective_strategy = self._explanation_dispatch_strategy(
+      result_shape, digest.get("counts", {}).get("returned_rows"), sample_rows is not None,
+      query_result_evidence,
+    )
     if effective_strategy == "insight_brief":
       return self._run_insight_brief(
         digest=digest,
@@ -6696,6 +6884,7 @@ class EdgeguardApiPlugin(BasePlugin):
         deadline=deadline,
         mode=mode_plan.mode if mode_plan is not None else None,
         progress=progress,
+        sample_rows=sample_rows,
       )
     if effective_strategy == "one_call":
       _emit_progress(progress, "brief", {"attempt": 1})
@@ -7265,34 +7454,14 @@ class EdgeguardApiPlugin(BasePlugin):
       )
       if misp_event_url_template is None:
         misp_event_url_template = misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE
-      if packet["execution"]["truncated"]:
+      if progress is not None:
+        _emit_partial(progress, self._explain_job_partial(packet, digest, misp_block, misp_event_url_template))
+      # EG-039 I-211: under `insight_brief` a truncated result goes to EGX/2 as a
+      # sample (rankings too, see _explanation_dispatch_strategy); the brief says so.
+      # On this explain_graph path the other strategies keep the deterministic
+      # transport_truncated failure (the prepared path is unchanged).
+      if packet["execution"]["truncated"] and self._active_explanation_strategy() != "insight_brief":
         _emit_progress(progress, "fallback", {"reason": "transport_truncated"})
-        if self._active_explanation_strategy() == "insight_brief":
-          result = egx2.run_insight_brief(
-            question=request,
-            graph=packet.get("graph") or {},
-            model=getattr(self, "cfg_edgeguard_explanation_model", None),
-            provider_call=self._call_graph_first_provider,
-            allow_model=False,
-            deterministic_reason="transport_truncated",
-            mode=mode_plan.mode if mode_plan is not None else None,
-          )
-          return self._bounded_graph_first_success({
-            "status": STATUS_OK,
-            "ok": True,
-            "executed": True,
-            "explained": False,
-            "packet": dict(packet),
-            "packet_meta": dict(packet_meta),
-            "result_digest": dict(digest),
-            **({"misp_enrichment": dict(misp_block)} if misp_block is not None else {}),
-            "case_explanation": result["case_explanation"],
-            "explanation_trace": result["explanation_trace"],
-            "validation": analysis,
-            "live_retry": dict(live_retry),
-            "provider": "local",
-            "model": getattr(self, "cfg_edgeguard_explanation_model", None),
-          })
         failure = self._graph_first_failure_transport(
           GraphFirstRuntimeError(
             "transport_truncated",
@@ -7315,7 +7484,13 @@ class EdgeguardApiPlugin(BasePlugin):
           misp_enrichment_block=misp_block,
         )
       result_shape = analysis.get("result_shape")
-      effective_strategy = self._explanation_dispatch_strategy(result_shape)
+      # Only the transport ROW cap makes the result a sample; a graph node or
+      # relationship cap alone also sets `packet.execution.truncated`.
+      sample_rows = packet["execution"]["row_count"] if query_result.get("truncated") else None
+      effective_strategy = self._explanation_dispatch_strategy(
+        result_shape, digest.get("counts", {}).get("returned_rows"), sample_rows is not None,
+        query_result_evidence,
+      )
       if effective_strategy == "insight_brief":
         return self._run_insight_brief(
           digest=digest,
@@ -7330,6 +7505,7 @@ class EdgeguardApiPlugin(BasePlugin):
           misp_node_aliases=misp_node_aliases,
           misp_event_url_template=misp_event_url_template,
           progress=progress,
+          sample_rows=sample_rows,
         )
       if effective_strategy == "one_call":
         _emit_progress(progress, "brief", {"attempt": 1})
@@ -7482,9 +7658,19 @@ class EdgeguardApiPlugin(BasePlugin):
         job["advanced"] = True
         job["settled"].set()
 
+  def _set_explain_job_partial(self, job_id: str, partial: Dict[str, Any]) -> None:
+    state = self._explain_job_state()
+    with state["lock"]:
+      job = state["jobs"].get(job_id)
+      if job is None or job["done"]:
+        return
+      job["partial"] = partial
+
   def _run_explain_job(self, job_id: str, params: Dict[str, Any]) -> None:
     def progress(phase: str, detail: Optional[Dict[str, Any]] = None) -> None:
       self._set_explain_job_phase(job_id, phase, detail)
+
+    progress.partial = lambda partial: self._set_explain_job_partial(job_id, partial)
 
     try:
       response = self._explain_graph_impl(progress=progress, **params)
@@ -7521,6 +7707,7 @@ class EdgeguardApiPlugin(BasePlugin):
       if status_code >= 400 or _is_failed_endpoint_response(result):
         with self._metrics_lock:
           self._error_count += 1
+      job.pop("partial", None)
       job.update(
         phase="done", detail=None, done=True, result=result, status_code=status_code,
         finished_at=time.monotonic(),
@@ -7624,7 +7811,8 @@ class EdgeguardApiPlugin(BasePlugin):
 
   @BasePlugin.endpoint(method="GET")
   def explain_graph_status(self, job_id: str = "") -> Dict[str, Any]:
-    """`{phase, detail, done}`; once done also `result` (exactly what
+    """`{phase, detail, done}`, plus `partial` (`{packet, result_digest,
+    misp_enrichment?}`) from the end of the MISP step while not done; once done also `result` (exactly what
     `/explain_graph` returned) and `result_status_code` (its HTTP status).
     Unknown or expired ids get 404."""
     state = self._explain_job_state()
@@ -7635,6 +7823,8 @@ class EdgeguardApiPlugin(BasePlugin):
         snapshot = None
       else:
         snapshot = {"phase": job["phase"], "detail": job["detail"], "done": job["done"]}
+        if not job["done"] and job.get("partial") is not None:
+          snapshot["partial"] = job["partial"]
         if job["done"]:
           snapshot["result"] = job["result"]
           snapshot["result_status_code"] = job["status_code"]

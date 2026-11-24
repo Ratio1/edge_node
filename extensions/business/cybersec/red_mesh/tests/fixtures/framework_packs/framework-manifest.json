@@ -1,0 +1,102 @@
+{
+ "schema": "redmesh.framework_manifest.v1",
+ "manifest_version": 1,
+ "packs": [
+  {
+   "pack_id": "test.status-ids.v1",
+   "title": "Synthetic ids-only pack (test)",
+   "version": 1,
+   "status": "active",
+   "supersedes": null,
+   "derived_from": null,
+   "scoring": "test_status.v1",
+   "pack_schema": "redmesh.framework_pack.v1",
+   "text_schema": "redmesh.framework_text.v1",
+   "pack_sha256": "f408768117c5a2090f5c13c281fed1563f5bbc011b54903764868cb4c06cbac0",
+   "text_sha256": {},
+   "languages": [
+    "en"
+   ],
+   "licence": {
+    "id": "TEST-ONLY",
+    "attribution": "Synthetic fixture, not a real framework",
+    "ship_text": false
+   },
+   "rules": {
+    "justification_required": true,
+    "exclusion_reason_required": true,
+    "remediation_on_fail": true,
+    "signoff_required": true,
+    "entity_fields": [],
+    "level_provenance_kinds": [
+     "declared"
+    ],
+    "exports": [
+     "json"
+    ]
+   },
+   "entries": [
+    {
+     "country": "RO",
+     "jurisdiction": null,
+     "sectors": [],
+     "legal_force": "voluntary",
+     "accepted_alternatives": [],
+     "source_url": "https://example.invalid/test",
+     "legal_reference": "none",
+     "verified_at": "2026-11-14",
+     "verified_by": "test fixture"
+    }
+   ]
+  },
+  {
+   "pack_id": "test.cyfun-like.v1",
+   "title": "Synthetic two-axis pack with levels (test)",
+   "version": 1,
+   "status": "active",
+   "supersedes": null,
+   "derived_from": "ro.dnsc.o1-2026@1",
+   "scoring": "maturity_two_axis.v1",
+   "pack_schema": "redmesh.framework_pack.v1",
+   "text_schema": "redmesh.framework_text.v1",
+   "pack_sha256": "141f56bd9463c67ae038d1c53c8102778e2af2f71873ed2b51ee760e46ea14a9",
+   "text_sha256": {
+    "en": "7ac192639d3041e5995268cfd4a623d6c086e5388c7b44a8870d92728a54b926"
+   },
+   "languages": [
+    "en"
+   ],
+   "licence": {
+    "id": "TEST-ONLY",
+    "attribution": "Synthetic fixture, not a real framework",
+    "ship_text": true
+   },
+   "rules": {
+    "justification_required": false,
+    "exclusion_reason_required": false,
+    "remediation_on_fail": false,
+    "signoff_required": false,
+    "entity_fields": [],
+    "level_provenance_kinds": [
+     "declared"
+    ],
+    "exports": [
+     "json"
+    ]
+   },
+   "entries": [
+    {
+     "country": null,
+     "jurisdiction": "EU",
+     "sectors": [],
+     "legal_force": "voluntary",
+     "accepted_alternatives": [],
+     "source_url": "https://example.invalid/test",
+     "legal_reference": "none",
+     "verified_at": "2026-11-14",
+     "verified_by": "test fixture"
+    }
+   ]
+  }
+ ]
+}

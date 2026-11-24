@@ -239,6 +239,33 @@ class DeploymentStatusTests(unittest.TestCase):
 
 
 class DeploymentOperationTests(unittest.TestCase):
+  def test_legacy_order_check_ignores_metadata_permutations_without_editing_the_saved_job(self):
+    plugin = Coordinator()
+    stored = copy.deepcopy(CONFIG)
+    stored["DEEPLOY_SPECS"] = {"job_id": 12, "current_target_nodes": ["A", "B"],
+                              "spare_nodes": ["S1", "S2"],
+                              "chainstore_response_keys": {"A": ["key1", "key2"]}}
+    stored["PLUGINS"][0]["INSTANCES"][0]["BUILD_AND_RUN_COMMANDS"] = ["build", "run"]
+    live = copy.deepcopy(stored)
+    live["DEEPLOY_SPECS"]["spare_nodes"].reverse()
+    live["DEEPLOY_SPECS"]["chainstore_response_keys"]["A"].reverse()
+
+    previous = plugin._previous_deployment_configs(stored, {"A": [live]})
+    self.assertEqual(previous, {"A": stored, "B": stored})
+    self.assertEqual(stored["DEEPLOY_SPECS"]["spare_nodes"], ["S1", "S2"])
+    self.assertEqual(stored["DEEPLOY_SPECS"]["chainstore_response_keys"]["A"], ["key1", "key2"])
+
+    # The same comparator still refuses a reordered command list or an ordered placement.
+    for path in ("commands", "targets"):
+      with self.subTest(path=path):
+        different = copy.deepcopy(live)
+        if path == "commands":
+          different["PLUGINS"][0]["INSTANCES"][0]["BUILD_AND_RUN_COMMANDS"].reverse()
+        else:
+          different["DEEPLOY_SPECS"]["current_target_nodes"].reverse()
+        with self.assertRaisesRegex(ValueError, "runs this job differently"):
+          plugin._previous_deployment_configs(stored, {"A": [different]})
+
   def test_an_operation_that_cannot_advance_is_logged_with_what_failed_and_not_with_the_error_text(self):
     plugin = Coordinator()
     lines = []

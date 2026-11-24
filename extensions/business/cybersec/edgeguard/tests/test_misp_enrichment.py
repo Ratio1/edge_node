@@ -1167,7 +1167,7 @@ class ModelAdmissionTests(unittest.TestCase):
       block["nodes"][0]["fields"]["pulse_name"] = {"nested": "object"}
     return block
 
-  def _run_egx2(self, block):
+  def _run_egx2(self, block, budget=1000):
     payloads = []
 
     def provider(payload):
@@ -1177,7 +1177,6 @@ class ModelAdmissionTests(unittest.TestCase):
         "observations": [{
           "text": "Pulse Synthetic Pulse lists 203.0.113.7, which indicates \"quietsieve\".",
           "insight_ids": ["I1"], "exemplar_entities": ["203.0.113.7", "quietsieve"],
-          "misp_citations": [{"entity": "203.0.113.7", "field": "pulse_name", "value": "Synthetic Pulse"}],
         }],
         "why_it_matters": "Shared infrastructure suggests common tooling.",
         "next_checks": [],
@@ -1187,20 +1186,33 @@ class ModelAdmissionTests(unittest.TestCase):
     plugin = _make_api(graph_first_provider=provider)
     result = plugin._run_insight_brief(
       digest={"counts": {"returned_rows": 2}}, packet=self._egx2_packet(), packet_meta={},
-      validation=None, live_retry={}, request="Explain", deadline=time.monotonic() + 1000,
+      validation=None, live_retry={}, request="Explain", deadline=time.monotonic() + budget,
       misp_enrichment_block=block, misp_node_aliases={"i1": "N0"},
     )
     return plugin, result, payloads
 
-  def test_egx2_model_call_carries_a_valid_block_and_grounds_the_citation(self):
+  def test_egx2_model_call_carries_no_block_and_code_attaches_the_source_field(self):
     _plugin, result, payloads = self._run_egx2(self._indicator_block())
     self.assertEqual(len(payloads), 1)
-    self.assertIn("MISP ENRICHMENT", payloads[0]["messages"][1]["content"])
-    self.assertIn("Synthetic Pulse", payloads[0]["messages"][1]["content"])
+    for message in payloads[0]["messages"]:
+      self.assertNotIn("MISP", message["content"])
+      self.assertNotIn("Synthetic Pulse", message["content"])
     self.assertEqual(result["explanation_trace"]["outcome"]["status"], "supported")
+    citations = result["case_explanation"]["observations"][0]["misp_citations"]
+    self.assertIn(("203.0.113.7", "pulse_name", "Synthetic Pulse"), [(c["entity"], c["field"], c["value"]) for c in citations])
     self.assertIn("misp_enrichment", result)
     _assert_text_has_no_block(self, json.dumps(result["explanation_trace"]))
     _assert_text_has_no_block(self, json.dumps(result["packet"]))
+
+  def test_egx2_model_call_is_admitted_only_with_the_worst_case_budget_left(self):
+    # Default admission is `egx2.MIN_CALL_SECONDS`: the worst-case cold call on a 4-core host.
+    from extensions.business.cybersec.edgeguard import egx2
+    for budget, calls in ((egx2.MIN_CALL_SECONDS - 2, 0), (egx2.MIN_CALL_SECONDS + 5, 1)):
+      with self.subTest(budget=budget):
+        _plugin, result, payloads = self._run_egx2(self._indicator_block(), budget=budget)
+        self.assertEqual(len(payloads), calls)
+        if not calls:
+          self.assertEqual(result["explanation_trace"]["outcome"]["safe_code"], "model_not_admitted")
 
   def test_egx2_rejected_block_never_reaches_the_model(self):
     plugin, result, payloads = self._run_egx2(self._indicator_block(inject=True))
@@ -1382,9 +1394,10 @@ class ResponsePathsCarryTheBlockTests(unittest.TestCase):
       target="extensions.business.cybersec.edgeguard.edgeguard_api.egx2.run_insight_brief",
     )
     self.assertEqual(spy.call_count, 1)
-    # The transport-truncated EGX/2 path is deterministic (no model call),
-    # so it still never receives the block.
-    _assert_no_block_leak(self, spy)
+    # EG-039: a truncated result is a sample the model may brief, so the admitted
+    # block reaches it like any other EGX/2 call (the row cap is passed on).
+    self.assertEqual(spy.call_args.kwargs["sample_rows"], 1)
+    self.assertIsNotNone(spy.call_args.kwargs["misp_enrichment"])
     self.assertEqual(result["status"], "ok")
     self.assertIn("misp_enrichment", result)
     self.assertEqual(result["misp_enrichment"]["nodes"][0]["misp_event_ids"], ["901"])
@@ -1476,10 +1489,10 @@ class BuildModelViewTests(unittest.TestCase):
 
 class InsightBriefModelInputIsolationTests(unittest.TestCase):
   """The `insight_brief` twin of `ModelInputIsolationTests`: end to end
-  through `explain_graph`, the block reaches only the EGX/2 prompt's
-  enrichment section."""
+  through `explain_graph`, the block never reaches the EGX/2 prompt (EG-039
+  phase 4); code attaches its source fields to the case."""
 
-  def test_block_reaches_only_the_egx2_enrichment_section(self):
+  def test_block_never_reaches_the_egx2_prompt(self):
     payloads = []
     logs = []
 
@@ -1530,10 +1543,8 @@ class InsightBriefModelInputIsolationTests(unittest.TestCase):
       self.assertEqual(payload["metadata"]["task"], "edgeguard_insight_brief")
       system_prompt, user_content = (message["content"] for message in payload["messages"])
       _assert_text_has_no_block(self, system_prompt)
-      head, marker, tail = user_content.partition("\n\nMISP ENRICHMENT")
-      self.assertTrue(marker)
-      _assert_text_has_no_block(self, head)
-      self.assertIn("Synthetic Pulse", tail)
+      self.assertNotIn("MISP", user_content)
+      self.assertNotIn("Synthetic Pulse", user_content)
     for key in ("explanation_trace", "packet", "packet_meta", "result_digest", "case_explanation"):
       with self.subTest(key=key):
         _assert_text_has_no_block(self, json.dumps(result.get(key)))

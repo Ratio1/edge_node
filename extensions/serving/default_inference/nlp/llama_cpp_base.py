@@ -36,6 +36,11 @@ _CONFIG = {
 
   # Format used to compute the prompt for the model
   "CHAT_FORMAT": None,
+  # Variables passed to the model's chat template on every request, e.g.
+  # {"enable_thinking": False} for a Qwen3.5 template that opens <think> otherwise.
+  "CHAT_TEMPLATE_KWARGS": None,
+  # Stop string or list of strings forwarded to every completion.
+  "STOP": None,
   # This can cause massive memory overhead.
   # Better used only for strong machines.
   "DRAFT_MODEL": None,
@@ -225,8 +230,57 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
       model_id=safe_model_id,
       model_str_id=model_ref,
     )
+    self._get_stop()
+    self._apply_chat_template_kwargs()
     self.P("Model loaded successfully.")
     return
+
+  # Keys the chat handler call already uses: a template variable must not shadow them.
+  _HANDLER_PARAMS = frozenset({
+    "llama", "messages", "functions", "function_call", "tools", "tool_choice", "temperature", "top_p",
+    "top_k", "min_p", "typical_p", "stream", "stop", "seed", "response_format", "max_tokens",
+    "presence_penalty", "frequency_penalty", "repeat_penalty", "tfs_z", "mirostat_mode", "mirostat_tau",
+    "mirostat_eta", "model", "logits_processor", "grammar", "logit_bias", "logprobs", "top_logprobs",
+    # Variables the Jinja chat formatter sets itself.
+    "add_generation_prompt", "eos_token", "bos_token", "raise_exception", "strftime_now",
+  })
+
+  def _get_stop(self):
+    stop = self.cfg_stop
+    if stop is None or isinstance(stop, str):
+      return stop
+    if isinstance(stop, list) and all(isinstance(item, str) for item in stop):
+      return stop
+    raise ValueError("STOP must be a string or a list of strings.")
+
+  def _apply_chat_template_kwargs(self):
+    """Make CHAT_TEMPLATE_KWARGS reach the chat template.
+
+    llama-cpp-python (0.3.28) `Llama.create_chat_completion` accepts no extra
+    keyword arguments, but a Jinja chat handler (the model's own template,
+    `chat_template*` format) renders the template with the ones it receives. So
+    wrap the handler the model would use anyway. A built-in Python formatter
+    (e.g. CHAT_FORMAT chatml) ignores them, so that combination is refused.
+    """
+    template_kwargs = self.cfg_chat_template_kwargs
+    if not template_kwargs:
+      return
+    if not isinstance(template_kwargs, dict):
+      raise ValueError("CHAT_TEMPLATE_KWARGS must be a mapping of template variables.")
+    reserved = sorted(set(template_kwargs) & self._HANDLER_PARAMS)
+    if reserved or not all(isinstance(key, str) for key in template_kwargs):
+      raise ValueError(f"CHAT_TEMPLATE_KWARGS keys must be string template variables, not handler parameters {reserved}.")
+    model = self.model
+    if not str(model.chat_format).startswith("chat_template"):
+      raise ValueError(
+        f"CHAT_TEMPLATE_KWARGS needs the model's own Jinja template, but the chat format is {model.chat_format!r}; "
+        "remove CHAT_FORMAT or CHAT_TEMPLATE_KWARGS."
+      )
+    inner = model.chat_handler or model._chat_handlers.get(model.chat_format)
+    if inner is None:
+      from llama_cpp import llama_chat_format
+      inner = llama_chat_format.get_chat_completion_handler(model.chat_format)
+    model.chat_handler = lambda **kwargs: inner(**{**template_kwargs, **kwargs})
 
   def maybe_add_context_to_messages(
       self,
@@ -329,6 +383,9 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
         'repeat_penalty': repetition_penalty,
         'response_format': response_format,
       }
+      stop = self._get_stop()
+      if stop:
+        predict_kwargs['stop'] = stop
       predict_kwargs = self.process_predict_kwargs(predict_kwargs)
       if not isinstance(messages, list):
         msg = f"Each input must have a list of messages. Received {type(messages)}: {self.shorten_str(inp)}"

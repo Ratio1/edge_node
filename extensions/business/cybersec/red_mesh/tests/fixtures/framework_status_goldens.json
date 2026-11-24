@@ -1,0 +1,142 @@
+[
+  {
+    "name": "empty",
+    "default_entry": null,
+    "entries": {},
+    "computed": {
+      "scoring": "compliance_status.v1",
+      "counts": {
+        "insufficient_evidence": 0,
+        "criteria_met": 0,
+        "partly_met": 0,
+        "criteria_not_met": 0,
+        "not_applicable": 0,
+        "unanswered": 161
+      },
+      "verdict": {
+        "passed": null
+      }
+    },
+    "submit_error_codes": [
+      "unscored"
+    ]
+  },
+  {
+    "name": "evidence_only",
+    "default_entry": null,
+    "entries": {
+      "0": {
+        "evidence_refs": [
+          "contract"
+        ]
+      }
+    },
+    "computed": {
+      "scoring": "compliance_status.v1",
+      "counts": {
+        "insufficient_evidence": 0,
+        "criteria_met": 0,
+        "partly_met": 0,
+        "criteria_not_met": 0,
+        "not_applicable": 0,
+        "unanswered": 161
+      },
+      "verdict": {
+        "passed": null
+      }
+    },
+    "submit_error_codes": [
+      "unscored"
+    ]
+  },
+  {
+    "name": "mixed",
+    "default_entry": {
+      "status": "criteria_met"
+    },
+    "entries": {
+      "0": {
+        "status": "partly_met"
+      },
+      "1": {
+        "status": "criteria_not_met"
+      },
+      "2": {
+        "rationale": "Proportionate alternative documented under Article 2 and Recital 4.",
+        "applicability": "not_applicable"
+      }
+    },
+    "computed": {
+      "scoring": "compliance_status.v1",
+      "counts": {
+        "insufficient_evidence": 0,
+        "criteria_met": 158,
+        "partly_met": 1,
+        "criteria_not_met": 1,
+        "not_applicable": 1,
+        "unanswered": 0
+      },
+      "verdict": {
+        "passed": null
+      }
+    },
+    "submit_error_codes": []
+  },
+  {
+    "name": "complete",
+    "default_entry": {
+      "status": "criteria_met"
+    },
+    "entries": {},
+    "computed": {
+      "scoring": "compliance_status.v1",
+      "counts": {
+        "insufficient_evidence": 0,
+        "criteria_met": 161,
+        "partly_met": 0,
+        "criteria_not_met": 0,
+        "not_applicable": 0,
+        "unanswered": 0
+      },
+      "verdict": {
+        "passed": null
+      }
+    },
+    "submit_error_codes": []
+  },
+  {
+    "name": "insufficient_and_explicit_null",
+    "default_entry": {
+      "status": "criteria_met"
+    },
+    "entries": {
+      "0": {
+        "status": "insufficient_evidence"
+      },
+      "1": {
+        "status": null
+      },
+      "2": {
+        "applicability": "not_applicable",
+        "rationale": "Out of scope."
+      }
+    },
+    "computed": {
+      "scoring": "compliance_status.v1",
+      "counts": {
+        "insufficient_evidence": 1,
+        "criteria_met": 158,
+        "partly_met": 0,
+        "criteria_not_met": 0,
+        "not_applicable": 1,
+        "unanswered": 1
+      },
+      "verdict": {
+        "passed": null
+      }
+    },
+    "submit_error_codes": [
+      "unscored"
+    ]
+  }
+]

@@ -15,12 +15,13 @@ class ArtifactRepository:
   def __init__(self, owner):
     self.owner = owner
 
-  def get_json(self, cid, *, secret=None):
+  def get_json(self, cid, *, secret=None, timeout=None):
     if not cid:
       return None
+    kwargs = {} if timeout is None else {"timeout": timeout}
     if secret:
-      return self.owner.r1fs.get_json(cid, secret=secret)
-    return self.owner.r1fs.get_json(cid)
+      return self.owner.r1fs.get_json(cid, secret=secret, **kwargs)
+    return self.owner.r1fs.get_json(cid, **kwargs)
 
   def put_json(self, payload, *, show_logs=False, secret=None):
     if secret:

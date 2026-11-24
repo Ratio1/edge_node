@@ -570,7 +570,8 @@ class TenantAdministrationService:
     # RM-155: `reports:review` also needs the Super-Tenant Admin's designation, read here beside the matrix.
     reviewer = operation == "reports:review" and self._report_reviewer(account)
     decision = authorize_tenant_operation(account, operation, TenantPolicyContext(
-      tenant_id, tenant["active"], tenant["allow_pentester"]), report_reviewer=reviewer)
+      tenant_id, tenant["active"], tenant["allow_pentester"]), report_reviewer=reviewer,
+      compliance_reviewer=self._compliance_reviewer(account) if operation == "compliance_assessments:review" else None)
     if not decision.allowed:
       raise AdministrationDenied(decision.status_code, decision.error)
     return tenant, account
@@ -1546,7 +1547,21 @@ class TenantAdministrationService:
       self.store.put("tenant", tenant_id, record=tenant)
     return {"tenantId": tenant_id, "accountId": account.account_id,
             "marked": isinstance(tenant.get("deleting"), dict),
-            "documentRefs": self._tenant_document_refs(tenant)}
+            "documentRefs": self._tenant_document_refs(tenant),
+            "engagementAssets": self._tenant_engagement_assets(tenant_id)}
+
+  def _tenant_engagement_assets(self, tenant_id):
+    """RM-121: `[{engagementId, engagementAssetId}]` of every engagement row of the tenant, read raw
+    like the document refs: the delete purges each asset's finding ledger before the rows go. An id
+    no ledger can be keyed by (an older row) has none."""
+    found = []
+    for ids in self.store.tenant_record_ids("engagement", tenant_id):
+      row = self.store.raw_record("engagement", *ids) or {}
+      for entry in row.get("assets") if isinstance(row.get("assets"), list) else ():
+        if (valid_engagement_id(ids[-1]) and isinstance(entry, dict)
+            and valid_engagement_asset_id(entry.get("engagement_asset_id"))):
+          found.append({"engagementId": ids[-1], "engagementAssetId": entry["engagement_asset_id"]})
+    return found
 
   @_endpoint
   def abort_tenant_delete(self, actor, tenant_id):
@@ -1603,6 +1618,29 @@ class TenantAdministrationService:
   # `framework_assessment_artifact_ref` resolved it under the lock.
 
   @_endpoint
+  def get_framework_assessment_review(self, actor, tenant_id, pack_id, revision, snapshot, assessment_id="default"):
+    from . import compliance_review
+    return compliance_review.read(self, actor, tenant_id, pack_id, revision, snapshot, assessment_id)
+
+  @_endpoint
+  def mutate_framework_assessment_review(self, actor, tenant_id, pack_id, revision, snapshot, action,
+                                         expected_review_revision, request_id, control_id=None, comment=None,
+                                         assessment_id="default"):
+    from . import compliance_review
+    return compliance_review.mutate(self, actor, tenant_id, pack_id, revision, snapshot, action,
+      expected_review_revision, request_id, control_id, comment, assessment_id)
+
+  @_endpoint
+  def get_tenant_compliance_profile(self, actor, tenant_id):
+    from . import compliance_profile
+    return compliance_profile.read(self, actor, tenant_id)
+
+  @_endpoint
+  def save_tenant_compliance_profile(self, actor, tenant_id, profile, expected_revision, request_id):
+    from . import compliance_profile
+    return compliance_profile.save(self, actor, tenant_id, profile, expected_revision, request_id)
+
+  @_endpoint
   def get_framework_assessment(self, actor, tenant_id, pack_id, include_pack=True, assessment_id="default"):
     return compliance.get_assessment(self, actor, tenant_id, pack_id, include_pack=include_pack,
                                      assessment_id=assessment_id)
@@ -1612,10 +1650,14 @@ class TenantAdministrationService:
     return compliance_catalogue.list_assessments(self, actor, tenant_id, pack_id, include_archived)
 
   @_endpoint
+  def list_framework_packs(self, actor, tenant_id):
+    return compliance_catalogue.list_packs(self, actor, tenant_id)
+
+  @_endpoint
   def create_framework_assessment(self, actor, tenant_id, pack_id, request_id, name, assurance_level=None,
-                                  level_provenance=None):
+                                  level_provenance=None, country=None):
     return compliance_catalogue.create_assessment(self, actor, tenant_id, pack_id, request_id, name,
-                                                  assurance_level, level_provenance)
+                                                  assurance_level, level_provenance, country)
 
   @_endpoint
   def archive_framework_assessment(self, actor, tenant_id, pack_id, assessment_id, archived,
@@ -1724,6 +1766,10 @@ class TenantAdministrationService:
   # it; only a Super-Tenant Admin sets `report_reviewer`. Certificate bytes never pass through
   # these methods: the plugin stores and deletes the files outside this lock.
 
+  def _compliance_reviewer(self, account):
+    row = self._own_profile_row(account)
+    return row.get("compliance_reviewer") if row is not None else None
+
   def _report_reviewer(self, account):
     """Whether the account is designated a report reviewer: false without a row of this
     incarnation of the account (fails closed)."""
@@ -1782,7 +1828,9 @@ class TenantAdministrationService:
   def _profile_dto(self, target, row):
     row = row if row is not None else account_profile.new_row(target.created_at)
     return {"account_id": target.account_id,
-            **account_profile.profile_dto(row, self.clock().date(), self._organization_default(target))}
+            **account_profile.profile_dto(row, self.clock().date(), self._organization_default(target)),
+            # the stored designation, else what policy defaults to: a deployment-wide Super-Tenant Admin
+            "compliance_reviewer": row.get("compliance_reviewer", holds_platform_role(target))}
 
   def _write_profile(self, target, row, actor_id):
     row = {**row, "updated_by": actor_id, "updated_at": datetime.now(timezone.utc).isoformat()}
@@ -1816,9 +1864,8 @@ class TenantAdministrationService:
             "changed": changed, "accountId": caller.account_id, "targetId": target.account_id,
             "dropped": [cert["ref"] for cert in dropped] + leftovers}
 
-  @_endpoint
-  def set_report_reviewer(self, actor, account_id=None, enabled=None):
-    """Tick or untick the reviewer designation. A full-portfolio Super-Tenant Admin only, on any
+  def _set_reviewer(self, actor, account_id, enabled, field):
+    """Tick or untick a reviewer designation (`field`). A full-portfolio Super-Tenant Admin only, on any
     account that exists (active or archived); a change is written and reported, a repeat is not."""
     caller = self._actor(actor, creator=True)
     target_id = canonical_account_id(account_id)
@@ -1828,15 +1875,23 @@ class TenantAdministrationService:
     if target is None or target.state not in (_ACTIVE_STATE, _DEACTIVATED_STATE):
       raise AdministrationDenied(404, "not_found")
     row = self._own_profile_row(target)
-    if (row["report_reviewer"] if row is not None else False) is enabled:
+    if (row or account_profile.new_row(target.created_at)).get(field) is enabled:
       return {"profile": self._profile_dto(target, row), "changed": False, "accountId": caller.account_id,
               "targetId": target.account_id, "dropped": []}
     stale = self._stale_profile(target)
     row = self._write_profile(target, {**(row or account_profile.new_row(target.created_at)),
-                                       "report_reviewer": enabled}, caller.account_id)
+                                       field: enabled}, caller.account_id)
     return {"profile": self._profile_dto(target, row), "changed": True, "accountId": caller.account_id,
             "targetId": target.account_id,
             "dropped": account_profile.certificate_refs(stale) if stale is not None else []}
+
+  @_endpoint
+  def set_compliance_reviewer(self, actor, account_id=None, enabled=None):
+    return self._set_reviewer(actor, account_id, enabled, "compliance_reviewer")
+
+  @_endpoint
+  def set_report_reviewer(self, actor, account_id=None, enabled=None):
+    return self._set_reviewer(actor, account_id, enabled, "report_reviewer")
 
   def _qualification_row(self, target, qualification_id):
     row = self._own_profile_row(target)
@@ -3117,3 +3172,4 @@ class TenantAdministrationService:
 # RM-120: imported last on purpose. `compliance` pulls in `services/`, whose package init imports
 # this module for `AdministrationDenied`; by here that name exists, so the cycle resolves.
 from . import compliance, compliance_catalogue  # noqa: E402
+from ..services.engagement_ledger import valid_engagement_asset_id  # noqa: E402  (RM-121, same reason)

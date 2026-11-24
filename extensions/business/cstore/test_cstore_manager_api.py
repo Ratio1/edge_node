@@ -194,6 +194,7 @@ class CstoreManagerApiPluginTests(unittest.TestCase):
 SYSTEM_HKEYS = [
   "DAUTH_JOB_SECRETS", "DAUTH_JOB_SECRET_REVISIONS", "DAUTH_REVOKED_UNLICENSED_NODES", "DAUTH_REQUESTS",
   "DEEPLOY_DEPLOYED_JOBS", "DEEPLOY_OPERATIONS", "DEEPLOY_NODE_OPERATIONS", "DEEPLOY_REQUESTS",
+  "DEEPLOY_REPLACEMENT_REFUSALS",
   "NODE_KEY_ROTATIONS", "tunnels_manager_secrets", "tunnels_manager_tcp_routes", "CHAINSTORE_SYNC",
   "plus_preferred_nodes", "chain_dist_monitor",
   "inference_api:capacity:default", "inference_api:req:default", "inference_api:res:default",
