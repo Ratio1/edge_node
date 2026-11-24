@@ -2665,6 +2665,12 @@ class TenantAdministrationService:
         if self._pending_pick(row["parent"]["tenant_id"], pick):
           if row.get(engagement_drafts.SUPERSEDES) is None:
             raise AdministrationDenied(409, "contract_not_active")
+          # RM-249: a pending pick is an amendment of the contract in force (or that contract itself, its activation unfinished).
+          in_force = _contract_in_force(tenant)
+          if pick not in (None, in_force):
+            amends = self.store.get("tenant_contract_draft", row["parent"]["tenant_id"], pick).get("supersedes")
+            if amends != in_force:
+              raise AdministrationDenied(400, "contract_unknown") if amends is None else AdministrationDenied(409, "contract_superseded")
         else:
           self._tenant_contract_sha256(tenant, pick)
     return {"draft": self._write_engagement_draft(row, account, previous), "dropped": dropped}

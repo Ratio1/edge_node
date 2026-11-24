@@ -230,6 +230,18 @@ class TestPendingPick(_AmendmentCase):
     refused(self, self.update_contract(tenant_id, second, {"state": "missing"}), 409, "contract_draft_in_use")
     self.assertEqual(self.stored_contract(tenant_id, second)["state"], "signed")
 
+  def test_a_pending_pick_needs_a_draft_that_amends_the_contract_in_force(self):
+    tenant_id, old_id = self.scenario()
+    pending = ok(self, self.contract_draft(tenant_id))["contract_id"]
+    row = self.stored_contract(tenant_id, pending)
+    for supersedes, status, code in ((None, 400, "contract_unknown"), ("c_9", 409, "contract_superseded")):
+      self.repo.put("tenant_contract_draft", tenant_id, pending, record={**row, "supersedes": supersedes})
+      draft_id = ok(self, self.plugin.create_engagement_draft(
+        self.actor, tenant_id, str(uuid4()), "Copy", supersedes=old_id))["engagement_draft_id"]
+      refused(self, self.update_child(draft_id, {"contract_id": pending}), status, code)
+    self.repo.put("tenant_contract_draft", tenant_id, pending, record=row)
+    ok(self, self.update_child(draft_id, {"contract_id": pending}))
+
 
 class TestIncompleteActivation(_AmendmentCase):
   """The tenant row holds the block and the draft row is left: only the activation touches the draft."""
@@ -273,6 +285,22 @@ class TestIncompleteActivation(_AmendmentCase):
     self.assertEqual(self.node_rows(tenant_id), [("Node-A", "shared", True)])
     self.assertEqual([event for event, _ in self.events], ["tenant_contract_activated"])
     self.assertIsNone(self.stored_contract(tenant_id, second))
+
+  def test_the_resume_reads_no_file_of_the_contract_draft_but_still_resolves_the_copy_packs(self):
+    tenant_id, _, second, _ = self.incomplete()
+    row = self.stored_contract(tenant_id, second)
+    for ref in (row["document"]["ref"], row["generated"]["ref"]):
+      self.documents.envelopes.pop(ref)
+    ok(self, self.activate_contract(tenant_id, second))
+    self.assertIsNone(self.stored_contract(tenant_id, second))
+
+  def test_a_copy_pack_is_still_resolved_on_the_resume(self):
+    tenant_id, old_id, second, copy_id = self.incomplete(copy=True)
+    pack = self.stored_child(copy_id)["document"]["document"]["ref"]
+    self.documents.envelopes.pop(pack)
+    result = self.activate_contract(tenant_id, second)
+    refused(self, result, 409, "copy_failed")
+    self.assertEqual(result["engagementDraftId"], copy_id)
 
   def test_a_planned_node_is_held_against_another_tenants_private_assignment_until_assigned(self):
     tenant_id, _, second, _ = self.incomplete()
