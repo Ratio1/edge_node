@@ -105,7 +105,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
           description=inferred.description.replace("openssl 1.0.1f", label),
           evidence=inferred.evidence.replace("Detected version: 1.0.1f,", "Detected version: 1.0.1-1.0.1f,"),
         )
-        findings.append(_stamp_identity(relabelled, "openssl", "1.0.1f", inferred.cve[0]))
+        findings.append(_stamp_identity(relabelled, "openssl", "1.0.1f", inferred.cve[0] if inferred.cve else "eol"))
 
     # Pass 5: Downgrade attacks (POODLE / BEAST)
     findings += self._tls_check_downgrade(target, port)

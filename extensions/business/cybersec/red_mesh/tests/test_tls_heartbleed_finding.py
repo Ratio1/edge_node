@@ -35,6 +35,35 @@ def _build_leak_response(extra_bytes: int = 0x4000) -> bytes:
   )
 
 
+def _heartbleed_positive_probe():
+  """A TLS probe whose sibling passes are no-ops and whose Heartbleed pass is positive."""
+  from extensions.business.cybersec.red_mesh.worker.service.tls import _ServiceTlsMixin
+  from extensions.business.cybersec.red_mesh.findings import Finding, Severity
+  probe = _ServiceTlsMixin.__new__(_ServiceTlsMixin)
+  # Stub every sibling pass to no-op except heartbleed → positive.
+  probe._tls_unverified_connect = lambda t, p: ("TLSv1.2", "ECDHE-RSA-AES256-GCM-SHA384", None)
+  probe._tls_check_protocol = lambda proto, cipher: []
+  probe._tls_parse_san_from_der = lambda d: ([], [])
+  probe._tls_check_signature_algorithm = lambda d: []
+  probe._tls_check_validity_period = lambda d: []
+  probe._tls_check_certificate = lambda t, p, raw: []
+  probe._tls_check_expiry = lambda raw: []
+  probe._tls_check_default_cn = lambda raw: []
+  probe._tls_check_downgrade = lambda t, p: []
+  probe._tls_check_heartbleed = lambda t, p, raw=None: Finding(
+    severity=Severity.CRITICAL,
+    title="TLS Heartbleed vulnerability (CVE-2014-0160)",
+    cve=("CVE-2014-0160",),
+    description="leak",
+    evidence="leak",
+    remediation="upgrade",
+    owasp_id="A06:2021",
+    cwe_id="CWE-126",
+    confidence="certain",
+  )
+  return probe
+
+
 class TestHeartbleedFindingHasCveField(unittest.TestCase):
   """Both code paths must return a Finding with cve=('CVE-2014-0160',)."""
 
@@ -176,32 +205,7 @@ class TestHeartbleedTriggersOpenSslCveInference(unittest.TestCase):
     )
 
   def test_service_info_tls_appends_inferred_cves_on_heartbleed(self):
-    from extensions.business.cybersec.red_mesh.worker.service.tls import _ServiceTlsMixin
-    from extensions.business.cybersec.red_mesh.findings import Finding, Severity
-
-    probe = _ServiceTlsMixin.__new__(_ServiceTlsMixin)
-
-    # Stub every sibling pass to no-op except heartbleed → positive.
-    probe._tls_unverified_connect = lambda t, p: ("TLSv1.2", "ECDHE-RSA-AES256-GCM-SHA384", None)
-    probe._tls_check_protocol = lambda proto, cipher: []
-    probe._tls_parse_san_from_der = lambda d: ([], [])
-    probe._tls_check_signature_algorithm = lambda d: []
-    probe._tls_check_validity_period = lambda d: []
-    probe._tls_check_certificate = lambda t, p, raw: []
-    probe._tls_check_expiry = lambda raw: []
-    probe._tls_check_default_cn = lambda raw: []
-    probe._tls_check_downgrade = lambda t, p: []
-    probe._tls_check_heartbleed = lambda t, p, raw=None: Finding(
-      severity=Severity.CRITICAL,
-      title="TLS Heartbleed vulnerability (CVE-2014-0160)",
-      cve=("CVE-2014-0160",),
-      description="leak",
-      evidence="leak",
-      remediation="upgrade",
-      owasp_id="A06:2021",
-      cwe_id="CWE-126",
-      confidence="certain",
-    )
+    probe = _heartbleed_positive_probe()
 
     with patch("extensions.business.cybersec.red_mesh.worker.service.tls._stamp_identity", wraps=_stamp_identity) as stamp:
       result = probe._service_info_tls("10.0.0.1", 8443)
@@ -233,6 +237,19 @@ class TestHeartbleedTriggersOpenSslCveInference(unittest.TestCase):
     self.assertEqual(stamp.call_args.args[1:3], ("openssl", "1.0.1f"))
     self.assertIn("1.0.1-1.0.1f", stamp.call_args.args[0].title)
 
+
+  def test_inferred_end_of_life_row_keeps_its_eol_identity(self):
+    """A build with an `eol` table also yields the CVE-less end-of-life row (live job b3f87de0 failed on it)."""
+    from extensions.business.cybersec.red_mesh.findings import Finding, Severity
+    eol = Finding(severity=Severity.HIGH, title="End-of-life openssl (openssl 1.0.1f)", description="openssl 1.0.1f is",
+                  evidence="Detected version: 1.0.1f, oldest supported 1.1.1", remediation="upgrade", owasp_id="A06:2021",
+                  cwe_id="CWE-1104", confidence="firm", tags=("vulndb_eol", "openssl"))
+    with patch("extensions.business.cybersec.red_mesh.worker.service.tls.check_cves", return_value=[eol]), \
+         patch("extensions.business.cybersec.red_mesh.worker.service.tls._stamp_identity", wraps=_stamp_identity) as stamp:
+      result = _heartbleed_positive_probe()._service_info_tls("10.0.0.1", 8443)
+    row = next(f for f in result["findings"] if "End-of-life" in f["title"])
+    self.assertIn("(openssl 1.0.1-1.0.1f)", row["title"])
+    self.assertEqual(stamp.call_args.args[1:], ("openssl", "1.0.1f", "eol"))
 
 TLS = "extensions.business.cybersec.red_mesh.worker.service.tls"
 CLOSE_NOTIFY = b"\x15\x03\x03\x00\x02\x01\x00"
