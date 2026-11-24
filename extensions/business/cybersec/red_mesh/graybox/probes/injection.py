@@ -3,10 +3,12 @@ Injection probes — A03 + A05 + API7.
 """
 
 import re
+from urllib.parse import urlparse
 
 from .base import ProbeBase
 from ... import cvss_vectors as V
 from ..findings import GrayboxFinding
+from ..models.target_config import ReflectiveEndpoint
 from ..scenario_catalog import graybox_scenario
 
 
@@ -69,6 +71,44 @@ class InjectionProbes(ProbeBase):
       entry.get("owasp") or "",
       f"no_configured_{kind}_endpoints",
     )
+
+  def _reflective_endpoints(self, configured):
+    """The one boundary where discovered candidates join configured endpoints.
+
+    - precedence: configured entries come first, are never capped, and win a
+      (path, param) tie;
+    - base path: discovery paths are origin-absolute and probes prefix
+      ``target_url``, so the target's base path is stripped here and
+      candidates outside it are dropped;
+    - cap: at most ``max_candidates_per_family`` (clamped to the ceiling);
+    - tag: discovered entries carry ``source="discovered"`` into evidence.
+    A family with discovered candidates is not "no endpoint".
+    """
+    merged = list(configured)
+    seen = {(ep.path, ep.param) for ep in merged}
+    cap = self.target_config.discovery.max_candidates_per_family
+    base = urlparse(self.target_url).path.rstrip("/")
+    added = 0
+    for cand in self.discovered_candidates:
+      if cand.method != "GET" or added >= cap:
+        continue
+      path = cand.path
+      if base:
+        if not (path == base or path.startswith(base + "/")):
+          continue  # outside the target's base path: not ours to request
+        path = path[len(base):] or "/"
+      key = (path, cand.param)
+      if key in seen:
+        continue
+      seen.add(key)
+      added += 1
+      merged.append(ReflectiveEndpoint(
+        path=path, param=cand.param, source=cand.source))
+    return merged
+
+  @staticmethod
+  def _source_tag(ep):
+    return "; source=discovered" if ep.source == "discovered" else ""
 
   def _test_login_injection(self):
     """PT-A05-01: inject into login form fields (unauthenticated)."""
@@ -813,7 +853,8 @@ class InjectionProbes(ProbeBase):
     Sends a script payload to each configured xss_endpoint and looks
     for unescaped reflection in the response body.
     """
-    endpoints = self.target_config.injection.xss_endpoints
+    endpoints = self._reflective_endpoints(
+      self.target_config.injection.xss_endpoints)
     if not endpoints:
       self._emit_no_endpoint("PT-A03-04", "xss")
       return
@@ -844,7 +885,9 @@ class InjectionProbes(ProbeBase):
         continue
       tested += 1
       if resp.status_code == 200 and sentinel in resp.text:
-        vulnerable.append((ep, f"endpoint={ep.path}; param={ep.param}; payload_reflected_unescaped=True"))
+        vulnerable.append((ep,
+          f"endpoint={ep.path}; param={ep.param}; payload_reflected_unescaped=True"
+          + self._source_tag(ep)))
 
     for ep, item in vulnerable:
       self.findings.append(GrayboxFinding(
@@ -883,7 +926,8 @@ class InjectionProbes(ProbeBase):
     Sends ``${7*7}`` and ``{{7*7}}`` to each ssti_endpoint; vulnerable
     if the response body contains ``49``.
     """
-    endpoints = self.target_config.injection.ssti_endpoints
+    endpoints = self._reflective_endpoints(
+      self.target_config.injection.ssti_endpoints)
     if not endpoints:
       self._emit_no_endpoint("PT-A03-06", "ssti")
       return
@@ -922,6 +966,7 @@ class InjectionProbes(ProbeBase):
           vulnerable.append((ep,
             f"endpoint={ep.path}; param={ep.param}; "
             f"payload={payload}; sentinel_in_body=True"
+            + self._source_tag(ep)
           ))
           break
 
@@ -962,7 +1007,8 @@ class InjectionProbes(ProbeBase):
     Sends payloads ``;id`` and ``$(id)``; vulnerable if the response
     body shows the canonical ``uid=`` prefix from ``id(1)``.
     """
-    endpoints = self.target_config.injection.cmd_endpoints
+    endpoints = self._reflective_endpoints(
+      self.target_config.injection.cmd_endpoints)
     if not endpoints:
       self._emit_no_endpoint("PT-A03-07", "cmd")
       return
@@ -998,6 +1044,7 @@ class InjectionProbes(ProbeBase):
           vulnerable.append((ep,
             f"endpoint={ep.path}; param={ep.param}; "
             f"payload={payload}; uid_marker_in_body=True"
+            + self._source_tag(ep)
           ))
           break
 
@@ -1041,7 +1088,8 @@ class InjectionProbes(ProbeBase):
     response carries the injected header (or splits/loses the
     location header in a way that proves CRLF was honored).
     """
-    endpoints = self.target_config.injection.header_endpoints
+    endpoints = self._reflective_endpoints(
+      self.target_config.injection.header_endpoints)
     if not endpoints:
       self._emit_no_endpoint("PT-A03-12", "header")
       return
@@ -1077,6 +1125,7 @@ class InjectionProbes(ProbeBase):
         vulnerable.append((ep,
           f"endpoint={ep.path}; param={ep.param}; "
           f"injected_header={inject_name}: {inject_value}"
+          + self._source_tag(ep)
         ))
 
     for ep, item in vulnerable:

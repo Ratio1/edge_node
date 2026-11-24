@@ -8,6 +8,7 @@ from extensions.business.cybersec.red_mesh.worker.base import BaseLocalWorker
 from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxEvidenceArtifact, GrayboxFinding
 from extensions.business.cybersec.red_mesh.graybox.models import (
   DiscoveryResult,
+  InjectionCandidate,
   GrayboxCredentialSet,
   GrayboxProbeContext,
   GrayboxProbeDefinition,
@@ -369,6 +370,13 @@ class TestExecution(unittest.TestCase):
     self.assertEqual(context.discovered_routes, ["/r"])
     self.assertEqual(context.discovered_forms, ["/f"])
     self.assertEqual(context.regular_username, "alice")
+
+  def test_probe_context_carries_discovered_candidates(self):
+    worker = _make_worker()
+    cand = InjectionCandidate(path="/s/", param="q")
+    context = worker._build_probe_kwargs(DiscoveryResult(candidates=[cand]))
+    self.assertEqual(context.discovered_candidates, [cand])
+    self.assertEqual(context.to_kwargs()["discovered_candidates"], [cand])
 
   def test_supported_features_come_from_typed_probe_definitions(self):
     with patch(
@@ -1429,6 +1437,12 @@ class TestDiscoveryCoverageNote(unittest.TestCase):
     worker.auth.primary_principal = principal
     worker._store_discovery_results(["/a/"], ["/f/"])
     return worker.state["service_info"]["8000"]["_graybox_discovery"]
+
+  def test_fetch_failures_are_persisted(self):
+    worker = _make_worker()
+    worker._store_discovery_results(["/a/"], ["/f/"], fetch_failures=3)
+    info = worker.state["service_info"]["8000"]["_graybox_discovery"]
+    self.assertEqual(info["fetch_failures"], 3)
 
   def test_regular_only_scan_states_its_coverage(self):
     info = self._stored("absent", "regular")

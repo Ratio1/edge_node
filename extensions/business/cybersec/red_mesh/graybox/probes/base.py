@@ -193,6 +193,7 @@ class ProbeBase:
 
   def __init__(self, target_url, auth_manager, target_config, safety,
                discovered_routes=None, discovered_forms=None,
+               discovered_candidates=None,
                regular_username="", allow_stateful=False,
                request_budget=None, allowed_scenario_ids=None,
                rollback_journal=None, job_id="", worker_id="",
@@ -203,6 +204,7 @@ class ProbeBase:
     self.safety = safety
     self.discovered_routes = discovered_routes or []
     self.discovered_forms = discovered_forms or []
+    self.discovered_candidates = discovered_candidates or []
     self.regular_username = regular_username
     self._allow_stateful = allow_stateful
     # OWASP API Top 10 — Subphase 1.7. Optional shared RequestBudget.

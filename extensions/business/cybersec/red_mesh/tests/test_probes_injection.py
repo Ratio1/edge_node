@@ -1,13 +1,15 @@
 """Tests for InjectionProbes."""
 
+import dataclasses
 import unittest
 from unittest.mock import MagicMock
 
 from extensions.business.cybersec.red_mesh.graybox.probes.injection import InjectionProbes
+from extensions.business.cybersec.red_mesh.graybox.models import InjectionCandidate
 from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
 from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
   GrayboxTargetConfig, InjectionConfig, SsrfEndpoint,
-  ReflectiveEndpoint, JsonLookupEndpoint,
+  ReflectiveEndpoint, JsonLookupEndpoint, DiscoveryConfig,
 )
 
 
@@ -27,7 +29,8 @@ def _make_probe(ssrf_endpoints=None, discovered_forms=None,
                 login_path="/auth/login/", logout_path="/auth/logout/",
                 xss_endpoints=None, ssti_endpoints=None,
                 cmd_endpoints=None, header_endpoints=None,
-                json_type_endpoints=None):
+                json_type_endpoints=None, discovered_candidates=None,
+                max_candidates=None):
   cfg = GrayboxTargetConfig(
     injection=InjectionConfig(
       ssrf_endpoints=ssrf_endpoints or [],
@@ -40,6 +43,9 @@ def _make_probe(ssrf_endpoints=None, discovered_forms=None,
     login_path=login_path,
     logout_path=logout_path,
   )
+  if max_candidates is not None:
+    cfg = dataclasses.replace(
+      cfg, discovery=DiscoveryConfig(max_candidates_per_family=max_candidates))
   auth = MagicMock()
   auth.primary_session = primary_session or MagicMock()
   auth.anon_session = MagicMock()
@@ -54,6 +60,7 @@ def _make_probe(ssrf_endpoints=None, discovered_forms=None,
     target_config=cfg,
     safety=safety,
     discovered_forms=discovered_forms or [],
+    discovered_candidates=discovered_candidates,
     allow_stateful=allow_stateful,
   )
   return probe
@@ -1088,3 +1095,93 @@ class TestPerEndpointFindingsRound1(unittest.TestCase):
     self.assertEqual([f.parameter for f in vuln], ["a", "b"])
     flat = [f.to_flat_finding(8000, "http", "p") for f in vuln]
     self.assertEqual(len({x["finding_id"] for x in flat}), 2)
+
+
+def _cand(path, param, source="discovered"):
+  return InjectionCandidate(path=path, param=param, source=source)
+
+
+class TestDiscoveredCandidatesFeedInjection(unittest.TestCase):
+  """RM-060 Phase B: discovered query params reach the reflective families."""
+
+  FAMILIES = [
+    ("_test_reflected_xss", "PT-A03-04", "xss"),
+    ("_test_template_injection", "PT-A03-06", "ssti"),
+    ("_test_command_injection", "PT-A03-07", "cmd"),
+    ("_test_header_injection", "PT-A03-12", "header"),
+  ]
+
+  def test_each_family_tests_discovered_candidate_without_inconclusive(self):
+    for method, sid, kind in self.FAMILIES:
+      probe = _make_probe(discovered_candidates=[_cand("/find/", "q")])
+      probe.auth.primary_session.get = MagicMock(return_value=_mock_response(
+        status=200, text="clean"))
+      getattr(probe, method)()
+      f = [x for x in probe.findings if x.scenario_id == sid]
+      self.assertEqual([x.status for x in f], ["not_vulnerable"], sid)
+      params = [c.kwargs.get("params") for c in
+                probe.auth.primary_session.get.call_args_list if c.kwargs.get("params")]
+      self.assertTrue(params and all("q" in p for p in params), sid)
+
+  def test_discovered_finding_tags_source_and_parameter(self):
+    probe = _make_probe(discovered_candidates=[_cand("/find/", "q")])
+    probe.auth.primary_session.get = MagicMock(return_value=_mock_response(
+      status=200, text="<script>alert(1)</script>"))
+    probe._test_reflected_xss()
+    f = probe.findings[0]
+    self.assertEqual(f.status, "vulnerable")
+    self.assertEqual(f.parameter, "q")
+    self.assertIn("source=discovered", f.evidence[0])
+
+  def test_candidates_capped_per_family(self):
+    cands = [_cand(f"/p{i}/", "q") for i in range(10)]
+    probe = _make_probe(discovered_candidates=cands, max_candidates=3)
+    probe.auth.primary_session.get = MagicMock(return_value=_mock_response(
+      status=200, text="clean"))
+    probe._test_reflected_xss()
+    # 3 candidates x (baseline GET + payload GET)
+    self.assertEqual(probe.auth.primary_session.get.call_count, 6)
+
+
+
+class TestCandidateBoundary(unittest.TestCase):
+  """_reflective_endpoints is the one place discovery meets injection."""
+
+  def test_base_path_stripped_once(self):
+    probe = _make_probe(discovered_candidates=[_cand("/app/find/", "q")])
+    probe.target_url = "http://testapp.local:8000/app"
+    eps = probe._reflective_endpoints([])
+    self.assertEqual([(e.path, e.param) for e in eps], [("/find/", "q")])
+    self.assertEqual(probe.target_url + eps[0].path,
+                     "http://testapp.local:8000/app/find/")
+
+  def test_dedup_keeps_configured_and_dedups_discovered(self):
+    ep = ReflectiveEndpoint(path="/f/", param="q")
+    probe = _make_probe(discovered_candidates=[
+      _cand("/f/", "q"), _cand("/g/", "z"), _cand("/g/", "z")])
+    eps = probe._reflective_endpoints([ep])
+    self.assertEqual([(e.path, e.param, e.source) for e in eps],
+                     [("/f/", "q", "configured"), ("/g/", "z", "discovered")])
+
+  def test_cap_never_exceeds_ceiling_and_spares_configured(self):
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      MAX_CANDIDATES_CEILING)
+    cfgd = DiscoveryConfig.from_dict({"max_candidates_per_family": 10_000})
+    self.assertEqual(cfgd.max_candidates_per_family, MAX_CANDIDATES_CEILING)
+    configured = [ReflectiveEndpoint(path=f"/c{i}/", param="a") for i in range(30)]
+    probe = _make_probe(discovered_candidates=[_cand(f"/d{i}/", "a") for i in range(99)],
+                        max_candidates=2)
+    eps = probe._reflective_endpoints(configured)
+    self.assertEqual(len(eps), 32)
+
+  def test_candidate_outside_base_path_is_dropped(self):
+    probe = _make_probe(discovered_candidates=[
+      _cand("/other/", "q"), _cand("/app/ok/", "q")])
+    probe.target_url = "http://testapp.local:8000/app"
+    eps = probe._reflective_endpoints([])
+    self.assertEqual([(e.path, e.source) for e in eps], [("/ok/", "discovered")])
+
+  def test_non_get_candidate_is_ignored(self):
+    c = InjectionCandidate(path="/p/", param="b", method="POST")
+    probe = _make_probe(discovered_candidates=[c])
+    self.assertEqual(probe._reflective_endpoints([]), [])

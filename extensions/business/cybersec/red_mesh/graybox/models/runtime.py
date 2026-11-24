@@ -91,9 +91,21 @@ class GrayboxCredentialSet:
 
 
 @dataclass(frozen=True)
+class InjectionCandidate:
+  """One discovered injectable parameter: GET ``param`` on origin-absolute ``path``."""
+  path: str
+  param: str
+  method: str = "GET"
+  source: str = "discovered"
+
+
+@dataclass(frozen=True)
 class DiscoveryResult:
   routes: list[str] = field(default_factory=list)
   forms: list[str] = field(default_factory=list)
+  candidates: list[InjectionCandidate] = field(default_factory=list)
+  # Seed fetches (robots/sitemap/OpenAPI) that failed and were ignored.
+  fetch_failures: int = 0
 
   def to_tuple(self) -> tuple[list[str], list[str]]:
     return self.routes, self.forms
@@ -107,6 +119,7 @@ class GrayboxProbeContext:
   safety: object
   discovered_routes: list[str] = field(default_factory=list)
   discovered_forms: list[str] = field(default_factory=list)
+  discovered_candidates: list[InjectionCandidate] = field(default_factory=list)
   regular_username: str = ""
   allow_stateful: bool = False
   # OWASP API Top 10 — Subphase 1.7. Reference (not value) to a shared
@@ -127,6 +140,7 @@ class GrayboxProbeContext:
       "safety": self.safety,
       "discovered_routes": list(self.discovered_routes),
       "discovered_forms": list(self.discovered_forms),
+      "discovered_candidates": list(self.discovered_candidates),
       "regular_username": self.regular_username,
       "allow_stateful": self.allow_stateful,
       "request_budget": self.request_budget,

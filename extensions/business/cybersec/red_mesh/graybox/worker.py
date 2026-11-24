@@ -459,7 +459,8 @@ class GrayboxLocalWorker(BaseLocalWorker):
           known_routes=self.job_config.app_routes,
         )
         result = DiscoveryResult(routes=routes, forms=forms)
-      self._store_discovery_results(result.routes, result.forms)
+      self._store_discovery_results(
+        result.routes, result.forms, fetch_failures=result.fetch_failures)
       self.state["completed_tests"].append("graybox_discovery")
       return result
     finally:
@@ -475,6 +476,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
       safety=self.safety,
       discovered_routes=discovery_result.routes,
       discovered_forms=discovery_result.forms,
+      discovered_candidates=discovery_result.candidates,
       regular_username=self._credentials.regular.username if self._credentials.regular else "",
       allow_stateful=self.job_config.allow_stateful_probes,
       request_budget=self.request_budget,
@@ -712,11 +714,12 @@ class GrayboxLocalWorker(BaseLocalWorker):
       "findings": [],
     }
 
-  def _store_discovery_results(self, routes, forms):
+  def _store_discovery_results(self, routes, forms, fetch_failures=0):
     port_info = self.state["service_info"].setdefault(self._port_key, {})
     port_info["_graybox_discovery"] = {
       "routes": routes,
       "forms": forms,
+      "fetch_failures": fetch_failures,
       "crawled_as": self.auth.primary_principal,
       "coverage_note": (
         "Crawled as the regular user; admin-only pages not reached."

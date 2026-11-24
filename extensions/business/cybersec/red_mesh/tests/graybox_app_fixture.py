@@ -57,6 +57,9 @@ class FakeResponse:
       return self._json
     return json.loads(self.text)
 
+  def close(self):
+    """requests.Response API: discovery closes redirect hops."""
+
   @property
   def ok(self):
     return self.status_code < 400
