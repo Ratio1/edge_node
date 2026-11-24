@@ -68,6 +68,10 @@ class TestContractInForce(_ContractSetCase):
   def test_a_node_only_the_archived_contract_lists_reads_retired_and_is_released_by_hand(self):
     _, tenant_id = self.tenant("acme", nodes=[SHARED_A], fixed=True)
     ok(self, self.activate_contract(tenant_id, self.ready_contract(tenant_id, [PRIVATE_B])))
+    # A tenant amended before the deploy still holds the dropped node: the rule reads it retired.
+    self.repo.put("tenant_node", tenant_id, "Node-A", record={
+      "tenant_id": tenant_id, "node_address": "Node-A", "active": True, "mode": "shared", "draining": False,
+      "changed_by": "creator", "changed_at": "2026-11-01T00:00:00+00:00"})
     nodes = {node["nodeAddress"]: node for node in ok(self, self.plugin.get_tenant_nodes(self.actor, tenant_id))["nodes"]}
     self.assertEqual((nodes["Node-A"]["state"], nodes["Node-B"]["state"]), ("retired", "assigned"))
     ok(self, self.plugin.set_tenant_node_assignment(self.actor, tenant_id, "Node-A", False))

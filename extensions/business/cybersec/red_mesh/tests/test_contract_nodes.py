@@ -241,6 +241,10 @@ class TestEngagementLaunchNodes(_ContractSetCase):
     self.store.grant("acme.admin", tenant_id)
     first = ok(self, self.engagement(tenant_id))
     ok(self, self.activate_contract(tenant_id, self.ready_contract(tenant_id, [PRIVATE_B])))
+    # A tenant amended before RM-249 still holds the node its archived contract listed (the amendment now releases it).
+    self.repo.put("tenant_node", tenant_id, "Node-A", record={
+      "tenant_id": tenant_id, "node_address": "Node-A", "active": True, "mode": "shared", "draining": False,
+      "changed_by": "creator", "changed_at": "2026-11-01T00:00:00+00:00"})
     self.service = self.admission_service()
     return tenant_id, first, ok(self, self.engagement(tenant_id, contract_id="c_2"))
 

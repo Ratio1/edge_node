@@ -26,7 +26,7 @@ SHARED_A = {"node_address": "Node-A", "mode": "shared"}
 PRIVATE_B = {"node_address": "Node-B", "mode": "private"}
 SHARED_C = {"node_address": "Node-C", "mode": "shared"}
 DRAFT_KEYS = {"tenant_id", "contract_id", "request_id", "state", "document", "generated", "effective_from",
-              "effective_until", "nodes", "supersedes", "created_by", "created_at", "updated_by", "updated_at"}
+              "effective_until", "nodes", "note", "supersedes", "created_by", "created_at", "updated_by", "updated_at"}
 ENTRY_KEYS = {"contractId", "state", "sha256", "effectiveFrom", "effectiveUntil", "nodes", "generatedSha256",
               "supersedes", "supersededBy"}
 
@@ -199,7 +199,7 @@ class TestLifecycle(_ContractSetCase):
     # The block on the tenant row, the draft row gone, the private node assigned, the shared one kept.
     tenant = self.tenant_row(tenant_id)
     block = tenant["contracts"][contract_id]
-    self.assertEqual(set(block), {"contract", "contract_generated", "effective_from", "effective_until", "nodes",
+    self.assertEqual(set(block), {"contract", "contract_generated", "effective_from", "effective_until", "nodes", "note",
                                   "activated_by", "activated_at", "supersedes", "superseded_by"})
     self.assertEqual((block["contract"], block["contract_generated"]["nodes"], block["effective_from"],
                       block["effective_until"], block["nodes"], block["activated_by"], block["supersedes"], block["superseded_by"]),
@@ -209,12 +209,12 @@ class TestLifecycle(_ContractSetCase):
     self.assertEqual(self.node_rows(tenant_id), [("Node-A", "shared", True), ("Node-B", "private", True)])
     # `c_1` is untouched: its fields, its receipt binding and every existing reader.
     self.assertEqual(tenant["contract"]["sha256"], ok(self, self.plugin.get_tenant_contract(self.actor, tenant_id))["contract"]["sha256"])
-    # A replay answers without writing; a draft row left behind by a crash goes with it.
+    # A replay answers without writing; a draft row left behind (RM-249: activation incomplete) is finished.
     writes = len(self.store.writes)
     self.assertEqual(ok(self, self.activate_contract(tenant_id, contract_id))["replayed"], True)
     self.assertEqual(len(self.store.writes), writes)
     self.repo.put("tenant_contract_draft", tenant_id, contract_id, record={key: draft[key] for key in DRAFT_KEYS})
-    self.assertEqual(ok(self, self.activate_contract(tenant_id, contract_id))["replayed"], True)
+    self.assertEqual(ok(self, self.activate_contract(tenant_id, contract_id))["replayed"], False)
     self.assertIsNone(self.stored_contract(tenant_id, contract_id))
 
   def test_the_tenant_lists_its_contracts_to_every_member_without_file_names(self):
@@ -311,10 +311,10 @@ class TestNodesAcrossTheSet(_ContractSetCase):
     self.assertEqual(self.node_rows(tenant_id), [("Node-A", "shared", True), ("Node-B", "private", True)])
     nodes = ok(self, self.plugin.get_tenant_nodes(self.actor, tenant_id))
     self.assertEqual((nodes["nodesFixed"], nodes["canManageAssignments"]), (True, False))
-    # The other mode is refused at the plan write already (the node has a live assignment)...
+    # The other mode is refused at the plan write already (RM-249: `node_mode_change`)...
     third = ok(self, self.contract_draft(tenant_id))["contract_id"]
     private_a = {"node_address": "Node-A", "mode": "private"}
-    refused(self, self.update_contract(tenant_id, third, {"nodes": [private_a]}), 409, "node_shared_assigned")
+    refused(self, self.update_contract(tenant_id, third, {"nodes": [private_a]}), 409, "node_mode_change")
     # ...and at activation, naming the node, when the plan was written before the assignment existed.
     third = self.ready_contract(tenant_id, [SHARED_C], signed=SIGNED_3, generated=GENERATED_3)
     row = self.stored_contract(tenant_id, third)
@@ -323,8 +323,8 @@ class TestNodesAcrossTheSet(_ContractSetCase):
     self.repo.put("tenant_contract_draft", tenant_id, third, record=row)
     tenant_before = self.tenant_row(tenant_id)
     result = self.activate_contract(tenant_id, third)
-    refused(self, result, 409, "contract_nodes_unavailable")
-    self.assertEqual(result["nodes"], [{"nodeAddress": "Node-A", "error": "node_shared_assigned"}])
+    refused(self, result, 409, "node_mode_change")
+    self.assertEqual(result["nodeAddress"], "Node-A")
     self.assertEqual(self.tenant_row(tenant_id), tenant_before)
     self.assertEqual(self.node_rows(tenant_id), [("Node-A", "shared", True), ("Node-B", "private", True)])
     self.assertIsNotNone(self.stored_contract(tenant_id, third))
@@ -549,7 +549,11 @@ class TestRevisions(_ContractSetCase):
     ok(self, self.upload_pack(child))
     refused(self, self.plugin.activate_engagement_draft(self.actor, child), 409, "contract_superseded")
     self.assertIsNotNone(self.stored_child(child))
+    # RM-249: the signed pack names its contract, so a re-pick needs the pack dropped first.
+    refused(self, self.update_child(child, {"contract_id": revision["contract_id"]}), 409, "already_signed")
+    ok(self, self.update_child(child, {"document": {"state": "missing"}}))
     ok(self, self.update_child(child, {"contract_id": revision["contract_id"]}))
+    ok(self, self.upload_pack(child))
     activated = ok(self, self.plugin.activate_engagement_draft(self.actor, child))
     engagement = ok(self, self.plugin.get_engagement(self.actor, tenant_id, activated["engagementId"]))["engagement"]
     self.assertEqual(engagement["contractSha256"], self.tenant_row(tenant_id)["contracts"][revision["contract_id"]]["contract"]["sha256"])
