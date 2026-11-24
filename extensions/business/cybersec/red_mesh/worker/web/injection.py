@@ -1005,6 +1005,7 @@ class _WebInjectionMixin(_InjectionTestBase):
             owasp_id="A08:2021",
             cwe_id="CWE-502",
             confidence="firm",
+            **({"cve": (ep["cve"],), **probe_cve_fields(ep["cve"])} if ep["cve"] else {}),
           ))
       except Exception:
         pass

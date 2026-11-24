@@ -419,9 +419,7 @@ class _RiskScoringMixin:
       if not (len(year) == 4 and year.isascii() and year.isdigit()):
         freshness = ""
       signature = str(f.get("finding_signature") or "")
-      # A finding that carries its CVE ids beats one that only names the CVE in its title (RM-257: the vulndb row for
-      # JBoss CVE-2017-12149 lost to the CVE-less /invoker finding on the signature tiebreak, and every CVE count lost it).
-      return severity, confidence, bool(f.get("cve")), freshness, signature
+      return severity, confidence, freshness, signature
 
     drop_indices = set()
     signature_best = {}

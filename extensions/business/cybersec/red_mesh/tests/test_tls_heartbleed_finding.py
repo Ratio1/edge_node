@@ -37,7 +37,6 @@ def _build_leak_response(extra_bytes: int = 0x4000) -> bytes:
 
 def _heartbleed_positive_probe():
   """A TLS probe whose sibling passes are no-ops and whose Heartbleed pass is positive."""
-  from extensions.business.cybersec.red_mesh.worker.service.tls import _ServiceTlsMixin
   from extensions.business.cybersec.red_mesh.findings import Finding, Severity
   probe = _ServiceTlsMixin.__new__(_ServiceTlsMixin)
   # Stub every sibling pass to no-op except heartbleed → positive.
@@ -240,15 +239,13 @@ class TestHeartbleedTriggersOpenSslCveInference(unittest.TestCase):
 
   def test_inferred_end_of_life_row_keeps_its_eol_identity(self):
     """A build with an `eol` table also yields the CVE-less end-of-life row (live job b3f87de0 failed on it)."""
-    from extensions.business.cybersec.red_mesh.findings import Finding, Severity
-    eol = Finding(severity=Severity.HIGH, title="End-of-life openssl (openssl 1.0.1f)", description="openssl 1.0.1f is",
-                  evidence="Detected version: 1.0.1f, oldest supported 1.1.1", remediation="upgrade", owasp_id="A06:2021",
-                  cwe_id="CWE-1104", confidence="firm", tags=("vulndb_eol", "openssl"))
+    from extensions.business.cybersec.red_mesh.cve_db import _unsupported_finding
+    eol = _unsupported_finding("openssl", "1.0.1f", "1.1.1", MagicMock(build_id="b1"))
     with patch("extensions.business.cybersec.red_mesh.worker.service.tls.check_cves", return_value=[eol]), \
          patch("extensions.business.cybersec.red_mesh.worker.service.tls._stamp_identity", wraps=_stamp_identity) as stamp:
       result = _heartbleed_positive_probe()._service_info_tls("10.0.0.1", 8443)
-    row = next(f for f in result["findings"] if "End-of-life" in f["title"])
-    self.assertIn("(openssl 1.0.1-1.0.1f)", row["title"])
+    row = next(f for f in result["findings"] if "Unsupported version" in f["title"])
+    self.assertEqual(row["title"], "Unsupported version: openssl 1.0.1-1.0.1f (oldest supported 1.1.1)")
     self.assertEqual(stamp.call_args.args[1:], ("openssl", "1.0.1f", "eol"))
 
 TLS = "extensions.business.cybersec.red_mesh.worker.service.tls"

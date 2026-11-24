@@ -4849,6 +4849,33 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
     findings = result.get("findings", [])
     self.assertTrue(any("CVE-2017-12149" in f["title"] for f in findings), f"Should detect JBoss invoker. Got: {[f['title'] for f in findings]}")
 
+  def test_jboss_invoker_cve_survives_dedup_whichever_wins(self):
+    """Live job ca8fcbde (RM-257): the /invoker/readonly finding and the vulndb row for CVE-2017-12149 tie on
+    7106; whichever the signature tiebreak keeps, the survivor carries the CVE id."""
+    _, worker = self._build_worker(ports=[7106])
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.status_code = 500 if "/invoker/readonly" in url else 404
+      resp.text = ""
+      resp.headers = {}
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get):
+      probe_findings = worker._web_test_java_deserialization("1.2.3.4", 7106)["findings"]
+    if 'extensions.business.cybersec.red_mesh.pentester_api_01' not in sys.modules:
+      mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    for row_signature in ("0" * 64, "f" * 64):
+      row = {"title": "CVE-2017-12149: In Jboss Application Server (jboss 6.0)", "severity": "CRITICAL",
+             "confidence": "firm", "cve": ["CVE-2017-12149"], "finding_signature": row_signature}
+      _risk, flat = PentesterApi01Plugin._compute_risk_and_findings(None, {
+        "open_ports": [7106], "port_protocols": {"7106": "http"}, "service_info": {},
+        "web_tests_info": {"7106": {"_web_test_java_deserialization": {"findings": probe_findings},
+                                    "_web_test_java_servers": {"findings": [row]}}},
+      })
+      self.assertEqual([list(f.get("cve") or []) for f in flat], [["CVE-2017-12149"]], row_signature)
+
   # ── Spring Actuator probe ─────────────────────────────────────────
 
   def test_spring_actuator_env_detected(self):

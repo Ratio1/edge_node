@@ -638,24 +638,6 @@ class TestCveDedupKeepsTheWorstFinding(unittest.TestCase):
     self.assertEqual(risk["breakdown"]["finding_counts"]["LOW"], 0)
 
 
-
-class TestCveDedupKeepsTheFindingThatCarriesTheCve(unittest.TestCase):
-  """Live job ca8fcbde (RM-257): two CRITICAL firm findings for CVE-2017-12149 on one port tied, and the signature
-  tiebreak kept the probe finding whose `cve` is empty, so the CVE was gone from every count and the CVE view."""
-
-  def test_the_finding_with_cve_ids_survives_a_tie(self):
-    findings = [
-      {"title": "CVE-2017-12149: JBoss deserialization endpoint /invoker/readonly", "severity": "CRITICAL",
-       "confidence": "firm", "description": "endpoint returns 500", "finding_signature": "f" * 64},
-      {"title": "CVE-2017-12149: In Jboss Application Server (jboss 6.0)", "severity": "CRITICAL",
-       "confidence": "firm", "description": "version match", "cve": ["CVE-2017-12149"], "finding_signature": "0" * 64},
-    ]
-    _risk, flat = _Host()._compute_risk_and_findings({
-      "target": "app.test", "port_protocols": {"7106": "http"},
-      "service_info": {"7106": {"_web_test_java_servers": {"findings": findings}}},
-    })
-    self.assertEqual([f.get("cve") for f in flat], [["CVE-2017-12149"]])
-
 class TestScoringIsOneWalk(unittest.TestCase):
   """Phase 3: score once, after dedup, over `flat_findings`.
 

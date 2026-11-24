@@ -101,7 +101,9 @@ class _ServiceTlsMixin(_ServiceProbeBase):
         label = "openssl 1.0.1-1.0.1f"
         relabelled = replace(
           inferred,
-          title=inferred.title.replace("(openssl 1.0.1f)", f"({label})"),
+          # CVE rows name the version in a "(openssl 1.0.1f)" suffix; the end-of-life row in its "Unsupported version:" text.
+          title=(inferred.title.replace("(openssl 1.0.1f)", f"({label})") if inferred.cve
+                 else inferred.title.replace("openssl 1.0.1f", label)),
           description=inferred.description.replace("openssl 1.0.1f", label),
           evidence=inferred.evidence.replace("Detected version: 1.0.1f,", "Detected version: 1.0.1-1.0.1f,"),
         )
