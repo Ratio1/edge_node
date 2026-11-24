@@ -226,8 +226,8 @@ def build_llm_input(
   # real findings, on a declared severity it kept because only `not_vulnerable`
   # is downgraded to INFO.
   real_findings = [f for f in finding_dicts if not _is_coverage_result(f)]
-  # RM-169, generated CVE findings: the listed ones go in `findings`; the view's counts, rollups and possible
-  # summary go in `scan_summary`. None under `static`.
+  # RM-169, generated CVE findings: the listed ones go in `findings`; the view's counts, rollups, possible
+  # summary and folded groups (with their per-reason counts) go in `scan_summary`. None under `static`.
   not_applicable = ((aggregated_report or {}).get("cves_not_applicable") or {}).values()
   # `triage` is the live host triage map, passed by the caller. A `triage` field embedded on a finding is never
   # read: it may come from a worker, and only the live map closes or confirms a finding.

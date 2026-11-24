@@ -864,7 +864,7 @@ class _RedMeshLlmAgentMixin(object):
         },
         "services": services,
         "top_findings": top_findings,
-        # RM-169, generated CVE findings only: counts, rollups and the possible summary; absent under `static`.
+        # RM-169, generated CVE findings only: counts, rollups, the possible summary and folded groups with their reasons; absent under `static`.
         **({"cve_view": summarize_view(cve_view)} if cve_view else {}),
         "coverage": self._build_llm_coverage_summary(aggregated_report, analysis_type),
         "attack_surface": self._build_attack_surface_summary(services, findings_summary),

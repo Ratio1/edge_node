@@ -30,6 +30,8 @@ from ..tenancy.identity import IdentityStoreError
 from ..tenancy.ports import TenantStoreError
 from .config import get_attestation_config
 from .control import stop_monitoring
+from .engagement_ledger import port_ranges
+from .engagement_ledger_store import EngagementLedgerRecorder
 from .config import get_llm_agent_config
 from .event_hooks import (
   emit_attestation_status_event as _emit_attestation_status_event,
@@ -490,6 +492,73 @@ def _ensure_rulebook_assessment_after_pass(owner, job_specs, *, job_id, pass_nr)
   return refreshed if isinstance(refreshed, dict) else job_specs
 
 
+def _record_skipped_ledger_pass(owner, job_specs, *, job_id, pass_nr, date_completed):
+  """RM-121: a pass left without a stored pass report still gets a `skipped` ledger entry, so the
+  job's later passes are folded. Non-fatal."""
+  try:
+    recorder = EngagementLedgerRecorder.for_job(owner, job_specs)
+    if recorder is not None:
+      recorder.record_skipped(job_id=job_id, pass_nr=pass_nr, date_completed=date_completed)
+  except Exception as exc:
+    owner.P(f"[LEDGER] Skipped entry for job {job_id} pass {pass_nr} not written ({type(exc).__name__})",
+            color='y')
+
+
+def _completed_port_ranges(node_reports, workers):
+  """The port runs of the workers whose report the pass collected: the worker's own port list when it
+  has one (comparison mode slices are not contiguous), else its `[start_port, end_port]`."""
+  ranges = []
+  for address, report in (node_reports or {}).items():
+    if not isinstance(report, dict):
+      continue
+    entry = (workers or {}).get(address) or {}
+    ports = report.get("target_ports") or entry.get("target_ports")
+    if ports:
+      ranges.extend(port_ranges(ports))
+    else:
+      ranges.append([int(report.get("start_port") or 0), int(report.get("end_port") or 0)])
+  return ranges
+
+
+def _record_engagement_ledger_after_pass(owner, job_key, job_specs, artifacts, *, job_id, pass_nr,
+                                         pass_report_cid, node_reports, workers, **facts):
+  """RM-121: the engagement finding ledger's post-pass hook (launcher only, every pass, non-fatal).
+
+  Stores the pass-changes artifact, puts its CID on the pass's `PassReportRef`, then writes the
+  asset's pass entry and folds (`continuous-monitoring.md` §2.1). A failure is logged and leaves a
+  `skipped` entry when the pass has none yet; the pass and the job go on.
+  """
+  recorder = None
+  try:
+    recorder = EngagementLedgerRecorder.for_job(owner, job_specs)
+    if recorder is None:
+      return job_specs
+    completed_ranges = _completed_port_ranges(node_reports, workers)
+    changes_cid = recorder.store_pass_changes(
+      artifacts, job_id=job_id, pass_nr=pass_nr, pass_report_cid=pass_report_cid,
+      completed_ranges=completed_ranges, **facts)
+    refs = job_specs.get("pass_reports") or []
+    for index, ref in enumerate(refs):
+      if ref.get("pass_nr") == pass_nr and ref.get("report_cid") == pass_report_cid:
+        refs[index] = PassReportRef.from_dict({**ref, "pass_changes_cid": changes_cid}).to_dict()
+    written = _write_job_record(owner, job_key, job_specs, context="finalize_engagement_ledger")
+    if written is not None:  # None: the write was not confirmed; the job record keeps the pass as it was
+      job_specs = written
+    recorder.record_pass(
+      artifacts, job_id=job_id, pass_nr=pass_nr, date_completed=facts["date_completed"],
+      pass_report_cid=pass_report_cid, pass_changes_cid=changes_cid)
+  except Exception as exc:
+    owner.P(f"[LEDGER] Engagement ledger not updated for job {job_id} pass {pass_nr} ({type(exc).__name__})",
+            color='y')
+    try:
+      if recorder is not None:
+        recorder.record_skipped(job_id=job_id, pass_nr=pass_nr, date_completed=facts.get("date_completed"))
+    except Exception as skipped_exc:
+      owner.P(f"[LEDGER] Skipped entry for job {job_id} pass {pass_nr} not written ({type(skipped_exc).__name__})",
+              color='y')
+  return job_specs
+
+
 def maybe_finalize_pass(owner):
   """
   Launcher finalizes completed passes and orchestrates continuous monitoring.
@@ -599,6 +668,8 @@ def maybe_finalize_pass(owner):
           f"({len(node_reports)} worker reports)"
         )
         if not aggregated:
+          _record_skipped_ledger_pass(
+            owner, job_specs, job_id=job_id, pass_nr=job_pass, date_completed=pass_date_completed)
           _mark_job_failed(
             owner, job_key, job_specs, job_id=job_id, pass_nr=job_pass,
             failure_class="report_aggregation_failed",
@@ -744,6 +815,8 @@ def maybe_finalize_pass(owner):
         aggregated_report_cid = artifacts.put_json(aggregated_data, show_logs=False)
         if not aggregated_report_cid:
           owner.P(f"Failed to store aggregated report for pass {job_pass} in R1FS", color='r')
+          _record_skipped_ledger_pass(
+            owner, job_specs, job_id=job_id, pass_nr=job_pass, date_completed=pass_date_completed)
           continue
 
       redmesh_test_attestation = None
@@ -889,6 +962,8 @@ def maybe_finalize_pass(owner):
       pass_report_cid = artifacts.put_pass_report(pass_report, show_logs=False)
       if not pass_report_cid:
         owner.P(f"Failed to store pass report for pass {job_pass} in R1FS", color='r')
+        _record_skipped_ledger_pass(
+          owner, job_specs, job_id=job_id, pass_nr=job_pass, date_completed=pass_date_completed)
         continue
 
       job_specs.setdefault("pass_reports", []).append(
@@ -925,6 +1000,13 @@ def maybe_finalize_pass(owner):
       set_job_status(job_specs, JOB_STATUS_FINALIZING)
       job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_finalizing")
       job_specs = _ensure_rulebook_assessment_after_pass(owner, job_specs, job_id=job_id, pass_nr=job_pass)
+      job_specs = _record_engagement_ledger_after_pass(
+        owner, job_key, job_specs, artifacts, job_id=job_id, pass_nr=job_pass,
+        pass_report_cid=pass_report_cid, node_reports=node_reports, workers=workers,
+        date_completed=pass_date_completed,
+        flat_findings=flat_findings, aggregated=aggregated, pass_metrics=pass_metrics,
+        abort_state=abort_state, job_config=job_config,
+      )
 
       if empty_abort and job_pass <= 1:
         phase = abort_state["abort_phase"] or "unknown"

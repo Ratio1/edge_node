@@ -60,7 +60,7 @@ class RiskBreakdown:
   credential_floor_applied: bool = None  # an accepted credential lifted the score
   constants: dict = None            # weights, multipliers, ceiling, penalty, floor
   possible_cves: int = None         # RM-169, generated CVE view: findings left out of the score as "possible"
-  cve_view_counts: dict = None      # RM-169: { raw, listed, rolled_up, possible, closed, dropped }
+  cve_view_counts: dict = None      # RM-169: { raw, listed, rolled_up, possible, folded, closed, dropped }
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))

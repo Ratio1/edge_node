@@ -23,27 +23,30 @@ class ArchiveCveViewTests(unittest.TestCase):
       return query.get_job_archive(object(), "j", **kw)
 
   def test_generated_passes_carry_the_view_and_static_passes_do_not(self):
-    stored = archive([finding(1), finding(2, kev=False, cvss_score=5.0)], [finding(1, build_id=None)], [])
+    stored = archive([finding(1), finding(2, kev=False, cvss_score=5.0),
+                      finding(3, confidence="tentative", confidence_reason="banner_unverified")],
+                     [finding(1, build_id=None)], [])
     before = copy.deepcopy(stored)
     passes = self.read(stored)["archive"]["passes"]
     view = passes[0]["cve_view"]
     self.assertEqual(view["services"][0]["listed"], ["id1"])
     self.assertEqual(view["services"][0]["rollup"]["member_finding_ids"], ["id2"])
-    self.assertEqual(view["counts"], {"raw": 2, "listed": 1, "rolled_up": 1, "possible": 0, "closed": 0, "dropped": 0})
-    self.assertEqual(len(passes[0]["findings"]), 2)  # `findings[]` keeps every CVE finding
+    self.assertEqual(view["counts"], {"raw": 3, "listed": 1, "rolled_up": 1, "possible": 0, "folded": 1, "closed": 0, "dropped": 0})
+    self.assertEqual(len(passes[0]["findings"]), 3)  # `findings[]` keeps every CVE finding, folded ones too
+    self.assertEqual(view["services"][0]["folded"]["member_finding_ids"], ["id3"])
     self.assertNotIn("cve_view", passes[1])
     self.assertNotIn("cve_view", passes[2])
     self.assertEqual(stored, before)  # the stored archive dict is untouched
 
   def test_dropped_comes_from_the_stored_breakdown_and_counts_equal_it(self):
     findings = [finding(1), finding(2, kev=False, cvss_score=5.0)]
-    counts = {"raw": 5, "listed": 1, "rolled_up": 1, "possible": 0, "closed": 0, "dropped": 3}
+    counts = {"raw": 5, "listed": 1, "rolled_up": 1, "possible": 0, "folded": 0, "closed": 0, "dropped": 3}
     stored = archive(findings, findings)
     stored["passes"][0]["risk_breakdown"] = {"cve_view_counts": counts}
     passes = self.read(stored)["archive"]["passes"]
     self.assertEqual(passes[0]["cve_view"]["counts"], counts)
     c = passes[0]["cve_view"]["counts"]
-    self.assertEqual(c["listed"] + c["rolled_up"] + c["possible"] + c["closed"] + c["dropped"], c["raw"])
+    self.assertEqual(c["listed"] + c["rolled_up"] + c["possible"] + c["folded"] + c["closed"] + c["dropped"], c["raw"])
     self.assertEqual(passes[1]["cve_view"]["counts"]["dropped"], 0)  # no stored counts
 
   def test_pagination_keeps_the_view_and_summary_does_not_need_it(self):

@@ -1,5 +1,6 @@
 import requests
 
+from ...constants import AUTH_SKIPPED
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
 from ..probe_registry import register_probe, CATEGORY_WEB_TEST
@@ -262,6 +263,9 @@ class _WebApiExposureMixin:
       for path in candidate_paths:
         self._withhold_on_catch_all(base_url, "_web_test_api_auth_bypass", path)
       return probe_result(findings=findings_list)
+    if not self._login_attempts_allowed():
+      # A request with a fabricated Bearer token is a login attempt.
+      return probe_result(raw_data={"auth_control": dict(AUTH_SKIPPED)}, findings=findings_list)
     try:
       for path in candidate_paths:
         url = base_url.rstrip("/") + path

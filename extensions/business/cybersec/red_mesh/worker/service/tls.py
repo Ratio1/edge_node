@@ -3,12 +3,13 @@ import re as _re
 import socket
 import struct
 import ssl
+from dataclasses import replace
 
 import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
-from ...cve_db import check_cves, probe_cve_fields
+from ...cve_db import check_cves, probe_cve_fields, _stamp_identity
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
 
@@ -96,7 +97,17 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       for inferred in check_cves("openssl", "1.0.1f", inferred_span=("1.0.1", "1.0.1f")):
         if "CVE-2014-0160" in (inferred.cve or ()):
           continue
-        findings.append(inferred)
+        # Display and evidence name the proven span; matching above already used it. Identity stays on 1.0.1f.
+        label = "openssl 1.0.1-1.0.1f"
+        relabelled = replace(
+          inferred,
+          # CVE rows name the version in a "(openssl 1.0.1f)" suffix; the end-of-life row in its "Unsupported version:" text.
+          title=(inferred.title.replace("(openssl 1.0.1f)", f"({label})") if inferred.cve
+                 else inferred.title.replace("openssl 1.0.1f", label)),
+          description=inferred.description.replace("openssl 1.0.1f", label),
+          evidence=inferred.evidence.replace("Detected version: 1.0.1f,", "Detected version: 1.0.1-1.0.1f,"),
+        )
+        findings.append(_stamp_identity(relabelled, "openssl", "1.0.1f", inferred.cve[0] if inferred.cve else "eol"))
 
     # Pass 5: Downgrade attacks (POODLE / BEAST)
     findings += self._tls_check_downgrade(target, port)
@@ -404,12 +415,14 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       try:
         raw_after = tls_sock.unwrap()
         raw_after.sendall(tls_record)
-        raw_after.settimeout(self._target_timeout(3))
-        response = raw_after.recv(65536)
+        response, alert_only = self._tls_read_heartbeat(raw_after)
         raw_after.close()
       except (ssl.SSLError, OSError):
         # If unwrap fails, try closing and testing with a new raw connection
         tls_sock.close()
+        return self._tls_heartbleed_raw(target, port, tls_ver_bytes)
+      if response is None and alert_only:
+        # Only the shutdown alert came back: the unwrapped socket proved nothing, try the raw path.
         return self._tls_heartbleed_raw(target, port, tls_ver_bytes)
 
       if response and len(response) >= 7:
@@ -438,13 +451,43 @@ class _ServiceTlsMixin(_ServiceProbeBase):
               confidence="certain",
               **probe_cve_fields("CVE-2014-0160"),
             )
-        # TLS Alert (ContentType=21) = not vulnerable (server rejected heartbeat)
-        elif response[0] == 21:
-          return None
 
     except Exception:
       pass
     return None
+
+  def _tls_read_heartbeat(self, sock):
+    """Read TLS records until a heartbeat record, skipping alerts (close_notify from `unwrap()`).
+
+    Stops at a heartbeat record, an unknown record, EOF or timeout, a 3 s deadline, or 70000 bytes.
+
+    Returns
+    -------
+    (bytes or None, bool)
+      The buffer starting at the heartbeat record (or None), and whether an alert was skipped.
+    """
+    deadline = self._deadline_in(self._target_timeout(3))
+    buf, alert = b"", False
+    while len(buf) < 70000:
+      try:
+        chunk = self._recv_by(sock, 65536, deadline)
+      except (socket.timeout, OSError):
+        break
+      if not chunk:
+        break
+      buf += chunk
+      while len(buf) >= 5:
+        if buf[0] == 24:
+          if len(buf) >= 7:
+            return buf, alert
+          break
+        end = 5 + struct.unpack(">H", buf[3:5])[0]
+        if buf[0] != 21:
+          return None, alert
+        if len(buf) < end:
+          break
+        buf, alert = buf[end:], True
+    return None, alert
 
   def _tls_heartbleed_raw(self, target, port, tls_ver_bytes):
     """Fallback Heartbleed test using a raw TLS ClientHello with heartbeat extension.
@@ -522,11 +565,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       sock.sendall(hb_record)
 
       # Read response
-      sock.settimeout(self._target_timeout(3))
-      try:
-        response = sock.recv(65536)
-      except (socket.timeout, OSError):
-        response = b""
+      response, _ = self._tls_read_heartbeat(sock)
       sock.close()
 
       if response and len(response) >= 7 and response[0] == 24:

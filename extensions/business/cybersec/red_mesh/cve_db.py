@@ -188,9 +188,11 @@ CVE_DATABASE: list = [
   # ── Apache httpd ───────────────────────────────────────────────────
   CveEntry("apache", ">=2.4.0,<2.4.60",  "CVE-2024-38475", Severity.CRITICAL, "mod_rewrite escaping flaw — SSRF / RCE", "CWE-116"),
   CveEntry("apache", ">=2.4.0,<2.4.60",  "CVE-2024-38476", Severity.CRITICAL, "Backend header exploit — SSRF / local script exec", "CWE-829"),
-  CveEntry("apache", ">=2.4.49,<2.4.51", "CVE-2021-41773", Severity.CRITICAL, "Path traversal + RCE", "CWE-22"),
+  CveEntry("apache", ">=2.4.49,<2.4.50", "CVE-2021-41773", Severity.CRITICAL, "Path traversal + RCE", "CWE-22"),
   CveEntry("apache", ">=2.4.0,<2.4.52",  "CVE-2021-44790", Severity.CRITICAL, "mod_lua buffer overflow", "CWE-787"),
-  CveEntry("apache", ">=2.4.0,<2.4.62",  "CVE-2024-40725", Severity.MEDIUM, "HTTP request smuggling via mod_proxy", "CWE-444"),
+  CveEntry("apache", ">=2.4.60,<2.4.62", "CVE-2024-40725", Severity.MEDIUM, "Source code disclosure with handlers configured via AddType", "CWE-668"),
+  CveEntry("apache", ">=2.4.60,<2.4.69", "CVE-2026-42356", Severity.LOW, "Limited RCE for some internal redirects to non-CGI files in CGI directories", "CWE-430"),
+  CveEntry("apache", ">=2.4.68,<2.4.69", "CVE-2026-56449", Severity.HIGH, "mod_proxy_html crash in dump_content", "CWE-787"),
   CveEntry("apache", "<2.4.49",           "CVE-2021-40438", Severity.CRITICAL, "mod_proxy SSRF", "CWE-918"),
   CveEntry("apache", "<2.2.34",           "CVE-2017-7679", Severity.CRITICAL, "mod_mime buffer overread", "CWE-126"),
 
@@ -411,22 +413,34 @@ _DISTRO_PACKAGE_RE = re.compile(
 )
 
 
+# `Apache/2.4.38 (Debian)`: the distribution marker without a package revision (RM-240).
+_DISTRO_NO_REVISION_RE = re.compile(r"[_\s/](?P<upstream>\d[\w.]*?)\s+\((?P<distro>Ubuntu|Debian)\)", re.IGNORECASE)
+
+
+_DISTRO_PARSE_LIMIT = 256
+
+
 def parse_distro_package(text):
   """The distribution package a banner or version string announces, or None.
 
-  None means "no distribution suffix": an upstream build, or a distribution
-  that does not stamp its revision into the banner. It does not mean
-  "not backported"; that state is `unknown` below.
+  None means "no distribution marker": an upstream build. It does not mean
+  "not backported"; that state is `unknown` below. A bare `(Debian)` or
+  `(Ubuntu)` after the version gives `revision=""`: the distribution is
+  known, the revision is not.
   """
   if not isinstance(text, str):
     return None
+  cut = len(text) > _DISTRO_PARSE_LIMIT
+  text = text[:_DISTRO_PARSE_LIMIT]  # a hostile banner must not set the regex cost
   m = _DISTRO_PACKAGE_RE.search(text)
   if not m:
+    m = _DISTRO_NO_REVISION_RE.search(text)
+  if not m or (cut and m.end() == len(text)):  # a match that ends at the cut may have lost the rest of its revision
     return None
   return DistroPackage(
     distro=m.group("distro").lower(),
     upstream=m.group("upstream"),
-    revision=m.group("revision"),
+    revision=m.groupdict().get("revision") or "",
   )
 
 
@@ -490,6 +504,9 @@ BACKPORT_NOT_AFFECTED = "not_affected"
 # The banner announced no distribution package at all, so there is nothing to
 # assess. Stated rather than left as "" so a report can always print a state.
 BACKPORT_UNKNOWN_NO_PACKAGE = "unknown_no_package"
+# `generated` only: the banner carries a positive upstream-build marker (`Apache/x (Unix)`, RM-204), so no
+# distribution backport applies. Set by the caller through `check_cves(upstream_build=True)`, never inferred here.
+BACKPORT_UPSTREAM_BUILD = "upstream_build"
 
 
 def _backport_row(product: str, cve_id: str, package):
@@ -517,6 +534,8 @@ def _backport_state(product: str, cve_id: str, package):
   if package is None:
     return BACKPORT_UNKNOWN_NO_PACKAGE, None
   row = _backport_row(product, cve_id, package)
+  if row is not None and not package.revision:
+    return BACKPORT_UNKNOWN, None  # a row matches by upstream: without a revision an equal upstream cannot say fixed or not
   if row is None:
     verdict = _distro_verdict(product, cve_id, package)
     if verdict is None:
@@ -579,7 +598,7 @@ def _record_not_applicable(entry, product: str, version: str, package, reason: s
     "title": entry.title,
     "product": product,
     "version": version,
-    "package": f"{package.distro} {package.upstream}-{package.revision}" if package else "",
+    "package": (f"{package.distro} {package.upstream}" + (f"-{package.revision}" if package.revision else "")) if package else "",
     "port": port,
     "reason": reason,
     "advisory": row[2] if row else "",
@@ -644,6 +663,7 @@ def check_cves(
   package=None,
   inferred_span=None,
   banner_verified=BANNER_NOT_ASSESSABLE,
+  upstream_build=False,
 ) -> list:
   """Match version against CVE database. Returns list of Findings.
 
@@ -666,6 +686,9 @@ def check_cves(
   ``BANNER_NOT_ASSESSABLE``. Omitted: no check exists for the product and nothing changes. ``None``: the check
   could not run, so a database-firm row is tentative ``banner_only``. ``True``: unchanged. ``False``: every row is
   tentative ``banner_unverified``, under ``static`` too.
+
+  ``upstream_build`` is True when the banner carries a positive upstream-build marker (RM-204). Under ``generated``
+  and with no package, a backported product's rows lose the ``banner_only`` reason. ``static`` ignores it.
   """
   if dynamic_cache is None:
     dynamic_cache = get_dynamic_reference_cache()
@@ -681,6 +704,8 @@ def check_cves(
           _record_not_applicable(match, product, version, package, NOT_APPLICABLE_CLIENT_SIDE)
         continue
       status, verdict = _backport_state(product, match.cve_id, package)
+      if upstream_build and status == BACKPORT_UNKNOWN_NO_PACKAGE:
+        status = BACKPORT_UPSTREAM_BUILD
       # A banner proven false (an emulator) cannot vouch for a distribution's verdict: the table does not drop the row, it
       # stays tentative `banner_unverified`. An overlay row (`verdict` None) keeps dropping, as before.
       if status in (BACKPORT_FIXED, BACKPORT_NOT_AFFECTED) and not (verdict and banner_verified is False):
@@ -808,7 +833,7 @@ def _confidence_reason(backport_status: str, match, product: str, banner_verifie
     reasons.add("platform_dependent")
   if _local_vector_only(match):
     reasons.add("local_vector")
-  if product in _BACKPORTED_PRODUCTS and backport_status != BACKPORT_NOT_FIXED:
+  if product in _BACKPORTED_PRODUCTS and backport_status not in (BACKPORT_NOT_FIXED, BACKPORT_UPSTREAM_BUILD):
     reasons.add("backport_unknown" if backport_status == BACKPORT_UNKNOWN else "banner_only")
   if match.confidence == "tentative":
     reasons.add(match.reason)  # a reason this node does not know passes through (readers ignore it)
@@ -818,6 +843,8 @@ def _confidence_reason(backport_status: str, match, product: str, banner_verifie
   if banner_verified is None and match.confidence != "tentative":
     # A database-firm row rests on the announced version alone: unproven for a banner no probe could check.
     return "tentative", "banner_only"
+  if backport_status == BACKPORT_UPSTREAM_BUILD:
+    return match.confidence, "upstream_build"
   return match.confidence, match.reason
 
 
@@ -921,6 +948,8 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
       " The distribution package is below the revision that carries the fix, "
       "so the backport does not apply."
     )
+  elif backport_status == BACKPORT_UPSTREAM_BUILD:
+    backport_note = " The banner announces an upstream build with no distribution package, so no backport applies."
   elif backport_status == BACKPORT_UNKNOWN:
     backport_note = (
       " Backport status unknown: a distribution package was detected but no "

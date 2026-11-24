@@ -35,7 +35,7 @@ class MemoryArtifacts:
     self.writes = []
     self.after_write = None
 
-  def get_json(self, cid):
+  def get_json(self, cid, **_kwargs):
     self.reads.append(cid)
     return deepcopy(self.values.get(cid))
 

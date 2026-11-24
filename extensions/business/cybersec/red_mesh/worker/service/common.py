@@ -10,6 +10,7 @@ from datetime import datetime
 
 import paramiko
 
+from ...constants import AUTH_SKIPPED
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
 from ...cve_db import (
@@ -202,6 +203,31 @@ _HTTP_SERVER_RE = _re.compile(
 _HTTP_PRODUCT_MAP = {'apache': 'apache', 'nginx': 'nginx'}
 
 
+_EHLO_LABEL = _re.compile(r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
+
+
+_DEFAULT_EHLO_DOMAIN = "probe.redmesh.local"
+
+
+def _ehlo_domain(identity):
+  """Return identity when it is a valid hostname (RFC 1123), else the default EHLO domain."""
+  if (isinstance(identity, str) and 0 < len(identity) <= 253
+      and all(_EHLO_LABEL.match(label) for label in identity.split("."))):
+    return identity
+  return _DEFAULT_EHLO_DOMAIN
+
+
+def _server_package(server, version):
+  """The distro package of a Server header, only when it names the version `check_cves` matches (RM-240)."""
+  package = parse_distro_package(server)
+  return package if package is not None and package.upstream == version else None
+
+
+# RM-204: the one positive upstream-build marker: a header that starts `Apache/x (Unix)`, followed only by `Name/version` module tokens.
+# A vendor word, a distro marker or no parenthesised token is not the marker; absence of a distro marker never is.
+_APACHE_UPSTREAM_RE = _re.compile(r'\s*Apache/\d+(?:\.\d+)+ \(Unix\)(?:\s+[\w.-]+/[\w.+~-]+)*\s*$')
+
+
 # --- SSH KEXINIT: the server's own algorithm offer (RM-200) ---------------------------------------
 # paramiko's `get_security_options()` is the client's preference list, so it says nothing about the server.
 # The server's SSH_MSG_KEXINIT (RFC 4253 section 7.1) is sent before any authentication and needs no keys.
@@ -340,7 +366,7 @@ def _smtp_banner_verdict(mta, ehlo_features):
   """`(verified, why)` for an SMTP banner from the EHLO reply lines. Only judged when an EHLO 250 reply was read.
 
   Exim always ends its EHLO reply with HELP; mailoney's reply has none. Other MTAs have no check: not assessable,
-  even when EHLO was refused (a scanner identity that is not a domain gets 501 from OpenSMTPD).
+  even when EHLO was refused.
   """
   if mta != "exim":
     return BANNER_NOT_ASSESSABLE, ""
@@ -412,7 +438,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         if _m:
           _cve_product = _HTTP_PRODUCT_MAP.get(_m.group(1).lower())
           if _cve_product:
-            findings += check_cves(_cve_product, _m.group(2))
+            findings += check_cves(_cve_product, _m.group(2),
+                                   package=_server_package(result["server"], _m.group(2)),
+                                   upstream_build=bool(_APACHE_UPSTREAM_RE.match(result["server"])))
         # Apache `ServerTokens Full` and some nginx builds disclose the
         # bundled OpenSSL package version in the Server header (e.g.
         # `Apache/2.4.50 (Unix) OpenSSL/1.0.2k`). Extract it as a separate
@@ -698,7 +726,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         if _m:
           _cve_product = _HTTP_PRODUCT_MAP.get(_m.group(1).lower())
           if _cve_product:
-            findings += check_cves(_cve_product, _m.group(2))
+            findings += check_cves(_cve_product, _m.group(2),
+                                   package=_server_package(raw["server"], _m.group(2)),
+                                   upstream_build=bool(_APACHE_UPSTREAM_RE.match(raw["server"])))
         # Co-disclosed OpenSSL package version in the HTTPS Server header
         # (e.g. ``Apache/2.4.50 (Unix) OpenSSL/1.0.2k``) — common with
         # ``ServerTokens Full`` and some nginx builds.
@@ -840,8 +870,8 @@ class _ServiceCommonMixin(_ServiceProbeBase):
   @register_probe(
     display_name="FTP service detection",
     description=(
-      "FTP banner / features / anonymous-login / write-access probes. "
-      "Detects exposed FTP, anonymous read/write, missing FTPS."
+      "FTP banner / features / anonymous-login probes. "
+      "Detects exposed FTP, anonymous login, missing FTPS."
     ),
     category=CATEGORY_SERVICE_INFO,
     default_cwe=(287, 319),
@@ -851,17 +881,16 @@ class _ServiceCommonMixin(_ServiceProbeBase):
   def _service_info_ftp(self, target, port):  # default port: 21
     """
     Assess FTP service security: banner, anonymous access, default creds,
-    server fingerprint, TLS support, write access, and credential validation.
+    server fingerprint, TLS support, and credential validation.
 
     Checks performed (in order):
 
     1. Banner grab and SYST/FEAT fingerprint.
     2. Anonymous login attempt.
-    3. Write access test (STOR) after anonymous login.
-    4. Directory listing and traversal.
-    5. TLS support check (AUTH TLS).
-    6. Default credential check.
-    7. Arbitrary credential acceptance test.
+    3. Directory listing and traversal.
+    4. TLS support check (AUTH TLS).
+    5. Default credential check.
+    6. Arbitrary credential acceptance test.
 
     Parameters
     ----------
@@ -881,7 +910,6 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       "server_type": None,
       "features": [],
       "anonymous_access": False,
-      "write_access": False,
       "tls_supported": False,
       "accepted_credentials": [],
       "directory_listing": None,
@@ -926,8 +954,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         owasp_id="A07:2021",
         cwe_id="CWE-287",
         confidence="certain",
-        # The upload test below always runs (RM-128); when it succeeds its own
-        # finding says `performed`, and "any performed" wins in the report.
+        # Anonymous login only; write access is never tested (RM-256).
         authenticated_action=AUTHENTICATED_ACTION_ATTEMPTED,
       ))
     except Exception:
@@ -984,35 +1011,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       except Exception:
         pass
 
-    # --- 3. Write access test (only if anonymous login succeeded) ---
-    if ftp and result["anonymous_access"]:
-      import io
-      try:
-        ftp.set_pasv(True)
-        test_data = io.BytesIO(b"RedMesh write access probe")
-        resp = ftp.storbinary("STOR __redmesh_probe.txt", test_data)
-        if resp and resp.startswith("226"):
-          result["write_access"] = True
-          findings.append(Finding(
-            severity=Severity.CRITICAL,
-            cvss_vector=V.UNAUTHENTICATED_READ_WRITE,
-            title="FTP anonymous write access enabled (file upload possible).",
-            description="Anonymous users can upload files to the FTP server.",
-            evidence="STOR command succeeded with anonymous session.",
-            remediation="Remove write permissions for anonymous FTP users.",
-            owasp_id="A01:2021",
-            cwe_id="CWE-434",
-            confidence="certain",
-            authenticated_action=AUTHENTICATED_ACTION_PERFORMED,
-          ))
-          try:
-            ftp.delete("__redmesh_probe.txt")
-          except Exception:
-            pass
-      except Exception:
-        pass
-
-    # --- 4. Directory listing and traversal ---
+    # --- 3. Directory listing and traversal ---
     if ftp:
       try:
         pwd = ftp.pwd()
@@ -1056,7 +1055,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       except Exception:
         pass
 
-    # --- 5. TLS support check ---
+    # --- 4. TLS support check ---
     try:
       ftp_tls = _ftp_connect()
       resp = ftp_tls.sendcmd("AUTH TLS")
@@ -1079,7 +1078,10 @@ class _ServiceCommonMixin(_ServiceProbeBase):
           confidence="certain",
         ))
 
-    # --- 6. Default credential check ---
+    # --- 5. Default credential check ---
+    if not self._login_attempts_allowed():
+      result["auth_control"] = dict(AUTH_SKIPPED)
+      return probe_result(raw_data=result, findings=findings)
     accepted_creds = []
     proofs = {}
     for user, passwd in _FTP_DEFAULT_CREDS:
@@ -1098,8 +1100,8 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       except Exception:
         pass
 
-    # --- 7. Arbitrary credential acceptance test ---
-    # Doubles as the negative control for step 6 (RM-069); the default-credential
+    # --- 6. Arbitrary credential acceptance test ---
+    # Doubles as the negative control for step 5 (RM-069); the default-credential
     # findings are built after it so they can be gated on its outcome.
     control = CONTROL_NOT_RUN
     import string as _string
@@ -1224,66 +1226,70 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     # --- 3. Default credential check ---
     accepted_creds = []
     proofs = {}
+    login_attempts = self._login_attempts_allowed()
+    control = CONTROL_NOT_RUN
 
-    for username, password in _SSH_DEFAULT_CREDS:
+    if not login_attempts:
+      result["auth_control"] = dict(AUTH_SKIPPED)
+    else:
+      for username, password in _SSH_DEFAULT_CREDS:
+        try:
+          client = paramiko.SSHClient()
+          client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+          client.connect(
+            target, port=port,
+            username=username, password=password,
+            timeout=self._target_timeout(3), auth_timeout=self._target_timeout(3),
+            look_for_keys=False, allow_agent=False,
+          )
+          cred = f"{username}:{password}"
+          accepted_creds.append(cred)
+          proofs[cred] = _ssh_authenticated_action(client, self._target_timeout(3))
+          client.close()
+        except paramiko.AuthenticationException:
+          continue
+        except Exception:
+          break  # connection issue, stop trying
+
+      # --- 4. Arbitrary credential acceptance test ---
+      # Doubles as the negative control for step 3: a service that accepts a
+      # random pair has not demonstrated a default credential in use, whatever
+      # it said to the defaults (RM-069).
+      random_user = f"probe_{random.randint(10000, 99999)}"
+      random_pass = f"rnd_{random.randint(10000, 99999)}"
       try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(
           target, port=port,
-          username=username, password=password,
+          username=random_user, password=random_pass,
           timeout=self._target_timeout(3), auth_timeout=self._target_timeout(3),
           look_for_keys=False, allow_agent=False,
         )
-        cred = f"{username}:{password}"
-        accepted_creds.append(cred)
-        proofs[cred] = _ssh_authenticated_action(client, self._target_timeout(3))
+        # The generated pair goes to raw_data, not into the finding. `evidence` is
+        # a content-hash field (models/finding_identity._CONTENT_FIELDS), so a
+        # value that differs every run gave this finding a new finding_signature
+        # on every scan and on every worker: change detection reported a change
+        # each pass and the aggregate carried one copy per worker.
+        result["arbitrary_credentials_accepted"] = f"{random_user}:{random_pass}"
+        control = CONTROL_ACCEPTED
+        findings.append(Finding(
+          severity=Severity.CRITICAL,
+          cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
+          title="SSH accepts arbitrary credentials",
+          description="Random credentials were accepted, indicating a dangerous misconfiguration or deceptive service.",
+          evidence="Randomly generated credentials were accepted by the SSH service.",
+          remediation="Investigate immediately — authentication is non-functional.",
+          owasp_id="A07:2021",
+          cwe_id="CWE-287",
+          confidence="certain",
+        ))
         client.close()
       except paramiko.AuthenticationException:
-        continue
+        control = CONTROL_REJECTED
       except Exception:
-        break  # connection issue, stop trying
-
-    # --- 4. Arbitrary credential acceptance test ---
-    # Doubles as the negative control for step 3: a service that accepts a
-    # random pair has not demonstrated a default credential in use, whatever
-    # it said to the defaults (RM-069).
-    control = CONTROL_NOT_RUN
-    random_user = f"probe_{random.randint(10000, 99999)}"
-    random_pass = f"rnd_{random.randint(10000, 99999)}"
-    try:
-      client = paramiko.SSHClient()
-      client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-      client.connect(
-        target, port=port,
-        username=random_user, password=random_pass,
-        timeout=self._target_timeout(3), auth_timeout=self._target_timeout(3),
-        look_for_keys=False, allow_agent=False,
-      )
-      # The generated pair goes to raw_data, not into the finding. `evidence` is
-      # a content-hash field (models/finding_identity._CONTENT_FIELDS), so a
-      # value that differs every run gave this finding a new finding_signature
-      # on every scan and on every worker: change detection reported a change
-      # each pass and the aggregate carried one copy per worker.
-      result["arbitrary_credentials_accepted"] = f"{random_user}:{random_pass}"
-      control = CONTROL_ACCEPTED
-      findings.append(Finding(
-        severity=Severity.CRITICAL,
-        cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
-        title="SSH accepts arbitrary credentials",
-        description="Random credentials were accepted, indicating a dangerous misconfiguration or deceptive service.",
-        evidence="Randomly generated credentials were accepted by the SSH service.",
-        remediation="Investigate immediately — authentication is non-functional.",
-        owasp_id="A07:2021",
-        cwe_id="CWE-287",
-        confidence="certain",
-      ))
-      client.close()
-    except paramiko.AuthenticationException:
-      control = CONTROL_REJECTED
-    except Exception:
-      pass  # the control did not run; stays CONTROL_NOT_RUN
-    result["auth_control"] = {"random_credentials": control}
+        pass  # the control did not run; stays CONTROL_NOT_RUN
+      result["auth_control"] = {"random_credentials": control}
 
     if accepted_creds:
       result["accepted_credentials"] = accepted_creds
@@ -1309,6 +1315,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         # returning the bare upstream version the matcher compares; the
         # package is what decides whether a matched CVE was backported (RM-070).
         package = parse_distro_package(result["banner"])
+        if package is not None and not package.revision:
+          # `OpenSSH_8.9p1 (Ubuntu)` names no revision: behave as if no package was parsed.
+          package = None
         if package is not None:
           result["ssh_package"] = f"{package.upstream} {package.distro}-{package.revision}"
         # Does the KEXINIT fit the implementation the banner names? An emulator announces a real
@@ -1318,7 +1327,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         findings += check_cves(ssh_lib, ssh_version, package=package, banner_verified=verified)
 
         # --- 7. libssh auth bypass (CVE-2018-10933) ---
-        if ssh_lib == "libssh":
+        if ssh_lib == "libssh" and login_attempts:
           bypass = self._ssh_check_libssh_bypass(target, port)
           if bypass:
             findings.append(bypass)
@@ -1622,7 +1631,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       return probe_error(target, port, "SMTP", e)
 
     # --- 2. EHLO — server capabilities ---
-    identity = getattr(self, 'scanner_identity', 'probe.redmesh.local')
+    identity = _ehlo_domain(getattr(self, 'scanner_identity', _DEFAULT_EHLO_DOMAIN))
     ehlo_features = []
     try:
       code, msg = smtp.ehlo(identity)
@@ -2061,6 +2070,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       except Exception:
         return False, None, None
 
+    if not self._login_attempts_allowed():
+      result["auth_control"] = dict(AUTH_SKIPPED)
+      return probe_result(raw_data=result, findings=findings)
     system_info_captured = False
     accepted_creds = []
     proofs = {}
