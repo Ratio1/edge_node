@@ -119,7 +119,7 @@ def _ssh(port, banner, accept, outputs, *, cves=True):
 
 
 class _FixtureFtp:
-  """Accepts anonymous and `ftp:ftp`; uploads succeed; directory changes are
+  """Accepts anonymous and `ftp:ftp`; directory changes are
   refused, so no MagicMock repr reaches a finding's evidence."""
 
   def __init__(self, *a, **k): pass
@@ -132,8 +132,6 @@ class _FixtureFtp:
   def pwd(self): return "/home/ftp"
   def sendcmd(self, cmd): raise ftplib.error_perm("502 not implemented")
   def cwd(self, _path): raise ftplib.error_perm("550 Permission denied")
-  def storbinary(self, cmd, fp, *a, **k): return "226 Transfer complete"
-  def delete(self, name): return "250 ok"
   def __getattr__(self, name): return MagicMock(return_value="")
 
 

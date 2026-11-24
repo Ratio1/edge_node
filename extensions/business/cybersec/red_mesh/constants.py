@@ -75,7 +75,9 @@ FEATURE_CATALOG = [
       "_service_info_mongodb",
       "_service_info_modbus",
       "_service_info_couchdb",
-      "_service_info_influxdb"
+      "_service_info_influxdb",
+      "_service_info_ajp",
+      "_service_info_erlang_dist"
     ]
   },
   {
@@ -109,7 +111,7 @@ FEATURE_CATALOG = [
   {
     "id": "web_auth_design",
     "label": "Authentication & design flaws",
-    "description": "Detect account enumeration, missing rate limiting, and IDOR indicators (OWASP A04).",
+    "description": "Detect account enumeration, missing rate limiting, and IDOR indicators (OWASP A04). The account-enumeration and rate-limit tests send login attempts and run only when Credential testing is on.",
     "category": "web",
     "methods": ["_web_test_account_enumeration", "_web_test_rate_limiting", "_web_test_idor_indicators"]
   },
@@ -123,7 +125,7 @@ FEATURE_CATALOG = [
   {
     "id": "active_auth",
     "label": "Credential testing",
-    "description": "Test default/weak credentials on database and remote access services. May trigger account lockout.",
+    "description": "Send login attempts: default/weak credential guesses on SSH, FTP, Telnet, databases and HTTP Basic, the SNMP `public` community, random-credential controls, authentication-bypass payloads, and web login-form POSTs. Turn off to send no credential guess; the FTP anonymous login, SSH `auth_none` check and PostgreSQL startup message still run. May trigger account lockout.",
     "category": "service",
     "methods": ["_service_info_mysql_creds", "_service_info_postgresql_creds", "_service_info_http_basic_auth"]
   },
@@ -154,6 +156,16 @@ NETWORK_FEATURE_REGISTRY = {
   )
   for category in NETWORK_FEATURE_CATEGORIES
 }
+# Methods of the `active_auth` group. Its presence in a job's enabled methods is the
+# one switch for every credential guess (see PentestLocalWorker._login_attempts_allowed).
+ACTIVE_AUTH_METHODS = tuple(
+  method
+  for item in FEATURE_CATALOG
+  if item.get("id") == "active_auth"
+  for method in item.get("methods", [])
+)
+# Raw-result record left by a login-attempt path that the closed gate skipped.
+AUTH_SKIPPED = {"skipped": "active_auth disabled"}
 NETWORK_FEATURE_METHODS = tuple(
   method
   for category in NETWORK_FEATURE_CATEGORIES
@@ -278,6 +290,8 @@ PROBE_PROTOCOL_MAP = {
     "_service_info_rsync":   frozenset({"rsync"}),
     "_service_info_couchdb":    frozenset({"http", "https"}),
     "_service_info_influxdb":   frozenset({"http", "https"}),
+    "_service_info_ajp":        frozenset({"ajp13"}),
+    "_service_info_erlang_dist": frozenset({"epmd"}),
     "_service_info_generic": frozenset({"unknown"}),
     "_service_info_mysql_creds": frozenset({"mysql"}),
     "_service_info_postgresql_creds": frozenset({"postgresql"}),

@@ -12,6 +12,7 @@ import struct
 import unittest
 from unittest.mock import MagicMock, patch
 
+from extensions.business.cybersec.red_mesh.cve_db import _stamp_identity
 from extensions.business.cybersec.red_mesh.worker.service.tls import _ServiceTlsMixin
 
 
@@ -32,6 +33,34 @@ def _build_leak_response(extra_bytes: int = 0x4000) -> bytes:
     + b"\xff" * extra_bytes                    # leaked memory bytes
     + b"\x00" * 16                             # padding
   )
+
+
+def _heartbleed_positive_probe():
+  """A TLS probe whose sibling passes are no-ops and whose Heartbleed pass is positive."""
+  from extensions.business.cybersec.red_mesh.findings import Finding, Severity
+  probe = _ServiceTlsMixin.__new__(_ServiceTlsMixin)
+  # Stub every sibling pass to no-op except heartbleed → positive.
+  probe._tls_unverified_connect = lambda t, p: ("TLSv1.2", "ECDHE-RSA-AES256-GCM-SHA384", None)
+  probe._tls_check_protocol = lambda proto, cipher: []
+  probe._tls_parse_san_from_der = lambda d: ([], [])
+  probe._tls_check_signature_algorithm = lambda d: []
+  probe._tls_check_validity_period = lambda d: []
+  probe._tls_check_certificate = lambda t, p, raw: []
+  probe._tls_check_expiry = lambda raw: []
+  probe._tls_check_default_cn = lambda raw: []
+  probe._tls_check_downgrade = lambda t, p: []
+  probe._tls_check_heartbleed = lambda t, p, raw=None: Finding(
+    severity=Severity.CRITICAL,
+    title="TLS Heartbleed vulnerability (CVE-2014-0160)",
+    cve=("CVE-2014-0160",),
+    description="leak",
+    evidence="leak",
+    remediation="upgrade",
+    owasp_id="A06:2021",
+    cwe_id="CWE-126",
+    confidence="certain",
+  )
+  return probe
 
 
 class TestHeartbleedFindingHasCveField(unittest.TestCase):
@@ -175,34 +204,10 @@ class TestHeartbleedTriggersOpenSslCveInference(unittest.TestCase):
     )
 
   def test_service_info_tls_appends_inferred_cves_on_heartbleed(self):
-    from extensions.business.cybersec.red_mesh.worker.service.tls import _ServiceTlsMixin
-    from extensions.business.cybersec.red_mesh.findings import Finding, Severity
+    probe = _heartbleed_positive_probe()
 
-    probe = _ServiceTlsMixin.__new__(_ServiceTlsMixin)
-
-    # Stub every sibling pass to no-op except heartbleed → positive.
-    probe._tls_unverified_connect = lambda t, p: ("TLSv1.2", "ECDHE-RSA-AES256-GCM-SHA384", None)
-    probe._tls_check_protocol = lambda proto, cipher: []
-    probe._tls_parse_san_from_der = lambda d: ([], [])
-    probe._tls_check_signature_algorithm = lambda d: []
-    probe._tls_check_validity_period = lambda d: []
-    probe._tls_check_certificate = lambda t, p, raw: []
-    probe._tls_check_expiry = lambda raw: []
-    probe._tls_check_default_cn = lambda raw: []
-    probe._tls_check_downgrade = lambda t, p: []
-    probe._tls_check_heartbleed = lambda t, p, raw=None: Finding(
-      severity=Severity.CRITICAL,
-      title="TLS Heartbleed vulnerability (CVE-2014-0160)",
-      cve=("CVE-2014-0160",),
-      description="leak",
-      evidence="leak",
-      remediation="upgrade",
-      owasp_id="A06:2021",
-      cwe_id="CWE-126",
-      confidence="certain",
-    )
-
-    result = probe._service_info_tls("10.0.0.1", 8443)
+    with patch("extensions.business.cybersec.red_mesh.worker.service.tls._stamp_identity", wraps=_stamp_identity) as stamp:
+      result = probe._service_info_tls("10.0.0.1", 8443)
     findings = result["findings"]
     # probe_result normalizes Finding instances to JSON-safe dicts; cve is a list.
     cves = [c for f in findings for c in (f.get("cve") or []) if c]
@@ -221,6 +226,72 @@ class TestHeartbleedTriggersOpenSslCveInference(unittest.TestCase):
       f"Expected at least one additional OpenSSL CVE inferred from the "
       f"Heartbleed positive, but got only {cves}",
     )
+
+    # The rows show the proven span; identity stays on the matched version and signs the shown text.
+    row = next(f for f in findings if f.get("cve") and f["cve"][0] != "CVE-2014-0160")
+    self.assertIn("(openssl 1.0.1-1.0.1f)", row["title"])
+    self.assertIn("openssl 1.0.1-1.0.1f is", row["description"])
+    self.assertIn("Detected version: 1.0.1-1.0.1f,", row["evidence"])
+    stamp.assert_called()
+    self.assertEqual(stamp.call_args.args[1:3], ("openssl", "1.0.1f"))
+    self.assertIn("1.0.1-1.0.1f", stamp.call_args.args[0].title)
+
+
+  def test_inferred_end_of_life_row_keeps_its_eol_identity(self):
+    """A build with an `eol` table also yields the CVE-less end-of-life row (live job b3f87de0 failed on it)."""
+    from extensions.business.cybersec.red_mesh.cve_db import _unsupported_finding
+    eol = _unsupported_finding("openssl", "1.0.1f", "1.1.1", MagicMock(build_id="b1"))
+    with patch("extensions.business.cybersec.red_mesh.worker.service.tls.check_cves", return_value=[eol]), \
+         patch("extensions.business.cybersec.red_mesh.worker.service.tls._stamp_identity", wraps=_stamp_identity) as stamp:
+      result = _heartbleed_positive_probe()._service_info_tls("10.0.0.1", 8443)
+    row = next(f for f in result["findings"] if "Unsupported version" in f["title"])
+    self.assertEqual(row["title"], "Unsupported version: openssl 1.0.1-1.0.1f (oldest supported 1.1.1)")
+    self.assertEqual(stamp.call_args.args[1:], ("openssl", "1.0.1f", "eol"))
+
+TLS = "extensions.business.cybersec.red_mesh.worker.service.tls"
+CLOSE_NOTIFY = b"\x15\x03\x03\x00\x02\x01\x00"
+
+
+class TestHeartbleedReadLoop(unittest.TestCase):
+  """One bounded read serves both paths: skip the shutdown alert, keep the raw fallback reachable."""
+
+  def _probe(self):
+    return _ServiceTlsMixin.__new__(_ServiceTlsMixin)
+
+  def _check(self, unwrapped_chunks, raw_chunks=()):
+    probe = self._probe()
+    after, raw_sock = MagicMock(), MagicMock()
+    after.recv.side_effect = list(unwrapped_chunks) + [b""]
+    raw_sock.recv.side_effect = [b"\x16\x03\x01\x00\x04\x0e\x00\x00\x00"] + list(raw_chunks) + [b""]
+    tls_sock = MagicMock()
+    tls_sock.unwrap.return_value = after
+    ctx = MagicMock()
+    ctx.wrap_socket.return_value = tls_sock
+    with patch(TLS + ".ssl.SSLContext", return_value=ctx), patch(TLS + ".socket.socket", return_value=raw_sock):
+      return probe._tls_check_heartbleed("10.0.0.1", 8443), raw_sock
+
+  def test_close_notify_then_heartbeat_in_separate_reads_is_found(self):
+    leak = _build_leak_response()
+    result, raw_sock = self._check([CLOSE_NOTIFY, leak[:3], leak[3:]])
+    self.assertIsNotNone(result)
+    self.assertEqual(raw_sock.connect.call_count, 1)  # the main connect only
+
+  def test_alert_only_falls_back_to_raw_path(self):
+    result, raw_sock = self._check([CLOSE_NOTIFY], [_build_leak_response()])
+    self.assertIsNotNone(result)
+    self.assertEqual(raw_sock.connect.call_count, 2)  # main connect plus raw fallback
+
+  def test_short_read_and_silence_are_not_vulnerable_and_skip_raw(self):
+    result, raw_sock = self._check([b"\x18\x03"])
+    self.assertIsNone(result)
+    self.assertEqual(raw_sock.connect.call_count, 1)  # the main connect only
+
+  def test_read_stops_at_the_deadline(self):
+    sock = MagicMock()
+    sock.recv.return_value = CLOSE_NOTIFY
+    with patch.object(_ServiceTlsMixin, "_deadline_in", return_value=0):
+      self.assertEqual(self._probe()._tls_read_heartbeat(sock), (None, False))
+    sock.recv.assert_not_called()
 
 
 if __name__ == "__main__":

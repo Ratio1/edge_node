@@ -5,7 +5,7 @@ import unittest
 
 from extensions.business.cybersec.red_mesh import cve_db
 from extensions.business.cybersec.red_mesh.findings import _finding_to_jsonable
-from extensions.business.cybersec.red_mesh.cve_view import MAX_SUMMARY_ROWS, build_cve_view, filter_listed
+from extensions.business.cybersec.red_mesh.cve_view import MAX_SUMMARY_ROWS, build_cve_view, filter_listed, summarize_view, view_members
 from extensions.business.cybersec.red_mesh.llm_input_builder import _sanitize_finding, build_llm_input
 from extensions.business.cybersec.red_mesh.mixins.risk import _RiskScoringMixin
 from extensions.business.cybersec.red_mesh.vulndb.reader import load_vulndb
@@ -31,7 +31,7 @@ def fnd(n, *, confidence="firm", kev=False, score=9.8, vector=NET, version="3.1"
 
 def conserved(test, view):
   c = view["counts"]
-  test.assertEqual(c["listed"] + c["rolled_up"] + c["possible"] + c["closed"] + c["dropped"], c["raw"])
+  test.assertEqual(c["listed"] + c["rolled_up"] + c["possible"] + c["folded"] + c["closed"] + c["dropped"], c["raw"])
 
 
 class CveViewTests(unittest.TestCase):
@@ -60,7 +60,7 @@ class CveViewTests(unittest.TestCase):
     self.assertEqual(set(service["listed"]), {"id0001", "id0002", "id0005"})
     self.assertEqual(service["listed"][0], "id0001")  # KEV first
     self.assertEqual(sorted(service["rollup"]["member_finding_ids"]), ["id0003", "id0004", "id0006"])
-    self.assertEqual(view["counts"], {"raw": 6, "listed": 3, "rolled_up": 3, "possible": 0, "closed": 0, "dropped": 0})
+    self.assertEqual(view["counts"], {"raw": 6, "listed": 3, "rolled_up": 3, "possible": 0, "folded": 0, "closed": 0, "dropped": 0})
 
   def test_v2_entry_with_network_text_never_lists(self):
     entry = [{"version": "2.0", "vector": "AV:N/PR:N/AV:N/PR:N", "score": 10.0, "source": "nvd"}]
@@ -139,8 +139,88 @@ class CveViewTests(unittest.TestCase):
     self.assertEqual(len(service["possible_kev"]), 8)
     self.assertTrue(set(service["possible_kev"]) <= set(possible["member_finding_ids"]))
     self.assertTrue(all(t["cve_id"] in ("CVE-2030-%04d" % n for n in range(1, 9)) for t in possible["top"]))  # KEV first
-    self.assertEqual(view["counts"], {"raw": 187, "listed": 1, "rolled_up": 0, "possible": 186, "closed": 0, "dropped": 0})
+    self.assertEqual(view["counts"], {"raw": 187, "listed": 1, "rolled_up": 0, "possible": 186, "folded": 0, "closed": 0, "dropped": 0})
     self.assertIsNone(service["rollup"])
+
+  def test_banner_unverified_rows_fold_and_others_do_not(self):
+    findings = [fnd(1, kev=True), fnd(2, score=5.0),
+                fnd(3, confidence="tentative", reason="banner_unverified", port=25, product="postfix", score=9.9),
+                fnd(4, confidence="tentative", reason="banner_unverified", port=25, product="postfix"),
+                fnd(5, confidence="tentative", reason="banner_only", port=25, product="postfix"),
+                fnd(6, confidence="tentative", reason=None, port=25, product="postfix"),
+                fnd(7, confidence="firm", reason="banner_unverified", port=25, product="postfix")]
+    view = build_cve_view(findings)
+    conserved(self, view)
+    mail, web = view["services"]
+    self.assertIsNone(web["folded"])
+    self.assertEqual(mail["folded"], {"count": 2, "reasons": {"banner_unverified": 2},
+                                      "member_finding_ids": ["id0003", "id0004"]})
+    self.assertEqual(mail["possible"]["member_finding_ids"], ["id0005", "id0006"])  # None and banner_only stay possible
+    self.assertEqual(mail["listed"], ["id0007"])  # a firm row never folds
+    self.assertEqual(view["counts"], {"raw": 7, "listed": 2, "rolled_up": 1, "possible": 2, "folded": 2,
+                                      "closed": 0, "dropped": 0})
+    self.assertLessEqual({"id0003", "id0004"}, view_members(view)[1])
+    self.assertEqual([f["finding_id"] for f in filter_listed(findings)], ["id0001", "id0007"])
+
+  def test_eol_unassessed_folds_only_under_the_unsupported_finding_and_not_kev(self):
+    eol = {"finding_id": "eol1", "port": 2700, "vulndb_build_id": "b1", "tags": ["vulndb_eol", "mongodb"]}
+    rows = [fnd(1, confidence="tentative", reason="eol_unassessed", port=2700, product="mongodb"),
+            fnd(2, confidence="tentative", reason="eol_unassessed", port=2700, product="mongodb"),
+            fnd(3, confidence="tentative", reason="banner_unverified", port=2700, product="mongodb"),
+            fnd(4, confidence="tentative", reason="eol_unassessed", port=2700, product="mongodb", kev=True),
+            fnd(5, confidence="tentative", reason="eol_unassessed", port=9, product="other")]
+    view = build_cve_view(rows + [eol])
+    conserved(self, view)
+    other, mongo = sorted(view["services"], key=lambda s: s["port"])
+    self.assertEqual(mongo["unsupported"], "eol1")
+    self.assertEqual(mongo["folded"], {"count": 3, "reasons": {"banner_unverified": 1, "eol_unassessed": 2},
+                                       "member_finding_ids": ["id0001", "id0002", "id0003"]})
+    self.assertEqual(summarize_view(view)["folded"], [{"port": 2700, "product": "mongodb", "version": "1.5", "count": 3,
+                                                       "reasons": {"banner_unverified": 1, "eol_unassessed": 2}}])
+    self.assertEqual(mongo["possible"]["member_finding_ids"], ["id0004"])  # KEV stays possible
+    self.assertEqual(mongo["possible_kev"], ["id0004"])
+    self.assertIsNone(other["unsupported"])  # no pointer: stays possible
+    self.assertEqual((other["possible"]["reasons"], other["folded"]), ({"eol_unassessed": 1}, None))
+    self.assertEqual(view["counts"], {"raw": 5, "listed": 0, "rolled_up": 0, "possible": 2, "folded": 3,
+                                      "closed": 0, "dropped": 0})
+    closed = build_cve_view(rows + [eol], triage={"id0001": "false_positive"})
+    conserved(self, closed)
+    self.assertEqual((closed["counts"]["folded"], closed["counts"]["closed"]), (2, 1))
+    eol_closed = build_cve_view(rows + [eol], triage={"eol1": "false_positive"})  # a closed pointer folds nothing
+    conserved(self, eol_closed)
+    self.assertEqual(eol_closed["counts"]["folded"], 1)  # the banner_unverified row only
+
+  def test_a_service_with_only_folded_rows_and_closed_wins(self):
+    findings = [fnd(1, confidence="tentative", reason="banner_unverified"),
+                fnd(2, confidence="tentative", reason="banner_unverified")]
+    view = build_cve_view(findings, triage={"id0002": "false_positive"})
+    conserved(self, view)
+    service = view["services"][0]
+    self.assertEqual((service["folded"]["count"], service["possible"], service["rollup"], service["listed"]),
+                     (1, None, None, []))
+    self.assertEqual((view["counts"]["folded"], view["counts"]["closed"]), (1, 1))
+
+  def test_summary_counts_folded_per_port_and_is_capped(self):
+    findings = [fnd(1, confidence="tentative", reason="banner_unverified", port=22, product="openssh", ver="7.4"),
+                fnd(2, confidence="tentative", reason="banner_unverified", port=22, product="openssh", ver="7.4")]
+    summary = summarize_view(build_cve_view(findings))
+    self.assertEqual(summary["folded"], [{"port": 22, "product": "openssh", "version": "7.4", "count": 2,
+                                          "reasons": {"banner_unverified": 2}}])
+    self.assertEqual((summary["possible"], summary["omitted_folded"], summary["counts"]["folded"]), ([], 0, 2))
+    unequal = [fnd(1, confidence="tentative", reason="banner_unverified", port=22, product="openssh", ver="7.4"),
+               fnd(2, confidence="tentative", reason="banner_unverified", port=443, product="nginx", ver="1.0"),
+               fnd(3, confidence="tentative", reason="banner_unverified", port=443, product="nginx", ver="1.0")]
+    self.assertEqual([(g["port"], g["count"]) for g in summarize_view(build_cve_view(unequal))["folded"]],
+                     [(443, 2), (22, 1)])  # count first, then port order
+    many = [fnd(n, confidence="tentative", reason="banner_unverified", port=n) for n in range(1, 31)]
+    capped = summarize_view(build_cve_view(many))
+    self.assertEqual((len(capped["folded"]), capped["omitted_folded"]), (MAX_SUMMARY_ROWS, 30 - MAX_SUMMARY_ROWS))
+
+  def test_folded_rows_stay_out_of_the_llm_findings(self):
+    base = [fnd(1, kev=True), fnd(2, score=5.0)]
+    tentative = fnd(3, confidence="tentative", reason="banner_unverified")
+    out = build_llm_input(findings=base + [tentative], aggregated_report={})
+    self.assertEqual([f["cve"] for f in out.findings], [["CVE-2030-0001"]])
 
   def test_closed_and_dropped_are_counted_once(self):
     findings = [fnd(1, kev=True), fnd(2), fnd(3, confidence="tentative"), fnd(4), fnd(5), fnd(6)]
@@ -148,7 +228,7 @@ class CveViewTests(unittest.TestCase):
               "id0004": {"status": "accepted_risk", "review_at": 2000}, "id0005": {"status": "accepted_risk", "review_at": 500},
               "id0006": "open"}
     view, service = self.one(findings, triage=triage, now=1000, not_applicable=[{"cve_id": "a"}, {"cve_id": "b"}])
-    self.assertEqual(view["counts"], {"raw": 8, "listed": 3, "rolled_up": 0, "possible": 0, "closed": 3, "dropped": 2})
+    self.assertEqual(view["counts"], {"raw": 8, "listed": 3, "rolled_up": 0, "possible": 0, "folded": 0, "closed": 3, "dropped": 2})
     self.assertEqual(sorted(service["listed"]), ["id0002", "id0005", "id0006"])
     self.assertNotIn("id0001", service["listed"])
     self.assertIsNone(service["possible"])

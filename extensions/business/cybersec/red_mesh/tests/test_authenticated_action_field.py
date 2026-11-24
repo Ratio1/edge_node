@@ -4,7 +4,7 @@ The report read this from prose — the `; authenticated action:` evidence marke
 and title phrases (RM-117) — so rewording a probe flipped a client-facing
 §3.5.2 line with every test green. The probe now states it as a field, at a
 closed list of sites: `_default_credential_findings` (FTP, SSH, Telnet, both
-variants), the anonymous-FTP login and upload, and the MySQL / PostgreSQL
+variants), the anonymous-FTP login, and the MySQL / PostgreSQL
 default-credential findings.
 """
 
@@ -56,10 +56,9 @@ class TestAnonymousFtp(unittest.TestCase):
     with patch(base + "ftplib.FTP", dcc._FakeAnonymousFtp), patch(base + "check_cves", return_value=[]):
       return worker._service_info_ftp("example.com", 21)
 
-  def test_login_is_attempted_and_the_upload_performed(self):
+  def test_login_is_attempted(self):
     actions = _actions(self._run())
     self.assertEqual(actions["FTP allows anonymous login."], "attempted")
-    self.assertEqual(actions["FTP anonymous write access enabled (file upload possible)."], "performed")
 
 
 class TestDatabaseLogins(unittest.TestCase):

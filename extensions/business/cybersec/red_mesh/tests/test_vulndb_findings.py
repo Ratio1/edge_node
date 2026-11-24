@@ -44,7 +44,7 @@ ROWS = [
 ]
 
 
-def build(dirpath, build_id="vulndb-aaaaaaaaaaaa", origin=None):
+def build(dirpath, build_id="vulndb-aaaaaaaaaaaa", origin=None, kev=0, epss=0.5):
   db, pin = Path(dirpath) / ("%s.sqlite" % build_id), Path(dirpath) / ("%s.json" % build_id)
   make_db(db, rows=ROWS, build_id=build_id)
   conn = sqlite3.connect(db)
@@ -54,8 +54,8 @@ def build(dirpath, build_id="vulndb-aaaaaaaaaaaa", origin=None):
     "INSERT INTO eol VALUES ('redis', '6.0'); INSERT INTO eol VALUES ('oldprod', '2.0');")
   conn.executemany("INSERT INTO cvss VALUES (?,?,?,?,?)", [
     (CVE, "4.0", V40, 9.3, "cna"), (CVE, "3.1", V31, 8.1, "nvd"), (CVE, "3.1", V31, 8.1, "cna")])
-  conn.execute("UPDATE vuln SET kev = 0, display_cvss_version = '3.1', display_cvss_score = 8.1,"
-               " display_cvss_source = 'nvd', severity = 'HIGH' WHERE cve_id = ?", (CVE,))
+  conn.execute("UPDATE vuln SET kev = ?, epss = ?, display_cvss_version = '3.1', display_cvss_score = 8.1,"
+               " display_cvss_source = 'nvd', severity = 'HIGH' WHERE cve_id = ?", (kev, epss, CVE))
   conn.execute("UPDATE vuln SET display_cvss_version = '4.0', display_cvss_score = 9.3, display_cvss_source = 'cna'"
                " WHERE cve_id = 'CVE-2030-0002'")
   conn.execute("UPDATE vuln SET severity = 'UNKNOWN', display_cvss_version = NULL WHERE cve_id = 'CVE-2030-0006'")
@@ -76,8 +76,8 @@ class FindingFieldTests(unittest.TestCase):
     self.addCleanup(tmp.cleanup)
     self.dir = tmp.name
 
-  def use(self, build_id="vulndb-aaaaaaaaaaaa", origin=None):
-    reader, keys = load_vulndb("generated", *build(self.dir, build_id, origin))
+  def use(self, build_id="vulndb-aaaaaaaaaaaa", origin=None, **enrichment):
+    reader, keys = load_vulndb("generated", *build(self.dir, build_id, origin, **enrichment))
     self.assertIsNone(keys["vulndb_load_error"])
     cve_db.set_vulndb_reader(reader)
     return reader
@@ -267,6 +267,26 @@ class FindingFieldTests(unittest.TestCase):
     self.assertEqual(first.finding_id, second.finding_id)
     self.assertEqual(first.finding_signature, second.finding_signature)  # build id is not content
     self.assertNotEqual(static.finding_signature, first.finding_signature)  # score and vector are
+
+  def test_kev_flip_moves_the_signature_and_keeps_the_id(self):
+    # RM-258. Failing input: CVE-2024-6387 with kev 0 -> 1, nothing else changed.
+    self.use(kev=0)
+    before = self.by_id("openssh", "4.0")[CVE]
+    self.use(kev=1)
+    after = self.by_id("openssh", "4.0")[CVE]
+    self.assertEqual((before.kev, after.kev), (False, True))
+    self.assertEqual(before.finding_id, after.finding_id)
+    self.assertNotEqual(before.finding_signature, after.finding_signature)
+
+  def test_epss_moves_the_signature_only_across_a_band(self):
+    # RM-258. Failing input: epss 0.05 -> 0.6 must move it; 0.5 -> 0.7 (same band) must not.
+    def sig(epss):
+      self.use(epss=epss)
+      return self.by_id("openssh", "4.0")[CVE]
+    low, mid, high, higher = sig(0.05), sig(0.5), sig(0.6), sig(0.7)
+    self.assertNotEqual(low.finding_signature, high.finding_signature)
+    self.assertEqual(mid.finding_signature, higher.finding_signature)
+    self.assertEqual(low.finding_id, high.finding_id)
 
   def test_dedup_across_two_pins_follows_freshness(self):
     self.use("vulndb-aaaaaaaaaaaa")

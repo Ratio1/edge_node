@@ -20,6 +20,7 @@ from the @register_probe decorator metadata + dynamic CVE DB lookup.
 
 import inspect
 import json
+import math
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, asdict, replace
@@ -261,6 +262,15 @@ class Finding:
       "remediation": self.remediation or "",
       "cvss_score": self.cvss_score,
       "cvss_vector": self.cvss_vector or "",
+      # Enrichment is content (`_CONTENT_FIELDS`). `kev` stays raw: None (not
+      # evaluated) and False (evaluated, not listed) are different states.
+      # `references` is a list; `content_hash` sorts it. Not
+      # `cvss_data_freshness`: a fetch timestamp would fork worker signatures.
+      "kev": self.kev,
+      "epss_score": epss_band(self.epss_score),
+      "cvss_score_env": self.cvss_score_env,
+      "cvss_vector_env": self.cvss_vector_env or "",
+      "references": list(self.references),
       "owasp_id": self.owasp_id,
       "cwe_id": self.cwe_id,
       "affected_assets": [_asset_as_dict(asset) for asset in self.affected_assets],
@@ -310,6 +320,23 @@ class Finding:
     data["finding_signature"] = finding_signature
     data["finding_id"] = finding_id
     return Finding(**_revive_finding_dict(data))
+
+
+def epss_band(score):
+  """EPSS as a coarse band for the signature, so daily score updates do not churn it.
+
+  Lower bound inclusive. None (unknown) stays None, distinct from "<0.01"; so does a value that is not a
+  finite number (NaN, a string, a bool), which no producer writes today.
+  """
+  if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
+    return None
+  if score < 0.01:
+    return "<0.01"
+  if score < 0.1:
+    return "0.01-0.1"
+  if score < 0.5:
+    return "0.1-0.5"
+  return ">=0.5"
 
 
 def _asset_as_dict(asset) -> dict:

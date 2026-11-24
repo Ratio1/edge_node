@@ -163,6 +163,7 @@ from .state_machine import (
 from .triage import (
   get_job_archive_with_triage,
   get_job_triage,
+  get_triage_rates,
   update_finding_triage,
 )
 from .authorization_upload import (
@@ -308,6 +309,7 @@ __all__ = [
   "test_event_export",
   "get_job_archive_with_triage",
   "get_job_triage",
+  "get_triage_rates",
   "update_finding_triage",
   "update_rulebook_review",
   "validation_error",
