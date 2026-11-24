@@ -33,6 +33,8 @@ CARRIED = "carried_documents"
 CARRIED_KINDS = ("third_party_consent", "other")
 # The title activation gives the generated pack; an old engagement's generated pack is not carried.
 GENERATED_PACK_TITLE = "Generated engagement pack (unsigned)"
+# The signed pack's comment names the generated pack it was signed from (activation writes it).
+BASELINE_PREFIX = "baseline sha256 "
 _DOCUMENT_ID = re.compile(r"ed_[1-9][0-9]*")
 
 
@@ -124,9 +126,14 @@ def carried(row):
 def replacing(row, engagement):
   """RM-248: a new draft `row` made a replacement of the stored `engagement`: its asset copies (the
   library is not read) and its third-party consent and other documents, without its packs."""
+  documents = engagement["documents"]
+  # The old generated pack is known by provenance, never by its title alone: the `other` document
+  # whose hash the signed pack's comment names. An operator's file with the same title is carried.
+  baselines = {document["comment"][len(BASELINE_PREFIX):] for document in documents
+               if document["kind"] == "agreement" and document["comment"].startswith(BASELINE_PREFIX)}
   return {**row, SUPERSEDES: engagement["engagement_id"], "assets": [dict(entry) for entry in engagement["assets"]],
-          CARRIED: [dict(document) for document in engagement["documents"] if document["kind"] in CARRIED_KINDS
-                    and document["title"] != GENERATED_PACK_TITLE]}
+          CARRIED: [dict(document) for document in documents if document["kind"] in CARRIED_KINDS
+                    and not (document["title"] == GENERATED_PACK_TITLE and document["sha256"] in baselines)]}
 
 
 def carried_refs(row):

@@ -910,6 +910,20 @@ class TestEngagementReplacement(_EngagementDraftCase):
     self.assertEqual([(doc["kind"], doc["title"]) for doc in draft["carried_documents"]],
                      [("third_party_consent", "Hosting consent"), ("other", "Scope notes")])
 
+  def test_an_operator_file_titled_like_the_generated_pack_is_carried(self):
+    ref = ok(self, self.plugin.upload_engagement_document(
+      self.actor, self.tenant_id, "doc.pdf", base64.b64encode(NOTES_PDF).decode("ascii"), "other",
+      "Generated engagement pack (unsigned)", ""))["ref"]
+    signed = ok(self, self.plugin.upload_engagement_document(
+      self.actor, self.tenant_id, "doc.pdf", base64.b64encode(PACK_PDF).decode("ascii"), "agreement", "Signed", ""))["ref"]
+    old_id = ok(self, self.plugin.create_engagement(
+      self.actor, self.tenant_id, str(uuid4()), "Look-alike", COMPLETE["valid_from"], COMPLETE["valid_until"],
+      COMPLETE["context"], [pick(self.asset_in(self.tenant_id))], [signed, ref]))["engagementId"]
+    draft = ok(self, self.plugin.create_engagement_draft(self.actor, self.tenant_id, str(uuid4()), "Again",
+                                                         supersedes=old_id))
+    self.assertEqual([(doc["kind"], doc["title"]) for doc in draft["carried_documents"]],
+                     [("other", "Generated engagement pack (unsigned)")])
+
   def test_carried_documents_can_be_removed_before_signing_and_their_files_stay(self):
     engagement_draft_id = self.replacement(sign=False)
     draft = ok(self, self.update_child(engagement_draft_id, {"carried_documents": ["ed_3"]}))
@@ -1049,6 +1063,18 @@ class TestEngagementReplacement(_EngagementDraftCase):
     self.assertEqual(len(self.store.writes), writes)
     refused(self, self.plugin.create_engagement_draft(self.actor, self.tenant_id, str(uuid4()), "Again",
                                                       supersedes=self.old_id), 409, "engagement_superseded")
+
+  def test_a_replacement_made_before_rm248_shows_on_the_read_of_the_old_engagement(self):
+    # A legacy replacement row wrote only `supersedes`; the old row has no `superseded_by`.
+    from extensions.business.cybersec.red_mesh.tenancy.engagements import engagement_hash
+    request_id = str(uuid4())
+    legacy = "en_" + request_id
+    row = {**{key: value for key, value in self.old.items() if key not in ("schemaVersion", "namespace", "kind", "ids")},
+           "engagement_id": legacy, "request_id": request_id, "supersedes": self.old_id}
+    self.repo.put("engagement", self.tenant_id, legacy, record={**row, "engagement_hash": engagement_hash(row)})
+    self.assertEqual(self.read(self.old_id)["supersededBy"], legacy)
+    listed = ok(self, self.plugin.list_engagements(self.actor, self.tenant_id))["engagements"]
+    self.assertEqual({item["engagementId"]: item["supersededBy"] for item in listed}, {self.old_id: legacy, legacy: None})
 
   def test_supersedes_names_an_engagement_of_the_parent_tenant(self):
     draft_parent = self.create()["draft_id"]

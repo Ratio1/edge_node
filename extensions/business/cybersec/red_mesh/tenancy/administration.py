@@ -1338,10 +1338,12 @@ class TenantAdministrationService:
     tenant, account = self._authorized_tenant(actor, tenant_id)
     if active is not None and type(active) is not bool:
       raise AdministrationDenied(400, "invalid_request")
-    rows = [row for row in self.store.list_engagements(tenant_id) if active is None or row["active"] is active]
+    stored = self.store.list_engagements(tenant_id)
+    replacements = self._replacements(stored)
+    rows = [row for row in stored if active is None or row["active"] is active]
     rows.sort(key=lambda row: row["engagement_id"])
     rows.sort(key=lambda row: row["created_at"], reverse=True)
-    return {"tenantId": tenant_id, "engagements": [self._engagement_row(row, tenant) for row in rows],
+    return {"tenantId": tenant_id, "engagements": [self._replaced_row(row, tenant, replacements) for row in rows],
             "canCreateEngagements": self._permission(account, tenant, "engagements:create"),
             "canRevokeEngagements": self._permission(account, tenant, "engagements:revoke")}
 
@@ -1351,7 +1353,7 @@ class TenantAdministrationService:
     row = self.store.get("engagement", tenant_id, self._engagement_id(engagement_id))
     if row is None:
       raise AdministrationDenied(404, "not_found")
-    return {"engagement": self._engagement_row(row, tenant),
+    return {"engagement": self._replaced_row(row, tenant, self._replacements(self.store.list_engagements(tenant_id))),
             "canRevokeEngagements": self._permission(account, tenant, "engagements:revoke"),
             "canDownloadDocuments": self._permission(account, tenant, "engagements:documents")}
 
@@ -2932,6 +2934,18 @@ class TenantAdministrationService:
     """The stored ref inside a `generated` block (what `resolve_engagement_pack` answers for it)."""
     return None if generated is None else {key: generated[key] for key in drafts.DOC_REF_KEYS}
 
+  @staticmethod
+  def _replacements(rows):
+    """RM-248: engagement id -> the row that `supersedes` it. A replacement made before RM-248 wrote only
+    that link, never `superseded_by` on the old row."""
+    return {row["supersedes"]: row["engagement_id"] for row in rows if row.get("supersedes")}
+
+  def _replaced_row(self, row, tenant, replacements):
+    """The engagement read with `supersededBy` from either link, so the console never offers to replace
+    an engagement that `_replaceable` refuses."""
+    read = self._engagement_row(row, tenant)
+    return {**read, "supersededBy": read["supersededBy"] or replacements.get(row["engagement_id"])}
+
   def _replaceable(self, tenant_id, engagement_id):
     """RM-248: the stored engagement a replacement names. One already replaced is refused, also when
     only the replacement row was written (a crash before the link): any row that `supersedes` it counts."""
@@ -3018,7 +3032,7 @@ class TenantAdministrationService:
     contract_sha256 = self._tenant_contract_sha256(tenant, engagement_drafts.contract_pick(row))
     generated = slot["generated"]
     packs = [{**stored["signed"], "kind": "agreement", "title": "Engagement pack",
-              "comment": "" if generated is None else "baseline sha256 " + generated["sha256"]}]
+              "comment": "" if generated is None else engagement_drafts.BASELINE_PREFIX + generated["sha256"]}]
     if generated is not None:
       packs.append({**stored["generated"], "kind": "other", "title": engagement_drafts.GENERATED_PACK_TITLE,
                     "comment": "snapshot sha256 " + generated["snapshot_sha256"]})
