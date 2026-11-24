@@ -125,7 +125,7 @@ FEATURE_CATALOG = [
   {
     "id": "active_auth",
     "label": "Credential testing",
-    "description": "Send login attempts: default/weak credential guesses on SSH, FTP, Telnet, databases and HTTP Basic, the SNMP `public` community, random-credential controls, authentication-bypass payloads, and web login-form POSTs. Turn off to send no login attempt. May trigger account lockout.",
+    "description": "Send login attempts: default/weak credential guesses on SSH, FTP, Telnet, databases and HTTP Basic, the SNMP `public` community, random-credential controls, authentication-bypass payloads, and web login-form POSTs. Turn off to send no credential guess; the FTP anonymous login, SSH `auth_none` check and PostgreSQL startup message still run. May trigger account lockout.",
     "category": "service",
     "methods": ["_service_info_mysql_creds", "_service_info_postgresql_creds", "_service_info_http_basic_auth"]
   },
