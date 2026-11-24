@@ -440,7 +440,7 @@ class TestPathTraversal(unittest.TestCase):
       call_count[0] += 1
       params = kwargs.get("params", {})
       for v in params.values():
-        if "etc/passwd" in str(v):
+        if "etc/passwd" in str(v) and url.endswith("/download/"):
           return passwd_resp
       return normal_resp
 
@@ -496,10 +496,13 @@ class TestReflectedXssPTA0304(unittest.TestCase):
     self.assertEqual(len(f), 1)
     self.assertEqual(f[0].status, "not_vulnerable")
 
-  def test_pt_a03_04_silent_when_no_endpoints(self):
+  def test_pt_a03_04_inconclusive_when_no_endpoints(self):
     probe = _make_probe(xss_endpoints=[])
     probe._test_reflected_xss()
-    self.assertFalse(any(f.scenario_id == "PT-A03-04" for f in probe.findings))
+    f = [x for x in probe.findings if x.scenario_id == "PT-A03-04"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "inconclusive")
+    self.assertIn("reason=no_configured_xss_endpoints", f[0].evidence)
 
 
 class TestTemplateInjectionPTA0306(unittest.TestCase):
@@ -766,7 +769,8 @@ class TestReachabilityRuleInjection(unittest.TestCase):
       side_effect=lambda url, data=None, **k: _ok(next(iter(data.values()))))
     probe._test_authenticated_injection()
     found, _ = _reason(probe, "PT-A03-01")
-    self.assertEqual({f.status for f in found}, {"vulnerable"})
+    # XSS echo is vulnerable; SQLi echo alone is only inconclusive (RM-060 P3.1).
+    self.assertEqual({f.status for f in found}, {"vulnerable", "inconclusive"})
     probe = self._probe("absent")
     probe._allow_stateful = True
     probe.auth.primary_session.get = MagicMock(return_value=_denial("405"))
@@ -851,8 +855,9 @@ class TestOpenRedirectReachability(unittest.TestCase):
     probe.auth.primary_session.get = MagicMock(side_effect=get)
     probe._test_open_redirect()
     found = [f for f in probe.findings if f.scenario_id == "PT-A01-04"]
-    self.assertEqual([f.status for f in found], ["vulnerable"])
-    self.assertTrue(any(e.startswith("endpoint=/auth/login/") for e in found[0].evidence))
+    self.assertEqual({f.status for f in found}, {"vulnerable"})
+    self.assertTrue(any(e.startswith("endpoint=/auth/login/")
+                        for f in found for e in f.evidence))
 
   def test_substring_host_match_is_not_enough(self):
     """Location=/x?u=evil.example.com has the string but not the host."""
@@ -978,3 +983,108 @@ class TestSharedReachabilityCheck(unittest.TestCase):
       '<form action="/auth/login/"><input name="username">'
       '<input type="password" name="password"></form>')
     self.assertFalse(probe.response_reached(login))
+
+
+class TestSilentDefectClosure(unittest.TestCase):
+  """RM-060 Phase A: inconclusive coverage, per-endpoint findings, SQLi reflection."""
+
+  def test_every_family_without_endpoints_is_inconclusive_not_silent(self):
+    cases = [
+      ("_test_ssrf", "PT-API7-01", "ssrf"),
+      ("_test_reflected_xss", "PT-A03-04", "xss"),
+      ("_test_template_injection", "PT-A03-06", "ssti"),
+      ("_test_command_injection", "PT-A03-07", "cmd"),
+      ("_test_header_injection", "PT-A03-12", "header"),
+      ("_test_json_type_confusion", "PT-A03-15", "json_type"),
+    ]
+    for runner, sid, kind in cases:
+      probe = _make_probe()
+      getattr(probe, runner)()
+      f = [x for x in probe.findings if x.scenario_id == sid]
+      self.assertEqual(len(f), 1, sid)
+      self.assertEqual(f[0].status, "inconclusive", sid)
+      self.assertEqual(f[0].evidence, [f"reason=no_configured_{kind}_endpoints"], sid)
+
+  def test_every_vulnerable_endpoint_gets_its_own_finding(self):
+    eps = [ReflectiveEndpoint(path="/e1/", param="m"),
+           ReflectiveEndpoint(path="/e2/", param="m")]
+    probe = _make_probe(xss_endpoints=eps)
+    probe.auth.primary_session.get = MagicMock(return_value=_mock_response(
+      status=200, text="<script>alert(1)</script>",
+    ))
+    probe._test_reflected_xss()
+    f = [x for x in probe.findings if x.status == "vulnerable"]
+    self.assertEqual(len(f), 2)
+    self.assertEqual([x.evidence[0].split(";")[0] for x in f],
+                     ["endpoint=/e1/", "endpoint=/e2/"])
+
+  def test_login_sqli_reflection_is_inconclusive_not_high(self):
+    probe = _make_probe()
+    anon = MagicMock()
+    anon.get.return_value = _mock_response(text="<form></form>")
+    anon.post.side_effect = lambda url, data=None, **kw: _mock_response(
+      text=data[probe.target_config.username_field])
+    probe.auth.make_anonymous_session.return_value = anon
+    probe._test_login_injection()
+    sqli = [f for f in probe.findings if "SQL" in f.title]
+    self.assertEqual(len(sqli), 1)
+    self.assertEqual(sqli[0].status, "inconclusive")
+    self.assertNotEqual(sqli[0].severity, "HIGH")
+    self.assertEqual(sqli[0].to_flat_finding(1, "http", "p")["confidence"], "tentative")
+    self.assertFalse(any(f.status == "vulnerable" and f.severity == "HIGH" for f in probe.findings))
+
+  def test_authenticated_form_sqli_reflection_is_inconclusive_not_high(self):
+    probe = _make_probe(discovered_forms=["/search/"])
+    session = probe.auth.primary_session
+    session.get.return_value = _mock_response(
+      text='<form><input name="q" type="text"></form>')
+    session.post.side_effect = lambda url, data=None, **kw: _mock_response(text=data["q"])
+    probe._test_authenticated_injection()
+    sqli = [f for f in probe.findings if "SQL" in f.title]
+    self.assertEqual(len(sqli), 1)
+    self.assertEqual(sqli[0].status, "inconclusive")
+    self.assertEqual(sqli[0].scenario_id, "PT-A03-01")
+    self.assertFalse(any(f.severity == "HIGH" for f in probe.findings))
+
+
+class TestPerEndpointFindingsRound1(unittest.TestCase):
+  """RM-060 fix round 1: path traversal, open redirect, parameter identity."""
+
+  def test_path_traversal_one_finding_per_route(self):
+    probe = _make_probe()
+    probe.discovered_routes = ["/a/", "/b/"]
+    passwd = _mock_response(status=200, text="root:x:0:0:root:/root:/bin/bash\n")
+    plain = _mock_response(status=200, text="plain")
+    probe.auth.primary_session.get = MagicMock(
+      side_effect=lambda url, **kw: passwd if any(
+        "etc/passwd" in str(v) for v in kw.get("params", {}).values()
+      ) and not url.endswith(":8000/") else plain)
+    probe._test_path_traversal()
+    vuln = [f for f in probe.findings if f.scenario_id == "PT-A03-03" and f.status == "vulnerable"]
+    self.assertEqual(sorted(f.evidence[0].split(";")[0] for f in vuln),
+                     ["endpoint=/a/", "endpoint=/b/"])
+    self.assertTrue(all(f.evidence[0] in " ".join(f.evidence) for f in vuln))
+    self.assertIn("/a/", [f for f in vuln if "/a/" in f.evidence[0]][0].replay_steps[1])
+
+  def test_open_redirect_one_finding_per_path(self):
+    probe = _make_probe()
+    probe.discovered_routes = ["/r1/", "/r2/"]
+    redirect = _mock_response(status=302, text="")
+    redirect.headers["Location"] = "//evil.example.com"
+    probe.auth.primary_session.get = MagicMock(return_value=redirect)
+    probe._test_open_redirect()
+    vuln = [f for f in probe.findings if f.scenario_id == "PT-A01-04" and f.status == "vulnerable"]
+    self.assertGreaterEqual(len(vuln), 2)
+    self.assertEqual(len({f.evidence[0].split(";")[0] for f in vuln}), len(vuln))
+
+  def test_same_path_different_params_get_distinct_identities(self):
+    eps = [ReflectiveEndpoint(path="/echo/", param="a"),
+           ReflectiveEndpoint(path="/echo/", param="b")]
+    probe = _make_probe(xss_endpoints=eps)
+    probe.auth.primary_session.get = MagicMock(return_value=_mock_response(
+      status=200, text="<script>alert(1)</script>"))
+    probe._test_reflected_xss()
+    vuln = [f for f in probe.findings if f.status == "vulnerable"]
+    self.assertEqual([f.parameter for f in vuln], ["a", "b"])
+    flat = [f.to_flat_finding(8000, "http", "p") for f in vuln]
+    self.assertEqual(len({x["finding_id"] for x in flat}), 2)

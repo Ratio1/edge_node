@@ -26,7 +26,7 @@ class BusinessLogicProbes(ProbeBase):
         title="Business logic probes skipped",
         status="inconclusive",
         severity="INFO",
-        owasp="A06:2021",
+        owasp="A04:2021",
         evidence=["stateful_probes_disabled=True"],
       ))
     return self.findings
@@ -201,7 +201,7 @@ class BusinessLogicProbes(ProbeBase):
             title="Workflow bypass — missing authorization guard",
             status="vulnerable",
             severity="MEDIUM",
-            owasp="A06:2021",
+            owasp="A04:2021",
             cwe=["CWE-841"],
             attack=["T1078"],
             # No typed `method=` here, deliberately. Two configured endpoints on
@@ -237,7 +237,7 @@ class BusinessLogicProbes(ProbeBase):
         title="Workflow bypass — guards held",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A06:2021",
+        owasp="A04:2021",
         evidence=[f"endpoints_tested={endpoints_tested}"],
       ))
 
@@ -422,7 +422,7 @@ class BusinessLogicProbes(ProbeBase):
         title="Business logic validation bypass",
         status="vulnerable",
         severity="MEDIUM",
-        owasp="A06:2021",
+        owasp="A04:2021",
         cwe=["CWE-20", "CWE-840"],
         attack=["T1190"],
         evidence=bypass_evidence,
@@ -441,14 +441,14 @@ class BusinessLogicProbes(ProbeBase):
         title="Business logic validation — no bypass detected",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A06:2021",
+        owasp="A04:2021",
         evidence=[f"endpoints_tested={tested}"],
       ))
     elif denied:
       self.emit_endpoint_denied("PT-A06-02")
     else:
       self.emit_inconclusive(
-        "PT-A06-02", "Business logic validation bypass", "A06:2021",
+        "PT-A06-02", "Business logic validation bypass", "A04:2021",
         "no_evaluable_responses",
       )
 

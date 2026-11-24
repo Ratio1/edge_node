@@ -223,11 +223,15 @@ _SCRUB_PATTERNS = (
   # Bearer schema in body / URL: keep prefix only.
   (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{8,}"), "Bearer <redacted>"),
   # Common name=value forms (cookie / form / URL query).
-  (re.compile(r"(?i)\b(password|secret|token|api_key|apikey)=" + _ALREADY_REDACTED
+  # `_`-prefixed and compound names count (`_token`, `access_token`,
+  # `client_secret`, `x-api-key`); a joined name (`csrftoken`) and a longer word
+  # (`tokens_count`) do not.
+  (re.compile(r"(?i)(?<![\w-])((?:[\w-]{0,64}?[_-])?"
+              r"(?:password|secret|token|api[_-]?key))=" + _ALREADY_REDACTED
               + r"([^&\s\";,]+)"),
    r"\1=<redacted>"),
   # JSON-style key:value.
-  (re.compile(r'(?i)"(password|secret|token|api_key|bearer_token|api[\w_-]*key)"\s*:\s*"[^"]+"'),
+  (re.compile(r'(?i)"((?:[\w-]{0,64}?[_-])?(?:password|secret|token|api_key|bearer_token|api[\w_-]*key))"\s*:\s*"[^"]+"'),
    r'"\1": "<redacted>"'),
 )
 

@@ -78,8 +78,8 @@ class AccessControlProbes(ProbeBase):
     """
     Test IDOR on configured or auto-detected endpoints.
 
-    Emits exactly ONE finding per scenario. Accumulates results across
-    all endpoints, then emits vulnerable (worst-case wins) or not_vulnerable.
+    Read-only, so every endpoint is tested: one vulnerable finding per
+    endpoint, or one not_vulnerable row when none is vulnerable.
     """
     endpoints = self.target_config.access_control.idor_endpoints
     if not endpoints:
@@ -90,7 +90,7 @@ class AccessControlProbes(ProbeBase):
     if not self.regular_username:
       return
 
-    vulnerable_evidence = None
+    vulnerable_hits = []
     endpoints_tested = 0
 
     for ep in endpoints:
@@ -101,11 +101,9 @@ class AccessControlProbes(ProbeBase):
       if outcome.get("evaluated"):
         endpoints_tested += 1
       if result:
-        vulnerable_evidence = result
-        break
+        vulnerable_hits.append(result)
 
-    if vulnerable_evidence:
-      owner, url, path = vulnerable_evidence
+    for owner, url, path in vulnerable_hits:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-01",
         title="Object-level authorization bypass",
@@ -127,7 +125,7 @@ class AccessControlProbes(ProbeBase):
         ],
         remediation="Authorize object access using both role and ownership checks server-side.",
       ))
-    elif endpoints_tested:
+    if not vulnerable_hits and endpoints_tested:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-01",
         title="Object-level authorization — no bypass detected",
@@ -558,6 +556,7 @@ class AccessControlProbes(ProbeBase):
     candidate_owner_ids = [1, 2, 3, 1000]
 
     transferred_evidence = []
+    restore_failed = False
     tested = 0
 
     import json as _json
@@ -610,29 +609,28 @@ class AccessControlProbes(ProbeBase):
           except Exception:
             continue
           if after_owner != before_owner:
-            transferred_evidence.append(
+            # Restore — PATCH owner back to original by name, then re-read.
+            restored = self._restore_verified(
+              url, {field: before_owner for field in transfer_targets},
+              headers, ep.owner_field, before_owner,
+            )
+            transferred_evidence.append((
               f"endpoint={path}; field={ep.owner_field}; "
               f"injected_id={owner_id}; "
-              f"before={before_owner!r}; after={after_owner!r}"
-            )
-            # Best-effort restore — PATCH owner back to original by name.
-            try:
-              restore_body = {field: before_owner for field in transfer_targets}
-              self.auth.regular_session.patch(
-                url, data=_json.dumps(restore_body), headers=headers, timeout=10,
-              )
-            except Exception:
-              pass
+              f"before={before_owner!r}; after={after_owner!r}",
+              "reverted" if restored else "revert_failed",
+            ))
+            restore_failed = not restored
             success = True
             break
 
         if success:
-          break
+          break  # one finding per endpoint
 
-      if transferred_evidence:
-        break
+      if restore_failed:
+        break  # no further writes once a transfer could not be undone
 
-    if transferred_evidence:
+    for item, rollback in transferred_evidence:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A04-02",
         title="Mass assignment — ownership field transferable",
@@ -641,7 +639,8 @@ class AccessControlProbes(ProbeBase):
         owasp="A04:2021",
         cwe=["CWE-915", "CWE-639"],
         attack=["T1078"],
-        evidence=transferred_evidence,
+        evidence=[item],
+        rollback_status=rollback,
         replay_steps=[
           "Log in as regular user.",
           "PATCH a record with body {\"owner_user_id\": <other-id>}.",
@@ -653,7 +652,7 @@ class AccessControlProbes(ProbeBase):
                     "every write boundary. Use explicit field allowlists "
                     "in serializers / form binding.",
       ))
-    elif tested > 0:
+    if not transferred_evidence and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A04-02",
         title="Mass-assignment ownership — guard held",
@@ -664,6 +663,25 @@ class AccessControlProbes(ProbeBase):
       ))
 
   # ── Batch 3 — A01 access-control variants ──────────────────────────────
+
+  def _restore_verified(self, url, body, headers, field, expected):
+    """PATCH ``body`` back, then re-GET and confirm ``field`` equals ``expected``.
+
+    A 2xx on the restore PATCH is not proof: the server may ignore it. Only a
+    re-read that shows the original value counts as restored.
+    """
+    import json as _json
+    try:
+      resp = self.auth.regular_session.patch(
+        url, data=_json.dumps(body), headers=headers, timeout=10,
+      )
+      if resp.status_code >= 400:
+        return False
+      self.safety.throttle()
+      check = self.auth.regular_session.get(url, timeout=10)
+      return check.json().get(field) == expected
+    except Exception:
+      return False
 
   def _test_ownership_update(self):
     """PT-A01-05: regular user updates a record they don't own.
@@ -680,6 +698,7 @@ class AccessControlProbes(ProbeBase):
     import json as _json
     sentinel_title = "redmesh-pt-a01-05-probe-marker"
     transferred_evidence = []
+    restore_failed = False
     tested = 0
 
     for ep in endpoints:
@@ -696,6 +715,7 @@ class AccessControlProbes(ProbeBase):
         try:
           before_owner = before.json().get(ep.owner_field)
           before_title = before.json().get("title")
+          had_title = "title" in before.json()
         except Exception:
           continue
         # Only attempt cross-tenant write — skip records this user owns.
@@ -728,23 +748,21 @@ class AccessControlProbes(ProbeBase):
           continue
 
         if after_title == sentinel_title:
-          transferred_evidence.append(
-            f"endpoint={path}; before_owner={before_owner!r}; "
-            f"sentinel_title_persisted=True"
+          # Restore only a field the record had; never send title=null.
+          restored = had_title and self._restore_verified(
+            url, {"title": before_title}, headers, "title", before_title,
           )
-          # Best-effort restore.
-          try:
-            self.auth.regular_session.patch(
-              url, data=_json.dumps({"title": before_title}),
-              headers=headers, timeout=10,
-            )
-          except Exception:
-            pass
-          break
-      if transferred_evidence:
-        break
+          transferred_evidence.append((
+            f"endpoint={path}; before_owner={before_owner!r}; "
+            f"sentinel_title_persisted=True",
+            "reverted" if restored else "revert_failed",
+          ))
+          restore_failed = not restored
+          break  # one finding per endpoint
+      if restore_failed:
+        break  # no further writes once a write could not be undone
 
-    if transferred_evidence:
+    for item, rollback in transferred_evidence:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-05",
         title="Ownership update bypass — regular user wrote to non-owned record",
@@ -753,7 +771,8 @@ class AccessControlProbes(ProbeBase):
         owasp="A01:2021",
         cwe=["CWE-639", "CWE-862"],
         attack=["T1078"],
-        evidence=transferred_evidence,
+        evidence=[item],
+        rollback_status=rollback,
         replay_steps=[
           "Log in as the regular user.",
           "PATCH a record whose owner is a different user with a "
@@ -765,7 +784,7 @@ class AccessControlProbes(ProbeBase):
                     "record's owner does not match the authenticated "
                     "principal (or an explicit admin role).",
       ))
-    elif tested > 0:
+    if not transferred_evidence and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-05",
         title="Ownership update — guard held",
@@ -842,6 +861,7 @@ class AccessControlProbes(ProbeBase):
           )
           break
       if deleted_evidence:
+        # A delete cannot be undone: stop after the first confirmed one.
         break
 
     if deleted_evidence:
@@ -1015,10 +1035,8 @@ class AccessControlProbes(ProbeBase):
             f"baseline_len={base_len}; probed_len={len(probed.text)}"
           )
           break
-      if delta_evidence:
-        break
 
-    if delta_evidence:
+    for item in delta_evidence:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-10",
         title="Query parameter role override — server honors URL-controlled role",
@@ -1027,7 +1045,7 @@ class AccessControlProbes(ProbeBase):
         owasp="A01:2021",
         cwe=["CWE-639", "CWE-285"],
         attack=["T1078"],
-        evidence=delta_evidence,
+        evidence=[item],
         replay_steps=[
           "GET a route as a regular user; record body.",
           "GET the same route with ``?role=admin`` (and other "
@@ -1038,7 +1056,7 @@ class AccessControlProbes(ProbeBase):
                     "ONLY. Strip / ignore role-related query parameters "
                     "before authorization decisions.",
       ))
-    elif tested > 0:
+    if not delta_evidence and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-10",
         title="Query parameter role override — no privilege escalation observed",
@@ -1047,7 +1065,7 @@ class AccessControlProbes(ProbeBase):
         owasp="A01:2021",
         evidence=[f"paths_tested={len(targets)}", f"requests={tested}"],
       ))
-    elif denied > 0:
+    elif not delta_evidence and denied > 0:
       self.emit_endpoint_denied("PT-A01-10")
 
   def _test_hidden_field_tampering(self):
@@ -1170,6 +1188,8 @@ class AccessControlProbes(ProbeBase):
             f"form={form_path}; hidden_auth_fields="
             f"{sorted(auth_fields.keys())}; submit_status={resp.status_code}"
           )
+          # The tampered POST is a write that cannot be undone here: stop
+          # after the first accepted one (same exclusion as PT-A01-06).
           break
 
     if tampered_evidence:

@@ -15,6 +15,7 @@ from ..findings import (
 )
 from ..models import GrayboxProbeContext, GrayboxProbeRunResult
 from ..rollback import MUTATION_ATTEMPTED_UNKNOWN, StatefulMutationPlan
+from ..scenario_runtime import owns_legacy_families
 
 
 _SNAPSHOT_MAX_CHARS = 2048
@@ -222,6 +223,16 @@ class ProbeBase:
     return cls(**context.to_kwargs())
 
   def run_safe(self, probe_name, probe_fn):
+    """Run a legacy (non-manifest) family, on the legacy-owning worker only.
+
+    Under SLICE the manifest divides the API scenarios but not these
+    families, so every worker would repeat them; only slice index 0 runs them.
+    """
+    if not owns_legacy_families(getattr(self, "allowed_scenario_ids", None)):
+      return
+    self._run_guarded(probe_name, probe_fn)
+
+  def _run_guarded(self, probe_name, probe_fn):
     """
     Run a probe with error recovery.
 
@@ -287,7 +298,7 @@ class ProbeBase:
     if self._is_api_security_scenario(scenario_id) and self._api_auth_unverified():
       self._emit_auth_unverified(scenario_id)
       return
-    self.run_safe(probe_name, probe_fn)
+    self._run_guarded(probe_name, probe_fn)
 
   def run_runtime_scenarios(self, probe_key: str):
     """Run assigned runtime-manifest scenarios for one probe family."""

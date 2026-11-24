@@ -7,6 +7,7 @@ import re
 from .base import ProbeBase
 from ... import cvss_vectors as V
 from ..findings import GrayboxFinding
+from ..scenario_catalog import graybox_scenario
 
 
 class InjectionProbes(ProbeBase):
@@ -55,6 +56,20 @@ class InjectionProbes(ProbeBase):
       self.run_safe("json_type_confusion", self._test_json_type_confusion)
     return self.findings
 
+  def _emit_no_endpoint(self, scenario_id, kind):
+    """Inconclusive coverage row for a family with no configured endpoint.
+
+    Without it the family returns silently and the coverage view cannot tell
+    "not tested" from "tested and clean".
+    """
+    entry = graybox_scenario(scenario_id) or {}
+    self.emit_inconclusive(
+      scenario_id,
+      entry.get("title") or scenario_id,
+      entry.get("owasp") or "",
+      f"no_configured_{kind}_endpoints",
+    )
+
   def _test_login_injection(self):
     """PT-A05-01: inject into login form fields (unauthenticated)."""
     session = self.auth.make_anonymous_session()
@@ -100,13 +115,31 @@ class InjectionProbes(ProbeBase):
 
     if vulnerable:
       for label, cwe, payload in vulnerable:
+        if label == "sqli":
+          # Reflection alone proves echo, not SQL injection.
+          self.findings.append(GrayboxFinding(
+            scenario_id="PT-A05-01",
+            title="SQL injection payload reflected in login form: not confirmed",
+            status="inconclusive",
+            severity="LOW",
+            owasp="A03:2021",
+            cwe=[cwe],
+            evidence=[
+              f"endpoint={login_url}",
+              f"field={self.target_config.username_field}",
+              f"payload={payload}",
+              "payload_reflected=True",
+              "reason=sqli_reflection_only",
+            ],
+          ))
+          continue
         self.findings.append(GrayboxFinding(
           scenario_id="PT-A05-01",
           title=f"Reflected {label.upper()} in login form",
           status="vulnerable",
-          severity="HIGH" if label == "sqli" else "MEDIUM",
-          cvss_vector=V.INJECTION_DATA_ACCESS if label == "sqli" else V.XSS_UNAUTHENTICATED,
-          owasp="A05:2021" if label == "sqli" else "A03:2021",
+          severity="MEDIUM",
+          cvss_vector=V.XSS_UNAUTHENTICATED,
+          owasp="A03:2021",
           cwe=[cwe],
           evidence=[
             f"endpoint={login_url}",
@@ -126,7 +159,7 @@ class InjectionProbes(ProbeBase):
         title="Login form injection — no reflection detected",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A05:2021",
+        owasp="A03:2021",
         evidence=[f"payloads_tested={len(payloads)}"],
       ))
 
@@ -210,13 +243,29 @@ class InjectionProbes(ProbeBase):
           vulnerable_forms.append((form_action, label, cwe, all_inputs[0]))
 
     for form_action, label, cwe, field in vulnerable_forms:
+      if label == "sqli":
+        # Reflection alone proves echo, not SQL injection.
+        self.findings.append(GrayboxFinding(
+          scenario_id="PT-A03-01",
+          title="SQL injection payload reflected in authenticated form: not confirmed",
+          status="inconclusive",
+          severity="LOW",
+          owasp="A03:2021",
+          cwe=[cwe],
+          evidence=[
+            f"endpoint={self.target_url + form_action}",
+            f"field={field}",
+            "payload_reflected=True",
+            "reason=sqli_reflection_only",
+          ],
+        ))
+        continue
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-01",
         title=f"Reflected {label.upper()} in authenticated form",
         status="vulnerable",
-        severity="HIGH" if label == "sqli" else "MEDIUM",
-        cvss_vector=(V.INJECTION_DATA_ACCESS_AUTHENTICATED if label == "sqli"
-                     else V.XSS_AUTHENTICATED),
+        severity="MEDIUM",
+        cvss_vector=V.XSS_AUTHENTICATED,
         owasp="A03:2021",
         cwe=[cwe],
         evidence=[
@@ -358,6 +407,7 @@ class InjectionProbes(ProbeBase):
     """
     ssrf_endpoints = self.target_config.injection.ssrf_endpoints
     if not ssrf_endpoints:
+      self._emit_no_endpoint("PT-API7-01", "ssrf")
       return
 
     import time as _time
@@ -582,13 +632,13 @@ class InjectionProbes(ProbeBase):
         # Check for redirect to evil domain
         location = _evil_redirect(resp)
         if location:
-          vulnerable_evidence.append(
-            f"endpoint={path}; param={param}; location={location}"
-          )
+          vulnerable_evidence.append((
+            path, param, f"endpoint={path}; param={param}; location={location}",
+          ))
           break  # one redirect per path is enough
 
         # Also test the alternate payload (full URL)
-        if not vulnerable_evidence or vulnerable_evidence[-1].split(";")[0] != f"endpoint={path}":
+        if not vulnerable_evidence or vulnerable_evidence[-1][0] != path:
           self.safety.throttle()
           try:
             resp2 = session.get(
@@ -604,15 +654,15 @@ class InjectionProbes(ProbeBase):
 
           location2 = _evil_redirect(resp2)
           if location2:
-            vulnerable_evidence.append(
-              f"endpoint={path}; param={param}; location={location2}"
-            )
+            vulnerable_evidence.append((
+              path, param, f"endpoint={path}; param={param}; location={location2}",
+            ))
             break
 
       if len(vulnerable_evidence) >= 3:
         break  # enough evidence
 
-    if vulnerable_evidence:
+    for path, param, item in vulnerable_evidence:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-04",
         title="Open redirect via URL parameter",
@@ -621,10 +671,9 @@ class InjectionProbes(ProbeBase):
         owasp="A01:2021",
         cwe=["CWE-601"],
         attack=["T1566"],
-        evidence=vulnerable_evidence,
+        evidence=[item],
         replay_steps=[
-          "Navigate to the vulnerable endpoint with redirect parameter.",
-          f"Set parameter to {payload} or {payload_alt}.",
+          f"GET {path}?{param}={payload} (or {payload_alt}).",
           "Observe 3xx redirect to attacker-controlled domain.",
         ],
         remediation="Validate redirect targets against a server-side allowlist. "
@@ -632,7 +681,7 @@ class InjectionProbes(ProbeBase):
                     "matches your domain. Never pass user input directly to "
                     "Location headers.",
       ))
-    elif tested > 0:
+    if not vulnerable_evidence and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-04",
         title="Open redirect — no vulnerability detected",
@@ -641,7 +690,7 @@ class InjectionProbes(ProbeBase):
         owasp="A01:2021",
         evidence=[f"parameters_tested={tested}"],
       ))
-    elif denied > 0:
+    elif not vulnerable_evidence and denied > 0:
       self.emit_endpoint_denied("PT-A01-04")
 
   def _test_path_traversal(self):
@@ -684,6 +733,7 @@ class InjectionProbes(ProbeBase):
 
     for route in test_routes[:10]:  # cap to avoid excessive requests
       url = self.target_url + route
+      route_hit = False
 
       # Baseline: a plain GET must reach the handler before the route counts.
       reached = self.baseline_reached(session, url)
@@ -711,17 +761,19 @@ class InjectionProbes(ProbeBase):
           if resp.status_code == 200:
             body = resp.text
             if any(m in body for m in markers):
-              vulnerable_evidence.append(
-                f"endpoint={route}; param={param}; payload={payload}"
-              )
+              vulnerable_evidence.append((
+                route, param, payload,
+                f"endpoint={route}; param={param}; payload={payload}",
+              ))
+              route_hit = True
               break  # one hit per route+param is enough
-        if vulnerable_evidence:
+        if route_hit:
           break  # found a hit on this route, move on
 
       if len(vulnerable_evidence) >= 3:
         break
 
-    if vulnerable_evidence:
+    for route, param, payload, item in vulnerable_evidence:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-03",
         title="Path traversal — file content disclosed",
@@ -730,10 +782,10 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         cwe=["CWE-22"],
         attack=["T1083"],
-        evidence=vulnerable_evidence,
+        evidence=[item],
         replay_steps=[
           "Log in as authenticated user.",
-          f"Request GET with traversal payload in file parameter.",
+          f"Request GET {route}?{param}={payload}.",
           "Observe OS file contents (e.g. /etc/passwd) in response body.",
         ],
         remediation="Validate and sanitize all file path inputs server-side. "
@@ -741,7 +793,7 @@ class InjectionProbes(ProbeBase):
                     "and ensure they stay within the application's base directory. "
                     "Never pass user input directly to file system operations.",
       ))
-    elif tested > 0:
+    if not vulnerable_evidence and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-03",
         title="Path traversal — no vulnerability detected",
@@ -750,7 +802,7 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"requests_tested={tested}"],
       ))
-    elif denied > 0:
+    elif not vulnerable_evidence and denied > 0:
       self.emit_endpoint_denied("PT-A03-03")
 
   # ── Batch 2 — A03 family expansion ──────────────────────────────────────
@@ -763,6 +815,7 @@ class InjectionProbes(ProbeBase):
     """
     endpoints = self.target_config.injection.xss_endpoints
     if not endpoints:
+      self._emit_no_endpoint("PT-A03-04", "xss")
       return
 
     payload = "<script>alert(1)</script>"
@@ -791,10 +844,9 @@ class InjectionProbes(ProbeBase):
         continue
       tested += 1
       if resp.status_code == 200 and sentinel in resp.text:
-        vulnerable.append(f"endpoint={ep.path}; param={ep.param}; payload_reflected_unescaped=True")
-        break
+        vulnerable.append((ep, f"endpoint={ep.path}; param={ep.param}; payload_reflected_unescaped=True"))
 
-    if vulnerable:
+    for ep, item in vulnerable:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-04",
         title="Reflected XSS — payload echoed unescaped",
@@ -803,16 +855,17 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         cwe=["CWE-79"],
         attack=["T1059.007"],
-        evidence=vulnerable,
+        parameter=ep.param,
+        evidence=[item],
         replay_steps=[
-          f"GET {endpoints[0].path}?{endpoints[0].param}=<script>alert(1)</script>",
+          f"GET {ep.path}?{ep.param}=<script>alert(1)</script>",
           "Observe payload returned in body without HTML escaping.",
         ],
         remediation="Escape user input on output (Django ``|escape``, "
                     "Jinja autoescape, etc.). Apply a Content Security "
                     "Policy that disallows inline scripts.",
       ))
-    elif tested > 0:
+    if not vulnerable and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-04",
         title="Reflected XSS — payload escaped or not reflected",
@@ -821,7 +874,7 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"endpoints_tested={tested}"],
       ))
-    elif denied > 0:
+    elif not vulnerable and denied > 0:
       self.emit_endpoint_denied("PT-A03-04")
 
   def _test_template_injection(self):
@@ -832,6 +885,7 @@ class InjectionProbes(ProbeBase):
     """
     endpoints = self.target_config.injection.ssti_endpoints
     if not endpoints:
+      self._emit_no_endpoint("PT-A03-06", "ssti")
       return
 
     payloads = ["${7*7}", "{{7*7}}", "{{ 7*7 }}"]
@@ -865,15 +919,13 @@ class InjectionProbes(ProbeBase):
         # would reflect both the payload and the sentinel).
         if (resp.status_code == 200 and sentinel in resp.text
             and "7*7" not in resp.text):
-          vulnerable.append(
+          vulnerable.append((ep,
             f"endpoint={ep.path}; param={ep.param}; "
             f"payload={payload}; sentinel_in_body=True"
-          )
+          ))
           break
-      if vulnerable:
-        break
 
-    if vulnerable:
+    for ep, item in vulnerable:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-06",
         title="Server-side template injection — expression evaluated",
@@ -882,16 +934,17 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         cwe=["CWE-94", "CWE-1336"],
         attack=["T1059"],
-        evidence=vulnerable,
+        parameter=ep.param,
+        evidence=[item],
         replay_steps=[
-          f"GET {endpoints[0].path}?{endpoints[0].param}=" + r"${7*7}",
+          f"GET {ep.path}?{ep.param}=" + r"${7*7}",
           "Observe the response body contains 49 (the evaluated result).",
         ],
         remediation="Never render user-controlled data through a template "
                     "engine. If templates must be dynamic, use a sandbox "
                     "or precompiled templates only.",
       ))
-    elif tested > 0:
+    if not vulnerable and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-06",
         title="Template injection — no expression evaluation observed",
@@ -900,7 +953,7 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"requests_tested={tested}"],
       ))
-    elif denied > 0:
+    elif not vulnerable and denied > 0:
       self.emit_endpoint_denied("PT-A03-06")
 
   def _test_command_injection(self):
@@ -911,6 +964,7 @@ class InjectionProbes(ProbeBase):
     """
     endpoints = self.target_config.injection.cmd_endpoints
     if not endpoints:
+      self._emit_no_endpoint("PT-A03-07", "cmd")
       return
 
     payloads = [";id", "$(id)", "`id`", "|id"]
@@ -941,15 +995,13 @@ class InjectionProbes(ProbeBase):
           continue
         tested += 1
         if resp.status_code == 200 and sentinel.search(resp.text):
-          vulnerable.append(
+          vulnerable.append((ep,
             f"endpoint={ep.path}; param={ep.param}; "
             f"payload={payload}; uid_marker_in_body=True"
-          )
+          ))
           break
-      if vulnerable:
-        break
 
-    if vulnerable:
+    for ep, item in vulnerable:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-07",
         title="OS command injection — shell metacharacters honored",
@@ -958,9 +1010,10 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         cwe=["CWE-78"],
         attack=["T1059.004"],
-        evidence=vulnerable,
+        parameter=ep.param,
+        evidence=[item],
         replay_steps=[
-          f"GET {endpoints[0].path}?{endpoints[0].param}=;id",
+          f"GET {ep.path}?{ep.param}=;id",
           "Observe ``uid=...`` from id(1) in the response body.",
         ],
         remediation="Never invoke a shell with user-controlled input. "
@@ -969,7 +1022,7 @@ class InjectionProbes(ProbeBase):
                     "the input as an argv element, never a substring of "
                     "the command line.",
       ))
-    elif tested > 0:
+    if not vulnerable and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-07",
         title="Command injection — shell metacharacters had no effect",
@@ -978,7 +1031,7 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"requests_tested={tested}"],
       ))
-    elif denied > 0:
+    elif not vulnerable and denied > 0:
       self.emit_endpoint_denied("PT-A03-07")
 
   def _test_header_injection(self):
@@ -990,6 +1043,7 @@ class InjectionProbes(ProbeBase):
     """
     endpoints = self.target_config.injection.header_endpoints
     if not endpoints:
+      self._emit_no_endpoint("PT-A03-12", "header")
       return
 
     inject_name = "X-Injected"
@@ -1020,13 +1074,12 @@ class InjectionProbes(ProbeBase):
         continue
       tested += 1
       if resp.headers.get(inject_name) == inject_value:
-        vulnerable.append(
+        vulnerable.append((ep,
           f"endpoint={ep.path}; param={ep.param}; "
           f"injected_header={inject_name}: {inject_value}"
-        )
-        break
+        ))
 
-    if vulnerable:
+    for ep, item in vulnerable:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-12",
         title="HTTP header injection via CRLF",
@@ -1035,9 +1088,10 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         cwe=["CWE-93", "CWE-113"],
         attack=["T1190"],
-        evidence=vulnerable,
+        parameter=ep.param,
+        evidence=[item],
         replay_steps=[
-          f"GET {endpoints[0].path}?{endpoints[0].param}=/x"
+          f"GET {ep.path}?{ep.param}=/x"
           + r"\r\nX-Injected: pwned",
           "Observe the X-Injected response header set with the "
           "attacker-supplied value.",
@@ -1046,7 +1100,7 @@ class InjectionProbes(ProbeBase):
                     "land in response headers. Validate redirect "
                     "targets against an allowlist of paths.",
       ))
-    elif tested > 0:
+    if not vulnerable and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-12",
         title="Header injection — CRLF stripped or not reflected",
@@ -1055,7 +1109,7 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"requests_tested={tested}"],
       ))
-    elif denied > 0:
+    elif not vulnerable and denied > 0:
       self.emit_endpoint_denied("PT-A03-12")
 
   def _test_json_type_confusion(self):
@@ -1068,6 +1122,7 @@ class InjectionProbes(ProbeBase):
     """
     endpoints = self.target_config.injection.json_type_endpoints
     if not endpoints:
+      self._emit_no_endpoint("PT-A03-15", "json_type")
       return
 
     import json as _json
@@ -1110,15 +1165,13 @@ class InjectionProbes(ProbeBase):
           continue
         tested += 1
         if resp.status_code < 400:
-          vulnerable.append(
+          vulnerable.append((ep,
             f"endpoint={ep.path}; field={ep.field}; "
             f"variant={variant!r}; status={resp.status_code}"
-          )
+          ))
           break
-      if vulnerable:
-        break
 
-    if vulnerable:
+    for ep, item in vulnerable:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-15",
         title="JSON body type confusion — non-integer accepted",
@@ -1127,11 +1180,11 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         cwe=["CWE-843", "CWE-704"],
         attack=["T1190"],
-        evidence=vulnerable,
+        evidence=[item],
         replay_steps=[
-          f"POST {endpoints[0].path} with body "
-          f'``{{"{endpoints[0].field}": [1]}}`` or '
-          f'``{{"{endpoints[0].field}": {{"$gt": 0}}}}``',
+          f"POST {ep.path} with body "
+          f'``{{"{ep.field}": [1]}}`` or '
+          f'``{{"{ep.field}": {{"$gt": 0}}}}``',
           "Observe the server processes the request without rejecting "
           "the type mismatch.",
         ],
@@ -1140,7 +1193,7 @@ class InjectionProbes(ProbeBase):
                     "lists, dicts, or operator-keys when an integer "
                     "is expected.",
       ))
-    elif tested > 0:
+    if not vulnerable and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-15",
         title="JSON type confusion — typed validation in place",
@@ -1149,5 +1202,5 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"requests_tested={tested}"],
       ))
-    elif denied > 0:
+    elif not vulnerable and denied > 0:
       self.emit_endpoint_denied("PT-A03-15")

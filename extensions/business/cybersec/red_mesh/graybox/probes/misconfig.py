@@ -62,7 +62,7 @@ class MisconfigProbes(ProbeBase):
         title="Debug/config endpoint exposed",
         status="vulnerable",
         severity="MEDIUM",
-        owasp="A02:2021",
+        owasp="A05:2021",
         cwe=["CWE-200"],
         evidence=[f"exposed_paths={', '.join(exposed)}"],
         remediation="Disable debug endpoints in production. Restrict access by IP or authentication.",
@@ -73,7 +73,7 @@ class MisconfigProbes(ProbeBase):
         title="Debug endpoints — not exposed",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A02:2021",
+        owasp="A05:2021",
         evidence=[f"paths_tested={len(debug_paths)}"],
       ))
 
@@ -132,7 +132,7 @@ class MisconfigProbes(ProbeBase):
           status="vulnerable",
           severity="HIGH" if acac == "true" else "LOW",
           cvss_vector=V.CORS_CREDENTIALED if acac == "true" else V.CORS_UNCREDENTIALED,
-          owasp="A02:2021",
+          owasp="A05:2021",
           cwe=["CWE-942"],
           evidence=[
             f"path={path}",
@@ -150,7 +150,7 @@ class MisconfigProbes(ProbeBase):
           status="vulnerable",
           severity="HIGH" if acac == "true" else "LOW",
           cvss_vector=V.CORS_CREDENTIALED if acac == "true" else V.CORS_UNCREDENTIALED,
-          owasp="A02:2021",
+          owasp="A05:2021",
           cwe=["CWE-942"],
           evidence=[
             f"path={path}",
@@ -170,7 +170,7 @@ class MisconfigProbes(ProbeBase):
         title="CORS configuration — no misconfiguration detected",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A02:2021",
+        owasp="A05:2021",
         evidence=[f"paths_tested={len(unique_paths)}"],
       ))
 
@@ -205,7 +205,7 @@ class MisconfigProbes(ProbeBase):
         title="Missing security headers",
         status="vulnerable",
         severity="LOW",
-        owasp="A02:2021",
+        owasp="A05:2021",
         cwe=["CWE-693"],
         evidence=[f"missing_headers={', '.join(missing)}"],
         remediation="Add security headers: " + ", ".join(missing),
@@ -216,7 +216,7 @@ class MisconfigProbes(ProbeBase):
         title="Security headers — all present",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A02:2021",
+        owasp="A05:2021",
         evidence=[f"headers_checked={len(checked)}"],
       ))
 
@@ -242,7 +242,7 @@ class MisconfigProbes(ProbeBase):
         title="Insecure cookie attributes",
         status="vulnerable",
         severity="LOW",
-        owasp="A02:2021",
+        owasp="A05:2021",
         cwe=["CWE-614"],
         evidence=issues,
         remediation="Set Secure, HttpOnly, and SameSite=Strict on all session cookies.",
@@ -253,7 +253,7 @@ class MisconfigProbes(ProbeBase):
         title="Cookie attributes — all secure",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A02:2021",
+        owasp="A05:2021",
         evidence=["all_cookies_have_secure_attributes"],
       ))
 
@@ -361,7 +361,7 @@ class MisconfigProbes(ProbeBase):
         title="CSRF protection bypass",
         status="vulnerable",
         severity="HIGH",
-        owasp="A02:2021",
+        owasp="A01:2021",
         cwe=["CWE-352"],
         attack=["T1185"],
         evidence=[
@@ -382,7 +382,7 @@ class MisconfigProbes(ProbeBase):
         title="CSRF protection — no bypass detected",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A02:2021",
+        owasp="A01:2021",
         evidence=[f"endpoints_tested={tested}"],
       ))
     elif denied > 0:
@@ -434,7 +434,7 @@ class MisconfigProbes(ProbeBase):
       status=status,
       severity=severity,
       cvss_vector=V.AUTH_DEFEATABLE,
-      owasp="A02:2021",
+      owasp="A07:2021",
       cwe=["CWE-331", "CWE-345"] if evidence else [],
       evidence=evidence or ["all_tokens_appear_adequate"],
       remediation="Use cryptographically random session IDs (128+ bits). "
@@ -514,7 +514,7 @@ class MisconfigProbes(ProbeBase):
         title="Login rate limiting not enforced",
         status="vulnerable",
         severity="MEDIUM",
-        owasp="A02:2021",
+        owasp="A07:2021",
         cwe=["CWE-307"],
         attack=["T1110"],
         evidence=[
@@ -536,7 +536,7 @@ class MisconfigProbes(ProbeBase):
         title="Login rate limiting — enforced",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A02:2021",
+        owasp="A07:2021",
         evidence=[
           f"endpoint={login_url}",
           f"lockout_triggered_after={attempts}_or_fewer_attempts",
