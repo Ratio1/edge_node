@@ -105,6 +105,20 @@ def test_suspended_and_not_yet_valid_engagements_are_audited():
     assert [row["reason"] for row in rows(fixture.owner_plugin)] == ["engagement_not_yet_valid", "engagement_suspended"]
 
 
+def test_an_archived_contract_launch_is_audited():
+  # RM-249: the engagement's contract is no longer the one in force
+  import copy
+  with launch_fixture() as fixture:
+    tenant = fixture.service.store.get("tenant", fixture.tenant)
+    block = {"contract": {**tenant["contract"], "sha256": "e" * 64}, "contract_generated": None, "effective_from": "2026-10-01",
+             "effective_until": None, "nodes": [{"node_address": "node-a", "mode": "shared"}], "activated_by": "creator",
+             "activated_at": "2026-10-10T00:00:00+00:00", "supersedes": "c_1", "superseded_by": None}
+    fixture.service.store.put("tenant", fixture.tenant, record={**copy.deepcopy(tenant), "contracts": {"c_2": block}})
+    result = launch(fixture)
+    assert result["error"] == "contract_archived" and result["status_code"] == 409, result
+    assert [row["reason"] for row in rows(fixture.owner_plugin)] == ["contract_archived"]
+
+
 def test_target_is_truncated():
   with launch_fixture() as fixture:
     launch(fixture, target="x" * 1000, engagement_asset_id="ea_2")

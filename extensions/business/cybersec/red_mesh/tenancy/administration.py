@@ -147,22 +147,23 @@ def _contract_blocks(tenant):
   return {contract_id: blocks[contract_id] for contract_id in tenant_contracts.sorted_ids(blocks)}
 
 
+def _contract_in_force(tenant):
+  """RM-249: the id of the tenant's contract in force; every other contract is archived."""
+  return tenant_contracts.in_force(_contract_blocks(tenant))
+
+
 def _contract_nodes(tenant):
-  """RM-127: the nodes the tenant's generated contract printed; empty for a one-step tenant and for
-  one activated from a pack generated before RM-127. RM-133: the union over `c_1` and every further
-  contract, active or superseded (nothing is released); one entry per node."""
-  nodes = list((tenant.get("contract_generated") or {}).get("nodes") or ())
-  seen = {entry["node_address"] for entry in nodes}
-  for block in _contract_blocks(tenant).values():
-    for entry in block["nodes"]:
-      if entry["node_address"] not in seen:
-        seen.add(entry["node_address"])
-        nodes.append(dict(entry))
-  return nodes
+  """RM-127: the nodes the tenant's contract printed; empty for a one-step tenant and for one activated
+  from a pack generated before RM-127. RM-249: the nodes of the contract in force alone (an
+  archived contract's nodes are not the tenant's)."""
+  in_force = _contract_in_force(tenant)
+  if in_force == tenant_contracts.FIRST_CONTRACT_ID:
+    return list((tenant.get("contract_generated") or {}).get("nodes") or ())
+  return [dict(entry) for entry in _contract_blocks(tenant)[in_force]["nodes"]]
 
 
 # RM-211: what `_engagement_launch_set` read: see its docstring.
-LaunchSet = namedtuple("LaunchSet", "considered reasons fixed others active peers")
+LaunchSet = namedtuple("LaunchSet", "considered reasons fixed active peers")
 
 
 def _contract_sha256s(tenant):
@@ -540,7 +541,7 @@ class TenantAdministrationService:
     first (eligibility as `set_tenant_node_assignment`, conflicts as `_assign_node`; the draft's own
     private plan holds for this tenant), and any refusal writes nothing. A replay after a crash
     part-way finds its own rows assigned and fills the gaps; a release removes them. RM-133: `nodes`
-    is the list to assign (the tenant's union, or one further contract's plan), so a node the tenant
+    is the list to assign (the contract in force's plan), so a node the tenant
     already holds in the same mode is the existing assignment and another mode is refused."""
     if not nodes:
       return
@@ -795,24 +796,17 @@ class TenantAdministrationService:
   def _engagement_launch_set(self, tenant, row):
     """RM-211: the nodes an engagement may launch on: its own contract's nodes, the tenant's active
     non-draining assignments and the configured peers. The contract is the one whose sha256 the
-    engagement carries. A contract with no node list (one-step tenant, pack before RM-127) lends its
-    active assignments minus every node another contract of the tenant lists, so an amended tenant
-    never lends `c_2`-only nodes to a `c_1` engagement. Returns a `LaunchSet`: the addresses listed,
-    `{address: reason or None}`, whether the contract lists nodes, the other contracts' addresses and
-    the active assignment addresses (the one assignment read) and the configured peers (the one peer read)."""
-    blocks = _contract_blocks(tenant)
-    by_sha = {tenant["contract"]["sha256"]: tenant_contracts.FIRST_CONTRACT_ID,
-              **{block["contract"]["sha256"]: contract_id for contract_id, block in blocks.items()}}
-    own_id = by_sha[row["contract_sha256"]]
-    listed = {contract_id: [entry["node_address"] for entry in self._contract_lineage(tenant, contract_id)[2]]
-              for contract_id in (tenant_contracts.FIRST_CONTRACT_ID, *blocks)}
-    others = {address for contract_id, addresses in listed.items() if contract_id != own_id for address in addresses}
+    engagement carries (the one in force: an archived one is refused before). A contract with no node
+    list (one-step tenant, pack before RM-127; only `c_1` can lack one) lends its active assignments.
+    Returns a `LaunchSet`: the addresses listed, `{address: reason or None}`, whether the contract
+    lists nodes, the active assignment addresses (the one assignment read) and the configured peers (the one peer read)."""
+    own_id = self._engagement_contract(tenant, row["contract_sha256"])[0]
+    listed = [entry["node_address"] for entry in self._contract_lineage(tenant, own_id)[2]]
     assigned = {assignment["node_address"]: assignment
                 for assignment in self.store.list_node_assignments(tenant["tenant_id"])}
     peers = self._configured_peers()
-    fixed = bool(listed[own_id])
-    considered = listed[own_id] if fixed else sorted(
-      address for address, assignment in assigned.items() if assignment["active"] and address not in others)
+    fixed = bool(listed)
+    considered = listed if fixed else sorted(address for address, assignment in assigned.items() if assignment["active"])
 
     def reason(address):
       assignment = assigned.get(address)
@@ -821,7 +815,7 @@ class TenantAdministrationService:
       if assignment.get("draining"):
         return "draining"
       return None if address in peers else "not_a_peer"
-    return LaunchSet(considered, {address: reason(address) for address in considered}, fixed, others,
+    return LaunchSet(considered, {address: reason(address) for address in considered}, fixed,
                      {address for address, assignment in assigned.items() if assignment["active"]}, peers)
 
   def _launch_refusal_nodes(self, launch, refused):
@@ -833,7 +827,7 @@ class TenantAdministrationService:
     nodes = []
     for address in refused:
       node = {"nodeAddress": address, "reason": launch.reasons.get(address) or (
-        "not_in_contract" if launch.fixed or address in launch.others else "not_assigned")}
+        "not_in_contract" if launch.fixed else "not_assigned")}
       if address in known:
         node["alias"] = named_entry(directory, address)["alias"]
       nodes.append(node)
@@ -875,12 +869,14 @@ class TenantAdministrationService:
       raise AdministrationDenied(400, "engagement_suspended")
     contract, legal = tenant.get("contract"), tenant.get("legal")
     # RM-133: the engagement was created under one of the tenant's contracts (`c_1` or a further
-    # one, superseded included); the contract cannot change after creation (there is no attach
+    # one, archived included); the contract cannot change after creation (there is no attach
     # operation), so a sha256 outside the set is a damaged record, never a reason to launch under a
     # different signed basis.
     if (not _valid_contract(contract) or not isinstance(legal, dict)
         or row["contract_sha256"] not in _contract_sha256s(tenant)):
       raise TenantStoreError("Engagement contract does not match its tenant")
+    if self._engagement_contract(tenant, row["contract_sha256"])[0] != _contract_in_force(tenant):
+      raise AdministrationDenied(409, "contract_archived")
     facts = {
       "engagement_id": row["engagement_id"], "engagement_hash": row["engagement_hash"],
       "contract_sha256": row["contract_sha256"],
@@ -952,6 +948,7 @@ class TenantAdministrationService:
     finalization is never refused. A schema-1 binding (a tenant asset row) is never reauthorized.
     RM-248: with `new_pass`, a suspended engagement is refused (`engagement_suspended`): the job holds
     its next pass. The current pass's checks never pass it, so a running pass is not cut off.
+    RM-249: with `new_pass`, an engagement bound to an archived contract is refused (`contract_archived`).
     """
     try:
       saved = (binding if isinstance(binding, ExecutionBinding) else ExecutionBinding(binding)).to_dict()
@@ -964,13 +961,16 @@ class TenantAdministrationService:
     account = self._actor({"account_id": saved["actor_id"]})
     if account.account_generation != saved["actor_generation"]:
       raise AdministrationDenied(409, "account_changed")
-    _, account, row, entry = self._execution_entry_for_account(
+    tenant, account, row, entry = self._execution_entry_for_account(
       account, saved["tenant_id"], saved["engagement_id"], saved["engagement_asset_id"])
     current = self._entry_facts(row, entry)
     if any(current[key] != saved[key] for key in current):
       raise AdministrationDenied(409, "invalid_execution_binding")
     if new_pass and row.get("suspended") is True:
       raise AdministrationDenied(409, "engagement_suspended")
+    # RM-249: an archived contract authorizes no new pass; the running pass is never refused here.
+    if new_pass and self._engagement_contract(tenant, row["contract_sha256"])[0] not in (None, _contract_in_force(tenant)):
+      raise AdministrationDenied(409, "contract_archived")
     # RM-102: eligibility here includes a draining row (no job check); a stale job view on this
     # backend node must never cut off a job that is actually still running.
     eligible = self._reauth_eligible_nodes(saved["tenant_id"])
@@ -988,7 +988,7 @@ class TenantAdministrationService:
     """Why an admitted job's engagement no longer covers it, or None while it does.
 
     RM-095 (owner, 2026-09-28): a continuous job hard-stops when its engagement ends, at
-    `valid_until` or on a revoke. System-internal like `reauthorize_execution`: the launcher asks
+    `valid_until`, on a revoke or when its contract is archived (RM-249). System-internal like `reauthorize_execution`: the launcher asks
     it for jobs it already admitted. A store it cannot read raises `TenantStoreError`, so a
     transient outage never reads as an ended engagement.
     """
@@ -1001,6 +1001,11 @@ class TenantAdministrationService:
       return "engagement_revoked"
     if self.clock() >= datetime.fromisoformat(row["valid_until"]):
       return "engagement_expired"
+    # RM-249: an archived contract authorizes nothing; the running job hard-stops, as on a revoke.
+    tenant = self.store.get("tenant", tenant_id)
+    if isinstance(tenant, dict) and self._engagement_contract(tenant, row["contract_sha256"])[0] not in (
+        None, _contract_in_force(tenant)):
+      return "contract_archived"
     return None
 
   def execution_basis_end_reason(self, tenant_id, engagement_id):
@@ -1042,6 +1047,12 @@ class TenantAdministrationService:
     nodes = [self._tenant_node_row(tenant_id, row) for row in
              sorted(assignments, key=lambda row: row["node_address"])]
     nodes = [node for node in nodes if node is not None]
+    # RM-249: a node the contract in force does not list is retired: derived on read, never launch-eligible.
+    listed = {entry["node_address"] for entry in _contract_nodes(tenant)}
+    in_force = _contract_in_force(tenant)
+    nodes = [{**node, "state": "retired", "reason": f"not in {in_force}"}
+             if listed and node["state"] == "assigned" and node["nodeAddress"] not in listed else node
+             for node in nodes]
     # RM-126: the tenant's own nodes carry their name and tags, under the read the caller already has.
     directory = self._node_directory(node["nodeAddress"] for node in nodes)
     # RM-127: a tenant whose contract lists its nodes keeps them; amendments will change them.
@@ -1112,8 +1123,8 @@ class TenantAdministrationService:
   def _engagement_row(self, row, tenant=None):
     if row is None:
       raise TenantStoreError("Engagement readback is unavailable")
-    contract_id, superseded_by = self._engagement_contract(
-      tenant or self.store.get("tenant", row["tenant_id"]) or {}, row["contract_sha256"])
+    tenant = tenant or self.store.get("tenant", row["tenant_id"]) or {}
+    contract_id, superseded_by = self._engagement_contract(tenant, row["contract_sha256"])
     assets = [{"engagementAssetId": entry["engagement_asset_id"], "assetId": entry["asset_id"],
                "displayName": entry["display_name"], "kind": entry["kind"], "target": entry["target"],
                "targetDigest": entry["target_digest"]} for entry in row["assets"]]
@@ -1131,6 +1142,7 @@ class TenantAdministrationService:
       "anchor": {"status": "pending"},
       "active": row["active"], "createdBy": row["created_by"], "createdAt": row["created_at"],
       "status": self._engagement_status(row), "contractId": contract_id, "contractSupersededBy": superseded_by,
+      "contractArchived": contract_id is not None and contract_id != _contract_in_force(tenant),
       "suspended": row.get("suspended") is True,
       **({"suspendedBy": row["suspended_by"], "suspendedAt": row["suspended_at"],
           "suspendReason": row["suspend_reason"]} if row.get("suspended") is True else {}),
@@ -1160,8 +1172,8 @@ class TenantAdministrationService:
     if not _valid_contract(contract):
       raise TenantStoreError("Invalid tenant contract record")
     if contract_id is None or contract_id == tenant_contracts.FIRST_CONTRACT_ID:
-      # RM-133 step 3: a replaced contract takes no new engagement (its own keep running).
-      if tenant.get("contract_superseded_by") is not None:
+      # RM-249: only the contract in force takes a new engagement; replaced or older, it is archived.
+      if _contract_in_force(tenant) != tenant_contracts.FIRST_CONTRACT_ID:
         raise AdministrationDenied(409, "contract_superseded")
       return contract["sha256"]
     if not tenant_contracts.valid_contract_id(contract_id):
@@ -1169,7 +1181,7 @@ class TenantAdministrationService:
     block = _contract_blocks(tenant).get(contract_id)
     if block is None:
       raise AdministrationDenied(400, "contract_unknown")
-    if block["superseded_by"] is not None:
+    if contract_id != _contract_in_force(tenant):
       raise AdministrationDenied(409, "contract_superseded")
     return block["contract"]["sha256"]
 
@@ -1192,14 +1204,16 @@ class TenantAdministrationService:
     if contract is None:
       return []
     effective = ((tenant.get("governance") or {}).get("effective") or {}).get("contract") or {}
+    in_force = _contract_in_force(tenant)
     entries = [tenant_contracts.contract_entry(
       tenant_contracts.FIRST_CONTRACT_ID, contract, tenant.get("contract_generated"), effective,
-      (tenant.get("contract_generated") or {}).get("nodes") or [], None, tenant.get("contract_superseded_by"))]
+      (tenant.get("contract_generated") or {}).get("nodes") or [], None, tenant.get("contract_superseded_by"),
+      in_force != tenant_contracts.FIRST_CONTRACT_ID)]
     for contract_id, block in _contract_blocks(tenant).items():
       entries.append(tenant_contracts.contract_entry(
         contract_id, block["contract"], block["contract_generated"],
         {key: block[key] for key in ("effective_from", "effective_until")}, block["nodes"],
-        block["supersedes"], block["superseded_by"]))
+        block["supersedes"], block["superseded_by"], contract_id != in_force))
     return entries
 
   @_endpoint
@@ -1570,7 +1584,9 @@ class TenantAdministrationService:
       raise AdministrationDenied(400, "invalid_request")
     # RM-127: the contract lists the tenant's nodes; a change waits for contract amendments. Asking
     # for an assignment the tenant already holds is still answered, as `_assign_node` does.
-    if _contract_nodes(tenant):
+    contract_nodes = _contract_nodes(tenant)
+    # RM-249: a node the contract in force does not list (retired) may be released by hand.
+    if contract_nodes and not (not active and node_address not in {entry["node_address"] for entry in contract_nodes}):
       if active and self._assignment_conflict(tenant_id, node_address, mode or "shared")[0] == "assigned":
         return {"tenantId": tenant_id, "nodeAddress": node_address, "active": True, "mode": mode or "shared",
                 "state": "assigned"}
@@ -3088,8 +3104,8 @@ class TenantAdministrationService:
     """Allocate `c_<n>` from the tenant row's counter and write the draft. The counter goes on the
     tenant row first, so a crash between the two writes leaves a gap, never a collision; a number is
     never reused. A create replayed with the same `request_id` answers the existing draft. RM-133
-    step 3: with `supersedes` (`c_<k>`, a contract the tenant holds that nobody replaced) the draft
-    is a revision, prefilled from it: its nodes, a term proposed from today."""
+    step 3: the draft is a revision, prefilled from `supersedes`: its nodes, a term proposed from today.
+    RM-249: `supersedes` is required and must be the contract in force (`supersedes_required`)."""
     tenant, account = self._platform_tenant(actor, tenant_id)
     if tenant.get("contract") is None:
       raise AdministrationDenied(400, "contract_required")
@@ -3098,15 +3114,16 @@ class TenantAdministrationService:
     if existing is not None:
       return existing
     supersedes = None if supersedes in (None, "") else supersedes
-    nodes = []
-    if supersedes is not None:
-      if not tenant_contracts.valid_contract_id(supersedes):
-        raise AdministrationDenied(400, "contract_unknown")
-      exists, superseded_by, nodes = self._contract_lineage(tenant, supersedes)
-      if not exists:
-        raise AdministrationDenied(400, "contract_unknown")
-      if superseded_by is not None:
-        raise AdministrationDenied(409, "contract_superseded")
+    # RM-249: only an amendment adds a contract, and it continues the contract in force.
+    if supersedes is None:
+      raise AdministrationDenied(400, "supersedes_required")
+    if not tenant_contracts.valid_contract_id(supersedes):
+      raise AdministrationDenied(400, "contract_unknown")
+    exists, _, nodes = self._contract_lineage(tenant, supersedes)
+    if not exists:
+      raise AdministrationDenied(400, "contract_unknown")
+    if supersedes != _contract_in_force(tenant):
+      raise AdministrationDenied(409, "contract_superseded")
     blocks = _contract_blocks(tenant)
     number = tenant.get("next_contract_no")
     if type(number) is not int or number < tenant_contracts.FIRST_CONTRACT_NO:
@@ -3118,8 +3135,7 @@ class TenantAdministrationService:
     self.store.put("tenant", tenant_id, record={**tenant, "next_contract_no": number + 1})
     now = datetime.now(timezone.utc)
     row = tenant_contracts.new_draft(tenant_id, contract_id, request_id, account.account_id, now.isoformat())
-    if supersedes is not None:
-      row = {**row, "supersedes": supersedes, "nodes": nodes, "effective_from": now.date().isoformat()}
+    row = {**row, "supersedes": supersedes, "nodes": nodes, "effective_from": now.date().isoformat()}
     self.store.put("tenant_contract_draft", tenant_id, contract_id, record=row)
     return self.store.get("tenant_contract_draft", tenant_id, contract_id)
 
@@ -3236,19 +3252,17 @@ class TenantAdministrationService:
     self._refuse_documents_in_use({row["document"]["ref"], row["generated"]["ref"]}, exclude=(tenant_id, contract_id))
     if row["document"]["sha256"] in _contract_sha256s(tenant):
       raise AdministrationDenied(409, "contract_in_use")
-    # RM-133 step 3: a revision replaces a contract nobody else replaced meanwhile; the replaced
-    # contract stays in force for its own engagements and takes no new one.
+    # RM-249: a revision replaces the contract in force; the replaced one is archived, and its
+    # engagements take no new pass. A draft with no `supersedes` is not an amendment.
     replaced = {}
-    if row["supersedes"] is not None:
-      exists, superseded_by, _ = self._contract_lineage(tenant, row["supersedes"])
-      if not exists:
-        raise AdministrationDenied(400, "contract_unknown")
-      if superseded_by is not None:
-        raise AdministrationDenied(409, "contract_superseded")
-      if row["supersedes"] == tenant_contracts.FIRST_CONTRACT_ID:
-        replaced = {"contract_superseded_by": contract_id}
-      else:
-        blocks = {**blocks, row["supersedes"]: {**blocks[row["supersedes"]], "superseded_by": contract_id}}
+    if row["supersedes"] is None:
+      raise AdministrationDenied(400, "supersedes_required")
+    if row["supersedes"] != _contract_in_force(tenant):
+      raise AdministrationDenied(409, "contract_superseded")
+    if row["supersedes"] == tenant_contracts.FIRST_CONTRACT_ID:
+      replaced = {"contract_superseded_by": contract_id}
+    else:
+      blocks = {**blocks, row["supersedes"]: {**blocks[row["supersedes"]], "superseded_by": contract_id}}
     self._assign_contract_nodes(account, tenant, row["nodes"])
     now = datetime.now(timezone.utc).isoformat()
     block = tenant_contracts.block_for(row, row["document"], row["generated"], account.account_id, now)

@@ -165,9 +165,16 @@ def block_for(row, signed, generated, actor_id, now):
           "supersedes": row["supersedes"], "superseded_by": None}
 
 
-def contract_entry(contract_id, contract, generated, effective, nodes, supersedes, superseded_by):
+def in_force(blocks):
+  """RM-249: the id of the contract in force: the highest-numbered further contract nobody replaced,
+  `c_1` when there is none. Every other contract is archived and authorizes nothing."""
+  open_ids = [contract_id for contract_id in sorted_ids(blocks) if blocks[contract_id]["superseded_by"] is None]
+  return open_ids[-1] if open_ids else FIRST_CONTRACT_ID
+
+
+def contract_entry(contract_id, contract, generated, effective, nodes, supersedes, superseded_by, archived=False):
   """One entry of the member-visible `contracts` list: hashes and dates, never a file name or ref."""
-  return {"contractId": contract_id, "state": "active", "sha256": contract["sha256"],
+  return {"contractId": contract_id, "state": "archived" if archived else "active", "sha256": contract["sha256"],
           "effectiveFrom": effective.get("effective_from"), "effectiveUntil": effective.get("effective_until"),
           "nodes": [{"nodeAddress": entry["node_address"], "mode": entry["mode"]} for entry in nodes],
           "generatedSha256": None if generated is None else generated["sha256"],

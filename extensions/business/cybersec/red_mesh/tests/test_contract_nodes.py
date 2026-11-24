@@ -233,18 +233,16 @@ class TestNodesFixedAfterActivation(_ContractNodesCase):
 
 class TestEngagementLaunchNodes(_ContractSetCase):
   """RM-211: an engagement launches on the nodes of its own contract that are live peers, and a
-  refusal names the nodes. The tenant's assignments are the union over its contracts."""
+  refusal names the nodes. The contract in force lists the tenant's nodes; an archived one launches nothing."""
 
-  def amended(self, fixed=True):
-    """`c_1` lists Node-A (or nothing, unless `fixed`), `c_2` lists Node-B: (tenant_id, e1 on c_1, e2 on c_2)."""
-    if fixed:
-      _, tenant_id = self.tenant("acme", nodes=[SHARED_A], fixed=True)
-    else:
-      _, tenant_id = self.tenant("acme", nodes=[SHARED_A])
-    ok(self, self.activate_contract(tenant_id, self.ready_contract(tenant_id, [PRIVATE_B])))
+  def amended(self):
+    """`c_1` lists Node-A, `c_2` replaces it and lists Node-B: (tenant_id, e1 on the archived c_1, e2 on c_2)."""
+    _, tenant_id = self.tenant("acme", nodes=[SHARED_A], fixed=True)
     self.store.grant("acme.admin", tenant_id)
+    first = ok(self, self.engagement(tenant_id))
+    ok(self, self.activate_contract(tenant_id, self.ready_contract(tenant_id, [PRIVATE_B])))
     self.service = self.admission_service()
-    return tenant_id, ok(self, self.engagement(tenant_id)), ok(self, self.engagement(tenant_id, contract_id="c_2"))
+    return tenant_id, first, ok(self, self.engagement(tenant_id, contract_id="c_2"))
 
   def launch_nodes(self, tenant_id, engagement):
     return ok(self, self.service.get_engagement_launch_nodes(self.actor, tenant_id, engagement["engagementId"]))["nodes"]
@@ -259,77 +257,75 @@ class TestEngagementLaunchNodes(_ContractSetCase):
     return self.service.resolve_execution_admission(
       self.actor, tenant_id, engagement["engagementId"], "ea_1", peers).to_dict()["selected_candidates"]
 
-  def test_each_engagement_sees_and_launches_on_its_own_contract_nodes_only(self):
+  def test_the_launch_set_of_the_contract_in_force_is_its_peers_only(self):
+    """RM-249: only the contract in force launches; the engagement on the archived `c_1` is refused."""
     tenant_id, first, second = self.amended()
-    self.assertEqual([(n["nodeAddress"], n["eligible"], n["reason"]) for n in self.launch_nodes(tenant_id, first)],
-                     [("Node-A", True, None)])
     self.assertEqual([(n["nodeAddress"], n["eligible"], n["reason"]) for n in self.launch_nodes(tenant_id, second)],
                      [("Node-B", True, None)])
-    self.assertEqual(set(self.launch_nodes(tenant_id, first)[0]), {"nodeAddress", "alias", "tags", "readiness", "eligible", "reason"})
-    self.assertEqual(self.admitted(tenant_id, first), ["Node-A"])
-    self.assertEqual(self.admitted(tenant_id, first, []), ["Node-A"])
+    self.assertEqual(set(self.launch_nodes(tenant_id, second)[0]), {"nodeAddress", "alias", "tags", "readiness", "eligible", "reason"})
     self.assertEqual(self.admitted(tenant_id, second), ["Node-B"])
     self.assertEqual(self.admitted(tenant_id, second, ["Node-B"]), ["Node-B"])
+    self.assertEqual(self.admitted(tenant_id, second, []), ["Node-B"])
+    refused(self, self.service.get_engagement_launch_nodes(self.actor, tenant_id, first["engagementId"]), 409, "contract_archived")
 
-  def test_a_live_peer_assigned_under_the_other_contract_is_refused_not_in_contract(self):
-    tenant_id, first, second = self.amended()
-    self.assertEqual(self.refusal(tenant_id, first, ["Node-B"]), [{"nodeAddress": "Node-B", "reason": "not_in_contract", "alias": None}])
+  def test_a_live_peer_assigned_under_the_archived_contract_is_refused_not_in_contract(self):
+    tenant_id, _, second = self.amended()
     self.assertEqual(self.refusal(tenant_id, second, ["Node-B", "Node-A"]),
                      [{"nodeAddress": "Node-A", "reason": "not_in_contract", "alias": None}])
 
   def test_a_contract_node_that_is_not_a_peer_is_left_out_and_named(self):
-    tenant_id, first, second = self.amended()
-    self.service.configured_peers_reader = lambda: ["Node-B", "Node-C"]
-    self.assertEqual([(n["nodeAddress"], n["eligible"], n["reason"]) for n in self.launch_nodes(tenant_id, first)],
-                     [("Node-A", False, "not_a_peer")])
-    self.assertEqual(self.refusal(tenant_id, first, ["Node-A"]), [{"nodeAddress": "Node-A", "reason": "not_a_peer", "alias": None}])
+    tenant_id, _, second = self.amended()
+    self.service.configured_peers_reader = lambda: ["Node-A", "Node-C"]
+    self.assertEqual([(n["nodeAddress"], n["eligible"], n["reason"]) for n in self.launch_nodes(tenant_id, second)],
+                     [("Node-B", False, "not_a_peer")])
+    self.assertEqual(self.refusal(tenant_id, second, ["Node-B"]), [{"nodeAddress": "Node-B", "reason": "not_a_peer", "alias": None}])
     # The empty set refuses an empty selection, with nothing to name.
-    self.assertEqual(self.refusal(tenant_id, first, None), [])
-    self.assertEqual(self.admitted(tenant_id, second), ["Node-B"])
+    self.assertEqual(self.refusal(tenant_id, second, None), [])
 
   def test_a_draining_or_released_contract_row_is_not_eligible(self):
-    tenant_id, first, second = self.amended()
+    tenant_id, _, second = self.amended()
     for key, reason in ((("draining", True), "draining"), (("active", False), "not_assigned")):
       with self.subTest(reason):
-        row = self.repo.get("tenant_node", tenant_id, "Node-A")
-        self.repo.put("tenant_node", tenant_id, "Node-A", record={**row, key[0]: key[1]})
-        self.assertEqual([(n["eligible"], n["reason"]) for n in self.launch_nodes(tenant_id, first)], [(False, reason)])
-        self.assertEqual(self.refusal(tenant_id, first, ["Node-A"])[0]["reason"], reason)
-        self.repo.put("tenant_node", tenant_id, "Node-A", record=row)
-    self.assertEqual(self.admitted(tenant_id, first), ["Node-A"])
-
-  def test_an_amended_node_less_contract_gets_no_node_listed_by_the_other_contract(self):
-    tenant_id, first, second = self.amended(fixed=False)
-    self.assertEqual([(n["nodeAddress"], n["eligible"]) for n in self.launch_nodes(tenant_id, first)], [("Node-A", True)])
-    self.assertEqual(self.admitted(tenant_id, first), ["Node-A"])
-    self.assertEqual(self.refusal(tenant_id, first, ["Node-B"]), [{"nodeAddress": "Node-B", "reason": "not_in_contract", "alias": None}])
-    self.assertEqual(self.refusal(tenant_id, first, ["Node-C"]), [{"nodeAddress": "Node-C", "reason": "not_assigned"}])
+        row = self.repo.get("tenant_node", tenant_id, "Node-B")
+        self.repo.put("tenant_node", tenant_id, "Node-B", record={**row, key[0]: key[1]})
+        self.assertEqual([(n["eligible"], n["reason"]) for n in self.launch_nodes(tenant_id, second)], [(False, reason)])
+        self.assertEqual(self.refusal(tenant_id, second, ["Node-B"])[0]["reason"], reason)
+        self.repo.put("tenant_node", tenant_id, "Node-B", record=row)
     self.assertEqual(self.admitted(tenant_id, second), ["Node-B"])
+
+  def test_a_node_less_first_contract_in_force_keeps_its_hand_assigned_nodes(self):
+    _, tenant_id = self.tenant("acme", nodes=[SHARED_A])
+    self.store.grant("acme.admin", tenant_id)
+    self.service = self.admission_service()
+    engagement = ok(self, self.engagement(tenant_id))
+    self.assertEqual([(n["nodeAddress"], n["eligible"]) for n in self.launch_nodes(tenant_id, engagement)], [("Node-A", True)])
+    self.assertEqual(self.admitted(tenant_id, engagement), ["Node-A"])
+    self.assertEqual(self.refusal(tenant_id, engagement, ["Node-C"]), [{"nodeAddress": "Node-C", "reason": "not_assigned"}])
 
   def test_the_launch_nodes_carry_readiness_from_the_peer_set_and_the_monitor(self):
     """RM-212: a listed node that is not a peer reads `not_in_deployment` (the ven4 case) even when online."""
-    tenant_id, first, _ = self.amended()
+    tenant_id, _, second = self.amended()
     self.service.node_directory_reader = lambda addresses: {
       address: {"alias": None, "tags": [], "ip": None, "online": True, "last_seen": "2026-11-23T01:00:00+00:00"}
       for address in addresses}
-    self.assertEqual(self.launch_nodes(tenant_id, first)[0]["readiness"], {
+    self.assertEqual(self.launch_nodes(tenant_id, second)[0]["readiness"], {
       "online": True, "lastSeen": "2026-11-23T01:00:00+00:00", "inDeployment": True, "state": "ready"})
-    self.service.configured_peers_reader = lambda: ["Node-B"]
-    self.assertEqual(self.launch_nodes(tenant_id, first)[0]["readiness"], {
+    self.service.configured_peers_reader = lambda: ["Node-A"]
+    self.assertEqual(self.launch_nodes(tenant_id, second)[0]["readiness"], {
       "online": True, "lastSeen": "2026-11-23T01:00:00+00:00", "inDeployment": False, "state": "not_in_deployment"})
 
   def test_the_refusal_names_an_alias_only_inside_the_contract_and_the_assignments(self):
-    tenant_id, first, _ = self.amended()
+    tenant_id, _, second = self.amended()
     self.service.node_directory_reader = lambda addresses: {
       address: {"alias": "alias-" + address, "tags": ["t"]} for address in addresses}
-    nodes = self.refusal(tenant_id, first, ["Node-B", "Node-C"])
-    self.assertEqual(nodes, [{"nodeAddress": "Node-B", "reason": "not_in_contract", "alias": "alias-Node-B"},
+    nodes = self.refusal(tenant_id, second, ["Node-A", "Node-C"])
+    self.assertEqual(nodes, [{"nodeAddress": "Node-A", "reason": "not_in_contract", "alias": "alias-Node-A"},
                              {"nodeAddress": "Node-C", "reason": "not_in_contract"}])
-    self.assertEqual(self.launch_nodes(tenant_id, first)[0]["alias"], "alias-Node-A")
+    self.assertEqual(self.launch_nodes(tenant_id, second)[0]["alias"], "alias-Node-B")
     # A released past node is no longer an assignment of the tenant, so it gets no alias either.
-    row = self.repo.get("tenant_node", tenant_id, "Node-B")
-    self.repo.put("tenant_node", tenant_id, "Node-B", record={**row, "active": False})
-    self.assertEqual(self.refusal(tenant_id, first, ["Node-B"]), [{"nodeAddress": "Node-B", "reason": "not_in_contract"}])
+    row = self.repo.get("tenant_node", tenant_id, "Node-A")
+    self.repo.put("tenant_node", tenant_id, "Node-A", record={**row, "active": False})
+    self.assertEqual(self.refusal(tenant_id, second, ["Node-A"]), [{"nodeAddress": "Node-A", "reason": "not_in_contract"}])
 
   def test_the_read_refuses_a_revoked_or_expired_engagement(self):
     tenant_id, first, second = self.amended()

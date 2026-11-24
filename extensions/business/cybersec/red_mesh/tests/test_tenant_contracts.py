@@ -8,6 +8,7 @@ import hashlib
 import json
 from uuid import uuid4
 
+from extensions.business.cybersec.red_mesh.tenancy.administration import _contract_in_force
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
 from extensions.business.cybersec.red_mesh.services.tenant_contract import (
   ContractRefused, resolve_contract, resolve_draft_document, resolve_engagement_pack, resolve_tenant_contract_document)
@@ -31,8 +32,12 @@ ENTRY_KEYS = {"contractId", "state", "sha256", "effectiveFrom", "effectiveUntil"
 
 
 class _ContractSetCase(_SetupCase):
-  def contract_draft(self, tenant_id, request_id=None, actor=None):
-    return self.plugin.create_tenant_contract_draft(actor or self.actor, tenant_id, request_id or str(uuid4()))
+  def contract_draft(self, tenant_id, request_id=None, actor=None, supersedes=True):
+    """RM-249: an amendment, by default of the contract in force; `supersedes=None` sends none."""
+    if supersedes is True:
+      supersedes = _contract_in_force(self.repo.get("tenant", tenant_id))
+    return self.plugin.create_tenant_contract_draft(
+      actor or self.actor, tenant_id, request_id or str(uuid4()), supersedes=supersedes)
 
   def update_contract(self, tenant_id, contract_id, changes, actor=None):
     return self.plugin.update_tenant_contract_draft(actor or self.actor, tenant_id, contract_id, changes)
@@ -93,9 +98,10 @@ class TestNumbering(_ContractSetCase):
   def test_ids_are_allocated_from_the_tenant_counter_and_never_reused(self):
     _, tenant_id = self.tenant("acme", fixed=True)
     first = ok(self, self.contract_draft(tenant_id))
-    self.assertEqual((first["contract_id"], first["state"], first["nodes"], first["supersedes"]), ("c_2", "missing", [], None))
+    self.assertEqual((first["contract_id"], first["state"], first["nodes"], first["supersedes"]), ("c_2", "missing", [SHARED_C], "c_1"))
     self.assertEqual(set(first) - {"completeness"}, DRAFT_KEYS)
-    self.assertEqual(first["completeness"]["missing"], ["field:effective_from", "field:nodes", "item:contract"])
+    # RM-249: an amendment is prefilled from the contract it continues, so only the contract is missing.
+    self.assertEqual(first["completeness"]["missing"], ["item:contract"])
     second = ok(self, self.contract_draft(tenant_id))
     self.assertEqual(second["contract_id"], "c_3")
     self.assertEqual(self.tenant_row(tenant_id)["next_contract_no"], 4)
@@ -198,7 +204,7 @@ class TestLifecycle(_ContractSetCase):
     self.assertEqual((block["contract"], block["contract_generated"]["nodes"], block["effective_from"],
                       block["effective_until"], block["nodes"], block["activated_by"], block["supersedes"], block["superseded_by"]),
                      (signed["document"], [SHARED_A, PRIVATE_B], "2027-01-01", "2027-12-31", [SHARED_A, PRIVATE_B],
-                      "creator", None, None))
+                      "creator", "c_1", None))
     self.assertIsNone(self.stored_contract(tenant_id, contract_id))
     self.assertEqual(self.node_rows(tenant_id), [("Node-A", "shared", True), ("Node-B", "private", True)])
     # `c_1` is untouched: its fields, its receipt binding and every existing reader.
@@ -220,13 +226,14 @@ class TestLifecycle(_ContractSetCase):
         self.assertEqual([entry["contractId"] for entry in contracts], ["c_1", contract_id])
         for entry in contracts:
           self.assertEqual(set(entry), ENTRY_KEYS)
-          self.assertEqual(entry["state"], "active")
+        # RM-249: the replaced `c_1` is archived, the contract in force active.
+        self.assertEqual([entry["state"] for entry in contracts], ["archived", "active"])
         self.assertEqual(contracts[0]["nodes"], [{"nodeAddress": "Node-A", "mode": "shared"}])
         self.assertEqual(contracts[0]["effectiveFrom"], "2026-11-01")
         self.assertEqual(contracts[1]["nodes"], [{"nodeAddress": "Node-A", "mode": "shared"}, {"nodeAddress": "Node-B", "mode": "private"}])
         self.assertEqual((contracts[1]["effectiveFrom"], contracts[1]["sha256"]),
                          ("2027-01-01", hashlib.sha256(SIGNED_2).hexdigest()))
-        self.assertEqual((contracts[1]["supersedes"], contracts[1]["supersededBy"]), (None, None))
+        self.assertEqual((contracts[1]["supersedes"], contracts[1]["supersededBy"]), ("c_1", None))
     # The file name and the download stay on the platform-only per-contract read.
     record = ok(self, self.plugin.get_tenant_contract(self.actor, tenant_id, contract_id))
     self.assertEqual((record["contract"]["filename"], record["contract_id"], record["nodes"], record["framework_agreement"]),
@@ -245,7 +252,7 @@ class TestLifecycle(_ContractSetCase):
     writes = len(self.store.writes)
     result = self.activate_contract(tenant_id, contract_id)
     refused(self, result, 409, "draft_incomplete")
-    self.assertEqual(result["missing"], ["field:effective_from", "field:nodes", "item:contract"])
+    self.assertEqual(result["missing"], ["item:contract"])
     ok(self, self.update_contract(tenant_id, contract_id, {"effective_from": "2027-01-01", "nodes": [SHARED_C]}))
     ok(self, self.upload_contract(tenant_id, contract_id))
     # Signed without a generated pack: stale.
@@ -339,9 +346,11 @@ class TestNodesAcrossTheSet(_ContractSetCase):
     second = self.ready_contract(tenant_id, [SHARED_A])
     ok(self, self.activate_contract(tenant_id, second))
     self.assertEqual(ok(self, self.plugin.get_tenant_nodes(self.actor, tenant_id))["nodesFixed"], True)
-    refused(self, self.plugin.set_tenant_node_assignment(self.actor, tenant_id, "Node-C", False), 409, "nodes_fixed_by_contract")
+    refused(self, self.assign(tenant_id, "Node-D"), 409, "nodes_fixed_by_contract")
     # An assignment the tenant already holds is still answered.
     self.assertEqual(ok(self, self.assign(tenant_id, "Node-A"))["state"], "assigned")
+    # RM-249: a node the contract in force lists cannot be released by hand (retired release: test_contract_in_force).
+    refused(self, self.plugin.set_tenant_node_assignment(self.actor, tenant_id, "Node-A", False), 409, "nodes_fixed_by_contract")
 
   def test_a_private_plan_holds_the_node_from_the_plan_write_until_the_draft_goes(self):
     _, tenant_id = self.tenant("acme", nodes=[SHARED_A], fixed=True)
@@ -409,29 +418,21 @@ class TestEngagementsPickAContract(_ContractSetCase):
   def test_an_engagement_binds_to_the_picked_contract_and_replays(self):
     tenant_id, contract_id = self.second_contract_tenant()
     tenant = self.tenant_row(tenant_id)
-    first = ok(self, self.engagement(tenant_id))
-    self.assertEqual(first["contractSha256"], tenant["contract"]["sha256"])
     request_id = str(uuid4())
     second = ok(self, self.engagement(tenant_id, request_id, contract_id=contract_id))
     self.assertEqual(second["contractSha256"], tenant["contracts"][contract_id]["contract"]["sha256"])
     self.assertEqual(second["contractId"], contract_id)  # RM-248: the read names the contract
     # Replays: the intent carries the pick only when it was sent.
     self.assertEqual(ok(self, self.engagement(tenant_id, request_id, contract_id=contract_id))["replayed"], True)
-    refused(self, self.engagement(tenant_id, request_id), 409, "conflict")
-    pre_upgrade = str(uuid4())
-    ok(self, self.engagement(tenant_id, pre_upgrade))
-    self.assertEqual(ok(self, self.engagement(tenant_id, pre_upgrade))["replayed"], True)
+    refused(self, self.engagement(tenant_id, request_id), 409, "contract_superseded")
     for label, bad in {"unknown": "c_9", "malformed": "two", "first id spelled": "c_01"}.items():
       with self.subTest(label):
         refused(self, self.engagement(tenant_id, contract_id=bad), 400, "contract_unknown")
-    # `c_1` spelled out is the default.
-    self.assertEqual(ok(self, self.engagement(tenant_id, contract_id="c_1"))["contractSha256"], tenant["contract"]["sha256"])
-    # The launch gate accepts both contracts of the set.
+    # `c_1` spelled out is the default, and archived.
+    refused(self, self.engagement(tenant_id, contract_id="c_1"), 409, "contract_superseded")
     service = self.admission_service()
     self.store.grant("acme.admin", tenant_id)
-    for engagement in (first, second):
-      with self.subTest(engagement["engagementId"]):
-        service.resolve_execution_admission(self.actor, tenant_id, engagement["engagementId"], "ea_1")
+    service.resolve_execution_admission(self.actor, tenant_id, second["engagementId"], "ea_1")
     # A sha256 outside the set is a damaged record.
     row = self.repo.get("engagement", tenant_id, second["engagementId"])
     self.store.data[(TENANCY_HKEY, json.dumps(["engagement", "deployment", tenant_id, second["engagementId"]], separators=(",", ":")))] = \
@@ -449,8 +450,7 @@ class TestEngagementsPickAContract(_ContractSetCase):
     picked = ok(self, self.update_child(child, {"contract_id": contract_id}))
     self.assertEqual(picked["contract_id"], contract_id)
     self.assertEqual(self.stored_child(child)["contract_id"], contract_id)
-    self.assertIsNone(ok(self, self.update_child(child, {"contract_id": ""}))["contract_id"])
-    ok(self, self.update_child(child, {"contract_id": contract_id}))
+    refused(self, self.update_child(child, {"contract_id": ""}), 409, "contract_superseded")
     # Under a tenant draft there is one contract: no pick.
     draft_id = self.create()["draft_id"]
     under_draft = self.child(draft_id)["engagement_draft_id"]
@@ -484,68 +484,65 @@ class TestRevisions(_ContractSetCase):
 
   def test_a_revision_is_prefilled_from_the_contract_it_replaces(self):
     tenant_id, second = self.second_contract_tenant(nodes=[SHARED_A, PRIVATE_B])
-    draft = ok(self, self.plugin.create_tenant_contract_draft(self.actor, tenant_id, str(uuid4()), supersedes="c_1"))
-    self.assertEqual((draft["contract_id"], draft["supersedes"], draft["nodes"], draft["state"]), ("c_3", "c_1", [SHARED_A], "missing"))
+    draft = ok(self, self.plugin.create_tenant_contract_draft(self.actor, tenant_id, str(uuid4()), supersedes=second))
+    self.assertEqual((draft["contract_id"], draft["supersedes"], draft["nodes"], draft["state"]),
+                     ("c_3", second, [SHARED_A, PRIVATE_B], "missing"))
     self.assertEqual(draft["effective_from"], datetime.now(timezone.utc).date().isoformat())
     self.assertIsNone(draft["effective_until"])
-    other = ok(self, self.plugin.create_tenant_contract_draft(self.actor, tenant_id, str(uuid4()), supersedes=second))
-    self.assertEqual((other["supersedes"], other["nodes"]), (second, [SHARED_A, PRIVATE_B]))
     rows = ok(self, self.plugin.list_tenant_contract_drafts(self.actor, tenant_id))
-    self.assertEqual([(row["contract_id"], row["supersedes"]) for row in rows], [("c_3", "c_1"), ("c_4", second)])
+    self.assertEqual([(row["contract_id"], row["supersedes"]) for row in rows], [("c_3", second)])
     refused(self, self.plugin.create_tenant_contract_draft(self.actor, tenant_id, str(uuid4()), supersedes="c_9"), 400, "contract_unknown")
     refused(self, self.plugin.create_tenant_contract_draft(self.actor, tenant_id, str(uuid4()), supersedes="nine"), 400, "contract_unknown")
-    # A plain further contract (no `supersedes`) starts empty, as before.
-    plain = ok(self, self.plugin.create_tenant_contract_draft(self.actor, tenant_id, str(uuid4()), supersedes=""))
-    self.assertEqual((plain["supersedes"], plain["nodes"], plain["effective_from"]), (None, [], None))
 
-  def test_activation_links_both_contracts_and_the_old_one_keeps_its_engagements(self):
+  def test_a_further_draft_continues_the_contract_in_force(self):
+    """RM-249: no `supersedes` is `supersedes_required`; an archived contract cannot be continued."""
+    tenant_id, second = self.second_contract_tenant()
+    for label, supersedes in {"none": None, "empty": ""}.items():
+      with self.subTest(label):
+        refused(self, self.contract_draft(tenant_id, supersedes=supersedes), 400, "supersedes_required")
+    refused(self, self.contract_draft(tenant_id, supersedes="c_1"), 409, "contract_superseded")
+    self.assertEqual(ok(self, self.contract_draft(tenant_id, supersedes=second))["supersedes"], second)
+
+  def test_activation_links_both_contracts_and_the_old_one_authorizes_nothing(self):
     tenant_id, second = self.second_contract_tenant(nodes=[SHARED_A])
-    old = ok(self, self.engagement(tenant_id))
     picked = ok(self, self.engagement(tenant_id, contract_id=second))
-    revision = self.revision(tenant_id, "c_1")
+    revision = self.revision(tenant_id, second)
     ok(self, self.activate_contract(tenant_id, revision["contract_id"]))
+    third = revision["contract_id"]
     tenant = self.tenant_row(tenant_id)
-    self.assertEqual(tenant["contract_superseded_by"], revision["contract_id"])
-    self.assertEqual(tenant["contracts"][revision["contract_id"]]["supersedes"], "c_1")
-    self.assertIsNone(tenant["contracts"][revision["contract_id"]]["superseded_by"])
+    self.assertEqual(tenant["contracts"][second]["superseded_by"], third)
+    self.assertEqual(tenant["contracts"][third]["supersedes"], second)
+    self.assertIsNone(tenant["contracts"][third]["superseded_by"])
     contracts = ok(self, self.plugin.get_tenant(self.actor, tenant_id))["contracts"]
-    self.assertEqual([(entry["contractId"], entry["supersedes"], entry["supersededBy"]) for entry in contracts],
-                     [("c_1", None, revision["contract_id"]), (second, None, None), (revision["contract_id"], "c_1", None)])
-    self.assertEqual(ok(self, self.plugin.get_tenant_contract(self.actor, tenant_id))["superseded_by"], revision["contract_id"])
-    # The old engagements still launch under the replaced contract; a new one on it is refused.
-    service = self.admission_service()
-    for engagement in (old, picked):
-      service.resolve_execution_admission(self.actor, tenant_id, engagement["engagementId"], "ea_1")
+    self.assertEqual([(entry["contractId"], entry["supersedes"], entry["supersededBy"], entry["state"]) for entry in contracts],
+                     [("c_1", None, second, "archived"), (second, "c_1", third, "archived"), (third, second, None, "active")])
+    self.assertEqual(ok(self, self.plugin.get_tenant_contract(self.actor, tenant_id))["superseded_by"], second)
+    # RM-249: the engagement on the replaced contract is flagged and cannot launch; a new one on it is refused.
+    self.assertIs(ok(self, self.plugin.get_engagement(self.actor, tenant_id, picked["engagementId"]))["engagement"]["contractArchived"], True)
     refused(self, self.engagement(tenant_id), 409, "contract_superseded")
-    refused(self, self.engagement(tenant_id, contract_id="c_1"), 409, "contract_superseded")
-    self.assertEqual(ok(self, self.engagement(tenant_id, contract_id=revision["contract_id"]))["contractSha256"],
-                     tenant["contracts"][revision["contract_id"]]["contract"]["sha256"])
-    # Nothing is released: the union still holds c_1's node.
+    refused(self, self.engagement(tenant_id, contract_id=second), 409, "contract_superseded")
+    on_third = ok(self, self.engagement(tenant_id, contract_id=third))
+    self.assertEqual(on_third["contractSha256"], tenant["contracts"][third]["contract"]["sha256"])
+    self.assertIs(on_third["contractArchived"], False)
     self.assertEqual(self.node_rows(tenant_id), [("Node-A", "shared", True)])
     refused(self, self.plugin.set_tenant_node_assignment(self.actor, tenant_id, "Node-A", False), 409, "nodes_fixed_by_contract")
-    # A further contract (`c_2`) can be revised too: the block carries the link.
-    again = self.revision(tenant_id, second, signed=b"%PDF-1.7\n%five\n%%EOF\n", generated=b"%PDF-1.7\n%gen five\n%%EOF\n")
-    ok(self, self.activate_contract(tenant_id, again["contract_id"]))
-    tenant = self.tenant_row(tenant_id)
-    self.assertEqual(tenant["contracts"][second]["superseded_by"], again["contract_id"])
-    refused(self, self.engagement(tenant_id, contract_id=second), 409, "contract_superseded")
 
   def test_a_contract_is_replaced_once_and_a_revision_of_a_replaced_one_is_refused(self):
-    tenant_id, _ = self.second_contract_tenant()
-    first = self.revision(tenant_id, "c_1")
-    rival = self.revision(tenant_id, "c_1", signed=b"%PDF-1.7\n%rival\n%%EOF\n", generated=b"%PDF-1.7\n%gen rival\n%%EOF\n")
+    tenant_id, second = self.second_contract_tenant()
+    first = self.revision(tenant_id, second)
+    rival = self.revision(tenant_id, second, signed=b"%PDF-1.7\n%rival\n%%EOF\n", generated=b"%PDF-1.7\n%gen rival\n%%EOF\n")
     ok(self, self.activate_contract(tenant_id, first["contract_id"]))
     tenant_before = self.tenant_row(tenant_id)
     refused(self, self.activate_contract(tenant_id, rival["contract_id"]), 409, "contract_superseded")
     self.assertEqual(self.tenant_row(tenant_id), tenant_before)
     self.assertIsNotNone(self.stored_contract(tenant_id, rival["contract_id"]))
-    refused(self, self.plugin.create_tenant_contract_draft(self.actor, tenant_id, str(uuid4()), supersedes="c_1"), 409, "contract_superseded")
+    refused(self, self.contract_draft(tenant_id, supersedes=second), 409, "contract_superseded")
 
   def test_an_engagement_draft_on_a_replaced_contract_stays_editable_and_is_re_pointed(self):
     tenant_id, second = self.second_contract_tenant()
     child = self.child(tenant_id)["engagement_draft_id"]
-    ok(self, self.update_child(child, {"contract_id": "c_1"}))
-    revision = self.revision(tenant_id, "c_1")
+    ok(self, self.update_child(child, {"contract_id": second}))
+    revision = self.revision(tenant_id, second)
     ok(self, self.activate_contract(tenant_id, revision["contract_id"]))
     # Other fields still save; activation on the replaced contract is refused; a re-pick activates.
     self.fill(child)
@@ -556,9 +553,9 @@ class TestRevisions(_ContractSetCase):
     activated = ok(self, self.plugin.activate_engagement_draft(self.actor, child))
     engagement = ok(self, self.plugin.get_engagement(self.actor, tenant_id, activated["engagementId"]))["engagement"]
     self.assertEqual(engagement["contractSha256"], self.tenant_row(tenant_id)["contracts"][revision["contract_id"]]["contract"]["sha256"])
-    # A re-pick onto the replaced contract is refused on the write, spelled out or empty (`c_1`).
+    # A re-pick onto a replaced contract is refused on the write, spelled out or empty (`c_1`).
     other = self.child(tenant_id)["engagement_draft_id"]
-    refused(self, self.update_child(other, {"contract_id": "c_1"}), 409, "contract_superseded")
+    refused(self, self.update_child(other, {"contract_id": second}), 409, "contract_superseded")
     refused(self, self.update_child(other, {"contract_id": ""}), 409, "contract_superseded")
     refused(self, self.update_child(other, {"contract_id": None}), 409, "contract_superseded")
     ok(self, self.update_child(other, {"display_name": "Still editable"}))
