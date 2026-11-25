@@ -357,6 +357,9 @@ class TestSessionToken(unittest.TestCase):
     inc = [f for f in probe.findings if f.scenario_id == "PT-A02-06" and f.status == "inconclusive"]
     self.assertEqual(len(inc), 1)
     self.assertEqual(inc[0].severity, "LOW")
+    # The evidence names the cookie, not its value, so redaction keeps it (RM-273 Phase C).
+    from extensions.business.cybersec.red_mesh.graybox.findings import scrub_graybox_secrets
+    self.assertIn("short_session_cookie=sid", scrub_graybox_secrets(inc[0].evidence)[0])
 
   def test_session_token_adequate(self):
     """Normal tokens → not_vulnerable."""

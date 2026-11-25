@@ -421,7 +421,7 @@ class MisconfigProbes(ProbeBase):
           pass
 
       if len(value) < 16 and any(c.isalnum() for c in value):
-        evidence.append(f"short_session_token={name}; length={len(value)}")
+        evidence.append(f"short_session_cookie={name}; length={len(value)}")
         if status == "not_vulnerable":
           status = "inconclusive"
 

@@ -336,6 +336,67 @@ class TestScrubGenericPatterns(unittest.TestCase):
     self.assertIn("foo=bar", out)
 
 
+class TestScrubNamedSecretShapes(unittest.TestCase):
+
+  SECRET_SHAPES = (
+    ("camel_access_token", 'accessToken=abc123', "abc123"),
+    ("camel_api_key", "?apiKey=abc123&x=1", "abc123"),
+    ("camel_client_secret", 'clientSecret: abc123', "abc123"),
+    ("camel_session_id", '{"sessionId": "abc123"}', "abc123"),
+    ("python_repr", "{'password': 'abc123'}", "abc123"),
+    ("spaced_quoted_value", 'password = "abc123"', "abc123"),
+    ("quoted_key_spaced", '"token" : "abc123"', "abc123"),
+    ("colon_bare", "token: abc123", "abc123"),
+    ("hyphen_header_name", "x-api-key=abc123", "abc123"),
+    ("after_non_secret_key", "Error: password=abc123", "abc123"),
+    ("inside_endpoint_url", "endpoint=https://h/cb?api_key=abc123&x=1", "abc123"),
+    ("long_prefix", ("x" * 100) + "_password=abc123", "abc123"),
+    ("key_prefix_over_256", ("x" * 300) + "_password=abc123", "abc123"),
+    ("bare_value_through_bracket", "password=ab)c}d]e", ")c}d]e"),
+    ("repr_quoted_leading_space", "{'password': ' abc123'}", "abc123"),
+    ("quoted_leading_space", '{"password": " abc123"}', "abc123"),
+    ("quoted_over_cap", '{"password": "' + "s" * 5000 + 'TAIL"}', "TAIL"),
+    ("bare_over_cap", "password=" + "s" * 5000 + "TAIL&x=1", "TAIL"),
+    ("unclosed_quote_to_end", 'password="' + "s" * 5000 + "TAIL", "TAIL"),
+    ("single_quote_not_closing", "password='hunter2'SECRET", "SECRET"),
+    ("empty_single_quote_then_value", "password=''SECRET", "SECRET"),
+    ("empty_double_quote_then_value", 'password=""SECRET', "SECRET"),
+    ("repr_both_quote_kinds", """{'password': 'a\\'b"cSECRET'}""", "SECRET"),
+    ("json_escaped_quote", '{"password": "ab\\"cdSECRET"}', "SECRET"),
+    ("aligned_separator", '{"password"          :          "SECRET"}', "SECRET"),
+  )
+  UNCHANGED = (
+    "username=admin",
+    "monkey=banana",
+    "tokens_remaining=5",
+    "keep: this",
+    '{"name": "alice"}',
+    "password=<redacted>",
+    '{"token": "<redacted>"}',
+    "short_session_cookie=sid; length=6",
+  )
+
+  def test_secret_shapes_redacted(self):
+    for label, text, secret in self.SECRET_SHAPES:
+      with self.subTest(label):
+        out = scrub_graybox_secrets(text)
+        self.assertNotIn(secret, out)
+        self.assertIn("<redacted>", out)
+        self.assertEqual(scrub_graybox_secrets(out), out)
+
+  def test_non_secret_names_unchanged(self):
+    for text in self.UNCHANGED:
+      with self.subTest(text):
+        self.assertEqual(scrub_graybox_secrets(text), text)
+
+  def test_pathological_input_is_fast(self):
+    import time
+    start = time.monotonic()
+    scrub_graybox_secrets("a" * 200000 + " " + "a=" * 50000 + "token" * 20000)
+    scrub_graybox_secrets('password="' * 50000 + "token=" * 50000 + "x" * 200000)
+    self.assertLess(time.monotonic() - start, 5)
+
+
 class TestScrubConfiguredNames(unittest.TestCase):
 
   def test_custom_header_redacted(self):
