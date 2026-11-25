@@ -1485,7 +1485,7 @@ class TestRealSqli(unittest.TestCase):
                      ReflectiveEndpoint(path="/b/", param="q")])
     probe.auth.primary_session.get = MagicMock(
       return_value=_mock_response(text="ok"))
-    probe.budget = MagicMock(side_effect=[True, True, True, False])
+    probe.budget_available = MagicMock(side_effect=[True, True, True, False])
     probe._test_sqli_get()
     self.assertEqual(probe.auth.primary_session.get.call_count, 3)
     self.assertEqual(len(probe.findings), 1)
@@ -1717,9 +1717,9 @@ class TestRealSqli(unittest.TestCase):
     probe = _make_probe()
     probe.auth.detected_csrf_field = "csrf_token"
     session = MagicMock()
-    session.get.return_value = _mock_response(text="x")
+    from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudgetExhausted
+    session.get.side_effect = RequestBudgetExhausted()  # the client refuses the CSRF GET
     session.post.return_value = _mock_response(text="x")
-    probe.budget = MagicMock(side_effect=[True, False])  # request ok, CSRF GET refused
     send, prepare = probe._sqli_send_post(session, "http://t/x", {"q": "test"}, "q", "http://t/x")
     outcome = probe._sqli_run("PT-A03-01", "http://t/x", "q", send, "POST", True,
                               prepare=prepare)
@@ -1739,7 +1739,7 @@ class TestRealSqli(unittest.TestCase):
     def budget():
       calls["n"] += 1
       return calls["n"] < 3
-    probe.budget = budget
+    probe.budget_available = budget
     probe._test_authenticated_injection()
     probe._test_sqli_get()
     stops = [f for f in probe.findings

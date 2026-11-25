@@ -261,7 +261,10 @@ class AuthManager:
       closed.add(id(session))
       try:
         if logout_url:
-          session.get(logout_url, timeout=5)
+          # Cleanup is exempt from the request budget (it still counts); a bare
+          # requests session, with no client, does not take the kwarg.
+          extra = {"budget_exempt": True} if self.http_client is not None else {}
+          session.get(logout_url, timeout=5, **extra)
       except requests.RequestException:
         pass
       finally:

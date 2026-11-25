@@ -931,10 +931,10 @@ class ApiSecurityConfig:
     "/debug", "/api/debug", "/api/_routes",
     "/actuator", "/actuator/env", "/q/dev", "/__debug__",
   ])
-  # OWASP API Top 10 — Subphase 1.7. Per-scan request budget cap. Each
-  # `ProbeBase.budget()` call decrements a shared `RequestBudget`; once
-  # exhausted, probes emit `inconclusive` with reason `budget_exhausted`
-  # rather than continuing to issue requests.
+  # OWASP API Top 10 — Subphase 1.7. Per-scan request budget cap. Every HTTP
+  # request `GrayboxHttpClient` sends (each redirect hop included) decrements a
+  # shared `RequestBudget`; once exhausted the client refuses further requests
+  # and the affected scenarios end `inconclusive` with reason `budget_exhausted`.
   max_total_requests: int = 1000
 
   @classmethod

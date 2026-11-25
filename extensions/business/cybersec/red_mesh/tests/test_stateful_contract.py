@@ -214,18 +214,25 @@ class TestRunStatefulHappyPath(unittest.TestCase):
     self.assertEqual(f.rollback_status, "reverted")
 
   def test_cleanup_revert_not_blocked_by_exhausted_probe_budget(self):
+    from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient
     p = _make_probe(allow_stateful=True)
     p.request_budget = RequestBudget(remaining=0, total=0)
+    client = GrayboxHttpClient("http://x", request_budget=p.request_budget,
+                               allow_private_targets=True)
+    session = MagicMock()
+    session.request.return_value = MagicMock(status_code=200)
 
     p.run_stateful(
       "PT-OAPI3-02",
       baseline_fn=lambda: None,
       mutate_fn=lambda b: True,
       verify_fn=lambda b: True,
-      revert_fn=lambda b: p.cleanup_budget(),
+      revert_fn=lambda b: client.request(
+        session, "POST", "/revert", budget_exempt=True).status_code == 200,
       finding_kwargs={"title": "Mass assignment", "owasp": "API3:2023"},
     )
 
+    self.assertEqual(session.request.call_count, 1)
     self.assertEqual(p.findings[0].status, "vulnerable")
     self.assertEqual(p.findings[0].rollback_status, "reverted")
 

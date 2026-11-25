@@ -369,7 +369,8 @@ class TestBoundGrayboxHttpClient(unittest.TestCase):
           scoped.post("/api/public/revert", allow_redirects=True, budget_exempt=True)
         self.assertEqual([request.url for request in transport.sent],
                          ["https://target.example/api/public/revert"])
-        self.assertEqual(budget.remaining, 0)
+        # The exempt revert hop is admitted on an empty budget and still charged.
+        self.assertEqual(budget.remaining, -1)
 
   def test_bound_cleanup_can_finish_in_scope_after_budget_exhaustion(self):
     from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
@@ -715,22 +716,25 @@ class TestGrayboxHttpClient(unittest.TestCase):
     self.assertEqual(list(result.history), [])
 
   def test_a_chain_cut_short_by_the_budget_still_reports_its_hops(self):
-    """Budget exhaustion returns the last response we did fetch, chain intact."""
-    from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
+    """A chain cut short by the budget raises: a refused hop is never answered
+    with the 3xx as if it were the destination (it used to be)."""
+    from extensions.business.cybersec.red_mesh.graybox.budget import (
+      RequestBudget, RequestBudgetExhausted,
+    )
     client = private_ok_client(
       "https://target.local",
       allowlist=["/a/", "/b/", "/c/"],
-      # The probe already paid for hop 0, so nothing is left for the redirect.
-      request_budget=RequestBudget(remaining=0, total=1),
+      # Hop 0 takes the only request; nothing is left for the redirect.
+      request_budget=RequestBudget(remaining=1, total=1),
     )
     session = MagicMock()
     first = MagicMock(status_code=302, headers={"Location": "/b/"})
     session.request.side_effect = [first]
 
-    result = client.request(session, "GET", "/a/", allow_redirects=True)
+    with self.assertRaises(RequestBudgetExhausted):
+      client.request(session, "GET", "/a/", allow_redirects=True)
 
-    self.assertIs(result, first)
-    self.assertEqual(list(result.history), [])
+    self.assertEqual(session.request.call_count, 1)
 
   def test_probe_modules_do_not_call_requests_directly(self):
     root = Path("extensions/business/cybersec/red_mesh/graybox/probes")
@@ -871,15 +875,14 @@ class TestRequestUrlBasePathMatrix(unittest.TestCase):
 
 class TestRedirectHopBudgetAccounting(unittest.TestCase):
   """
-  A probe consults the shared budget once per logical call, then
-  `GrayboxHttpClient.request` follows up to five redirects — each a real HTTP
-  request that nobody counted. Measured: one redirecting call issued 5 requests
-  against a single consume, so `budget_remaining` over-reported by 4 and the cap
-  that exists to stop the scanner DoSing a target could be exceeded five-fold by
-  a target that simply redirects.
+  `GrayboxHttpClient.request` follows up to five redirects, each a real HTTP
+  request. Measured once: one redirecting call issued 5 requests against a
+  single consume, so `budget_remaining` over-reported by 4 and the cap that
+  exists to stop the scanner DoSing a target could be exceeded five-fold by a
+  target that simply redirects.
 
-  Only the *extra* hops are charged here. The probe's own consume covers the
-  first request, so charging it again would double-count every ordinary call.
+  The client now charges every hop it issues, the first included, and a refused
+  hop raises instead of returning the 3xx.
   """
 
   def _redirecting_session(self, hops):
@@ -904,34 +907,35 @@ class TestRedirectHopBudgetAccounting(unittest.TestCase):
     client = private_ok_client("https://h", allowlist=["h"], request_budget=budget)
     session, calls = self._redirecting_session(hops=4)
     client.request(session, "GET", "https://h/start", allow_redirects=True)
-    # 5 real requests: the first plus 4 hops. The probe would have consumed the
-    # first, so the client charges the 4 extra.
+    # 5 real requests: the first plus 4 hops, each charged.
     self.assertEqual(calls["n"], 5)
-    self.assertEqual(budget.remaining, 10 - 4)
+    self.assertEqual(budget.remaining, 10 - 5)
 
   def test_a_chain_stops_when_the_budget_runs_out(self):
     from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
     budget = RequestBudget(remaining=2, total=10)
     client = private_ok_client("https://h", allowlist=["h"], request_budget=budget)
     session, calls = self._redirecting_session(hops=4)
-    client.request(session, "GET", "https://h/start", allow_redirects=True)
-    # First request, then only as many hops as the budget covers.
-    self.assertEqual(calls["n"], 3)
+    from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudgetExhausted
+    with self.assertRaises(RequestBudgetExhausted):
+      client.request(session, "GET", "https://h/start", allow_redirects=True)
+    # Only as many requests as the budget covers; the next hop is refused unsent.
+    self.assertEqual(calls["n"], 2)
     self.assertEqual(budget.remaining, 0)
     self.assertGreaterEqual(budget.exhausted_count, 1)
 
-  def test_a_non_redirecting_call_is_not_charged(self):
+  def test_a_non_redirecting_call_is_charged_once(self):
     from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
     budget = RequestBudget(remaining=10, total=10)
     client = private_ok_client("https://h", allowlist=["h"], request_budget=budget)
     session, calls = self._redirecting_session(hops=0)
     client.request(session, "GET", "https://h/start", allow_redirects=True)
     self.assertEqual(calls["n"], 1)
-    self.assertEqual(budget.remaining, 10, "the probe already paid for this one")
+    self.assertEqual(budget.remaining, 9)
 
   def test_the_cleanup_path_is_exempt(self):
-    # Budget exhaustion must never prevent a revert, which is the existing
-    # contract of ProbeBase.cleanup_budget.
+    # Budget exhaustion must never prevent a revert: exempt hops are admitted
+    # on an empty budget and still charged (an honest overdraft).
     from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
     budget = RequestBudget(remaining=0, total=10)
     client = private_ok_client("https://h", allowlist=["h"], request_budget=budget)
@@ -939,12 +943,48 @@ class TestRedirectHopBudgetAccounting(unittest.TestCase):
     client.request(session, "GET", "https://h/revert", allow_redirects=True,
                    budget_exempt=True)
     self.assertEqual(calls["n"], 3, "a revert was blocked by an exhausted budget")
+    self.assertEqual(budget.remaining, -3)
 
   def test_it_works_without_a_budget_configured(self):
     client = private_ok_client("https://h", allowlist=["h"])
     session, calls = self._redirecting_session(hops=2)
     client.request(session, "GET", "https://h/start", allow_redirects=True)
     self.assertEqual(calls["n"], 3)
+
+  def test_a_refused_first_request_is_never_sent(self):
+    from extensions.business.cybersec.red_mesh.graybox.budget import (
+      RequestBudget, RequestBudgetExhausted,
+    )
+    budget = RequestBudget(remaining=0, total=10)
+    client = private_ok_client("https://h", allowlist=["h"], request_budget=budget)
+    session, calls = self._redirecting_session(hops=0)
+    for follow in (False, True):
+      with self.assertRaises(RequestBudgetExhausted):
+        client.request(session, "GET", "https://h/start", allow_redirects=follow)
+    self.assertEqual(calls["n"], 0)
+    self.assertEqual(budget.exhausted_count, 2)
+    self.assertEqual(budget.remaining, 0)
+
+  def test_every_hop_is_paced_and_a_request_can_tighten_the_spacing(self):
+    from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
+    safety = MagicMock()
+    client = private_ok_client("https://h", allowlist=["h"], safety=safety,
+                               request_budget=RequestBudget(remaining=10, total=10))
+    session, _ = self._redirecting_session(hops=2)
+    client.request(session, "GET", "https://h/start", allow_redirects=True)
+    self.assertEqual(safety.throttle.call_count, 3)
+    safety.throttle.reset_mock()
+    session, _ = self._redirecting_session(hops=0)
+    client.request(session, "POST", "https://h/burst", throttle_min_delay=0.1)
+    safety.throttle.assert_called_once_with(0.1)
+    self.assertNotIn("throttle_min_delay", session.request.call_args.kwargs)
+
+  def test_pacing_applies_without_a_budget(self):
+    safety = MagicMock()
+    client = private_ok_client("https://h", allowlist=["h"], safety=safety)
+    session, _ = self._redirecting_session(hops=0)
+    client.request(session, "GET", "https://h/start")
+    safety.throttle.assert_called_once_with(None)
 
 
 if __name__ == "__main__":

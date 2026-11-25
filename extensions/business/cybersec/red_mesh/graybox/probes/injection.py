@@ -173,9 +173,9 @@ class InjectionProbes(ProbeBase):
       return "budget"
     left = state.setdefault("_sqli_time_left", {"s": SCAN_TIME_ALLOWANCE})
     res = detect_sqli(
-      send, throttle=self.safety.throttle,
+      send, throttle=self.safety.throttle,  # paced before the clock; sends run prepaid
       reached=reached or self.response_reached,
-      budget=self.budget, time_left=left, prepare=prepare,
+      budget=self.budget_available, time_left=left, prepare=prepare,
       allow_time=allow_time, **(caps or {}))
     outcome = res["outcome"]
     if outcome == "budget":
@@ -208,18 +208,20 @@ class InjectionProbes(ProbeBase):
     field = self.auth.detected_csrf_field
     if not field:
       return None
-    if not self.budget():
-      raise BudgetRefused()
-    self.safety.throttle()
     try:
       page = session.get(page_url, timeout=10)
+    except BudgetRefused:
+      raise
     except Exception:
       raise CsrfUnavailable()  # no token, no POST; ends this form's check only
     return self.auth.extract_csrf_value(page.text, field)
 
   def _sqli_send_get(self, session, url, param):
     """Request builder: one GET query parameter."""
-    return lambda v: session.get(url, params={param: v}, timeout=15)
+    def send(v):
+      with self.safety.prepaid():
+        return session.get(url, params={param: v}, timeout=15)
+    return send
 
   def _sqli_send_post(self, session, url, fields, target, page_url):
     """Request builder for one POSTed field: returns (send, prepare). The
@@ -232,7 +234,8 @@ class InjectionProbes(ProbeBase):
       data[target] = value
       if token:
         data[self.auth.detected_csrf_field] = token
-      return session.post(url, data=data, timeout=15)
+      with self.safety.prepaid():
+        return session.post(url, data=data, timeout=15)
     return send, prepare
 
   def _test_sqli_get(self):
@@ -273,7 +276,6 @@ class InjectionProbes(ProbeBase):
 
     vulnerable = []
     for label, payload, cwe in payloads:
-      self.safety.throttle()
       form_data = {
         self.target_config.username_field: payload,
         self.target_config.password_field: "test",
@@ -387,7 +389,6 @@ class InjectionProbes(ProbeBase):
     for form_action in self.discovered_forms:
       if form_action == login_path:
         continue
-      self.safety.throttle()
       url = self.target_url + form_action
 
       try:
@@ -432,7 +433,6 @@ class InjectionProbes(ProbeBase):
         csrf_token = self.auth.extract_csrf_value(page_text, csrf_field)
 
       for label, payload, cwe in payloads:
-        self.safety.throttle()
         form_data = {name: payload for name in all_inputs}
         if csrf_token and csrf_field:
           form_data[csrf_field] = csrf_token
@@ -549,7 +549,6 @@ class InjectionProbes(ProbeBase):
     for form_action in self.discovered_forms[:3]:
       if form_action in skip_paths:
         continue
-      self.safety.throttle()
       url = self.target_url + form_action
 
       try:
@@ -587,7 +586,6 @@ class InjectionProbes(ProbeBase):
         denied += 1
         continue
 
-      self.safety.throttle()
       try:
         readback = self.auth.primary_session.get(url, timeout=10)
       except Exception:
@@ -652,20 +650,23 @@ class InjectionProbes(ProbeBase):
     baseline_url = "http://example.invalid/nonexistent"
 
     for ep in ssrf_endpoints:
-      self.safety.throttle()
       url = self.target_url + "/" + ep.path.lstrip("/")
       session = self.auth.primary_session or self.auth.anon_session
 
       try:
+        self.safety.throttle()  # pace before the clock, not inside the timed window
         t0 = _time.monotonic()
-        session.get(url, params={ep.param: baseline_url}, timeout=10)
+        with self.safety.prepaid():
+          session.get(url, params={ep.param: baseline_url}, timeout=10)
         baseline_ms = (_time.monotonic() - t0) * 1000
       except Exception:
         continue
 
       try:
+        self.safety.throttle()
         t0 = _time.monotonic()
-        resp = session.get(url, params={ep.param: payload_url}, timeout=10)
+        with self.safety.prepaid():
+          resp = session.get(url, params={ep.param: payload_url}, timeout=10)
         probe_ms = (_time.monotonic() - t0) * 1000
       except Exception:
         continue
@@ -747,7 +748,6 @@ class InjectionProbes(ProbeBase):
     for ep in ssrf_endpoints:
       url = self.target_url + "/" + ep.path.lstrip("/")
       for body_field in body_fields:
-        self.safety.throttle()
         try:
           resp = session.post(url, json={body_field: payload_url}, timeout=10)
         except _rq.RequestException:
@@ -860,7 +860,6 @@ class InjectionProbes(ProbeBase):
           denied += 1
           continue
       for param in redirect_params:
-        self.safety.throttle()
         url = self.target_url + path
         try:
           resp = session.get(
@@ -885,7 +884,6 @@ class InjectionProbes(ProbeBase):
 
         # Also test the alternate payload (full URL)
         if not vulnerable_evidence or vulnerable_evidence[-1][0] != path:
-          self.safety.throttle()
           try:
             resp2 = session.get(
               url, params={param: payload_alt},
@@ -996,7 +994,6 @@ class InjectionProbes(ProbeBase):
         if tested > 60:
           break  # hard cap on total requests
         for payload, markers in traversal_payloads:
-          self.safety.throttle()
           try:
             resp = session.get(url, params={param: payload}, timeout=10)
           except Exception:
@@ -1083,7 +1080,6 @@ class InjectionProbes(ProbeBase):
       if not reached:
         denied += 1
         continue
-      self.safety.throttle()
       try:
         resp = self.auth.primary_session.get(
           url, params={ep.param: payload}, timeout=10,
@@ -1158,7 +1154,6 @@ class InjectionProbes(ProbeBase):
         denied += 1
         continue
       for payload in payloads:
-        self.safety.throttle()
         try:
           resp = self.auth.primary_session.get(
             url, params={ep.param: payload}, timeout=10,
@@ -1242,7 +1237,6 @@ class InjectionProbes(ProbeBase):
         denied += 1
         continue
       for payload in payloads:
-        self.safety.throttle()
         try:
           resp = self.auth.primary_session.get(
             url, params={ep.param: payload}, timeout=10,
@@ -1324,7 +1318,6 @@ class InjectionProbes(ProbeBase):
       if not reached:
         denied += 1
         continue
-      self.safety.throttle()
       try:
         resp = self.auth.primary_session.get(
           url, params={ep.param: payload},
@@ -1425,7 +1418,6 @@ class InjectionProbes(ProbeBase):
       headers = {"Content-Type": "application/json"}
 
       # Baseline: clean integer
-      self.safety.throttle()
       try:
         baseline = self.auth.primary_session.post(
           url, data=_json.dumps({ep.field: 1}),
@@ -1443,7 +1435,6 @@ class InjectionProbes(ProbeBase):
       # it does not validate the field at all and the variants prove nothing
       # about type handling. A 5xx is a rejection (the type is not handled
       # gracefully), not a denial: the variants still run.
-      self.safety.throttle()
       try:
         control = self.auth.primary_session.post(
           url, data=_json.dumps({ep.field: "not-an-integer"}),
@@ -1461,7 +1452,6 @@ class InjectionProbes(ProbeBase):
       # Variant: list
       payloads_to_try = [[1], {"$gt": 0}]
       for variant in payloads_to_try:
-        self.safety.throttle()
         try:
           resp = self.auth.primary_session.post(
             url, data=_json.dumps({ep.field: variant}),

@@ -6,8 +6,11 @@ Probes receive fully initialized collaborators — they don't manage
 sessions or credentials themselves.
 """
 
+import dataclasses
+
 import requests
 
+from ..budget import RequestBudgetExhausted
 from ..findings import (
   GrayboxEvidenceArtifact,
   evidence_content_sha256,
@@ -18,6 +21,11 @@ from ..models import GrayboxProbeContext, GrayboxProbeRunResult
 from ..rollback import MUTATION_ATTEMPTED_UNKNOWN, StatefulMutationPlan
 from ..scenario_runtime import owns_legacy_families
 
+
+# Scenarios that report "vulnerable" because something was NOT seen (no block,
+# no lockout, no limit). A refused request looks like "nothing seen", so these
+# verdicts do not survive a refusal during their run.
+ABSENCE_VERDICT_SCENARIOS = frozenset({"PT-A02-07", "PT-OAPI4-03", "PT-OAPI6-01"})
 
 _SNAPSHOT_MAX_CHARS = 2048
 _SCRUB_WINDOW_CHARS = _SNAPSHOT_MAX_CHARS * 2
@@ -206,7 +214,8 @@ class ProbeBase:
     self.regular_username = regular_username
     self._allow_stateful = allow_stateful
     # OWASP API Top 10 — Subphase 1.7. Optional shared RequestBudget.
-    # When None, `self.budget()` always returns True (no enforcement).
+    # Charged by GrayboxHttpClient; probes only peek via `budget_available()`.
+    # When None there is no enforcement.
     self.request_budget = request_budget
     self.allowed_scenario_ids = (
       None if allowed_scenario_ids is None else set(allowed_scenario_ids)
@@ -240,14 +249,47 @@ class ProbeBase:
     lifecycle. Probes just use self.auth.primary_session /
     self.auth.regular_session as-is.
     """
+    budget = getattr(self, "request_budget", None)
+    refusals_before = budget.exhausted_count if budget is not None else 0
+    mark = len(self.findings)
     try:
       probe_fn()
+    except RequestBudgetExhausted:
+      pass  # recorded below with the other refusals
     except requests.exceptions.ConnectionError as exc:
       self._record_error(probe_name, self._error_with_detail("target_unreachable", exc))
     except requests.exceptions.Timeout as exc:
       self._record_error(probe_name, self._error_with_detail("request_timeout", exc))
     except Exception as exc:
       self._record_error(probe_name, self._sanitize_error(str(exc)))
+    if budget is not None and budget.exhausted_count > refusals_before:
+      self._downgrade_after_refusal(probe_name, mark)
+
+  @staticmethod
+  def _neutral_title(scenario_id):
+    try:
+      from ..scenario_catalog import graybox_scenario
+      return (graybox_scenario(scenario_id) or {}).get("title") or scenario_id
+    except ImportError:
+      return scenario_id
+
+  def _downgrade_after_refusal(self, probe_name, mark):
+    """A request was refused during this run, so it may have been swallowed by a
+    probe's own error handling: a clean verdict (and an absence-based vulnerable
+    one) is no longer proven. Findings backed by fetched evidence stay."""
+    for i in range(mark, len(self.findings)):
+      f = self.findings[i]
+      if f.status == "not_vulnerable" or (
+          f.status == "vulnerable" and f.scenario_id in ABSENCE_VERDICT_SCENARIOS):
+        # Neutral shape: the old title and location asserted the verdict being withdrawn.
+        self.findings[i] = dataclasses.replace(
+          f, title=self._neutral_title(f.scenario_id), status="inconclusive",
+          severity="INFO", cwe=[], attack=[], confidence="",
+          url=None, parameter=None, method=None,
+          evidence=["reason=budget_exhausted"], evidence_artifacts=[],
+          replay_steps=[], remediation="", cvss_score=None, cvss_vector="",
+        )
+    self._record_error(probe_name, "budget_exhausted")
 
   def scenario_enabled(self, scenario_id: str) -> bool:
     """Return whether this worker is allowed to execute ``scenario_id``."""
@@ -402,6 +444,12 @@ class ProbeBase:
         mutation_attempted_unknown = True
       else:
         mutated = bool(mutate_result)
+    except RequestBudgetExhausted:
+      # A refusal part-way through mutate may follow a request that already
+      # landed: treat the mutation as attempted so the revert still runs
+      # (revert traffic is exempt from the budget).
+      mutated = True
+      mutation_attempted_unknown = True
     except Exception as exc:
       self.emit_inconclusive(
         scenario_id, title, owasp,
@@ -522,26 +570,14 @@ class ProbeBase:
       )
       return False
 
-  def budget(self, n: int = 1) -> bool:
-    """Consume ``n`` requests from the shared per-scan RequestBudget.
+  def budget_available(self, n: int = 1) -> bool:
+    """True when the shared budget could cover ``n`` more requests.
 
-    Returns False (and records an exhaustion event on the budget object)
-    when the budget can't cover the request. Probes that hit this should
-    stop iteration and emit `inconclusive` with reason
-    ``budget_exhausted``. Returns True when no budget is configured
-    (legacy callers / tests without a budget).
+    A peek, not a charge: `GrayboxHttpClient` charges each request as it is
+    sent. Use it to skip a multi-request burst up front and emit
+    ``inconclusive`` / ``budget_exhausted`` instead of sending half of it.
     """
-    if self.request_budget is None:
-      return True
-    return self.request_budget.consume(n)
-
-  def cleanup_budget(self, n: int = 1) -> bool:
-    """Return True for cleanup/revert requests.
-
-    Cleanup requests are deliberately exempt from the normal probe
-    request budget; budget exhaustion must not prevent rollback.
-    """
-    return True
+    return self.request_budget is None or self.request_budget.remaining >= n
 
   def request(self, session, method: str, url: str, **kwargs):
     """Probe-facing HTTP helper.
@@ -691,7 +727,6 @@ class ProbeBase:
   def baseline_reached(self, session, url, **kwargs):
     """Plain GET baseline of ``url``: True/False for reached, None on a
     transport failure (the caller skips the endpoint)."""
-    self.safety.throttle()
     try:
       resp = session.get(url, timeout=10, **kwargs)
     except Exception:
@@ -714,7 +749,6 @@ class ProbeBase:
     cache = self.__dict__.setdefault("_admin_baseline_cache", {})
     if url not in cache:
       try:
-        self.safety.throttle()
         resp = self.request(admin, "GET", url, timeout=10,
                             allow_redirects=False)
         cache[url] = self.response_reached(resp)

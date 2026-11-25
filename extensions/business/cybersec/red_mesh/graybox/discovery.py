@@ -132,7 +132,6 @@ class DiscoveryModule:
       if self._is_logout(path):
         continue
 
-      self.safety.throttle()
 
       # Use authenticated session if available, else anonymous
       session = self.auth.primary_session or self.auth.anon_session
@@ -213,7 +212,6 @@ class DiscoveryModule:
       if self._is_logout(path):
         continue
 
-      self.safety.throttle()
 
       session = self.auth.primary_session or self.auth.anon_session
       if session is None:
@@ -315,7 +313,6 @@ class DiscoveryModule:
     session = self.auth.primary_session or self.auth.anon_session
     if session is None:
       return None
-    self.safety.throttle()
     try:
       resp = self._get(session, self._origin + path)
     except requests.RequestException:
