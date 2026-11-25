@@ -262,7 +262,7 @@ class TestWeakAuth(unittest.TestCase):
     probe.auth.try_credentials.assert_not_called()
 
 
-def _stored_record(sess, store=True, amount="100.00", status="draft"):
+def _stored_record(sess, store=True, amount="100.00", status="draft", post_response=None):
   """Fake record page: GET shows the stored fields, POST stores them (or not)."""
   state = {"amount": amount, "status": status}
 
@@ -275,7 +275,7 @@ def _stored_record(sess, store=True, amount="100.00", status="draft"):
     if store:
       state["amount"] = data["amount"]
       state["status"] = data["status"]
-    return _mock_response(status=302, text="", headers={"Location": "/records/"})
+    return post_response or _mock_response(status=302, text="", headers={"Location": "/records/"})
 
   sess.get = MagicMock(side_effect=get)
   sess.post = MagicMock(side_effect=post)
@@ -317,19 +317,38 @@ class TestNegativeAmountScenarioPTA0604(unittest.TestCase):
     self.assertTrue(any("submitted_amount=-9999.99" in e for e in a06_04[0].evidence))
     self.assertTrue(any("stored_amount=-9999.99" in e for e in a06_04[0].evidence))
 
-  def test_pt_a06_04_accepted_but_not_stored_is_inconclusive(self):
-    """A 302 alone is not acceptance: the record still shows the old amount."""
-    probe = _make_probe(record_endpoints=[RecordEndpoint(path="/records/1/")],
-                        allow_stateful=True)
-    _stored_record(probe.auth.primary_session, store=False)
+  def test_pt_a06_04_read_back_decides_whatever_the_post_says(self):
+    """Error words in a 200 POST answer do not skip the read-back."""
+    for store, verdict in ((True, "vulnerable"), (False, "not_vulnerable")):
+      with self.subTest(store=store):
+        probe = _make_probe(record_endpoints=[RecordEndpoint(path="/records/1/")],
+                            allow_stateful=True)
+        _stored_record(probe.auth.primary_session, store=store,
+                       post_response=_mock_response(status=200, text="error: check input"))
+        probe._test_validation_bypass()
+        found = {f.scenario_id: f.status for f in probe.findings
+                 if f.scenario_id in ("PT-A06-02", "PT-A06-04")}
+        self.assertEqual(found, {"PT-A06-02": verdict, "PT-A06-04": verdict})
 
-    probe._test_validation_bypass()
+  def test_pt_a06_04_unparseable_read_back_is_inconclusive(self):
+    """A stored amount shown in a display format ("-9,999.99") is not read as a guard that held."""
+    for shown in ("-9,999.99", "$-9999.99"):
+      with self.subTest(shown=shown):
+        probe = _make_probe(record_endpoints=[RecordEndpoint(path="/records/1/")],
+                            allow_stateful=True)
+        state = _stored_record(probe.auth.primary_session, store=True)
+        post = probe.auth.primary_session.post.side_effect
 
-    found = {f.scenario_id: f for f in probe.findings
-             if f.scenario_id in ("PT-A06-02", "PT-A06-04")}
-    for sid in ("PT-A06-02", "PT-A06-04"):
-      self.assertEqual(found[sid].status, "inconclusive")
-      self.assertIn("reason=accepted_value_not_read_back", found[sid].evidence)
+        def post_and_format(url, data=None, **kw):
+          resp = post(url, data=data, **kw)
+          state["amount"] = shown
+          return resp
+
+        probe.auth.primary_session.post.side_effect = post_and_format
+        probe._test_validation_bypass()
+        a06_04 = [f for f in probe.findings if f.scenario_id == "PT-A06-04"]
+        self.assertEqual([f.status for f in a06_04], ["inconclusive"])
+        self.assertIn("reason=accepted_value_not_read_back", a06_04[0].evidence)
 
   def test_pt_a06_04_residue_from_an_earlier_run_is_inconclusive(self):
     """The record already holds -9999.99 before the POST: no proof."""
@@ -364,7 +383,7 @@ class TestNegativeAmountScenarioPTA0604(unittest.TestCase):
       status=302, text="", headers={"Location": "/records/"}))
     probe._test_validation_bypass()
     a06_02 = [f for f in probe.findings if f.scenario_id == "PT-A06-02"]
-    self.assertEqual(a06_02[0].status, "inconclusive")
+    self.assertEqual(a06_02[0].status, "not_vulnerable")  # read-back shows draft
 
   def test_pt_a06_04_emits_not_vulnerable_when_amount_rejected(self):
     record_ep = RecordEndpoint(path="/records/1/")

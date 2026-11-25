@@ -254,6 +254,14 @@ class BusinessLogicProbes(ProbeBase):
     return parse_form_fields(page.text, csrf_field).get(field)
 
   @staticmethod
+  def _is_number(value):
+    try:
+      float(value)
+      return True
+    except (TypeError, ValueError):
+      return False
+
+  @staticmethod
   def _same_amount(stored, submitted):
     try:
       return abs(float(stored) - float(submitted)) < 0.005
@@ -345,27 +353,27 @@ class BusinessLogicProbes(ProbeBase):
         denied += 1
       elif resp is not None:
         tested += 1
-        # A 2xx/302 or a missing error word does not prove the value was
-        # taken: read the record back and compare with what was submitted.
-        accepted = resp.status_code in (301, 302)
-        if not accepted and resp.status_code == 200:
-          body_lower = resp.text.lower()
-          error_markers = ["must be", "invalid", "error", "cannot", "negative"]
-          accepted = not any(m in body_lower for m in error_markers)
+        # The POST response (status, error words) proves nothing either way:
+        # the read-back alone decides. Stored payload = vulnerable, another
+        # stored value = guard held, no read-back = inconclusive.
         before = form_fields.get(ep.amount_field)
-        if accepted and before is not None and self._same_amount(before, "-9999.99"):
+        if before is not None and self._same_amount(before, "-9999.99"):
           # The record already held the payload value (residue of an earlier
           # run): reading it back proves nothing.
           amount_unconfirmed.append((path, "value_present_before_probe"))
-        elif accepted:
+        else:
           stored = self._read_back_field(url, ep.amount_field, csrf_field)
-          if stored is not None and self._same_amount(stored, "-9999.99"):
+          if stored is None:
+            amount_unconfirmed.append((path, "accepted_value_not_read_back"))
+          elif self._same_amount(stored, "-9999.99"):
             bypass_evidence.append(f"negative_amount_accepted=True; endpoint={path}")
             negative_amount_evidence.append(
               f"endpoint={path}; submitted_amount=-9999.99; "
               f"stored_amount={stored[:MAX_EVIDENCE_VALUE]}; status={resp.status_code}"
             )
-          else:
+          elif not (stored == before or self._is_number(stored)):
+            # A display format the probe cannot compare ("-9,999.99", "$-9999.99"):
+            # neither the payload nor a different amount is proven.
             amount_unconfirmed.append((path, "accepted_value_not_read_back"))
 
       # Test B: Invalid state transition (if transitions are configured)
@@ -408,21 +416,16 @@ class BusinessLogicProbes(ProbeBase):
             resp2 = None
 
           if resp2 is not None and self.response_reached(resp2):
-            accepted2 = resp2.status_code in (301, 302)
-            if not accepted2 and resp2.status_code == 200:
-              body_lower = resp2.text.lower()
-              error_markers = ["must be", "invalid", "error", "cannot", "blocked", "transition"]
-              accepted2 = not any(m in body_lower for m in error_markers)
-            if accepted2:
-              stored2 = self._read_back_field(url, ep.status_field, csrf_field)
-              if stored2 == invalid_target:
-                bypass_evidence.append(
-                  f"invalid_transition_accepted=True; "
-                  f"from={current_status}; to={invalid_target}; "
-                  f"stored_status={stored2[:MAX_EVIDENCE_VALUE]}; endpoint={path}"
-                )
-              else:
-                transition_unconfirmed.append((path, "accepted_value_not_read_back"))
+            # Same rule as Test A: the read-back alone decides.
+            stored2 = self._read_back_field(url, ep.status_field, csrf_field)
+            if stored2 is None:
+              transition_unconfirmed.append((path, "accepted_value_not_read_back"))
+            elif stored2 == invalid_target:
+              bypass_evidence.append(
+                f"invalid_transition_accepted=True; "
+                f"from={current_status}; to={invalid_target}; "
+                f"stored_status={stored2[:MAX_EVIDENCE_VALUE]}; endpoint={path}"
+              )
 
     if bypass_evidence:
       self.findings.append(GrayboxFinding(

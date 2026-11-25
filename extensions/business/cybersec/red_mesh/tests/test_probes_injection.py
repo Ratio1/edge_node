@@ -632,11 +632,28 @@ class TestJsonTypeConfusionPTA0315(unittest.TestCase):
     self.assertEqual([x.status for x in f], ["inconclusive"])
     self.assertIn("reason=json_type_not_validated", f[0].evidence)
 
-  def test_pt_a03_15_5xx_control_skips_the_endpoint(self):
+  def test_pt_a03_15_5xx_control_counts_as_rejected(self):
     ok = _mock_response(status=200, text='{"matched":1}')
-    probe, f = self._json_probe([ok, _mock_response(status=500, text="boom")])
-    self.assertEqual(f, [])
-    self.assertEqual(probe.auth.primary_session.post.call_count, 2)
+    boom = _mock_response(status=500, text="boom")
+    bad = _mock_response(status=400, text='{"error":"id_must_be_integer"}')
+    _, f = self._json_probe([ok, boom, bad, _mock_response(status=200, text='{"matched":50}')])
+    self.assertEqual([x.status for x in f], ["vulnerable"])
+    self.assertTrue(any("$gt" in e for e in f[0].evidence))
+    _, f = self._json_probe([ok, boom, bad, bad])
+    self.assertEqual([x.status for x in f], ["not_vulnerable"])
+
+  def test_pt_a03_15_unvalidated_endpoint_reported_beside_a_clean_one(self):
+    ok = _mock_response(status=200, text='{"matched":1}')
+    bad = _mock_response(status=400, text='{"error":"id_must_be_integer"}')
+    probe = _make_probe(json_type_endpoints=[
+      JsonLookupEndpoint(path="/api/open/", field="id"),
+      JsonLookupEndpoint(path="/api/strict/", field="id")])
+    probe.auth.primary_session.post = MagicMock(side_effect=[ok, ok, ok, bad, bad, bad])
+    probe._test_json_type_confusion()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A03-15"]
+    self.assertEqual([x.status for x in f], ["inconclusive"])
+    self.assertIn("reason=json_type_not_validated", f[0].evidence)
+    self.assertIn("endpoint=/api/open/", f[0].evidence)
 
   def test_pt_a03_15_only_the_gt_variant_accepted_is_vulnerable(self):
     ok = _mock_response(status=200, text='{"matched":1}')

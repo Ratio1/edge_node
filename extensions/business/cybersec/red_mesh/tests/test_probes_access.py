@@ -612,10 +612,14 @@ class TestMassAssignment(unittest.TestCase):
                      ["not_vulnerable"])
 
   def test_mass_assignment_field_absent_after_accept_is_inconclusive(self):
-    html = '<form><input name="username" value="alice"></form>'
-    found = self._accepted_with(html, html)
-    self.assertEqual([f.status for f in found], ["inconclusive"])
-    self.assertIn("reason=privilege_field_not_observable", found[0].evidence)
+    """`role="group"` / `class="admin"` are attributes, not privilege fields."""
+    for html in ('<form><input name="username" value="alice"></form>',
+                 '<div role="group" class="admin"><form>'
+                 '<input name="username" value="alice"></form></div>'):
+      with self.subTest(html=html):
+        found = self._accepted_with(html, html)
+        self.assertEqual([f.status for f in found], ["inconclusive"])
+        self.assertIn("reason=privilege_field_not_observable", found[0].evidence)
 
   def test_mass_assignment_unreadable_verify_page_is_inconclusive(self):
     html = '<form><input name="username" value="alice"></form>'

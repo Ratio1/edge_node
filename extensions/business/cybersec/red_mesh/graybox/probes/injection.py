@@ -1126,7 +1126,8 @@ class InjectionProbes(ProbeBase):
 
       # Control: a clearly invalid string. If the endpoint accepts that too,
       # it does not validate the field at all and the variants prove nothing
-      # about type handling.
+      # about type handling. A 5xx is a rejection (the type is not handled
+      # gracefully), not a denial: the variants still run.
       self.safety.throttle()
       try:
         control = self.auth.primary_session.post(
@@ -1135,9 +1136,7 @@ class InjectionProbes(ProbeBase):
         )
       except Exception:
         continue
-      if control.status_code >= 500:
-        continue  # a server error says nothing about validation (as for the baseline)
-      if not self.response_reached(control, validation_ok=True):
+      if control.status_code < 500 and not self.response_reached(control, validation_ok=True):
         denied += 1
         continue
       if self._json_accepted(control):
@@ -1190,12 +1189,13 @@ class InjectionProbes(ProbeBase):
                     "lists, dicts, or operator-keys when an integer "
                     "is expected.",
       ))
-    elif unvalidated and not tested:
+    elif unvalidated:
+      # An unvalidated endpoint stays reported even when another is clean.
       self.emit_inconclusive(
         "PT-A03-15", "JSON type confusion — endpoint does not validate the "
         "field at all", "A03:2021", "json_type_not_validated",
       )
-      self.findings[-1].evidence.append(f"endpoint={unvalidated[0]}")
+      self.findings[-1].evidence.extend(f"endpoint={p}" for p in unvalidated)
       self.findings[-1].evidence.append("variant=control:not-an-integer")
     elif tested > 0:
       self.findings.append(GrayboxFinding(

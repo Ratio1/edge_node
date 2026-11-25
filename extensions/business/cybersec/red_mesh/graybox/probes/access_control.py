@@ -546,9 +546,11 @@ class AccessControlProbes(ProbeBase):
 
       # Accepted, but the page never shows any privilege field: the absence
       # of the value proves nothing, so this form is not a clean result.
-      if not persisted_fields and not any(
-          f'name="{n}"' in verify.text or f"name='{n}'" in verify.text
-          or f'"{n}"' in verify.text for n in priv_fields):
+      # Observable = a form field name or a JSON key; `role="group"` or
+      # `class="admin"` is not.
+      names = "|".join(priv_fields)
+      if not persisted_fields and not re.search(
+          rf"""name=["']({names})["']|"({names})"\s*:""", verify.text):
         unobservable.append((form_path, "privilege_field_not_observable"))
 
       if persisted_fields:
