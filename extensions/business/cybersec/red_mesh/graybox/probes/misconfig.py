@@ -46,6 +46,7 @@ class MisconfigProbes(ProbeBase):
 
     debug_paths = self.target_config.misconfig.debug_paths
     exposed = []
+    exposed_response = None
     for path in debug_paths:
       self.safety.throttle()
       url = self.target_url + path
@@ -55,6 +56,8 @@ class MisconfigProbes(ProbeBase):
         continue
       if resp.status_code == 200 and len(resp.text) > 50:
         exposed.append(path)
+        if exposed_response is None:
+          exposed_response = resp
 
     if exposed:
       self.findings.append(GrayboxFinding(
@@ -62,10 +65,11 @@ class MisconfigProbes(ProbeBase):
         title="Debug/config endpoint exposed",
         status="vulnerable",
         severity="MEDIUM",
-        owasp="A02:2021",
+        owasp="A05:2021",
         cwe=["CWE-200"],
         evidence=[f"exposed_paths={', '.join(exposed)}"],
         remediation="Disable debug endpoints in production. Restrict access by IP or authentication.",
+        evidence_artifacts=self.evidence_from(exposed_response),
       ))
     else:
       self.findings.append(GrayboxFinding(
@@ -73,7 +77,7 @@ class MisconfigProbes(ProbeBase):
         title="Debug endpoints — not exposed",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A02:2021",
+        owasp="A05:2021",
         evidence=[f"paths_tested={len(debug_paths)}"],
       ))
 
@@ -132,7 +136,7 @@ class MisconfigProbes(ProbeBase):
           status="vulnerable",
           severity="HIGH" if acac == "true" else "LOW",
           cvss_vector=V.CORS_CREDENTIALED if acac == "true" else V.CORS_UNCREDENTIALED,
-          owasp="A02:2021",
+          owasp="A05:2021",
           cwe=["CWE-942"],
           evidence=[
             f"path={path}",
@@ -140,6 +144,7 @@ class MisconfigProbes(ProbeBase):
             f"allow_credentials={acac}",
           ],
           remediation="Restrict Access-Control-Allow-Origin to trusted domains. Never use * with credentials.",
+          evidence_artifacts=self.evidence_from(resp),
         )
         if not worst_finding or finding.severity == "HIGH":
           worst_finding = finding
@@ -150,7 +155,7 @@ class MisconfigProbes(ProbeBase):
           status="vulnerable",
           severity="HIGH" if acac == "true" else "LOW",
           cvss_vector=V.CORS_CREDENTIALED if acac == "true" else V.CORS_UNCREDENTIALED,
-          owasp="A02:2021",
+          owasp="A05:2021",
           cwe=["CWE-942"],
           evidence=[
             f"path={path}",
@@ -158,8 +163,9 @@ class MisconfigProbes(ProbeBase):
             f"allow_credentials={acac}",
           ],
           remediation="Validate the Origin header against an allowlist. Do not reflect arbitrary origins.",
+          evidence_artifacts=self.evidence_from(resp),
         )
-        if not worst_finding or severity == "HIGH":
+        if not worst_finding or finding.severity == "HIGH":
           worst_finding = finding
 
     if worst_finding:
@@ -170,7 +176,7 @@ class MisconfigProbes(ProbeBase):
         title="CORS configuration — no misconfiguration detected",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A02:2021",
+        owasp="A05:2021",
         evidence=[f"paths_tested={len(unique_paths)}"],
       ))
 
@@ -205,10 +211,11 @@ class MisconfigProbes(ProbeBase):
         title="Missing security headers",
         status="vulnerable",
         severity="LOW",
-        owasp="A02:2021",
+        owasp="A05:2021",
         cwe=["CWE-693"],
         evidence=[f"missing_headers={', '.join(missing)}"],
         remediation="Add security headers: " + ", ".join(missing),
+        evidence_artifacts=self.evidence_from(resp),
       ))
     else:
       self.findings.append(GrayboxFinding(
@@ -216,7 +223,7 @@ class MisconfigProbes(ProbeBase):
         title="Security headers — all present",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A02:2021",
+        owasp="A05:2021",
         evidence=[f"headers_checked={len(checked)}"],
       ))
 
@@ -242,7 +249,7 @@ class MisconfigProbes(ProbeBase):
         title="Insecure cookie attributes",
         status="vulnerable",
         severity="LOW",
-        owasp="A02:2021",
+        owasp="A05:2021",
         cwe=["CWE-614"],
         evidence=issues,
         remediation="Set Secure, HttpOnly, and SameSite=Strict on all session cookies.",
@@ -253,7 +260,7 @@ class MisconfigProbes(ProbeBase):
         title="Cookie attributes — all secure",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A02:2021",
+        owasp="A05:2021",
         evidence=["all_cookies_have_secure_attributes"],
       ))
 
@@ -282,6 +289,7 @@ class MisconfigProbes(ProbeBase):
     tested = 0
     denied = 0
     vulnerable_endpoints = []
+    vulnerable_response = None
     csrf_field = self.auth.detected_csrf_field
     for path in csrf_test_endpoints[:5]:
       # A POST to the logout URL ends the scan session.
@@ -354,6 +362,8 @@ class MisconfigProbes(ProbeBase):
       if (not csrf_rejected and resp.status_code < 400
           and self.response_reached(resp)):
         vulnerable_endpoints.append(path)
+        if vulnerable_response is None:
+          vulnerable_response = resp
 
     if vulnerable_endpoints:
       self.findings.append(GrayboxFinding(
@@ -361,7 +371,7 @@ class MisconfigProbes(ProbeBase):
         title="CSRF protection bypass",
         status="vulnerable",
         severity="HIGH",
-        owasp="A02:2021",
+        owasp="A01:2021",
         cwe=["CWE-352"],
         attack=["T1185"],
         evidence=[
@@ -375,6 +385,7 @@ class MisconfigProbes(ProbeBase):
         ],
         remediation="Enforce CSRF tokens on all state-changing endpoints. "
                     "Use SameSite=Strict cookies as defense-in-depth.",
+        evidence_artifacts=self.evidence_from(vulnerable_response),
       ))
     elif tested > 0:
       self.findings.append(GrayboxFinding(
@@ -382,7 +393,7 @@ class MisconfigProbes(ProbeBase):
         title="CSRF protection — no bypass detected",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A02:2021",
+        owasp="A01:2021",
         evidence=[f"endpoints_tested={tested}"],
       ))
     elif denied > 0:
@@ -434,7 +445,7 @@ class MisconfigProbes(ProbeBase):
       status=status,
       severity=severity,
       cvss_vector=V.AUTH_DEFEATABLE,
-      owasp="A02:2021",
+      owasp="A07:2021",
       cwe=["CWE-331", "CWE-345"] if evidence else [],
       evidence=evidence or ["all_tokens_appear_adequate"],
       remediation="Use cryptographically random session IDs (128+ bits). "
@@ -466,6 +477,7 @@ class MisconfigProbes(ProbeBase):
     test_username = "ratelimit_probe_user_nonexist"
     attempts = 8
     blocked = False
+    last_response = None
     lockout_markers = [
       "account locked", "too many attempts", "temporarily blocked",
       "account suspended", "try again later", "rate limit",
@@ -497,6 +509,7 @@ class MisconfigProbes(ProbeBase):
         )
       except Exception:
         continue
+      last_response = resp
 
       if resp.status_code == 429:
         blocked = True
@@ -508,13 +521,19 @@ class MisconfigProbes(ProbeBase):
 
     session.close()
 
-    if not blocked:
+    if not blocked and last_response is None:
+      # Every login POST raised: nothing was observed, so "not enforced" is unproven.
+      self.emit_inconclusive(
+        "PT-A02-07", "Login rate limiting could not be evaluated",
+        "A07:2021", "no_login_response",
+      )
+    elif not blocked:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A02-07",
         title="Login rate limiting not enforced",
         status="vulnerable",
         severity="MEDIUM",
-        owasp="A02:2021",
+        owasp="A07:2021",
         cwe=["CWE-307"],
         attack=["T1110"],
         evidence=[
@@ -529,6 +548,7 @@ class MisconfigProbes(ProbeBase):
         ],
         remediation="Implement account lockout after repeated failures. "
                     "Add rate limiting (e.g. 429 responses) on login endpoints.",
+        evidence_artifacts=self.evidence_from(last_response),
       ))
     else:
       self.findings.append(GrayboxFinding(
@@ -536,7 +556,7 @@ class MisconfigProbes(ProbeBase):
         title="Login rate limiting — enforced",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A02:2021",
+        owasp="A07:2021",
         evidence=[
           f"endpoint={login_url}",
           f"lockout_triggered_after={attempts}_or_fewer_attempts",
@@ -805,7 +825,7 @@ class MisconfigProbes(ProbeBase):
         evidence=[
           f"reset_endpoint={reset_path}",
           f"tokens_observed={len(issued)}",
-          f"first_token={issued[0]}",
+          f"token_length={len(str(issued[0]))}",  # the token itself is the secret: never in evidence
           "tokens_identical=True",
         ],
         replay_steps=[
@@ -1127,6 +1147,7 @@ class MisconfigProbes(ProbeBase):
                       "(or any algorithm not in an explicit allowlist). "
                       "Pin the verification algorithm server-side rather "
                       "than reading it from the untrusted header.",
+          evidence_artifacts=self.evidence_from(me),
         ))
         return
 
@@ -1164,7 +1185,7 @@ class MisconfigProbes(ProbeBase):
     # Step 1: GET login page with a fresh session, capture pre-auth cookies
     pre_session = self.auth.make_anonymous_session()
     try:
-      pre_session.get(login_url, timeout=10, allow_redirects=True)
+      pre_response = pre_session.get(login_url, timeout=10, allow_redirects=True)
     except Exception:
       pre_session.close()
       return
@@ -1228,6 +1249,7 @@ class MisconfigProbes(ProbeBase):
         remediation="Regenerate session ID after successful authentication. "
                     "Django: this is automatic. Flask: call session.regenerate(). "
                     "Rails: call reset_session in the login action.",
+        evidence_artifacts=self.evidence_from(pre_response),
       ))
     else:
       self.findings.append(GrayboxFinding(
@@ -1272,7 +1294,7 @@ class MisconfigProbes(ProbeBase):
     session = self.auth.make_anonymous_session()
 
     def _submit_login(username):
-      """Submit a failed login and return (status_code, body, content_length)."""
+      """Submit a failed login and return (status_code, body, content_length, response)."""
       try:
         page = session.get(login_url, timeout=10)
       except Exception:
@@ -1299,7 +1321,7 @@ class MisconfigProbes(ProbeBase):
       except Exception:
         return None
 
-      return (resp.status_code, resp.text, len(resp.text))
+      return (resp.status_code, resp.text, len(resp.text), resp)
 
     self.safety.throttle()
     result_valid = _submit_login(valid_username)
@@ -1311,8 +1333,8 @@ class MisconfigProbes(ProbeBase):
     if not result_valid or not result_invalid:
       return
 
-    status_valid, body_valid, len_valid = result_valid
-    status_invalid, body_invalid, len_invalid = result_invalid
+    status_valid, body_valid, len_valid, resp_valid = result_valid
+    status_invalid, body_invalid, len_invalid, _ = result_invalid
 
     differences = []
 
@@ -1368,6 +1390,7 @@ class MisconfigProbes(ProbeBase):
         remediation="Return identical error messages for all failed login attempts. "
                     "Use generic text like 'Invalid credentials' regardless of "
                     "whether the username exists.",
+        evidence_artifacts=self.evidence_from(resp_valid),
       ))
     else:
       self.findings.append(GrayboxFinding(

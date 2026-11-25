@@ -223,11 +223,30 @@ _SCRUB_PATTERNS = (
   # Bearer schema in body / URL: keep prefix only.
   (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{8,}"), "Bearer <redacted>"),
   # Common name=value forms (cookie / form / URL query).
-  (re.compile(r"(?i)\b(password|secret|token|api_key|apikey)=" + _ALREADY_REDACTED
+  # `_`-prefixed and compound names count (`_token`, `access_token`,
+  # `client_secret`, `x-api-key`); a joined name (`csrftoken`) and a longer word
+  # (`tokens_count`) do not.
+  (re.compile(r"(?i)(?<![\w-])((?:[\w-]{0,64}?[_-])?"
+              r"(?:password|secret|token|api[_-]?key))=" + _ALREADY_REDACTED
               + r"([^&\s\";,]+)"),
    r"\1=<redacted>"),
+  # Login-form and session forms a captured request/response carries. Names
+  # are literal alternations behind `(?<![\w-])`, with a bounded value class, so
+  # each match stays linear.
+  (re.compile(r"(?i)(?<![\w-])(pass|pwd|passwd|csrfmiddlewaretoken|authenticity_token"
+              r"|phpsessid|jsessionid|sid|session)=" + _ALREADY_REDACTED
+              + r"([^&\s\";,?]+)"),
+   r"\1=<redacted>"),
+  # `;jsessionid=` path parameter is matched by the rule above (`;` is not a
+  # name character). Headers that carry a token or key by name.
+  (re.compile(r"(?i)\b(x-csrf-token|x-xsrf-token|x-auth-token|x-api-key)\s*:"
+              + _ALREADY_REDACTED + r"\s*[^,\r\n;]+"),
+   r"\1: <redacted>"),
+  # JSON session_id (the generic JSON rule only knows password/secret/token/key).
+  (re.compile(r'(?i)"(session_id|sessionid)"\s*:\s*"[^"]+"'),
+   r'"\1": "<redacted>"'),
   # JSON-style key:value.
-  (re.compile(r'(?i)"(password|secret|token|api_key|bearer_token|api[\w_-]*key)"\s*:\s*"[^"]+"'),
+  (re.compile(r'(?i)"((?:[\w-]{0,64}?[_-])?(?:password|secret|token|api_key|bearer_token|api[\w_-]*key))"\s*:\s*"[^"]+"'),
    r'"\1": "<redacted>"'),
 )
 
@@ -457,6 +476,25 @@ class GrayboxEvidenceArtifact:
     return asdict(self)
 
 
+def evidence_blob(request_snapshot, response_snapshot) -> dict:
+  """The redacted snapshot pair that is hashed and stored as raw evidence."""
+  return {
+    "request_snapshot": request_snapshot or "",
+    "response_snapshot": response_snapshot or "",
+  }
+
+
+def evidence_content_sha256(request_snapshot, response_snapshot) -> str:
+  """sha256 hex of the canonical JSON of the (already redacted) snapshot pair."""
+  import hashlib
+  import json
+  canonical = json.dumps(
+    evidence_blob(request_snapshot, response_snapshot),
+    sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+  )
+  return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _asset_host(url) -> str:
   """Host component of a finding's URL, for the affected-asset record."""
   if not isinstance(url, str) or not url:
@@ -506,6 +544,8 @@ class GrayboxFinding:
   url: str | None = None
   parameter: str | None = None
   method: str | None = None
+  # Explicit confidence ("firm", "tentative", ...); "" keeps the status default.
+  confidence: str = ""
 
   @classmethod
   def from_dict(cls, payload: dict[str, Any]) -> "GrayboxFinding":
@@ -590,7 +630,7 @@ class GrayboxFinding:
     declared_severity = self.severity.upper()
     effective_severity = "INFO" if self.status == "not_vulnerable" else declared_severity
     confidence, confidence_recognised = _normalize_confidence(
-      confidence_map.get(self.status, "tentative"),
+      self.confidence or confidence_map.get(self.status, "tentative"),
     )
     cvss_vector, cvss_score, severity_source = self._cvss(declared_severity)
 

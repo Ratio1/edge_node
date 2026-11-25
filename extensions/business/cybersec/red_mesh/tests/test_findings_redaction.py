@@ -565,3 +565,64 @@ class TestConfiguredNamesFromReport(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestScrubUnderscoreAndCompoundKeys(unittest.TestCase):
+  """RM-060 P5.7: `_`-prefixed and compound secret key names are redacted."""
+
+  def test_prefixed_and_compound_keys_are_redacted(self):
+    for key in ("_token", "access_token", "client_secret", "x-api-key",
+                "refresh_token", "db_password", "token"):
+      out = scrub_graybox_secrets(f"{key}=hunter2value&x=1")
+      self.assertNotIn("hunter2value", out, key)
+      self.assertIn(f"{key}=<redacted>", out)
+    out = scrub_graybox_secrets('{"x-api-key": "hunter2value", "access_token": "tok123456"}')
+    self.assertNotIn("hunter2value", out)
+    self.assertNotIn("tok123456", out)
+
+  def test_other_names_are_left_alone(self):
+    for text in ("tokens_count=5", "csrftoken=abc123", "secretary=bob", "max_tokens=100"):
+      self.assertEqual(scrub_graybox_secrets(text), text)
+
+  def test_long_separator_runs_scrub_in_linear_time(self):
+    import time
+    for chunk in ("x_", "a_", "x-"):
+      text = chunk * 100_000
+      start = time.monotonic()
+      scrub_graybox_secrets(text)
+      scrub_graybox_secrets(text + "token=abc123")
+      self.assertLess(time.monotonic() - start, 0.5, chunk)
+
+
+class TestScrubLoginAndSessionForms(unittest.TestCase):
+  """RM-060 Phase F: a captured login request/response carries these forms."""
+
+  CASES = (
+    ("pass=hunter2x&u=1", "hunter2x"),
+    ("pwd=hunter2x&u=1", "hunter2x"),
+    ("passwd=hunter2x&u=1", "hunter2x"),
+    ("csrfmiddlewaretoken=AbCdEf123456&u=1", "AbCdEf123456"),
+    ("authenticity_token=AbCdEf123456&u=1", "AbCdEf123456"),
+    ("GET /a;jsessionid=ABCDEF123456?x=1", "ABCDEF123456"),
+    ("GET /a?PHPSESSID=ABCDEF123456&x=1", "ABCDEF123456"),
+    ("GET /a?sid=ABCDEF123456&x=1", "ABCDEF123456"),
+    ("GET /a?session=ABCDEF123456&x=1", "ABCDEF123456"),
+    ("X-CSRF-Token: ABCDEF123456", "ABCDEF123456"),
+    ("X-Auth-Token: ABCDEF123456", "ABCDEF123456"),
+    ("X-Api-Key: ABCDEF123456", "ABCDEF123456"),
+    ('{"session_id": "ABCDEF123456"}', "ABCDEF123456"),
+  )
+
+  def test_each_form_is_scrubbed(self):
+    for text, secret in self.CASES:
+      with self.subTest(text=text):
+        self.assertNotIn(secret, scrub_graybox_secrets(text))
+
+  def test_new_patterns_keep_linear_time(self):
+    import time
+    for chunk in ("x_", "a-", "pass", "sid"):
+      text = chunk * 100_000
+      start = time.monotonic()
+      scrub_graybox_secrets(text)
+      scrub_graybox_secrets(text + "sid=abc123456")
+      self.assertLess(time.monotonic() - start, 0.5, chunk)

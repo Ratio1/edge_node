@@ -8,6 +8,7 @@ from extensions.business.cybersec.red_mesh.worker.base import BaseLocalWorker
 from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxEvidenceArtifact, GrayboxFinding
 from extensions.business.cybersec.red_mesh.graybox.models import (
   DiscoveryResult,
+  InjectionCandidate,
   GrayboxCredentialSet,
   GrayboxProbeContext,
   GrayboxProbeDefinition,
@@ -231,6 +232,138 @@ class TestStateShape(unittest.TestCase):
     self.assertIn("X-Customer-Api-Key: <redacted>", haystack)
 
 
+class TestEvidenceCid(unittest.TestCase):
+  """RM-060 Phase F: redacted snapshots are hashed and stored; cid set on success."""
+
+  def setUp(self):
+    from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
+    self._patch = patch(
+      "extensions.business.cybersec.red_mesh.services.secrets.R1fsSecretStore")
+    store = self._patch.start()
+    self.addCleanup(self._patch.stop)
+    self.secret_store = store.return_value
+    self.secret_store.resolve_secret_store_key.return_value = ("key-1", {})
+    self._redact = lambda report: _ReportMixin._redact_report(None, report)
+
+  def _worker(self, **overrides):
+    worker = _make_worker(**overrides)
+    worker.owner._redact_report = self._redact
+    worker.owner.time.return_value = 1000.0
+    self.put = worker.owner._get_artifact_repository.return_value.put_json
+    self.put.return_value = "QmCid1"
+    return worker
+
+  def _finding(self, status="vulnerable", request="GET /x", response="HTTP 200\nbody"):
+    from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxEvidenceArtifact
+    artifacts = []
+    if request or response:
+      artifacts = [GrayboxEvidenceArtifact(
+        summary="s", request_snapshot=request, response_snapshot=response,
+      )]
+    return GrayboxFinding(
+      scenario_id="T-01", title="T", status=status, severity="HIGH",
+      owasp="A01:2021", evidence_artifacts=artifacts,
+    )
+
+  def _stored(self, worker, finding):
+    worker._store_findings("_p", [finding])
+    return worker.state["graybox_results"]["8000"]["_p"]["findings"][0]
+
+  def test_cid_set_when_store_succeeds(self):
+    worker = self._worker()
+    art = self._stored(worker, self._finding())["evidence_artifacts"][0]
+    self.assertEqual(art["raw_evidence_cid"], "QmCid1")
+    self.assertEqual(len(art["content_sha256"]), 64)
+
+  def test_cid_empty_when_store_fails_hash_kept(self):
+    worker = self._worker()
+    self.put.side_effect = RuntimeError("down")
+    art = self._stored(worker, self._finding())["evidence_artifacts"][0]
+    self.assertEqual(art["raw_evidence_cid"], "")
+    self.assertEqual(len(art["content_sha256"]), 64)
+
+  def test_cid_empty_when_store_returns_none(self):
+    worker = self._worker()
+    self.put.return_value = None
+    art = self._stored(worker, self._finding(status="inconclusive"))["evidence_artifacts"][0]
+    self.assertEqual(art["raw_evidence_cid"], "")
+    self.assertEqual(len(art["content_sha256"]), 64)
+
+  def test_hash_stable_and_content_sensitive(self):
+    from extensions.business.cybersec.red_mesh.graybox.findings import evidence_content_sha256 as h
+    self.assertEqual(h("a", "b"), h("a", "b"))
+    self.assertNotEqual(h("a", "b"), h("a", "c"))
+    self.assertNotEqual(h("a", "b"), h("ab", ""))
+
+  def test_no_snapshot_or_not_vulnerable_unchanged(self):
+    worker = self._worker()
+    self._stored(worker, self._finding(request="", response=""))
+    self._stored(worker, self._finding(status="not_vulnerable"))
+    self.put.assert_not_called()
+
+  # -- fix round 1 --
+
+  def test_blob_gets_the_report_level_redaction(self):
+    worker = self._worker()
+    request = ("GET https://bob:Hunter2pw@app.test/x\n"
+               "DB mysql://root:toor@db:3306/x\nlogin password: hunter2")
+    stored = self._stored(worker, self._finding(request=request))
+    blob = str(self.put.call_args[0][0])
+    state = str(stored["evidence_artifacts"])
+    for secret in ("Hunter2pw", "toor", "hunter2"):
+      self.assertNotIn(secret, blob)
+      self.assertNotIn(secret, state)
+
+  def test_hash_matches_the_stored_redacted_snapshot(self):
+    from extensions.business.cybersec.red_mesh.graybox.findings import evidence_content_sha256
+    worker = self._worker()
+    art = self._stored(
+      worker, self._finding(request="GET https://bob:Hunter2pw@app.test/x"),
+    )["evidence_artifacts"][0]
+    self.assertEqual(art["content_sha256"], evidence_content_sha256(
+      art["request_snapshot"], art["response_snapshot"]))
+
+  def test_redact_credentials_false_is_honoured(self):
+    worker = self._worker(redact_credentials=False)
+    self._stored(worker, self._finding(request="DB mysql://root:toor@db:3306/x"))
+    self.assertIn("toor", str(self.put.call_args[0][0]))
+
+  def test_blob_is_encrypted_with_the_secret_store_key(self):
+    worker = self._worker()
+    self._stored(worker, self._finding())
+    self.assertEqual(self.put.call_args.kwargs.get("secret"), "key-1")
+    blob = self.put.call_args[0][0]
+    self.assertTrue(blob.get("retention_until"))
+    self.assertEqual(blob.get("job_id"), "test-job-1")
+
+  def test_no_key_means_no_blob_but_hash_kept(self):
+    worker = self._worker()
+    self.secret_store.resolve_secret_store_key.return_value = ("", {})
+    art = self._stored(worker, self._finding())["evidence_artifacts"][0]
+    self.put.assert_not_called()
+    self.assertEqual(art["raw_evidence_cid"], "")
+    self.assertEqual(len(art["content_sha256"]), 64)
+
+  def test_blobs_capped_per_worker_then_hash_only(self):
+    from extensions.business.cybersec.red_mesh.graybox import worker as worker_module
+    worker = self._worker()
+    cap = worker_module.MAX_EVIDENCE_BLOBS_PER_WORKER
+    findings = [self._finding(request=f"GET /{i}") for i in range(cap + 3)]
+    worker._store_findings("_p", findings)
+    stored = worker.state["graybox_results"]["8000"]["_p"]["findings"]
+    self.assertEqual(self.put.call_count, cap)
+    last = stored[-1]["evidence_artifacts"][0]
+    self.assertEqual(last["raw_evidence_cid"], "")
+    self.assertEqual(len(last["content_sha256"]), 64)
+
+  def test_configured_login_field_names_are_secret(self):
+    worker = self._worker(target_config={"password_field": "pw_field", "csrf_field": "csrf_x"})
+    worker.auth.detected_csrf_field = "hidden_tok"
+    names = worker._configured_secret_field_names()
+    for name in ("pw_field", "csrf_x", "hidden_tok"):
+      self.assertIn(name, names)
+
+
 class TestStatus(unittest.TestCase):
 
   def test_get_status_scan_metrics_key(self):
@@ -369,6 +502,13 @@ class TestExecution(unittest.TestCase):
     self.assertEqual(context.discovered_routes, ["/r"])
     self.assertEqual(context.discovered_forms, ["/f"])
     self.assertEqual(context.regular_username, "alice")
+
+  def test_probe_context_carries_discovered_candidates(self):
+    worker = _make_worker()
+    cand = InjectionCandidate(path="/s/", param="q")
+    context = worker._build_probe_kwargs(DiscoveryResult(candidates=[cand]))
+    self.assertEqual(context.discovered_candidates, [cand])
+    self.assertEqual(context.to_kwargs()["discovered_candidates"], [cand])
 
   def test_supported_features_come_from_typed_probe_definitions(self):
     with patch(
@@ -1429,6 +1569,12 @@ class TestDiscoveryCoverageNote(unittest.TestCase):
     worker.auth.primary_principal = principal
     worker._store_discovery_results(["/a/"], ["/f/"])
     return worker.state["service_info"]["8000"]["_graybox_discovery"]
+
+  def test_fetch_failures_are_persisted(self):
+    worker = _make_worker()
+    worker._store_discovery_results(["/a/"], ["/f/"], fetch_failures=3)
+    info = worker.state["service_info"]["8000"]["_graybox_discovery"]
+    self.assertEqual(info["fetch_failures"], 3)
 
   def test_regular_only_scan_states_its_coverage(self):
     info = self._stored("absent", "regular")

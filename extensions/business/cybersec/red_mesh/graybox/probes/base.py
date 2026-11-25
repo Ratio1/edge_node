@@ -10,11 +10,13 @@ import requests
 
 from ..findings import (
   GrayboxEvidenceArtifact,
+  evidence_content_sha256,
   GrayboxFinding,
   location_from_evidence as _location_from_evidence,
 )
 from ..models import GrayboxProbeContext, GrayboxProbeRunResult
 from ..rollback import MUTATION_ATTEMPTED_UNKNOWN, StatefulMutationPlan
+from ..scenario_runtime import owns_legacy_families
 
 
 _SNAPSHOT_MAX_CHARS = 2048
@@ -119,7 +121,6 @@ def _artifact_from_response(response, scrub):
   through the caller's scrubber before anything is retained: an artifact must
   not become a new route for archiving what the scrubber removes elsewhere.
   """
-  import hashlib
   from datetime import datetime, timezone
 
   if response is None:
@@ -159,9 +160,7 @@ def _artifact_from_response(response, scrub):
       latency_ms = 0
 
   # Hashed after scrubbing, so the digest describes what is actually retained.
-  digest = hashlib.sha256(
-    (request_snapshot + "\x00" + response_snapshot).encode("utf-8", "replace")
-  ).hexdigest()
+  digest = evidence_content_sha256(request_snapshot, response_snapshot)
 
   return GrayboxEvidenceArtifact(
     summary=f"{method} {url} -> HTTP {status}"[:_SNAPSHOT_MAX_CHARS],
@@ -192,6 +191,7 @@ class ProbeBase:
 
   def __init__(self, target_url, auth_manager, target_config, safety,
                discovered_routes=None, discovered_forms=None,
+               discovered_candidates=None,
                regular_username="", allow_stateful=False,
                request_budget=None, allowed_scenario_ids=None,
                rollback_journal=None, job_id="", worker_id="",
@@ -202,6 +202,7 @@ class ProbeBase:
     self.safety = safety
     self.discovered_routes = discovered_routes or []
     self.discovered_forms = discovered_forms or []
+    self.discovered_candidates = discovered_candidates or []
     self.regular_username = regular_username
     self._allow_stateful = allow_stateful
     # OWASP API Top 10 — Subphase 1.7. Optional shared RequestBudget.
@@ -222,6 +223,16 @@ class ProbeBase:
     return cls(**context.to_kwargs())
 
   def run_safe(self, probe_name, probe_fn):
+    """Run a legacy (non-manifest) family, on the legacy-owning worker only.
+
+    Under SLICE the manifest divides the API scenarios but not these
+    families, so every worker would repeat them; only slice index 0 runs them.
+    """
+    if not owns_legacy_families(getattr(self, "allowed_scenario_ids", None)):
+      return
+    self._run_guarded(probe_name, probe_fn)
+
+  def _run_guarded(self, probe_name, probe_fn):
     """
     Run a probe with error recovery.
 
@@ -287,7 +298,7 @@ class ProbeBase:
     if self._is_api_security_scenario(scenario_id) and self._api_auth_unverified():
       self._emit_auth_unverified(scenario_id)
       return
-    self.run_safe(probe_name, probe_fn)
+    self._run_guarded(probe_name, probe_fn)
 
   def run_runtime_scenarios(self, probe_key: str):
     """Run assigned runtime-manifest scenarios for one probe family."""
@@ -848,6 +859,15 @@ class ProbeBase:
     except TypeError:
       sanitized = self.safety.sanitize_error(str(value))
     return self._scrub_for_emission(sanitized)
+
+  def evidence_from(self, response):
+    """Evidence artifacts for a finding built directly with `GrayboxFinding`.
+
+    Same artifact `emit_vulnerable(response=...)` builds, without changing how
+    the finding itself is constructed. Empty when there is no response.
+    """
+    built = _best_effort(_artifact_from_response, response, self._scrub_for_emission)
+    return self._scrub_for_emission([built]) if built is not None else []
 
   def emit_vulnerable(self, scenario_id, title, severity, owasp, cwe,
                        evidence, *, attack=None, evidence_artifacts=None,

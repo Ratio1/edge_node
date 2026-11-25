@@ -14,6 +14,8 @@ from .findings import (
   FindingRedactionContext,
   GrayboxEvidenceArtifact,
   GrayboxFinding,
+  evidence_blob,
+  evidence_content_sha256,
 )
 from .auth import AuthManager
 from .discovery import DiscoveryModule
@@ -29,6 +31,10 @@ from .models import (
   GrayboxProbeRunResult,
   GrayboxTargetConfig,
 )
+
+# The evidence add is synchronous on the scan thread: past this many blobs a
+# worker's findings keep their content hash only.
+MAX_EVIDENCE_BLOBS_PER_WORKER = 200
 
 # Weak auth uses a direct import (not the registry) because it is a
 # distinct pipeline phase, not a generic probe.
@@ -116,6 +122,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
     self._execution_identity = execution_identity
     self._port = parsed.port or (443 if parsed.scheme == "https" else 80)
     self._port_key = str(self._port)
+    self._evidence_blobs_stored = 0
 
     self.initial_ports = [self._port]
 
@@ -459,7 +466,8 @@ class GrayboxLocalWorker(BaseLocalWorker):
           known_routes=self.job_config.app_routes,
         )
         result = DiscoveryResult(routes=routes, forms=forms)
-      self._store_discovery_results(result.routes, result.forms)
+      self._store_discovery_results(
+        result.routes, result.forms, fetch_failures=result.fetch_failures)
       self.state["completed_tests"].append("graybox_discovery")
       return result
     finally:
@@ -475,6 +483,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
       safety=self.safety,
       discovered_routes=discovery_result.routes,
       discovered_forms=discovery_result.forms,
+      discovered_candidates=discovery_result.candidates,
       regular_username=self._credentials.regular.username if self._credentials.regular else "",
       allow_stateful=self.job_config.allow_stateful_probes,
       request_budget=self.request_budget,
@@ -663,7 +672,9 @@ class GrayboxLocalWorker(BaseLocalWorker):
       secret_field_names=self._configured_secret_field_names(),
     ):
       port_results[key] = {
-        "findings": [f.to_dict() for f in run_result.findings],
+        "findings": self._attach_evidence_cids(
+          [f.to_dict() for f in run_result.findings], key,
+        ),
         "artifacts": [
           GrayboxEvidenceArtifact.from_value(artifact).to_dict()
           for artifact in run_result.artifacts
@@ -672,6 +683,84 @@ class GrayboxLocalWorker(BaseLocalWorker):
       }
     for finding in run_result.findings:
       self.metrics.record_finding(getattr(finding, "severity", "INFO"))
+
+  def _attach_evidence_cids(self, flats, key):
+    """Hash and store the redacted snapshots of vulnerable/inconclusive findings.
+
+    The snapshots go through the same `_redact_report` pass the worker report
+    gets (honouring `redact_credentials`) before they are hashed or stored, and
+    the redacted text replaces the one held in the result, so the hash matches
+    what the report shows. A storage failure leaves the cid empty and keeps the
+    hash; it never fails the job. The R1FS add is synchronous on the scan
+    thread, so past `MAX_EVIDENCE_BLOBS_PER_WORKER` a finding keeps only its hash.
+    """
+    targets = [
+      artifact
+      for flat in flats
+      if flat.get("status") in ("vulnerable", "inconclusive")
+      for artifact in (flat.get("evidence_artifacts") or [])
+      if isinstance(artifact, dict)
+      and (artifact.get("request_snapshot") or artifact.get("response_snapshot"))
+    ]
+    if not targets:
+      return flats
+    if getattr(self.job_config, "redact_credentials", True):
+      try:
+        redacted = self.owner._redact_report(
+          {"graybox_results": {self._port_key: {key: {"findings": flats}}}}
+        )
+        redacted_flats = redacted["graybox_results"][self._port_key][key]["findings"]
+        for flat, red in zip(flats, redacted_flats):
+          for artifact, red_artifact in zip(
+            flat.get("evidence_artifacts") or [], red.get("evidence_artifacts") or [],
+          ):
+            if isinstance(artifact, dict) and isinstance(red_artifact, dict):
+              for field_name in ("summary", "request_snapshot", "response_snapshot"):
+                artifact[field_name] = red_artifact.get(field_name, "")
+      except Exception as exc:
+        # Fail closed: nothing unredacted is hashed or stored.
+        self.P(f"Evidence redaction failed: {self._sanitize_error(exc)}", color='y')
+        return flats
+    for artifact in targets:
+      request = artifact.get("request_snapshot") or ""
+      response = artifact.get("response_snapshot") or ""
+      artifact["content_sha256"] = evidence_content_sha256(request, response)
+      if not artifact.get("raw_evidence_cid"):
+        artifact["raw_evidence_cid"] = self._store_evidence_blob(
+          request, response, artifact["content_sha256"],
+        )
+    return flats
+
+  def _store_evidence_blob(self, request, response, digest):
+    if self._evidence_blobs_stored >= MAX_EVIDENCE_BLOBS_PER_WORKER:
+      return ""
+    # Imported here: `services` imports this module, so a top-level import cycles.
+    from ..model_testing.raw_evidence import _retention_until
+    from ..services.config import get_model_testing_config
+    from ..services.secrets import R1fsSecretStore
+    try:
+      secret_key, _ = R1fsSecretStore(self.owner).resolve_secret_store_key()
+      if not secret_key:
+        return ""
+      payload = {
+        "kind": "redmesh_graybox_evidence",
+        "job_id": self.job_id,
+        "retention_until": _retention_until(
+          self.owner, get_model_testing_config(self.owner),
+        ),
+        "content_sha256": digest,
+        **evidence_blob(request, response),
+      }
+      cid = self.owner._get_artifact_repository().put_json(
+        payload, show_logs=False, secret=secret_key,
+      )
+    except Exception as exc:
+      self.P(f"Evidence storage failed: {self._sanitize_error(exc)}", color='y')
+      return ""
+    if not isinstance(cid, str) or not cid:
+      return ""
+    self._evidence_blobs_stored += 1
+    return cid
 
   def _configured_secret_field_names(self):
     api_security = getattr(self.target_config, "api_security", None)
@@ -689,6 +778,15 @@ class GrayboxLocalWorker(BaseLocalWorker):
         value = getattr(descriptor, attr, None)
         if isinstance(value, str) and value and value not in names:
           names.append(value)
+    # The login form's own field names: a captured login request carries the
+    # operator's target password and the CSRF token under them.
+    for value in (
+      getattr(self.target_config, "password_field", None),
+      getattr(self.target_config, "csrf_field", None),
+      getattr(getattr(self, "auth", None), "detected_csrf_field", None),
+    ):
+      if isinstance(value, str) and value and value not in names:
+        names.append(value)
     return tuple(names)
 
   def _sanitize_error(self, value):
@@ -712,11 +810,12 @@ class GrayboxLocalWorker(BaseLocalWorker):
       "findings": [],
     }
 
-  def _store_discovery_results(self, routes, forms):
+  def _store_discovery_results(self, routes, forms, fetch_failures=0):
     port_info = self.state["service_info"].setdefault(self._port_key, {})
     port_info["_graybox_discovery"] = {
       "routes": routes,
       "forms": forms,
+      "fetch_failures": fetch_failures,
       "crawled_as": self.auth.primary_principal,
       "coverage_note": (
         "Crawled as the regular user; admin-only pages not reached."

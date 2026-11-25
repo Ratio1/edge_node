@@ -361,6 +361,8 @@ class ReflectiveEndpoint:
   """
   path: str
   param: str = "msg"
+  # "discovered" for candidates the crawler fed in; never read from config.
+  source: str = "configured"
 
   @classmethod
   def from_dict(cls, d: dict) -> ReflectiveEndpoint:
@@ -439,12 +441,19 @@ class BusinessLogicConfig:
     )
 
 
+# Hard ceiling on discovered candidates per family, whatever the config says.
+MAX_CANDIDATES_CEILING = 50
+
+
 @dataclass(frozen=True)
 class DiscoveryConfig:
   """Config for route/form discovery."""
   scope_prefix: str = ""                  # e.g. "/api/" — only crawl under this path
   max_pages: int = 50                     # max pages to crawl
   max_depth: int = 3                      # max link-follow depth
+  # Discovered injection candidates tried per probe family; configured
+  # endpoints are never capped. Clamped to MAX_CANDIDATES_CEILING.
+  max_candidates_per_family: int = 20
 
   @classmethod
   def from_dict(cls, d: dict) -> DiscoveryConfig:
@@ -453,6 +462,8 @@ class DiscoveryConfig:
       scope_prefix=d.get("scope_prefix", ""),
       max_pages=d.get("max_pages", 50),
       max_depth=d.get("max_depth", 3),
+      max_candidates_per_family=max(0, min(
+        int(d.get("max_candidates_per_family", 20)), MAX_CANDIDATES_CEILING)),
     )
 
 

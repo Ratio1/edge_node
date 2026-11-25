@@ -26,7 +26,7 @@ class BusinessLogicProbes(ProbeBase):
         title="Business logic probes skipped",
         status="inconclusive",
         severity="INFO",
-        owasp="A06:2021",
+        owasp="A04:2021",
         evidence=["stateful_probes_disabled=True"],
       ))
     return self.findings
@@ -201,7 +201,7 @@ class BusinessLogicProbes(ProbeBase):
             title="Workflow bypass — missing authorization guard",
             status="vulnerable",
             severity="MEDIUM",
-            owasp="A06:2021",
+            owasp="A04:2021",
             cwe=["CWE-841"],
             attack=["T1078"],
             # No typed `method=` here, deliberately. Two configured endpoints on
@@ -226,6 +226,7 @@ class BusinessLogicProbes(ProbeBase):
               f"Observe status {resp.status_code} instead of expected guard {expected}.",
             ],
             remediation="Enforce workflow state guards and role checks on all state-changing endpoints.",
+            evidence_artifacts=self.evidence_from(resp),
           ))
           bypass_emitted = True
 
@@ -237,7 +238,7 @@ class BusinessLogicProbes(ProbeBase):
         title="Workflow bypass — guards held",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A06:2021",
+        owasp="A04:2021",
         evidence=[f"endpoints_tested={endpoints_tested}"],
       ))
 
@@ -265,12 +266,14 @@ class BusinessLogicProbes(ProbeBase):
         break
 
     bypass_evidence = []
+    bypass_response = None
     tested = 0
     denied = 0
     # PT-A06-04 (Negative amount accepted) is a strict subset of PT-A06-02
     # — track separately so the catalog row fires when negative amount is
     # accepted, even if the invalid-state branch also triggers PT-A06-02.
     negative_amount_evidence = []
+    negative_amount_response = None
 
     for ep in endpoints:
       path = ep.path
@@ -361,6 +364,10 @@ class BusinessLogicProbes(ProbeBase):
           accepted = not any(m in body_lower for m in error_markers)
         if accepted:
           bypass_evidence.append(f"negative_amount_accepted=True; endpoint={path}")
+          if bypass_response is None:
+            bypass_response = resp
+          if negative_amount_response is None:
+            negative_amount_response = resp
           negative_amount_evidence.append(
             f"endpoint={path}; submitted_amount=-9999.99; status={resp.status_code}"
           )
@@ -415,6 +422,8 @@ class BusinessLogicProbes(ProbeBase):
                 f"invalid_transition_accepted=True; "
                 f"from={current_status}; to={invalid_target}; endpoint={path}"
               )
+              if bypass_response is None:
+                bypass_response = resp2
 
     if bypass_evidence:
       self.findings.append(GrayboxFinding(
@@ -422,7 +431,7 @@ class BusinessLogicProbes(ProbeBase):
         title="Business logic validation bypass",
         status="vulnerable",
         severity="MEDIUM",
-        owasp="A06:2021",
+        owasp="A04:2021",
         cwe=["CWE-20", "CWE-840"],
         attack=["T1190"],
         evidence=bypass_evidence,
@@ -434,6 +443,7 @@ class BusinessLogicProbes(ProbeBase):
         remediation="Enforce server-side validation for monetary amounts (>= 0) "
                     "and business state machine transitions. "
                     "Never rely on client-side validation alone.",
+        evidence_artifacts=self.evidence_from(bypass_response),
       ))
     elif tested:
       self.findings.append(GrayboxFinding(
@@ -441,14 +451,14 @@ class BusinessLogicProbes(ProbeBase):
         title="Business logic validation — no bypass detected",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A06:2021",
+        owasp="A04:2021",
         evidence=[f"endpoints_tested={tested}"],
       ))
     elif denied:
       self.emit_endpoint_denied("PT-A06-02")
     else:
       self.emit_inconclusive(
-        "PT-A06-02", "Business logic validation bypass", "A06:2021",
+        "PT-A06-02", "Business logic validation bypass", "A04:2021",
         "no_evaluable_responses",
       )
 
@@ -473,6 +483,7 @@ class BusinessLogicProbes(ProbeBase):
                     "endpoint that mutates monetary fields. Form-level "
                     "validation alone is insufficient — always re-validate at "
                     "the model or service boundary.",
+        evidence_artifacts=self.evidence_from(negative_amount_response),
       ))
     elif tested:
       self.findings.append(GrayboxFinding(
