@@ -2,6 +2,7 @@
 
 import dataclasses
 import unittest
+import unittest.mock
 from unittest.mock import MagicMock
 
 from extensions.business.cybersec.red_mesh.graybox.probes.injection import InjectionProbes
@@ -1185,3 +1186,460 @@ class TestCandidateBoundary(unittest.TestCase):
     c = InjectionCandidate(path="/p/", param="b", method="POST")
     probe = _make_probe(discovered_candidates=[c])
     self.assertEqual(probe._reflective_endpoints([]), [])
+
+
+class _FakeDb:
+  """A tiny app that behaves like a SQL-backed search page.
+
+  mode: "boolean" (TRUE/FALSE queries differ), "error" (quote leaks a DBMS
+  error), "time" (SLEEP payload delays), "safe" (value ignored),
+  "noisy" (random token on every response, value ignored).
+  """
+
+  def __init__(self, mode, clock):
+    self.mode = mode
+    self.clock = clock
+    self.calls = []
+    self._n = 0
+
+  def handle(self, value):
+    self.calls.append(value)
+    self._n += 1
+    v = value or ""
+    body = "<h1>Items</h1>"
+    if self.mode == "boolean":
+      if "'1'='2" in v or "1=2" in v:
+        body += "no rows"
+      else:
+        body += "row-a row-b"
+    elif self.mode == "error":
+      body += "ok"
+      if v.endswith("'"):
+        body += " You have an error in your SQL syntax near ''1'''"
+    elif self.mode == "time":
+      body += "ok"
+      if "SLEEP(" in v:
+        self.clock.now += 3
+    elif self.mode == "noisy":
+      body += "ok session=%032x" % (self._n * 7919 + 0xABCDEF123456)
+    else:
+      body += "ok"
+    return _mock_response(text=body)
+
+
+class _Clock:
+  def __init__(self):
+    self.now = 0.0
+
+  def __call__(self):
+    return self.now
+
+
+class TestRealSqli(unittest.TestCase):
+  """RM-060 Phase D: technique decision logic against fake apps."""
+
+  def _run_get(self, mode):
+    from types import SimpleNamespace
+    from extensions.business.cybersec.red_mesh.graybox.probes import (
+      injection as inj_mod, sqli as sqli_detect)
+    clock = _Clock()
+    app = _FakeDb(mode, clock)
+    probe = _make_probe(
+      xss_endpoints=[ReflectiveEndpoint(path="/search/", param="q")])
+    probe.auth.primary_session.get = MagicMock(
+      side_effect=lambda url, params=None, timeout=None: app.handle(params["q"]))
+    with unittest.mock.patch.object(
+        sqli_detect, "time", SimpleNamespace(monotonic=clock)):
+      probe._test_sqli_get()
+    return probe, app
+
+  def test_boolean_difference_is_vulnerable(self):
+    probe, app = self._run_get("boolean")
+    f = [x for x in probe.findings if x.status == "vulnerable"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].severity, "HIGH")
+    self.assertEqual(f[0].parameter, "q")
+    self.assertIn("technique=boolean", f[0].evidence)
+    self.assertIn("confidence=firm", f[0].evidence)
+
+  def test_error_signature_names_dbms(self):
+    probe, _ = self._run_get("error")
+    f = [x for x in probe.findings if x.status == "vulnerable"]
+    self.assertEqual(len(f), 1)
+    self.assertIn("technique=error", f[0].evidence)
+    self.assertIn("dbms=mysql", f[0].evidence)
+
+  def test_time_delay_is_tentative(self):
+    probe, app = self._run_get("time")
+    f = [x for x in probe.findings if x.status == "vulnerable"]
+    self.assertEqual(len(f), 1)
+    self.assertIn("technique=time", f[0].evidence)
+    self.assertIn("confidence=tentative", f[0].evidence)
+    self.assertLessEqual(sum("SLEEP(" in v or "pg_sleep" in v for v in app.calls), 4)
+
+  def test_safe_endpoint_yields_nothing(self):
+    probe, app = self._run_get("safe")
+    self.assertEqual(probe.findings, [])
+    self.assertLessEqual(len(app.calls), 11)  # 2 + 2 + 4 + 3 time payloads
+
+  def test_noisy_endpoint_does_not_trigger_boolean(self):
+    probe, _ = self._run_get("noisy")
+    self.assertEqual(probe.findings, [])
+
+  def test_payloads_are_read_style_only(self):
+    _, app = self._run_get("time")
+    for v in app.calls:
+      for bad in (";", "DROP", "UPDATE", "DELETE", "INSERT"):
+        self.assertNotIn(bad, v.upper() if bad.isalpha() else v)
+
+  def test_login_form_boolean_replaces_reflection_row(self):
+    clock = _Clock()
+    app = _FakeDb("boolean", clock)
+    probe = _make_probe()
+    anon = MagicMock()
+    anon.get.return_value = _mock_response(text="<form></form>")
+    anon.post.side_effect = lambda url, data=None, **kw: app.handle(
+      data[probe.target_config.username_field])
+    probe.auth.make_anonymous_session.return_value = anon
+    probe._test_login_injection()
+    sqli = [f for f in probe.findings if f.scenario_id == "PT-A05-01"
+            and "SQL" in f.title]
+    self.assertEqual(len(sqli), 1)
+    self.assertEqual(sqli[0].status, "vulnerable")
+    self.assertEqual(sqli[0].parameter, probe.target_config.username_field)
+
+  def test_authenticated_form_error_is_vulnerable(self):
+    clock = _Clock()
+    app = _FakeDb("error", clock)
+    probe = _make_probe(discovered_forms=["/search/"], allow_stateful=True)
+    session = probe.auth.primary_session
+    session.get.return_value = _mock_response(
+      text='<form><input name="q" type="text"></form>')
+    session.post.side_effect = lambda url, data=None, **kw: app.handle(data["q"])
+    probe._test_authenticated_injection()
+    sqli = [f for f in probe.findings if "SQL" in f.title]
+    self.assertEqual(len(sqli), 1)
+    self.assertEqual(sqli[0].status, "vulnerable")
+    self.assertEqual(sqli[0].scenario_id, "PT-A03-01")
+    self.assertEqual(sqli[0].parameter, "q")
+
+  def test_confidence_reaches_flat_finding(self):
+    probe, _ = self._run_get("boolean")
+    self.assertEqual(
+      probe.findings[0].to_flat_finding(1, "http", "p")["confidence"], "firm")
+    probe, _ = self._run_get("time")
+    self.assertEqual(
+      probe.findings[0].to_flat_finding(1, "http", "p")["confidence"], "tentative")
+
+  def test_unstable_baseline_is_inconclusive_no_boolean(self):
+    from types import SimpleNamespace
+    from extensions.business.cybersec.red_mesh.graybox.probes import sqli
+    clock = _Clock()
+    probe = _make_probe(
+      xss_endpoints=[ReflectiveEndpoint(path="/s/", param="q")])
+    n = {"i": 0}
+
+    def get(url, params=None, timeout=None):
+      n["i"] += 1
+      return _mock_response(text="visitor " + "x" * n["i"])  # every body differs
+    probe.auth.primary_session.get = MagicMock(side_effect=get)
+    with unittest.mock.patch.object(sqli, "time", SimpleNamespace(monotonic=clock)):
+      probe._test_sqli_get()
+    self.assertEqual(len(probe.findings), 1)
+    self.assertEqual(probe.findings[0].status, "inconclusive")
+    self.assertIn("reason=sqli_baseline_unstable", probe.findings[0].evidence)
+
+  def test_time_timeout_is_inconclusive(self):
+    from types import SimpleNamespace
+    from extensions.business.cybersec.red_mesh.graybox.probes import sqli
+    probe = _make_probe(
+      xss_endpoints=[ReflectiveEndpoint(path="/s/", param="q")])
+
+    def get(url, params=None, timeout=None):
+      if "SLEEP" in params["q"] or "pg_sleep" in params["q"]:
+        raise TimeoutError("slow")
+      return _mock_response(text="ok")
+    probe.auth.primary_session.get = MagicMock(side_effect=get)
+    with unittest.mock.patch.object(
+        sqli, "time", SimpleNamespace(monotonic=_Clock())):
+      probe._test_sqli_get()
+    self.assertEqual([f.evidence[-1] for f in probe.findings],
+                     ["reason=sqli_time_timeout"])
+
+  def test_budget_exhausted_is_inconclusive_and_stops(self):
+    probe = _make_probe(
+      xss_endpoints=[ReflectiveEndpoint(path="/a/", param="q"),
+                     ReflectiveEndpoint(path="/b/", param="q")])
+    probe.auth.primary_session.get = MagicMock(
+      return_value=_mock_response(text="ok"))
+    probe.budget = MagicMock(side_effect=[True, True, True, False])
+    probe._test_sqli_get()
+    self.assertEqual(probe.auth.primary_session.get.call_count, 3)
+    self.assertEqual(len(probe.findings), 1)
+    self.assertIn("reason=sqli_budget_exhausted", probe.findings[0].evidence)
+
+  def test_scan_wide_time_allowance_skips_time_technique(self):
+    from types import SimpleNamespace
+    from extensions.business.cybersec.red_mesh.graybox.probes import sqli
+    clock = _Clock()
+    app = _FakeDb("safe", clock)
+    probe = _make_probe(
+      xss_endpoints=[ReflectiveEndpoint(path="/s/", param="q")])
+    probe._sqli_time_left = {"s": 0}
+    probe.auth.primary_session.get = MagicMock(
+      side_effect=lambda url, params=None, timeout=None: app.handle(params["q"]))
+    with unittest.mock.patch.object(sqli, "time", SimpleNamespace(monotonic=clock)):
+      probe._test_sqli_get()
+    self.assertFalse(any("SLEEP" in v or "pg_sleep" in v for v in app.calls))
+
+  def test_post_fetches_fresh_csrf_before_each_request(self):
+    probe = _make_probe(discovered_forms=["/search/"], allow_stateful=True)
+    probe.auth.detected_csrf_field = "csrf_token"
+    session = probe.auth.primary_session
+    n = {"i": 0}
+
+    def get(url, **kw):
+      n["i"] += 1
+      return _mock_response(
+        text='<form><input name="q" type="text">tok%d</form>' % n["i"])
+    session.get.side_effect = get
+    probe.auth.extract_csrf_value = MagicMock(
+      side_effect=lambda text, field: text.split("</form>")[0].rsplit(">", 1)[1])
+    seen = []
+
+    def post(url, data=None, **kw):
+      seen.append((data.get("csrf_token"), n["i"]))
+      return _mock_response(text="ok")
+    session.post.side_effect = post
+    probe._test_authenticated_injection()
+    # each SQLi POST carries the token of the GET that immediately preceded it
+    sqli_posts = seen[2:]  # the 2 legacy reflection POSTs reuse the page token
+    self.assertGreater(len(sqli_posts), 5)
+    for token, last_get in sqli_posts:
+      self.assertEqual(token, "tok%d" % last_get)
+
+  def test_form_sqli_posts_need_stateful(self):
+    probe = _make_probe(discovered_forms=["/search/"], allow_stateful=False)
+    session = probe.auth.primary_session
+    session.get.return_value = _mock_response(
+      text='<form><input name="q" type="text"></form>')
+    session.post.return_value = _mock_response(text="ok")
+    probe._test_authenticated_injection()
+    self.assertEqual(session.post.call_count, 2)  # legacy payloads only
+
+  def test_time_technique_is_get_only(self):
+    from types import SimpleNamespace
+    from extensions.business.cybersec.red_mesh.graybox.probes import sqli
+    clock = _Clock()
+    app = _FakeDb("time", clock)
+    probe = _make_probe(discovered_forms=["/search/"], allow_stateful=True)
+    session = probe.auth.primary_session
+    session.get.return_value = _mock_response(
+      text='<form><input name="q" type="text"></form>')
+    session.post.side_effect = lambda url, data=None, **kw: app.handle(data["q"])
+    with unittest.mock.patch.object(sqli, "time", SimpleNamespace(monotonic=clock)):
+      probe._test_authenticated_injection()
+    self.assertFalse(any("SLEEP" in v or "pg_sleep" in v for v in app.calls))
+
+  def _login_probe(self, app_handle, status=200):
+    probe = _make_probe()
+    login_url = probe.target_url + probe.target_config.login_path
+    anon = MagicMock()
+    anon.get.return_value = _mock_response(text="<form></form>")
+
+    def post(url, data=None, **kw):
+      r = app_handle(data[probe.target_config.username_field])
+      r.url = login_url   # a login that re-renders the login form
+      r.status_code = status
+      return r
+    anon.post.side_effect = post
+    probe.auth.make_anonymous_session.return_value = anon
+    return probe, anon
+
+  def test_login_rerender_at_login_url_is_still_tested(self):
+    app = _FakeDb("boolean", _Clock())
+    probe, _ = self._login_probe(app.handle)
+    probe._test_login_injection()
+    sqli = [f for f in probe.findings if "SQL injection (boolean" in f.title]
+    self.assertEqual(len(sqli), 1)
+
+  def test_login_denied_status_is_not_tested(self):
+    app = _FakeDb("boolean", _Clock())
+    probe, anon = self._login_probe(app.handle, status=403)
+    probe._test_login_injection()
+    self.assertFalse(any(f.status == "vulnerable" for f in probe.findings))
+
+  def test_login_cap_per_field_and_scan_and_no_time(self):
+    app = _FakeDb("safe", _Clock())
+    probe, anon = self._login_probe(app.handle)
+    probe._test_login_injection()
+    sqli_posts = anon.post.call_count - 2  # two legacy payload POSTs
+    self.assertLessEqual(sqli_posts, 16)
+    self.assertFalse(any("SLEEP" in v or "pg_sleep" in v for v in app.calls))
+
+  def test_login_field_cap_moves_on_to_password_field(self):
+    seen = {"false": 0}
+
+    def flaky(value):
+      # First FALSE query differs (looks injectable), the repeat does not: the
+      # boolean check needs a second pair, which pushes past the 8-POST cap.
+      v = value or ""
+      body = "<h1>Items</h1>row-a"
+      if "'1'='2" in v or "1=2" in v:
+        seen["false"] += 1
+        if seen["false"] == 1:
+          body = "<h1>Items</h1>no rows"
+      return _mock_response(text=body)
+    probe, anon = self._login_probe(flaky)
+    probe._test_login_injection()
+    pw = probe.target_config.password_field
+    pw_payloads = [c.kwargs["data"][pw] for c in anon.post.call_args_list
+                   if c.kwargs["data"][pw] != "test"]
+    self.assertTrue(any("'" in v or "AND" in v for v in pw_payloads))
+
+  def test_mssql_signature_needs_an_error_context(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes.sqli import dbms_from_text
+    self.assertIsNone(dbms_from_text("Powered by Microsoft SQL Server 2019"))
+    self.assertIsNone(dbms_from_text("sqlserver connection guide"))
+    self.assertEqual(dbms_from_text("Microsoft SQL Server Native Client error '80040e14'"), "mssql")
+    self.assertEqual(dbms_from_text("Microsoft OLE DB Provider for SQL Server error '80040e14'"), "mssql")
+
+  def test_csrf_fetch_failure_ends_only_that_form(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes.sqli import CsrfUnavailable
+    probe = _make_probe()
+    probe.auth.detected_csrf_field = "csrfmiddlewaretoken"
+    session = MagicMock()
+    session.get.side_effect = ConnectionError("down")
+    send, prepare = probe._sqli_send_post(session, probe.target_url + "/f/", {"q": "test"}, "q",
+                                          probe.target_url + "/f/")
+    outcome = probe._sqli_run("PT-A03-01", probe.target_url + "/f/", "q", send, "POST", True,
+                              prepare=prepare)
+    self.assertEqual(outcome, "csrf_unavailable")
+    session.post.assert_not_called()
+    self.assertFalse(probe.__dict__.get("_sqli_stopped"))  # later passes still run
+    self.assertFalse([f for f in probe.findings if "budget" in " ".join(f.evidence)])
+
+  def test_get_pass_stops_on_429(self):
+    eps = [ReflectiveEndpoint(path="/a/", param="q"), ReflectiveEndpoint(path="/b/", param="q")]
+    probe = _make_probe(xss_endpoints=eps)
+    probe.auth.primary_session.get = MagicMock(return_value=_mock_response(status=429, text="slow down"))
+    probe._test_sqli_get()
+    urls = {c.args[0] for c in probe.auth.primary_session.get.call_args_list}
+    self.assertNotIn(probe.target_url + "/b/", urls)
+
+  def test_login_429_stops(self):
+    app = _FakeDb("boolean", _Clock())
+    probe, anon = self._login_probe(app.handle, status=429)
+    probe._test_login_injection()
+    self.assertLessEqual(anon.post.call_count, 2 + 2)
+
+  def test_echoed_escaped_input_does_not_hide_or_fake_boolean(self):
+    import html as _h
+
+    def page(mode):
+      def handle(v):
+        body = "<p>You searched: %s</p>" % _h.escape(v)  # &#x27; form
+        body = body.replace("&#x27;", "&#39;")
+        if mode == "inject":
+          body += "no rows" if ("'1'='2" in v or "1=2" in v) else "rows"
+        else:
+          body += "rows"
+        return _mock_response(text=body)
+      return handle
+    for mode, expected in (("inject", 1), ("safe", 0)):
+      probe = _make_probe(
+        xss_endpoints=[ReflectiveEndpoint(path="/s/", param="q")])
+      h = page(mode)
+      probe.auth.primary_session.get = MagicMock(
+        side_effect=lambda url, params=None, timeout=None: h(params["q"]))
+      from types import SimpleNamespace
+      from extensions.business.cybersec.red_mesh.graybox.probes import sqli
+      with unittest.mock.patch.object(
+          sqli, "time", SimpleNamespace(monotonic=_Clock())):
+        probe._test_sqli_get()
+      self.assertEqual(
+        len([f for f in probe.findings if f.status == "vulnerable"]), expected, mode)
+
+  def test_raising_request_is_charged_elapsed_time(self):
+    from types import SimpleNamespace
+    from extensions.business.cybersec.red_mesh.graybox.probes import sqli
+    clock = _Clock()
+
+    def send(v):
+      if "SLEEP" in v or "pg_sleep" in v:
+        clock.now += 5
+        raise TimeoutError("slow")
+      return _mock_response(text="ok")
+    left = {"s": 60}
+    with unittest.mock.patch.object(sqli, "time", SimpleNamespace(monotonic=clock)):
+      res = sqli.detect_sqli(send, time_left=left)
+    self.assertEqual(res["outcome"], "timeout")
+    self.assertEqual(left["s"], 55)
+
+  def test_mysql_time_payload_is_one_shot_subquery(self):
+    _, app = self._run_get("time")
+    self.assertTrue(any("(SELECT 1 FROM (SELECT SLEEP(3))x)" in v for v in app.calls))
+
+  def test_slow_server_control_request_blocks_time_hit(self):
+    from types import SimpleNamespace
+    from extensions.business.cybersec.red_mesh.graybox.probes import sqli
+    clock = _Clock()
+    n = {"i": 0}
+
+    def send(v):
+      n["i"] += 1
+      if n["i"] > 8:      # after the baseline and error/boolean probes: slow
+        clock.now += 3.5
+      return _mock_response(text="ok")
+    with unittest.mock.patch.object(sqli, "time", SimpleNamespace(monotonic=clock)):
+      res = sqli.detect_sqli(send, time_left={"s": 60})
+    self.assertNotEqual(res["outcome"], "hit")
+
+  def test_refused_budget_on_csrf_get_sends_no_post(self):
+    probe = _make_probe()
+    probe.auth.detected_csrf_field = "csrf_token"
+    session = MagicMock()
+    session.get.return_value = _mock_response(text="x")
+    session.post.return_value = _mock_response(text="x")
+    probe.budget = MagicMock(side_effect=[True, False])  # request ok, CSRF GET refused
+    send, prepare = probe._sqli_send_post(session, "http://t/x", {"q": "test"}, "q", "http://t/x")
+    outcome = probe._sqli_run("PT-A03-01", "http://t/x", "q", send, "POST", True,
+                              prepare=prepare)
+    self.assertEqual(outcome, "budget")
+    session.post.assert_not_called()
+
+  def test_budget_stop_is_family_wide_with_one_inconclusive(self):
+    probe = _make_probe(
+      discovered_forms=["/a/", "/b/"], allow_stateful=True,
+      xss_endpoints=[ReflectiveEndpoint(path="/g/", param="q")])
+    session = probe.auth.primary_session
+    session.get.return_value = _mock_response(
+      text='<form><input name="q" type="text"></form>')
+    session.post.return_value = _mock_response(text="ok")
+    calls = {"n": 0}
+
+    def budget():
+      calls["n"] += 1
+      return calls["n"] < 3
+    probe.budget = budget
+    probe._test_authenticated_injection()
+    probe._test_sqli_get()
+    stops = [f for f in probe.findings
+             if "reason=sqli_budget_exhausted" in f.evidence]
+    self.assertEqual(len(stops), 1)
+
+  def test_unstable_inconclusive_once_per_endpoint(self):
+    probe = _make_probe(discovered_forms=["/s/"], allow_stateful=True)
+    session = probe.auth.primary_session
+    session.get.return_value = _mock_response(
+      text='<form><input name="a" type="text"><input name="b" type="text"></form>')
+    n = {"i": 0}
+
+    def post(url, data=None, **kw):
+      n["i"] += 1
+      return _mock_response(text="visitor " + "x" * n["i"])
+    session.post.side_effect = post
+    probe._test_authenticated_injection()
+    unstable = [f for f in probe.findings
+                if "reason=sqli_baseline_unstable" in f.evidence]
+    self.assertEqual(len(unstable), 1)

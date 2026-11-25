@@ -510,6 +510,8 @@ class GrayboxFinding:
   url: str | None = None
   parameter: str | None = None
   method: str | None = None
+  # Explicit confidence ("firm", "tentative", ...); "" keeps the status default.
+  confidence: str = ""
 
   @classmethod
   def from_dict(cls, payload: dict[str, Any]) -> "GrayboxFinding":
@@ -594,7 +596,7 @@ class GrayboxFinding:
     declared_severity = self.severity.upper()
     effective_severity = "INFO" if self.status == "not_vulnerable" else declared_severity
     confidence, confidence_recognised = _normalize_confidence(
-      confidence_map.get(self.status, "tentative"),
+      self.confidence or confidence_map.get(self.status, "tentative"),
     )
     cvss_vector, cvss_score, severity_source = self._cvss(declared_severity)
 

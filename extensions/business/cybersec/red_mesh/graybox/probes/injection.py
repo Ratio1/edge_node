@@ -2,6 +2,7 @@
 Injection probes — A03 + A05 + API7.
 """
 
+import dataclasses
 import re
 from urllib.parse import urlparse
 
@@ -10,6 +11,17 @@ from ... import cvss_vectors as V
 from ..findings import GrayboxFinding
 from ..models.target_config import ReflectiveEndpoint
 from ..scenario_catalog import graybox_scenario
+from .sqli import (
+  BudgetRefused, CsrfUnavailable, LOGIN_MAX_PER_FIELD, LOGIN_MAX_PER_SCAN, SCAN_TIME_ALLOWANCE,
+  detect_sqli, status_reached,
+)
+
+
+_SQLI_REASONS = {  # "capped", "field_capped", "rate_limited", "csrf_unavailable" end silently
+  "unstable": "sqli_baseline_unstable",
+  "timeout": "sqli_time_timeout",
+  "budget": "sqli_budget_exhausted",
+}
 
 
 class InjectionProbes(ProbeBase):
@@ -28,6 +40,7 @@ class InjectionProbes(ProbeBase):
     self.run_safe("login_injection", self._test_login_injection)
     if self.auth.primary_session:
       self.run_safe("authenticated_injection", self._test_authenticated_injection)
+      self.run_safe("sqli_get", self._test_sqli_get)
       if self._allow_stateful:
         self.run_safe("stored_xss", self._test_stored_xss)
       else:
@@ -110,6 +123,128 @@ class InjectionProbes(ProbeBase):
   def _source_tag(ep):
     return "; source=discovered" if ep.source == "discovered" else ""
 
+  def _sqli_finding(self, scenario_id, url, param, hit, authenticated, method):
+    """One vulnerable finding for a confirmed SQL injection (typed parameter)."""
+    pair = hit["payload_true"] + (
+      f" / {hit['payload_false']}" if hit["payload_false"] else "")
+    finding = GrayboxFinding(
+      scenario_id=scenario_id,
+      title=f"SQL injection ({hit['technique']}-based) confirmed",
+      status="vulnerable",
+      severity="HIGH",
+      cvss_vector=V.INJECTION_DATA_ACCESS,
+      owasp="A03:2021",
+      cwe=["CWE-89"],
+      attack=["T1190"],
+      parameter=param,
+      confidence=hit["confidence"],
+      evidence=[
+        f"endpoint={url}",
+        f"parameter={param}",
+        f"technique={hit['technique']}",
+        f"payload={pair}",
+        f"dbms={hit['dbms']}",
+        f"confidence={hit['confidence']}",
+        f"requests={hit['requests']}",
+      ],
+      replay_steps=[
+        f"{method} {url} with {param} set to {hit['payload_true']}.",
+        "Compare the response with the unmodified request"
+        + (f" and with {hit['payload_false']}." if hit["payload_false"] else "."),
+      ],
+      remediation="Use parameterized queries; never build SQL from request input.",
+    )
+    if authenticated:
+      finding = dataclasses.replace(
+        finding, cvss_vector=V.INJECTION_DATA_ACCESS_AUTHENTICATED)
+    return finding
+
+  def _sqli_run(self, scenario_id, url, param, send, method, authenticated,
+                prepare=None, allow_time=False, reached=None, caps=None):
+    """Run the techniques on one parameter; emit the finding. Returns the
+    outcome (hit | clean | denied | unstable | timeout | budget | capped).
+    Once the request budget refuses, the whole SQLi family stops for this
+    worker (one inconclusive); ``caps`` is the login-form limit."""
+    state = self.__dict__
+    if state.get("_sqli_stopped"):
+      return "budget"
+    left = state.setdefault("_sqli_time_left", {"s": SCAN_TIME_ALLOWANCE})
+    res = detect_sqli(
+      send, throttle=self.safety.throttle,
+      reached=reached or self.response_reached,
+      budget=self.budget, time_left=left, prepare=prepare,
+      allow_time=allow_time, **(caps or {}))
+    outcome = res["outcome"]
+    if outcome == "budget":
+      state["_sqli_stopped"] = True
+    if outcome == "hit":
+      self.findings.append(self._sqli_finding(
+        scenario_id, url, param, res, authenticated, method))
+    elif outcome in _SQLI_REASONS:
+      seen = state.setdefault("_sqli_unstable_seen", set())
+      if outcome == "unstable":
+        if url in seen:
+          return outcome  # one per endpoint, not per parameter
+        seen.add(url)
+      self.findings.append(GrayboxFinding(
+        scenario_id=scenario_id,
+        title="SQL injection check incomplete",
+        status="inconclusive",
+        severity="INFO",
+        owasp="A03:2021",
+        parameter=param,
+        evidence=[f"endpoint={url}", f"parameter={param}",
+                  f"reason={_SQLI_REASONS[outcome]}"],
+      ))
+    return outcome
+
+  def _sqli_csrf_prepare(self, session, page_url):
+    """Untimed step before each POST: a fresh CSRF token (None when the app
+    has no CSRF field). A refused budget raises BudgetRefused: no POST."""
+    field = self.auth.detected_csrf_field
+    if not field:
+      return None
+    if not self.budget():
+      raise BudgetRefused()
+    self.safety.throttle()
+    try:
+      page = session.get(page_url, timeout=10)
+    except Exception:
+      raise CsrfUnavailable()  # no token, no POST; ends this form's check only
+    return self.auth.extract_csrf_value(page.text, field)
+
+  def _sqli_send_get(self, session, url, param):
+    """Request builder: one GET query parameter."""
+    return lambda v: session.get(url, params={param: v}, timeout=15)
+
+  def _sqli_send_post(self, session, url, fields, target, page_url):
+    """Request builder for one POSTed field: returns (send, prepare). The
+    other fields keep their benign value; each POST uses a fresh token."""
+    def prepare():
+      return self._sqli_csrf_prepare(session, page_url)
+
+    def send(value, token):
+      data = dict(fields)
+      data[target] = value
+      if token:
+        data[self.auth.detected_csrf_field] = token
+      return session.post(url, data=data, timeout=15)
+    return send, prepare
+
+  def _test_sqli_get(self):
+    """PT-A03-01: SQL injection on reflective GET parameters (configured
+    and discovered). Silent when clean: the reflective families carry coverage."""
+    endpoints = self._reflective_endpoints(
+      self.target_config.injection.xss_endpoints)
+    session = self.auth.primary_session
+    for ep in endpoints:
+      url = self.target_url + ep.path
+      outcome = self._sqli_run(
+        "PT-A03-01", url, ep.param, self._sqli_send_get(session, url, ep.param),
+        "GET", True, allow_time=True)
+      if outcome in ("budget", "rate_limited"):
+        return
+
   def _test_login_injection(self):
     """PT-A05-01: inject into login form fields (unauthenticated)."""
     session = self.auth.make_anonymous_session()
@@ -151,11 +286,31 @@ class InjectionProbes(ProbeBase):
       if payload in resp.text:
         vulnerable.append((label, cwe, payload))
 
+    sqli_hit = False
+    login_cap = {"left": LOGIN_MAX_PER_SCAN}
+    for field in (self.target_config.username_field,
+                  self.target_config.password_field):
+      fields = {self.target_config.username_field: "test",
+                self.target_config.password_field: "test"}
+      send, prepare = self._sqli_send_post(
+        session, login_url, fields, field, login_url)
+      # Login form: status-based reachability, boolean + error only, capped.
+      outcome = self._sqli_run(
+        "PT-A05-01", login_url, field, send, "POST", False,
+        prepare=prepare, reached=status_reached,
+        caps={"max_requests": LOGIN_MAX_PER_FIELD, "cap": login_cap})
+      if outcome == "hit":
+        sqli_hit = True
+        break
+      if outcome in ("budget", "capped", "rate_limited", "csrf_unavailable"):
+        break  # a per-field cap ("field_capped") moves on to the next field
     session.close()
 
     if vulnerable:
       for label, cwe, payload in vulnerable:
         if label == "sqli":
+          if sqli_hit:
+            continue  # confirmed above; reflection is not a second finding
           # Reflection alone proves echo, not SQL injection.
           self.findings.append(GrayboxFinding(
             scenario_id="PT-A05-01",
@@ -193,7 +348,7 @@ class InjectionProbes(ProbeBase):
           ],
           remediation="Apply input validation and output encoding on all form fields.",
         ))
-    else:
+    elif not sqli_hit:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A05-01",
         title="Login form injection — no reflection detected",
@@ -221,6 +376,7 @@ class InjectionProbes(ProbeBase):
     tested = 0
     denied = 0
     vulnerable_forms = []
+    sqli_hits = set()
 
     for form_action in self.discovered_forms:
       if form_action == login_path:
@@ -282,8 +438,25 @@ class InjectionProbes(ProbeBase):
         if payload in resp.text:
           vulnerable_forms.append((form_action, label, cwe, all_inputs[0]))
 
+      # Real SQLi check per input: POSTs to discovered forms are stateful-gated
+      # (a POST can write); POST-only actions stay skipped. Time is GET only.
+      if not post_only and self._allow_stateful:
+        fields = {n: "test" for n in all_inputs}
+        for name in all_inputs[:3]:
+          send, prepare = self._sqli_send_post(
+            self.auth.primary_session, url, fields, name, url)
+          outcome = self._sqli_run(
+            "PT-A03-01", url, name, send, "POST", True, prepare=prepare)
+          if outcome == "hit":
+            sqli_hits.add(form_action)
+            break
+          if outcome in ("budget", "rate_limited", "csrf_unavailable"):
+            break
+
     for form_action, label, cwe, field in vulnerable_forms:
       if label == "sqli":
+        if form_action in sqli_hits:
+          continue  # confirmed above; reflection is not a second finding
         # Reflection alone proves echo, not SQL injection.
         self.findings.append(GrayboxFinding(
           scenario_id="PT-A03-01",
@@ -321,7 +494,7 @@ class InjectionProbes(ProbeBase):
         remediation="Apply input validation and output encoding on all form fields.",
       ))
 
-    if tested > 0 and not vulnerable_forms:
+    if tested > 0 and not vulnerable_forms and not sqli_hits:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-01",
         title="Authenticated injection — no reflection detected",
@@ -330,7 +503,7 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"forms_tested={tested}"],
       ))
-    elif denied > 0 and not vulnerable_forms and tested == 0:
+    elif denied > 0 and not vulnerable_forms and not sqli_hits and tested == 0:
       self.emit_endpoint_denied("PT-A03-01")
 
   def _test_stored_xss(self):
