@@ -30,7 +30,7 @@ def _engagement(kind="network", **ignored):
   """
   return {
     "engagement_id": "en_00000000-0000-4000-8000-000000000003", "engagement_hash": "e" * 64,
-    "contract_sha256": "c" * 64,
+    "contract_sha256": "c" * 64, "authorized_ports": "all", "authorized_tests": "all",
     "context": {"client_name": "Example"},
     "authorization": {"document_cid": "", "authorized_signer_name": "Ana Pop", "authorized_signer_role": "CISO",
                       "document_sha256": "a" * 64},
@@ -489,6 +489,141 @@ class TestPhase1ConfigCID(unittest.TestCase):
           plugin = self._build_mock_plugin(job_id="engagement-run-modes")
           self.assertNotIn("error", launch(plugin, run_mode=run_mode))
           self.assertEqual(self._latest_job_config(plugin)["run_mode"], expected)
+
+  def test_a_port_outside_1_to_65535_is_refused(self):
+    # I-117: both bounds are checked before anything is stored.
+    for start, end in ((0, 100), (1, 65536), (-5, 10), (70000, 80000)):
+      with self.subTest(start=start, end=end):
+        plugin = self._build_mock_plugin(job_id="port-range")
+        result = self._launch_network(plugin, start_port=start, end_port=end)
+        self.assertEqual(result["error"], "validation_error", result)
+        plugin.r1fs.add_json.assert_not_called()
+
+  def _scoped(self, **scope):
+    return {**_engagement(), **scope}
+
+  def test_a_launch_outside_the_authorized_ports_is_refused_by_range_and_audited(self):
+    # RM-251: the range minus the exceptions must lie inside the ranges; a restriction of "all" refuses nothing.
+    engagement = self._scoped(authorized_ports=[[1, 1024]])
+    plugin = self._build_mock_plugin(job_id="scope-ports")
+    self.assertNotIn("error", self._launch_network(plugin, engagement=engagement, end_port=1024))
+    plugin = self._build_mock_plugin(job_id="scope-ports")
+    result = self._launch_network(plugin, engagement=engagement, end_port=2000, exceptions=[1500])
+    self._refused(plugin, result, "scope_exceeded", ports=[[1025, 1499], [1501, 2000]], tests=[])
+    self.assertIn("1025-1499", result["message"])
+    self.assertEqual(plugin._log_audit_event.call_args.args[0], "launch_refused")
+    audited = plugin._log_audit_event.call_args.args[1]
+    self.assertEqual((audited["reason"], audited["ports"], audited["tests"]),
+                     ("scope_exceeded", [[1025, 1499], [1501, 2000]], []))
+    # An exception inside the gap narrows the launch back into the scope.
+    plugin = self._build_mock_plugin(job_id="scope-ports")
+    self.assertNotIn("error", self._launch_network(
+      plugin, engagement=self._scoped(authorized_ports=[[1, 1024], [2000, 2000]]), end_port=2000,
+      exceptions=list(range(1025, 2000))))
+
+  def test_the_comparison_tier_outside_the_authorized_ports_is_refused(self):
+    engagement = self._scoped(authorized_ports=[[1, 100]])
+    plugin = self._build_mock_plugin(job_id="scope-tier")
+    self.assertNotIn("error", self._launch_network(plugin, engagement=engagement, end_port=100))
+    plugin = self._build_mock_plugin(job_id="scope-tier")
+    result = self._launch_network(plugin, engagement=engagement, end_port=100, comparison_mode=True)
+    self.assertEqual(result["error"], "scope_exceeded", result)
+    self.assertIn([443, 443], result["ports"])
+    plugin.r1fs.add_json.assert_not_called()
+
+  def test_exceptions_narrow_the_comparison_tier_too(self):
+    from extensions.business.cybersec.red_mesh.constants import COMMON_PORTS
+    engagement = self._scoped(authorized_ports=[[1, 100]])
+    plugin = self._build_mock_plugin(job_id="scope-tier-exc")
+    result = self._launch_network(plugin, engagement=engagement, end_port=100, comparison_mode=True,
+                                  exceptions=[port for port in COMMON_PORTS if port > 100])
+    self.assertNotIn("error", result, result)
+
+  def test_a_kind_with_no_authorized_test_is_refused_even_when_nothing_is_enabled(self):
+    from extensions.business.cybersec.red_mesh.tenancy.engagements import feature_ids_for_kind
+    for kind, launch, other in (("network", self._launch_network, "graybox"), ("webapp", self._launch_webapp, "web_discovery")):
+      with self.subTest(kind):
+        plugin = self._build_mock_plugin(job_id="scope-empty-kind")
+        features = self._get_features(plugin, kind)
+        result = launch(plugin, engagement=self._scoped(authorized_tests=[other]), excluded_features=features)
+        self._refused(plugin, result, "scope_exceeded")
+        self.assertEqual(result["tests"], sorted(feature_ids_for_kind(kind))[:20])
+
+  def _get_features(self, plugin, kind):
+    self._bind_launch_helpers(plugin)  # mocks the base modules before the plugin is imported
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    return PentesterApi01Plugin._get_all_features(plugin, scan_type=kind)
+
+  def test_the_enabled_tests_must_be_inside_the_authorized_tests_and_an_exclusion_narrows(self):
+    from extensions.business.cybersec.red_mesh.constants import FEATURE_CATALOG
+    methods = {item["id"]: item["methods"] for item in FEATURE_CATALOG}
+    scoped = self._scoped(authorized_tests=["service_info_common"])
+    plugin = self._build_mock_plugin(job_id="scope-tests")
+    result = self._launch_network(plugin, engagement=scoped)
+    self._refused(plugin, result, "scope_exceeded", ports=[])
+    self.assertIn("web_discovery", result["tests"])
+    self.assertNotIn("service_info_common", result["tests"])
+    # Excluding every method of the other items launches inside the scope.
+    outside = [method for item, found in methods.items() if item != "service_info_common" for method in found]
+    plugin = self._build_mock_plugin(job_id="scope-tests")
+    self.assertNotIn("error", self._launch_network(plugin, engagement=scoped, excluded_features=outside))
+    self.assertEqual(self._latest_job_config(plugin)["engagement_authorized_tests"], ["service_info_common"])
+    # A webapp launch is held to `graybox` the same way.
+    plugin = self._build_mock_plugin(job_id="scope-tests")
+    self.assertNotIn("error", self._launch_webapp(plugin, engagement=self._scoped(authorized_tests=["graybox"])))
+    plugin = self._build_mock_plugin(job_id="scope-tests")
+    self._refused(plugin, self._launch_webapp(plugin, engagement=self._scoped(authorized_tests=["web_discovery"])),
+                  "scope_exceeded", tests=["graybox"])
+
+  def test_a_comparison_bundle_forced_on_is_held_to_the_authorized_tests(self):
+    # The bundle re-enables `web_discovery` methods the request excluded, so the check follows it.
+    plugin = self._build_mock_plugin(job_id="scope-bundle")
+    self._mock_plugin_modules()  # before the plugin is imported
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    original = PentesterApi01Plugin._get_supported_features
+    # The webapp worker supports one bundle method, as a deployment that registers it would.
+    widened = lambda host, scan_type=None, categs=False: (
+      [*original(host, scan_type=scan_type), "_web_test_common"] if str(scan_type) == "webapp" else original(
+        host, scan_type=scan_type, categs=categs))
+    scoped = self._scoped(authorized_tests=["graybox"])
+    with patch.object(PentesterApi01Plugin, "_get_supported_features", widened):
+      result = self._launch_webapp(plugin, engagement=scoped, comparison_mode=True,
+                                   excluded_features=["_web_test_common"])
+    self._refused(plugin, result, "scope_exceeded", tests=["web_discovery"])
+
+  def test_the_job_config_snapshots_the_authorized_scope(self):
+    plugin = self._build_mock_plugin(job_id="scope-snapshot")
+    result = self._launch_network(plugin, engagement=self._scoped(authorized_ports=[[1, 1024]]), end_port=100,
+                                  excluded_features=[m for item in __import__(
+                                    "extensions.business.cybersec.red_mesh.constants", fromlist=["x"]).FEATURE_CATALOG
+                                                     for m in item["methods"]])
+    self.assertNotIn("error", result, result)
+    config = self._latest_job_config(plugin)
+    self.assertEqual((config["engagement_authorized_ports"], config["engagement_authorized_tests"]),
+                     ([[1, 1024]], "all"))
+
+  def test_an_unknown_request_exclusion_is_refused_by_name_on_every_launch_path(self):
+    # I-185: catalogue ids such as `graybox` are not feature names; no alias, no silent drop.
+    for name, launch in (("network", self._launch_network), ("webapp", self._launch_webapp)):
+      with self.subTest(name):
+        plugin = self._build_mock_plugin(job_id="unknown-feature")
+        result = launch(plugin, excluded_features=["graybox", "no_such_test"])
+        self._refused(plugin, result, "unknown_feature", features=["graybox", "no_such_test"])
+        self.assertIn("graybox", result["message"])
+
+  def test_another_scan_types_method_is_a_known_exclusion(self):
+    # The console sends exclusions from the all-types catalog, so a webapp method on a network launch
+    # (and the reverse) is known, not refused.
+    for name, launch, other in (("network", self._launch_network, "_graybox_weak_auth"),
+                                ("webapp", self._launch_webapp, "_service_info_http")):
+      with self.subTest(name):
+        self.assertNotIn("error", launch(self._build_mock_plugin(job_id="cross-" + name), excluded_features=[other]))
+
+  def test_a_stale_config_exclusion_is_dropped_and_does_not_refuse_the_launch(self):
+    plugin = self._build_mock_plugin(job_id="stale-config-exclusion")
+    plugin.cfg_excluded_features = ["removed_test"]
+    self.assertNotIn("error", self._launch_network(plugin))
+    self.assertEqual(self._latest_job_config(plugin)["excluded_features"], [])
 
   def test_engagement_comparison_mode_still_launches_a_webapp(self):
     # Comparison mode force-enables the graybox bundle; no test allow-list gates it (RM-125).

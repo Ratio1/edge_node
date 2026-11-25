@@ -315,7 +315,7 @@ class TestFtpActionGate(unittest.TestCase):
 
 
 class _FakeAnonymousFtp(_FakeFtp):
-  """Accepts anonymous login and uploads; records every STOR."""
+  """Accepts anonymous login; records any write command the probe sends (ftplib write methods and raw commands)."""
   stored = []
 
   def login(self, user="", passwd=""):
@@ -327,12 +327,43 @@ class _FakeAnonymousFtp(_FakeFtp):
     _FakeAnonymousFtp.stored.append(cmd)
     return "226 Transfer complete"
 
+  def storlines(self, cmd, fp, *a, **k):
+    _FakeAnonymousFtp.stored.append(cmd)
+    return "226 Transfer complete"
+
+  def transfercmd(self, cmd, *a, **k):
+    _FakeAnonymousFtp.stored.append(cmd)
+    raise ftplib.error_perm("502 not implemented")
+
+  _WRITE_VERBS = ("STOR", "STOU", "APPE", "DELE", "MKD", "RMD", "RNFR", "SITE")
+
+  def sendcmd(self, cmd):
+    if cmd.split(" ", 1)[0].upper() in self._WRITE_VERBS:
+      _FakeAnonymousFtp.stored.append(cmd)
+    raise ftplib.error_perm("502 not implemented")
+
+  voidcmd = putcmd = sendcmd
+  ntransfercmd = transfercmd
+
+  def rmd(self, name):
+    _FakeAnonymousFtp.stored.append("RMD " + name)
+    return "250 ok"
+
   def delete(self, name):
+    _FakeAnonymousFtp.stored.append("DELE " + name)
+    return "250 ok"
+
+  def mkd(self, name):
+    _FakeAnonymousFtp.stored.append("MKD " + name)
+    return name
+
+  def rename(self, a, b):
+    _FakeAnonymousFtp.stored.append("RNFR " + a)
     return "250 ok"
 
 
 class TestFtpAnonymousWriteGate(unittest.TestCase):
-  """RM-128: the anonymous upload test always runs."""
+  """RM-256: the probe never uploads or deletes over anonymous FTP."""
 
   def _run(self):
     _FakeAnonymousFtp.stored = []
@@ -341,11 +372,12 @@ class TestFtpAnonymousWriteGate(unittest.TestCase):
     with patch(base + "ftplib.FTP", _FakeAnonymousFtp), patch(base + "check_cves", return_value=[]):
       return worker._service_info_ftp("example.com", 21)
 
-  def test_the_upload_test_always_runs(self):
+  def test_no_stor_or_dele_ever(self):
     result = self._run()
-    self.assertEqual(_FakeAnonymousFtp.stored, ["STOR __redmesh_probe.txt"])
-    self.assertIn("FTP anonymous write access enabled (file upload possible).",
-                  [f["title"] for f in result["findings"]])
+    self.assertEqual(_FakeAnonymousFtp.stored, [])
+    titles = [f["title"] for f in result["findings"]]
+    self.assertNotIn("FTP anonymous write access enabled (file upload possible).", titles)
+    self.assertNotIn("write_access", result)
 
 
 class _FakeTelnet:

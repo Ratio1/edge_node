@@ -4,6 +4,7 @@ import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
+from ...constants import AUTH_SKIPPED
 from ...cve_db import check_cves, probe_cve_fields
 from ..probe_registry import register_probe, CATEGORY_WEB_TEST
 
@@ -1162,6 +1163,9 @@ class _WebDiscoveryMixin:
       except Exception:
         pass
       # CVE-2020-14882: Console authentication bypass via double-encoded path
+      if not self._login_attempts_allowed():
+        raw["auth_control"] = dict(AUTH_SKIPPED)  # an auth-bypass payload is a login attempt
+        return probe_result(raw_data=raw, findings=findings_list)
       try:
         bypass_url = base_url + "/console/css/%252e%252e%252fconsole.portal"
         resp = requests.get(bypass_url, timeout=self._target_timeout(4), verify=False, allow_redirects=False)

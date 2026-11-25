@@ -48,7 +48,7 @@ class TestTenantEngagementLaunch(unittest.TestCase):
     self.assertEqual(context["asset_target_digest"], self.engagement["assets"][0]["targetDigest"])
     self.assertEqual(context["engagement"], {
       "engagement_id": self.engagement["engagementId"], "engagement_hash": self.engagement["engagementHash"],
-      "contract_sha256": CONTRACT_SHA256,
+      "contract_sha256": CONTRACT_SHA256, "authorized_ports": "all", "authorized_tests": "all",
       "context": self.engagement["context"],
       # RM-107: the signed basis is the tenant contract and its legal signer; the consents are
       # named by the titles of the engagement's third-party consent documents.
@@ -79,7 +79,7 @@ class TestTenantEngagementLaunch(unittest.TestCase):
   def test_webapp_admission_has_no_port_scope_or_scan_modes(self):
     context = self.admit(asset="ea_2").to_dict()
     self.assertNotIn("asset_authorized_ports", context)
-    self.assertFalse(set(context["engagement"]) & {"roe", "authorized_tests", "authorized_scan_modes", "allowed_run_modes"})
+    self.assertFalse(set(context["engagement"]) & {"roe", "authorized_scan_modes", "allowed_run_modes"})
 
   def test_the_binding_names_the_engagement_asset_and_keeps_policy_out(self):
     binding = self.admit().build_binding("launcher", ["node-a"]).to_dict()
@@ -124,21 +124,58 @@ class TestTenantEngagementLaunch(unittest.TestCase):
     self.denied(400, "engagement_asset_not_locked", asset="ea_4")
 
   def test_window_bounds(self):
-    for instant, allowed in ((datetime(2026, 10, 1, tzinfo=timezone.utc), True),
-                             (datetime(2026, 9, 30, 23, 59, 59, tzinfo=timezone.utc), False),
-                             (datetime(2026, 10, 30, 23, 59, 59, tzinfo=timezone.utc), True),
-                             (datetime(2026, 10, 31, tzinfo=timezone.utc), False)):
+    # RM-248: before `valid_from` the refusal is `engagement_not_yet_valid`, not `engagement_expired`.
+    for instant, allowed, error in ((datetime(2026, 10, 1, tzinfo=timezone.utc), True, None),
+                                    (datetime(2026, 9, 30, 23, 59, 59, tzinfo=timezone.utc), False,
+                                     "engagement_not_yet_valid"),
+                                    (datetime(2026, 10, 30, 23, 59, 59, tzinfo=timezone.utc), True, None),
+                                    (datetime(2026, 10, 31, tzinfo=timezone.utc), False, "engagement_expired")):
       with self.subTest(instant=instant):
         self.service.clock = lambda instant=instant: instant
         if allowed:
           self.assertIn("engagement", self.admit().to_dict())
         else:
-          self.denied(400, "engagement_expired")
+          self.denied(400, error)
 
   def test_a_revoked_engagement_is_refused(self):
     self.assertTrue(self.service.revoke_engagement(self.actor, self.tenant, self.engagement["engagementId"],
                                                    "Contract ended")["success"])
     self.denied(400, "engagement_revoked")
+
+  def test_a_suspended_engagement_is_refused_until_it_is_resumed(self):
+    # RM-248
+    engagement_id = self.engagement["engagementId"]
+    self.assertTrue(self.service.suspend_engagement(self.actor, self.tenant, engagement_id, "Amended")["success"])
+    self.denied(400, "engagement_suspended")
+    self.assertTrue(self.service.resume_engagement(self.actor, self.tenant, engagement_id, "Signed")["success"])
+    self.assertIn("engagement", self.admit().to_dict())
+
+  def test_a_launch_before_valid_from_is_not_yet_valid_and_the_refusal_order_holds(self):
+    # RM-248: revoked, not yet valid, expired, suspended.
+    engagement_id = self.engagement["engagementId"]
+    self.service.clock = lambda: datetime(2026, 9, 30, 23, 59, 59, tzinfo=timezone.utc)
+    self.denied(400, "engagement_not_yet_valid")
+    self.assertTrue(self.service.suspend_engagement(self.actor, self.tenant, engagement_id, "Hold")["success"])
+    self.denied(400, "engagement_not_yet_valid")
+    self.service.clock = lambda: datetime(2026, 10, 31, tzinfo=timezone.utc)
+    self.denied(400, "engagement_expired")
+    self.service.clock = lambda: INSIDE
+    self.denied(400, "engagement_suspended")
+    self.assertTrue(self.service.revoke_engagement(self.actor, self.tenant, engagement_id, "Done")["success"])
+    self.denied(400, "engagement_revoked")
+
+  def test_reauthorization_holds_only_a_new_pass_while_suspended(self):
+    # RM-248: the current pass keeps its authority; the next one is held.
+    engagement_id = self.engagement["engagementId"]
+    binding = self.admit().build_binding("coordinator", ["node-a"])
+    self.assertTrue(self.service.suspend_engagement(self.actor, self.tenant, engagement_id, "Hold")["success"])
+    self.service.reauthorize_execution(binding, worker_node="node-a")
+    with self.assertRaises(AdministrationDenied) as caught:
+      self.service.reauthorize_execution(binding, worker_node="node-a", new_pass=True)
+    self.assertEqual(caught.exception.error, "engagement_suspended")
+    self.assertTrue(self.service.resume_engagement(self.actor, self.tenant, engagement_id, "Signed")["success"])
+    self.service.reauthorize_execution(binding, worker_node="node-a", new_pass=True)
+    self.assertIsNone(self.service.engagement_end_reason(self.tenant, engagement_id))
 
   def test_an_engagement_of_another_tenant_is_not_found(self):
     other = self.new_tenant("other", contract=True)

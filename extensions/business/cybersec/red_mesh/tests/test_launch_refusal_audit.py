@@ -79,11 +79,44 @@ def test_each_audited_reason_writes_one_row_with_the_specified_fields_and_no_bod
     assert [row["reason"] for row in rows(owner)] == ["engagement_revoked"]
 
 
+def test_ineligible_node_refusal_body_names_the_nodes_without_widening_the_audit_row():
+  with launch_fixture() as fixture:
+    result = launch(fixture, selected_peers=["node-a", "node-zzz"], target="192.0.2.10")
+    assert result["error"] == "ineligible_node" and result["status_code"] == 400 and result["success"] is False
+    assert result["nodes"] == [{"nodeAddress": "node-zzz", "reason": "not_assigned"}]
+    assert set(rows(fixture.owner_plugin)[0]) == ROW_FIELDS
+
+
 def test_expired_engagement_is_audited():
   with launch_fixture() as fixture:
     fixture.service.clock = lambda: datetime(2026, 12, 1, tzinfo=timezone.utc)
     assert launch(fixture)["error"] == "engagement_expired"
     assert [row["reason"] for row in rows(fixture.owner_plugin)] == ["engagement_expired"]
+
+
+def test_suspended_and_not_yet_valid_engagements_are_audited():
+  # RM-248
+  with launch_fixture() as fixture:
+    fixture.service.clock = lambda: datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert launch(fixture)["error"] == "engagement_not_yet_valid"
+    fixture.service.clock = lambda: datetime(2026, 10, 15, tzinfo=timezone.utc)
+    fixture.service.suspend_engagement(fixture.actor, fixture.tenant, fixture.engagement_id, "hold")
+    assert launch(fixture)["error"] == "engagement_suspended"
+    assert [row["reason"] for row in rows(fixture.owner_plugin)] == ["engagement_not_yet_valid", "engagement_suspended"]
+
+
+def test_an_archived_contract_launch_is_audited():
+  # RM-249: the engagement's contract is no longer the one in force
+  import copy
+  with launch_fixture() as fixture:
+    tenant = fixture.service.store.get("tenant", fixture.tenant)
+    block = {"contract": {**tenant["contract"], "sha256": "e" * 64}, "contract_generated": None, "effective_from": "2026-10-01",
+             "effective_until": None, "nodes": [{"node_address": "node-a", "mode": "shared"}], "activated_by": "creator",
+             "activated_at": "2026-10-10T00:00:00+00:00", "supersedes": "c_1", "superseded_by": None}
+    fixture.service.store.put("tenant", fixture.tenant, record={**copy.deepcopy(tenant), "contracts": {"c_2": block}})
+    result = launch(fixture)
+    assert result["error"] == "contract_archived" and result["status_code"] == 409, result
+    assert [row["reason"] for row in rows(fixture.owner_plugin)] == ["contract_archived"]
 
 
 def test_target_is_truncated():

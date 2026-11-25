@@ -1,4 +1,4 @@
-"""`cve_view`: the listing, rollup and possible rows of CVE findings (RM-169; report-findings.md, `cve_view`).
+"""`cve_view`: the listing, rollup, possible and folded rows of CVE findings (RM-169; report-findings.md, `cve_view`).
 
 A pure function of the flat finding dicts, the scan-local not-applicable records and the host triage map. It
 is computed, never stored. It applies to CVE findings of the `generated` source only (they carry
@@ -13,10 +13,13 @@ from .models.finding_schema import is_coverage_result
 
 MAX_LISTED = 10
 MAX_POSSIBLE_TOP = 3
-# Rollup and possible rows the LLM summary carries across all services, each kind; the rest are counted, not sent.
+# Rollup, possible and folded rows the LLM summary carries across all services, each kind; the rest are counted, not sent.
 MAX_SUMMARY_ROWS = 20
 LISTED_CVSS = 9.0
 CLOSED_STATUSES = frozenset({"false_positive", "remediated"})
+# A tentative row with this reason failed the banner check (RM-205): it folds into a count, not a possible row.
+FOLD_REASON = "banner_unverified"
+EOL_FOLD_REASON = "eol_unassessed"  # folds under the service's `unsupported` finding, unless KEV (RM-207)
 
 # The matched constraint and the product are read from the finding text `cve_db._build_finding` writes
 # (`evidence`: "Detected version: V, affected: C"; `description`: "P V is vulnerable to CVE."); a test pins both.
@@ -178,12 +181,27 @@ def _possible(members):
   }
 
 
+def _folded(members):
+  """The count-only group of folded rows: no CVE ids, scores or `top`."""
+  reasons = {}
+  for f in members:
+    reason = f.get("confidence_reason") or ""
+    reasons[reason] = reasons.get(reason, 0) + 1
+  return {
+    "count": len(members),
+    "reasons": dict(sorted(reasons.items())),
+    "member_finding_ids": sorted(f["finding_id"] for f in members),
+  }
+
+
 def build_cve_view(findings, not_applicable=(), triage=None, now=None):
   """The view of `findings` (flat dicts), or None when none is a generated CVE finding.
 
   `not_applicable`: the scan-local records of CVEs matched and skipped (client side, backport fixed), counted as
   `dropped`. `triage`: finding_id -> status or `{status, review_at}`; a closed member is counted in `closed` only.
-  Conservation: `listed + rolled_up + possible + closed + dropped == raw` (`possible_kev` rows are inside `possible`).
+  Conservation: `listed + rolled_up + possible + folded + closed + dropped == raw` (`possible_kev` rows are inside `possible`).
+  `folded`: tentative rows whose reason is `banner_unverified`, or `eol_unassessed` on a service with an open `unsupported`
+  finding and not KEV (RM-207), a count per service (RM-205); a closed one counts as closed.
 
   Notes: with only `not_applicable` records and no generated finding the result is None (no view, no counts). In a
   mixed job every collector record counts as `dropped`, whichever source made it. A finding whose description does
@@ -204,11 +222,21 @@ def build_cve_view(findings, not_applicable=(), triage=None, now=None):
   eol = {(f.get("port"), f["tags"][1]): f["finding_id"] for f in findings
          if isinstance(f, dict) and f.get("vulndb_build_id") and f.get("finding_id")
          and len(f.get("tags") or ()) > 1 and f["tags"][0] == "vulndb_eol"}
+  eol_closed = {fid for fid in eol.values() if _is_closed({"finding_id": fid}, triage, now)}
   services = []
-  totals = {"listed": 0, "rolled_up": 0, "possible": 0}
+  totals = {"listed": 0, "rolled_up": 0, "possible": 0, "folded": 0}
   for (port, product), members in sorted(groups.items(), key=lambda kv: _service_order(*kv[0])):
     firm = sorted((f for f in members if f.get("confidence") != "tentative"), key=_rank)
-    tentative = [f for f in members if f.get("confidence") == "tentative"]
+    unsupported = eol.get((port, product))
+    tentative, unverified = [], []
+    for f in members:
+      if f.get("confidence") != "tentative":
+        continue
+      reason = f.get("confidence_reason")
+      # An end-of-life row folds only under an open unsupported-version finding; a KEV one stays possible.
+      folds = reason == FOLD_REASON or (reason == EOL_FOLD_REASON and unsupported and not effective_kev(f)
+                                        and unsupported not in eol_closed)
+      (unverified if folds else tentative).append(f)
     candidates = [f for f in firm if _is_listed(f)]
     listed, overflow = candidates[:MAX_LISTED], candidates[MAX_LISTED:]
     rest = [f for f in firm if not _is_listed(f)] + overflow
@@ -220,12 +248,14 @@ def build_cve_view(findings, not_applicable=(), triage=None, now=None):
       "listed": [f["finding_id"] for f in listed],
       "rollup": _rollup(product, sorted(rest, key=_rank)) if rest else None,
       "possible": _possible(tentative) if tentative else None,
+      "folded": _folded(unverified) if unverified else None,
       "possible_kev": [f["finding_id"] for f in kev_possible],
-      "unsupported": eol.get((port, product)),  # the end-of-life finding, outside `raw`
+      "unsupported": unsupported,  # the end-of-life finding, outside `raw`
     })
     totals["listed"] += len(listed)
     totals["rolled_up"] += len(rest)
     totals["possible"] += len(tentative)
+    totals["folded"] += len(unverified)
   dropped = len(list(not_applicable or ()))
   return {
     "services": services,
@@ -234,19 +264,20 @@ def build_cve_view(findings, not_applicable=(), triage=None, now=None):
 
 
 def view_members(view):
-  """`(listed ids, ids folded into a rollup or a possible row)` of a view."""
+  """`(listed ids, ids folded into a rollup, a possible row or a folded group)` of a view."""
   listed, folded = set(), set()
   for service in view["services"]:
     listed.update(service["listed"])
     folded.update((service["rollup"] or {}).get("member_finding_ids", ()))
     folded.update((service["possible"] or {}).get("member_finding_ids", ()))
+    folded.update((service.get("folded") or {}).get("member_finding_ids", ()))  # absent in a view stored before RM-205
   return listed, folded
 
 
 def filter_listed(findings, not_applicable=(), triage=None, view=None):
   """`findings` keeping a generated CVE finding only when the view lists it.
 
-  Folded (rollup, possible) and closed findings leave. For the surfaces that show listed findings only
+  Folded (rollup, possible, folded group) and closed findings leave. For the surfaces that show listed findings only
   (`top_findings`, the LLM input, the score walk). Without a view, unchanged.
   """
   view = view or build_cve_view(findings, not_applicable, triage)
@@ -257,8 +288,8 @@ def filter_listed(findings, not_applicable=(), triage=None, view=None):
 
 
 def summarize_view(view):
-  """The view as the LLM input carries it: counts, one line per rollup, the possible summary per service."""
-  rollups, possible = [], []
+  """The view as the LLM input carries it: counts, one line per rollup, the possible summary and the folded count and reasons per service."""
+  rollups, possible, folded = [], [], []
   for service in view["services"]:
     where = {"port": service["port"], "product": service["product"]}
     if service["rollup"]:
@@ -267,9 +298,14 @@ def summarize_view(view):
     if service["possible"]:
       p = service["possible"]
       possible.append({**where, "count": p["count"], "reasons": p["reasons"], "top": p["top"]})
+    if service.get("folded"):
+      folded.append({**where, "version": service["version"], "count": service["folded"]["count"],
+                   "reasons": service["folded"]["reasons"]})
   # Bounded across services, so a large scan cannot exhaust the model's input: KEV, then highest CVSS, first.
   rollups.sort(key=lambda r: (-r["kev_count"], -(r["max_cvss"]["score"] or -1), -r["cve_count"]))
   possible.sort(key=lambda p: (-max((t["score"] or -1 for t in p["top"]), default=-1), -p["count"]))
+  folded.sort(key=lambda g: (-g["count"], _service_order(g["port"], g["product"])))
   return {"counts": dict(view["counts"]),
           "rollups": rollups[:MAX_SUMMARY_ROWS], "omitted_rollups": max(len(rollups) - MAX_SUMMARY_ROWS, 0),
-          "possible": possible[:MAX_SUMMARY_ROWS], "omitted_possible": max(len(possible) - MAX_SUMMARY_ROWS, 0)}
+          "possible": possible[:MAX_SUMMARY_ROWS], "omitted_possible": max(len(possible) - MAX_SUMMARY_ROWS, 0),
+          "folded": folded[:MAX_SUMMARY_ROWS], "omitted_folded": max(len(folded) - MAX_SUMMARY_ROWS, 0)}

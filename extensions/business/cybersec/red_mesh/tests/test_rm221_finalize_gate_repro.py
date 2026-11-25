@@ -35,7 +35,7 @@ class RecordingService:
   def __init__(self):
     self.calls = []
 
-  def reauthorize_execution(self, binding, *, worker_node=None):
+  def reauthorize_execution(self, binding, *, worker_node=None, new_pass=False):
     self.calls.append((deepcopy(binding.to_dict()), worker_node))
     return True
 
@@ -167,7 +167,7 @@ def test_a_refused_reauthorization_names_its_reason_and_keeps_the_results():
   from extensions.business.cybersec.red_mesh.tenancy.administration import AdministrationDenied
   owner = RealStoreOwner()
 
-  def deny(binding, *, worker_node=None):
+  def deny(binding, *, worker_node=None, new_pass=False):
     raise AdministrationDenied(409, "account_changed")
 
   owner.service.reauthorize_execution = deny

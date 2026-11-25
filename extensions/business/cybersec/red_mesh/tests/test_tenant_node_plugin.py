@@ -62,7 +62,9 @@ class TestTenantNodePlugin(unittest.TestCase):
     }})
     self.assertEqual(self.plugin.get_tenant_nodes({"account_id": "initial"}, self.tenant)["data"], {
       "tenantId": self.tenant,
-      "nodes": [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None}],
+      "nodes": [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None,
+                 # RM-212: no network monitor here, so a configured peer reads as `unknown`.
+                 "readiness": {"online": None, "lastSeen": None, "inDeployment": True, "state": "unknown"}}],
       "canManageAssignments": False, "nodesFixed": False,
     })
 
@@ -125,11 +127,16 @@ class TestTenantNodePlugin(unittest.TestCase):
       self.assertEqual(self.plugin.get_tenant_nodes(platform, self.tenant)["status_code"], 404)
       config.assert_not_called()
 
-  def test_reads_and_removal_do_not_evaluate_plugin_peer_property(self):
+  def test_unreadable_peers_read_answers_removal_skips_assignment_refuses(self):
     self.plugin.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True)
     with patch.object(self.Plugin, "cfg_chainstore_peers", new_callable=PropertyMock,
                       create=True, side_effect=RuntimeError("private configuration")) as config:
-      self.assertTrue(self.plugin.get_tenant_nodes(self.actor, self.tenant)["success"])
+      # RM-212: the read evaluates the peers once for `readiness.inDeployment`; an unreadable list still answers.
+      read = self.plugin.get_tenant_nodes(self.actor, self.tenant)
+      self.assertTrue(read["success"])
+      self.assertIsNone(read["data"]["nodes"][0]["readiness"]["inDeployment"])
+      config.assert_called_once()
+      config.reset_mock()
       self.assertTrue(self.plugin.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["success"])
       self.assertTrue(self.plugin.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["success"])
       config.assert_not_called()

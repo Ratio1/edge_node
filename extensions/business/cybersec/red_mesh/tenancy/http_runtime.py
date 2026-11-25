@@ -89,6 +89,7 @@ _READ_FIELDS = {
   "get_job_archive": _JOB_FIELD + (("summary_only", bool, False), ("pass_offset", int, 0),
                                   ("pass_limit", int, 0)) + _REQUESTER_FIELDS,
   "get_job_triage": _JOB_FIELD + (("finding_id", str, ""),) + _REQUESTER_FIELDS,
+  "get_triage_rates": _REQUESTER_FIELDS + (("engagement_id", str, ""),),
   "get_job_progress": _JOB_FIELD + _REQUESTER_FIELDS,
   "list_network_jobs": _REQUESTER_FIELDS,
   "list_local_jobs": _REQUESTER_FIELDS,

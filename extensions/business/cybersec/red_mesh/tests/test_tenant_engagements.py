@@ -220,8 +220,6 @@ class TestTenantEngagements(unittest.TestCase):
       ({"documents": [doc(SHA_ROE, "roe"), doc(SHA_ROE, "roe-again")]}, "document_invalid"),
       ({"documents": [doc("%064x" % index, "d%d" % index) for index in range(21)]}, "document_invalid"),
       ({"documents": "roe"}, "document_invalid"),
-      ({"supersedes": "en_nope"}, "supersedes_invalid"),
-      ({"supersedes": "en_" + str(uuid4())}, "supersedes_invalid"),
       ({"request_id": "not-a-uuid"}, "invalid_request"),
     ]
     for changes, error in cases:
@@ -247,6 +245,32 @@ class TestTenantEngagements(unittest.TestCase):
     self.refused(self.create(documents=[doc(SHA_ROE, "roe", title="SOW"), documents[1]]), 409, "conflict")
     self.refused(self.create(valid_until="2026-10-30T00:00:00Z"), 409, "conflict")
     self.refused(self.create(assets=list(reversed(self.fields()["assets"]))), 409, "conflict")
+
+  def test_a_new_engagement_carries_the_scope_both_keys_and_hashes_as_v5(self):
+    # RM-251: the default is "all" for both; a restricted scope is stored sorted and merged.
+    default = self.create()["data"]
+    self.assertEqual((default["authorizedPorts"], default["authorizedTests"]), ("all", "all"))
+    stored = self.store.get("engagement", self.tenant, default["engagementId"])
+    self.assertEqual((stored["authorized_ports"], stored["authorized_tests"]), ("all", "all"))
+    restricted = self.create(request_id=str(uuid4()), authorized_ports=[[80, 90], [1, 10], [11, 20]],
+                             authorized_tests=["web_discovery", "graybox", "web_discovery"])["data"]
+    self.assertEqual((restricted["authorizedPorts"], restricted["authorizedTests"]),
+                     ([[1, 20], [80, 90]], ["graybox", "web_discovery"]))
+    self.assertNotEqual(restricted["engagementHash"], default["engagementHash"])
+    self.refused(self.create(request_id=str(uuid4()), authorized_ports=[]), 400, "authorized_ports_invalid")
+    self.refused(self.create(request_id=str(uuid4()), authorized_tests=[]), 400, "authorized_tests_invalid")
+    # An id valid for no kind the engagement holds (here a webapp-only one on a network-only engagement).
+    network_only = [pick(self.net)]
+    self.refused(self.create(request_id=str(uuid4()), assets=network_only, authorized_tests=["graybox"]),
+                 400, "authorized_tests_unknown")
+    self.refused(self.create(request_id=str(uuid4()), authorized_tests=["no_such_test"]), 400, "authorized_tests_unknown")
+
+  def test_a_replay_with_another_scope_is_a_conflict(self):
+    first = self.view(self.create(authorized_ports=[[1, 1024]]))
+    self.assertEqual(self.view(self.create(authorized_ports=[[1, 1024]])), first)
+    self.refused(self.create(authorized_ports=[[1, 1025]]), 409, "conflict")
+    self.refused(self.create(authorized_ports=[[1, 1024]], authorized_tests=["graybox"]), 409, "conflict")
+    self.refused(self.create(), 409, "conflict")
 
   def test_roles(self):
     self.owner.account("platform-pentester", memberships=[{"role": "super_pentester", "tenant_id": None}])
@@ -293,12 +317,14 @@ class TestTenantEngagements(unittest.TestCase):
     ref = self.service.engagement_document_ref(self.actor, self.tenant, engagement, "ed_2")["data"]
     self.assertEqual((ref["store"], ref["ref"], ref["sha256"]), ("r1fs", "auth", SHA_AUTH))
 
-  def test_supersedes_links_without_revoking(self):
+  def test_supersedes_is_refused_outside_a_draft(self):
+    # RM-248: a replacement goes through an engagement draft and its signed pack, never a direct create.
     first = self.create()["data"]["engagementId"]
-    second = self.create(request_id=str(uuid4()), supersedes=first)["data"]
-    self.assertEqual(second["supersedes"], first)
+    writes = len(self.owner.writes)
+    for supersedes in (first, "en_nope"):
+      self.refused(self.create(request_id=str(uuid4()), supersedes=supersedes), 400, "supersedes_via_draft")
+    self.assertEqual(len(self.owner.writes), writes)
     self.assertTrue(self.service.get_engagement(self.actor, self.tenant, first)["data"]["engagement"]["active"])
-    self.refused(self.create(request_id=first[3:], supersedes=first), 409, "conflict")
 
   def test_revoke_is_final_and_idempotent(self):
     engagement = self.create()["data"]
@@ -319,6 +345,7 @@ class TestTenantEngagements(unittest.TestCase):
 
   def test_list_is_newest_first_and_filters_on_active(self):
     with patch("extensions.business.cybersec.red_mesh.tenancy.administration.datetime") as clock:
+      clock.fromisoformat.side_effect = datetime.fromisoformat  # RM-248: the read parses the window
       ids = []
       for day in (1, 3, 2):
         clock.now.return_value = datetime(2026, 9, day, tzinfo=timezone.utc)
@@ -329,6 +356,123 @@ class TestTenantEngagements(unittest.TestCase):
     active = self.service.list_engagements(self.actor, self.tenant, active=True)["data"]["engagements"]
     self.assertEqual([row["engagementId"] for row in active], [ids[1], ids[2]])
     self.refused(self.service.list_engagements(self.actor, self.tenant, active="yes"), 400, "invalid_request")
+
+
+class TestEngagementSuspend(unittest.TestCase):
+  """RM-248: suspend is a reversible state on the row, outside the engagement hash."""
+  setUp_engagements = TestTenantEngagements.setUp
+  new_tenant = TestTenantEngagements.new_tenant
+  fields = TestTenantEngagements.fields
+  default_assets = TestTenantEngagements.default_assets
+  create = TestTenantEngagements.create
+  view = TestTenantEngagements.view
+  refused = TestTenantEngagements.refused
+
+  def setUp(self):
+    self.setUp_engagements()
+    self.service.clock = lambda: datetime(2026, 10, 15, tzinfo=timezone.utc)
+    self.engagement = self.create()["data"]
+    self.id = self.engagement["engagementId"]
+
+  def read(self):
+    return self.service.get_engagement(self.actor, self.tenant, self.id)["data"]["engagement"]
+
+  def test_suspend_and_resume_keep_the_hash_and_replay_without_a_write(self):
+    suspended = self.service.suspend_engagement(self.actor, self.tenant, self.id, " Contract amended ")
+    self.assertTrue(suspended["success"], suspended)
+    data = suspended["data"]
+    self.assertEqual((data["status"], data["suspended"], data["suspendedBy"], data["suspendReason"], data["replayed"]),
+                     ("suspended", True, "creator", "Contract amended", False))
+    self.assertTrue(data["active"])
+    self.assertEqual(data["engagementHash"], self.engagement["engagementHash"])
+    writes = len(self.owner.writes)
+    again = self.service.suspend_engagement(self.actor, self.tenant, self.id, "again")
+    self.assertIs(again["data"]["replayed"], True)
+    self.assertEqual(len(self.owner.writes), writes)
+    resumed = self.service.resume_engagement(self.actor, self.tenant, self.id, "Amendment signed")
+    self.assertTrue(resumed["success"], resumed)
+    data = resumed["data"]
+    self.assertEqual((data["status"], data["suspended"], data["resumedBy"], data["replayed"]),
+                     ("active", False, "creator", False))
+    self.assertNotIn("suspendedBy", data)
+    self.assertEqual(data["engagementHash"], self.engagement["engagementHash"])
+    writes = len(self.owner.writes)
+    self.assertIs(self.service.resume_engagement(self.actor, self.tenant, self.id, "again")["data"]["replayed"], True)
+    self.assertEqual(len(self.owner.writes), writes)
+
+  def test_a_reason_is_required_and_the_engagement_must_exist(self):
+    self.refused(self.service.suspend_engagement(self.actor, self.tenant, self.id, " "), 400, "invalid_request")
+    self.refused(self.service.resume_engagement(self.actor, self.tenant, self.id, None), 400, "invalid_request")
+    self.refused(self.service.suspend_engagement(self.actor, self.tenant, "en_" + str(uuid4()), "x"), 404, "not_found")
+
+  def test_a_revoked_engagement_is_refused_and_a_revoke_ends_the_suspend_state(self):
+    self.assertTrue(self.service.suspend_engagement(self.actor, self.tenant, self.id, "Hold")["success"])
+    self.assertTrue(self.service.revoke_engagement(self.actor, self.tenant, self.id, "Done")["success"])
+    revoked = self.read()
+    self.assertEqual((revoked["status"], revoked["suspended"]), ("revoked", False))
+    self.refused(self.service.suspend_engagement(self.actor, self.tenant, self.id, "x"), 400, "engagement_revoked")
+    self.refused(self.service.resume_engagement(self.actor, self.tenant, self.id, "x"), 400, "engagement_revoked")
+
+  def test_a_revoke_landing_before_the_write_is_not_undone(self):
+    real_get, reads = self.store.get, []
+
+    def get(kind, *ids):
+      row = real_get(kind, *ids)
+      if kind == "engagement":
+        reads.append(1)
+        if len(reads) == 2:  # the re-read before the put: another node revoked meanwhile
+          row = {**row, "active": False, "revoked_by": "other", "revoked_at": "2026-10-15T00:00:00+00:00",
+                 "revoke_reason": "Done"}
+      return row
+    self.store.get = get
+    self.refused(self.service.suspend_engagement(self.actor, self.tenant, self.id, "Hold"), 400, "engagement_revoked")
+    self.store.get = real_get
+    self.assertFalse(self.read()["suspended"])
+
+  def test_status_on_a_frozen_clock(self):
+    def status(day, month=10):
+      self.service.clock = lambda: datetime(2026, month, day, tzinfo=timezone.utc)
+      return self.read()["status"]
+    self.assertEqual((status(15), status(30), status(1, 9)), ("active", "active", "scheduled"))
+    self.assertEqual(status(31), "expired")
+    self.service.suspend_engagement(self.actor, self.tenant, self.id, "Hold")
+    # Revoked beats expired beats scheduled beats suspended, in that order.
+    self.assertEqual((status(15), status(1, 9), status(31)), ("suspended", "scheduled", "expired"))
+    self.service.revoke_engagement(self.actor, self.tenant, self.id, "Done")
+    self.assertEqual(status(31), "revoked")
+
+  def test_the_read_and_the_list_name_the_contract_and_its_replacement(self):
+    listed = self.service.list_engagements(self.actor, self.tenant)["data"]["engagements"][0]
+    self.assertEqual((listed["contractId"], listed["contractSupersededBy"]), ("c_1", None))
+    row = self.store.get("tenant", self.tenant)
+    self.store.put("tenant", self.tenant, record={**row, "contract_superseded_by": "c_2"})
+    for engagement in (self.read(), self.service.list_engagements(self.actor, self.tenant)["data"]["engagements"][0]):
+      self.assertEqual((engagement["contractId"], engagement["contractSupersededBy"]), ("c_1", "c_2"))
+      self.assertEqual(engagement["status"], "active")
+
+  def test_a_legacy_row_reads_as_not_suspended(self):
+    stored = self.store.get("engagement", self.tenant, self.id)
+    self.assertNotIn("suspended", stored)
+    read = self.read()
+    self.assertEqual((read["suspended"], read["status"]), (False, "active"))
+    self.assertNotIn("suspendedBy", read)
+
+  def test_the_validator_refuses_a_malformed_suspend_state(self):
+    from extensions.business.cybersec.red_mesh.tenancy.engagements import validate_engagement
+    row = self.store.get("engagement", self.tenant, self.id)
+    ids = (self.tenant, self.id)
+    at = "2026-10-15T00:00:00+00:00"
+    suspended = {**row, "suspended": True, "suspended_by": "creator", "suspended_at": at, "suspend_reason": "Hold"}
+    validate_engagement(suspended, ids)
+    validate_engagement({**row, "suspended": False, "resumed_by": "creator", "resumed_at": at}, ids)
+    for bad in ({**row, "suspended": "yes"},
+                {**suspended, "suspend_reason": " "},
+                {**suspended, "resumed_by": "creator", "resumed_at": at},
+                {**row, "suspended_by": "creator"},
+                {**row, "resumed_by": "creator"},
+                {**suspended, "active": False, "revoked_by": "creator", "revoked_at": at, "revoke_reason": "Done"}):
+      with self.subTest(bad=bad), self.assertRaises(ValueError):
+        validate_engagement(bad, ids)
 
 
 class TestEngagementTargetGrammar(unittest.TestCase):

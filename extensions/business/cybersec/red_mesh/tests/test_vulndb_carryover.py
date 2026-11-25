@@ -16,8 +16,8 @@ RED_MESH = Path(__file__).resolve().parents[1]
 
 # sha256 over the sorted catalog rows. The static catalog is frozen (RM-169): `redmesh-vulndb/overlay/curated.json` is its
 # master. A change here means the overlay must change with it, then update this pin in the same step.
-FROZEN_CATALOG_ROWS = 374
-FROZEN_CATALOG_SHA256 = "f42755a9c016c635471163b1957932144eeba561f9c906115add91215db7ee8b"
+FROZEN_CATALOG_ROWS = 378
+FROZEN_CATALOG_SHA256 = "4d537b7334947c9de9db08f7bcd5a3822484a151ef6b69f8dde3f3afd1361a05"
 
 
 class TestMysqlProbeRange(unittest.TestCase):

@@ -1437,7 +1437,7 @@ class _DeploymentOperationsMixin:
   def _node_operation_reports(self, operation, attempt):
     """Read newest signed reports from the planned nodes for this attempt."""
     reports = {}
-    nodes = operation["nodes"] if attempt == "deploy" else operation["previous_nodes"]
+    nodes = set(operation["nodes"] if attempt == "deploy" else operation["previous_nodes"])
     revision = operation["target_revision"] if attempt == "deploy" else operation["previous_revision"]
     for report in (self.chainstore_hgetall(NODE_OPERATIONS_HKEY) or {}).values():
       if not isinstance(report, dict) or report.get("operation_id") != operation["operation_id"]:
@@ -1447,8 +1447,15 @@ class _DeploymentOperationsMixin:
       if report.get("attempt") != attempt or type(report.get("revision")) is not int or report["revision"] != revision:
         continue
       node = report.get("node_addr")
-      if node not in nodes or report.get("coordinator") != operation["coordinator"]:
+      if not isinstance(node, str) or report.get("coordinator") != operation["coordinator"]:
         continue
+      if node not in nodes:
+        # A legacy plan can key the same worker by its bare, case-sensitive address.
+        prefix = BCct.ADDR_PREFIX
+        node = node.removeprefix(prefix) if node.startswith(prefix) else prefix + node
+        if node not in nodes:
+          continue
+      # Verify the untouched report against its signer. Index it by the original plan key.
       if not self._verify_operation_record(report, "node_addr"):
         continue
       sequence = report.get("sequence")

@@ -136,6 +136,29 @@ class DeeploySummaryControlLivenessTests(unittest.TestCase):
     self.assertEqual(plugin.netmon.direct_calls, [])
     self.assertEqual(plugin.netmon.control_calls, ["0xai_node_gamma"])
 
+  def test_evm_target_is_resolved_to_the_prefixed_worker_address(self):
+    plugin = _plugin()
+    # NetMon resolves the EVM address to an internal address without its prefix.
+    eth = "0x" + "9" * 40
+    plugin.bc.is_valid_eth_address = lambda addr: addr == eth
+    plugin.bc.eth_addr_to_internal_addr = lambda addr: "node_gamma"
+    inputs = make_inputs(target_nodes=[eth])
+
+    self.assertEqual(
+      plugin._check_nodes_availability(inputs, skip_resource_check=True),
+      ["0xai_node_gamma"],
+    )
+
+  def test_explicit_target_aliases_cannot_count_as_two_workers(self):
+    plugin = _plugin()
+    eth = "0x" + "9" * 40
+    plugin.bc.is_valid_eth_address = lambda addr: addr == eth
+    plugin.bc.eth_addr_to_internal_addr = lambda addr: "node_gamma"
+    inputs = make_inputs(target_nodes=[eth, "0xai_node_gamma"])
+
+    with self.assertRaisesRegex(ValueError, "Duplicate target node"):
+      plugin._check_nodes_availability(inputs, skip_resource_check=True)
+
   def test_string_true_supervisor_flag_rejects_target_node(self):
     plugin = _plugin()
     plugin.netmon = _NetmonStub(is_supervisor="true")
@@ -193,7 +216,7 @@ class DeeploySummaryControlLivenessTests(unittest.TestCase):
 
     nodes = plugin._check_nodes_availability(inputs)
 
-    self.assertEqual(nodes, ["node_alpha"])
+    self.assertEqual(nodes, ["0xai_node_alpha"])
     self.assertEqual(
       plugin.netmon.control_calls,
       ["0xai_node_alpha", "0xai_node_beta", "0xai_node_gamma"],
@@ -354,7 +377,7 @@ class DeeploySummaryControlLivenessTests(unittest.TestCase):
 
     nodes = plugin._find_nodes_for_deeployment(inputs)
 
-    self.assertEqual(nodes, ["node_alpha"])
+    self.assertEqual(nodes, ["0xai_node_alpha"])
 
   def test_stack_auto_selection_disk_rejects_selected_storage_over_available(self):
     plugin = _plugin()
@@ -395,7 +418,7 @@ class DeeploySummaryControlLivenessTests(unittest.TestCase):
 
     nodes = plugin._find_nodes_for_deeployment(inputs)
 
-    self.assertEqual(nodes, ["node_beta"])
+    self.assertEqual(nodes, ["0xai_node_beta"])
 
   def test_malformed_total_resources_fail_closed_without_crashing(self):
     plugin = _plugin()

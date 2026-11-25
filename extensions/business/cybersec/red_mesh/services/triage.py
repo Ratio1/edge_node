@@ -10,7 +10,7 @@ from ..repositories import ArtifactRepository, JobStateRepository
 from ..repositories.cstore import TriageStoreError
 from ..tenancy.administration import AdministrationDenied
 from ..tenancy.job_artifacts import (
-  MAX_ARTIFACT_REFERENCES, TenantJobArtifacts, checked_job_snapshot, validate_snapshot_mode,
+  MAX_ARTIFACT_FETCHES, MAX_ARTIFACT_REFERENCES, TenantJobArtifacts, checked_job_snapshot, validate_snapshot_mode,
 )
 from ..tenancy.execution import triage_scope
 from ..tenancy.ports import TenantStoreError
@@ -172,6 +172,81 @@ def get_job_triage(owner, job_id: str, finding_id: str = "", *, checked_job=_UNS
       return {"job_id": job_id, "finding_id": finding_id, "found": False, "triage": None, "audit": audit}
     return {"job_id": job_id, "finding_id": finding_id, "found": True, "triage": state, "audit": audit}
   return {"job_id": job_id, "triage": triage_map}
+
+
+def _archive_findings(archive):
+  """`finding_id -> (confidence_reason, confidence)` of a raw archive; the first pass's finding wins, as in
+  `_find_archive_finding`."""
+  index = {}
+  for pass_report in (archive or {}).get("passes", []) or []:
+    for item in pass_report.get("findings", []) or []:
+      if isinstance(item, dict):
+        index.setdefault(item.get("finding_id"),
+                         (item.get("confidence_reason") or "none", item.get("confidence") or "none"))
+  return index
+
+
+def get_triage_rates(owner, tenant_id: str, engagement_id: str = "", *, checked_jobs, snapshot_mode="tenant_bound"):
+  """False-positive counts and rate per (confidence reason, confidence), for the tenant and per engagement.
+
+  Every record of the tenant's host-triage hash is joined to the raw archive of its writer job, which gives the
+  reason and the engagement (never the merged read, which stamps a confirmed finding `triage_confirmed`). A record
+  whose writer job is outside the snapshot, or whose finding is not in that archive, is `unattributed`; it has no
+  known engagement, so with `engagement_id` set the count is `None`. A deleted row (value None) is skipped. A malformed
+  record or job, a scope mismatch or more than MAX_ARTIFACT_FETCHES writer archives make the read unavailable.
+  """
+  validate_snapshot_mode(snapshot_mode, snapshot_supplied=True)
+  try:
+    repo = _job_repo(owner)
+    jobs = {key: checked_job_snapshot(job, key, snapshot_mode=snapshot_mode) for key, job in checked_jobs.items()}
+    stored_records = owner.chainstore_hgetall(hkey=repo.host_triage_hkey(tenant_id)) or {}
+    counts, unattributed, archives = {}, 0, {}
+    for key, stored in stored_records.items():
+      if stored is None:  # a deleted row: the purge sweep writes None and hgetall still lists it
+        continue
+      host, _, finding_id = key.partition("\x1f")
+      state = FindingTriageState.from_dict(stored)
+      if key != repo.host_triage_key(host, finding_id) or not _names_key(stored, tenant_id, host, finding_id):
+        raise ValueError("Invalid finding state identity")
+      job = jobs.get(state.job_id)
+      if job is None:
+        unattributed += 1
+        continue
+      if is_model_test_job(job):
+        continue
+      if triage_scope(job["execution_binding"]) != (tenant_id, host):
+        raise ValueError("Triage record and writer job differ in scope")
+      engagement = job["execution_binding"]["engagement_id"]
+      if engagement_id and engagement != engagement_id:
+        continue
+      if state.job_id not in archives:
+        if len(archives) >= MAX_ARTIFACT_FETCHES:
+          raise ValueError("Archive read budget exceeded")
+        archive = TenantJobArtifacts(job, _artifact_repo(owner).get_json, snapshot_mode=snapshot_mode).archive()
+        archives[state.job_id] = _archive_findings(archive)
+      reason = archives[state.job_id].get(finding_id)
+      if reason is None:
+        unattributed += 1
+        continue
+      outcome = ("false_positive" if state.status == "false_positive"
+                 else "true_positive" if state.confirmed or state.status in ("remediated", "accepted_risk")
+                 else "unreviewed")
+      for scope in (None, engagement):
+        row = counts.setdefault(scope, {}).setdefault(reason, {"false_positive": 0, "true_positive": 0, "unreviewed": 0})
+        row[outcome] += 1
+  except Exception:
+    raise TenantStoreError("Tenant triage rates are unavailable") from None
+
+  def by_reason(scope):
+    rows = []
+    for (reason, confidence), row in sorted(counts.get(scope, {}).items()):
+      n = row["false_positive"] + row["true_positive"]
+      rows.append({"reason": reason, "confidence": confidence, **row, "n": n,
+                   "rate": row["false_positive"] / n if n else None})
+    return rows
+
+  return {"tenant": {"by_reason": by_reason(None), "unattributed": None if engagement_id else unattributed},
+          "engagements": {scope: {"by_reason": by_reason(scope)} for scope in sorted(s for s in counts if s)}}
 
 
 MAX_TRIAGE_FINDINGS = 500
