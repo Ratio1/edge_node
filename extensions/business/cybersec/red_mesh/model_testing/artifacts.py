@@ -24,7 +24,7 @@ MODEL_TEST_JOB_CONFIG_SCHEMA = "model_test_job_config_v1"
 MODEL_TEST_ARCHIVE_SCHEMA = "model_test_archive_v1"
 MODEL_TEST_WORKER_RESULT_SCHEMA = "model_test_worker_result_v1"
 _ENGAGEMENT_SNAPSHOT_KEYS = ("engagement_id", "engagement_hash", "contract_sha256", "engagement",
-                             "authorization")
+                             "authorization", "engagement_authorized_ports", "engagement_authorized_tests")
 
 
 @dataclass(frozen=True)
@@ -61,6 +61,8 @@ class ModelTestJobConfig:
   engagement_id: str | None = None
   engagement_hash: str | None = None
   contract_sha256: str | None = None
+  engagement_authorized_ports: str | list | None = None
+  engagement_authorized_tests: str | list | None = None
   engagement: dict | None = None
   authorization: dict | None = None
 

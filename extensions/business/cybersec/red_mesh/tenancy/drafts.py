@@ -12,6 +12,7 @@ a private entry holds its node (checked by `tenancy.administration`, which reads
 from datetime import date, datetime
 import json
 import re
+import unicodedata
 
 from .assets import normalize_name, valid_digest
 from .contacts import valid_email, valid_phone
@@ -65,6 +66,7 @@ _DISPLAY_NAME_MAX = 120
 LEGAL_MAX = 200
 _LEGAL_MAX = LEGAL_MAX
 _REASON_MAX = 500
+_NOTE_MAX = 2000
 DTO_FIELDS = ("draft_id", "display_name", "domain_id", "initial_admin_id", "legal", "compliance_types",
               "items", "applicability", "nodes", "activation", "last_release", "created_by", "created_at",
               "updated_by", "updated_at")
@@ -224,14 +226,27 @@ def normalize_applicability(value):
   return {"decision": value["decision"], "reason": reason}
 
 
+def normalize_note(value):
+  """RM-249: the amendment note, none or up to `_NOTE_MAX` characters (blank is none); no control, format or lone-surrogate characters, no line or paragraph separators."""
+  if value is not None and (not isinstance(value, str) or len(value.strip()) > _NOTE_MAX
+                            or any((unicodedata.category(ch) in ("Cc", "Cf") and ch not in "\n\t") or unicodedata.category(ch) in ("Cs", "Zl", "Zp")
+                                   for ch in value)):
+    raise DraftInvalid()
+  return None if value is None else value.strip() or None
+
+
 def valid_generated(value, with_nodes=False):
   """The `generated` block: the stored ref of the unsigned pack plus its baseline stamps, or null.
   RM-127: `with_nodes` (the tenant contract) also allows `nodes`, the non-empty node plan the pack
-  printed, in the `normalize_nodes` shape; a block written before RM-127 has none."""
+  printed, in the `normalize_nodes` shape; a block written before RM-127 has none. RM-249: and the
+  amendment `note` it printed (absent when none)."""
   nodes = isinstance(value, dict) and with_nodes and "nodes" in value
+  note = nodes and "note" in value
   return (value is None
-          or (isinstance(value, dict) and set(value) == {*DOC_REF_KEYS, *_GENERATED_FIELDS, *(("nodes",) if nodes else ())}
+          or (isinstance(value, dict) and set(value) == {*DOC_REF_KEYS, *_GENERATED_FIELDS, *(("nodes",) if nodes else ()),
+                                                          *(("note",) if note else ())}
               and (not nodes or (bool(value["nodes"]) and _same(normalize_nodes, value["nodes"])))
+              and (not note or (value["note"] is not None and _same(normalize_note, value["note"])))
               and valid_doc_ref({key: value[key] for key in DOC_REF_KEYS})
               and value["mime"] == "application/pdf" and valid_digest(value["snapshot_sha256"])
               and all(_nonempty_text(value[key]) for key in ("generated_at", "generated_by"))))

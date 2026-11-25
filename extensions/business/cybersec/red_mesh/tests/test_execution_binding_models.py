@@ -24,6 +24,7 @@ def binding_payload():
 
 
 ENGAGEMENT_FACTS = {"engagement_hash": "e" * 64, "contract_sha256": "c" * 64,
+                    "authorized_ports": "all", "authorized_tests": "all",
                     "context": {}, "authorization": {}}
 
 
@@ -211,8 +212,8 @@ class TestResolvedContextCarriesThePolicy(unittest.TestCase):
               {**engagement, "engagement_hash": "f" * 64},
               {**engagement, "extra": 1}, {**engagement, "roe": {"authenticated_action": False}},
               {**engagement, "contract_sha256": None},
-              # RM-125: the removed picks are no longer part of the engagement facts.
-              {**engagement, "authorized_tests": ["service_info_common"]},
+              # RM-251: both scope keys are part of the facts; RM-125's other picks are not.
+              {key: value for key, value in engagement.items() if key != "authorized_tests"},
               {**engagement, "authorized_scan_modes": ["connect"]},
               {**engagement, "allowed_run_modes": ["single_pass"]})
     for value in broken:

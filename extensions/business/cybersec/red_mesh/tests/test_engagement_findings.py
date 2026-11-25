@@ -912,8 +912,8 @@ class TestListEngagementFindings(_EngagementPlugin):
     asset = self.plugin.get_engagement(self.actor, self.tenant, self.engagement)["data"]["engagement"]["assets"][0]
     successor = self.plugin.create_engagement(
       self.actor, self.tenant, str(uuid4()), "Q4 bis", "2026-10-01T00:00:00Z", "2027-10-01T00:00:00Z",
-      {"client_name": "Example"}, [pick(asset["assetId"])], [self.upload("Rules v2", raw=b"%PDF-1.7\n%v2\n%%EOF\n")],
-      supersedes=self.engagement)
+      {"client_name": "Example"}, [pick(asset["assetId"])], [self.upload("Rules v2", raw=b"%PDF-1.7\n%v2\n%%EOF\n")])
+    # RM-248: a replacement goes through an engagement draft; a new engagement plus the revoke stands in here.
     self.assertTrue(successor["success"], successor)
     self.assertTrue(self.plugin.revoke_engagement(self.actor, self.tenant, self.engagement, "replaced")["success"])
     self.assertEqual(self.fields(), before)

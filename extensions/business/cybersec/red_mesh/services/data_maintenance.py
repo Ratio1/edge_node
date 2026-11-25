@@ -67,7 +67,8 @@ _PER_JOB = (
 # RM-139: the tenant `integration` kind is retired: its rows classify old and are never restored.
 _TENANCY_KINDS = ("tenant", "receipt", "domain", "tenant_node", "engagement", "tenant_draft",
                   "engagement_draft", "super_tenant_profile", "tenant_asset", "tenant_contract_draft",
-                  "super_tenant_branding", "super_tenant_integration", "account_profile")
+                  "super_tenant_branding", "super_tenant_integration", "account_profile",
+                  "supporting_document")
 # Graybox credentials that job configs held inline before they moved to an encrypted secret file.
 # Such a config is stored under the engine's fixed default secret, so its bytes are as good as
 # plaintext: it is withheld from the backup (owner, 2026-09-29: no plaintext credential leaves the node).

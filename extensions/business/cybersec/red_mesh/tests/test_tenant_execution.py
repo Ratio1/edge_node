@@ -254,7 +254,25 @@ class TestTenantExecution(unittest.TestCase):
     # written back in (release once more, then a fresh assignment).
     self.service.tenant_node_jobs_reader = lambda tenant_id, node_address: False
     self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"],
-                     [{"nodeAddress": "node-b", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None}])
+                     [{"nodeAddress": "node-b", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None,
+                       "readiness": {"online": None, "lastSeen": None, "inDeployment": True, "state": "unknown"}}])
+
+  def test_the_launch_set_of_a_node_less_contract_is_its_active_assignments(self):
+    """RM-211: a released row leaves the set and is refused `not_assigned`; a draining row stays listed,
+    not eligible."""
+    asset = self.ready()
+    read = lambda: [(node["nodeAddress"], node["eligible"], node["reason"]) for node in self.service.get_engagement_launch_nodes(
+      self.actor, self.tenant, asset["engagementId"])["data"]["nodes"]]
+    self.assertEqual(read(), [("node-a", True, None), ("node-b", True, None)])
+    self.service.set_tenant_node_assignment(self.actor, self.tenant, "node-b", False)
+    self.assertEqual(read(), [("node-a", True, None)])
+    self.assertEqual(self.admit(self.actor, asset).to_dict()["selected_candidates"], ["node-a"])
+    with self.assertRaises(AdministrationDenied) as denied:
+      self.admit(self.actor, asset, ["node-b"])
+    self.assertEqual(denied.exception.details["nodes"], [{"nodeAddress": "node-b", "reason": "not_assigned"}])
+    self.service.tenant_node_jobs_reader = lambda tenant_id, node_address: True
+    self.service.set_tenant_node_assignment(self.actor, self.tenant, "node-a", False)
+    self.assertEqual(read(), [("node-a", False, "draining")])
 
   def test_existing_execution_checks_namespace_publication_engagement_and_current_configuration(self):
     asset = self.ready()

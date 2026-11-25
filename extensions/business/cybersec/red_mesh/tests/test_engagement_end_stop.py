@@ -245,5 +245,94 @@ class TestContinuousJobStopsWhenTheEngagementEnds(unittest.TestCase):
     self.assertEqual(single.reason_checks, [])
 
 
+class SuspendedOwner(EngagementOwner):
+  """RM-248: the engagement is suspended; only a new pass is refused, the current pass is not."""
+  suspended = True
+  new_pass_denial = "engagement_suspended"
+
+  def __init__(self, **kwargs):
+    super().__init__(**kwargs)
+    self.denials = []
+
+  def _execution_denial_reason(self, job_specs, *, operation="current", config=None, **kwargs):
+    self.denials.append(operation)
+    return self.new_pass_denial if self.suspended and operation == "new_pass" else None
+
+
+class TestContinuousJobHoldsItsNextPassWhileSuspended(unittest.TestCase):
+  def held(self):
+    owner = SuspendedOwner()
+    owner.job["next_pass_at"] = 50
+    return owner
+
+  def test_the_next_pass_is_held_not_stopped_and_starts_after_the_resume(self):
+    owner = self.held()
+    maybe_finalize_pass(owner)
+    self.assertEqual((owner.job["job_pass"], owner.job["job_status"]), (1, "RUNNING"))
+    self.assertEqual(owner.audit, [])
+    owner.suspended = False
+    owner.now = 161
+    maybe_finalize_pass(owner)
+    self.assertEqual(owner.job["job_pass"], 2)
+    self.assertIn("pass_started", [event["type"] for event in owner.job["timeline"]])
+
+  def test_one_timeline_entry_while_held(self):
+    owner = self.held()
+    for now in (100, 130, 190):
+      owner.now = now
+      maybe_finalize_pass(owner)
+    entries = [event for event in owner.job["timeline"] if event["type"] == "execution_denied"]
+    self.assertEqual(len(entries), 1)
+    self.assertEqual(entries[0]["meta"], {"operation": "new_pass", "reason": "engagement_suspended", "pass_nr": 1})
+
+  def test_a_held_pass_is_rechecked_at_most_once_a_minute_and_written_once(self):
+    owner = self.held()
+    for now in (100, 130, 159, 161):
+      owner.now = now
+      maybe_finalize_pass(owner)
+    self.assertEqual(owner.denials.count("new_pass"), 2)  # at 100 and at 161
+    self.assertEqual(len(owner.reason_checks), 2)  # the end-stop check keeps the same cadence
+    self.assertEqual(owner.job["job_revision"], 1)
+
+  def test_a_held_pass_stays_held_when_the_store_is_unavailable(self):
+    owner = self.held()
+    owner.new_pass_denial = "store_unavailable"
+    maybe_finalize_pass(owner)
+    self.assertEqual((owner.job["job_pass"], owner.job["job_status"]), (1, "RUNNING"))
+    self.assertEqual(owner.audit, [])
+
+  def test_a_single_pass_job_under_a_suspended_engagement_runs_to_completion(self):
+    owner = SuspendedOwner(continuous=False)
+    maybe_finalize_pass(owner)
+    self.assertNotIn(owner.job["job_status"], ("STOPPED", "FAILED"))
+    self.assertNotIn("new_pass", owner.denials)
+    self.assertEqual(owner.audit, [])
+
+  def test_the_hard_stop_still_stops_a_suspended_job_on_revoke_and_expiry(self):
+    for reason in ("engagement_revoked", "engagement_expired"):
+      with self.subTest(reason=reason):
+        owner = SuspendedOwner(reason=reason)
+        owner.job["next_pass_at"] = 50
+        maybe_finalize_pass(owner)
+        self.assertEqual(owner.job["job_status"], "STOPPED")
+        self.assertEqual(owner.job["job_pass"], 1)
+
+
+class TestPluginHoldsOnlyANewPass(unittest.TestCase):
+  """The plugin seam asks the service for a new pass only with `new_pass`."""
+
+  def test_the_denial_reason_passes_new_pass_to_the_service(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    asked = []
+    service = SimpleNamespace(reauthorize_execution=lambda binding, worker_node=None, new_pass=False:
+                              asked.append(new_pass))
+    plugin = SimpleNamespace(_execution_service=lambda: service)
+    job = {"execution_binding": execution_binding(), "scan_type": "network"}
+    for operation in ("current", "new_pass"):
+      PentesterApi01Plugin._execution_denial_reason(plugin, job, operation=operation)
+    self.assertEqual(asked, [False, True])
+
+
 if __name__ == "__main__":
   unittest.main()
