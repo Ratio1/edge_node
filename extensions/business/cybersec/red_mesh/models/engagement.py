@@ -44,6 +44,9 @@ from typing import Any
 # frontend form via redmeshApi.types.ts).
 # ---------------------------------------------------------------------
 
+DEFAULT_METHODOLOGY = "PTES + OWASP WSTG + CVSS v3.1 and v4.0"
+LEGACY_METHODOLOGY = "PTES + OWASP WSTG + CVSS v3.1"  # default of records stored before v4.0
+
 DATA_CLASSIFICATIONS = (
   "PII",
   "PCI",
@@ -120,7 +123,7 @@ class EngagementContext:
   scope_rationale: str = ""
   data_classification: str = ""        # one of DATA_CLASSIFICATIONS
   asset_exposure: str = ""             # one of ASSET_EXPOSURES
-  methodology: str = "PTES + OWASP WSTG + CVSS v3.1"
+  methodology: str = DEFAULT_METHODOLOGY
   point_of_contact: Contact | None = None
   emergency_contact: Contact | None = None
 
@@ -151,7 +154,7 @@ class EngagementContext:
       scope_rationale=str(d.get("scope_rationale", "")),
       data_classification=str(d.get("data_classification", "")),
       asset_exposure=str(d.get("asset_exposure", "")),
-      methodology=str(d.get("methodology", "PTES + OWASP WSTG + CVSS v3.1")),
+      methodology=str(d.get("methodology", DEFAULT_METHODOLOGY)),
       point_of_contact=Contact.from_dict(d.get("point_of_contact")),
       emergency_contact=Contact.from_dict(d.get("emergency_contact")),
     )
@@ -162,7 +165,7 @@ class EngagementContext:
       not self.primary_objective, not self.secondary_objective,
       not self.scope_rationale, not self.data_classification,
       not self.asset_exposure,
-      self.methodology in ("", "PTES + OWASP WSTG + CVSS v3.1"),
+      self.methodology in ("", LEGACY_METHODOLOGY, DEFAULT_METHODOLOGY),
       self.point_of_contact is None or self.point_of_contact.is_empty(),
       self.emergency_contact is None or self.emergency_contact.is_empty(),
     ])

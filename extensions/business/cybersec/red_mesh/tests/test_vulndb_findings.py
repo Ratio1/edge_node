@@ -104,6 +104,7 @@ class FindingFieldTests(unittest.TestCase):
     self.assertEqual((finding.cvss_version, finding.cvss_score, finding.cvss_source, finding.cvss_vector),
                      ("3.1", 8.1, "nvd", V31))
     self.assertEqual([(c["version"], c["source"]) for c in finding.cvss], [("3.1", "cna"), ("3.1", "nvd"), ("4.0", "cna")])
+    self.assertEqual([c.get("nomenclature") for c in finding.cvss], [None, None, "CVSS-B"])  # RM-170: v4.0 only
     self.assertEqual((finding.confidence, finding.confidence_reason), ("tentative", "banner_only"))
     self.assertEqual(finding.cwe_id, "CWE-362")  # frozen to the static row
     self.assertEqual(finding.cwe, (79,))  # display classification from the database

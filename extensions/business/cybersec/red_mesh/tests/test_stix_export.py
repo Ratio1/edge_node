@@ -23,6 +23,10 @@ def _sample_findings():
       "cwe_id": "CWE-89",
       "cve_id": "CVE-2026-0001",
       "cvss_score": 9.8,
+      "cvss": [
+        {"version": "3.1", "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", "score": 9.8, "source": "nvd"},
+        {"version": "4.0", "vector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N", "score": 9.3, "source": "nvd"},
+      ],
       "port": 443,
       "protocol": "https",
       "probe": "_web_test_sql_injection",
@@ -188,6 +192,41 @@ class TestStixExport(unittest.TestCase):
     self.assertNotIn("' OR 1=1", serialized)
     self.assertIn("target:", serialized)
     self.assertIn("x_redmesh_banner_hash", serialized)
+
+  def test_vulnerability_context_carries_both_cvss_versions(self):
+    bundle = build_stix_bundle(_owner(), "job-1")["bundle"]
+    vulns = [o for o in bundle["objects"] if o["type"] == "vulnerability"]
+    entries = vulns[0]["x_redmesh_context"]["cvss"]
+    self.assertEqual([e["version"] for e in entries], ["3.1", "4.0"])
+    self.assertEqual(entries[1], {"version": "4.0", "vector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N", "score": 9.3, "source": "nvd", "nomenclature": "CVSS-B"})
+    self.assertNotIn("cvss", vulns[1]["x_redmesh_context"])
+
+  def test_stix_context_drops_duplicates_and_bad_entries(self):
+    from extensions.business.cybersec.red_mesh.cvss_entries import cvss_entries
+    v31 = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    v4 = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"
+    got = cvss_entries({"cvss": [
+      {"version": 4.0, "vector": v4, "score": 9.3},
+      {"version": "3.1", "vector": v31, "score": 9.8, "source": "nvd"},
+      {"version": "3.1", "vector": v31, "score": 9.8, "source": "cna"},
+      {"version": "2.0", "vector": "AV:N/AC:L"}, {"version": "3.1"}, {"vector": v31}, "x",
+      {"version": "3.1", "vector": "CVSS:3.1/" + "A:B/" * 80 + "A:B"}]})
+    self.assertEqual([(e["version"], e["vector"]) for e in got], [("3.1", v31), ("4.0", v4)])
+
+  def test_v4_vector_with_provider_urgency_and_int_version_is_kept(self):
+    from extensions.business.cybersec.red_mesh.cvss_entries import cvss_entries
+    v4 = ("CVSS:4.0/AV:N/AC:H/AT:P/PR:L/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N/AU:N/R:A/V:D/RE:M/U:Red")
+    got = cvss_entries({"cvss": [{"version": 4, "vector": v4, "score": 8.1},
+                                 {"version": "4.0", "vector": v4.replace("U:Red", "U:Purple")},
+                                 {"version": "4.0", "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]})
+    self.assertEqual([(e["version"], e["vector"]) for e in got], [("4.0", v4)])
+    self.assertEqual(got[0]["nomenclature"], "CVSS-B")
+
+  def test_v4_nomenclature(self):
+    from extensions.business.cybersec.red_mesh.cvss_entries import cvss_v4_nomenclature
+    base = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"
+    self.assertEqual([cvss_v4_nomenclature(base + s) for s in ("", "/E:X", "/E:A", "/CR:H", "/E:P/MAV:L", "/U:Red/R:A")],
+                     ["CVSS-B", "CVSS-B", "CVSS-BT", "CVSS-BE", "CVSS-BTE", "CVSS-B"])
 
   def test_every_sdo_carries_the_job_tenant_label(self):
     """RM-139: the label OpenCTI and TAXII consumers filter one tenant's objects by."""
