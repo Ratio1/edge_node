@@ -548,7 +548,8 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertEqual(self.scan()[(TENANCY, under_tenant)]["reason"], "unrecognized")
 
   def test_v2_shaped_engagements_and_drafts_are_old_and_cleanup_removes_them(self):
-    # RM-125 phase 2b: entries without `asset_id` (or with the v2 test picks) predate the asset library.
+    # RM-125 phase 2b: entries without `asset_id` predate the asset library. RM-277: one with an `asset_id` and
+    # a scope that does not read is simply unrecognized.
     tenant = self.tenant
     field = self.engagement_draft_row(tenant, 60)
     entry = {"engagement_asset_id": "ea_1", "display_name": "Edge", "kind": "network",
@@ -564,12 +565,18 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertEqual((rows[(TENANCY, field)]["class"], rows[(TENANCY, field)]["reason"]),
                      ("old", "engagement_draft_v1"))
     self.assertEqual((rows[(TENANCY, with_id)]["class"], rows[(TENANCY, with_id)]["reason"]),
-                     ("old", "engagement_draft_v1"))
+                     ("old", "unrecognized"))
     self.assertEqual((rows[(TENANCY, engagement)]["class"], rows[(TENANCY, engagement)]["reason"]),
                      ("old", "engagement_v2"))
     self.assertEqual(self.clean(rows[(TENANCY, field)])[0]["outcome"], "deleted")
     self.assertEqual(sorted(self.files.deleted), sorted([cid(60), cid(61)]))
     self.assertEqual(self.clean(rows[(TENANCY, engagement)])[0]["outcome"], "deleted")
+
+  def test_an_rm251_draft_with_the_engagement_level_scope_is_current(self):
+    # RM-277: 2.10.810 drafts and engagements hold the pair on the row; they read, so they are never offered for cleanup.
+    field = self.engagement_draft_row(self.tenant, 70)
+    self.storage.data[(TENANCY, field)].update(authorized_ports=[[1, 1024]], authorized_tests=["web_discovery"])
+    self.assertEqual(self.scan()[(TENANCY, field)]["class"], "current")
 
   def tenant_asset_row(self, parent, address):
     """RM-125. A tenant asset written through the real endpoint."""

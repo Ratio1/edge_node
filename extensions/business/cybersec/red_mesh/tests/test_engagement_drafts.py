@@ -11,6 +11,7 @@ from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administratio
   CstoreTenantAdministrationStore,
 )
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
+from extensions.business.cybersec.red_mesh.tenancy.engagements import scope_of
 from .asset_fixture import pick, register_asset
 from .contract_fixture import envelope
 from .test_tenant_drafts import (GENERATED_AT, PLAN, PNG, SCHEDULE_PDF, TENANCY_HKEY, _ActivationCase, ok, refused,
@@ -20,13 +21,15 @@ PACK_PDF = b"%PDF-1.7\n%fixture signed engagement pack\n%%EOF\n"
 GENERATED_PDF = b"%PDF-1.7\n%fixture generated engagement pack\n%%EOF\n"
 NETWORK = {"kind": "network", "address": "192.0.2.10"}
 WEBAPP = {"kind": "webapp", "url": "https://app.example.com/", "allowedPathPrefix": "/"}
+MODEL = {"kind": "model", "adapter": "openai_compatible",
+         "endpointUrl": "https://llm.example.com/v1/chat/completions", "model": "example-model"}
 COMPLETE = {"display_name": " Q4 external ",
             "valid_from": "2026-10-01T00:00:00Z", "valid_until": "2026-10-31T00:00:00+00:00",
             "context": {"client_name": "Example"}}
 LIST_KEYS = {"engagement_draft_id", "parent", "display_name", "assets_count", "document_state", "created_at",
              "updated_at", "contract_id", "supersedes"}
 # RM-252: an engagement pack's snapshot also names the contract it was printed for (`c_1` for a tenant draft's child).
-PACK_SNAPSHOT = snapshot_of(PLAN, contractId="c_1")
+PACK_SNAPSHOT = snapshot_of(PLAN, contractId="c_1", assets=[])
 SNAPSHOT_SHA256 = hashlib.sha256(PACK_SNAPSHOT.encode("utf-8")).hexdigest()
 
 
@@ -70,6 +73,12 @@ class _EngagementDraftCase(_ActivationCase):
   def pack_snapshot(self, engagement_draft_id, **extra):
     """The snapshot the Navigator sends: the draft's binding (`c_1` for none) and the nodes it holds now."""
     row = self.stored_child(engagement_draft_id)
+    # RM-277: the console names every held asset with its scope ("all" left out).
+    extra.setdefault("assets", [{"assetId": entry["asset_id"], **{
+      name: entry[key] for key, name in (("authorized_ports", "authorizedPorts"), ("authorized_tests", "authorizedTests"))
+      if entry.get(key, "all") != "all"}} for entry in row.get("assets", [])])
+    if extra["assets"] is None:
+      del extra["assets"]  # a snapshot with no list at all
     parent = row["parent"]
     if "draft_id" in parent:
       return snapshot_of(self.stored(parent["draft_id"])["nodes"], contractId="c_1", **extra)
@@ -180,9 +189,11 @@ class TestEngagementDraftRecord(_EngagementDraftCase):
       "instant type": ({"valid_until": None}, "window_invalid"),
       "window order": ({"valid_until": "2026-09-01T00:00:00Z"}, "window_invalid"),
       "context": ({"context": {"client_name": None}}, "context_invalid"),
-      "asset ports dropped": ({"assets": [{**entry, "authorized_ports": "443"}]}, "engagement_asset_invalid"),
-      "asset tests": ({"assets": [{**entry, "authorized_tests": ["service_info_common"]}]},
-                      "engagement_asset_invalid"),
+      "engagement-level ports": ({"authorized_ports": "all"}, "invalid_request"),
+      "engagement-level tests": ({"authorized_tests": "all"}, "invalid_request"),
+      "ports on a webapp asset": ({"assets": [{**pick(web), "authorized_ports": [[1, 80]]}]}, "authorized_ports_invalid"),
+      "tests of another kind": ({"assets": [{**entry, "authorized_tests": ["graybox_injection"]}]},
+                                "authorized_tests_unknown"),
       "asset scan modes": ({"assets": [{**entry, "authorized_scan_modes": ["connect"]}]},
                            "engagement_asset_invalid"),
       "asset target": ({"assets": [{**entry, "target": NETWORK}]}, "engagement_asset_invalid"),
@@ -213,10 +224,9 @@ class TestEngagementDraftRecord(_EngagementDraftCase):
     asset = draft["assets"][0]
     self.assertEqual((asset["engagement_asset_id"], asset["asset_id"], asset["kind"]),
                      ("ea_1", self.asset_in(parent), "network"))
-    self.assertNotIn("authorized_ports", asset)
+    self.assertEqual((asset["authorized_ports"], asset["authorized_tests"]), ("all", "all"))
     self.assertEqual((asset["display_name"], asset["target"]), ("Network", NETWORK))
     self.assertNotIn("authorized_scan_modes", asset)
-    self.assertNotIn("authorized_tests", asset)
     self.assertEqual(draft["completeness"], {"complete": False, "missing": ["item:engagement_pack"], "reasons": {}})
     emptied = ok(self, self.update_child(engagement_draft_id, {
       "display_name": "", "valid_from": "", "valid_until": "", "context": None,
@@ -624,6 +634,7 @@ class TestEngagementDraftActivation(_EngagementDraftCase):
     engagement_draft_id = self.ready_child(tenant_id)
     row = self.stored_child(engagement_draft_id)
     signed, generated = row["document"]["document"], row["document"]["generated"]
+    printed = self.pack_snapshot(engagement_draft_id)
     self.events.clear()
     result = ok(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id))
     engagement_id = "en_" + engagement_draft_id[4:]
@@ -642,7 +653,7 @@ class TestEngagementDraftActivation(_EngagementDraftCase):
       {"document_id": "ed_1", **signed, "kind": "agreement", "title": "Engagement pack",
        "comment": "baseline sha256 " + generated["sha256"]},
       {"document_id": "ed_2", **{key: generated[key] for key in signed}, "kind": "other",
-       "title": "Generated engagement pack (unsigned)", "comment": "snapshot sha256 " + SNAPSHOT_SHA256}])
+       "title": "Generated engagement pack (unsigned)", "comment": "snapshot sha256 " + generated["snapshot_sha256"]}])
     self.assertEqual(self.events, [("engagement_created", {
       "tenant_id": tenant_id, "engagement_id": engagement_id, "engagement_hash": engagement["engagement_hash"],
       "actor": "creator"})])
@@ -657,8 +668,8 @@ class TestEngagementDraftActivation(_EngagementDraftCase):
     # The baseline readers (RM-111, RM-068) find the snapshot in the second document's envelope.
     baseline = self.documents.get(engagement["documents"][1]["ref"])
     self.assertEqual((baseline["role"], baseline["snapshot"], baseline["engagement_draft_id"]),
-                     ("generated", PACK_SNAPSHOT, engagement_draft_id))
-    self.assertEqual(hashlib.sha256(baseline["snapshot"].encode("utf-8")).hexdigest(), SNAPSHOT_SHA256)
+                     ("generated", printed, engagement_draft_id))
+    self.assertEqual(hashlib.sha256(baseline["snapshot"].encode("utf-8")).hexdigest(), generated["snapshot_sha256"])
     self.assertEqual([item["engagement_draft_id"] for item in ok(self, self.plugin.list_engagement_drafts(self.actor, tenant_id))], [])
 
   def test_go_live_with_the_generated_file_as_the_signed_copy_binds_both(self):
@@ -987,64 +998,126 @@ class TestEngagementReplacement(_EngagementDraftCase):
                      ["agreement", "other"])
     self.assertEqual(self.documents.deleted, [])
 
-  def test_a_replacement_keeps_a_restricted_scope_and_never_widens_it(self):
-    # RM-251: the Replace path, which an amendment copy takes too (both are `supersedes` drafts).
+  def test_a_replacement_keeps_each_assets_scope_and_never_widens_it(self):
+    # RM-251, RM-277: the Replace path, which an amendment copy takes too (both are `supersedes` drafts).
+    net, web = self.asset_in(self.tenant_id), self.asset_in(self.tenant_id, WEBAPP)
+    scoped = [dict(pick(net), authorized_ports=[[1, 1024]], authorized_tests=["web_discovery"]),
+              dict(pick(web), authorized_tests=["graybox_injection"])]
     restricted = ok(self, self.plugin.create_engagement(
       self.actor, self.tenant_id, str(uuid4()), "Restricted", COMPLETE["valid_from"], COMPLETE["valid_until"],
-      COMPLETE["context"], [pick(self.asset_in(self.tenant_id))], [],
-      authorized_ports=[[1, 1024]], authorized_tests=["web_discovery"]))["engagementId"]
+      COMPLETE["context"], scoped, []))["engagementId"]
     engagement_draft_id = ok(self, self.plugin.create_engagement_draft(
       self.actor, self.tenant_id, str(uuid4()), "Replaced", supersedes=restricted))["engagement_draft_id"]
+    shown = lambda draft: [(entry["authorized_ports"] if "authorized_ports" in entry else None, entry["authorized_tests"])
+                           for entry in draft["assets"]]
     draft = ok(self, self.plugin.get_engagement_draft(self.actor, engagement_draft_id))
-    self.assertEqual((draft["authorized_ports"], draft["authorized_tests"]), ([[1, 1024]], ["web_discovery"]))
-    self.fill(engagement_draft_id)
+    self.assertEqual(shown(draft), [([[1, 1024]], ["web_discovery"]), (None, ["graybox_injection"])])
+    self.assertNotIn("authorized_ports", draft)
+    # An asset added in the copy starts at "all"; the others are sent with the scope the draft shows.
+    model = self.asset_in(self.tenant_id, MODEL)
+    ok(self, self.update_child(engagement_draft_id, {**COMPLETE, "assets": [
+      dict(scoped[0]), dict(scoped[1]), pick(model)]}))
     ok(self, self.upload_pack(engagement_draft_id))
     ok(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id))
     new = self.engagement("en_" + engagement_draft_id[4:])
-    self.assertEqual((new["authorized_ports"], new["authorized_tests"]), ([[1, 1024]], ["web_discovery"]))
+    self.assertEqual([scope_of(entry) for entry in new["assets"]],
+                     [([[1, 1024]], ["web_discovery"]), ("all", ["graybox_injection"]), ("all", "all")])
     # The same plain replacement of an engagement with no scope keys (`/4`) starts at "all".
-    self.assertEqual(ok(self, self.plugin.get_engagement_draft(
-      self.actor, self.replacement(sign=False)))["authorized_ports"], "all")
+    legacy = self.engagement(self.old_id)
+    plain = ok(self, self.plugin.get_engagement_draft(self.actor, self.replacement(sign=False)))
+    self.assertEqual([scope_of(entry) for entry in plain["assets"]], [("all", "all")] * len(legacy["assets"]))
 
-  def test_the_scope_is_a_draft_field_default_all_checked_when_written_and_complete_only_if_valid(self):
+  def test_an_rm251_draft_reads_with_its_scope_derived_per_asset_and_never_widens(self):
+    parent = self.tenant_id
+    draft_id = self.child(parent)["engagement_draft_id"]
+    self.fill(draft_id, assets=[pick(self.asset_in(parent)), pick(self.asset_in(parent, WEBAPP))])
+    row = self.stored_child(draft_id)
+    row["assets"] = [{key: value for key, value in entry.items() if not key.startswith("authorized_")} for entry in row["assets"]]
+    row.update(authorized_ports=[[1, 1024]], authorized_tests=["web_discovery"])
+    self.repo.put("engagement_draft", draft_id, record=row)
+    read = ok(self, self.plugin.get_engagement_draft(self.actor, draft_id))
+    self.assertNotIn("authorized_ports", read)
+    self.assertEqual([scope_of(entry) for entry in read["assets"]], [([[1, 1024]], ["web_discovery"]), ("all", [])])
+    # Nothing authorized for the webapp asset: not complete until its scope is set.
+    self.assertEqual(read["completeness"]["reasons"], {"assets": "authorized_tests_invalid"})
+    self.assertEqual(self.stored_child(draft_id)["assets"], read["assets"])
+    # Any write stores the per-asset form; a held asset re-sent without keys keeps its derived scope.
+    fixed = ok(self, self.update_child(draft_id, {"assets": [pick(self.asset_in(parent)), dict(
+      pick(self.asset_in(parent, WEBAPP)), authorized_tests=["graybox_injection"])]}))
+    self.assertEqual([scope_of(entry) for entry in fixed["assets"]],
+                     [([[1, 1024]], ["web_discovery"]), ("all", ["graybox_injection"])])
+    self.assertNotIn("authorized_ports", self.stored_child(draft_id))
+    # A stale list-form `pack_scope` of 2.10.810 stays stale.
+    self.generate_pack(draft_id, snapshot=self.pack_snapshot(
+      draft_id, assets=[{"assetId": self.asset_in(parent), "authorizedPorts": [[1, 1024]], "authorizedTests": ["web_discovery"]},
+                        {"assetId": self.asset_in(parent, WEBAPP), "authorizedTests": ["graybox_injection"]}]))
+    row = self.stored_child(draft_id)
+    row["pack_scope"] = ["all", "all"]
+    self.repo.put("engagement_draft", draft_id, record=row)
+    self.assertIn("item:engagement_pack_stale", ok(
+      self, self.plugin.get_engagement_draft(self.actor, draft_id))["completeness"]["missing"])
+
+  def test_a_held_asset_sent_without_scope_keeps_its_scope_and_only_an_explicit_all_resets_it(self):
+    net, web = self.asset_in(self.tenant_id), self.asset_in(self.tenant_id, WEBAPP)
+    restricted = ok(self, self.plugin.create_engagement(
+      self.actor, self.tenant_id, str(uuid4()), "Restricted", COMPLETE["valid_from"], COMPLETE["valid_until"],
+      COMPLETE["context"], [dict(pick(net), authorized_ports=[[1, 1024]])], []))["engagementId"]
+    draft_id = ok(self, self.plugin.create_engagement_draft(
+      self.actor, self.tenant_id, str(uuid4()), "Replaced", supersedes=restricted))["engagement_draft_id"]
+    kept = ok(self, self.update_child(draft_id, {"assets": [pick(net), pick(web)]}))
+    self.assertEqual([scope_of(entry) for entry in kept["assets"]], [([[1, 1024]], "all"), ("all", "all")])
+    reset = ok(self, self.update_child(draft_id, {"assets": [dict(pick(net), authorized_ports="all"), pick(web)]}))
+    self.assertEqual([scope_of(entry) for entry in reset["assets"]], [("all", "all")] * 2)
+
+  def test_the_scope_is_per_asset_default_all_checked_when_written_and_complete_only_if_valid(self):
     parent = self.tenant_id
     draft = self.child(parent)
-    self.assertEqual((draft["authorized_ports"], draft["authorized_tests"]), ("all", "all"))
-    # A row written before the scope reads "all".
-    row = self.stored_child(draft["engagement_draft_id"])
-    for key in ("authorized_ports", "authorized_tests"):
-      row.pop(key)
-    self.repo.put("engagement_draft", draft["engagement_draft_id"], record=row)
-    read = ok(self, self.plugin.get_engagement_draft(self.actor, draft["engagement_draft_id"]))
-    self.assertEqual((read["authorized_ports"], read["authorized_tests"]), ("all", "all"))
-    edited = ok(self, self.update_child(draft["engagement_draft_id"], {"authorized_ports": [[20, 30], [1, 25]]}))
-    self.assertEqual(edited["authorized_ports"], [[1, 30]])
-    refused(self, self.update_child(draft["engagement_draft_id"], {"authorized_ports": []}), 400, "authorized_ports_invalid")
-    refused(self, self.update_child(draft["engagement_draft_id"], {"authorized_tests": []}), 400, "authorized_tests_invalid")
-    # With a network asset held, a webapp-only id is refused on write; a later asset change shows in completeness.
-    self.fill(draft["engagement_draft_id"])
-    refused(self, self.update_child(draft["engagement_draft_id"], {"authorized_tests": ["graybox"]}),
-            400, "authorized_tests_unknown")
-    ok(self, self.update_child(draft["engagement_draft_id"], {"authorized_tests": ["web_discovery"]}))
-    other = ok(self, self.update_child(draft["engagement_draft_id"], {"assets": [pick(self.asset_in(parent, WEBAPP))]}))
-    self.assertEqual(other["completeness"]["reasons"], {"authorized_tests": "authorized_tests_unknown"})
+    self.assertNotIn("authorized_ports", draft)
+    draft_id = draft["engagement_draft_id"]
+    filled = self.fill(draft_id)
+    self.assertEqual([scope_of(entry) for entry in filled["assets"]], [("all", "all")])
+    # A row written before the scope has entries without keys: it reads "all" and stays complete.
+    row = self.stored_child(draft_id)
+    for entry in row["assets"]:
+      entry.pop("authorized_ports"), entry.pop("authorized_tests")
+    self.repo.put("engagement_draft", draft_id, record=row)
+    read = ok(self, self.plugin.get_engagement_draft(self.actor, draft_id))
+    self.assertEqual(read["completeness"]["missing"], ["item:engagement_pack"])
+    net = pick(self.asset_in(parent))
+    edited = ok(self, self.update_child(draft_id, {"assets": [dict(net, authorized_ports=[[20, 30], [1, 25]])]}))
+    self.assertEqual(scope_of(edited["assets"][0]), ([[1, 30]], "all"))
+    for scope, code in (({"authorized_ports": []}, "authorized_ports_invalid"),
+                        ({"authorized_tests": []}, "authorized_tests_invalid"),
+                        ({"authorized_tests": ["graybox_injection"]}, "authorized_tests_unknown")):
+      refused(self, self.update_child(draft_id, {"assets": [dict(net, **scope)]}), 400, code)
+    self.assertEqual(self.stored_child(draft_id)["assets"], edited["assets"])
+    # A scope the kind no longer knows (the catalogue changed) shows in completeness.
+    row = self.stored_child(draft_id)
+    row["assets"][0]["authorized_tests"] = ["retired_test_id"]
+    self.repo.put("engagement_draft", draft_id, record=row)
+    other = ok(self, self.plugin.get_engagement_draft(self.actor, draft_id))
+    self.assertEqual(other["completeness"]["reasons"], {"assets": "authorized_tests_unknown"})
 
   def test_the_pack_prints_the_scope_and_a_later_scope_change_makes_it_stale(self):
-    # RM-251, as RM-252's nodes: the snapshot's scope must be the draft's, and the pack is stale once it moves.
-    draft_id = self.child(self.tenant_id)["engagement_draft_id"]
+    # RM-251, RM-277, as RM-252's nodes: the snapshot's scope by asset must be the draft's, and the pack is stale once it moves.
+    parent = self.tenant_id
+    draft_id = self.child(parent)["engagement_draft_id"]
     self.fill(draft_id)
+    net = self.asset_in(parent)
+    narrowed = [{"assetId": net, "authorizedPorts": [[1, 80]]}]
     stale = lambda: "item:engagement_pack_stale" in ok(
       self, self.plugin.get_engagement_draft(self.actor, draft_id))["completeness"]["missing"]
-    refused(self, self.generate_pack_raw(draft_id, self.pack_snapshot(draft_id, authorizedPorts=[[1, 80]])),
-            409, "draft_changed")
+    for printed in (narrowed, [{"assetId": net, "authorizedTests": ["web_discovery"]}],
+                    [{"assetId": "ta_" + str(uuid4())}], [], None):
+      refused(self, self.generate_pack_raw(draft_id, self.pack_snapshot(draft_id, assets=printed)), 409, "draft_changed")
     self.assertIsNone(self.stored_child(draft_id)["document"]["generated"])
     # The authorization refuses on its own, before any file is stored.
     ask = lambda **extra: self.plugin._call_tenant_administration(
       "authorize_generated_document", self.actor, draft_id=None, engagement_draft_id=draft_id,
       document_kind="engagement_pack", snapshot=self.pack_snapshot(draft_id, **extra), generated_at=GENERATED_AT,
       tenant_id=None, contract_id=None)
-    refused(self, ask(authorizedTests=["web_discovery"]), 409, "draft_changed")
-    self.assertEqual(ok(self, ask())["scope"], ["all", "all"])
+    refused(self, ask(assets=narrowed), 409, "draft_changed")
+    self.assertEqual(ok(self, ask())["scope"], {net: ["all", "all"]})
     # The scope moves between the authorization and the attach: refused under the lock, nothing written.
     from extensions.business.cybersec.red_mesh.tenancy.administration import TenantAdministrationService
     real = TenantAdministrationService._pack_snapshot
@@ -1052,27 +1125,27 @@ class TestEngagementReplacement(_EngagementDraftCase):
     def moved(service, row, snapshot):
       answer = real(service, row, snapshot)
       changed = self.stored_child(draft_id)
-      changed["authorized_ports"] = [[1, 80]]
+      changed["assets"][0]["authorized_ports"] = [[1, 80]]
       self.repo.put("engagement_draft", draft_id, record=changed)
       return answer
     with patch.object(TenantAdministrationService, "_pack_snapshot", autospec=True, side_effect=moved):
       refused(self, self.generate_pack_raw(draft_id, self.pack_snapshot(draft_id)), 409, "draft_changed")
     self.assertIsNone(self.stored_child(draft_id)["document"]["generated"])
-    ok(self, self.update_child(draft_id, {"authorized_ports": "all"}))
+    ok(self, self.update_child(draft_id, {"assets": [dict(pick(net), authorized_ports="all")]}))
     self.generate_pack(draft_id)
-    self.assertEqual(self.stored_child(draft_id)["pack_scope"], ["all", "all"])
+    self.assertEqual(self.stored_child(draft_id)["pack_scope"], {net: ["all", "all"]})
     self.assertFalse(stale())
-    ok(self, self.update_child(draft_id, {"authorized_ports": [[1, 80]]}))
+    ok(self, self.update_child(draft_id, {"assets": [dict(pick(net), authorized_ports=[[1, 80]])]}))
     self.assertTrue(stale())
-    self.generate_pack(draft_id, snapshot=self.pack_snapshot(draft_id, authorizedPorts=[[1, 80]], authorizedTests="all"))
+    self.generate_pack(draft_id, snapshot=self.pack_snapshot(draft_id, assets=narrowed))
     self.assertFalse(stale())
     # A pack stored before the scope has no `pack_scope` and printed "all": stale only once a restriction is set.
     row = self.stored_child(draft_id)
     del row["pack_scope"]
-    row["authorized_ports"] = "all"
+    row["assets"][0]["authorized_ports"] = "all"
     self.repo.put("engagement_draft", draft_id, record=row)
     self.assertFalse(stale())
-    ok(self, self.update_child(draft_id, {"authorized_tests": ["web_discovery"]}))
+    ok(self, self.update_child(draft_id, {"assets": [dict(pick(net), authorized_tests=["web_discovery"])]}))
     self.assertTrue(stale())
     # A pack from before RM-252 stores no contract, nodes or scope: a restricted scope still makes it stale.
     row = self.stored_child(draft_id)

@@ -93,7 +93,8 @@ class CstoreTenantAdministrationStore:
         raise TenantStoreError("Invalid tenant draft storage record") from exc
     if kind == "engagement_draft":
       try:
-        validate_engagement_draft(raw, ids)
+        # RM-277: answers the row with an RM-251 engagement-level scope derived onto its assets.
+        raw = validate_engagement_draft(raw, ids)
       except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
         raise TenantStoreError("Invalid engagement draft storage record") from exc
     if kind == "tenant_asset":

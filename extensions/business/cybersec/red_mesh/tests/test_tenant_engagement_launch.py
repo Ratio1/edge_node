@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from extensions.business.cybersec.red_mesh.tenancy.administration import AdministrationDenied, TenantStoreError
 
+from .asset_fixture import pick, register_asset
 from .contract_fixture import CONTRACT_PDF, CONTRACT_SHA256, LEGAL
 
 from . import test_tenant_engagements as engagements
@@ -109,6 +110,55 @@ class TestTenantEngagementLaunch(unittest.TestCase):
     # A context without the key (a caller that predates RM-131) still builds; the launch reads it as prod.
     value.pop("asset_environment")
     ResolvedExecutionContext(value)
+
+  def test_admission_carries_the_scope_of_the_asset_it_targets_and_the_gate_holds_each_launch_to_it(self):
+    # RM-277: two network assets of one engagement, each launch held to its own ports and tests.
+    from unittest.mock import MagicMock
+    from extensions.business.cybersec.red_mesh.services.launch_api import _launch_scope_error
+    second = register_asset(self.service, self.actor, self.tenant, {"kind": "network", "address": "192.0.2.11"}, "Second host")
+    created = self.create(request_id=str(uuid4()), assets=[
+      dict(pick(self.net), authorized_ports=[[443, 443]]),
+      dict(pick(second), authorized_ports=[[1, 1024]], authorized_tests=["web_discovery"]),
+      dict(pick(self.web), authorized_tests=["graybox_injection"])])["data"]
+    facts = {asset: self.admit(asset=asset, engagement_id=created["engagementId"]).to_dict()["engagement"]
+             for asset in ("ea_1", "ea_2", "ea_3")}
+    self.assertEqual([(facts[asset]["authorized_ports"], facts[asset]["authorized_tests"]) for asset in facts],
+                     [([[443, 443]], "all"), ([[1, 1024]], ["web_discovery"]), ("all", ["graybox_injection"])])
+    def gate(asset, port):
+      context = self.admit(asset=asset, engagement_id=created["engagementId"])
+      return _launch_scope_error(MagicMock(), context, facts[asset], scan_type="network", target="x",
+                                 start_port=port, end_port=port, exceptions=[], comparison_ports=None,
+                                 enabled_features=[])
+    # Port 80 is inside the second host's range and outside the first host's; port 443 the other way round.
+    self.assertEqual((gate("ea_1", 80)["ports"], gate("ea_2", 80)), ([[80, 80]], None))
+    self.assertEqual((gate("ea_1", 443), gate("ea_2", 443)), (None, None))
+    self.assertEqual(gate("ea_2", 2000)["ports"], [[2000, 2000]])
+
+  def test_an_rm251_engagement_keeps_launching_with_its_scope_derived_per_asset(self):
+    # RM-277: a row 2.10.810 wrote (the pair on the engagement, hash `/5`) reads as before and is gated per asset.
+    from unittest.mock import MagicMock
+    from extensions.business.cybersec.red_mesh.services.launch_api import _launch_scope_error
+    from extensions.business.cybersec.red_mesh.tenancy.engagements import engagement_hash, feature_ids_for_kind
+    def legacy(ports, tests):
+      row = self.store.get("engagement", self.tenant, self.engagement["engagementId"])
+      row = {**row, "assets": [{key: value for key, value in entry.items() if not key.startswith("authorized_")}
+                               for entry in row["assets"]], "authorized_ports": ports, "authorized_tests": tests}
+      row["engagement_hash"] = engagement_hash(row)
+      self.store.put("engagement", self.tenant, row["engagement_id"], record=row)
+      return row["engagement_hash"]
+    legacy([[1, 1024]], ["graybox", "web_discovery"])
+    facts = lambda asset: self.admit(asset=asset).to_dict()["engagement"]
+    self.assertEqual([(facts(asset)["authorized_ports"], facts(asset)["authorized_tests"]) for asset in ("ea_1", "ea_2", "ea_3")],
+                     [([[1, 1024]], ["web_discovery"]), ("all", sorted(feature_ids_for_kind("webapp"))), ("all", [])])
+    gate = lambda asset, port: _launch_scope_error(
+      MagicMock(), self.admit(asset=asset), facts(asset), scan_type="network", target="x", start_port=port,
+      end_port=port, exceptions=[], comparison_ports=None, enabled_features=[])
+    self.assertEqual((gate("ea_1", 80), gate("ea_1", 2000)["ports"]), (None, [[2000, 2000]]))
+    # A restricted list with no id for the asset's kind refuses its launch.
+    legacy("all", ["graybox"])
+    refused_kind = gate("ea_1", 80)
+    self.assertEqual(refused_kind["error"], "scope_exceeded")
+    self.assertEqual(refused_kind["tests"], sorted(feature_ids_for_kind("network"))[:20])
 
   def test_a_model_asset_is_admitted_with_its_question_sets(self):
     context = self.admit(asset="ea_3").to_dict()
