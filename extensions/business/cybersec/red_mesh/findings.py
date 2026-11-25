@@ -195,6 +195,11 @@ class Finding:
   confidence_reason: str = ""
   vulndb_build_id: str | None = None
   cvss: tuple = ()
+  # RM-263, probe CVE findings: the service the CVE view files the finding under. `cve_db.probe_cve_fields` sets
+  # `product` when the database names exactly one product for the CVE; `version` is reserved and stays empty (no probe
+  # reports one yet). Not content fields: they do not move `finding_signature`.
+  product: str = ""
+  version: str = ""
 
   # Metadata
   ai_generated: bool = False             # P12 invariant — must stay False for finding data
@@ -625,7 +630,7 @@ def _finding_to_jsonable(f: Finding) -> dict:
     if isinstance(d.get(k), tuple):
       d[k] = list(d[k])
   # Absent unless set, so a finding with no CVE keeps its shape (report-findings.md, Per-finding fields).
-  for k in ("confidence_reason", "vulndb_build_id", "cvss"):
+  for k in ("confidence_reason", "vulndb_build_id", "cvss", "product", "version"):
     if not d.get(k):
       d.pop(k, None)
   return d

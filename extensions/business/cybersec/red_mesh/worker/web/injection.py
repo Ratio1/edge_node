@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from urllib.parse import quote
 
 from ...findings import Evidence, Finding, Severity, probe_result, probe_error
-from ...cve_db import probe_cve_fields
+from ...cve_db import HINT_SPRING_FRAMEWORK, HINT_STRUTS2, probe_cve_fields
 from ..response_fingerprint import sanitize_excerpt
 from ... import cvss_vectors as V
 from ..probe_registry import register_probe, CATEGORY_WEB_TEST
@@ -875,7 +875,7 @@ class _WebInjectionMixin(_InjectionTestBase):
             severity=Severity.CRITICAL,
             title=f"CVE-2017-5638: Struts2 S2-045 OGNL injection RCE via {path}",
             cve=("CVE-2017-5638",),
-            **probe_cve_fields("CVE-2017-5638"),
+            **probe_cve_fields("CVE-2017-5638", product_hint=HINT_STRUTS2),
             description="Apache Struts2 evaluates OGNL expressions injected via "
                         "the Content-Type header, enabling unauthenticated RCE.",
             evidence=f"GET {url} with OGNL payload in Content-Type "
@@ -1230,7 +1230,7 @@ class _WebInjectionMixin(_InjectionTestBase):
             cvss_vector=V.RCE_UNCONFIRMED,
             title="Spring4Shell (CVE-2022-22965) parameter binding indicator",
             cve=("CVE-2022-22965",),
-            **probe_cve_fields("CVE-2022-22965"),
+            **probe_cve_fields("CVE-2022-22965", product_hint=HINT_SPRING_FRAMEWORK),
             description="Spring MVC processes class.module.classLoader parameter "
                         "binding (type error on URLs[0] vs ignored control), "
                         "confirming Spring4Shell attack surface.",
@@ -1258,7 +1258,7 @@ class _WebInjectionMixin(_InjectionTestBase):
             cvss_vector=V.RCE_UNCONFIRMED,
             title="Spring4Shell (CVE-2022-22965) parameter binding indicator",
             cve=("CVE-2022-22965",),
-            **probe_cve_fields("CVE-2022-22965"),
+            **probe_cve_fields("CVE-2022-22965", product_hint=HINT_SPRING_FRAMEWORK),
             description="Spring MVC accepts class.module.classLoader parameter "
                         "binding, which is the attack surface for Spring4Shell RCE.",
             evidence=f"GET with class.module.classLoader parameter → 200, "
@@ -1276,7 +1276,7 @@ class _WebInjectionMixin(_InjectionTestBase):
             cvss_vector=V.RCE_UNCONFIRMED,
             title="Spring4Shell (CVE-2022-22965) parameter binding indicator",
             cve=("CVE-2022-22965",),
-            **probe_cve_fields("CVE-2022-22965"),
+            **probe_cve_fields("CVE-2022-22965", product_hint=HINT_SPRING_FRAMEWORK),
             description="Spring MVC processes class.module.classLoader parameter "
                         "binding (type error on URLs[0]), confirming Spring4Shell "
                         "attack surface.",
