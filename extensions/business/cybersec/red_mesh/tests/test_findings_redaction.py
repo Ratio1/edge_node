@@ -368,6 +368,7 @@ class TestScrubNamedSecretShapes(unittest.TestCase):
     ("aws_secret_access_key", "aws_secret_access_key=SECRET", "SECRET"),
     ("passphrase", "passphrase: SECRET", "SECRET"),
     ("trailing_backslash_unclosed", 'password="SECRET\\', "SECRET"),
+    ("escaped_newline_in_quote", 'password="SEC\\\nRET"', "RET"),
   )
   UNCHANGED = (
     "username=admin",

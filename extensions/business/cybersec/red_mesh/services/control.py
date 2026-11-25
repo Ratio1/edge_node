@@ -362,11 +362,14 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
       if success:
         deleted += 1
         done.add(cid)
-        _save_progress()
         # Irreversible. A later raise must not reach the caller as "nothing happened".
         if ledger is not None:
           ledger.record(EffectState.DELIVERED)
         owner.P(f"[PURGE] Deleted CID {cid}")
+        try:
+          _save_progress()
+        except Exception as e:
+          owner.P(f"[PURGE] Could not record progress after deleting {cid}: {e}", color='r')
       else:
         failed += 1
         owner.P(f"[PURGE] delete_file returned False for CID {cid}", color='r')
@@ -491,13 +494,15 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
       return 0, len(job_submission_cids)
   cids.update(job_submission_cids - shared_submission_cids)
   progress_hkey = f"{owner.cfg_instance_id}:purge_progress"
+  recorded, keep_progress = set(), False
   try:
     stored = owner.chainstore_hget(hkey=progress_hkey, key=job_id)
   except Exception:
-    stored = None
+    stored, keep_progress = None, True
   if isinstance(stored, dict):  # children of parents an earlier purge already deleted (RM-273)
     gone = set(stored.get("deleted") or ())
-    cids.update(c for c in stored.get("cids") or () if isinstance(c, str) and c not in gone)
+    recorded = {c for c in stored.get("cids") or () if isinstance(c, str) and c not in gone}
+    cids.update(recorded)
   cids.difference_update(shared_submission_cids)
   cids = sorted(cids)
   cids_deleted = 0
@@ -518,11 +523,13 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
         owner.P(f"[PURGE_ALL_FORCE] Deleted CID {cid} for {job_id}")
       else:
         cids_failed += 1
+        keep_progress = keep_progress or cid in recorded
         if cid in job_submission_cids:
           failed_submission_cids.add(cid)
         owner.P(f"[PURGE_ALL_FORCE] delete returned False for CID {cid} ({job_id})", color='y')
     except Exception as exc:
       cids_failed += 1
+      keep_progress = keep_progress or cid in recorded
       if cid in job_submission_cids:
         failed_submission_cids.add(cid)
       owner.P(f"[PURGE_ALL_FORCE] Failed to delete CID {cid} ({job_id}): {exc}", color='r')
@@ -560,7 +567,9 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
         except Exception as exc:
           errors.append({"job_id": job_id, "scope": hkey, "message": type(exc).__name__})
 
-  for hkey in (cfg_instance_id, progress_hkey):
+  # The progress row is the only pointer to a recorded child whose parent is gone: keep it until those
+  # children are deleted, so a later purge-all can retry them.
+  for hkey in (cfg_instance_id,) if keep_progress else (cfg_instance_id, progress_hkey):
     try:
       owner.chainstore_hset(hkey=hkey, key=job_id, value=None)
     except Exception as exc:

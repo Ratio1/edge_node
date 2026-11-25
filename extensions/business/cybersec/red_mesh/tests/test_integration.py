@@ -2033,6 +2033,7 @@ class TestPurgeAllJobs(unittest.TestCase):
       integrations=integrations,
     )
     plugin._hashes["test-instance:auth"] = {"user-1": {"role": "admin"}}
+    plugin._hashes["test-instance:purge_progress"] = {"orphan-job": {"cids": ["cid-x"], "deleted": []}}
 
     def _fake_purge(job_id):
       plugin._hashes["test-instance"].pop(job_id, None)
@@ -2059,6 +2060,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     self.assertEqual(plugin._hashes["test-instance:triage"], {})
     self.assertEqual(plugin._hashes["test-instance:triage:audit"], {})
     self.assertEqual(plugin._hashes["test-instance:integrations"], {})
+    self.assertEqual(plugin._hashes["test-instance:purge_progress"], {})
     self.assertEqual(plugin._hashes["test-instance:auth"], {"user-1": {"role": "admin"}})
 
     plugin._log_audit_event.assert_called_once()
@@ -2429,6 +2431,20 @@ class TestPurgeAllJobs(unittest.TestCase):
 
     self.assertEqual({call.args[0] for call in plugin.r1fs.delete_file.call_args_list}, {"cid-child"})
     self.assertEqual(progress, {})
+
+  def test_force_purge_keeps_purge_progress_when_a_recorded_child_fails(self):
+    from extensions.business.cybersec.red_mesh.services.control import _force_purge_job
+
+    jobs = {"job-bad": {"job_id": "job-bad", "job_status": "legacy"}}
+    plugin = self._make_plugin(jobs)
+    plugin._hashes["test-instance:purge_progress"] = {"job-bad": {"cids": ["cid-child"], "deleted": []}}
+    plugin.chainstore_hget.side_effect = lambda *, hkey, key: plugin._hashes.get(hkey, {}).get(key)
+    plugin.r1fs = MagicMock()
+    plugin.r1fs.delete_file.return_value = False
+
+    _force_purge_job(plugin, "job-bad", jobs["job-bad"], [])
+
+    self.assertIn("job-bad", plugin._hashes["test-instance:purge_progress"])
 
   def test_force_purge_clears_rows_after_relay_acknowledges_formal_cid_delete(self):
     Plugin = self._get_plugin_class()
