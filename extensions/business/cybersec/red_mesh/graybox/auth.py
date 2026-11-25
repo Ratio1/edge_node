@@ -17,12 +17,14 @@ subphases route to `BearerAuth` / `ApiKeyAuth` based on
 
 import re
 import time
+from urllib.parse import urljoin, urlparse
 
 import requests
 
 from ..constants import GRAYBOX_SESSION_MAX_AGE
 from .auth_credentials import Credentials
 from .auth_strategies import ApiKeyAuth, BearerAuth, FormAuth
+from .http_client import GrayboxScopeError, normalize_request_url
 from .models.target_config import COMMON_CSRF_FIELDS
 from .models import GrayboxAuthState
 
@@ -128,7 +130,10 @@ class AuthManager:
       if not valid and not retryable and last_stage in (
           "authenticated_probe_redirect", "authenticated_probe_rejected",
           "authenticated_probe_marker_missing",
-          "authenticated_probe_identity_missing"):
+          "authenticated_probe_identity_missing",
+          # Proven at login, public now: a logout that kept the cookie and
+          # redirects the check path to a public page (form one-hop rule).
+          "authenticated_probe_public_control"):
         return True
     return False
 
@@ -545,7 +550,7 @@ class AuthManager:
       return None
 
   def _validate_authenticated_session(self, session) -> tuple[bool, bool]:
-    """Validate token/key sessions after credentials have been attached.
+    """Validate an authenticated session after credentials have been attached.
 
     Tightened in B2 (PR406 remediation): we no longer follow redirects
     or accept any <400 status, since an invalid bearer token frequently
@@ -562,6 +567,14 @@ class AuthManager:
          assertion (marker present in authenticated body but missing
          from anonymous; identity path non-empty when authenticated and
          empty/missing when anonymous).
+
+    Redirects: bearer / api_key sessions reject every 3xx (a 302 means the
+    token is bad). A form (cookie) session may legitimately be redirected,
+    e.g. Django ``APPEND_SLASH`` 301s ``/dashboard`` to ``/dashboard/``. For
+    form auth a 3xx whose ``Location`` is in scope and is not the login path
+    is followed for exactly one hop, and the destination is evaluated with the
+    rules above (the anonymous control then targets the destination). A
+    missing, off-origin or login-path ``Location`` is rejected as before.
     """
     # Form auth used to short-circuit here and return success unverified, so
     # the anonymous-control-delta check below — the only thing that actually
@@ -584,6 +597,28 @@ class AuthManager:
       )
       return False, True
     status = getattr(resp, "status_code", None)
+    if (status is not None and 300 <= status < 400
+        and self._resolve_auth_type() == "form"):
+      hop_url = self._form_redirect_hop_url(resp, probe_url)
+      if hop_url:
+        # 301/302/303 become GET (HEAD stays HEAD), as the client's own
+        # redirect loop and browsers do; only 307/308 keep the method. The
+        # anonymous control below then uses the hop's method too.
+        if status in (301, 302, 303) and method != "head":
+          method = "get"
+          req = session.get
+        try:
+          resp = req(hop_url, timeout=10, allow_redirects=False)
+        except GrayboxScopeError:
+          self._record_auth_diagnostic("authenticated_probe_redirect", resp)
+          return False, False
+        except requests.RequestException:
+          self._record_auth_diagnostic(
+            "authenticated_probe_transport", error="transport_error",
+          )
+          return False, True
+        probe_url = hop_url
+        status = getattr(resp, "status_code", None)
     if status is None:
       self._record_auth_diagnostic("authenticated_probe_missing_status", resp)
       return False, False
@@ -647,6 +682,30 @@ class AuthManager:
       if anon_value:
         return False, False
     return True, False
+
+  def _form_redirect_hop_url(self, resp, probe_url: str) -> str:
+    """Absolute URL of the one hop to follow for a form-auth 3xx, or "".
+
+    Empty means reject: no ``Location``, an unparsable one, a different
+    origin than the target (the client's own origin rule), or a destination
+    on the configured login or logout path (query ignored; following a
+    logout hop would end the session it is checking).
+    """
+    headers = getattr(resp, "headers", None) or {}
+    location = headers.get("Location") or headers.get("location") or ""
+    if not isinstance(location, str) or not location.strip():
+      return ""
+    try:
+      dest = normalize_request_url(
+        self.target_url, urljoin(probe_url, location.strip()))
+    except (GrayboxScopeError, ValueError):
+      return ""
+    dest_path = urlparse(dest).path.rstrip("/")
+    for attr in ("login_path", "logout_path"):
+      path = getattr(self.target_config, attr, "") or ""
+      if path and dest_path == urlparse(self.target_url + path).path.rstrip("/"):
+        return ""
+    return dest
 
   @staticmethod
   def _read_response_body(resp) -> str:

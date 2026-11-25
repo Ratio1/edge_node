@@ -274,14 +274,12 @@ class FormAuth(AuthStrategy):
     navigated_away = bool(response.history) and login_url not in (response.url or "")
     if not navigated_away and _LOGIN_FORM_RE.search(response.text or ""):
       return False
-    has_cookies = bool(session.cookies.get_dict())
-    if response.url and "login" not in response.url.lower():
-      if has_cookies:
-        return True
-    if response.history and login_url not in response.url:
-      if has_cookies:
-        return True
-    return has_cookies
+    # Cookie presence is a necessary condition for a cookie session, not
+    # evidence of authentication: the login page itself sets one. The evidence
+    # is the failure-marker / JSON / password-form checks above; the proof is
+    # the authenticated probe path check in
+    # `AuthManager._validate_authenticated_session` when one is configured.
+    return bool(session.cookies.get_dict())
 
   def _extract_csrf(self, html):
     """Return ``(field_name, token_value)`` or ``(None, None)``.
