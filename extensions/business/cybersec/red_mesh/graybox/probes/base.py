@@ -10,6 +10,7 @@ import requests
 
 from ..findings import (
   GrayboxEvidenceArtifact,
+  evidence_content_sha256,
   GrayboxFinding,
   location_from_evidence as _location_from_evidence,
 )
@@ -120,7 +121,6 @@ def _artifact_from_response(response, scrub):
   through the caller's scrubber before anything is retained: an artifact must
   not become a new route for archiving what the scrubber removes elsewhere.
   """
-  import hashlib
   from datetime import datetime, timezone
 
   if response is None:
@@ -160,9 +160,7 @@ def _artifact_from_response(response, scrub):
       latency_ms = 0
 
   # Hashed after scrubbing, so the digest describes what is actually retained.
-  digest = hashlib.sha256(
-    (request_snapshot + "\x00" + response_snapshot).encode("utf-8", "replace")
-  ).hexdigest()
+  digest = evidence_content_sha256(request_snapshot, response_snapshot)
 
   return GrayboxEvidenceArtifact(
     summary=f"{method} {url} -> HTTP {status}"[:_SNAPSHOT_MAX_CHARS],

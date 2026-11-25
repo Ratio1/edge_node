@@ -199,6 +199,7 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
       return {"status": "error", "message": "Cannot purge a running job. Stop it first."}
 
   cids = set()
+  evidence_cids = set()
 
   def _track(cid, source):
     if cid and isinstance(cid, str) and cid not in cids:
@@ -224,6 +225,7 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
           for addr, wr in (pass_data.get("worker_reports") or {}).items():
             if isinstance(wr, dict):
               _track(wr.get("report_cid"), f"archive.passes[{pi}].worker_reports[{addr}].report_cid")
+              evidence_cids.update(_graybox_evidence_cids(artifacts, wr.get("report_cid")))
       else:
         owner.P(f"[PURGE] Archive fetch returned non-dict: {type(archive)}", color='y')
     except Exception as e:
@@ -231,6 +233,7 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
 
   for addr, w in workers.items():
     _track(w.get("report_cid"), f"workers[{addr}].report_cid")
+    evidence_cids.update(_graybox_evidence_cids(artifacts, w.get("report_cid")))
 
   rulebook_assessments = job_specs.get("rulebook_assessments")
   if isinstance(rulebook_assessments, dict):
@@ -296,10 +299,14 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
           for addr, wr in (pass_data.get("worker_reports") or {}).items():
             if isinstance(wr, dict):
               _track(wr.get("report_cid"), f"pass_reports[{ri}]->worker_reports[{addr}].report_cid")
+              evidence_cids.update(_graybox_evidence_cids(artifacts, wr.get("report_cid")))
         else:
           owner.P(f"[PURGE] Pass report fetch returned non-dict: {type(pass_data)}", color='y')
       except Exception as e:
         owner.P(f"[PURGE] Failed to fetch pass report {report_cid}: {e}", color='r')
+
+  for evidence_cid in sorted(_unshared_evidence_cids(owner, artifacts, job_id, evidence_cids)):
+    _track(evidence_cid, "graybox evidence raw_evidence_cid")
 
   owner.P(f"[PURGE] Total CIDs collected: {len(cids)}: {sorted(cids)}")
 
@@ -355,6 +362,73 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
   owner._log_audit_event("job_purged", {"job_id": job_id, "cids_deleted": deleted, "cids_total": len(cids)})
 
   return {"status": "success", "job_id": job_id, "cids_deleted": deleted, "cids_total": len(cids)}
+
+
+def _graybox_evidence_cids(artifacts, report_cid, strict=False):
+  """CIDs of the graybox evidence blobs a worker report's findings point at.
+
+  ``strict`` (shared-CID guard): an unreadable report raises instead of reading
+  as "no evidence", so the purge keeps the evidence rather than guessing.
+  """
+  found = set()
+  if not report_cid or not isinstance(report_cid, str):
+    return found
+  try:
+    report = artifacts.get_json(report_cid)
+  except Exception:
+    if strict:
+      raise
+    return found
+  if strict and report is None:
+    raise LookupError(f"report {report_cid} unreadable")
+  results = report.get("graybox_results") if isinstance(report, dict) else None
+  for probes in (results or {}).values():
+    for probe_data in (probes.values() if isinstance(probes, dict) else ()):
+      for finding in (probe_data.get("findings") if isinstance(probe_data, dict) else None) or ():
+        for artifact in (finding.get("evidence_artifacts") if isinstance(finding, dict) else None) or ():
+          cid = artifact.get("raw_evidence_cid") if isinstance(artifact, dict) else None
+          if isinstance(cid, str) and cid:
+            found.add(cid)
+  return found
+
+
+def _report_cids_in(payload):
+  """Every value under a `report_cid` key in a raw job record."""
+  if isinstance(payload, dict):
+    for key, value in payload.items():
+      if key == "report_cid" and isinstance(value, str) and value:
+        yield value
+      else:
+        yield from _report_cids_in(value)
+  elif isinstance(payload, (list, tuple)):
+    for item in payload:
+      yield from _report_cids_in(item)
+
+
+def _evidence_cids_referenced_elsewhere(owner, artifacts, job_id):
+  """Evidence CIDs another job's worker reports still point at (shared-CID guard).
+
+  Raises when the job registry or a report cannot be read: the caller then
+  keeps the evidence rather than guessing it is unshared.
+  """
+  referenced = set()
+  all_jobs = _job_repo(owner).list_jobs() or {}
+  for other_job_id, other_payload in all_jobs.items():
+    if other_job_id == job_id or not isinstance(other_payload, dict):
+      continue
+    for report_cid in _report_cids_in(other_payload):
+      referenced |= _graybox_evidence_cids(artifacts, report_cid, strict=True)
+  return referenced
+
+
+def _unshared_evidence_cids(owner, artifacts, job_id, evidence_cids):
+  if not evidence_cids:
+    return set()
+  try:
+    return set(evidence_cids) - _evidence_cids_referenced_elsewhere(owner, artifacts, job_id)
+  except Exception as exc:
+    owner.P(f"[PURGE] Could not check shared evidence CIDs for {job_id}: {exc}; keeping them.", color='r')
+    return set()
 
 
 def _collect_cids_from_raw(payload, skip=()):
@@ -442,6 +516,11 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
       return 0, len(job_submission_cids)
   cids.update(job_submission_cids - shared_submission_cids)
   cids.difference_update(shared_submission_cids)
+  force_artifacts = _artifact_repo(owner)
+  force_evidence = set()
+  for report_cid in _report_cids_in(raw_payload):
+    force_evidence |= _graybox_evidence_cids(force_artifacts, report_cid)
+  cids.update(_unshared_evidence_cids(owner, force_artifacts, job_id, force_evidence))
   cids = sorted(cids)
   cids_deleted = 0
   cids_failed = len(shared_submission_cids)

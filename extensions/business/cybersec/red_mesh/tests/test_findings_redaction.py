@@ -592,3 +592,37 @@ class TestScrubUnderscoreAndCompoundKeys(unittest.TestCase):
       scrub_graybox_secrets(text)
       scrub_graybox_secrets(text + "token=abc123")
       self.assertLess(time.monotonic() - start, 0.5, chunk)
+
+
+class TestScrubLoginAndSessionForms(unittest.TestCase):
+  """RM-060 Phase F: a captured login request/response carries these forms."""
+
+  CASES = (
+    ("pass=hunter2x&u=1", "hunter2x"),
+    ("pwd=hunter2x&u=1", "hunter2x"),
+    ("passwd=hunter2x&u=1", "hunter2x"),
+    ("csrfmiddlewaretoken=AbCdEf123456&u=1", "AbCdEf123456"),
+    ("authenticity_token=AbCdEf123456&u=1", "AbCdEf123456"),
+    ("GET /a;jsessionid=ABCDEF123456?x=1", "ABCDEF123456"),
+    ("GET /a?PHPSESSID=ABCDEF123456&x=1", "ABCDEF123456"),
+    ("GET /a?sid=ABCDEF123456&x=1", "ABCDEF123456"),
+    ("GET /a?session=ABCDEF123456&x=1", "ABCDEF123456"),
+    ("X-CSRF-Token: ABCDEF123456", "ABCDEF123456"),
+    ("X-Auth-Token: ABCDEF123456", "ABCDEF123456"),
+    ("X-Api-Key: ABCDEF123456", "ABCDEF123456"),
+    ('{"session_id": "ABCDEF123456"}', "ABCDEF123456"),
+  )
+
+  def test_each_form_is_scrubbed(self):
+    for text, secret in self.CASES:
+      with self.subTest(text=text):
+        self.assertNotIn(secret, scrub_graybox_secrets(text))
+
+  def test_new_patterns_keep_linear_time(self):
+    import time
+    for chunk in ("x_", "a-", "pass", "sid"):
+      text = chunk * 100_000
+      start = time.monotonic()
+      scrub_graybox_secrets(text)
+      scrub_graybox_secrets(text + "sid=abc123456")
+      self.assertLess(time.monotonic() - start, 0.5, chunk)

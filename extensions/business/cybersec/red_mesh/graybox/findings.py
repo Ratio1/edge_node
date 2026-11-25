@@ -230,6 +230,21 @@ _SCRUB_PATTERNS = (
               r"(?:password|secret|token|api[_-]?key))=" + _ALREADY_REDACTED
               + r"([^&\s\";,]+)"),
    r"\1=<redacted>"),
+  # Login-form and session forms a captured request/response carries. Names
+  # are literal alternations behind `(?<![\w-])`, with a bounded value class, so
+  # each match stays linear.
+  (re.compile(r"(?i)(?<![\w-])(pass|pwd|passwd|csrfmiddlewaretoken|authenticity_token"
+              r"|phpsessid|jsessionid|sid|session)=" + _ALREADY_REDACTED
+              + r"([^&\s\";,?]+)"),
+   r"\1=<redacted>"),
+  # `;jsessionid=` path parameter is matched by the rule above (`;` is not a
+  # name character). Headers that carry a token or key by name.
+  (re.compile(r"(?i)\b(x-csrf-token|x-xsrf-token|x-auth-token|x-api-key)\s*:"
+              + _ALREADY_REDACTED + r"\s*[^,\r\n;]+"),
+   r"\1: <redacted>"),
+  # JSON session_id (the generic JSON rule only knows password/secret/token/key).
+  (re.compile(r'(?i)"(session_id|sessionid)"\s*:\s*"[^"]+"'),
+   r'"\1": "<redacted>"'),
   # JSON-style key:value.
   (re.compile(r'(?i)"((?:[\w-]{0,64}?[_-])?(?:password|secret|token|api_key|bearer_token|api[\w_-]*key))"\s*:\s*"[^"]+"'),
    r'"\1": "<redacted>"'),
@@ -459,6 +474,25 @@ class GrayboxEvidenceArtifact:
 
   def to_dict(self) -> dict[str, Any]:
     return asdict(self)
+
+
+def evidence_blob(request_snapshot, response_snapshot) -> dict:
+  """The redacted snapshot pair that is hashed and stored as raw evidence."""
+  return {
+    "request_snapshot": request_snapshot or "",
+    "response_snapshot": response_snapshot or "",
+  }
+
+
+def evidence_content_sha256(request_snapshot, response_snapshot) -> str:
+  """sha256 hex of the canonical JSON of the (already redacted) snapshot pair."""
+  import hashlib
+  import json
+  canonical = json.dumps(
+    evidence_blob(request_snapshot, response_snapshot),
+    sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+  )
+  return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _asset_host(url) -> str:
