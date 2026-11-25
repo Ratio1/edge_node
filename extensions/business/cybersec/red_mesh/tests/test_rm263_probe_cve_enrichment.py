@@ -77,6 +77,12 @@ class ProbeEnrichmentTests(unittest.TestCase):
     self.load()
     self.assertEqual(cve_db.probe_cve_fields("CVE-2030-0001").get("product", ""), "")
 
+  def test_a_probe_hint_picks_one_of_several_products(self):
+    self.load()
+    self.assertEqual(cve_db.probe_cve_fields("CVE-2030-0001", product_hint="multi")["product"], "multi")
+    # A hint the build does not name for the CVE is ignored.
+    self.assertEqual(cve_db.probe_cve_fields("CVE-2030-0001", product_hint="nope").get("product", ""), "")
+
   def test_a_cve_the_build_lacks_gets_no_enrichment(self):
     self.load()
     fields = cve_db.probe_cve_fields("CVE-2099-0001")
