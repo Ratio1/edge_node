@@ -228,7 +228,8 @@ class SqliTests(RouteInjectionBase):
 
     def handler(path, params, url):
       page = real(path, params, url)
-      return resp(page.text + f"<p>you searched {"&".join(f"{k}={v}" for k, v in params.items())}</p>")
+      echoed = "&".join(f"{k}={v}" for k, v in params.items())
+      return resp(page.text + f"<p>you searched {echoed}</p>")
     result = self.run_probe("_web_test_sql_injection", handler)
     (f,) = self.titled(result, "SQL injection")
     self.assertEqual((f["title"], f["confidence"]), ("SQL injection (boolean-based) via ?term=", "firm"))
