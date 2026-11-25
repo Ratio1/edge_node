@@ -217,7 +217,8 @@ class TestStixExport(unittest.TestCase):
     from extensions.business.cybersec.red_mesh.cvss_entries import cvss_entries
     v4 = ("CVSS:4.0/AV:N/AC:H/AT:P/PR:L/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N/AU:N/R:A/V:D/RE:M/U:Red")
     got = cvss_entries({"cvss": [{"version": 4, "vector": v4, "score": 8.1},
-                                 {"version": "4.0", "vector": v4.replace("U:Red", "U:Purple")}]})
+                                 {"version": "4.0", "vector": v4.replace("U:Red", "U:Purple")},
+                                 {"version": "4.0", "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]})
     self.assertEqual([(e["version"], e["vector"]) for e in got], [("4.0", v4)])
 
   def test_every_sdo_carries_the_job_tenant_label(self):

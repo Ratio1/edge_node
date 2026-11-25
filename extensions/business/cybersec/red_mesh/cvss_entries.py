@@ -29,7 +29,8 @@ def cvss_entries(finding: dict) -> list[dict]:
       version = f"{float(version):.1f}"
     version = str(version) if version is not None else ""
     vector = entry.get("vector")
-    if version not in _VERSION_ORDER or not is_cvss_vector(vector) or (version, vector) in seen:
+    if (version not in _VERSION_ORDER or not is_cvss_vector(vector)
+        or not vector.startswith(f"CVSS:{version}/") or (version, vector) in seen):
       continue
     seen.add((version, vector))
     item = {"version": version, "vector": vector}
