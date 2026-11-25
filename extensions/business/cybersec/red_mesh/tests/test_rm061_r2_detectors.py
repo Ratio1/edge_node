@@ -69,6 +69,12 @@ class TestTelnetGate(unittest.TestCase):
       self.assertEqual(len(f), 1, reply)
       self.assertEqual((f[0]["severity"], f[0]["confidence"]), ("MEDIUM", "certain"), reply)
 
+  def test_lone_or_non_command_iac_bytes_are_info_tentative(self):
+    # RM-061 final review: a bare 0xff, or 0xff followed by bytes that are no Telnet command, is not negotiation.
+    for reply in (b"\xff", b"\xff\x00\x00", b"\x00\xff"):
+      f = self._exposed(reply)
+      self.assertEqual([(x["severity"], x["confidence"]) for x in f], [("INFO", "tentative")], reply)
+
   def test_no_bytes_is_info_tentative(self):
     f = self._exposed(b"")
     self.assertEqual(len(f), 1)

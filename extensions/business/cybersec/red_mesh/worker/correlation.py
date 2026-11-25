@@ -61,7 +61,10 @@ HOST_RATIO_MIN_SCANNED = 1000
 
 def _os_mismatch(os_claims):
   """True when the OS claims name more than one OS family."""
-  return len({_normalize_os_family(os_string) for os_string in (os_claims or {}).values()}) > 1 and len(os_claims) >= 2
+  # Only claims the family map knows count: an unmapped string ("Cisco IOS ...") is no evidence of a second OS.
+  known = set(_OS_FAMILY_MAP.values())
+  families = {_normalize_os_family(os_string) for os_string in (os_claims or {}).values()}
+  return len(families & known) > 1
 
 
 def host_honeypot_verdict(report):

@@ -150,7 +150,7 @@ class _WebDiscoveryMixin:
     """The URL that shows `base_url` exposes a git repository, or None (RM-086).
 
     `/.git/HEAD` (a `ref: refs/` line or a 40-hex sha), `/.git/config` (`[core]`), or the `/.git/` listing
-    itself when it names `HEAD` and `refs` or `objects`. A 403 or an HTML page names none of them.
+    itself when it links `HEAD` and `refs/` or `objects/`. A 403 or an HTML page names none of them.
     """
     checks = (
       ("/.git/HEAD", lambda b: b.lstrip().startswith("ref: refs/") or bool(_re.fullmatch(r"[0-9a-f]{40}", b.strip()))),
@@ -164,7 +164,8 @@ class _WebDiscoveryMixin:
       if resp.status_code == 200 and looks_right(resp.text or ""):
         return base_url + path
     body = (listing.text or "") if listing.status_code == 200 else ""
-    if "HEAD" in body and ("refs" in body or "objects" in body):
+    # A directory index links its entries; a page that only mentions the words is not one.
+    if _re.search(r'href="(\./)?HEAD"', body) and _re.search(r'href="(\./)?(refs|objects)/?"', body):
       return base_url + "/.git/"
     return None
 

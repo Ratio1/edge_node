@@ -1926,7 +1926,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     i = 0
     text_parts = []
     while i < len(raw):
-      if raw[i] == 0xFF and i + 2 < len(raw):
+      if raw[i] == 0xFF and i + 2 < len(raw) and 250 <= raw[i + 1] <= 254:  # IAC SB/WILL/WONT/DO/DONT <option>
         cmd = cmd_names.get(raw[i + 1], f"CMD_{raw[i+1]}")
         opt = opt_names.get(raw[i + 2], f"OPT_{raw[i+2]}")
         iac_options.append(f"{cmd} {opt}")
@@ -1945,7 +1945,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       result["banner"] = "(no banner)"
     result["negotiation_options"] = iac_options
 
-    if banner_text or b"\xff" in raw:
+    if banner_text or iac_options:
       findings.append(Finding(
         severity=Severity.MEDIUM,
         cvss_vector=V.WEAK_TRANSPORT,

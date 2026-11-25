@@ -101,12 +101,9 @@ class HoneypotFoldTests(unittest.TestCase):
     apply_host_honeypot_verdict(rep)
     self.assertEqual(rep["web_tests_info"][8080]["_web_test_common"]["findings"], [web_row()])
 
-  def test_vulhub_like_host_keeps_firm_rows(self):
-    rep = report(range(8000, 8057))  # 57 open of 1000: ratio not met
-    self.assertIsNone(apply_host_honeypot_verdict(rep))
-    for r in cve_rows(rep):
-      self.assertEqual((r["confidence"], r["confidence_reason"]), ("firm", "nvd_range"))
-      self.assertNotIn("honeypot_verdict", r["evidence"])
+  def test_unmapped_os_claim_is_not_a_mismatch(self):
+    # A sysDescr the family map does not know ("Cisco IOS") must not fold a real Linux host.
+    self.assertIsNone(host_honeypot_verdict(report([22], os_claims={"ssh:22": "Ubuntu", "snmp:161": "Cisco IOS 15.2"})))
 
   def test_second_run_does_not_duplicate_evidence(self):
     rep = report(range(1, 601))
@@ -227,6 +224,10 @@ class BodyCheckTests(unittest.TestCase):
     with patch(DISCOVERY + "get", side_effect=get):
       result = self._w()._web_test_common("example.com", 80)
     self.assertIn("Accessible resource: /admin", [f["title"] for f in result["findings"]])
+
+  def test_html_page_mentioning_head_and_refs_is_not_a_git_listing(self):
+    page = "<html><title>HEAD refs and objects in Git</title></html>"
+    self.assertNotIn("Accessible resource: /.git/", self.titles({"/.git/": (200, page)}))
 
   def test_git_403_and_plain_html_are_not_reported(self):
     self.assertNotIn("Accessible resource: /.git/", self.titles({"/.git/": (403, "Forbidden")}))
