@@ -222,7 +222,7 @@ class TestAuthenticatedInjection(unittest.TestCase):
 
   def test_authenticated_injection(self):
     """Payload reflected in form → finding."""
-    probe = _make_probe(discovered_forms=["/search/"])
+    probe = _make_probe(discovered_forms=["/search/"], allow_stateful=True)
     session = probe.auth.primary_session
     # GET the form page → has text input
     session.get.return_value = _mock_response(
@@ -236,6 +236,19 @@ class TestAuthenticatedInjection(unittest.TestCase):
     probe._test_authenticated_injection()
     vuln = [f for f in probe.findings if f.scenario_id == "PT-A03-01" and f.status == "vulnerable"]
     self.assertEqual(len(vuln), 1)
+
+  def test_stateful_off_sends_no_post_and_is_inconclusive(self):
+    """Payload POST may write data: without allow_stateful no POST, inconclusive row."""
+    probe = _make_probe(discovered_forms=["/search/"])
+    session = probe.auth.primary_session
+    session.get.return_value = _mock_response(
+      text='<form><input name="q" type="text"></form>',
+    )
+    probe._test_authenticated_injection()
+    session.post.assert_not_called()
+    found = [f for f in probe.findings if f.scenario_id == "PT-A03-01"]
+    self.assertEqual([f.status for f in found], ["inconclusive"])
+    self.assertIn("reason=stateful_probes_disabled", found[0].evidence)
 
   def test_authenticated_injection_no_forms(self):
     """No forms → skip."""
@@ -709,6 +722,7 @@ class TestReachabilityRuleInjection(unittest.TestCase):
   def test_baseline_reached_but_payload_redirected_to_login(self):
     """GET baseline reaches the handler, the payload POST bounces to login."""
     probe = self._probe("absent")
+    probe._allow_stateful = True
     session = probe.auth.primary_session
     session.get = MagicMock(return_value=_ok(
       '<form><input name="title" type="text"></form>'))

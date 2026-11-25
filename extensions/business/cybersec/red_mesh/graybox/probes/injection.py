@@ -148,6 +148,7 @@ class InjectionProbes(ProbeBase):
     tested = 0
     denied = 0
     vulnerable_forms = []
+    stateful_skipped = []
 
     for form_action in self.discovered_forms:
       if form_action == login_path:
@@ -164,9 +165,14 @@ class InjectionProbes(ProbeBase):
       # Such actions often create or delete records, so only with allow_stateful.
       post_only = page.status_code == 405
       if post_only and not self._allow_stateful:
+        stateful_skipped.append(form_action)
         continue
       if not post_only and not self.response_reached(page):
         denied += 1
+        continue
+      # The payload POST may write data to the target: only with allow_stateful.
+      if not self._allow_stateful:
+        stateful_skipped.append(form_action)
         continue
       page_text = "" if post_only else page.text
 
@@ -232,6 +238,17 @@ class InjectionProbes(ProbeBase):
         remediation="Apply input validation and output encoding on all form fields.",
       ))
 
+    if stateful_skipped:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A03-01",
+        title="Authenticated form injection skipped: stateful probes disabled",
+        status="inconclusive",
+        severity="INFO",
+        owasp="A03:2021",
+        evidence=["stateful_probes_disabled=True",
+                  "reason=stateful_probes_disabled",
+                  f"forms_skipped={len(stateful_skipped)}"],
+      ))
     if tested > 0 and not vulnerable_forms:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-01",
