@@ -11,6 +11,7 @@ import math as _math
 import struct as _struct
 
 from ..worker import PentestLocalWorker
+from ..connection_metrics import RESPONSIVE_CONNECTION_OUTCOMES
 from .live_progress import _LiveProgressMixin
 from ..models import UiAggregate
 from ..cve_view import apply_triage, drop_closed, filter_listed
@@ -1027,7 +1028,11 @@ class _ReportMixin:
       # so they must not override "reached" when the node returned results.
       if not has_report and addr not in worker_scan_metrics:
         status = "failed"
-      elif outcomes and outcomes.get("connected", 0) == 0 and outcomes.get("timeout", 0) > 0:
+      elif (
+        outcomes
+        and outcomes.get("timeout", 0) > 0
+        and not any(outcomes.get(k, 0) for k in RESPONSIVE_CONNECTION_OUTCOMES)
+      ):
         status = "timeout"
       else:
         status = "reached"
