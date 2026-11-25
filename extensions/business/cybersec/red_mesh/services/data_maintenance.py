@@ -57,6 +57,7 @@ _PER_JOB = (
   (":triage", dict, True),
   (":triage:audit", list, True),
   (":model_test_raw_evidence", dict, False),
+  (":purge_progress", dict, False),
   (":rulebook_review", dict, True),
   (":rulebook_review:audit", list, True),
   (":rulebook_review:submissions", dict, True),
