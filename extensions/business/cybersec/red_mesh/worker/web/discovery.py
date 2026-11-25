@@ -48,6 +48,14 @@ def web_base_url(target, port):
   return f"{scheme}://{target}:{port}"
 
 
+def _looks_like_dotenv(body):
+  """A dotenv body: `KEY=VALUE` lines (optionally indented or after `export `), and not an HTML page."""
+  head = body.lstrip().lower()
+  if head.startswith("<") or "<html" in head or "<script" in head:
+    return False
+  return bool(_re.search(r"^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_.]*\s*=", body, _re.M))
+
+
 class _WebDiscoveryMixin:
   """
   Enumerate exposed files, admin panels, and homepage secrets (OWASP WSTG-INFO).
@@ -137,6 +145,28 @@ class _WebDiscoveryMixin:
     entry = {"probe": probe, "path": path}
     if entry not in withheld:
       withheld.append(entry)
+
+  def _exposed_git_url(self, base_url, listing):
+    """The URL that shows `base_url` exposes a git repository, or None (RM-086).
+
+    `/.git/HEAD` (a `ref: refs/` line or a 40-hex sha), `/.git/config` (`[core]`), or the `/.git/` listing
+    itself when it names `HEAD` and `refs` or `objects`. A 403 or an HTML page names none of them.
+    """
+    checks = (
+      ("/.git/HEAD", lambda b: b.lstrip().startswith("ref: refs/") or bool(_re.fullmatch(r"[0-9a-f]{40}", b.strip()))),
+      ("/.git/config", lambda b: "[core]" in b),
+    )
+    for path, looks_right in checks:
+      try:
+        resp = requests.get(base_url + path, timeout=self._target_timeout(2), verify=False)
+      except Exception:
+        continue  # a timeout here must not cost the findings already collected
+      if resp.status_code == 200 and looks_right(resp.text or ""):
+        return base_url + path
+    body = (listing.text or "") if listing.status_code == 200 else ""
+    if "HEAD" in body and ("refs" in body or "objects" in body):
+      return base_url + "/.git/"
+    return None
 
   @register_probe(
     display_name="Common admin / debug endpoint discovery",
@@ -254,6 +284,9 @@ class _WebDiscoveryMixin:
       "/wp-login.php": V.INFO_DISCLOSURE_LOW,
     }
 
+    # RM-086: `/.env` reports only when the body is a dotenv file, not an HTML page that happens to answer 200.
+    _PATH_BODY_CHECK = {"/.env": _looks_like_dotenv}
+
     if catch_all:
       # Every check below is a bare 200; on this host that proves nothing, so
       # none is requested and each is recorded as withheld instead.
@@ -265,7 +298,13 @@ class _WebDiscoveryMixin:
       for path, (severity, cwe, owasp, desc) in _PATH_META.items():
         url = base_url + path
         resp = requests.get(url, timeout=self._target_timeout(2), verify=False)
-        if resp.status_code == 200:
+        if path == "/.git/":
+          # The directory URL is an autoindex page or a 403; the repository shows in HEAD and config.
+          url = self._exposed_git_url(base_url, resp)
+          shown = bool(url)
+        else:
+          shown = resp.status_code == 200 and _PATH_BODY_CHECK.get(path, lambda body: True)(resp.text or "")
+        if shown:
           findings_list.append(Finding(
             severity=severity,
             cvss_vector=_PATH_CVSS.get(path, ""),
@@ -792,7 +831,8 @@ class _WebDiscoveryMixin:
     # Check /_ignition/health-check
     try:
       resp = requests.get(base_url + "/_ignition/health-check", timeout=self._target_timeout(3), verify=False)
-      if resp.ok and ("can_execute_commands" in resp.text or "ok" in resp.text.lower()):
+      # RM-086: a bare "ok" is what any health endpoint says; Ignition answers with a JSON object.
+      if resp.ok and "can_execute_commands" in resp.text:
         ignition_detected = True
         laravel_detected = True
         findings_list.append(Finding(
