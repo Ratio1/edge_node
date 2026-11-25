@@ -1101,7 +1101,7 @@ class TestEngagementReplacement(_EngagementDraftCase):
     stale = lambda: "item:engagement_pack_stale" in ok(
       self, self.plugin.get_engagement_draft(self.actor, draft_id))["completeness"]["missing"]
     for printed in (narrowed, [{"assetId": net, "authorizedTests": ["web_discovery"]}],
-                    [{"assetId": "ta_" + str(uuid4())}]):
+                    [{"assetId": "ta_" + str(uuid4())}], []):
       refused(self, self.generate_pack_raw(draft_id, self.pack_snapshot(draft_id, assets=printed)), 409, "draft_changed")
     self.assertIsNone(self.stored_child(draft_id)["document"]["generated"])
     # The authorization refuses on its own, before any file is stored.

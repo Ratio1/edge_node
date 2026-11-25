@@ -3179,17 +3179,20 @@ class TenantAdministrationService:
   @staticmethod
   def _snapshot_scope(row, printed):
     """RM-277: the scope the pack printed by asset, `{asset_id: [ports, tests]}`, from the snapshot's
-    `assets` (`{assetId, authorizedPorts, authorizedTests}`; absent keys and assets read "all").
-    An asset the draft does not hold, or a malformed list, answers a scope the draft never has."""
-    entries = printed.get("assets", [])
+    `assets` (`{assetId, authorizedPorts, authorizedTests}`; absent keys read "all"). The list names
+    every asset the draft holds; one left out, one the draft does not hold, or a malformed list answers
+    a scope the draft never has. A snapshot without `assets` (a console before RM-277) printed "all"."""
+    if "assets" not in printed:
+      return {entry["asset_id"]: ["all", "all"] for entry in row["assets"]}
+    entries = printed["assets"]
     if (not isinstance(entries, list)
         or any(not isinstance(entry, dict) or not isinstance(entry.get("assetId"), str) for entry in entries)
         or len({entry["assetId"] for entry in entries}) != len(entries)
-        or not {entry["assetId"] for entry in entries} <= {entry["asset_id"] for entry in row["assets"]}):
+        or {entry["assetId"] for entry in entries} != {entry["asset_id"] for entry in row["assets"]}):
       return None
     printed_scope = {entry["assetId"]: [entry.get("authorizedPorts", "all"), entry.get("authorizedTests", "all")]
                      for entry in entries}
-    return {entry["asset_id"]: printed_scope.get(entry["asset_id"], ["all", "all"]) for entry in row["assets"]}
+    return {entry["asset_id"]: printed_scope[entry["asset_id"]] for entry in row["assets"]}
 
   @staticmethod
   def _snapshot_nodes(snapshot):
