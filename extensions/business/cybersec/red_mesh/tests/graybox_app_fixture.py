@@ -304,3 +304,27 @@ class FakeApp:
       '<input name="amount" value="100.00"><input name="status" value="draft">'
       '<input name="title" type="text" value="t"></form>'
     ))
+
+
+class DjangoApp(FakeApp):
+  """Django `CommonMiddleware` `APPEND_SLASH`: a slash-less page path 301s to `path/`
+  before auth runs. With `mfa_pending`, good credentials set a `sessionid` the app
+  does not accept and answer 200 with no password field."""
+
+  def __init__(self, *args, mfa_pending=False, **kwargs):
+    super().__init__(*args, **kwargs)
+    self.mfa_pending = mfa_pending
+
+  def handle(self, session, method, url, params, data, json_body, headers):
+    path = urlparse(url).path
+    if method == "GET" and not path.endswith("/") and not path.startswith("/api/"):
+      self.log.append((session.id, method, path))
+      return FakeResponse(301, "", headers={"Location": path + "/"})
+    return super().handle(session, method, url, params, data, json_body, headers)
+
+  def _login(self, session, method, full, data):
+    resp = super()._login(session, method, full, data)
+    if self.mfa_pending and method == "POST" and session.cookies.get("sessionid") == "valid":
+      session.cookies.set("sessionid", "pending-mfa")
+      return self._page(full, "Enter the code from your authenticator app.")
+    return resp
