@@ -299,7 +299,7 @@ class FormAuth(AuthStrategy):
     if (form is not None or resp.status_code < 400 or self._cached
         or self._path_overridden()):
       return resp, form, cfg_url
-    tried, fetches, answered = {cfg_url}, 1, False
+    tried, fetches, transport_failed = {cfg_url}, 1, False
     pending, expanded = deque([self.target_url + "/"]), False
     data_paths = [self.target_url + p for p in LOGIN_DISCOVERY_PATHS]
     while pending and fetches < MAX_LOGIN_SEARCH_FETCHES:
@@ -310,10 +310,11 @@ class FormAuth(AuthStrategy):
       fetches += 1
       try:
         cand = session.get(url, timeout=10, allow_redirects=True)
+      except GrayboxScopeError:
+        cand = None  # refused by scope: skip this candidate only
       except requests.RequestException:
-        cand = None  # skip this candidate only (budget refusal is not one)
+        cand, transport_failed = None, True  # skip it (budget refusal is not one)
       if cand is not None:
-        answered = True
         form = self._form_on(cand, url)
         if form is not None:
           return cand, form, url
@@ -326,9 +327,10 @@ class FormAuth(AuthStrategy):
           page_url = cand.url if isinstance(cand.url, str) and cand.url else url
           pending.extend(login_links(cand.text, page_url))
         pending.extend(data_paths)
-    if not answered:
-      # Every candidate failed in transport: retryable, and no miss is cached.
-      raise requests.ConnectionError("login search: no candidate answered")
+    if transport_failed:
+      # A candidate that failed in transport may hold the form: retryable, no
+      # miss is cached.
+      raise requests.ConnectionError("login search: a candidate failed in transport")
     self.search_found_nothing = True
     return resp, None, cfg_url
 
@@ -346,12 +348,14 @@ class FormAuth(AuthStrategy):
       post_url, payload = form.action, dict(form.fields)
       user_field, pass_field = form.username_field, form.password_field
     else:  # legacy: the configured path answered without a form
-      page_url, post_url, payload = login_url, login_url, {}
+      page_url, post_url, payload = "", login_url, {}
       user_field = self.target_config.username_field
       pass_field = self.target_config.password_field
     payload[user_field] = creds.username
     payload[pass_field] = creds.password
     headers = {"Referer": login_url}
+    if form is not None and csrf_field in form.fields:
+      csrf_token = form.fields[csrf_field]  # the form's own token, not another form's
     if csrf_token and csrf_field:
       payload[csrf_field] = csrf_token
       headers["X-CSRFToken"] = csrf_token
@@ -416,9 +420,13 @@ class FormAuth(AuthStrategy):
     # that as a rejection aborts the entire authenticated scan — the mirror of
     # the bug above, with the same end result of findings never being looked for.
     # Back on the login page (the form's page, or its action) is not navigation.
+    # Detected form: exact path+query (a root action must not match every URL);
+    # legacy configured path: the historical substring rule.
     final = response.url or ""
-    on_login = login_url in final or (
-      bool(page_url) and _path_query(page_url) == _path_query(final))
+    if page_url:
+      on_login = _path_query(final) in (_path_query(login_url), _path_query(page_url))
+    else:
+      on_login = login_url in final
     navigated_away = bool(response.history) and not on_login
     if not navigated_away and _LOGIN_FORM_RE.search(response.text or ""):
       return False

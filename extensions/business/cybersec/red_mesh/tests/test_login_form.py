@@ -333,20 +333,40 @@ class TestFormSearch(unittest.TestCase):
     _, session = self._login(site)
     self.assertIsNone(session)
 
-  def test_a_search_where_nothing_answered_is_not_cached(self):
+  def test_a_transport_error_on_the_form_page_is_retryable_and_not_cached(self):
     import requests
-    site = FakeSite({})
-    real_get = site.get
+    site = FakeSite({"/": (200, "x"), "/login": (200, AUDIT_FORM), "/dashboard": DASHBOARD})
+    real_get, failed = site.get, []
 
-    def down(url, **kw):
-      if not url.endswith("/auth/login/"):
+    def flaky_once(url, **kw):
+      if url.endswith("/login") and not failed:
+        failed.append(url)
         raise requests.ConnectionError("reset")
       return real_get(url, **kw)
-    site.get = down
+    site.get = flaky_once
     mgr, patcher = _manager(site)
     self.addCleanup(patcher.stop)
     self.assertEqual(mgr._try_login_attempt(_creds(site)), (None, True))  # retryable
-    self.assertIsNone(mgr._login_target)  # the retry searches again
+    self.assertIsNone(mgr._login_target)  # no miss cached
+    session, _ = mgr._try_login_attempt(_creds(site))
+    self.assertIsNotNone(session)
+
+  def test_the_forms_own_token_is_posted_not_another_forms(self):
+    news = ('<form method="post" action="/news"><input type="hidden" name="_token" value="NEWS">'
+            '<input name="email"></form>')
+    login = AUDIT_FORM.replace('<input name="user_login">',
+                               '<input type="hidden" name="_token" value="LOGIN"><input name="user_login">')
+    site = FakeSite({"/auth/login/": (200, news + login), "/dashboard": DASHBOARD})
+    self._login(site)
+    self.assertEqual(site.posts[0][1]["_token"], "LOGIN")
+
+  def test_a_root_action_login_reaching_a_page_with_a_password_widget_succeeds(self):
+    form = AUDIT_FORM.replace('action="/signin"', 'action="/"')
+    site = FakeSite({
+      "/": (200, form),
+      "/dashboard": (200, '<form><input type="password" name="new"></form>')})
+    _, session = self._login(site)
+    self.assertIsNotNone(session)
 
   def test_search_is_capped_and_a_miss_is_cached(self):
     links = "".join(f'<a href="/login/{i}">x</a>' for i in range(5))
