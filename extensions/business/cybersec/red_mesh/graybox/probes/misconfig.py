@@ -717,19 +717,14 @@ class MisconfigProbes(ProbeBase):
     """
     PT-A02-18: detect password reset tokens that aren't invalidated on use.
 
-    Two requests for the same user produce the same token string when the
-    reset table never marks rows ``is_used=True`` after consumption — the
-    canonical "token not invalidated" bug. Issuing a fresh token twice and
-    observing identity is a non-destructive proxy that still flags the
-    underlying server-side issue.
-
-    Conservative: emits ``inconclusive`` INFO when the reset endpoint is
-    configured but tokens couldn't be extracted (probe couldn't observe
-    the bug); ``vulnerable`` HIGH when both issued tokens are identical;
-    ``not_vulnerable`` INFO when the issued tokens differ.
-
-    Stays read-only — does NOT consume tokens or mutate user passwords.
-    Destructive verification (true two-consume test) is tracked separately.
+    Reuse means one issued token is accepted twice. Two issuance requests
+    returning the same string, or different strings, say nothing about that
+    (the token column is unique, so a second issuance collides or rotates),
+    so neither is a verdict. Proving reuse needs a confirm POST, and a
+    confirm sets a new password: the probe has no current password to set,
+    and it must never change the scan account's password. So this check
+    issues one token, proves the flow is reachable, and stays ``inconclusive``
+    with a reason code until a safe consume (current password supplied) exists.
     """
     reset_path = self.target_config.password_reset_path
     if not reset_path:
@@ -764,94 +759,60 @@ class MisconfigProbes(ProbeBase):
       re.compile(r'(reset-\w+)', re.I),
     ]
 
-    issued = []
-    for _ in range(2):
-      self.safety.throttle()
-      csrf_token = None
-      try:
-        page = session.get(reset_url, timeout=10)
-        csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
-      except Exception:
-        pass
+    self.safety.throttle()
+    csrf_token = None
+    try:
+      page = session.get(reset_url, timeout=10)
+      csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
+    except Exception:
+      pass
 
-      payload = {"username": test_username}
-      headers = {"Referer": reset_url}
-      if csrf_token and csrf_field:
-        payload[csrf_field] = csrf_token
-        # Django checks the X-CSRFToken header against the cookie too —
-        # send both so the form-protected POST is accepted.
-        headers["X-CSRFToken"] = csrf_token
+    payload = {"username": test_username}
+    headers = {"Referer": reset_url}
+    if csrf_token and csrf_field:
+      payload[csrf_field] = csrf_token
+      # Django checks the X-CSRFToken header against the cookie too —
+      # send both so the form-protected POST is accepted.
+      headers["X-CSRFToken"] = csrf_token
 
-      try:
-        resp = session.post(
-          reset_url, data=payload, headers=headers,
-          timeout=10, allow_redirects=True,
-        )
-      except Exception:
-        continue
-
-      for pat in token_patterns:
-        m = pat.search(resp.text)
-        if m:
-          issued.append(m.group(1))
-          break
-
+    body = ""
+    try:
+      body = session.post(
+        reset_url, data=payload, headers=headers,
+        timeout=10, allow_redirects=True,
+      ).text
+    except Exception:
+      pass
     session.close()
 
-    if len(issued) < 2:
+    token_seen = any(pat.search(body) for pat in token_patterns)
+    if not token_seen:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A02-18",
-        title="Password reset token reuse — could not extract two tokens",
+        title="Password reset token reuse — could not extract a token",
         status="inconclusive",
         severity="INFO",
         owasp="A07:2021",
         evidence=[
-          f"tokens_extracted={len(issued)}",
+          "tokens_extracted=0",
           f"reset_endpoint={reset_path}",
           "reason=insufficient_response_visibility",
         ],
       ))
       return
 
-    if issued[0] == issued[1]:
-      self.findings.append(GrayboxFinding(
-        scenario_id="PT-A02-18",
-        title="Password reset token not invalidated between requests",
-        status="vulnerable",
-        severity="HIGH",
-        owasp="A07:2021",
-        cwe=["CWE-640", "CWE-294"],
-        attack=["T1110"],
-        evidence=[
-          f"reset_endpoint={reset_path}",
-          f"tokens_observed={len(issued)}",
-          f"token_length={len(str(issued[0]))}",  # the token itself is the secret: never in evidence
-          "tokens_identical=True",
-        ],
-        replay_steps=[
-          f"POST {reset_path} for {test_username} (request #1).",
-          f"POST {reset_path} for {test_username} (request #2).",
-          "Compare tokens in the response bodies — observe identity.",
-          "Confirms the issued token persists across requests, "
-          "implying it is not invalidated on consumption either.",
-        ],
-        remediation="Issue a fresh, single-use token on every reset request. "
-                    "Mark the prior token consumed AND invalidated when a new "
-                    "one is issued. Treat reset tokens like one-time bearer "
-                    "credentials with short TTL.",
-      ))
-    else:
-      self.findings.append(GrayboxFinding(
-        scenario_id="PT-A02-18",
-        title="Password reset token rotates between requests",
-        status="not_vulnerable",
-        severity="INFO",
-        owasp="A07:2021",
-        evidence=[
-          f"reset_endpoint={reset_path}",
-          "tokens_identical=False",
-        ],
-      ))
+    self.findings.append(GrayboxFinding(
+      scenario_id="PT-A02-18",
+      title="Password reset token reuse — not verified (no safe consume)",
+      status="inconclusive",
+      severity="INFO",
+      owasp="A07:2021",
+      evidence=[
+        "tokens_extracted=1",
+        f"reset_endpoint={reset_path}",
+        "reason=reset_consume_needs_current_password",
+      ],
+    ))
 
   def _test_account_enumeration_timing(self):
     """

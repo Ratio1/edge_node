@@ -553,6 +553,80 @@ class TestMassAssignment(unittest.TestCase):
     self.assertEqual(vuln[0].severity, "HIGH")
     self.assertIn("CWE-915", vuln[0].cwe)
 
+  def test_mass_assignment_preexisting_option_is_not_evidence(self):
+    """`<option value="admin">` is on the page before the POST: nothing changed."""
+    probe = _make_probe(allow_stateful=True)
+    probe.discovered_forms = ["/profile/"]
+    session = probe.auth.regular_session
+
+    html = ('<form><input name="username" value="alice">'
+            '<select name="role"><option value="user" selected>user</option>'
+            '<option value="admin">admin</option></select></form>')
+    session.get = MagicMock(return_value=_mock_response(status=200, text=html))
+    session.post = MagicMock(return_value=_redirect_to("/profile/"))
+    probe.auth.detected_csrf_field = None
+    probe.auth.extract_csrf_value = MagicMock(return_value=None)
+
+    probe._test_mass_assignment()
+    found = [f for f in probe.findings if f.scenario_id == "PT-A04-01"]
+    self.assertEqual([f.status for f in found], ["not_vulnerable"])
+
+  def _accepted_with(self, before_html, after_html, verify_status=200):
+    probe = _make_probe(allow_stateful=True)
+    probe.discovered_forms = ["/profile/"]
+    session = probe.auth.regular_session
+    session.get = MagicMock(side_effect=[
+      _mock_response(status=200, text=before_html),
+      _mock_response(status=verify_status, text=after_html)])
+    session.post = MagicMock(return_value=_redirect_to("/profile/"))
+    probe.auth.detected_csrf_field = None
+    probe.auth.extract_csrf_value = MagicMock(return_value=None)
+    probe._test_mass_assignment()
+    return [f for f in probe.findings if f.scenario_id == "PT-A04-01"]
+
+  def test_mass_assignment_unchecked_checkbox_is_not_persisted(self):
+    html = ('<form><input name="username" value="alice">'
+            '<input type="checkbox" name="is_admin" value="true"></form>')
+    self.assertEqual([f.status for f in self._accepted_with(html, html)],
+                     ["not_vulnerable"])
+
+  def test_mass_assignment_checked_checkbox_is_persisted(self):
+    before = '<form><input name="username" value="alice"></form>'
+    after = ('<form><input name="username" value="alice">'
+             '<input type="checkbox" name="is_admin" value="true" checked></form>')
+    self.assertEqual([f.status for f in self._accepted_with(before, after)],
+                     ["vulnerable"])
+
+  def test_mass_assignment_django_checkbox_without_value_counts_when_checked(self):
+    before = '<form><input name="username" value="alice"><input type="checkbox" name="is_admin"></form>'
+    after = ('<form><input name="username" value="alice">'
+             '<input type="checkbox" name="is_admin" checked></form>')
+    self.assertEqual([f.status for f in self._accepted_with(before, after)],
+                     ["vulnerable"])
+
+  def test_mass_assignment_data_checked_is_not_checked(self):
+    before = '<form><input name="username" value="alice"><input type="checkbox" name="is_admin"></form>'
+    after = ('<form><input name="username" value="alice">'
+             '<input type="checkbox" name="is_admin" data-checked="1"></form>')
+    self.assertEqual([f.status for f in self._accepted_with(before, after)],
+                     ["not_vulnerable"])
+
+  def test_mass_assignment_field_absent_after_accept_is_inconclusive(self):
+    """`role="group"` / `class="admin"` are attributes, not privilege fields."""
+    for html in ('<form><input name="username" value="alice"></form>',
+                 '<div role="group" class="admin"><form>'
+                 '<input name="username" value="alice"></form></div>'):
+      with self.subTest(html=html):
+        found = self._accepted_with(html, html)
+        self.assertEqual([f.status for f in found], ["inconclusive"])
+        self.assertIn("reason=privilege_field_not_observable", found[0].evidence)
+
+  def test_mass_assignment_unreadable_verify_page_is_inconclusive(self):
+    html = '<form><input name="username" value="alice"></form>'
+    found = self._accepted_with(html, "", verify_status=500)
+    self.assertEqual([f.status for f in found], ["inconclusive"])
+    self.assertIn("reason=verify_not_readable", found[0].evidence)
+
   def test_mass_assignment_rejected(self):
     """Server rejects extra fields → not_vulnerable."""
     probe = _make_probe(allow_stateful=True)

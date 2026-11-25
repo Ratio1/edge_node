@@ -2,6 +2,7 @@
 Business logic probes — A06 workflow bypass + A07 weak auth.
 """
 
+from .access_control import MAX_EVIDENCE_VALUE, parse_form_fields
 from .base import ProbeBase
 from ..findings import GrayboxFinding
 
@@ -242,6 +243,32 @@ class BusinessLogicProbes(ProbeBase):
         evidence=[f"endpoints_tested={endpoints_tested}"],
       ))
 
+  def _read_back_field(self, url, field, csrf_field):
+    """GET the record again and return the stored value of ``field``, or None."""
+    self.safety.throttle()
+    try:
+      page = self.auth.primary_session.get(url, timeout=10)
+    except Exception:
+      return None
+    if page.status_code != 200 or not self.response_reached(page):
+      return None
+    return parse_form_fields(page.text, csrf_field).get(field)
+
+  @staticmethod
+  def _is_number(value):
+    try:
+      float(value)
+      return True
+    except (TypeError, ValueError):
+      return False
+
+  @staticmethod
+  def _same_amount(stored, submitted):
+    try:
+      return abs(float(stored) - float(submitted)) < 0.005
+    except (TypeError, ValueError):
+      return str(stored) == str(submitted)
+
   def _test_validation_bypass(self):
     """
     PT-A06-02: test business logic validation (negative amounts, invalid state transitions).
@@ -256,8 +283,6 @@ class BusinessLogicProbes(ProbeBase):
     endpoints = self.target_config.business_logic.record_endpoints
     if not endpoints:
       return
-
-    import re
 
     idor_ids = [1, 2]
     for iep in self.target_config.access_control.idor_endpoints:
@@ -274,6 +299,8 @@ class BusinessLogicProbes(ProbeBase):
     # accepted, even if the invalid-state branch also triggers PT-A06-02.
     negative_amount_evidence = []
     negative_amount_response = None
+    amount_unconfirmed = []      # (path, reason)
+    transition_unconfirmed = []
 
     for ep in endpoints:
       path = ep.path
@@ -302,34 +329,7 @@ class BusinessLogicProbes(ProbeBase):
       if csrf_field:
         csrf_token = self.auth.extract_csrf_value(page_text, csrf_field)
 
-      # Extract all form fields with current values.
-      # Parse <input> (any type), <textarea>, and <select> elements.
-      form_fields = {}
-      for tag in re.finditer(r'<input\b([^>]*)>', page_text, re.I):
-        attrs = tag.group(1)
-        name_m = re.search(r'name=["\']([^"\']+)', attrs)
-        val_m = re.search(r'value=["\']([^"\']*)', attrs)
-        if name_m:
-          name = name_m.group(1)
-          if name != csrf_field:
-            form_fields[name] = val_m.group(1) if val_m else ""
-      for m in re.finditer(
-        r'<textarea[^>]+name=["\']([^"\']+)["\'][^>]*>(.*?)</textarea>',
-        page_text, re.I | re.DOTALL,
-      ):
-        form_fields[m.group(1)] = m.group(2).strip()
-      # Extract <select> current values via selected option
-      for sel in re.finditer(
-        r'<select[^>]+name=["\']([^"\']+)["\'][^>]*>(.*?)</select>',
-        page_text, re.I | re.DOTALL,
-      ):
-        sel_name = sel.group(1)
-        sel_body = sel.group(2)
-        opt = re.search(r'<option[^>]*selected[^>]*value=["\']([^"\']+)', sel_body, re.I)
-        if not opt:
-          opt = re.search(r'<option[^>]*value=["\']([^"\']+)["\'][^>]*selected', sel_body, re.I)
-        if opt:
-          form_fields[sel_name] = opt.group(1)
+      form_fields = parse_form_fields(page_text, csrf_field)
 
       current_status = form_fields.get(ep.status_field)
 
@@ -356,21 +356,32 @@ class BusinessLogicProbes(ProbeBase):
         denied += 1
       elif resp is not None:
         tested += 1
-        # Success indicators: 302 redirect (form accepted) or 200 without error
-        accepted = resp.status_code in (301, 302)
-        if not accepted and resp.status_code == 200:
-          body_lower = resp.text.lower()
-          error_markers = ["must be", "invalid", "error", "cannot", "negative"]
-          accepted = not any(m in body_lower for m in error_markers)
-        if accepted:
-          bypass_evidence.append(f"negative_amount_accepted=True; endpoint={path}")
-          if bypass_response is None:
-            bypass_response = resp
-          if negative_amount_response is None:
-            negative_amount_response = resp
-          negative_amount_evidence.append(
-            f"endpoint={path}; submitted_amount=-9999.99; status={resp.status_code}"
-          )
+        # The POST response (status, error words) proves nothing either way:
+        # the read-back alone decides. Stored payload = vulnerable, another
+        # stored value = guard held, no read-back = inconclusive.
+        before = form_fields.get(ep.amount_field)
+        if before is not None and self._same_amount(before, "-9999.99"):
+          # The record already held the payload value (residue of an earlier
+          # run): reading it back proves nothing.
+          amount_unconfirmed.append((path, "value_present_before_probe"))
+        else:
+          stored = self._read_back_field(url, ep.amount_field, csrf_field)
+          if stored is None:
+            amount_unconfirmed.append((path, "accepted_value_not_read_back"))
+          elif self._same_amount(stored, "-9999.99"):
+            bypass_evidence.append(f"negative_amount_accepted=True; endpoint={path}")
+            if bypass_response is None:
+              bypass_response = resp
+            if negative_amount_response is None:
+              negative_amount_response = resp
+            negative_amount_evidence.append(
+              f"endpoint={path}; submitted_amount=-9999.99; "
+              f"stored_amount={stored[:MAX_EVIDENCE_VALUE]}; status={resp.status_code}"
+            )
+          elif not (stored == before or self._is_number(stored)):
+            # A display format the probe cannot compare ("-9,999.99", "$-9999.99"):
+            # neither the payload nor a different amount is proven.
+            amount_unconfirmed.append((path, "accepted_value_not_read_back"))
 
       # Test B: Invalid state transition (if transitions are configured)
       if ep.valid_transitions and current_status:
@@ -412,15 +423,15 @@ class BusinessLogicProbes(ProbeBase):
             resp2 = None
 
           if resp2 is not None and self.response_reached(resp2):
-            accepted2 = resp2.status_code in (301, 302)
-            if not accepted2 and resp2.status_code == 200:
-              body_lower = resp2.text.lower()
-              error_markers = ["must be", "invalid", "error", "cannot", "blocked", "transition"]
-              accepted2 = not any(m in body_lower for m in error_markers)
-            if accepted2:
+            # Same rule as Test A: the read-back alone decides.
+            stored2 = self._read_back_field(url, ep.status_field, csrf_field)
+            if stored2 is None:
+              transition_unconfirmed.append((path, "accepted_value_not_read_back"))
+            elif stored2 == invalid_target:
               bypass_evidence.append(
                 f"invalid_transition_accepted=True; "
-                f"from={current_status}; to={invalid_target}; endpoint={path}"
+                f"from={current_status}; to={invalid_target}; "
+                f"stored_status={stored2[:MAX_EVIDENCE_VALUE]}; endpoint={path}"
               )
               if bypass_response is None:
                 bypass_response = resp2
@@ -445,6 +456,12 @@ class BusinessLogicProbes(ProbeBase):
                     "Never rely on client-side validation alone.",
         evidence_artifacts=self.evidence_from(bypass_response),
       ))
+    elif transition_unconfirmed or amount_unconfirmed:
+      path, reason = (transition_unconfirmed or amount_unconfirmed)[0]
+      self.emit_inconclusive(
+        "PT-A06-02", "Business logic validation bypass", "A04:2021", reason,
+      )
+      self.findings[-1].evidence.append(f"endpoint={path}")
     elif tested:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A06-02",
@@ -485,6 +502,12 @@ class BusinessLogicProbes(ProbeBase):
                     "the model or service boundary.",
         evidence_artifacts=self.evidence_from(negative_amount_response),
       ))
+    elif amount_unconfirmed:
+      path, reason = amount_unconfirmed[0]
+      self.emit_inconclusive(
+        "PT-A06-04", "Negative amount accepted", "A04:2021", reason,
+      )
+      self.findings[-1].evidence.append(f"endpoint={path}")
     elif tested:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A06-04",
