@@ -822,7 +822,9 @@ class _ResponseFingerprintMixin:
       headers = {"User-Agent": user_agent} if user_agent else {}
       if dial_host and dial_host != self.target:
         # Dialing the pinned address must not change what the virtual host sees.
-        name = f"[{self.target}]" if ":" in self.target else self.target
+        # urllib3 drops a trailing dot from the name it puts in Host and SNI; match it.
+        target_name = self.target.rstrip(".")
+        name = f"[{target_name}]" if ":" in target_name else target_name
         default_port = 443 if scheme == "https" else 80
         headers["Host"] = name if port == default_port else f"{name}:{port}"
       timeout = self._target_timeout(FINGERPRINT_HTTP_TIMEOUT)

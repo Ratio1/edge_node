@@ -1616,7 +1616,7 @@ class TestDnsMultiplicityBound(unittest.TestCase):
     ] + [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", live_port))]
 
     def _lookup(host, *args, **kwargs):
-      return records if host == "multi.test" else real(host, *args, **kwargs)
+      return records if host in ("multi.test", "multi.test.") else real(host, *args, **kwargs)
 
     patcher = patch("socket.getaddrinfo", side_effect=_lookup)
     patcher.start()
@@ -1683,6 +1683,17 @@ class TestDnsMultiplicityBound(unittest.TestCase):
     peer = _Peer.serving(b"ok")
     self.addCleanup(peer.close)
     self._assert_one_endpoint(peer, "http", f"multi.test:{peer.port}")
+
+  def test_a_trailing_dot_name_sends_host_without_the_dot(self):
+    peer = _Peer.serving(b"ok")
+    self.addCleanup(peer.close)
+    self._zone(self.FAST, 3, peer.port)
+    worker = self._worker(peer.port)
+    worker.target = "multi.test."
+    entry = worker._fingerprint_port(peer.port)
+    self.assertTrue(entry["reachable"])
+    request = next(r for r in reversed(peer.requests) if r.startswith(b"GET"))
+    self.assertIn(f"Host: multi.test:{peer.port}\r\n".encode(), request)
 
   def test_all_three_legs_use_one_address_and_keep_hostname_for_sni_and_host(self):
     peer = _TlsPeer.serving(b"ok")
