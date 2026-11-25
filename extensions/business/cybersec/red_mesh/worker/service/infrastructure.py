@@ -1016,7 +1016,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           evidence=f"Shares: {share_names}",
           remediation="Disable null session access; restrict admin shares.",
           owasp_id="A01:2021",
-          cwe_id="CWE-284",
+          cwe_id="CWE-200",
           confidence="certain",
         ))
       else:
@@ -1483,7 +1483,9 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           return []
         shares.append({"name": name, "type": share_type, "comment": _ServiceInfraMixin._smb_clean_text(comment)})
 
-      # TotalEntries, the resume handle (null, or referent + value), then the WERROR return value
+      # TotalEntries (never below the entries read), the resume handle (null, or referent + value), then WERROR
+      if struct.unpack_from("<I", stub, offset)[0] < entries:
+        return []
       offset += 4
       offset += 8 if struct.unpack_from("<I", stub, offset)[0] else 4
       if struct.unpack_from("<I", stub, offset)[0] != 0:

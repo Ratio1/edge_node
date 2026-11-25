@@ -249,6 +249,7 @@ class TestNetShareEnumAllParser(unittest.TestCase):
       "no terminator": _built_stub([("a", 0, "")]).replace("a\x00".encode("utf-16-le"), "ab".encode("utf-16-le"), 1),
       "non-zero WERROR": _built_stub([("a", 0, "")], trailer=struct.pack("<III", 1, 0, 5)),
       "WERROR missing": _built_stub([("a", 0, "")], trailer=struct.pack("<II", 1, 0)),
+      "TotalEntries below entries read": _built_stub([("a", 0, ""), ("b", 0, "")], trailer=struct.pack("<III", 1, 0, 0)),
       "zero entries": _built_stub([]),
       "wrong level": struct.pack("<I", 2) + _stub()[4:],
       "empty name": _built_stub([("", 0, "")]),
