@@ -25,7 +25,7 @@ from .assets import canonical_digest, normalize_name, valid_digest
 from .integrations import integration_ids, valid_integration_id
 from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, SUSPEND_STATE_KEYS, EngagementInvalid, document_id_for, engagement_hash,
                           engagement_id_for, normalize_asset_requests,
-                          normalize_context, scope_of, with_scope,
+                          normalize_context, asset_scope, with_scope,
                           build_engagement_assets, normalize_engagement_assets, normalize_window, valid_doc_ref, valid_engagement_id)
 from . import (account_profile, drafts, engagement_drafts, super_tenant_branding, super_tenant_integrations, super_tenant_profile,
                supporting_documents, tenant_assets, tenant_contracts)
@@ -888,7 +888,7 @@ class TenantAdministrationService:
       "contract_sha256": row["contract_sha256"],
       "context": row["context"],
       # RM-251, RM-277: the scope of the asset the launch targets; a `/4` entry reads as "all".
-      **dict(zip(("authorized_ports", "authorized_tests"), scope_of(entry or {}))),
+      **dict(zip(("authorized_ports", "authorized_tests"), asset_scope(row, entry) if entry else ("all", "all"))),
       # `AuthorizationRef` shape, so reports, exports and SIEM hooks read the job snapshot as
       # before. The signed basis is the engagement's contract, signed by the tenant's legal signer. No
       # document reference: the job is readable under `reports:view`, while the contract itself is
@@ -1151,8 +1151,8 @@ class TenantAdministrationService:
                "displayName": entry["display_name"], "kind": entry["kind"], "target": entry["target"],
                "targetDigest": entry["target_digest"],
                # RM-277: the asset's scope; a `/4` entry reads as "all", only a network asset has ports.
-               "authorizedTests": scope_of(entry)[1],
-               **({"authorizedPorts": scope_of(entry)[0]} if entry["kind"] == "network" else {})}
+               "authorizedTests": asset_scope(row, entry)[1],
+               **({"authorizedPorts": asset_scope(row, entry)[0]} if entry["kind"] == "network" else {})}
               for entry in row["assets"]]
     return {
       "tenantId": row["tenant_id"], "engagementId": row["engagement_id"],
@@ -2877,13 +2877,13 @@ class TenantAdministrationService:
 
   def _draft_assets(self, requests, parent, previous):
     """RM-125 phase 2b: an `assets` change as stored entries (an empty list clears them). An asset
-    the draft already holds keeps its stored copy, only its ports change; a newly picked one is
-    copied from the parent's registered assets now. A later rename or archive of a held asset
+    the draft already holds keeps its stored copy and, unless the request names it, its stored
+    scope (an explicit "all" resets it); a newly picked one is copied from the parent's registered assets now. A later rename or archive of a held asset
     therefore never reaches the draft (contract: remove and re-pick to take a newer copy)."""
     if requests == []:
       return []
     try:
-      requests = normalize_asset_requests(requests)
+      requests = normalize_asset_requests(requests, keep_all=True)
     except EngagementInvalid as exc:
       raise AdministrationDenied(400, exc.code) from None
     return self._engagement_assets(requests, parent, previous)
@@ -3182,9 +3182,10 @@ class TenantAdministrationService:
     `assets` (`{assetId, authorizedPorts, authorizedTests}`; absent keys and assets read "all").
     An asset the draft does not hold, or a malformed list, answers a scope the draft never has."""
     entries = printed.get("assets", [])
-    if (not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries)
-        or len({entry.get("assetId") for entry in entries}) != len(entries)
-        or not {entry.get("assetId") for entry in entries} <= {entry["asset_id"] for entry in row["assets"]}):
+    if (not isinstance(entries, list)
+        or any(not isinstance(entry, dict) or not isinstance(entry.get("assetId"), str) for entry in entries)
+        or len({entry["assetId"] for entry in entries}) != len(entries)
+        or not {entry["assetId"] for entry in entries} <= {entry["asset_id"] for entry in row["assets"]}):
       return None
     printed_scope = {entry["assetId"]: [entry.get("authorizedPorts", "all"), entry.get("authorizedTests", "all")]
                      for entry in entries}

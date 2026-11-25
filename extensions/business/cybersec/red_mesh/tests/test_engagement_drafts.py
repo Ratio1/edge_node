@@ -1020,6 +1020,48 @@ class TestEngagementReplacement(_EngagementDraftCase):
     plain = ok(self, self.plugin.get_engagement_draft(self.actor, self.replacement(sign=False)))
     self.assertEqual([scope_of(entry) for entry in plain["assets"]], [("all", "all")] * len(legacy["assets"]))
 
+  def test_an_rm251_draft_reads_with_its_scope_derived_per_asset_and_never_widens(self):
+    parent = self.tenant_id
+    draft_id = self.child(parent)["engagement_draft_id"]
+    self.fill(draft_id, assets=[pick(self.asset_in(parent)), pick(self.asset_in(parent, WEBAPP))])
+    row = self.stored_child(draft_id)
+    row["assets"] = [{key: value for key, value in entry.items() if not key.startswith("authorized_")} for entry in row["assets"]]
+    row.update(authorized_ports=[[1, 1024]], authorized_tests=["web_discovery"])
+    self.repo.put("engagement_draft", draft_id, record=row)
+    read = ok(self, self.plugin.get_engagement_draft(self.actor, draft_id))
+    self.assertNotIn("authorized_ports", read)
+    self.assertEqual([scope_of(entry) for entry in read["assets"]], [([[1, 1024]], ["web_discovery"]), ("all", [])])
+    # Nothing authorized for the webapp asset: not complete until its scope is set.
+    self.assertEqual(read["completeness"]["reasons"], {"assets": "authorized_tests_invalid"})
+    self.assertEqual(self.stored_child(draft_id)["assets"], read["assets"])
+    # Any write stores the per-asset form; a held asset re-sent without keys keeps its derived scope.
+    fixed = ok(self, self.update_child(draft_id, {"assets": [pick(self.asset_in(parent)), dict(
+      pick(self.asset_in(parent, WEBAPP)), authorized_tests=["graybox_injection"])]}))
+    self.assertEqual([scope_of(entry) for entry in fixed["assets"]],
+                     [([[1, 1024]], ["web_discovery"]), ("all", ["graybox_injection"])])
+    self.assertNotIn("authorized_ports", self.stored_child(draft_id))
+    # A stale list-form `pack_scope` of 2.10.810 stays stale.
+    self.generate_pack(draft_id, snapshot=self.pack_snapshot(
+      draft_id, assets=[{"assetId": self.asset_in(parent), "authorizedPorts": [[1, 1024]], "authorizedTests": ["web_discovery"]},
+                        {"assetId": self.asset_in(parent, WEBAPP), "authorizedTests": ["graybox_injection"]}]))
+    row = self.stored_child(draft_id)
+    row["pack_scope"] = ["all", "all"]
+    self.repo.put("engagement_draft", draft_id, record=row)
+    self.assertIn("item:engagement_pack_stale", ok(
+      self, self.plugin.get_engagement_draft(self.actor, draft_id))["completeness"]["missing"])
+
+  def test_a_held_asset_sent_without_scope_keeps_its_scope_and_only_an_explicit_all_resets_it(self):
+    net, web = self.asset_in(self.tenant_id), self.asset_in(self.tenant_id, WEBAPP)
+    restricted = ok(self, self.plugin.create_engagement(
+      self.actor, self.tenant_id, str(uuid4()), "Restricted", COMPLETE["valid_from"], COMPLETE["valid_until"],
+      COMPLETE["context"], [dict(pick(net), authorized_ports=[[1, 1024]])], []))["engagementId"]
+    draft_id = ok(self, self.plugin.create_engagement_draft(
+      self.actor, self.tenant_id, str(uuid4()), "Replaced", supersedes=restricted))["engagement_draft_id"]
+    kept = ok(self, self.update_child(draft_id, {"assets": [pick(net), pick(web)]}))
+    self.assertEqual([scope_of(entry) for entry in kept["assets"]], [([[1, 1024]], "all"), ("all", "all")])
+    reset = ok(self, self.update_child(draft_id, {"assets": [dict(pick(net), authorized_ports="all"), pick(web)]}))
+    self.assertEqual([scope_of(entry) for entry in reset["assets"]], [("all", "all")] * 2)
+
   def test_the_scope_is_per_asset_default_all_checked_when_written_and_complete_only_if_valid(self):
     parent = self.tenant_id
     draft = self.child(parent)
@@ -1082,7 +1124,7 @@ class TestEngagementReplacement(_EngagementDraftCase):
     with patch.object(TenantAdministrationService, "_pack_snapshot", autospec=True, side_effect=moved):
       refused(self, self.generate_pack_raw(draft_id, self.pack_snapshot(draft_id)), 409, "draft_changed")
     self.assertIsNone(self.stored_child(draft_id)["document"]["generated"])
-    ok(self, self.update_child(draft_id, {"assets": [pick(net)]}))
+    ok(self, self.update_child(draft_id, {"assets": [dict(pick(net), authorized_ports="all")]}))
     self.generate_pack(draft_id)
     self.assertEqual(self.stored_child(draft_id)["pack_scope"], {net: ["all", "all"]})
     self.assertFalse(stale())

@@ -11,8 +11,9 @@ import re
 
 from .assets import normalize_name
 from .drafts import ITEM_STATES, _UUID, _nonempty_text, valid_draft_id, valid_generated
-from .engagements import (EngagementInvalid, MAX_ENGAGEMENT_ASSETS, _asset_entry_valid, _scope_uniform,
-                          normalize_context, normalize_engagement_assets, normalize_instant, normalize_window,
+from .engagements import (EngagementInvalid, asset_scope, MAX_ENGAGEMENT_ASSETS, _asset_entry_valid, _legacy_scope_valid,
+                          _scope_uniform, derive_scope, normalize_context, normalize_engagement_assets,
+                          normalize_instant, normalize_window,
                           scope_of, valid_doc_ref, valid_engagement_id, with_scope)
 from .tenant_contracts import FIRST_CONTRACT_ID, valid_contract_id
 
@@ -158,7 +159,7 @@ def replacing(row, engagement, supporting=()):
                if document["kind"] == "agreement" and document["comment"].startswith(BASELINE_PREFIX)}
   top = max([int(document["document_id"][3:]) for document in documents] or [0])
   # RM-251, RM-277: a replacement keeps each asset's scope, never widens it (a `/4` entry reads as "all").
-  return {**row, SUPERSEDES: engagement["engagement_id"], "assets": [with_scope(entry) for entry in engagement["assets"]],
+  return {**row, SUPERSEDES: engagement["engagement_id"], "assets": [with_scope(entry, asset_scope(engagement, entry)) for entry in engagement["assets"]],
           CARRIED: [dict(document) for document in documents if document["kind"] in CARRIED_KINDS
                     and not (document["title"] == GENERATED_PACK_TITLE and document["sha256"] in baselines)]
                    + [{"document_id": "ed_%d" % (top + number), SOURCE: source, **entry}
@@ -326,7 +327,7 @@ def _stored_assets_valid(assets):
   # Shape only for the entries, as `validate_engagement` does: a catalog change must not make a
   # draft unreadable; activation re-normalizes them in full.
   return (isinstance(assets, list) and len(assets) <= MAX_ENGAGEMENT_ASSETS
-          and all(_asset_entry_valid(index, entry) for index, entry in enumerate(assets))
+          and all(_asset_entry_valid(index, entry, empty_tests=True) for index, entry in enumerate(assets))
           and len({entry["target_digest"] for entry in assets}) == len(assets)
           and len({entry["asset_id"] for entry in assets}) == len(assets) and _scope_uniform(assets))
 
@@ -347,7 +348,9 @@ def _carried_valid(documents):
 
 
 def validate_engagement_draft(row, ids):
-  """Refuse a stored engagement draft the operations could not have written. Unknown fields are kept."""
+  """Refuse a stored engagement draft the operations could not have written. Unknown fields are kept.
+  RM-277: answers the row; one written with the RM-251 engagement-level scope answers with that scope
+  derived onto each asset (never widened), so the next write stores the per-asset form."""
   slot = row.get("document")
   if (len(ids) != 1 or row.get("engagement_draft_id") != ids[0] or not valid_engagement_draft_id(ids[0])
       or not valid_parent(row.get("parent"))
@@ -356,6 +359,8 @@ def validate_engagement_draft(row, ids):
       # Shape only for the context: `EngagementContext` may gain fields.
       or not isinstance(row.get("context"), dict)
       or not _stored_assets_valid(row.get("assets"))
+      or not _legacy_scope_valid(row)
+      or ("authorized_tests" in row and any("authorized_tests" in entry for entry in row["assets"]))
       or not isinstance(slot, dict) or set(slot) != {"state", "document", "generated"}
       or slot["state"] not in ITEM_STATES
       or (slot["state"] == "signed") != (slot["document"] is not None)
@@ -372,4 +377,9 @@ def validate_engagement_draft(row, ids):
     _check_window(row)
   except EngagementDraftInvalid:
     raise ValueError("Invalid engagement draft window") from None
+  if "authorized_tests" in row:
+    keys = ("authorized_ports", "authorized_tests")
+    return {**{key: value for key, value in row.items() if key not in keys},
+            "assets": [with_scope(entry, derive_scope(row[keys[0]], row[keys[1]], entry["kind"]))
+                       for entry in row["assets"]]}
   return row

@@ -231,9 +231,9 @@ class TestEngagementHash(unittest.TestCase):
         documents[0][label] = value
         self.assertNotEqual(record(documents=documents)["engagement_hash"], base)
 
-  def test_the_hash_schema_is_v5_and_a_row_without_the_scope_keys_stays_v4(self):
+  def test_the_hash_schema_is_v6_and_a_row_without_the_scope_keys_stays_v4(self):
     from extensions.business.cybersec.red_mesh.tenancy.engagements import HASH_SCHEMA, hashed_fields
-    self.assertEqual(HASH_SCHEMA, "redmesh.engagement/5")
+    self.assertEqual(HASH_SCHEMA, "redmesh.engagement/6")
     fields = hashed_fields(record())
     self.assertEqual(fields["schema"], "redmesh.engagement/4")
     self.assertNotIn("authorized_ports", fields)
@@ -340,7 +340,8 @@ class TestEngagementValidator(unittest.TestCase):
 
 
 class TestEngagementScope(unittest.TestCase):
-  """RM-251, RM-277: the authorized ports and tests of each asset, the key-presence hash schema (D-10) and the reader."""
+  """RM-251, RM-277: the authorized ports and tests of each asset (`/6`), the RM-251 engagement-level pair (`/5`,
+  read-only), the key-presence hash schema (D-10) and the reader."""
 
   @staticmethod
   def scoped(ports="all", tests="all", web="all", **changes):
@@ -362,12 +363,12 @@ class TestEngagementScope(unittest.TestCase):
     validate_engagement(row, (TENANT, ENGAGEMENT))
     self.assertEqual([scope_of(entry) for entry in row["assets"]], [("all", "all")] * 2)
 
-  def test_the_keys_on_every_asset_make_a_v5_row_and_a_mix_or_an_engagement_level_key_is_refused(self):
+  def test_the_keys_on_every_asset_make_a_v6_row_and_a_mix_or_an_engagement_level_key_is_refused(self):
     from extensions.business.cybersec.red_mesh.tenancy.engagements import hashed_fields
     base = record()
     scoped = self.scoped()
     validate_engagement(scoped, (TENANT, ENGAGEMENT))
-    self.assertEqual(hashed_fields(scoped)["schema"], "redmesh.engagement/5")
+    self.assertEqual(hashed_fields(scoped)["schema"], "redmesh.engagement/6")
     self.assertNotEqual(scoped["engagement_hash"], base["engagement_hash"])
     self.assertNotEqual(self.scoped([[1, 1024]])["engagement_hash"], scoped["engagement_hash"])
     self.assertNotEqual(self.scoped(web=["graybox_misconfig"])["engagement_hash"], scoped["engagement_hash"])
@@ -375,13 +376,45 @@ class TestEngagementScope(unittest.TestCase):
     del mixed["assets"][1]["authorized_tests"]
     mixed["engagement_hash"] = engagement_hash(mixed)
     for name, row in (("a mix of scoped and unscoped assets", mixed),
-                      ("engagement-level scope on a /4 row", {**base, "authorized_ports": "all", "authorized_tests": "all"}),
-                      ("engagement-level scope on a /5 row", {**scoped, "authorized_tests": "all"})):
+                      ("one engagement-level key alone", {**base, "authorized_tests": "all"}),
+                      ("engagement-level plus asset scope", {**scoped, "authorized_ports": "all", "authorized_tests": "all"})):
       with self.subTest(name), self.assertRaises(ValueError):
         validate_engagement(row, (TENANT, ENGAGEMENT))
     # Revoke keeps the schema.
     validate_engagement({**scoped, "active": False, "revoked_by": "creator", "revoked_at": "2026-10-02T00:00:00+00:00",
                          "revoke_reason": "done"}, (TENANT, ENGAGEMENT))
+
+  @staticmethod
+  def rm251(ports="all", tests="all"):
+    """A row as 2.10.810 wrote and hashed it (origin/main): the pair on the engagement, `/5`, none on the assets."""
+    row = record(authorized_ports=ports, authorized_tests=tests)
+    fields = {"schema": "redmesh.engagement/5", "tenant_id": TENANT, "engagement_id": ENGAGEMENT,
+              "display_name": row["display_name"], "valid_from": row["valid_from"], "valid_until": row["valid_until"],
+              "contract_sha256": SHA_C, "documents": sorted([d["kind"], d["sha256"], d["title"], d["comment"]]
+                                                           for d in row["documents"]),
+              "supersedes": None, "context": row["context"], "assets": row["assets"],
+              "authorized_ports": ports, "authorized_tests": tests}
+    return {**row, "engagement_hash": canonical_digest(fields)}
+
+  def test_an_rm251_row_reads_with_its_hash_and_each_assets_scope_is_derived_from_it(self):
+    from extensions.business.cybersec.red_mesh.tenancy.engagements import asset_scope
+    row = self.rm251([[1, 1024]], ["graybox", "web_discovery"])
+    self.assertEqual(row["engagement_hash"], engagement_hash(row))
+    validate_engagement(row, (TENANT, ENGAGEMENT))
+    network, webapp = row["assets"]
+    # Ports bind the network asset; `graybox` was every graybox family; ids of another kind drop out.
+    self.assertEqual(asset_scope(row, network), ([[1, 1024]], ["web_discovery"]))
+    self.assertEqual(asset_scope(row, webapp), ("all", sorted(feature_ids_for_kind("webapp"))))
+    # A restricted list holding no id for the kind authorizes nothing there (the gate refuses the launch).
+    self.assertEqual(asset_scope(self.rm251("all", ["graybox"]), network), ("all", []))
+    self.assertEqual(asset_scope(self.rm251("all", ["web_discovery"]), webapp), ("all", []))
+    self.assertEqual(asset_scope(self.rm251(), network), ("all", "all"))
+    # A /6 row answers its own entry.
+    scoped = self.scoped([[5, 9]])
+    self.assertEqual(asset_scope(scoped, scoped["assets"][0]), ([[5, 9]], "all"))
+    for bad in (self.rm251([], "all"), self.rm251("all", ["b", "a"])):
+      with self.assertRaises(ValueError):
+        validate_engagement(bad, (TENANT, ENGAGEMENT))
 
   def test_a_malformed_stored_scope_is_refused_but_an_unknown_test_id_reads(self):
     for ports, tests, web in (([], "all", "all"), ([[5, 1]], "all", "all"), ([[1, 5], [3, 9]], "all", "all"),

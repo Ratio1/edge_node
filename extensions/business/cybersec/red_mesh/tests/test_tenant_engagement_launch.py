@@ -134,6 +134,32 @@ class TestTenantEngagementLaunch(unittest.TestCase):
     self.assertEqual((gate("ea_1", 443), gate("ea_2", 443)), (None, None))
     self.assertEqual(gate("ea_2", 2000)["ports"], [[2000, 2000]])
 
+  def test_an_rm251_engagement_keeps_launching_with_its_scope_derived_per_asset(self):
+    # RM-277: a row 2.10.810 wrote (the pair on the engagement, hash `/5`) reads as before and is gated per asset.
+    from unittest.mock import MagicMock
+    from extensions.business.cybersec.red_mesh.services.launch_api import _launch_scope_error
+    from extensions.business.cybersec.red_mesh.tenancy.engagements import engagement_hash, feature_ids_for_kind
+    def legacy(ports, tests):
+      row = self.store.get("engagement", self.tenant, self.engagement["engagementId"])
+      row = {**row, "assets": [{key: value for key, value in entry.items() if not key.startswith("authorized_")}
+                               for entry in row["assets"]], "authorized_ports": ports, "authorized_tests": tests}
+      row["engagement_hash"] = engagement_hash(row)
+      self.store.put("engagement", self.tenant, row["engagement_id"], record=row)
+      return row["engagement_hash"]
+    legacy([[1, 1024]], ["graybox", "web_discovery"])
+    facts = lambda asset: self.admit(asset=asset).to_dict()["engagement"]
+    self.assertEqual([(facts(asset)["authorized_ports"], facts(asset)["authorized_tests"]) for asset in ("ea_1", "ea_2", "ea_3")],
+                     [([[1, 1024]], ["web_discovery"]), ("all", sorted(feature_ids_for_kind("webapp"))), ("all", [])])
+    gate = lambda asset, port: _launch_scope_error(
+      MagicMock(), self.admit(asset=asset), facts(asset), scan_type="network", target="x", start_port=port,
+      end_port=port, exceptions=[], comparison_ports=None, enabled_features=[])
+    self.assertEqual((gate("ea_1", 80), gate("ea_1", 2000)["ports"]), (None, [[2000, 2000]]))
+    # A restricted list with no id for the asset's kind refuses its launch.
+    legacy("all", ["graybox"])
+    refused_kind = gate("ea_1", 80)
+    self.assertEqual(refused_kind["error"], "scope_exceeded")
+    self.assertEqual(refused_kind["tests"], sorted(feature_ids_for_kind("network"))[:20])
+
   def test_a_model_asset_is_admitted_with_its_question_sets(self):
     context = self.admit(asset="ea_3").to_dict()
     self.assertEqual(context["asset_target"]["kind"], "model")
