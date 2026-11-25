@@ -46,6 +46,7 @@ class MisconfigProbes(ProbeBase):
 
     debug_paths = self.target_config.misconfig.debug_paths
     exposed = []
+    exposed_response = None
     for path in debug_paths:
       self.safety.throttle()
       url = self.target_url + path
@@ -55,6 +56,8 @@ class MisconfigProbes(ProbeBase):
         continue
       if resp.status_code == 200 and len(resp.text) > 50:
         exposed.append(path)
+        if exposed_response is None:
+          exposed_response = resp
 
     if exposed:
       self.findings.append(GrayboxFinding(
@@ -66,6 +69,7 @@ class MisconfigProbes(ProbeBase):
         cwe=["CWE-200"],
         evidence=[f"exposed_paths={', '.join(exposed)}"],
         remediation="Disable debug endpoints in production. Restrict access by IP or authentication.",
+        evidence_artifacts=self.evidence_from(exposed_response),
       ))
     else:
       self.findings.append(GrayboxFinding(
@@ -140,6 +144,7 @@ class MisconfigProbes(ProbeBase):
             f"allow_credentials={acac}",
           ],
           remediation="Restrict Access-Control-Allow-Origin to trusted domains. Never use * with credentials.",
+          evidence_artifacts=self.evidence_from(resp),
         )
         if not worst_finding or finding.severity == "HIGH":
           worst_finding = finding
@@ -158,8 +163,9 @@ class MisconfigProbes(ProbeBase):
             f"allow_credentials={acac}",
           ],
           remediation="Validate the Origin header against an allowlist. Do not reflect arbitrary origins.",
+          evidence_artifacts=self.evidence_from(resp),
         )
-        if not worst_finding or severity == "HIGH":
+        if not worst_finding or finding.severity == "HIGH":
           worst_finding = finding
 
     if worst_finding:
@@ -209,6 +215,7 @@ class MisconfigProbes(ProbeBase):
         cwe=["CWE-693"],
         evidence=[f"missing_headers={', '.join(missing)}"],
         remediation="Add security headers: " + ", ".join(missing),
+        evidence_artifacts=self.evidence_from(resp),
       ))
     else:
       self.findings.append(GrayboxFinding(
@@ -282,6 +289,7 @@ class MisconfigProbes(ProbeBase):
     tested = 0
     denied = 0
     vulnerable_endpoints = []
+    vulnerable_response = None
     csrf_field = self.auth.detected_csrf_field
     for path in csrf_test_endpoints[:5]:
       # A POST to the logout URL ends the scan session.
@@ -354,6 +362,8 @@ class MisconfigProbes(ProbeBase):
       if (not csrf_rejected and resp.status_code < 400
           and self.response_reached(resp)):
         vulnerable_endpoints.append(path)
+        if vulnerable_response is None:
+          vulnerable_response = resp
 
     if vulnerable_endpoints:
       self.findings.append(GrayboxFinding(
@@ -375,6 +385,7 @@ class MisconfigProbes(ProbeBase):
         ],
         remediation="Enforce CSRF tokens on all state-changing endpoints. "
                     "Use SameSite=Strict cookies as defense-in-depth.",
+        evidence_artifacts=self.evidence_from(vulnerable_response),
       ))
     elif tested > 0:
       self.findings.append(GrayboxFinding(
@@ -466,6 +477,7 @@ class MisconfigProbes(ProbeBase):
     test_username = "ratelimit_probe_user_nonexist"
     attempts = 8
     blocked = False
+    last_response = None
     lockout_markers = [
       "account locked", "too many attempts", "temporarily blocked",
       "account suspended", "try again later", "rate limit",
@@ -497,6 +509,7 @@ class MisconfigProbes(ProbeBase):
         )
       except Exception:
         continue
+      last_response = resp
 
       if resp.status_code == 429:
         blocked = True
@@ -529,6 +542,7 @@ class MisconfigProbes(ProbeBase):
         ],
         remediation="Implement account lockout after repeated failures. "
                     "Add rate limiting (e.g. 429 responses) on login endpoints.",
+        evidence_artifacts=self.evidence_from(last_response),
       ))
     else:
       self.findings.append(GrayboxFinding(
@@ -581,6 +595,7 @@ class MisconfigProbes(ProbeBase):
 
     import re
     tokens = []
+    token_response = None
     for i in range(2):
       self.safety.throttle()
       if i > 0:
@@ -619,6 +634,8 @@ class MisconfigProbes(ProbeBase):
         m = pat.search(body)
         if m:
           tokens.append(m.group(1))
+          if token_response is None:
+            token_response = resp
           break
 
     session.close()
@@ -670,6 +687,7 @@ class MisconfigProbes(ProbeBase):
         remediation="Use cryptographically random tokens (128+ bits). "
                     "Never expose tokens in HTML responses. "
                     "Enforce single-use and short expiration.",
+        evidence_artifacts=self.evidence_from(token_response),
       ))
     elif status == "inconclusive":
       self.findings.append(GrayboxFinding(
@@ -745,6 +763,7 @@ class MisconfigProbes(ProbeBase):
     ]
 
     issued = []
+    issued_response = None
     for _ in range(2):
       self.safety.throttle()
       csrf_token = None
@@ -774,6 +793,7 @@ class MisconfigProbes(ProbeBase):
         m = pat.search(resp.text)
         if m:
           issued.append(m.group(1))
+          issued_response = resp
           break
 
     session.close()
@@ -819,6 +839,7 @@ class MisconfigProbes(ProbeBase):
                     "Mark the prior token consumed AND invalidated when a new "
                     "one is issued. Treat reset tokens like one-time bearer "
                     "credentials with short TTL.",
+        evidence_artifacts=self.evidence_from(issued_response),
       ))
     else:
       self.findings.append(GrayboxFinding(
@@ -1127,6 +1148,7 @@ class MisconfigProbes(ProbeBase):
                       "(or any algorithm not in an explicit allowlist). "
                       "Pin the verification algorithm server-side rather "
                       "than reading it from the untrusted header.",
+          evidence_artifacts=self.evidence_from(me),
         ))
         return
 
@@ -1164,7 +1186,7 @@ class MisconfigProbes(ProbeBase):
     # Step 1: GET login page with a fresh session, capture pre-auth cookies
     pre_session = self.auth.make_anonymous_session()
     try:
-      pre_session.get(login_url, timeout=10, allow_redirects=True)
+      pre_response = pre_session.get(login_url, timeout=10, allow_redirects=True)
     except Exception:
       pre_session.close()
       return
@@ -1228,6 +1250,7 @@ class MisconfigProbes(ProbeBase):
         remediation="Regenerate session ID after successful authentication. "
                     "Django: this is automatic. Flask: call session.regenerate(). "
                     "Rails: call reset_session in the login action.",
+        evidence_artifacts=self.evidence_from(pre_response),
       ))
     else:
       self.findings.append(GrayboxFinding(
@@ -1272,7 +1295,7 @@ class MisconfigProbes(ProbeBase):
     session = self.auth.make_anonymous_session()
 
     def _submit_login(username):
-      """Submit a failed login and return (status_code, body, content_length)."""
+      """Submit a failed login and return (status_code, body, content_length, response)."""
       try:
         page = session.get(login_url, timeout=10)
       except Exception:
@@ -1299,7 +1322,7 @@ class MisconfigProbes(ProbeBase):
       except Exception:
         return None
 
-      return (resp.status_code, resp.text, len(resp.text))
+      return (resp.status_code, resp.text, len(resp.text), resp)
 
     self.safety.throttle()
     result_valid = _submit_login(valid_username)
@@ -1311,8 +1334,8 @@ class MisconfigProbes(ProbeBase):
     if not result_valid or not result_invalid:
       return
 
-    status_valid, body_valid, len_valid = result_valid
-    status_invalid, body_invalid, len_invalid = result_invalid
+    status_valid, body_valid, len_valid, resp_valid = result_valid
+    status_invalid, body_invalid, len_invalid, _ = result_invalid
 
     differences = []
 
@@ -1368,6 +1391,7 @@ class MisconfigProbes(ProbeBase):
         remediation="Return identical error messages for all failed login attempts. "
                     "Use generic text like 'Invalid credentials' regardless of "
                     "whether the username exists.",
+        evidence_artifacts=self.evidence_from(resp_valid),
       ))
     else:
       self.findings.append(GrayboxFinding(

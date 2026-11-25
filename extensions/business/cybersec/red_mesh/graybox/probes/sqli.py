@@ -127,7 +127,7 @@ def detect_sqli(send, throttle=None, reached=None, budget=None,
   ``{"left": n}`` cap across parameters.
   Result ``outcome``: hit | clean | denied | unstable | timeout | budget |
   capped. A hit also carries technique, payload_true, payload_false, dbms,
-  confidence, requests.
+  confidence, requests, response (the response that proved it).
   """
   strip = [p for pair in BOOLEAN_PAIRS for p in pair] + list(ERROR_PAYLOADS)
   strip += [p for _, p in TIME_PAYLOADS]
@@ -162,10 +162,11 @@ def detect_sqli(send, throttle=None, reached=None, budget=None,
       raise _Stop("rate_limited")
     return resp, time.monotonic() - started
 
-  def hit(technique, true_p, false_p, dbms, confidence):
+  def hit(technique, true_p, false_p, dbms, confidence, response=None):
     return {"outcome": "hit", "technique": technique, "payload_true": true_p,
             "payload_false": false_p, "dbms": dbms or "unknown",
-            "confidence": confidence, "requests": count["n"]}
+            "confidence": confidence, "requests": count["n"],
+            "response": response}
 
   try:
     return _run(req, hit, strip, reached, time_left, base_value, allow_time)
@@ -192,7 +193,7 @@ def _run(req, hit, strip, reached, time_left, base_value, allow_time):
       continue
     found = dbms_from_text(resp.text)
     if found and found not in base_dbms:
-      return hit("error", payload, "", found, "firm")
+      return hit("error", payload, "", found, "firm", resp)
 
   # Boolean: TRUE matches the baseline, FALSE differs; repeated once.
   # No verdict when the baseline itself is not stable.
@@ -207,7 +208,7 @@ def _run(req, hit, strip, reached, time_left, base_value, allow_time):
                 and _signature(rf, strip, base_value) != base_sig):
           break
       else:
-        return hit("boolean", true_p, false_p, None, "firm")
+        return hit("boolean", true_p, false_p, None, "firm", rf)
 
   if allow_time:
     result = _time_check(req, hit, time_left, base_value, base_elapsed)
@@ -243,5 +244,5 @@ def _time_check(req, hit, time_left, base_value, base_elapsed):
         if ctrl is None or ctrl_elapsed > base_elapsed + TIME_CONTROL_MARGIN:
           break  # the server is slow in general: not a sleep payload
     if hits == 2:
-      return hit("time", payload, "", dbms, "tentative")
+      return hit("time", payload, "", dbms, "tentative", resp)
   return None

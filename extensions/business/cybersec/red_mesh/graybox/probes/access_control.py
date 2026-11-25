@@ -101,9 +101,9 @@ class AccessControlProbes(ProbeBase):
       if outcome.get("evaluated"):
         endpoints_tested += 1
       if result:
-        vulnerable_hits.append(result)
+        vulnerable_hits.append((result, outcome.get("hit_response")))
 
-    for owner, url, path in vulnerable_hits:
+    for (owner, url, path), hit_response in vulnerable_hits:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-01",
         title="Object-level authorization bypass",
@@ -124,6 +124,7 @@ class AccessControlProbes(ProbeBase):
           "Observe owner field not matching logged-in user.",
         ],
         remediation="Authorize object access using both role and ownership checks server-side.",
+        evidence_artifacts=self.evidence_from(hit_response),
       ))
     if not vulnerable_hits and endpoints_tested:
       self.findings.append(GrayboxFinding(
@@ -159,6 +160,8 @@ class AccessControlProbes(ProbeBase):
         continue
       owner = body.get(ep.owner_field, "")
       if owner and owner != self.regular_username:
+        if outcome is not None:
+          outcome["hit_response"] = resp
         return (owner, url, path)
     return None
 
@@ -231,6 +234,7 @@ class AccessControlProbes(ProbeBase):
             "Confirm privileged data is returned.",
           ],
           remediation="Require admin role and deny by default for all privileged functions.",
+          evidence_artifacts=self.evidence_from(resp),
         ))
 
   def _test_verb_tampering(self):
@@ -251,6 +255,7 @@ class AccessControlProbes(ProbeBase):
 
     tested = 0
     bypass_evidence = []
+    bypass_response = None
     baseline_reachable = 0
 
     for ep in endpoints:
@@ -295,6 +300,8 @@ class AccessControlProbes(ProbeBase):
               f"endpoint={ep.path}; denied_method={ep.method}; "
               f"accepted_method={method}; status={resp.status_code}"
             )
+            if bypass_response is None:
+              bypass_response = resp
             break  # one bypass per endpoint is enough
 
     if bypass_evidence:
@@ -314,6 +321,7 @@ class AccessControlProbes(ProbeBase):
         ],
         remediation="Enforce authorization checks regardless of HTTP method. "
                     "Deny all methods by default and explicitly allow required ones.",
+        evidence_artifacts=self.evidence_from(bypass_response),
       ))
     elif tested > 0:
       self.findings.append(GrayboxFinding(
@@ -383,6 +391,7 @@ class AccessControlProbes(ProbeBase):
     tested = 0
     denied = 0
     accepted_evidence = []
+    accepted_response = None
 
     for form_path in form_paths[:5]:  # cap at 5 forms
       self.safety.throttle()
@@ -491,6 +500,8 @@ class AccessControlProbes(ProbeBase):
         accepted_evidence.append(
           f"endpoint={form_path}; persisted_fields={','.join(persisted_fields)}"
         )
+        if accepted_response is None:
+          accepted_response = verify
 
     if accepted_evidence:
       self.findings.append(GrayboxFinding(
@@ -510,6 +521,7 @@ class AccessControlProbes(ProbeBase):
         remediation="Use explicit field allowlists in form/API binding. "
                     "Never bind user input directly to model attributes. "
                     "Django: use ModelForm.Meta.fields. Rails: use strong_parameters.",
+        evidence_artifacts=self.evidence_from(accepted_response),
       ))
     elif tested > 0:
       self.findings.append(GrayboxFinding(
@@ -619,6 +631,7 @@ class AccessControlProbes(ProbeBase):
               f"injected_id={owner_id}; "
               f"before={before_owner!r}; after={after_owner!r}",
               "reverted" if restored else "revert_failed",
+              after,
             ))
             restore_failed = not restored
             success = True
@@ -630,7 +643,7 @@ class AccessControlProbes(ProbeBase):
       if restore_failed:
         break  # no further writes once a transfer could not be undone
 
-    for item, rollback in transferred_evidence:
+    for item, rollback, proof in transferred_evidence:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A04-02",
         title="Mass assignment — ownership field transferable",
@@ -651,6 +664,7 @@ class AccessControlProbes(ProbeBase):
                     "Reject or strip ``owner_user_id`` (and aliases) on "
                     "every write boundary. Use explicit field allowlists "
                     "in serializers / form binding.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
     if not transferred_evidence and tested > 0:
       self.findings.append(GrayboxFinding(
@@ -756,13 +770,14 @@ class AccessControlProbes(ProbeBase):
             f"endpoint={path}; before_owner={before_owner!r}; "
             f"sentinel_title_persisted=True",
             "reverted" if restored else "revert_failed",
+            after,
           ))
           restore_failed = not restored
           break  # one finding per endpoint
       if restore_failed:
         break  # no further writes once a write could not be undone
 
-    for item, rollback in transferred_evidence:
+    for item, rollback, proof in transferred_evidence:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-05",
         title="Ownership update bypass — regular user wrote to non-owned record",
@@ -783,6 +798,7 @@ class AccessControlProbes(ProbeBase):
                     "endpoints. Reject mutating requests where the "
                     "record's owner does not match the authenticated "
                     "principal (or an explicit admin role).",
+        evidence_artifacts=self.evidence_from(proof),
       ))
     if not transferred_evidence and tested > 0:
       self.findings.append(GrayboxFinding(
@@ -809,6 +825,7 @@ class AccessControlProbes(ProbeBase):
       return
 
     deleted_evidence = []
+    deleted_response = None
     tested = 0
     for ep in endpoints:
       for record_id in (ep.test_ids or [1, 2]):
@@ -859,6 +876,7 @@ class AccessControlProbes(ProbeBase):
             f"delete_status={del_resp.status_code}; "
             f"followup_status={after.status_code}"
           )
+          deleted_response = after
           break
       if deleted_evidence:
         # A delete cannot be undone: stop after the first confirmed one.
@@ -882,6 +900,7 @@ class AccessControlProbes(ProbeBase):
         remediation="Apply ownership / role checks on all DELETE "
                     "endpoints. Soft-delete with audit trail is "
                     "preferable when destructive behavior is expected.",
+        evidence_artifacts=self.evidence_from(deleted_response),
       ))
     elif tested > 0:
       self.findings.append(GrayboxFinding(
@@ -923,6 +942,7 @@ class AccessControlProbes(ProbeBase):
     denial_markers = ["access denied", "permission denied", "forbidden",
                       "not authorized", "unauthorized", "403"]
     reachable = []
+    reachable_response = None
     tested = 0
     for path in candidates:
       url = self.target_url + path
@@ -938,6 +958,8 @@ class AccessControlProbes(ProbeBase):
       if any(m in body_lower for m in denial_markers):
         continue
       reachable.append(f"path={path}; status={resp.status_code}")
+      if reachable_response is None:
+        reachable_response = resp
 
     if reachable:
       self.findings.append(GrayboxFinding(
@@ -957,6 +979,7 @@ class AccessControlProbes(ProbeBase):
         remediation="Apply role-gated middleware to every administrative "
                     "URL prefix. Default-deny on path-based admin "
                     "namespaces (``/admin/``, ``/manage/``, etc.).",
+        evidence_artifacts=self.evidence_from(reachable_response),
       ))
     elif tested > 0:
       self.findings.append(GrayboxFinding(
@@ -1029,14 +1052,15 @@ class AccessControlProbes(ProbeBase):
           and m.lower() not in base_body.lower()
         ]
         if new_markers:
-          delta_evidence.append(
+          delta_evidence.append((
             f"path={path}; param={key}={value}; "
             f"new_markers={new_markers}; "
-            f"baseline_len={base_len}; probed_len={len(probed.text)}"
-          )
+            f"baseline_len={base_len}; probed_len={len(probed.text)}",
+            probed,
+          ))
           break
 
-    for item in delta_evidence:
+    for item, proof in delta_evidence:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-10",
         title="Query parameter role override — server honors URL-controlled role",
@@ -1055,6 +1079,7 @@ class AccessControlProbes(ProbeBase):
         remediation="Read role state from the authenticated session "
                     "ONLY. Strip / ignore role-related query parameters "
                     "before authorization decisions.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
     if not delta_evidence and tested > 0:
       self.findings.append(GrayboxFinding(
@@ -1104,6 +1129,7 @@ class AccessControlProbes(ProbeBase):
       re.IGNORECASE,
     )
     tampered_evidence = []
+    tampered_response = None
     tested = 0
     denied = 0
 
@@ -1188,6 +1214,7 @@ class AccessControlProbes(ProbeBase):
             f"form={form_path}; hidden_auth_fields="
             f"{sorted(auth_fields.keys())}; submit_status={resp.status_code}"
           )
+          tampered_response = resp
           # The tampered POST is a write that cannot be undone here: stop
           # after the first accepted one (same exclusion as PT-A01-06).
           break
@@ -1212,6 +1239,7 @@ class AccessControlProbes(ProbeBase):
                     "Strip hidden auth-like fields server-side or use a "
                     "session-bound state token. ModelForms should not "
                     "include role / is_staff in their bound fields.",
+        evidence_artifacts=self.evidence_from(tampered_response),
       ))
     elif tested > 0:
       self.findings.append(GrayboxFinding(

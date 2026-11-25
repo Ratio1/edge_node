@@ -103,6 +103,21 @@ class TestCors(unittest.TestCase):
     self.assertEqual(vuln[0].severity, "LOW")
 
 
+  def test_cors_reflected_origin_on_several_paths(self):
+    """RM-060: a second reflecting path used to raise NameError and drop the whole finding."""
+    probe = _make_probe()
+    probe.discovered_routes = ["/api/a/", "/api/b/"]
+    session = probe.auth.anon_session
+    session.get.return_value = _mock_response(
+      headers={"Access-Control-Allow-Origin": "http://evil.example.com",
+               "Access-Control-Allow-Credentials": "true"},
+    )
+    probe._test_cors()
+    self.assertGreaterEqual(session.get.call_count, 2)
+    vuln = [f for f in probe.findings if f.scenario_id == "PT-A02-02" and f.status == "vulnerable"]
+    self.assertEqual(len(vuln), 1)
+    self.assertEqual(vuln[0].severity, "HIGH")
+
 class TestSecurityHeaders(unittest.TestCase):
 
   def test_security_headers_missing(self):

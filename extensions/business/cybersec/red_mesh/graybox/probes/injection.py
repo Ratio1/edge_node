@@ -153,6 +153,7 @@ class InjectionProbes(ProbeBase):
         + (f" and with {hit['payload_false']}." if hit["payload_false"] else "."),
       ],
       remediation="Use parameterized queries; never build SQL from request input.",
+      evidence_artifacts=self.evidence_from(hit.get("response")),
     )
     if authenticated:
       finding = dataclasses.replace(
@@ -284,7 +285,7 @@ class InjectionProbes(ProbeBase):
 
       # Check for reflection
       if payload in resp.text:
-        vulnerable.append((label, cwe, payload))
+        vulnerable.append((label, cwe, payload, resp))
 
     sqli_hit = False
     login_cap = {"left": LOGIN_MAX_PER_SCAN}
@@ -307,7 +308,7 @@ class InjectionProbes(ProbeBase):
     session.close()
 
     if vulnerable:
-      for label, cwe, payload in vulnerable:
+      for label, cwe, payload, proof in vulnerable:
         if label == "sqli":
           if sqli_hit:
             continue  # confirmed above; reflection is not a second finding
@@ -347,6 +348,7 @@ class InjectionProbes(ProbeBase):
             "Observe payload reflected in the response.",
           ],
           remediation="Apply input validation and output encoding on all form fields.",
+          evidence_artifacts=self.evidence_from(proof),
         ))
     elif not sqli_hit:
       self.findings.append(GrayboxFinding(
@@ -436,7 +438,7 @@ class InjectionProbes(ProbeBase):
         tested += 1
 
         if payload in resp.text:
-          vulnerable_forms.append((form_action, label, cwe, all_inputs[0]))
+          vulnerable_forms.append((form_action, label, cwe, all_inputs[0], resp))
 
       # Real SQLi check per input: POSTs to discovered forms are stateful-gated
       # (a POST can write); POST-only actions stay skipped. Time is GET only.
@@ -453,7 +455,7 @@ class InjectionProbes(ProbeBase):
           if outcome in ("budget", "rate_limited", "csrf_unavailable"):
             break
 
-    for form_action, label, cwe, field in vulnerable_forms:
+    for form_action, label, cwe, field, proof in vulnerable_forms:
       if label == "sqli":
         if form_action in sqli_hits:
           continue  # confirmed above; reflection is not a second finding
@@ -492,6 +494,7 @@ class InjectionProbes(ProbeBase):
           "Observe payload reflected in the response.",
         ],
         remediation="Apply input validation and output encoding on all form fields.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
 
     if tested > 0 and not vulnerable_forms and not sqli_hits:
@@ -596,6 +599,7 @@ class InjectionProbes(ProbeBase):
           ],
           remediation="Apply output encoding on all user-supplied content. "
                       "Use Content-Security-Policy to mitigate impact.",
+          evidence_artifacts=self.evidence_from(readback),
         ))
         return
 
@@ -671,6 +675,7 @@ class InjectionProbes(ProbeBase):
             "Observe server-side fetch of local callback URL.",
           ],
           remediation="Apply strict outbound URL allowlists and block local network ranges.",
+          evidence_artifacts=self.evidence_from(resp),
         ))
         return
 
@@ -753,6 +758,7 @@ class InjectionProbes(ProbeBase):
               "Reject loopback / link-local / private ranges before issuing "
               "the outbound request."
             ),
+            evidence_artifacts=self.evidence_from(resp),
           ))
           return  # one body-field demo per scan is sufficient
 
@@ -847,6 +853,7 @@ class InjectionProbes(ProbeBase):
         if location:
           vulnerable_evidence.append((
             path, param, f"endpoint={path}; param={param}; location={location}",
+            resp,
           ))
           break  # one redirect per path is enough
 
@@ -869,13 +876,14 @@ class InjectionProbes(ProbeBase):
           if location2:
             vulnerable_evidence.append((
               path, param, f"endpoint={path}; param={param}; location={location2}",
+              resp2,
             ))
             break
 
       if len(vulnerable_evidence) >= 3:
         break  # enough evidence
 
-    for path, param, item in vulnerable_evidence:
+    for path, param, item, proof in vulnerable_evidence:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-04",
         title="Open redirect via URL parameter",
@@ -893,6 +901,7 @@ class InjectionProbes(ProbeBase):
                     "Use relative paths only, or verify the destination host "
                     "matches your domain. Never pass user input directly to "
                     "Location headers.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
     if not vulnerable_evidence and tested > 0:
       self.findings.append(GrayboxFinding(
@@ -977,6 +986,7 @@ class InjectionProbes(ProbeBase):
               vulnerable_evidence.append((
                 route, param, payload,
                 f"endpoint={route}; param={param}; payload={payload}",
+                resp,
               ))
               route_hit = True
               break  # one hit per route+param is enough
@@ -986,7 +996,7 @@ class InjectionProbes(ProbeBase):
       if len(vulnerable_evidence) >= 3:
         break
 
-    for route, param, payload, item in vulnerable_evidence:
+    for route, param, payload, item, proof in vulnerable_evidence:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-03",
         title="Path traversal — file content disclosed",
@@ -1005,6 +1015,7 @@ class InjectionProbes(ProbeBase):
                     "Use a whitelist of allowed files, canonicalize paths, "
                     "and ensure they stay within the application's base directory. "
                     "Never pass user input directly to file system operations.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
     if not vulnerable_evidence and tested > 0:
       self.findings.append(GrayboxFinding(
@@ -1060,9 +1071,9 @@ class InjectionProbes(ProbeBase):
       if resp.status_code == 200 and sentinel in resp.text:
         vulnerable.append((ep,
           f"endpoint={ep.path}; param={ep.param}; payload_reflected_unescaped=True"
-          + self._source_tag(ep)))
+          + self._source_tag(ep), resp))
 
-    for ep, item in vulnerable:
+    for ep, item, proof in vulnerable:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-04",
         title="Reflected XSS — payload echoed unescaped",
@@ -1080,6 +1091,7 @@ class InjectionProbes(ProbeBase):
         remediation="Escape user input on output (Django ``|escape``, "
                     "Jinja autoescape, etc.). Apply a Content Security "
                     "Policy that disallows inline scripts.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
     if not vulnerable and tested > 0:
       self.findings.append(GrayboxFinding(
@@ -1139,11 +1151,12 @@ class InjectionProbes(ProbeBase):
           vulnerable.append((ep,
             f"endpoint={ep.path}; param={ep.param}; "
             f"payload={payload}; sentinel_in_body=True"
-            + self._source_tag(ep)
+            + self._source_tag(ep),
+            resp,
           ))
           break
 
-    for ep, item in vulnerable:
+    for ep, item, proof in vulnerable:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-06",
         title="Server-side template injection — expression evaluated",
@@ -1161,6 +1174,7 @@ class InjectionProbes(ProbeBase):
         remediation="Never render user-controlled data through a template "
                     "engine. If templates must be dynamic, use a sandbox "
                     "or precompiled templates only.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
     if not vulnerable and tested > 0:
       self.findings.append(GrayboxFinding(
@@ -1217,11 +1231,12 @@ class InjectionProbes(ProbeBase):
           vulnerable.append((ep,
             f"endpoint={ep.path}; param={ep.param}; "
             f"payload={payload}; uid_marker_in_body=True"
-            + self._source_tag(ep)
+            + self._source_tag(ep),
+            resp,
           ))
           break
 
-    for ep, item in vulnerable:
+    for ep, item, proof in vulnerable:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-07",
         title="OS command injection — shell metacharacters honored",
@@ -1241,6 +1256,7 @@ class InjectionProbes(ProbeBase):
                     "(``subprocess.run([...], shell=False)``) and pass "
                     "the input as an argv element, never a substring of "
                     "the command line.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
     if not vulnerable and tested > 0:
       self.findings.append(GrayboxFinding(
@@ -1298,10 +1314,11 @@ class InjectionProbes(ProbeBase):
         vulnerable.append((ep,
           f"endpoint={ep.path}; param={ep.param}; "
           f"injected_header={inject_name}: {inject_value}"
-          + self._source_tag(ep)
+          + self._source_tag(ep),
+          resp,
         ))
 
-    for ep, item in vulnerable:
+    for ep, item, proof in vulnerable:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-12",
         title="HTTP header injection via CRLF",
@@ -1321,6 +1338,7 @@ class InjectionProbes(ProbeBase):
         remediation="Strip ``\\r`` and ``\\n`` from values before they "
                     "land in response headers. Validate redirect "
                     "targets against an allowlist of paths.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
     if not vulnerable and tested > 0:
       self.findings.append(GrayboxFinding(
@@ -1389,11 +1407,12 @@ class InjectionProbes(ProbeBase):
         if resp.status_code < 400:
           vulnerable.append((ep,
             f"endpoint={ep.path}; field={ep.field}; "
-            f"variant={variant!r}; status={resp.status_code}"
+            f"variant={variant!r}; status={resp.status_code}",
+            resp,
           ))
           break
 
-    for ep, item in vulnerable:
+    for ep, item, proof in vulnerable:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-15",
         title="JSON body type confusion — non-integer accepted",
@@ -1414,6 +1433,7 @@ class InjectionProbes(ProbeBase):
                     "(pydantic, marshmallow, JSON Schema). Reject "
                     "lists, dicts, or operator-keys when an integer "
                     "is expected.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
     if not vulnerable and tested > 0:
       self.findings.append(GrayboxFinding(

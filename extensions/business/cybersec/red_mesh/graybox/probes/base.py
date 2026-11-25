@@ -860,6 +860,15 @@ class ProbeBase:
       sanitized = self.safety.sanitize_error(str(value))
     return self._scrub_for_emission(sanitized)
 
+  def evidence_from(self, response):
+    """Evidence artifacts for a finding built directly with `GrayboxFinding`.
+
+    Same artifact `emit_vulnerable(response=...)` builds, without changing how
+    the finding itself is constructed. Empty when there is no response.
+    """
+    built = _best_effort(_artifact_from_response, response, self._scrub_for_emission)
+    return self._scrub_for_emission([built]) if built is not None else []
+
   def emit_vulnerable(self, scenario_id, title, severity, owasp, cwe,
                        evidence, *, attack=None, evidence_artifacts=None,
                        replay_steps=None, remediation=None,
