@@ -247,7 +247,7 @@ FINGERPRINT_HTTP_TIMEOUT = 4   # seconds — active HTTP probe timeout (honeypot
 FINGERPRINT_NUDGE_TIMEOUT = 3  # seconds — generic \r\n nudge probe timeout
 
 # Blackbox web injection caps (RM-275). Workers may override any key through a
-# `web_injection_caps` dict attribute; every cap that bites is named in the probe's coverage note.
+# `web_injection_caps` dict attribute; the candidate, request, page and time caps are named in the probe's coverage note.
 WEB_INJECTION_CAPS = {
   "crawl_max_pages": 30,           # routes fetched by the shared crawl, per base URL
   "crawl_max_depth": 2,            # link depth from the root

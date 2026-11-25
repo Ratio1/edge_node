@@ -66,7 +66,7 @@ def crawl_routes(worker, base_url):
       scope_prefix="", max_pages=caps["crawl_max_pages"], max_depth=caps["crawl_max_depth"]),
     logout_path="")
   auth = SimpleNamespace(primary_session=None, anon_session=session)
-  info = {"error": None, "pages": 0, "page_cap_reached": False, "seed_fetch_failures": 0,
+  info = {"error": None, "pages_visited": 0, "page_cap_reached": False, "seed_fetch_failures": 0,
           "candidate_store_cap": MAX_STORED_CANDIDATES, "candidate_store_cap_reached": False}
   result = None
   try:
@@ -74,11 +74,11 @@ def crawl_routes(worker, base_url):
     module.fetch_timeout = worker._target_timeout(3)
     result = module.discover_result()
     info.update(
-      pages=len(result.routes), page_cap_reached=len(result.routes) >= caps["crawl_max_pages"],
+      pages_visited=module.pages_visited, page_cap_reached=module.pages_visited >= caps["crawl_max_pages"],
       seed_fetch_failures=result.fetch_failures,
       candidate_store_cap_reached=len(result.candidates) >= MAX_STORED_CANDIDATES)
   except Exception as exc:
-    info["error"] = f"{type(exc).__name__}: {exc}"
+    info["error"] = f"{type(exc).__name__}: {exc}"[:MAX_LABEL]
   finally:
     session.close()
   cache[base_url] = (result, info)

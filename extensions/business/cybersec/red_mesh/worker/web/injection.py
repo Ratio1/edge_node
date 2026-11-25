@@ -11,8 +11,7 @@ from urllib.parse import quote, urlencode
 
 from ...findings import AffectedAsset, Evidence, Finding, Severity, probe_result, probe_error
 from ...graybox.probes.sqli import (
-  BOOLEAN_PAIRS, DBMS_ERRORS, ERROR_PAYLOADS, SCAN_TIME_ALLOWANCE, TIME_DELAY, TIME_PAYLOADS,
-  _signature, dbms_from_text, detect_sqli,
+  DBMS_ERRORS, SCAN_TIME_ALLOWANCE, SQLI_STRIP, TIME_DELAY, _signature, dbms_from_text, detect_sqli,
 )
 from .route_crawl import finish_coverage, label, plan_candidates, web_caps
 from ...cve_db import HINT_SPRING_FRAMEWORK, HINT_STRUTS2, probe_cve_fields
@@ -122,7 +121,8 @@ def _raw_path_get(scheme, host, port, path, timeout):
 
 
 MAX_INJECTION_BODY_BYTES = 1024 * 1024  # largest injection response body kept; more is truncated
-MAX_TITLE_PARAM = 64
+MAX_PARAM = 64    # chars of a target-controlled parameter name kept in a finding
+MAX_PATH = 200    # chars of a target-controlled route path kept in a finding
 _SQLI_GUESSED_PARAMS = ("id", "page", "q", "user", "item", "cat")
 _XSS_GUESSED_PARAMS = ("q", "search", "id", "name", "page", "input", "text")
 _ANSWERS_ANY = ("The endpoint answers any parameter name the same way (a random parameter name "
@@ -130,8 +130,6 @@ _ANSWERS_ANY = ("The endpoint answers any parameter name the same way (a random 
 _CONTROL_FAILED = "The control request under a random parameter name could not run, so the hit is unconfirmed."
 # Elements whose content is not parsed as markup: a marker tag inside one is no injection.
 _RAW_TEXT_TAGS = frozenset({"textarea", "title", "noscript", "xmp", "plaintext", "iframe", "noembed"})
-_SQLI_STRIP = ([p for pair in BOOLEAN_PAIRS for p in pair] + list(ERROR_PAYLOADS)
-               + [p for _, p in TIME_PAYLOADS])
 
 
 def _web_base_url(target, port):
@@ -171,6 +169,11 @@ def _stop_run(coverage, candidates, reason):
 
 def _control_name():
   return "rm" + secrets.token_hex(4)
+
+
+def _cut(text, limit):
+  """A target-controlled name, cut for a finding (the request keeps the full text)."""
+  return text if text is None or len(text) <= limit else text[:limit] + "..."
 
 
 def _asset(target, port, path, param):
@@ -242,13 +245,15 @@ def _xss_control_note(fetch):
   return _ANSWERS_ANY if confidence == "firm" else ""
 
 
-def _xss_finding(target, port, url, path, param, confidence, context, resp, payload, note):
+def _xss_finding(target, port, base_url, path, param, confidence, context, resp, payload, note):
+  path, param = _cut(path, MAX_PATH), _cut(param, MAX_PARAM)
+  url = _request_url(base_url, path, param, payload) if param else f"{base_url}/{payload}"
   where = f"?{param}= parameter" if param else "URL path"
   parsed = "parsed as a tag" if confidence == "firm" or note else "echoed raw but not parsed as a tag"
   return Finding(
     severity=Severity.HIGH,
     cvss_vector=V.XSS_REFLECTED,
-    title=f"Reflected XSS via {'?' + param[:MAX_TITLE_PARAM] + '= parameter' if param else 'URL path'}",
+    title=f"Reflected XSS via {where}",
     description=f"A marker payload sent in the {where} came back {parsed} ({context} context)."
                 + (f" {note}" if note else ""),
     evidence=f"URL: {url}; marker {parsed}, context {context}",
@@ -265,23 +270,27 @@ def _xss_finding(target, port, url, path, param, confidence, context, resp, payl
 def _sqli_control_note(hit, fetch):
   """"" when a random parameter name does not reproduce an error or boolean hit; else the caveat.
 
-  `fetch(value)` sends under the random name. Error: the same DBMS error. Boolean: TRUE and FALSE
-  differ, i.e. the endpoint reacts to any parameter. A control that raises leaves the hit unconfirmed.
+  `fetch(name, value)` sends under a name. One random name serves the whole control. Error: the same
+  DBMS error. Boolean: the base value, TRUE and FALSE sent under it show the hit's own pattern (TRUE
+  like the base, FALSE not), i.e. the endpoint reacts to any parameter; a page that only echoes its
+  query string does not. A control that raises leaves the hit unconfirmed.
   """
+  name = _control_name()
   try:
     if hit["technique"] == "error":
-      reproduced = dbms_from_text(fetch(hit["payload_true"]).text) == hit["dbms"]
+      reproduced = dbms_from_text(fetch(name, hit["payload_true"]).text) == hit["dbms"]
     else:
-      reproduced = (_signature(fetch(hit["payload_true"]), _SQLI_STRIP, "1")
-                    != _signature(fetch(hit["payload_false"]), _SQLI_STRIP, "1"))
+      base = _signature(fetch(name, "1"), SQLI_STRIP, "1")
+      reproduced = (_signature(fetch(name, hit["payload_true"]), SQLI_STRIP, "1") == base
+                    and _signature(fetch(name, hit["payload_false"]), SQLI_STRIP, "1") != base)
   except Exception:
     return _CONTROL_FAILED
   return _ANSWERS_ANY if reproduced else ""
 
 
 def _sqli_finding(target, port, base_url, cand, hit, note):
-  technique, param = hit["technique"], cand.param
-  url = _request_url(base_url, cand.path, param, hit["payload_true"])
+  technique, param, path = hit["technique"], _cut(cand.param, MAX_PARAM), _cut(cand.path, MAX_PATH)
+  url = _request_url(base_url, path, param, hit["payload_true"])
   text = getattr(hit.get("response"), "text", "") or ""
   match = DBMS_ERRORS[hit["dbms"]].search(text) if technique == "error" and hit["dbms"] in DBMS_ERRORS else None
   how = {
@@ -292,8 +301,8 @@ def _sqli_finding(target, port, base_url, cand, hit, note):
   return Finding(
     severity=Severity.HIGH,
     cvss_vector=V.INJECTION_DATA_ACCESS,
-    title=f"SQL injection ({technique}-based) via ?{param[:MAX_TITLE_PARAM]}=",
-    description=f"{how} Parameter '{param}' on {cand.path}." + (f" {note}" if note else ""),
+    title=f"SQL injection ({technique}-based) via ?{param}=",
+    description=f"{how} Parameter '{param}' on {path}." + (f" {note}" if note else ""),
     evidence=f"URL: {url}; payload {hit['payload_true']!r}"
              + (f", false payload {hit['payload_false']!r}" if hit["payload_false"] else ""),
     evidence_items=_traversal_evidence(url, text, (match.group(0),) if match else ()),
@@ -301,7 +310,7 @@ def _sqli_finding(target, port, base_url, cand, hit, note):
     owasp_id="A03:2021",
     cwe_id="CWE-89",
     confidence="tentative" if note else hit["confidence"],
-    affected_assets=_asset(target, port, cand.path, param),
+    affected_assets=_asset(target, port, path, param),
   )
 
 
@@ -470,7 +479,7 @@ class _WebInjectionMixin:
       if confidence:
         # The asset names the root, not the payload path, so the identity does not depend on the marker.
         findings_list.append(_xss_finding(
-          target, port, url, "/", None, confidence, context, resp, payload, note))
+          target, port, base_url, "/", None, confidence, context, resp, payload, note))
     except Exception:
       pass
 
@@ -494,8 +503,7 @@ class _WebInjectionMixin:
           if note:
             confidence = "tentative"
         findings_list.append(_xss_finding(
-          target, port, _request_url(base_url, cand.path, cand.param, payload), cand.path, cand.param,
-          confidence, context, resp, payload, note))
+          target, port, base_url, cand.path, cand.param, confidence, context, resp, payload, note))
       except Exception as exc:
         coverage["inconclusive"][label(cand)] = type(exc).__name__
 
@@ -557,7 +565,7 @@ class _WebInjectionMixin:
       if outcome == "hit":
         note = ""
         if res["technique"] in ("error", "boolean"):
-          note = _sqli_control_note(res, lambda v: fetch(cand.path, _control_name(), v))
+          note = _sqli_control_note(res, lambda n, v: fetch(cand.path, n, v))
         findings_list.append(_sqli_finding(target, port, base_url, cand, res, note))
       elif outcome != "clean":
         coverage["inconclusive"][label(cand)] = outcome

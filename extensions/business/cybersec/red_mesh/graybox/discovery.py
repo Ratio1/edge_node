@@ -94,6 +94,7 @@ class DiscoveryModule:
     self.routes = []
     self.forms = []
     self.fetch_failures = 0
+    self.pages_visited = 0  # paths fetched or tried: what max_pages counts, failed fetches included
     # Per-request timeout of a discovery fetch; a network scan sets its own.
     self.fetch_timeout = 10
     api = getattr(target_config, "api_security", None)
@@ -267,6 +268,7 @@ class DiscoveryModule:
         for name in spec["inputs"]:
           self._add_candidate(target, name, candidates)
 
+    self.pages_visited = len(visited)
     self.routes = sorted(all_routes)
     self.forms = sorted(all_forms)
     return DiscoveryResult(

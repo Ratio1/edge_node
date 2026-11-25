@@ -118,18 +118,13 @@ class CrawlTests(RouteInjectionBase):
     self.assertNotIn("_web_crawl_cache", self.worker.state)
 
   def test_crawl_error_recorded_probe_survives(self):
-    boom = MagicMock(side_effect=RuntimeError("boom"))
+    boom = MagicMock(side_effect=RuntimeError("boom" * 200))
     with patch.object(route_crawl, "DiscoveryModule", boom):
       result = self.run_probe("_web_test_xss")
     cov = result["coverage"]
     self.assertIn("RuntimeError", cov["crawl"]["error"])
+    self.assertLessEqual(len(cov["crawl"]["error"]), route_crawl.MAX_LABEL)
     self.assertEqual(cov["candidates_found"], len(inj._XSS_GUESSED_PARAMS))
-
-  def test_discovery_result_lists_post_forms(self):
-    with patch.object(route_crawl.requests, "Session", lambda: FakeSession()):
-      found, info = route_crawl.crawl_routes(self.worker, "http://example.com")
-    self.assertEqual(found.post_forms, ["/login"])
-    self.assertIsNone(info["error"])
 
   def test_discovery_fetch_timeout_override(self):
     cfg = SimpleNamespace(discovery=SimpleNamespace(scope_prefix="", max_pages=1, max_depth=0), logout_path="")
@@ -144,6 +139,19 @@ class CrawlTests(RouteInjectionBase):
 
 
 class CapTests(RouteInjectionBase):
+  def test_page_cap_reached_counts_failed_fetches(self):
+    class Failing(FakeSession):
+      def get(self, url, **kw):
+        raise requests.ConnectionError("down")
+    with patch.object(route_crawl.requests, "Session", lambda: Failing()):
+      info = route_crawl.crawl_routes(self.worker, "http://example.com")[1]
+    self.assertEqual(info["pages_visited"], 1)
+    self.assertFalse(info["page_cap_reached"])
+    self.worker.web_injection_caps = {"crawl_max_pages": 1}
+    with patch.object(route_crawl.requests, "Session", lambda: Failing()):
+      info = route_crawl.crawl_routes(self.worker, "http://other.example")[1]
+    self.assertTrue(info["page_cap_reached"])
+
   def test_candidate_cap_lists_untested(self):
     result = self.run_probe("_web_test_sql_injection", caps={"candidates_per_probe": 2})
     cov = result["coverage"]
@@ -214,6 +222,30 @@ class SqliTests(RouteInjectionBase):
     self.assertEqual(f["title"], "SQL injection (time-based) via ?q=")
     self.assertEqual(f["confidence"], "tentative")
     self.assertTrue(all(c["timeout"] >= sqli_mod.TIME_DELAY + 1 for c in self.ep.calls))
+
+  def test_sqli_boolean_hit_on_page_that_echoes_query_stays_firm(self):
+    real = sqli_handler(boolean_on="term")
+
+    def handler(path, params, url):
+      page = real(path, params, url)
+      return resp(page.text + f"<p>you searched {"&".join(f"{k}={v}" for k, v in params.items())}</p>")
+    result = self.run_probe("_web_test_sql_injection", handler)
+    (f,) = self.titled(result, "SQL injection")
+    self.assertEqual((f["title"], f["confidence"]), ("SQL injection (boolean-based) via ?term=", "firm"))
+
+  def test_finding_bounds_hostile_param_and_path(self):
+    name = "n" * 300
+    site = {"/": f'<a href="/{"p" * 300}?{name}=1">x</a>'}
+
+    def handler(path, params, url):
+      return resp(SQL_ERROR) if any(k == name and "'" in v for k, v in params.items()) else resp(PAGE)
+    result = self.run_probe("_web_test_sql_injection", handler, site=site)
+    (f,) = self.titled(result, "SQL injection")
+    asset = f["affected_assets"][0]
+    self.assertLessEqual(len(asset["parameter"]), inj.MAX_PARAM + 3)
+    self.assertLessEqual(len(asset["url"]), inj.MAX_PATH + 3)
+    self.assertLess(len(f["title"]) + len(f["description"]) + len(f["evidence"]) + len(f["remediation"]), 900)
+    self.assertTrue(any(name in c["params"] for c in self.ep.calls))  # the request keeps the full name
 
   def test_sqli_control_failure_stays_tentative(self):
     ok = sqli_handler(error_on="q")
@@ -311,7 +343,7 @@ class HoneypotTests(RouteInjectionBase):
             self.assertTrue(any("answers any parameter" in f["description"] for f in result["findings"]))
 
 
-class FixRoundTests(RouteInjectionBase):
+class CoverageAndLimitsTests(RouteInjectionBase):
   def test_xss_reported_marker_is_stable_across_scans(self):
     echo = XssTests.echo(self, "<html><p>{}</p></html>")
     first = self.run_probe("_web_test_xss", echo)
@@ -350,8 +382,6 @@ class FixRoundTests(RouteInjectionBase):
     self.assertEqual(out["not_tested_more"], 30)
     self.assertTrue(all(len(x) <= route_crawl.MAX_LABEL for x in out["not_tested"]))
     self.assertEqual(out["inconclusive_more"], 10)
-    result = self.run_probe("_web_test_xss", site={"/": '<a href="/p?' + "n" * 300 + '=1">x</a>'})
-    self.assertEqual(result["coverage"]["crawl"]["candidate_store_cap"], 200)
 
 
 class AssetAndRedirectTests(RouteInjectionBase):

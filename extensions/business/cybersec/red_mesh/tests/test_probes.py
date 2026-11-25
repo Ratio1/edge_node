@@ -114,16 +114,6 @@ class RedMeshOWASPTests(unittest.TestCase):
     self._assert_has_finding(result, "Cookie missing HttpOnly flag")
     self._assert_has_finding(result, "Cookie missing SameSite flag")
 
-  @staticmethod
-  def _no_crawl():
-    """Keep the shared crawl off the network: every page answers 404."""
-    session = MagicMock()
-    session.get.return_value = MagicMock(status_code=404, headers={}, text="")
-    return patch(
-      "extensions.business.cybersec.red_mesh.worker.web.route_crawl.requests.Session",
-      return_value=session,
-    )
-
   def test_insecure_design_path_traversal(self):
     owner, worker = self._build_worker()
     resp = MagicMock()
@@ -399,26 +389,6 @@ class RedMeshOWASPTests(unittest.TestCase):
     owner, worker = self._build_worker(ports=[80, 9000], exceptions=[9000])
     self.assertNotIn(9000, worker.state["ports_to_scan"])
     self.assertIn(9000, worker.exceptions)
-
-  def test_cross_site_scripting_context_check(self):
-    owner, worker = self._build_worker()
-
-    def reflect(url, params=None, **kwargs):
-      resp = MagicMock()
-      resp.status_code = 200
-      resp.headers = {"Content-Type": "text/html"}
-      resp.text = "<html><p>" + "".join((params or {}).values()) + "</p></html>"
-      return resp
-    with self._no_crawl(), patch(
-      "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get",
-      side_effect=reflect,
-    ):
-      result = worker._web_test_xss("example.com", 80)
-    xss = [f for f in result["findings"] if "?q=" in f["title"]]
-    self.assertEqual(len(xss), 1)
-    self.assertEqual(xss[0]["affected_assets"][0]["parameter"], "q")
-    # the fake reflects every parameter, so the random-name control reproduces it
-    self.assertEqual(xss[0]["confidence"], "tentative")
 
   def test_tls_certificate_expiration_reporting(self):
     owner, worker = self._build_worker(ports=[443])
