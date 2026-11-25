@@ -312,7 +312,7 @@ class ProbeBase:
     if auth is None:
       return False
     auth_type = getattr(auth, "auth_type", "form") or "form"
-    if auth_type not in ("bearer", "api_key"):
+    if auth_type not in ("bearer", "api_key", "basic"):
       return False
     probe_path = (getattr(auth, "authenticated_probe_path", "") or "").strip()
     return bool(getattr(auth, "allow_unverified_auth", False)) and not probe_path

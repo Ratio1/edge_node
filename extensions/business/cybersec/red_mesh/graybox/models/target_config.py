@@ -23,6 +23,13 @@ COMMON_CSRF_FIELDS = [
   "_token",               # Laravel
 ]
 
+# Login pages tried, in order, when the configured login_path answers >= 400.
+# Six entries: the search cap is 8 GETs, minus the configured path and the root.
+# Product paths are data: engine code never branches on a product name.
+LOGIN_DISCOVERY_PATHS = (
+  "/login", "/signin", "/wp-login.php", "/backend", "/user/login", "/users/sign_in",
+)
+
 
 _SECRET_BODY_KEY_PARTS = (
   "password", "passwd", "pwd", "secret", "api_key", "apikey",
@@ -793,7 +800,7 @@ class AuthDescriptor:
                must resolve to a non-empty value when authenticated and
                not when anonymous (e.g. ``user.id``).
   """
-  auth_type: str = "form"   # "form" | "bearer" | "api_key"
+  auth_type: str = "form"   # "form" | "bearer" | "api_key" | "basic"
   bearer_token_header_name: str = "Authorization"
   bearer_scheme: str = "Bearer"
   bearer_refresh_url: str = ""

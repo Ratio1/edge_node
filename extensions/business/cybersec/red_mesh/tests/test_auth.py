@@ -1106,11 +1106,11 @@ class TestAuthManagerLifecycle(unittest.TestCase):
 
   @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
   def test_preflight_login_404(self, mock_requests):
-    """preflight_check returns error if login page returns 404."""
+    """preflight_check returns error if an override login page returns 404."""
     mock_requests.head.return_value = _mock_response(status=200)
     mock_requests.get.return_value = _mock_response(status=404)
     mock_requests.RequestException = Exception
-    auth = _make_auth()
+    auth = _make_auth(target_config=GrayboxTargetConfig(login_path="/custom/login"))
     err = auth.preflight_check()
     self.assertIsNotNone(err)
     self.assertIn("404", err)

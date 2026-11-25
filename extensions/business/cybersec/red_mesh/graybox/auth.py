@@ -15,6 +15,7 @@ subphases route to `BearerAuth` / `ApiKeyAuth` based on
 `target_config.api_security.auth.auth_type`.
 """
 
+import dataclasses
 import re
 import time
 from urllib.parse import urljoin, urlparse
@@ -23,7 +24,9 @@ import requests
 
 from ..constants import GRAYBOX_SESSION_MAX_AGE
 from .auth_credentials import Credentials
-from .auth_strategies import ApiKeyAuth, BearerAuth, FormAuth
+from .auth_strategies import (
+  ApiKeyAuth, BasicAuth, BearerAuth, FormAuth, LOGIN_NOT_FOUND, LoginTarget,
+)
 from .http_client import GrayboxScopeError, normalize_request_url
 from .models.target_config import COMMON_CSRF_FIELDS
 from .models import GrayboxAuthState
@@ -58,6 +61,9 @@ class AuthManager:
     self._auth_errors = []
     self._auth_diagnostics = []
     self._detected_csrf_field = None
+    # Form login found by FormAuth's search: LoginTarget, LOGIN_NOT_FOUND or
+    # None (not searched yet). The search runs at most once per manager.
+    self._login_target = None
 
   @property
   def detected_csrf_field(self) -> str | None:
@@ -439,13 +445,17 @@ class AuthManager:
       # login page and detected the CSRF field — preserve it.
       if strategy.last_detected_csrf_field:
         self._detected_csrf_field = strategy.last_detected_csrf_field
+      self._remember_login_target(strategy)  # a retry must not search again
       return None, True
     # Always propagate whatever CSRF field the strategy saw, regardless
     # of whether the credential check ultimately succeeded.
     if strategy.last_detected_csrf_field:
       self._detected_csrf_field = strategy.last_detected_csrf_field
+    self._remember_login_target(strategy)
     if session is None:
-      self._record_auth_diagnostic("login_rejected", strategy.last_response)
+      self._record_auth_diagnostic(
+        getattr(strategy, "failure_stage", "") or "login_rejected",
+        strategy.last_response)
     if session is not None:
       valid, retryable_failure = self._validate_authenticated_session(session)
       if not valid:
@@ -456,6 +466,27 @@ class AuthManager:
         return None, retryable_failure
       return session, False
     return None, False
+
+  def _remember_login_target(self, strategy):
+    """Cache what the form search found and write the detected names back
+    to ``target_config``, before the session is validated, so the probe-path
+    redirect check and every probe use the detected login page and fields."""
+    if getattr(strategy, "search_found_nothing", False):
+      self._login_target = LOGIN_NOT_FOUND
+    found = getattr(strategy, "found_login_target", None)
+    if found is None:
+      return
+    self._login_target = found
+    base = urlparse(self.target_url).path.rstrip("/")
+    page = urlparse(found.page_url)
+    path = page.path + (f"?{page.query}" if page.query else "")
+    if base and not page.path.startswith(base + "/"):
+      path = self.target_config.login_path  # outside the base: cache still drives login
+    elif base:
+      path = path[len(base):]
+    self.target_config = dataclasses.replace(
+      self.target_config, login_path=path,
+      username_field=found.username_field, password_field=found.password_field)
 
   def _authenticated_probe_path(self) -> str:
     api_security = getattr(self.target_config, "api_security", None)
@@ -761,10 +792,14 @@ class AuthManager:
     ``form``   → FormAuth (existing form-login)
     ``bearer`` → BearerAuth (Subphase 1.5 commit #6)
     ``api_key``→ ApiKeyAuth (Subphase 1.5 commit #7)
+    ``basic``  → BasicAuth
     """
     auth_type = self._resolve_auth_type()
     if auth_type == "form":
-      return FormAuth(self.target_url, self.target_config, self.verify_tls, self.http_client)
+      return FormAuth(self.target_url, self.target_config, self.verify_tls,
+                      self.http_client, self._login_target)
+    if auth_type == "basic":
+      return BasicAuth(self.target_url, self.target_config, self.verify_tls, self.http_client)
     if auth_type == "bearer":
       return BearerAuth(self.target_url, self.target_config, self.verify_tls, self.http_client)
     if auth_type == "api_key":

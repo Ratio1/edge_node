@@ -3,6 +3,7 @@
 import unittest
 from unittest.mock import MagicMock, patch, PropertyMock
 
+from extensions.business.cybersec.red_mesh.graybox.models.target_config import GrayboxTargetConfig
 from extensions.business.cybersec.red_mesh.graybox.worker import GrayboxLocalWorker
 from extensions.business.cybersec.red_mesh.worker.base import BaseLocalWorker
 from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxEvidenceArtifact, GrayboxFinding
@@ -465,6 +466,16 @@ class TestExecution(unittest.TestCase):
     self.assertTrue(worker.state["done"])
     metrics = worker.metrics.build()
     self.assertTrue(len(metrics.phase_durations) > 0)
+
+  def test_authentication_phase_adopts_the_detected_login_config(self):
+    """Probes read the login page and fields the auth manager detected."""
+    worker = _make_worker()
+    detected = GrayboxTargetConfig(login_path="/signin", username_field="user_login")
+    worker.auth = MagicMock()
+    worker.auth.authenticate.return_value = True
+    worker.auth.target_config = detected
+    worker._run_authentication_phase()
+    self.assertIs(worker.target_config, detected)
 
   def test_worker_builds_typed_credentials(self):
     worker = _make_worker(regular_username="alice", regular_password="pass", weak_candidates=["admin:admin"])

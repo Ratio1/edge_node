@@ -446,6 +446,8 @@ class GrayboxLocalWorker(BaseLocalWorker):
           "Request budget exhausted during authentication.",
           reason_class="budget_exhausted",
         )
+      # Probes read the login page and field names the form search detected.
+      self.target_config = self.auth.target_config
       self._store_auth_results()
       self.state["completed_tests"].append("graybox_auth")
     finally:
