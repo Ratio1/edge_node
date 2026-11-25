@@ -7,9 +7,10 @@ OS mismatches, infrastructure leaks, and timezone drift.
 """
 
 import ipaddress
+from urllib.parse import urlparse
 
 from ..cve_view import FOLD_REASON, _subject, is_view_finding
-from ..findings import epss_band, Finding, Severity, probe_result
+from ..findings import AffectedAsset, epss_band, Finding, Severity, probe_result
 from .. import cvss_vectors as V
 from ..models.finding_identity import content_hash
 from .probe_registry import register_probe, CATEGORY_CORRELATION
@@ -120,6 +121,62 @@ def apply_host_honeypot_verdict(report):
             asset_canonical=f"{product}:{version}:{row['cve'][0]}",
           )
   return verdict
+
+
+HTTP_NO_HTTPS_REDIRECT_TITLE = "Site served over HTTP without redirect to HTTPS"
+
+
+def http_without_https_redirect_findings(report):
+  """Serialised findings, one per HTTP port that serves a page while the same target serves HTTPS (RM-265).
+
+  Runs on the merged host report: the HTTP and the TLS port usually sit on different workers. Input is
+  `scan_metadata["web_root"]`; port keys may be int or str after JSON transport. No finding without a TLS
+  counterpart, for a redirect to https, a non-2xx final answer, an empty page, a catch-all host, a page
+  served by another host the redirect chain reached, or a port that itself completed TLS.
+  """
+  merged = {}
+  for port, facts in ((report.get("scan_metadata") or {}).get("web_root") or {}).items():
+    try:
+      merged.setdefault(int(port), {}).update(facts or {})
+    except (TypeError, ValueError):
+      continue
+  tls_ports = sorted(p for p, f in merged.items() if f.get("tls"))
+  if not tls_ports:
+    return []
+  ports_txt = ", ".join(str(p) for p in tls_ports)
+  findings = []
+  for port in sorted(merged):
+    f = merged[port]
+    status = f.get("final_status")
+    if not f.get("url") or f.get("tls") or not isinstance(status, int) or not 200 <= status < 300:
+      continue
+    # `catch_all` must be a verdict: None means step 2 of the HTTP probe never ran, so the page is unchecked.
+    if "https" in (f.get("location_scheme"), f.get("final_scheme")) or f.get("empty") or f.get("catch_all") is not False:
+      continue
+    if f.get("same_host") is False:  # the page came from another host the redirect chain reached
+      continue
+    host = urlparse(f["url"]).hostname or ""
+    findings.append(Finding(
+      severity=Severity.LOW,
+      cvss_vector=V.MISSING_HEADER_LOW,
+      title=HTTP_NO_HTTPS_REDIRECT_TITLE,
+      description=(
+        f"GET / on HTTP port {port} answered {status} without redirecting to https://, while the same target "
+        f"completes a TLS handshake on port(s) {ports_txt}. Visitors who type or follow an http:// link stay "
+        "on cleartext. The comparison is per target, not per virtual host (vhost pinning is RM-165), so a site "
+        "meant for a hosts-file-only lab may be a false match: the owner decides whether that is intended."
+      ),
+      evidence=(
+        f"HTTP port {port}: first status {f.get('status')}, Location scheme {f.get('location_scheme') or 'none'}, "
+        f"final status {status}, final scheme {f.get('final_scheme') or 'http'}; TLS port(s): {ports_txt}."
+      ),
+      remediation="Redirect HTTP to HTTPS (301) on the server, or close the HTTP port; add HSTS on the HTTPS side.",
+      owasp_id="A02:2021",
+      cwe_id="CWE-319",
+      confidence="firm",
+      affected_assets=(AffectedAsset(host=host, port=port, url=f["url"]),),
+    ))
+  return probe_result(findings=findings, probe_id="_post_scan_correlate")["findings"]
 
 
 def _is_private_ip(ip_str):
