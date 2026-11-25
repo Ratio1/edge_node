@@ -4,6 +4,7 @@ Safety controls for graybox scanning.
 Rate limiting, attempt budgeting, and target validation.
 """
 
+import contextlib
 import ipaddress
 import random
 import socket
@@ -31,6 +32,7 @@ class SafetyControls:
     self._request_delay_max = request_delay_max or self._request_delay
     self._weak_auth_delay = weak_auth_delay or GRAYBOX_WEAK_AUTH_DELAY
     self._last_request_at = 0.0
+    self._prepaid = 0
     # Enforce minimum delay for non-local targets to avoid
     # triggering WAF blocking or causing DoS on resource-constrained targets.
     if not target_is_local and self._request_delay < GRAYBOX_DEFAULT_DELAY:
@@ -44,8 +46,23 @@ class SafetyControls:
       return self._request_delay
     return random.uniform(self._request_delay, self._request_delay_max)
 
+  @contextlib.contextmanager
+  def prepaid(self):
+    """Requests inside were paced by the caller just before: the client adds no delay.
+
+    For timing probes, which must pace before starting the clock so the client's
+    sleep never lands inside the measured window.
+    """
+    self._prepaid += 1
+    try:
+      yield
+    finally:
+      self._prepaid -= 1
+
   def throttle(self, min_delay=None):
     """Enforce minimum delay between requests."""
+    if self._prepaid and min_delay is None:
+      return
     delay = min_delay if min_delay is not None else self._next_request_delay()
     elapsed = time.time() - self._last_request_at
     if elapsed < delay:

@@ -14,6 +14,7 @@ from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 
+from .budget import RequestBudgetExhausted
 from .models import DiscoveryResult, InjectionCandidate
 
 # Seed fetches per scan: robots.txt (1) + sitemaps (sitemap.xml, robots
@@ -27,6 +28,8 @@ MAX_SEEDED_ENTRIES = 500
 # Largest body read from a discovery fetch; more counts as a failed fetch.
 MAX_BODY_BYTES = 5 * 1024 * 1024
 MAX_REDIRECTS = 3
+MAX_JSON_DEPTH = 6
+MAX_JSON_STRINGS = 500
 _SKIP_INPUT_TYPES = {"submit", "button", "image", "reset", "hidden", "password",
                      "file", "checkbox", "radio"}
 
@@ -135,7 +138,6 @@ class DiscoveryModule:
       if self._is_logout(path):
         continue
 
-      self.safety.throttle()
 
       # Use authenticated session if available, else anonymous
       session = self.auth.primary_session or self.auth.anon_session
@@ -151,6 +153,9 @@ class DiscoveryModule:
       url = self._origin + path
       try:
         resp = self._get(session, url)
+      except RequestBudgetExhausted:
+        self.fetch_failures += 1  # stop the crawl, keep what was found
+        break
       except requests.RequestException:
         continue
       if resp is None:
@@ -217,7 +222,6 @@ class DiscoveryModule:
       if self._is_logout(path):
         continue
 
-      self.safety.throttle()
 
       session = self.auth.primary_session or self.auth.anon_session
       if session is None:
@@ -227,6 +231,9 @@ class DiscoveryModule:
       url = self._origin + path
       try:
         resp = self._get(session, url)
+      except RequestBudgetExhausted:
+        self.fetch_failures += 1  # stop the crawl, keep what was found
+        break
       except requests.RequestException:
         continue
       if resp is None:
@@ -234,7 +241,18 @@ class DiscoveryModule:
 
       all_routes.add(path)
 
-      if "text/html" not in resp.headers.get("Content-Type", ""):
+      content_type = resp.headers.get("Content-Type", "")
+      if "json" in content_type.lower():
+        # A JSON response contributes its same-origin link strings and their
+        # query parameters, like an HTML page's links.
+        for link in self._json_links(resp):
+          normalized = self._normalize(link)
+          if depth < self._max_depth and normalized and normalized not in visited \
+              and self._in_scope(normalized):
+            to_visit.append((normalized, depth + 1))
+          self._add_query_candidates(normalized, candidates, link)
+        continue
+      if "text/html" not in content_type:
         continue
 
       parser = _RouteParser()
@@ -275,6 +293,25 @@ class DiscoveryModule:
       routes=self.routes, forms=self.forms,
       candidates=list(candidates.values()), fetch_failures=self.fetch_failures,
       post_forms=sorted(post_forms))
+
+  @staticmethod
+  def _json_links(resp):
+    """Same-origin link strings of a JSON body: depth <= 6, <= 500 strings."""
+    try:
+      stack, links, seen = [(resp.json(), 0)], [], 0
+    except (ValueError, RecursionError):
+      return []
+    while stack and seen < MAX_JSON_STRINGS:
+      node, depth = stack.pop()
+      if isinstance(node, str):
+        seen += 1
+        if node.startswith(("/", "http://", "https://")):
+          links.append(node)
+      elif depth < MAX_JSON_DEPTH and isinstance(node, dict):
+        stack.extend((v, depth + 1) for v in node.values())
+      elif depth < MAX_JSON_DEPTH and isinstance(node, list):
+        stack.extend((v, depth + 1) for v in node)
+    return links
 
   # ── seeds: robots.txt, sitemap.xml, OpenAPI ──────────────────────────
 
@@ -323,7 +360,6 @@ class DiscoveryModule:
     session = self.auth.primary_session or self.auth.anon_session
     if session is None:
       return None
-    self.safety.throttle()
     try:
       resp = self._get(session, self._origin + path)
     except requests.RequestException:
@@ -441,8 +477,10 @@ class DiscoveryModule:
         continue
       self._seeded += 1
       to_visit.append((path, 0))
-      params = get.get("parameters")
-      for prm in params if isinstance(params, list) else []:
+      shared, own = item.get("parameters"), get.get("parameters")
+      params = [*(shared if isinstance(shared, list) else []),
+                *(own if isinstance(own, list) else [])]
+      for prm in params:
         name = prm.get("name") if isinstance(prm, dict) else None
         if isinstance(name, str) and name and prm.get("in") == "query":
           self._add_candidate(path, name, candidates)

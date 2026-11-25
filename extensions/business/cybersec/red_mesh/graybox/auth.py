@@ -15,14 +15,19 @@ subphases route to `BearerAuth` / `ApiKeyAuth` based on
 `target_config.api_security.auth.auth_type`.
 """
 
+import dataclasses
 import re
 import time
+from urllib.parse import urljoin, urlparse
 
 import requests
 
 from ..constants import GRAYBOX_SESSION_MAX_AGE
 from .auth_credentials import Credentials
-from .auth_strategies import ApiKeyAuth, BearerAuth, FormAuth
+from .auth_strategies import (
+  ApiKeyAuth, BasicAuth, BearerAuth, FormAuth, LOGIN_NOT_FOUND, LoginTarget,
+)
+from .http_client import GrayboxScopeError, normalize_request_url
 from .models.target_config import COMMON_CSRF_FIELDS
 from .models import GrayboxAuthState
 
@@ -56,6 +61,9 @@ class AuthManager:
     self._auth_errors = []
     self._auth_diagnostics = []
     self._detected_csrf_field = None
+    # Form login found by FormAuth's search: LoginTarget, LOGIN_NOT_FOUND or
+    # None (not searched yet). The search runs at most once per manager.
+    self._login_target = None
 
   @property
   def detected_csrf_field(self) -> str | None:
@@ -128,7 +136,10 @@ class AuthManager:
       if not valid and not retryable and last_stage in (
           "authenticated_probe_redirect", "authenticated_probe_rejected",
           "authenticated_probe_marker_missing",
-          "authenticated_probe_identity_missing"):
+          "authenticated_probe_identity_missing",
+          # Proven at login, public now: a logout that kept the cookie and
+          # redirects the check path to a public page (form one-hop rule).
+          "authenticated_probe_public_control"):
         return True
     return False
 
@@ -261,7 +272,10 @@ class AuthManager:
       closed.add(id(session))
       try:
         if logout_url:
-          session.get(logout_url, timeout=5)
+          # Cleanup is exempt from the request budget (it still counts); a bare
+          # requests session, with no client, does not take the kwarg.
+          extra = {"budget_exempt": True} if self.http_client is not None else {}
+          session.get(logout_url, timeout=5, **extra)
       except requests.RequestException:
         pass
       finally:
@@ -431,13 +445,17 @@ class AuthManager:
       # login page and detected the CSRF field — preserve it.
       if strategy.last_detected_csrf_field:
         self._detected_csrf_field = strategy.last_detected_csrf_field
+      self._remember_login_target(strategy)  # a retry must not search again
       return None, True
     # Always propagate whatever CSRF field the strategy saw, regardless
     # of whether the credential check ultimately succeeded.
     if strategy.last_detected_csrf_field:
       self._detected_csrf_field = strategy.last_detected_csrf_field
+    self._remember_login_target(strategy)
     if session is None:
-      self._record_auth_diagnostic("login_rejected", strategy.last_response)
+      self._record_auth_diagnostic(
+        getattr(strategy, "failure_stage", "") or "login_rejected",
+        strategy.last_response)
     if session is not None:
       valid, retryable_failure = self._validate_authenticated_session(session)
       if not valid:
@@ -448,6 +466,27 @@ class AuthManager:
         return None, retryable_failure
       return session, False
     return None, False
+
+  def _remember_login_target(self, strategy):
+    """Cache what the form search found and write the detected names back
+    to ``target_config``, before the session is validated, so the probe-path
+    redirect check and every probe use the detected login page and fields."""
+    if getattr(strategy, "search_found_nothing", False):
+      self._login_target = LOGIN_NOT_FOUND
+    found = getattr(strategy, "found_login_target", None)
+    if found is None:
+      return
+    self._login_target = found
+    base = urlparse(self.target_url).path.rstrip("/")
+    page = urlparse(found.page_url)
+    path = page.path + (f"?{page.query}" if page.query else "")
+    if base and not page.path.startswith(base + "/"):
+      path = self.target_config.login_path  # outside the base: cache still drives login
+    elif base:
+      path = path[len(base):]
+    self.target_config = dataclasses.replace(
+      self.target_config, login_path=path,
+      username_field=found.username_field, password_field=found.password_field)
 
   def _authenticated_probe_path(self) -> str:
     api_security = getattr(self.target_config, "api_security", None)
@@ -542,7 +581,7 @@ class AuthManager:
       return None
 
   def _validate_authenticated_session(self, session) -> tuple[bool, bool]:
-    """Validate token/key sessions after credentials have been attached.
+    """Validate an authenticated session after credentials have been attached.
 
     Tightened in B2 (PR406 remediation): we no longer follow redirects
     or accept any <400 status, since an invalid bearer token frequently
@@ -559,6 +598,14 @@ class AuthManager:
          assertion (marker present in authenticated body but missing
          from anonymous; identity path non-empty when authenticated and
          empty/missing when anonymous).
+
+    Redirects: bearer / api_key sessions reject every 3xx (a 302 means the
+    token is bad). A form (cookie) session may legitimately be redirected,
+    e.g. Django ``APPEND_SLASH`` 301s ``/dashboard`` to ``/dashboard/``. For
+    form auth a 3xx whose ``Location`` is in scope and is not the login path
+    is followed for exactly one hop, and the destination is evaluated with the
+    rules above (the anonymous control then targets the destination). A
+    missing, off-origin or login-path ``Location`` is rejected as before.
     """
     # Form auth used to short-circuit here and return success unverified, so
     # the anonymous-control-delta check below — the only thing that actually
@@ -581,6 +628,28 @@ class AuthManager:
       )
       return False, True
     status = getattr(resp, "status_code", None)
+    if (status is not None and 300 <= status < 400
+        and self._resolve_auth_type() == "form"):
+      hop_url = self._form_redirect_hop_url(resp, probe_url)
+      if hop_url:
+        # 301/302/303 become GET (HEAD stays HEAD), as the client's own
+        # redirect loop and browsers do; only 307/308 keep the method. The
+        # anonymous control below then uses the hop's method too.
+        if status in (301, 302, 303) and method != "head":
+          method = "get"
+          req = session.get
+        try:
+          resp = req(hop_url, timeout=10, allow_redirects=False)
+        except GrayboxScopeError:
+          self._record_auth_diagnostic("authenticated_probe_redirect", resp)
+          return False, False
+        except requests.RequestException:
+          self._record_auth_diagnostic(
+            "authenticated_probe_transport", error="transport_error",
+          )
+          return False, True
+        probe_url = hop_url
+        status = getattr(resp, "status_code", None)
     if status is None:
       self._record_auth_diagnostic("authenticated_probe_missing_status", resp)
       return False, False
@@ -645,6 +714,30 @@ class AuthManager:
         return False, False
     return True, False
 
+  def _form_redirect_hop_url(self, resp, probe_url: str) -> str:
+    """Absolute URL of the one hop to follow for a form-auth 3xx, or "".
+
+    Empty means reject: no ``Location``, an unparsable one, a different
+    origin than the target (the client's own origin rule), or a destination
+    on the configured login or logout path (query ignored; following a
+    logout hop would end the session it is checking).
+    """
+    headers = getattr(resp, "headers", None) or {}
+    location = headers.get("Location") or headers.get("location") or ""
+    if not isinstance(location, str) or not location.strip():
+      return ""
+    try:
+      dest = normalize_request_url(
+        self.target_url, urljoin(probe_url, location.strip()))
+    except (GrayboxScopeError, ValueError):
+      return ""
+    dest_path = urlparse(dest).path.rstrip("/")
+    for attr in ("login_path", "logout_path"):
+      path = getattr(self.target_config, attr, "") or ""
+      if path and dest_path == urlparse(self.target_url + path).path.rstrip("/"):
+        return ""
+    return dest
+
   @staticmethod
   def _read_response_body(resp) -> str:
     if resp is None:
@@ -699,10 +792,14 @@ class AuthManager:
     ``form``   → FormAuth (existing form-login)
     ``bearer`` → BearerAuth (Subphase 1.5 commit #6)
     ``api_key``→ ApiKeyAuth (Subphase 1.5 commit #7)
+    ``basic``  → BasicAuth
     """
     auth_type = self._resolve_auth_type()
     if auth_type == "form":
-      return FormAuth(self.target_url, self.target_config, self.verify_tls, self.http_client)
+      return FormAuth(self.target_url, self.target_config, self.verify_tls,
+                      self.http_client, self._login_target)
+    if auth_type == "basic":
+      return BasicAuth(self.target_url, self.target_config, self.verify_tls, self.http_client)
     if auth_type == "bearer":
       return BearerAuth(self.target_url, self.target_config, self.verify_tls, self.http_client)
     if auth_type == "api_key":

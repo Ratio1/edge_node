@@ -12,6 +12,8 @@ from urllib.parse import parse_qsl, urlencode, unquote, urljoin, urlsplit, urlun
 
 import requests
 
+from .budget import RequestBudgetExhausted
+
 
 class GrayboxScopeError(requests.RequestException):
   """Raised before any outbound request when scope validation fails."""
@@ -260,6 +262,8 @@ class _ScopedAdapter(requests.adapters.BaseAdapter):
     self._client._validate_bound_url(request.url)
     self._client._validate_bound_headers(request.headers)
     self._client.validate_url(request.url)
+    # Not charged: an auth object or hook that resends here bypasses `_admit`. No caller
+    # supplies one today; RM-273 P4.4 (Digest/NTLM) must charge here.
     response = self._adapter.send(request, **kwargs)
     # Requests auth hooks can retry through response.connection.send directly.
     response.connection = self
@@ -355,8 +359,8 @@ class GrayboxHttpClient:
       if target["kind"] != "webapp":
         raise GrayboxScopeError("graybox requires a webapp execution target")
       self._bound_target = (target["url"], target["allowedPathPrefix"])
-    # The shared per-scan RequestBudget, so redirect hops can be charged where
-    # they are actually issued. Optional: legacy callers and tests construct the
+    # The shared per-scan RequestBudget, charged here for every hop actually
+    # issued (see `_admit`). Optional: legacy callers and tests construct the
     # client without one and are unaffected.
     self._request_budget = request_budget
     self._safety = safety
@@ -551,11 +555,26 @@ class GrayboxHttpClient:
     except (AttributeError, TypeError, ValueError, UnicodeError) as exc:
       raise GrayboxScopeError("Host header is outside the bound graybox target") from exc
 
+  def _admit(self, budget_exempt=False, min_delay=None):
+    """Gate every hop before it is sent: charge the budget, then pace it.
+
+    The one admission point for outbound traffic. A refused hop raises and
+    sends nothing; callers never receive a stand-in response. Pre-request
+    checks (kill switch, breaker) belong here.
+    """
+    if self._request_budget is not None:
+      if not self._request_budget.consume(1, exempt=budget_exempt):
+        raise RequestBudgetExhausted()
+    if self._safety is not None:
+      self._safety.throttle(min_delay)
+
   def request(self, session, method, url, **kwargs):
     allow_redirects = bool(kwargs.pop("allow_redirects", False))
-    # Cleanup and revert traffic is exempt: budget exhaustion must never prevent
-    # a rollback, which is the existing contract of ProbeBase.cleanup_budget.
+    # Rollback traffic is exempt from the refusal (still charged): budget
+    # exhaustion must never prevent an undo from completing.
     budget_exempt = bool(kwargs.pop("budget_exempt", False))
+    # Per-request pacing override (e.g. a rate-limit burst's tighter spacing).
+    throttle_min_delay = kwargs.pop("throttle_min_delay", None)
     safe_url = self.validate_url(url)
     self._guard_transport(session)
     if self._bound_target is not None:
@@ -564,8 +583,6 @@ class GrayboxHttpClient:
     kwargs = self._with_protected_gateway_auth(kwargs)
     if self._protected_params:
       safe_url = self._without_protected_query_values(safe_url, self._protected_params)
-    if not allow_redirects:
-      return session.request(method, safe_url, allow_redirects=False, **kwargs)
     current_url = safe_url
     response = None
     # We resolve redirects ourselves so every hop re-enters `validate_url`, which
@@ -579,25 +596,22 @@ class GrayboxHttpClient:
     # reported "not vulnerable". Record the chain we consumed so the attribute
     # means what the `requests` contract says it means.
     history = []
-    for hop in range(5):
-      # Charge every hop *after* the first. A probe consults the shared budget
-      # once per logical call, so the first request is already paid for;
-      # charging it again would double-count every ordinary request. The hops
-      # were charged to nobody at all — measured, one redirecting call issued
-      # five real requests against a single consume, which let a target that
-      # simply redirects push actual traffic to five times the configured cap
-      # while `budget_remaining` reported the cap was being respected.
-      if hop and not budget_exempt and self._request_budget is not None:
-        if not self._request_budget.consume(1):
-          return _with_history(response, history)
-        if self._safety is not None:
-          self._safety.throttle()
+    # One loop issues every request: a call without redirects is one hop.
+    for hop in range(5 if allow_redirects else 1):
+      # Every hop, the first included, is charged and paced here, so the budget
+      # equals the requests really sent whichever probe (or discovery, or auth)
+      # sent them. Redirect hops were once charged to nobody: one redirecting
+      # call issued five real requests against a single consume.
       if response is not None:
         history.append(response)
       if hop and self._bound_target is not None:
         self._validate_bound_headers(session.headers)
         self._validate_bound_headers(kwargs.get("headers"))
+      # Last gate before the wire, after every validation: a charged hop is a sent hop.
+      self._admit(budget_exempt, throttle_min_delay)
       response = session.request(method, current_url, allow_redirects=False, **kwargs)
+      if not allow_redirects:
+        return response
       if response.status_code not in (301, 302, 303, 307, 308):
         return _with_history(response, history)
       location = response.headers.get("Location", "")

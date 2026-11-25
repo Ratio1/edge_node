@@ -48,7 +48,6 @@ class MisconfigProbes(ProbeBase):
     exposed = []
     exposed_response = None
     for path in debug_paths:
-      self.safety.throttle()
       url = self.target_url + path
       try:
         resp = session.get(url, timeout=10)
@@ -115,7 +114,6 @@ class MisconfigProbes(ProbeBase):
 
     worst_finding = None
     for path in unique_paths:
-      self.safety.throttle()
       try:
         resp = session.get(
           self.target_url + path,
@@ -186,7 +184,6 @@ class MisconfigProbes(ProbeBase):
     if not session:
       return
 
-    self.safety.throttle()
     try:
       resp = session.get(self.target_url + "/", timeout=10)
     except Exception:
@@ -295,7 +292,6 @@ class MisconfigProbes(ProbeBase):
       # A POST to the logout URL ends the scan session.
       if self.is_logout_path(path):
         continue
-      self.safety.throttle()
       url = self.target_url + path
       # Baseline: the principal must be allowed to use this endpoint, else a
       # tokenless 403 proves nothing about CSRF. With allow_stateful the
@@ -459,8 +455,19 @@ class MisconfigProbes(ProbeBase):
     Sends a bounded burst of failed login attempts and checks whether the
     server blocks, throttles, or continues to accept them unchanged.
     """
-    session = self.auth.make_anonymous_session()
     login_url = self.target_url + self.target_config.login_path
+    csrf_field = self.auth.detected_csrf_field
+    attempts = 8
+    # Worst case: the page, every POST, and a CSRF refetch before each later POST.
+    # "Not enforced" is a verdict from absence, so a burst the budget cannot cover
+    # in full is not sent: half a burst proves nothing.
+    if not self.budget_available(1 + attempts + (attempts - 1 if csrf_field else 0)):
+      self.emit_inconclusive(
+        "PT-A02-07", "Login rate limiting could not be evaluated",
+        "A07:2021", "budget_exhausted",
+      )
+      return
+    session = self.auth.make_anonymous_session()
 
     try:
       page = session.get(login_url, timeout=10)
@@ -468,14 +475,12 @@ class MisconfigProbes(ProbeBase):
       session.close()
       return
 
-    csrf_field = self.auth.detected_csrf_field
     csrf_token = None
     if csrf_field:
       csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
 
     # Use a non-existent username to avoid locking a real account
     test_username = "ratelimit_probe_user_nonexist"
-    attempts = 8
     blocked = False
     last_response = None
     lockout_markers = [
@@ -484,12 +489,10 @@ class MisconfigProbes(ProbeBase):
     ]
 
     for i in range(attempts):
-      self.safety.throttle(min_delay=0.1)
-
       # Re-extract CSRF token each time (some frameworks rotate it)
       if csrf_field and i > 0:
         try:
-          page = session.get(login_url, timeout=10)
+          page = session.get(login_url, timeout=10, throttle_min_delay=0.1)
           csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
         except Exception:
           pass
@@ -505,7 +508,7 @@ class MisconfigProbes(ProbeBase):
         resp = session.post(
           login_url, data=payload,
           headers={"Referer": login_url},
-          timeout=10,
+          timeout=10, throttle_min_delay=0.1,
         )
       except Exception:
         continue
@@ -602,7 +605,6 @@ class MisconfigProbes(ProbeBase):
     import re
     tokens = []
     for i in range(2):
-      self.safety.throttle()
       if i > 0:
         try:
           page = session.get(reset_url, timeout=10)
@@ -759,7 +761,6 @@ class MisconfigProbes(ProbeBase):
       re.compile(r'(reset-\w+)', re.I),
     ]
 
-    self.safety.throttle()
     csrf_token = None
     try:
       page = session.get(reset_url, timeout=10)
@@ -860,10 +861,13 @@ class MisconfigProbes(ProbeBase):
       headers = {"Referer": login_url}
       if csrf_token:
         headers["X-CSRFToken"] = csrf_token
+      # Pace before the clock: the timed request must not include the client's sleep.
+      self.safety.throttle()
       t0 = _time.monotonic()
       try:
-        session.post(login_url, data=payload, headers=headers,
-                     timeout=10, allow_redirects=False)
+        with self.safety.prepaid():
+          session.post(login_url, data=payload, headers=headers,
+                       timeout=10, allow_redirects=False)
       except Exception:
         session.close()
         return None
@@ -874,12 +878,10 @@ class MisconfigProbes(ProbeBase):
     known_timings = []
     unknown_timings = []
     for _ in range(sample_size):
-      self.safety.throttle()
       v = _measure(known_user)
       if v is not None:
         known_timings.append(v)
     for _ in range(sample_size):
-      self.safety.throttle()
       v = _measure("nx-" + secrets.token_hex(4))
       if v is not None:
         unknown_timings.append(v)
@@ -1284,9 +1286,7 @@ class MisconfigProbes(ProbeBase):
 
       return (resp.status_code, resp.text, len(resp.text), resp)
 
-    self.safety.throttle()
     result_valid = _submit_login(valid_username)
-    self.safety.throttle()
     result_invalid = _submit_login(invalid_username)
 
     session.close()

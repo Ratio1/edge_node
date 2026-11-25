@@ -97,14 +97,19 @@ class TestProbeBaseBudgetHelper(unittest.TestCase):
     )
     return p, budget
 
-  def test_budget_helper_consumes(self):
+  def test_budget_available_peeks_without_consuming(self):
+    """The client charges; a probe only asks whether a burst still fits."""
     p, budget = self._make_probe_with_budget(2)
-    self.assertTrue(p.budget())
-    self.assertTrue(p.budget())
-    self.assertFalse(p.budget())
-    self.assertEqual(budget.exhausted_count, 1)
+    self.assertTrue(p.budget_available())
+    self.assertTrue(p.budget_available(2))
+    self.assertFalse(p.budget_available(3))
+    self.assertEqual(budget.remaining, 2)
+    self.assertEqual(budget.exhausted_count, 0)
+    budget.consume(2)
+    self.assertFalse(p.budget_available())
+    self.assertEqual(budget.exhausted_count, 0)
 
-  def test_budget_helper_no_budget_always_true(self):
+  def test_budget_available_no_budget_always_true(self):
     """ProbeBase without a budget (legacy callers) should never block."""
     class _Probe(ProbeBase):
       def run(self):
@@ -115,7 +120,7 @@ class TestProbeBaseBudgetHelper(unittest.TestCase):
       target_config=MagicMock(), safety=MagicMock(),
     )
     for _ in range(100):
-      self.assertTrue(p.budget())
+      self.assertTrue(p.budget_available())
 
 
 class TestRequestBudgetSharedAcrossProbes(unittest.TestCase):
@@ -139,14 +144,12 @@ class TestRequestBudgetSharedAcrossProbes(unittest.TestCase):
       request_budget=budget,
     )
 
-    self.assertTrue(p1.budget())
-    self.assertTrue(p2.budget())
-    self.assertTrue(p1.budget())
-    self.assertTrue(p2.budget())
-    self.assertTrue(p1.budget())
-    # Five total — next call from either probe fails.
-    self.assertFalse(p1.budget())
-    self.assertFalse(p2.budget())
+    for _ in range(5):
+      self.assertTrue(p1.budget_available() and p2.budget_available())
+      self.assertTrue(budget.consume())
+    # Five total — next peek from either probe fails.
+    self.assertFalse(p1.budget_available())
+    self.assertFalse(p2.budget_available())
     self.assertEqual(budget.remaining, 0)
 
 

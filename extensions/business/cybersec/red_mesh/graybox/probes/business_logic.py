@@ -4,6 +4,7 @@ Business logic probes — A06 workflow bypass + A07 weak auth.
 
 from .access_control import MAX_EVIDENCE_VALUE, parse_form_fields
 from .base import ProbeBase
+from ..budget import RequestBudgetExhausted
 from ..findings import GrayboxFinding
 
 
@@ -50,12 +51,17 @@ class BusinessLogicProbes(ProbeBase):
 
     attempts = 0
     successes = []
+    refused = False
     for cred in candidates[:budget]:
       if ":" not in cred:
         continue
       username, password = cred.split(":", 1)
       self.safety.throttle_auth()
-      session = self.auth.try_credentials(username, password)
+      try:
+        session = self.auth.try_credentials(username, password)
+      except RequestBudgetExhausted:
+        refused = True  # keep the successes already found; the rest is unproven
+        break
       attempts += 1
       if session:
         successes.append(username)
@@ -87,6 +93,9 @@ class BusinessLogicProbes(ProbeBase):
       if attempts >= budget:
         break
 
+    if refused:
+      self.emit_inconclusive(
+        "PT-A07-01", "Weak credential check incomplete", "A07:2021", "budget_exhausted")
     if successes:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A07-01",
@@ -140,7 +149,6 @@ class BusinessLogicProbes(ProbeBase):
       path = ep.path
       if "{id}" in path:
         path = path.replace("{id}", str(idor_ids[0]))
-      self.safety.throttle()
       url = self.target_url + path
       method = ep.method.upper()
       # The verb this loop really issues (see below); the finding reports this one.
@@ -245,7 +253,6 @@ class BusinessLogicProbes(ProbeBase):
 
   def _read_back_field(self, url, field, csrf_field):
     """GET the record again and return the stored value of ``field``, or None."""
-    self.safety.throttle()
     try:
       page = self.auth.primary_session.get(url, timeout=10)
     except Exception:
@@ -309,7 +316,6 @@ class BusinessLogicProbes(ProbeBase):
       url = self.target_url + path
 
       # Step 1: GET the form to extract current state and CSRF token
-      self.safety.throttle()
       try:
         page = self.auth.primary_session.get(url, timeout=10)
       except Exception:
@@ -334,7 +340,6 @@ class BusinessLogicProbes(ProbeBase):
       current_status = form_fields.get(ep.status_field)
 
       # Test A: Negative amount
-      self.safety.throttle()
       payload = dict(form_fields)
       payload[ep.amount_field] = "-9999.99"
       if csrf_token and csrf_field:
@@ -395,7 +400,6 @@ class BusinessLogicProbes(ProbeBase):
 
         if invalid_states:
           invalid_target = sorted(invalid_states)[0]
-          self.safety.throttle()
 
           # Re-fetch CSRF token (may have been consumed)
           if csrf_field:

@@ -20,6 +20,8 @@ import html
 import re
 import time
 
+from ..budget import RequestBudgetExhausted
+
 TIME_DELAY = 3                 # seconds asked of the database
 TIME_MARGIN = 0.8              # elapsed must exceed baseline + delay * margin
 MAX_TIME_REQUESTS = 4          # hard cap of time-based requests per parameter
@@ -102,8 +104,8 @@ def status_reached(resp):
   return isinstance(status, int) and 200 <= status < 400
 
 
-class BudgetRefused(Exception):
-  """Raised by a ``prepare`` step when the request budget refuses it."""
+# The client's refusal, raised by a ``prepare`` step or by ``send``.
+BudgetRefused = RequestBudgetExhausted
 
 
 class CsrfUnavailable(Exception):
@@ -124,7 +126,8 @@ def detect_sqli(send, throttle=None, reached=None, budget=None,
   request and returns a response; it may raise. ``prepare()`` runs untimed
   before each request (a CSRF fetch) and may raise ``BudgetRefused``.
   ``reached(resp)`` says whether the response came from the endpoint handler.
-  ``budget()`` is called before every request; False stops the run.
+  ``budget()`` peeks before every request (the client charges it); False stops
+  the run, as does a ``BudgetRefused`` raised by ``send`` or ``prepare``.
   ``time_left`` is a one-key dict ``{"s": seconds}``: the allowance of
   time-based waiting, one dict per worker. ``allow_time=False`` skips the time
   technique. ``max_requests`` caps this parameter; ``cap`` is a shared
@@ -143,8 +146,6 @@ def detect_sqli(send, throttle=None, reached=None, budget=None,
       raise _Stop("capped")
     if budget is not None and not budget():
       raise _Stop("budget")
-    if throttle:
-      throttle()
     count["n"] += 1
     if cap is not None:
       cap["left"] -= 1
@@ -156,9 +157,15 @@ def detect_sqli(send, throttle=None, reached=None, budget=None,
       raise _Stop("csrf_unavailable")
     except Exception:
       return None, 0.0
+    # Pace last, after any prepare() request, so the gap before the timed send is
+    # already served and the client adds none inside the clock.
+    if throttle:
+      throttle()
     started = time.monotonic()
     try:
       resp = send(value, ctx) if prepare else send(value)
+    except BudgetRefused:
+      raise _Stop("budget")
     except Exception:
       return None, time.monotonic() - started
     if getattr(resp, "status_code", None) == 429:

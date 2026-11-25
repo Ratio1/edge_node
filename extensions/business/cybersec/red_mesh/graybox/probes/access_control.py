@@ -154,7 +154,6 @@ class AccessControlProbes(ProbeBase):
     endpoints_tested = 0
 
     for ep in endpoints:
-      self.safety.throttle()
       outcome = {}
       result = self._test_single_idor(ep, outcome)
       # A bare 404 is skipped (mistyped path), a denial counts as tested.
@@ -246,7 +245,6 @@ class AccessControlProbes(ProbeBase):
     if not endpoints:
       return
     for ep in endpoints:
-      self.safety.throttle()
       method = ep.method.upper()
       url = self.target_url + ep.path
       if method == "GET":
@@ -320,7 +318,6 @@ class AccessControlProbes(ProbeBase):
 
     for ep in endpoints:
       # First, confirm the endpoint denies regular user via its normal method.
-      self.safety.throttle()
       url = self.target_url + ep.path
       try:
         baseline = self.auth.regular_session.request(
@@ -345,7 +342,6 @@ class AccessControlProbes(ProbeBase):
 
       # Try alternative methods
       for method in alternative_methods:
-        self.safety.throttle()
         try:
           resp = self.auth.regular_session.request(method, url, timeout=10)
         except Exception:
@@ -455,7 +451,6 @@ class AccessControlProbes(ProbeBase):
     unobservable = []
 
     for form_path in form_paths[:5]:  # cap at 5 forms
-      self.safety.throttle()
       url = self.target_url + form_path
 
       # GET the form to extract existing fields + CSRF token
@@ -490,7 +485,6 @@ class AccessControlProbes(ProbeBase):
       if csrf_token:
         headers["X-CSRFToken"] = csrf_token
 
-      self.safety.throttle()
       try:
         resp = self.auth.regular_session.post(
           url, data=payload, headers=headers,
@@ -518,7 +512,6 @@ class AccessControlProbes(ProbeBase):
         continue
 
       # Verify: GET the page again and check if privilege fields are reflected
-      self.safety.throttle()
       try:
         verify = self.auth.regular_session.get(url, timeout=10)
       except Exception:
@@ -647,7 +640,6 @@ class AccessControlProbes(ProbeBase):
       for record_id in (ep.test_ids or [1, 2]):
         path = ep.path.replace("{id}", str(record_id))
         url = self.target_url + path
-        self.safety.throttle()
 
         try:
           before = self.auth.regular_session.get(url, timeout=10)
@@ -671,7 +663,6 @@ class AccessControlProbes(ProbeBase):
         success = False
         for owner_id in candidate_owner_ids:
           patch_body = {field: owner_id for field in transfer_targets}
-          self.safety.throttle()
           try:
             patch_resp = self.auth.regular_session.patch(
               url, data=_json.dumps(patch_body), headers=headers, timeout=10,
@@ -684,9 +675,9 @@ class AccessControlProbes(ProbeBase):
           if patch_resp.status_code >= 400:
             continue
 
-          self.safety.throttle()
           try:
-            after = self.auth.regular_session.get(url, timeout=10)
+            # Reads back a write that already landed; its answer decides the restore.
+            after = self.auth.regular_session.get(url, timeout=10, budget_exempt=True)
             after_owner = after.json().get(ep.owner_field)
           except Exception:
             continue
@@ -758,11 +749,11 @@ class AccessControlProbes(ProbeBase):
     try:
       resp = self.auth.regular_session.patch(
         url, data=_json.dumps(body), headers=headers, timeout=10,
+        budget_exempt=True,
       )
       if resp.status_code >= 400:
         return False
-      self.safety.throttle()
-      check = self.auth.regular_session.get(url, timeout=10)
+      check = self.auth.regular_session.get(url, timeout=10, budget_exempt=True)
       return check.json().get(field) == expected
     except Exception:
       return False
@@ -789,7 +780,6 @@ class AccessControlProbes(ProbeBase):
       for record_id in (ep.test_ids or [1, 2]):
         path = ep.path.replace("{id}", str(record_id))
         url = self.target_url + path
-        self.safety.throttle()
         try:
           before = self.auth.regular_session.get(url, timeout=10)
         except Exception:
@@ -810,7 +800,6 @@ class AccessControlProbes(ProbeBase):
         headers = {"Content-Type": "application/json", "Referer": url}
         if csrf_token:
           headers["X-CSRFToken"] = csrf_token
-        self.safety.throttle()
         try:
           patch_resp = self.auth.regular_session.patch(
             url, data=_json.dumps({"title": sentinel_title}),
@@ -824,9 +813,9 @@ class AccessControlProbes(ProbeBase):
         if patch_resp.status_code >= 400:
           continue
 
-        self.safety.throttle()
         try:
-          after = self.auth.regular_session.get(url, timeout=10)
+          # Reads back a write that already landed; its answer decides the restore.
+          after = self.auth.regular_session.get(url, timeout=10, budget_exempt=True)
           after_title = after.json().get("title")
         except Exception:
           continue
@@ -901,7 +890,6 @@ class AccessControlProbes(ProbeBase):
       for record_id in (ep.test_ids or [1, 2]):
         path = ep.path.replace("{id}", str(record_id))
         url = self.target_url + path
-        self.safety.throttle()
         try:
           before = self.auth.regular_session.get(url, timeout=10)
         except Exception:
@@ -919,7 +907,6 @@ class AccessControlProbes(ProbeBase):
         headers = {"Referer": url}
         if csrf_token:
           headers["X-CSRFToken"] = csrf_token
-        self.safety.throttle()
         try:
           del_resp = self.auth.regular_session.delete(
             url, headers=headers, timeout=10,
@@ -933,7 +920,6 @@ class AccessControlProbes(ProbeBase):
           continue
         # Confirm the record is actually gone — defends against a server
         # that returns 200 but ignores the verb.
-        self.safety.throttle()
         try:
           after = self.auth.regular_session.get(url, timeout=10)
         except Exception:
@@ -1016,7 +1002,6 @@ class AccessControlProbes(ProbeBase):
     tested = 0
     for path in candidates:
       url = self.target_url + path
-      self.safety.throttle()
       try:
         resp = self.auth.regular_session.get(url, timeout=10)
       except Exception:
@@ -1090,7 +1075,6 @@ class AccessControlProbes(ProbeBase):
     denied = 0
     for path in targets:
       url = self.target_url + path
-      self.safety.throttle()
       try:
         baseline = self.auth.regular_session.get(url, timeout=10)
       except Exception:
@@ -1101,7 +1085,6 @@ class AccessControlProbes(ProbeBase):
       base_body = baseline.text
       base_len = len(base_body)
       for key, value in overrides:
-        self.safety.throttle()
         try:
           probed = self.auth.regular_session.get(
             url, params={key: value}, timeout=10,
@@ -1205,7 +1188,6 @@ class AccessControlProbes(ProbeBase):
 
     for form_path in forms[:5]:
       url = self.target_url + form_path
-      self.safety.throttle()
       try:
         page = self.auth.regular_session.get(url, timeout=10)
       except Exception:
@@ -1260,7 +1242,6 @@ class AccessControlProbes(ProbeBase):
       if csrf_token:
         headers["X-CSRFToken"] = csrf_token
 
-      self.safety.throttle()
       try:
         resp = self.auth.regular_session.post(
           url, data=payload, headers=headers,

@@ -432,6 +432,51 @@ class TestDiscoverySeedsAndCandidates(unittest.TestCase):
     self.assertEqual(got, {("/api/search", "text")})
     self.assertIn("/api/search", result.routes)
 
+  def test_json_links_and_their_query_parameters_become_targets(self):
+    import json
+    body = json.dumps({"data": [{"self": "/api/items?page=2&sort=asc"},
+                                {"ext": "https://evil.example/x?y=1"},
+                                {"abs": "http://testapp.local:8000/api/more?q=1"}],
+                       "title": "not a link"})
+    disc = _spec_discovery({
+      "/": (200, '<a href="/api/list">l</a>', "text/html"),
+      "/api/list": (200, body, "application/json"),
+      "/api/items": (200, "<html></html>", "text/html"),
+      "/api/more": (200, "<html></html>", "text/html"),
+    })
+    result = disc.discover_result()
+    got = {(c.path, c.param) for c in result.candidates}
+    self.assertEqual(got, {("/api/items", "page"), ("/api/items", "sort"), ("/api/more", "q")})
+    self.assertIn("/api/items", result.routes)
+    self.assertIn("/api/more", result.routes)
+    self.assertFalse([u for u in disc.requested if "evil" in u])
+
+  def test_json_walk_is_bounded(self):
+    nested = cur = {}
+    for _ in range(20):
+      cur["k"] = cur = {}
+    cur["k"] = "/too-deep"
+    wide = {"l": [f"/p{i}" for i in range(600)]}
+    disc = _make_discovery()
+    for body in (nested, wide):
+      resp = MagicMock()
+      resp.json.return_value = body
+      links = disc._json_links(resp)
+      self.assertNotIn("/too-deep", links)
+      self.assertLessEqual(len(links), 500)
+
+  def test_openapi_path_level_query_parameters(self):
+    spec = _openapi_spec({"/api/s": {
+      "parameters": [{"name": "shared", "in": "query"}, {"name": "h", "in": "header"}],
+      "get": {"parameters": [{"name": "own", "in": "query"}]}}})
+    disc = _spec_discovery({
+      "/": (200, "<html></html>", "text/html"),
+      "/openapi.json": (200, spec, "application/json"),
+      "/api/s": (200, "{}", "text/plain"),
+    })
+    got = {(c.path, c.param) for c in disc.discover_result().candidates}
+    self.assertEqual(got, {("/api/s", "shared"), ("/api/s", "own")})
+
   def test_seeds_stay_within_max_pages(self):
     sm = "<urlset>" + "".join(
       f"<url><loc>http://testapp.local:8000/p{i}/</loc></url>" for i in range(30)

@@ -1128,6 +1128,25 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertIn("regular_api_key", result["message"])
     self.assertFalse(plugin.r1fs.add_json.called)
 
+  def test_launch_webapp_basic_auth_rules(self):
+    from extensions.business.cybersec.red_mesh.services.launch_api import (
+      _auth_descriptor_carrier, _validate_api_auth_descriptor,
+    )
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import AuthDescriptor
+    basic = AuthDescriptor(auth_type="basic")
+    self.assertIn("authenticated_probe_path", _validate_api_auth_descriptor(basic)["message"])
+    self.assertIsNone(_validate_api_auth_descriptor(
+      AuthDescriptor(auth_type="basic", authenticated_probe_path="/me")))
+    self.assertEqual(_auth_descriptor_carrier(basic)[:2], ("header", "authorization"))
+
+    plugin = self._build_mock_plugin(job_id="test-job-basic-regular-required")
+    result = self._launch_webapp(
+      plugin, regular_username="", regular_password="",
+      target_config={"api_security": {"auth": {
+        "auth_type": "basic", "authenticated_probe_path": "/me"}}})
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("regular credentials", result["message"])
+
   def test_launch_webapp_rejects_unconfirmed_security_downgrades(self):
     plugin = self._build_mock_plugin(job_id="test-job-webapp-unsafe")
 

@@ -19,11 +19,35 @@ must NOT capture credentials beyond the active session lifetime — call
 
 from __future__ import annotations
 
+import base64
 import re
 from abc import ABC, abstractmethod
+from collections import deque
+from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urljoin, urlparse
 
 import requests
+
+from .http_client import GrayboxScopeError, normalize_request_url
+from .login_form import find_login_form, login_links
+from .models.target_config import GrayboxTargetConfig, LOGIN_DISCOVERY_PATHS
+
+# Login-page search budget, the configured login_path GET included.
+MAX_LOGIN_SEARCH_FETCHES = 8
+_DEFAULTS = GrayboxTargetConfig()
+_REDIRECT_TO_GET = (301, 302, 303)
+# Cache marker: the search ran once and found no login form.
+LOGIN_NOT_FOUND = "login_not_found"
+
+
+@dataclass(frozen=True)
+class LoginTarget:
+  """A login form found by the search; AuthManager caches it. Each login
+  re-parses the cached page, so tokens and the action are always fresh."""
+  page_url: str
+  username_field: str
+  password_field: str
 
 
 class AuthStrategy(ABC):
@@ -134,27 +158,44 @@ _LOGIN_FORM_RE = re.compile(
 )
 
 
+def _path_query(url):
+  parts = urlparse(url)
+  return (parts.path.rstrip("/"), parts.query)
+
+
 class FormAuth(AuthStrategy):
-  """Cookie-session login via HTML form (existing legacy behaviour).
+  """Cookie-session login via HTML form.
 
-  Wraps the form-login logic that previously lived inline in
-  `AuthManager._try_login_attempt`. The behaviour and heuristics are
-  identical — see Subphase 1.5 commit #3 for the wiring into the
-  orchestrator.
+  The login form is found structurally (`login_form.find_login_form`); a
+  `login_path` / `username_field` / `password_field` that differs from the
+  `GrayboxTargetConfig` default is an operator override and wins.
 
-  Public methods:
-    - ``preflight()`` — verifies target reachability AND that the login
-      page exists at ``target_config.login_path`` (not 404).
-    - ``authenticate(creds)`` — GETs the login page, auto-detects the
-      CSRF field, POSTs ``username``/``password`` from ``creds``, and
-      heuristically confirms success.
+  - ``preflight()`` — verifies target reachability, and for an override
+    ``login_path`` that the page exists (not 404).
+  - ``authenticate(creds)`` — GETs the login page (searching for it when
+    the configured default path answers >= 400), POSTs the form's own
+    hidden fields plus credentials, and heuristically confirms success.
   """
+
+  def __init__(self, target_url, target_config, verify_tls=True,
+               http_client=None, login_target=None):
+    super().__init__(target_url, target_config, verify_tls, http_client)
+    self._cached = login_target  # LoginTarget, LOGIN_NOT_FOUND or None
+    self.found_login_target = None
+    self.search_found_nothing = False
+    # Diagnostic stage when authenticate() fails before a credential check.
+    self.failure_stage = ""
+
+  def _path_overridden(self) -> bool:
+    return self.target_config.login_path != _DEFAULTS.login_path
 
   def preflight(self) -> Optional[str]:
     if self.http_client is not None:
       session = self.make_session()
       try:
         session.head(self.target_url, timeout=10, allow_redirects=True)
+        if not self._path_overridden():
+          return None
         login_url = self.target_url + self.target_config.login_path
         resp = session.get(login_url, timeout=10)
         if resp.status_code == 404:
@@ -175,8 +216,10 @@ class FormAuth(AuthStrategy):
       )
     except requests.RequestException as exc:
       return f"Target unreachable: {exc}"
+    if not self._path_overridden():
+      return None
 
-    # 2. Login page exists?
+    # 2. Override login page exists?
     login_url = self.target_url + self.target_config.login_path
     try:
       resp = requests.get(login_url, timeout=10, verify=self.verify_tls)
@@ -195,42 +238,149 @@ class FormAuth(AuthStrategy):
     definitive credential failures.
     """
     self.last_response = None
+    self.found_login_target = None
+    self.failure_stage = ""
+    if self._cached == LOGIN_NOT_FOUND:
+      self.failure_stage = "login_form_not_found"
+      return None
     session = self.make_session()
-    login_url = self.target_url + self.target_config.login_path
-
-    # GET login page — transport errors bubble up (retryable).
     try:
-      resp = session.get(login_url, timeout=10, allow_redirects=True)
+      resp, form, login_url = self._load_login_page(session)
+      if form is None and (self._cached or resp.status_code >= 400):
+        self.failure_stage = self.failure_stage or "login_form_not_found"
+        self.last_response = resp
+        session.close()
+        return None
+      return self._submit(session, creds, resp, form, login_url)
     except requests.RequestException:
       session.close()
       raise
 
-    # Auto-detect or use configured CSRF field
-    csrf_field, csrf_token = self._extract_csrf(resp.text)
+  def _cfg_overrides(self):
+    """(username, password) operator overrides, None when left at the default."""
+    cfg = self.target_config
+    return (
+      cfg.username_field if cfg.username_field != _DEFAULTS.username_field else None,
+      cfg.password_field if cfg.password_field != _DEFAULTS.password_field else None,
+    )
+
+  def _form_on(self, resp, url):
+    """The login form of a < 400 response whose action stays on the target."""
+    if resp.status_code >= 400:
+      return None
+    page_url = resp.url if isinstance(resp.url, str) and resp.url else url
+    user, password = self._cfg_overrides()
+    if isinstance(self._cached, LoginTarget):
+      user, password = self._cached.username_field, self._cached.password_field
+    form = find_login_form(
+      resp.text, page_url, user, password, self.target_config.username_field)
+    if form is None:
+      return None
+    try:
+      form.action = normalize_request_url(self.target_url, form.action)
+    except GrayboxScopeError:
+      return None  # credentials never go off-origin
+    base = urlparse(self.target_url).path.rstrip("/")
+    path = urlparse(form.action).path
+    if base and path != base and not path.startswith(base + "/"):
+      return None  # nor to a path outside the target base
+    return form
+
+  def _load_login_page(self, session):
+    """GET the login page; returns ``(response, form, page_url)``.
+
+    The search (root, root's login links, LOGIN_DISCOVERY_PATHS) runs only
+    when the configured default path answers >= 400.
+    """
+    cfg_url = (self._cached.page_url if isinstance(self._cached, LoginTarget)
+               else self.target_url + self.target_config.login_path)
+    resp = session.get(cfg_url, timeout=10, allow_redirects=True)
+    form = self._form_on(resp, cfg_url)
+    if (form is not None or resp.status_code < 400 or self._cached
+        or self._path_overridden()):
+      return resp, form, cfg_url
+    tried, fetches, transport_failed = {cfg_url}, 1, False
+    pending, expanded = deque([self.target_url + "/"]), False
+    data_paths = [self.target_url + p for p in LOGIN_DISCOVERY_PATHS]
+    while pending and fetches < MAX_LOGIN_SEARCH_FETCHES:
+      url = pending.popleft()
+      if url in tried:
+        continue
+      tried.add(url)
+      fetches += 1
+      try:
+        cand = session.get(url, timeout=10, allow_redirects=True)
+      except GrayboxScopeError:
+        cand = None  # refused by scope: skip this candidate only
+      except requests.RequestException:
+        cand, transport_failed = None, True  # skip it (budget refusal is not one)
+      if cand is not None:
+        form = self._form_on(cand, url)
+        if form is not None:
+          return cand, form, url
+        if cand.status_code == 401 and "basic" in str(
+            cand.headers.get("WWW-Authenticate", "")).lower():
+          self.failure_stage = "basic_challenge"
+      if not expanded:
+        expanded = True
+        if cand is not None:
+          page_url = cand.url if isinstance(cand.url, str) and cand.url else url
+          pending.extend(login_links(cand.text, page_url))
+        pending.extend(data_paths)
+    if transport_failed:
+      # A candidate that failed in transport may hold the form: retryable, no
+      # miss is cached.
+      raise requests.ConnectionError("login search: a candidate failed in transport")
+    self.search_found_nothing = True
+    return resp, None, cfg_url
+
+  def _submit(self, session, creds, resp, form, login_url):
+    # Anti-forgery token: a detected form's own (never another form's on the
+    # page); otherwise auto-detect or the configured field, page-wide.
+    if form is not None:
+      csrf_field, csrf_token = self._form_csrf(form.fields)
+    else:
+      csrf_field, csrf_token = self._extract_csrf(resp.text)
     if csrf_field:
       self.last_detected_csrf_field = csrf_field
 
-    payload = {
-      self.target_config.username_field: creds.username,
-      self.target_config.password_field: creds.password,
-    }
+    if form is not None:
+      self.failure_stage = ""
+      page_url = resp.url if isinstance(resp.url, str) and resp.url else login_url
+      self.found_login_target = LoginTarget(
+        page_url, form.username_field, form.password_field)
+      post_url, payload = form.action, dict(form.fields)
+      user_field, pass_field = form.username_field, form.password_field
+    else:  # legacy: the configured path answered without a form
+      page_url, post_url, payload = "", login_url, {}
+      user_field = self.target_config.username_field
+      pass_field = self.target_config.password_field
+    payload[user_field] = creds.username
+    payload[pass_field] = creds.password
     headers = {"Referer": login_url}
     if csrf_token and csrf_field:
       payload[csrf_field] = csrf_token
       headers["X-CSRFToken"] = csrf_token
 
-    # POST credentials — transport errors bubble up (retryable).
-    try:
-      resp = session.post(
-        login_url, data=payload, headers=headers,
-        timeout=10, allow_redirects=True,
-      )
-    except requests.RequestException:
-      session.close()
-      raise
-
+    # POST credentials — transport errors bubble up (retryable). The POST is
+    # never auto-followed: a 307/308 would replay the credentials.
+    resp = session.post(
+      post_url, data=payload, headers=headers,
+      timeout=10, allow_redirects=False,
+    )
     self.last_response = resp
-    if self._is_login_success(resp, session, login_url):
+    if resp.status_code in (307, 308):
+      session.close()
+      return None
+    if resp.status_code in _REDIRECT_TO_GET and resp.headers.get("Location"):
+      posted = resp
+      resp = session.get(
+        urljoin(resp.url or post_url, posted.headers["Location"]),
+        timeout=10, allow_redirects=True)
+      resp.history = [posted] + list(resp.history or [])
+      self.last_response = resp
+    # page_url: where the form was served, after redirects.
+    if self._is_login_success(resp, session, post_url, page_url):
       self._session = session
       return session
 
@@ -240,7 +390,7 @@ class FormAuth(AuthStrategy):
   # ── Internal helpers (mirrored from legacy AuthManager) ────────────────
 
   @staticmethod
-  def _is_login_success(response, session, login_url):
+  def _is_login_success(response, session, login_url, page_url=""):
     if response.status_code >= 400:
       return False
     body_lower = response.text.lower()
@@ -271,17 +421,36 @@ class FormAuth(AuthStrategy):
     # widget or a persistent nav login box on the real dashboard, and reading
     # that as a rejection aborts the entire authenticated scan — the mirror of
     # the bug above, with the same end result of findings never being looked for.
-    navigated_away = bool(response.history) and login_url not in (response.url or "")
+    # Back on the login page (the form's page, or its action) is not navigation.
+    # Detected form: same path as the action or the page, query ignored
+    # (`/login?error` is still the login page; a root action matches only `/`);
+    # legacy configured path: the historical substring rule.
+    final = response.url or ""
+    if page_url:
+      on_login = _path_query(final)[0] in (
+        _path_query(login_url)[0], _path_query(page_url)[0])
+    else:
+      on_login = login_url in final
+    navigated_away = bool(response.history) and not on_login
     if not navigated_away and _LOGIN_FORM_RE.search(response.text or ""):
       return False
-    has_cookies = bool(session.cookies.get_dict())
-    if response.url and "login" not in response.url.lower():
-      if has_cookies:
-        return True
-    if response.history and login_url not in response.url:
-      if has_cookies:
-        return True
-    return has_cookies
+    # Cookie presence is a necessary condition for a cookie session, not
+    # evidence of authentication: the login page itself sets one. The evidence
+    # is the failure-marker / JSON / password-form checks above; the proof is
+    # the authenticated probe path check in
+    # `AuthManager._validate_authenticated_session` when one is configured.
+    return bool(session.cookies.get_dict())
+
+  def _form_csrf(self, fields):
+    """``(field_name, token_value)`` among a detected form's own fields."""
+    configured = getattr(self.target_config, "csrf_field", "") or ""
+    for name in (configured, *_FORM_AUTH_CSRF_FIELDS):
+      if name and fields.get(name):
+        return (name, fields[name])
+    for name, value in fields.items():
+      if value and ("csrf" in name.lower() or "token" in name.lower()):
+        return (name, value)
+    return (None, None)
 
   def _extract_csrf(self, html):
     """Return ``(field_name, token_value)`` or ``(None, None)``.
@@ -396,6 +565,25 @@ class BearerAuth(AuthStrategy):
     if self._creds is not None:
       # Don't clear caller-owned creds — AuthManager.cleanup() drives that.
       self._creds = None
+
+
+class BasicAuth(BearerAuth):
+  """HTTP Basic auth: stamps ``Authorization: Basic b64(user:pass)``.
+
+  Sends nothing at login, like BearerAuth; the proof is AuthManager's
+  authenticated-probe-path check. The client refuses cross-origin hops, so
+  the header never leaves the target.
+  """
+
+  def authenticate(self, creds) -> Optional[requests.Session]:
+    if not creds.has_form_credentials():
+      return None
+    session = self.make_session()
+    raw = f"{creds.username}:{creds.password}".encode("utf-8")
+    session.headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
+    self._session = session
+    self._creds = creds
+    return session
 
 
 class ApiKeyAuth(AuthStrategy):

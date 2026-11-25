@@ -9,9 +9,13 @@ Design (Subphase 1.7 of the API Top 10 plan):
 - `GrayboxProbeContext` is `frozen=True`, so it cannot itself hold the
   counter. The frozen context instead holds a *reference* to a single
   RequestBudget shared across all probes.
-- Probes consult the budget via `ProbeBase.budget()` before each HTTP
-  request. When exhausted, probes emit `inconclusive` with reason
-  ``budget_exhausted`` rather than skipping silently.
+- `GrayboxHttpClient.request` is the only place the budget is consumed: it
+  charges every hop it issues, including the first. A refused hop raises
+  `RequestBudgetExhausted` and sends nothing; `ProbeBase._run_guarded` turns
+  a refusal during a run into `inconclusive` / ``budget_exhausted``.
+  Probes only *peek* (`ProbeBase.budget_available`) to skip a burst early.
+- Requests that undo a change (rollbacks) are exempt from the refusal: they
+  are still charged, so `remaining` may go negative (the honest overdraft).
 - `consume()` is thread-safe (`threading.Lock`) so future parallel
   dispatch cannot double-spend.
 """
@@ -20,6 +24,13 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
+
+
+class RequestBudgetExhausted(RuntimeError):
+  """A request was refused (and not sent) because the scan budget is spent."""
+
+  def __init__(self, message="budget_exhausted"):
+    super().__init__(message)
 
 
 @dataclass
@@ -43,12 +54,18 @@ class RequestBudget:
   _lock: threading.Lock = field(default_factory=threading.Lock,
                                   init=False, repr=False, compare=False)
 
-  def consume(self, n: int = 1) -> bool:
+  def consume(self, n: int = 1, exempt: bool = False) -> bool:
     """Decrement by ``n`` if available; return False (and bump
-    ``exhausted_count``) when the budget can't cover the request."""
+    ``exhausted_count``) when the budget can't cover the request.
+
+    ``exempt`` (rollback traffic) always succeeds and still charges, so
+    ``remaining`` can go below zero."""
     if n <= 0:
       raise ValueError("RequestBudget.consume requires n > 0")
     with self._lock:
+      if exempt:
+        self.remaining -= n
+        return True
       if self.remaining < n:
         self.exhausted_count += 1
         return False

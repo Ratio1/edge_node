@@ -19,6 +19,7 @@ from .findings import (
 )
 from .auth import AuthManager
 from .discovery import DiscoveryModule
+from .budget import RequestBudgetExhausted
 from .http_client import GrayboxHttpClient
 from .safety import SafetyControls
 from .rollback import RollbackJournalRepository
@@ -145,7 +146,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
     self.request_budget = RequestBudget(
       remaining=budget_total, total=budget_total,
     )
-    # Built before the client so redirect hops are throttled, not just budgeted.
+    # Built before the client: the client charges the budget and paces every request.
     self.safety = SafetyControls(
       request_delay=job_config.scan_min_delay or None,
       request_delay_max=job_config.scan_max_delay or None,
@@ -160,9 +161,8 @@ class GrayboxLocalWorker(BaseLocalWorker):
       gateway_bearer_refresh_token=getattr(
         job_config, "gateway_bearer_refresh_token", "",
       ) or "",
-      # So redirect hops are charged where they are actually issued. A probe
-      # consults the budget once per logical call, but the client follows up to
-      # five redirects and those extra requests were counted by nobody.
+      # The client charges and paces every request it sends, redirect hops
+      # included, so `budget_remaining` is the real request count.
       request_budget=self.request_budget,
       safety=self.safety,
       # RM-273 (D30): the engagement snapshot's flag; absent means private targets are refused.
@@ -437,9 +437,17 @@ class GrayboxLocalWorker(BaseLocalWorker):
     self.metrics.phase_start("authentication")
     self._phase_open = True
     try:
-      auth_ok = self.auth.authenticate(
-        self._credentials.official, self._credentials.regular,
-      )
+      try:
+        auth_ok = self.auth.authenticate(
+          self._credentials.official, self._credentials.regular,
+        )
+      except RequestBudgetExhausted:
+        self._abort(
+          "Request budget exhausted during authentication.",
+          reason_class="budget_exhausted",
+        )
+      # Probes read the login page and field names the form search detected.
+      self.target_config = self.auth.target_config
       self._store_auth_results()
       self.state["completed_tests"].append("graybox_auth")
     finally:
@@ -622,10 +630,17 @@ class GrayboxLocalWorker(BaseLocalWorker):
     # and continue with subsequent probes. Phase-level session checks
     # (discovery/weak_auth) use _ensure_active_sessions which raises
     # on failure; this call explicitly does not.
-    if not self.auth.ensure_sessions(
-      self._credentials.official,
-      self._credentials.regular if require_regular or self._credentials.regular else None,
-    ):
+    try:
+      refreshed = self.auth.ensure_sessions(
+        self._credentials.official,
+        self._credentials.regular if require_regular or self._credentials.regular else None,
+      )
+    except RequestBudgetExhausted as exc:
+      # The refresh itself was refused: record this family and go on to the next.
+      self._record_probe_error(store_key, exc)
+      self.metrics.record_probe(store_key, "failed:budget_exhausted")
+      return
+    if not refreshed:
       self.metrics.record_probe(store_key, "failed:auth_refresh")
       return
 
@@ -650,10 +665,16 @@ class GrayboxLocalWorker(BaseLocalWorker):
     an authenticated session. Callers should NOT swallow the exception;
     it propagates to execute_job's single handler.
     """
-    auth_ok = self.auth.ensure_sessions(
-      self._credentials.official,
-      self._credentials.regular if require_regular or self._credentials.regular else None,
-    )
+    try:
+      auth_ok = self.auth.ensure_sessions(
+        self._credentials.official,
+        self._credentials.regular if require_regular or self._credentials.regular else None,
+      )
+    except RequestBudgetExhausted:
+      self._abort(
+        f"Request budget exhausted during {scope.replace('_', ' ')}.",
+        reason_class="budget_exhausted",
+      )
     if auth_ok:
       return True
 
