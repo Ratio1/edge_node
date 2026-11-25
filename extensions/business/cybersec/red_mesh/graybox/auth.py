@@ -24,7 +24,7 @@ import requests
 from ..constants import GRAYBOX_SESSION_MAX_AGE
 from .auth_credentials import Credentials
 from .auth_strategies import ApiKeyAuth, BearerAuth, FormAuth
-from .http_client import GrayboxScopeError
+from .http_client import GrayboxScopeError, normalize_request_url
 from .models.target_config import COMMON_CSRF_FIELDS
 from .models import GrayboxAuthState
 
@@ -130,7 +130,10 @@ class AuthManager:
       if not valid and not retryable and last_stage in (
           "authenticated_probe_redirect", "authenticated_probe_rejected",
           "authenticated_probe_marker_missing",
-          "authenticated_probe_identity_missing"):
+          "authenticated_probe_identity_missing",
+          # Proven at login, public now: a logout that kept the cookie and
+          # redirects the check path to a public page (form one-hop rule).
+          "authenticated_probe_public_control"):
         return True
     return False
 
@@ -683,28 +686,25 @@ class AuthManager:
   def _form_redirect_hop_url(self, resp, probe_url: str) -> str:
     """Absolute URL of the one hop to follow for a form-auth 3xx, or "".
 
-    Empty means reject: no ``Location``, a different origin than the target,
-    or a destination on the configured login path (query ignored).
+    Empty means reject: no ``Location``, an unparsable one, a different
+    origin than the target (the client's own origin rule), or a destination
+    on the configured login or logout path (query ignored; following a
+    logout hop would end the session it is checking).
     """
     headers = getattr(resp, "headers", None) or {}
     location = headers.get("Location") or headers.get("location") or ""
     if not isinstance(location, str) or not location.strip():
       return ""
     try:
-      dest = urljoin(probe_url, location.strip())
-      parsed, base = urlparse(dest), urlparse(self.target_url)
-      # .port raises ValueError on a target-sent bad port ("host:99999").
-      same_origin = (parsed.scheme, parsed.hostname, parsed.port or 0) == (
-        base.scheme, base.hostname, base.port or 0)
-    except ValueError:
+      dest = normalize_request_url(
+        self.target_url, urljoin(probe_url, location.strip()))
+    except (GrayboxScopeError, ValueError):
       return ""
-    if parsed.scheme not in ("http", "https") or not same_origin:
-      return ""
-    login_path = urlparse(
-      self.target_url + (getattr(self.target_config, "login_path", "") or "")
-    ).path.rstrip("/")
-    if parsed.path.rstrip("/") == login_path:
-      return ""
+    dest_path = urlparse(dest).path.rstrip("/")
+    for attr in ("login_path", "logout_path"):
+      path = getattr(self.target_config, attr, "") or ""
+      if path and dest_path == urlparse(self.target_url + path).path.rstrip("/"):
+        return ""
     return dest
 
   @staticmethod

@@ -1373,10 +1373,12 @@ class TestRegularOnlyAuthentication(unittest.TestCase):
   @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
   def test_probe_path_login_page_without_marker_or_identity_is_a_logout(self, mock_requests):
     """A 200 login page at the probe path lacks the configured marker or
-    identity: the session ended."""
+    identity, or (form one-hop rule) a public page the anonymous control also
+    gets: the session ended."""
     import time
     for stage in ("authenticated_probe_marker_missing",
-                  "authenticated_probe_identity_missing"):
+                  "authenticated_probe_identity_missing",
+                  "authenticated_probe_public_control"):
       with self.subTest(stage=stage):
         mock_requests.Session.return_value = self._form_session()
         auth = _make_auth()
@@ -1488,12 +1490,7 @@ class TestFormAuthFollowsOneInScopeRedirect(unittest.TestCase):
     self.assertNotIn(fx.LOGIN, [p for _s, _m, p in log[last + 1:]])
 
   def test_a_form_redirect_to_another_origin_is_not_requested(self):
-    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
-      ApiSecurityConfig, AuthDescriptor,
-    )
-    cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(auth=AuthDescriptor(
-      auth_type="form", authenticated_probe_path="/account")))
-    auth = AuthManager("http://api.example", cfg, verify_tls=False)
+    auth = self._form_auth()
     sess = MagicMock()
     sess.get.return_value = _mock_response(
       status=302, headers={"Location": "http://evil.example/account/"})
@@ -1517,6 +1514,31 @@ class TestFormAuthFollowsOneInScopeRedirect(unittest.TestCase):
         sess.get.return_value = _mock_response(status=302, headers={"Location": location})
         self.assertEqual(auth._validate_authenticated_session(sess), (False, False))
         self.assertEqual(sess.get.call_count, 1)
+
+  def test_a_form_redirect_to_the_logout_path_is_not_followed(self):
+    # Following it would end the very session being checked.
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      ApiSecurityConfig, AuthDescriptor,
+    )
+    cfg = GrayboxTargetConfig(logout_path="/auth/logout/", api_security=ApiSecurityConfig(
+      auth=AuthDescriptor(auth_type="form", authenticated_probe_path="/account")))
+    auth = AuthManager("http://api.example", cfg, verify_tls=False)
+    sess = MagicMock()
+    sess.get.return_value = _mock_response(status=302, headers={"Location": "/auth/logout/"})
+    self.assertEqual(auth._validate_authenticated_session(sess), (False, False))
+    self.assertEqual(sess.get.call_count, 1)
+
+  def test_an_explicit_default_port_is_the_same_origin(self):
+    auth = self._form_auth()
+    sess = MagicMock()
+    sess.get.side_effect = [
+      _mock_response(status=301, headers={"Location": "http://api.example:80/account/"}),
+      _mock_response(status=200),
+    ]
+    with patch.object(auth, "_anonymous_control_response",
+                      return_value=_mock_response(status=302)):
+      self.assertEqual(auth._validate_authenticated_session(sess), (True, False))
+    self.assertEqual(sess.get.call_args.args[0], "http://api.example/account/")
 
   def test_a_form_redirect_to_a_public_page_is_rejected_by_the_control(self):
     # The hop lands on a 200 page the anonymous control also gets: nothing proves the login.
