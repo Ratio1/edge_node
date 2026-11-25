@@ -1094,7 +1094,8 @@ def scope_exceeded(owner, execution_context, scan_type, target, *, ports=(), tes
 def _launch_scope_error(owner, execution_context, engagement, *, scan_type, target, start_port, end_port,
                         exceptions, comparison_ports, enabled_features):
   """RM-251: ports (network: the range plus the comparison tier, minus exceptions) and enabled methods
-  (after the comparison bundle) must lie inside the engagement's scope; exclusions only narrow."""
+  (after the comparison bundle) must lie inside the scope of the targeted asset (RM-277: the facts carry it
+  as the engagement's); exclusions only narrow."""
   authorized_ports, authorized_tests = engagement["authorized_ports"], engagement["authorized_tests"]
   stray_ports = []
   if authorized_ports != "all" and scan_type == ScanType.NETWORK.value:
@@ -1103,7 +1104,9 @@ def _launch_scope_error(owner, execution_context, engagement, *, scan_type, targ
     stray_ports = ports_outside(effective, authorized_ports)
   stray_tests = []
   if authorized_tests != "all":
-    owner_of = {method: item["id"] for item in FEATURE_CATALOG for method in item.get("methods", [])}
+    # RM-277: a webapp test is a graybox probe family, named as its method without the leading underscore.
+    owner_of = {method: method.lstrip("_") if item["id"] == "graybox" else item["id"]
+                for item in FEATURE_CATALOG for method in item.get("methods", [])}
     stray_tests = sorted({owner_of.get(method, method) for method in enabled_features} - set(authorized_tests))
     # A kind with no authorized id is outside even when no method is enabled (the port scan or crawl still runs).
     kind_ids = feature_ids_for_kind(scan_type)

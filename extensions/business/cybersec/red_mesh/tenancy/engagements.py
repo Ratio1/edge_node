@@ -14,7 +14,7 @@ import re
 from .assets import canonical_digest, canonical_uuid, normalize_name, normalize_target, valid_digest
 from .contacts import valid_email, valid_phone
 from .identity import canonical_account_id
-from ..constants import FEATURE_CATALOG
+from ..constants import FEATURE_CATALOG, GRAYBOX_PROBE_REGISTRY
 from ..models.engagement import Contact, EngagementContext
 
 # `agreement`: signed between the client and the Super-Tenant (RoE, SOW, contract annex, permission
@@ -33,8 +33,9 @@ MAX_ENGAGEMENT_ASSETS = 64
 _ASSET_NAME_MAX = 200
 # RM-125: /3 drops the per-engagement test, scan-mode and run-mode picks (every test, both run modes).
 # RM-128: /4 drops the rules of engagement and the network assets' authorized ports.
-# RM-251: /5 brings the authorized ports and tests back. The schema follows the keys a row holds (D-10):
-# a row with neither is `/4`, read as scope "all", and keeps its stored hash; new rows carry both.
+# RM-251, RM-277: /5 brings the authorized ports and tests back, on each asset entry. The schema follows
+# the keys the assets hold (D-10): no asset with a scope key is `/4`, read as scope "all", and keeps its
+# stored hash; new rows carry them on every asset (a mix is refused).
 HASH_SCHEMA = "redmesh.engagement/5"
 HASH_SCHEMA_V4 = "redmesh.engagement/4"
 MAX_SCOPE_ENTRIES = 64
@@ -64,6 +65,9 @@ def feature_ids_for_kind(kind):
     # Imported here: the catalog loads the probe cases, which the record validator never needs.
     from ..model_testing.catalog import MODEL_TEST_CATALOG
     return tuple(test_set["id"] for test_set in MODEL_TEST_CATALOG)
+  if kind == "webapp":
+    # RM-277: the graybox probe families (the probe methods, without the leading underscore).
+    return tuple(entry["key"].lstrip("_") for entry in GRAYBOX_PROBE_REGISTRY) + ("graybox_weak_auth",)
   categories = _KIND_CATEGORIES.get(kind, ())
   return tuple(item["id"] for item in FEATURE_CATALOG if item["category"] in categories)
 
@@ -88,9 +92,8 @@ def normalize_authorized_ports(value):
 
 
 def normalize_authorized_tests(value, kinds=None):
-  """RM-251: `"all"` or the catalogue ids, sorted. With `kinds` (the asset kinds the engagement holds)
-  each id must be valid for one of them; without, the shape only (a catalogue change never makes a
-  record unreadable)."""
+  """RM-251: `"all"` or the catalogue ids, sorted. With `kinds` (the asset kind) each id must be valid
+  for one of them; without, the shape only (a catalogue change never makes a record unreadable)."""
   if value == "all":
     return value
   if (not isinstance(value, list) or not 1 <= len(value) <= MAX_SCOPE_ENTRIES
@@ -101,19 +104,27 @@ def normalize_authorized_tests(value, kinds=None):
   return sorted(set(value))
 
 
-def scope_of(record):
-  """RM-251: `(authorized_ports, authorized_tests)`; a `/4` row (no scope keys) is `all`."""
-  return record.get("authorized_ports", "all"), record.get("authorized_tests", "all")
+_SCOPE_KEYS = ("authorized_ports", "authorized_tests")
 
 
-def _scope_valid(record):
-  if ("authorized_ports" in record) != ("authorized_tests" in record):
-    return False
-  try:
-    ports, tests = scope_of(record)
-    return normalize_authorized_ports(ports) == ports and normalize_authorized_tests(tests) == tests
-  except EngagementInvalid:
-    return False
+def scope_keys(kind):
+  """RM-277: the scope keys an asset entry of `kind` carries; only a network asset has ports."""
+  return _SCOPE_KEYS if kind == "network" else _SCOPE_KEYS[1:]
+
+
+def scope_of(entry):
+  """RM-277: `(authorized_ports, authorized_tests)` of an asset entry; a `/4` entry (no scope keys) is `all`."""
+  return entry.get("authorized_ports", "all"), entry.get("authorized_tests", "all")
+
+
+def with_scope(entry):
+  """RM-277: the entry with the scope keys its kind carries (`all` where it had none)."""
+  return {**entry, **{key: entry.get(key, "all") for key in scope_keys(entry["kind"])}}
+
+
+def _scope_uniform(assets):
+  """Every asset carries its scope keys or none does (the schema follows them)."""
+  return len({"authorized_tests" in entry for entry in assets}) <= 1
 
 
 def ports_outside(ports, authorized):
@@ -250,7 +261,9 @@ def valid_asset_id(value):
 
 
 def normalize_asset_requests(value):
-  """RM-125 phase 2b: the public request form, each entry exactly `{asset_id}` (RM-128: no ports).
+  """RM-125 phase 2b: the public request form, each entry `{asset_id}` and, RM-277, the asset's
+  `authorized_ports` and `authorized_tests` (shape only, kept when restricted, so an "all" request
+  replays as before the scope).
 
   Pure (no store read): this is what the replay intent covers. The target, name and kind are never
   sent; `build_engagement_assets` copies them from the registered asset at write time.
@@ -259,9 +272,14 @@ def normalize_asset_requests(value):
     raise EngagementInvalid("engagement_asset_invalid")
   requests = []
   for entry in value:
-    if not isinstance(entry, dict) or set(entry) != {"asset_id"} or not valid_asset_id(entry["asset_id"]):
+    if (not isinstance(entry, dict) or "asset_id" not in entry or not set(entry) <= {"asset_id", *_SCOPE_KEYS}
+        or not valid_asset_id(entry["asset_id"])):
       raise EngagementInvalid("engagement_asset_invalid")
-    requests.append({"asset_id": entry["asset_id"]})
+    request = {"asset_id": entry["asset_id"]}
+    for key, normalize in zip(_SCOPE_KEYS, (normalize_authorized_ports, normalize_authorized_tests)):
+      if key in entry and normalize(entry[key]) != "all":
+        request[key] = normalize(entry[key])
+    requests.append(request)
   if len({request["asset_id"] for request in requests}) != len(requests):
     raise EngagementInvalid("engagement_asset_invalid")
   return requests
@@ -271,15 +289,20 @@ def build_engagement_assets(requests, lookup):
   """The stored entries for normalized `requests`, in order. `lookup(asset_id)` answers the
   registered asset row or raises (the administration's `asset_not_found` / `asset_archived`).
 
-  The kind is the target's.
+  The kind is the target's. RM-277: each entry carries the scope keys of its kind (`all` unless the
+  request restricts them); ports on a non-network asset and tests outside the kind are refused.
   """
   assets = []
   for index, request in enumerate(requests):
     row = lookup(request["asset_id"])
     target = row["target"]
-    assets.append({"engagement_asset_id": engagement_asset_id_for(index), "asset_id": row["asset_id"],
-                   "display_name": row["display_name"], "kind": target["kind"], "target": target,
-                   "target_digest": row["target_digest"]})
+    if "authorized_ports" in request and target["kind"] != "network":
+      raise EngagementInvalid("authorized_ports_invalid")
+    assets.append(with_scope({
+      "engagement_asset_id": engagement_asset_id_for(index), "asset_id": row["asset_id"],
+      "display_name": row["display_name"], "kind": target["kind"], "target": target,
+      "target_digest": row["target_digest"], **{key: request[key] for key in _SCOPE_KEYS if key in request}}))
+    normalize_authorized_tests(assets[-1]["authorized_tests"], {target["kind"]})
   if len({entry["target_digest"] for entry in assets}) != len(assets):
     raise EngagementInvalid("engagement_asset_invalid")
   return assets
@@ -290,8 +313,11 @@ def normalize_engagement_assets(value):
   if (not isinstance(value, list) or not 1 <= len(value) <= MAX_ENGAGEMENT_ASSETS
       or not all(_asset_entry_valid(index, entry) for index, entry in enumerate(value))
       or len({entry["target_digest"] for entry in value}) != len(value)
-      or len({entry["asset_id"] for entry in value}) != len(value)):
+      or len({entry["asset_id"] for entry in value}) != len(value) or not _scope_uniform(value)):
     raise EngagementInvalid("engagement_asset_invalid")
+  # RM-277: the ids are checked against the asset's kind here (the record check is shape only).
+  for entry in value:
+    normalize_authorized_tests(scope_of(entry)[1], {entry["kind"]})
   return [dict(entry) for entry in value]
 
 
@@ -316,10 +342,14 @@ def _asset_entry_valid(index, entry):
   if not isinstance(entry, dict) or not isinstance(entry.get("kind"), str):
     return False
   kind = entry["kind"]
-  if kind not in ENGAGEMENT_ASSET_KINDS or set(entry) != {
-      "engagement_asset_id", "asset_id", "display_name", "kind", "target", "target_digest"}:
+  base = {"engagement_asset_id", "asset_id", "display_name", "kind", "target", "target_digest"}
+  # RM-277: the scope keys of its kind, or none (a `/4` entry).
+  if kind not in ENGAGEMENT_ASSET_KINDS or set(entry) not in (base, base | set(scope_keys(kind))):
     return False
   try:
+    ports, tests = scope_of(entry)
+    if normalize_authorized_ports(ports) != ports or normalize_authorized_tests(tests) != tests:
+      return False
     if (entry["engagement_asset_id"] != engagement_asset_id_for(index) or not valid_asset_id(entry["asset_id"])
         or normalize_name(entry["display_name"], _ASSET_NAME_MAX) != entry["display_name"]
         or normalize_target(entry["target"]) != entry["target"] or entry["target"]["kind"] != kind
@@ -332,7 +362,7 @@ def _asset_entry_valid(index, entry):
 
 def hashed_fields(record):
   """The exact content the engagement hash commits to (and RM-068 will later sign)."""
-  scoped = "authorized_ports" in record and "authorized_tests" in record
+  scoped = any("authorized_tests" in entry for entry in record["assets"])
   return {
     "schema": HASH_SCHEMA if scoped else HASH_SCHEMA_V4, "tenant_id": record["tenant_id"], "engagement_id": record["engagement_id"],
     "display_name": record["display_name"],
@@ -344,7 +374,6 @@ def hashed_fields(record):
     "supersedes": record.get("supersedes"),
     # In stored order: `ea_<n>` is positional, and launches and reports name assets by it.
     "context": record["context"], "assets": record["assets"],
-    **({"authorized_ports": record["authorized_ports"], "authorized_tests": record["authorized_tests"]} if scoped else {}),
   }
 
 
@@ -414,7 +443,7 @@ def validate_engagement(row, ids):
       or len({entry["target_digest"] for entry in assets}) != len(assets)
       or len({entry["asset_id"] for entry in assets}) != len(assets)
       or not valid_digest(row.get("create_intent_digest"))
-      or not _scope_valid(row)
+      or not _scope_uniform(assets) or any(key in row for key in _SCOPE_KEYS)
       or row.get("engagement_hash") != engagement_hash(row)):
     raise ValueError("Invalid engagement")
   if not row.get("created_by") or canonical_account_id(row["created_by"]) != row["created_by"]:

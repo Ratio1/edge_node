@@ -368,9 +368,9 @@ class Inventory:
     if kind == "engagement" and isinstance(value, dict) and any(
         name in value for name in _ENGAGEMENT_V1_FIELDS):
       return OLD, "engagement_v1"
-    # RM-125 phase 2b: an entry without `asset_id`, or still with the v2 `authorized_tests`.
+    # RM-125 phase 2b: an entry without `asset_id`. RM-277: `authorized_tests` is the asset's scope now.
     if kind in ("engagement", "engagement_draft") and isinstance(value, dict) and any(
-        isinstance(entry, dict) and ("asset_id" not in entry or "authorized_tests" in entry)
+        isinstance(entry, dict) and "asset_id" not in entry
         for entry in (value["assets"] if isinstance(value.get("assets"), list) else ())):
       return OLD, "engagement_v2" if kind == "engagement" else "engagement_draft_v1"
     try:

@@ -386,7 +386,8 @@ class TestTenantAssetLinks(_AssetCase):
     stored = self.stored_child(draft_id)["assets"]
     self.assertEqual(stored, [{"engagement_asset_id": "ea_1", "asset_id": own["asset_id"],
                                "display_name": own["display_name"], "kind": "network", "target": NETWORK,
-                               "target_digest": own["target_digest"]}])
+                               "target_digest": own["target_digest"],
+                               "authorized_ports": "all", "authorized_tests": "all"}])
     tenant_id = self.tenant()
     live = self.asset(tenant_id, target=WEBAPP)
     under_tenant = self.child(tenant_id)["engagement_draft_id"]

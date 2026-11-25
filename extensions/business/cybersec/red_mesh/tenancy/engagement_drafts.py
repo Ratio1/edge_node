@@ -11,15 +11,14 @@ import re
 
 from .assets import normalize_name
 from .drafts import ITEM_STATES, _UUID, _nonempty_text, valid_draft_id, valid_generated
-from .engagements import (EngagementInvalid, MAX_ENGAGEMENT_ASSETS, _asset_entry_valid, normalize_authorized_ports,
-                          normalize_authorized_tests, normalize_context, normalize_engagement_assets,
-                          normalize_instant, normalize_window, scope_of, valid_doc_ref, valid_engagement_id)
+from .engagements import (EngagementInvalid, MAX_ENGAGEMENT_ASSETS, _asset_entry_valid, _scope_uniform,
+                          normalize_context, normalize_engagement_assets, normalize_instant, normalize_window,
+                          scope_of, valid_doc_ref, valid_engagement_id, with_scope)
 from .tenant_contracts import FIRST_CONTRACT_ID, valid_contract_id
 
 # The `create_engagement` argument set, in the order `missing[]` reports them.
-# RM-251: the scope (`"all"` by default); a row written before it reads as `"all"`.
-SCOPE = ("authorized_ports", "authorized_tests")
-FIELDS = ("display_name", "valid_from", "valid_until", "context", "assets", *SCOPE)
+# RM-277: the scope lives on each asset entry (`"all"` by default; an entry without it reads as `"all"`).
+FIELDS = ("display_name", "valid_from", "valid_until", "context", "assets")
 # The pack slot's `document_kind` in the upload envelope; the engagement pack is one PDF.
 DOCUMENT_KIND = "engagement_pack"
 DTO_FIELDS = ("engagement_draft_id", "parent", *FIELDS, "document", "created_by", "created_at",
@@ -33,7 +32,7 @@ PACK_PICK = "pack_contract_id"
 # RM-252: the nodes that pack printed (normalized, from its snapshot), and the nodes its source holds now,
 # set on a row the service answers (never stored) so `completeness` can compare the two.
 PACK_NODES = "pack_nodes"
-# RM-251: the `[authorized_ports, authorized_tests]` the pack printed; a row without it is never stale on scope.
+# RM-251, RM-277: the `{asset_id: [authorized_ports, authorized_tests]}` the pack printed; a row without it printed "all".
 PACK_SCOPE = "pack_scope"
 SOURCE_NODES = "pack_source_nodes"
 # RM-248: a draft that replaces an engagement names it (`supersedes`, set at creation only) and carries
@@ -109,16 +108,13 @@ def _assets(value):
 
 # Per field: the write-time normalizer (emptiness allowed) and the empty value a new draft starts with.
 _NORMALIZE = {"display_name": _display_name, "valid_from": _instant, "valid_until": _instant,
-              "context": lambda value: _refused(normalize_context, value, "context_invalid"), "assets": _assets,
-              "authorized_ports": lambda value: _refused(normalize_authorized_ports, value, "authorized_ports_invalid"),
-              "authorized_tests": lambda value: _refused(normalize_authorized_tests, value, "authorized_tests_invalid")}
-_EMPTY = {"display_name": "", "valid_from": "", "valid_until": "", "context": None, "assets": [],
-          "authorized_ports": "all", "authorized_tests": "all"}
+              "context": lambda value: _refused(normalize_context, value, "context_invalid"), "assets": _assets}
+_EMPTY = {"display_name": "", "valid_from": "", "valid_until": "", "context": None, "assets": []}
 
 
 def scope(row):
-  """The draft's `(authorized_ports, authorized_tests)`."""
-  return tuple(row.get(field, "all") for field in SCOPE)
+  """The draft's scope by asset: `{asset_id: [authorized_ports, authorized_tests]}`."""
+  return {entry["asset_id"]: list(scope_of(entry)) for entry in row["assets"]}
 
 
 def _check_window(row):
@@ -161,9 +157,8 @@ def replacing(row, engagement, supporting=()):
   baselines = {document["comment"][len(BASELINE_PREFIX):] for document in documents
                if document["kind"] == "agreement" and document["comment"].startswith(BASELINE_PREFIX)}
   top = max([int(document["document_id"][3:]) for document in documents] or [0])
-  # RM-251: a replacement keeps the old scope, never widens it (a `/4` engagement reads as "all").
-  return {**row, SUPERSEDES: engagement["engagement_id"], "assets": [dict(entry) for entry in engagement["assets"]],
-          **dict(zip(SCOPE, scope_of(engagement))),
+  # RM-251, RM-277: a replacement keeps each asset's scope, never widens it (a `/4` entry reads as "all").
+  return {**row, SUPERSEDES: engagement["engagement_id"], "assets": [with_scope(entry) for entry in engagement["assets"]],
           CARRIED: [dict(document) for document in documents if document["kind"] in CARRIED_KINDS
                     and not (document["title"] == GENERATED_PACK_TITLE and document["sha256"] in baselines)]
                    + [{"document_id": "ed_%d" % (top + number), SOURCE: source, **entry}
@@ -231,9 +226,6 @@ def apply_changes(row, changes):
     dropped.extend(document["ref"] for document in added_documents(row) if document not in kept)
     row[CARRIED] = kept
   _check_window(row)
-  if "authorized_tests" in changes and row["assets"]:
-    _refused(lambda tests: normalize_authorized_tests(tests, {entry["kind"] for entry in row["assets"]}),
-             row["authorized_tests"], "authorized_tests_invalid")
   if "document" in changes:
     change = changes["document"]
     if not isinstance(change, dict) or set(change) != {"state"}:
@@ -257,8 +249,10 @@ def document_refs(row):
 
 
 def asset_requests(assets):
-  """The stored entries as the public `create_engagement` request form (RM-125 phase 2b)."""
-  return [{"asset_id": entry["asset_id"]} for entry in assets]
+  """The stored entries as the public `create_engagement` request form (RM-125 phase 2b); RM-277: with
+  each restricted scope key."""
+  return [{"asset_id": entry["asset_id"], **{key: value for key, value in zip(
+    ("authorized_ports", "authorized_tests"), scope_of(entry)) if value != "all"}} for entry in assets]
 
 
 def completeness(row):
@@ -290,10 +284,6 @@ def completeness(row):
     normalize_engagement_assets(row["assets"])
   except EngagementInvalid as exc:
     gap("assets", exc.code)
-  try:
-    normalize_authorized_tests(scope(row)[1], {entry["kind"] for entry in row["assets"]})
-  except EngagementInvalid as exc:
-    gap("authorized_tests", exc.code)
   if row["document"]["state"] != "signed":
     missing.append(f"item:{DOCUMENT_KIND}")
   # RM-252: the binding or the source's nodes moved after the pack was generated; an old row has no stored keys.
@@ -302,13 +292,14 @@ def completeness(row):
       pack_contract(row) != (contract_pick(row) or FIRST_CONTRACT_ID)
       or (PACK_NODES in row and source_nodes is not None and row[PACK_NODES] != source_nodes))
   # RM-251: any generated pack, older ones too (no stored keys at all), printed "all" unless it stored a scope.
-  if stale or (row["document"]["generated"] is not None and row.get(PACK_SCOPE, ["all", "all"]) != list(scope(row))):
+  printed = row.get(PACK_SCOPE, {entry["asset_id"]: ["all", "all"] for entry in row["assets"]})
+  if stale or (row["document"]["generated"] is not None and printed != scope(row)):
     missing.append(f"item:{DOCUMENT_KIND}_stale")
   return {"complete": not missing, "missing": missing, "reasons": reasons}
 
 
 def draft_dto(row):
-  return {**{key: row[key] for key in DTO_FIELDS if key not in SCOPE}, **dict(zip(SCOPE, scope(row))),
+  return {**{key: row[key] for key in DTO_FIELDS},
           CONTRACT_PICK: contract_pick(row),
           SUPERSEDES: row.get(SUPERSEDES), CARRIED: carried(row), "completeness": completeness(row)}
 
@@ -337,7 +328,7 @@ def _stored_assets_valid(assets):
   return (isinstance(assets, list) and len(assets) <= MAX_ENGAGEMENT_ASSETS
           and all(_asset_entry_valid(index, entry) for index, entry in enumerate(assets))
           and len({entry["target_digest"] for entry in assets}) == len(assets)
-          and len({entry["asset_id"] for entry in assets}) == len(assets))
+          and len({entry["asset_id"] for entry in assets}) == len(assets) and _scope_uniform(assets))
 
 
 def _carried_valid(documents):
@@ -365,7 +356,6 @@ def validate_engagement_draft(row, ids):
       # Shape only for the context: `EngagementContext` may gain fields.
       or not isinstance(row.get("context"), dict)
       or not _stored_assets_valid(row.get("assets"))
-      or not all(_same(_NORMALIZE[field], value) for field, value in zip(SCOPE, scope(row)))
       or not isinstance(slot, dict) or set(slot) != {"state", "document", "generated"}
       or slot["state"] not in ITEM_STATES
       or (slot["state"] == "signed") != (slot["document"] is not None)

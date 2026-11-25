@@ -541,7 +541,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
 
   def test_a_kind_with_no_authorized_test_is_refused_even_when_nothing_is_enabled(self):
     from extensions.business.cybersec.red_mesh.tenancy.engagements import feature_ids_for_kind
-    for kind, launch, other in (("network", self._launch_network, "graybox"), ("webapp", self._launch_webapp, "web_discovery")):
+    for kind, launch, other in (("network", self._launch_network, "graybox_injection"), ("webapp", self._launch_webapp, "web_discovery")):
       with self.subTest(kind):
         plugin = self._build_mock_plugin(job_id="scope-empty-kind")
         features = self._get_features(plugin, kind)
@@ -568,12 +568,20 @@ class TestPhase1ConfigCID(unittest.TestCase):
     plugin = self._build_mock_plugin(job_id="scope-tests")
     self.assertNotIn("error", self._launch_network(plugin, engagement=scoped, excluded_features=outside))
     self.assertEqual(self._latest_job_config(plugin)["engagement_authorized_tests"], ["service_info_common"])
-    # A webapp launch is held to `graybox` the same way.
-    plugin = self._build_mock_plugin(job_id="scope-tests")
-    self.assertNotIn("error", self._launch_webapp(plugin, engagement=self._scoped(authorized_tests=["graybox"])))
-    plugin = self._build_mock_plugin(job_id="scope-tests")
-    self._refused(plugin, self._launch_webapp(plugin, engagement=self._scoped(authorized_tests=["web_discovery"])),
-                  "scope_exceeded", tests=["graybox"])
+
+  def test_a_webapp_asset_limited_to_some_graybox_families_is_held_to_them(self):
+    # RM-277: a webapp test is a graybox probe family (the probe method without the leading underscore).
+    from extensions.business.cybersec.red_mesh.tenancy.engagements import feature_ids_for_kind
+    families = ["graybox_access_control", "graybox_weak_auth"]
+    scoped = self._scoped(authorized_tests=families)
+    plugin = self._build_mock_plugin(job_id="scope-families")
+    result = self._launch_webapp(plugin, engagement=scoped)
+    self._refused(plugin, result, "scope_exceeded", ports=[])
+    self.assertEqual(result["tests"], sorted(set(feature_ids_for_kind("webapp")) - set(families))[:20])
+    plugin = self._build_mock_plugin(job_id="scope-families")
+    outside = [method for method in self._get_features(plugin, "webapp") if method.lstrip("_") not in families]
+    self.assertNotIn("error", self._launch_webapp(plugin, engagement=scoped, excluded_features=outside))
+    self.assertEqual(self._latest_job_config(plugin)["engagement_authorized_tests"], families)
 
   def test_a_comparison_bundle_forced_on_is_held_to_the_authorized_tests(self):
     # The bundle re-enables `web_discovery` methods the request excluded, so the check follows it.
@@ -585,7 +593,8 @@ class TestPhase1ConfigCID(unittest.TestCase):
     widened = lambda host, scan_type=None, categs=False: (
       [*original(host, scan_type=scan_type), "_web_test_common"] if str(scan_type) == "webapp" else original(
         host, scan_type=scan_type, categs=categs))
-    scoped = self._scoped(authorized_tests=["graybox"])
+    from extensions.business.cybersec.red_mesh.tenancy.engagements import feature_ids_for_kind
+    scoped = self._scoped(authorized_tests=sorted(feature_ids_for_kind("webapp")))
     with patch.object(PentesterApi01Plugin, "_get_supported_features", widened):
       result = self._launch_webapp(plugin, engagement=scoped, comparison_mode=True,
                                    excluded_features=["_web_test_common"])
