@@ -216,6 +216,7 @@ class ApiAccessProbes(ProbeBase):
       self.emit_vulnerable(
         "PT-OAPI1-01", title, "MEDIUM", owasp, cwe, evidence,
         replay_steps=replay,
+        response=resp,
         remediation=(
           "Enforce per-object authorization on the endpoint: verify that "
           "the requester owns the object (or shares its tenant) before "

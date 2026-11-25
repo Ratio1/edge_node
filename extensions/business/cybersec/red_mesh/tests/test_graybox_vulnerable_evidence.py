@@ -24,6 +24,19 @@ _ALLOWED = {
     "judged from the cookie jar attributes; no response is retained",
   ("misconfig.py", "_test_account_enumeration_timing"):
     "statistical median over 12 requests; no single response proves it",
+  ("misconfig.py", "_test_password_reset_token"):
+    "response body is the secret",
+  ("misconfig.py", "_test_password_reset_token_reuse"):
+    "response body is the secret",
+}
+
+# emit_vulnerable(...) callers that pass neither `response=` nor
+# `evidence_artifacts=`: (file, enclosing function) -> reason.
+_EMIT_ALLOWED = {
+  ("base.py", "run_stateful"):
+    "pass-through: **finding_kwargs carries the caller's response",
+  ("api_auth.py", "_test_jwt_weak_hmac"):
+    "local HMAC compare; no HTTP response proves it",
 }
 
 
@@ -59,7 +72,34 @@ def _vulnerable_without_artifacts():
   return out
 
 
+def _emit_vulnerable_without_response():
+  out = []
+  for path in sorted(Path(_probes_pkg.__file__).parent.glob("*.py")):
+    tree = ast.parse(path.read_text())
+    owner = _enclosing(tree)
+    for node in ast.walk(tree):
+      if not isinstance(node, ast.Call):
+        continue
+      name = getattr(node.func, "attr", getattr(node.func, "id", ""))
+      if name == "emit_vulnerable":
+        names = {k.arg for k in node.keywords}
+        if "response" in names or "evidence_artifacts" in names:
+          continue
+        key = (path.name, owner.get(id(node), "<module>"))
+        if key in _EMIT_ALLOWED:
+          continue
+        out.append(f"{path.name}:{node.lineno} in {key[1]}")
+      elif (name == "evidence_from" and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value is None):
+        out.append(f"{path.name}:{node.lineno} evidence_from(None)")
+  return out
+
+
 class TestVulnerableFindingsCarryEvidence(unittest.TestCase):
+  def test_emit_vulnerable_passes_response_or_artifacts(self):
+    self.assertEqual(_emit_vulnerable_without_response(), [])
+
   def test_direct_vulnerable_findings_pass_evidence_artifacts(self):
     self.assertEqual(_vulnerable_without_artifacts(), [])
 

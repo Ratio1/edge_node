@@ -681,6 +681,63 @@ class TestPasswordResetTokenReusePTA0218(unittest.TestCase):
     self.assertFalse(any(f.scenario_id == "PT-A02-18" for f in probe.findings))
 
 
+class TestResetTokenSnapshotNotAttached(unittest.TestCase):
+  """The reset response body is the secret: no snapshot of it is stored."""
+
+  def test_pt_a02_18_vulnerable_finding_has_no_snapshot(self):
+    probe = _make_probe(password_reset_path="/auth/password-reset/request/")
+    sess = MagicMock()
+    sess.get = MagicMock(return_value=_mock_response(status=200, text=""))
+    sess.post = MagicMock(side_effect=[
+      _mock_response(status=200, text="<code>reset-admin</code>"),
+      _mock_response(status=200, text="<code>reset-admin</code>"),
+    ])
+    probe.auth.make_anonymous_session = MagicMock(return_value=sess)
+
+    probe._test_password_reset_token_reuse()
+
+    f = next(x for x in probe.findings if x.scenario_id == "PT-A02-18")
+    self.assertEqual(f.status, "vulnerable")
+    self.assertEqual(f.evidence_artifacts, [])
+
+  def test_pt_a07_02_vulnerable_finding_keeps_exposure_evidence_no_snapshot(self):
+    probe = _make_probe(password_reset_path="/auth/password-reset/request/")
+    sess = MagicMock()
+    sess.get = MagicMock(return_value=_mock_response(status=200, text=""))
+    sess.post = MagicMock(return_value=_mock_response(
+      status=200, text="<code>reset-admin</code>"))
+    probe.auth.make_anonymous_session = MagicMock(return_value=sess)
+
+    probe._test_password_reset_token()
+
+    f = next(x for x in probe.findings if x.scenario_id == "PT-A07-02")
+    self.assertEqual(f.status, "vulnerable")
+    self.assertIn("token_exposed_in_response=True", f.evidence)
+    self.assertEqual(f.evidence_artifacts, [])
+
+
+class TestLoginRateLimitingPTA0207(unittest.TestCase):
+
+  def _run(self, post_side_effect):
+    probe = _make_probe()
+    sess = MagicMock()
+    sess.get = MagicMock(return_value=_mock_response(status=200, text=""))
+    sess.post = MagicMock(side_effect=post_side_effect)
+    probe.auth.make_anonymous_session = MagicMock(return_value=sess)
+    probe._test_login_rate_limiting()
+    return [x for x in probe.findings if x.scenario_id == "PT-A02-07"]
+
+  def test_all_posts_raising_is_inconclusive_not_vulnerable(self):
+    f = self._run(Exception("boom"))
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "inconclusive")
+    self.assertIn("reason=no_login_response", f[0].evidence)
+
+  def test_responses_without_lockout_is_vulnerable(self):
+    f = self._run(lambda *a, **k: _mock_response(status=200, text="bad login"))
+    self.assertEqual(f[0].status, "vulnerable")
+
+
 class TestAccountEnumeration(unittest.TestCase):
 
   def test_account_enumeration_detected(self):

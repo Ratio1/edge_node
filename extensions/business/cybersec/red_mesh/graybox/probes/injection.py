@@ -123,7 +123,8 @@ class InjectionProbes(ProbeBase):
   def _source_tag(ep):
     return "; source=discovered" if ep.source == "discovered" else ""
 
-  def _sqli_finding(self, scenario_id, url, param, hit, authenticated, method):
+  def _sqli_finding(self, scenario_id, url, param, hit, authenticated, method,
+                    source=""):
     """One vulnerable finding for a confirmed SQL injection (typed parameter)."""
     pair = hit["payload_true"] + (
       f" / {hit['payload_false']}" if hit["payload_false"] else "")
@@ -146,7 +147,7 @@ class InjectionProbes(ProbeBase):
         f"dbms={hit['dbms']}",
         f"confidence={hit['confidence']}",
         f"requests={hit['requests']}",
-      ],
+      ] + ([f"source={source}"] if source == "discovered" else []),
       replay_steps=[
         f"{method} {url} with {param} set to {hit['payload_true']}.",
         "Compare the response with the unmodified request"
@@ -161,7 +162,8 @@ class InjectionProbes(ProbeBase):
     return finding
 
   def _sqli_run(self, scenario_id, url, param, send, method, authenticated,
-                prepare=None, allow_time=False, reached=None, caps=None):
+                prepare=None, allow_time=False, reached=None, caps=None,
+                source=""):
     """Run the techniques on one parameter; emit the finding. Returns the
     outcome (hit | clean | denied | unstable | timeout | budget | capped).
     Once the request budget refuses, the whole SQLi family stops for this
@@ -180,7 +182,7 @@ class InjectionProbes(ProbeBase):
       state["_sqli_stopped"] = True
     if outcome == "hit":
       self.findings.append(self._sqli_finding(
-        scenario_id, url, param, res, authenticated, method))
+        scenario_id, url, param, res, authenticated, method, source))
     elif outcome in _SQLI_REASONS:
       seen = state.setdefault("_sqli_unstable_seen", set())
       if outcome == "unstable":
@@ -195,7 +197,8 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         parameter=param,
         evidence=[f"endpoint={url}", f"parameter={param}",
-                  f"reason={_SQLI_REASONS[outcome]}"],
+                  f"reason={_SQLI_REASONS[outcome]}"]
+                 + ([f"source={source}"] if source == "discovered" else []),
       ))
     return outcome
 
@@ -242,7 +245,7 @@ class InjectionProbes(ProbeBase):
       url = self.target_url + ep.path
       outcome = self._sqli_run(
         "PT-A03-01", url, ep.param, self._sqli_send_get(session, url, ep.param),
-        "GET", True, allow_time=True)
+        "GET", True, allow_time=True, source=ep.source)
       if outcome in ("budget", "rate_limited"):
         return
 

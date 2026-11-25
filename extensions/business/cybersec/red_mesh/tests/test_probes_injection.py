@@ -1323,6 +1323,38 @@ class TestRealSqli(unittest.TestCase):
     self.assertEqual(sqli[0].scenario_id, "PT-A03-01")
     self.assertEqual(sqli[0].parameter, "q")
 
+  def test_discovered_candidate_sqli_hit_and_inconclusive_carry_source(self):
+    from types import SimpleNamespace
+    from extensions.business.cybersec.red_mesh.graybox.probes import sqli
+    for mode, status in (("boolean", "vulnerable"), ("noisy", None)):
+      clock = _Clock()
+      app = _FakeDb(mode, clock)
+      probe = _make_probe(discovered_candidates=[_cand("/find/", "q")])
+      probe.auth.primary_session.get = MagicMock(
+        side_effect=lambda url, params=None, timeout=None: app.handle(params["q"]))
+      with unittest.mock.patch.object(sqli, "time", SimpleNamespace(monotonic=clock)):
+        probe._test_sqli_get()
+      if status:
+        self.assertEqual(probe.findings[0].status, status)
+        self.assertIn("source=discovered", probe.findings[0].evidence)
+    # inconclusive on a discovered candidate
+    n = {"i": 0}
+
+    def get(url, params=None, timeout=None):
+      n["i"] += 1
+      return _mock_response(text="visitor " + "x" * n["i"])
+    probe = _make_probe(discovered_candidates=[_cand("/find/", "q")])
+    probe.auth.primary_session.get = MagicMock(side_effect=get)
+    with unittest.mock.patch.object(
+        sqli, "time", SimpleNamespace(monotonic=_Clock())):
+      probe._test_sqli_get()
+    self.assertEqual(probe.findings[0].status, "inconclusive")
+    self.assertIn("source=discovered", probe.findings[0].evidence)
+
+  def test_configured_endpoint_sqli_has_no_source_tag(self):
+    probe, _ = self._run_get("boolean")
+    self.assertFalse(any("source=" in e for e in probe.findings[0].evidence))
+
   def test_confidence_reaches_flat_finding(self):
     probe, _ = self._run_get("boolean")
     self.assertEqual(

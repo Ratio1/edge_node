@@ -344,10 +344,10 @@ class TestEvidenceCid(unittest.TestCase):
     self.assertEqual(art["raw_evidence_cid"], "")
     self.assertEqual(len(art["content_sha256"]), 64)
 
-  def test_blobs_capped_per_job_then_hash_only(self):
+  def test_blobs_capped_per_worker_then_hash_only(self):
     from extensions.business.cybersec.red_mesh.graybox import worker as worker_module
     worker = self._worker()
-    cap = worker_module.MAX_EVIDENCE_BLOBS_PER_JOB
+    cap = worker_module.MAX_EVIDENCE_BLOBS_PER_WORKER
     findings = [self._finding(request=f"GET /{i}") for i in range(cap + 3)]
     worker._store_findings("_p", findings)
     stored = worker.state["graybox_results"]["8000"]["_p"]["findings"]

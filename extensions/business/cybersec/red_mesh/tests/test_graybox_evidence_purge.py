@@ -4,7 +4,7 @@ from copy import deepcopy
 
 from extensions.business.cybersec.red_mesh.services import control
 from .test_triage_purge import _PurgeOwner, _PurgeRepo
-from .test_triage_store import TENANT_A, TENANT_B
+from .test_triage_store import TENANT_A
 
 
 def _worker_report(*evidence_cids):
@@ -49,19 +49,18 @@ class TestPurgeDeletesEvidence(unittest.TestCase):
     self.assertIn("ev-1", self.owner.deleted)
     self.assertIn("ev-2", self.owner.deleted)
 
-  def test_purge_job_keeps_evidence_cid_referenced_by_another_job(self):
-    self.owner.add_graybox_job("job-1", TENANT_A, "rep-1", _worker_report("ev-1", "ev-shared"))
-    self.owner.add_graybox_job("job-b", TENANT_B, "rep-b", _worker_report("ev-shared"))
-    control.purge_job(self.owner, "job-1", checked_job=deepcopy(self.owner.hashes["inst"]["job-1"]))
-    self.assertIn("ev-1", self.owner.deleted)
-    self.assertNotIn("ev-shared", self.owner.deleted)
+  def test_unreadable_own_report_is_kept_and_reported(self):
+    self.owner.add_graybox_job("job-1", TENANT_A, "rep-1", _worker_report("ev-1"))
+    del self.owner.archives["rep-1"]  # its evidence CIDs cannot be listed: deleting it would orphan them
+    result = control.purge_job(self.owner, "job-1", checked_job=deepcopy(self.owner.hashes["inst"]["job-1"]))
+    self.assertNotIn("rep-1", self.owner.deleted)
+    self.assertEqual(result["kept_unreadable_reports"], ["rep-1"])
 
-  def test_unreadable_other_report_keeps_evidence(self):
-    self.owner.add_graybox_job("job-1", TENANT_A, "rep-1", _worker_report("ev-shared"))
-    self.owner.add_graybox_job("job-b", TENANT_B, "rep-b", _worker_report("ev-shared"))
-    del self.owner.archives["rep-b"]  # job-b's report cannot be read: sharing is unknown
-    control.purge_job(self.owner, "job-1", checked_job=deepcopy(self.owner.hashes["inst"]["job-1"]))
-    self.assertNotIn("ev-shared", self.owner.deleted)
+  def test_readable_reports_have_no_kept_entry(self):
+    self.owner.add_graybox_job("job-1", TENANT_A, "rep-1", _worker_report("ev-1"))
+    result = control.purge_job(self.owner, "job-1", checked_job=deepcopy(self.owner.hashes["inst"]["job-1"]))
+    self.assertNotIn("kept_unreadable_reports", result)
+    self.assertIn("rep-1", self.owner.deleted)
 
   def test_force_purge_deletes_evidence_cids(self):
     record = self.owner.add_graybox_job("job-1", TENANT_A, "rep-1", _worker_report("ev-1"))

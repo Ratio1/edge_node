@@ -521,7 +521,13 @@ class MisconfigProbes(ProbeBase):
 
     session.close()
 
-    if not blocked:
+    if not blocked and last_response is None:
+      # Every login POST raised: nothing was observed, so "not enforced" is unproven.
+      self.emit_inconclusive(
+        "PT-A02-07", "Login rate limiting could not be evaluated",
+        "A07:2021", "no_login_response",
+      )
+    elif not blocked:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A02-07",
         title="Login rate limiting not enforced",
@@ -595,7 +601,6 @@ class MisconfigProbes(ProbeBase):
 
     import re
     tokens = []
-    token_response = None
     for i in range(2):
       self.safety.throttle()
       if i > 0:
@@ -634,8 +639,6 @@ class MisconfigProbes(ProbeBase):
         m = pat.search(body)
         if m:
           tokens.append(m.group(1))
-          if token_response is None:
-            token_response = resp
           break
 
     session.close()
@@ -687,7 +690,6 @@ class MisconfigProbes(ProbeBase):
         remediation="Use cryptographically random tokens (128+ bits). "
                     "Never expose tokens in HTML responses. "
                     "Enforce single-use and short expiration.",
-        evidence_artifacts=self.evidence_from(token_response),
       ))
     elif status == "inconclusive":
       self.findings.append(GrayboxFinding(
@@ -763,7 +765,6 @@ class MisconfigProbes(ProbeBase):
     ]
 
     issued = []
-    issued_response = None
     for _ in range(2):
       self.safety.throttle()
       csrf_token = None
@@ -793,7 +794,6 @@ class MisconfigProbes(ProbeBase):
         m = pat.search(resp.text)
         if m:
           issued.append(m.group(1))
-          issued_response = resp
           break
 
     session.close()
@@ -825,7 +825,7 @@ class MisconfigProbes(ProbeBase):
         evidence=[
           f"reset_endpoint={reset_path}",
           f"tokens_observed={len(issued)}",
-          f"first_token={issued[0]}",
+          f"token_length={len(str(issued[0]))}",  # the token itself is the secret: never in evidence
           "tokens_identical=True",
         ],
         replay_steps=[
@@ -839,7 +839,6 @@ class MisconfigProbes(ProbeBase):
                     "Mark the prior token consumed AND invalidated when a new "
                     "one is issued. Treat reset tokens like one-time bearer "
                     "credentials with short TTL.",
-        evidence_artifacts=self.evidence_from(issued_response),
       ))
     else:
       self.findings.append(GrayboxFinding(

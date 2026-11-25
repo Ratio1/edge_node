@@ -33,8 +33,8 @@ from .models import (
 )
 
 # The evidence add is synchronous on the scan thread: past this many blobs a
-# job's findings keep their content hash only.
-MAX_EVIDENCE_BLOBS_PER_JOB = 200
+# worker's findings keep their content hash only.
+MAX_EVIDENCE_BLOBS_PER_WORKER = 200
 
 # Weak auth uses a direct import (not the registry) because it is a
 # distinct pipeline phase, not a generic probe.
@@ -692,7 +692,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
     the redacted text replaces the one held in the result, so the hash matches
     what the report shows. A storage failure leaves the cid empty and keeps the
     hash; it never fails the job. The R1FS add is synchronous on the scan
-    thread, so past `MAX_EVIDENCE_BLOBS_PER_JOB` a finding keeps only its hash.
+    thread, so past `MAX_EVIDENCE_BLOBS_PER_WORKER` a finding keeps only its hash.
     """
     targets = [
       artifact
@@ -732,7 +732,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
     return flats
 
   def _store_evidence_blob(self, request, response, digest):
-    if self._evidence_blobs_stored >= MAX_EVIDENCE_BLOBS_PER_JOB:
+    if self._evidence_blobs_stored >= MAX_EVIDENCE_BLOBS_PER_WORKER:
       return ""
     # Imported here: `services` imports this module, so a top-level import cycles.
     from ..model_testing.raw_evidence import _retention_until
