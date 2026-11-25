@@ -30,6 +30,7 @@ from ..graybox.models.target_config import (
   validate_target_config_secret_ref_positions,
 )
 from ..graybox.http_client import validate_target_config_paths
+from ..graybox.safety import SafetyControls
 from ..repositories import JobStateRepository
 from ..tenancy.effective_targets import resolve_launch_target, validate_effective_config
 from ..graybox.scenario_runtime import (
@@ -1819,6 +1820,11 @@ def launch_webapp_scan(
   )
   if auth_error:
     return auth_error
+  # RM-273 (D30): a private-range target needs the engagement's allow_private_targets.
+  allow_private = ((engagement or {}).get("context") or {}).get("allow_private_targets") is True
+  private_reason = None if allow_private else SafetyControls.private_target_reason(target)
+  if private_reason:
+    return validation_error(private_reason)
   path_scope_errors = validate_target_config_paths(
     target_url,
     raw_target_config,

@@ -79,10 +79,10 @@ class TestTheWorkerHandsItsControlsToTheClient(unittest.TestCase):
   throttled.
   """
 
-  def _client(self):
+  def _client(self, **overrides):
     owner = MagicMock()
     owner.P = MagicMock()
-    cfg = _make_job_config()
+    cfg = _make_job_config(**overrides)
     with patch("extensions.business.cybersec.red_mesh.graybox.worker.AuthManager"):
       with patch("extensions.business.cybersec.red_mesh.graybox.worker.DiscoveryModule"):
         worker = GrayboxLocalWorker(
@@ -104,6 +104,13 @@ class TestTheWorkerHandsItsControlsToTheClient(unittest.TestCase):
       "budgeted but never throttled",
     )
     self.assertIs(worker.http_client._safety, worker.safety)
+
+  def test_the_engagement_private_target_flag_reaches_the_client(self):
+    # RM-273 (D30): only a literal True in the engagement snapshot lifts the refusal.
+    for engagement, expected in (({"allow_private_targets": True}, True),
+                                 ({"allow_private_targets": "yes"}, False), ({}, False), (None, False)):
+      with self.subTest(engagement=engagement):
+        self.assertIs(self._client(engagement=engagement).http_client._allow_private_targets, expected)
 
 
 class TestBaseLocalWorkerIntegration(unittest.TestCase):

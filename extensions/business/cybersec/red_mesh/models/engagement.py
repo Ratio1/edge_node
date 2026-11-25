@@ -123,6 +123,8 @@ class EngagementContext:
   methodology: str = "PTES + OWASP WSTG + CVSS v3.1"
   point_of_contact: Contact | None = None
   emergency_contact: Contact | None = None
+  # RM-273 (D30): the engagement authorises scanning private-range targets.
+  allow_private_targets: bool = False
 
   def to_dict(self) -> dict:
     out: dict[str, Any] = {
@@ -137,6 +139,8 @@ class EngagementContext:
       "point_of_contact": self.point_of_contact.to_dict() if self.point_of_contact else None,
       "emergency_contact": self.emergency_contact.to_dict() if self.emergency_contact else None,
     }
+    if self.allow_private_targets:
+      out["allow_private_targets"] = True
     return out
 
   @classmethod
@@ -144,6 +148,7 @@ class EngagementContext:
     if not d:
       return None
     return cls(
+      allow_private_targets=d.get("allow_private_targets") is True,
       client_name=str(d.get("client_name", "")),
       engagement_code=str(d.get("engagement_code", "")),
       primary_objective=str(d.get("primary_objective", "")),

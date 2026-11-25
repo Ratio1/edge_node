@@ -167,10 +167,11 @@ def normalize_context(value):
   if value is None:
     value = {}
   if (not isinstance(value, dict)
-      or not set(value) <= {*_CONTEXT_TEXT, "point_of_contact", "emergency_contact"}):
+      or not set(value) <= {*_CONTEXT_TEXT, "point_of_contact", "emergency_contact", "allow_private_targets"}
+      or not isinstance(value.get("allow_private_targets", False), bool)):
     raise EngagementInvalid("context_invalid")
   text = {key: _context_text(value[key]) for key in _CONTEXT_TEXT if key in value}
-  context = EngagementContext(**text)
+  context = EngagementContext(**text, allow_private_targets=value.get("allow_private_targets", False))
   context.point_of_contact = _contact(value.get("point_of_contact"))
   context.emergency_contact = _contact(value.get("emergency_contact"))
   if context.validate():

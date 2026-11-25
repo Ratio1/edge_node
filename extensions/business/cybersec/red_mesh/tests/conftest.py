@@ -136,6 +136,17 @@ class DummyOwner:
     return
 
 
+def private_ok_client(*args, **kwargs):
+  """A `GrayboxHttpClient` that may reach private or unresolvable test hosts.
+
+  RM-273 (D30): the client refuses private targets by default; suites about scope, auth or
+  redirects run against hosts like `target.local` that resolve nowhere in the test sandbox.
+  """
+  from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient
+  kwargs.setdefault("allow_private_targets", True)
+  return GrayboxHttpClient(*args, **kwargs)
+
+
 def mock_plugin_modules():
   """Install mock modules so pentester_api_01 can be imported without naeural_core."""
   install_pymisp_stub()
