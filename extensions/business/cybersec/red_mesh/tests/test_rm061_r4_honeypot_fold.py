@@ -57,6 +57,15 @@ class HoneypotFoldTests(unittest.TestCase):
       self.assertIn("Detected version: 2.2.22", r["evidence"])
       self.assertEqual(r["finding_id"], f"id-8080-{r['cve'][0][-1]}")
 
+  def test_targeted_port_list_never_fires_the_ratio_rule(self):
+    # RM-268 vulhub regression 1469c783: a scan of only the listed service ports has nearly all of them open.
+    rep = report(range(1, 58), scanned=60)
+    self.assertIsNone(host_honeypot_verdict(rep))
+    self.assertIsNone(apply_host_honeypot_verdict(rep))
+    self.assertEqual({r["confidence"] for r in cve_rows(rep)}, {"firm"})
+    self.assertEqual(host_honeypot_verdict(report(range(1, 501), scanned=999)), None)
+    self.assertEqual(host_honeypot_verdict(report(range(1, 5002), scanned=10000)), "port_ratio")
+
   def test_demoted_rows_fold_in_cve_view(self):
     rep = report(range(1, 601))
     apply_host_honeypot_verdict(rep)
@@ -137,8 +146,8 @@ class HostVerdictOverBatchesTests(unittest.TestCase):
   """The verdict is per host: a worker sees one slice of the ports, the merged report sees them all."""
 
   def test_honeypot_split_over_16_batches_is_still_detected(self):
-    # T-Pot 1-300: ~19 open of 19 scanned per batch never meets the >20 rule alone; merged, 300 of 300 does.
-    batch_ports = [list(range(i * 19 + 1, i * 19 + 20)) for i in range(16)]
+    # T-Pot 1-1216 over 64 batches: 19 open of 19 scanned per batch never meets the >20 rule alone; merged, all do.
+    batch_ports = [list(range(i * 19 + 1, i * 19 + 20)) for i in range(64)]
     self.assertTrue(all(not _port_ratio_fires(len(b), len(b)) for b in batch_ports))
     merged = report([p for b in batch_ports for p in b], scanned=sum(len(b) for b in batch_ports))
     self.assertEqual(host_honeypot_verdict(merged), "port_ratio")
@@ -153,7 +162,7 @@ class HostVerdictOverBatchesTests(unittest.TestCase):
     self.assertEqual(host_honeypot_verdict(merged), "os_mismatch")
 
   def test_worker_list_scanned_is_accepted(self):
-    self.assertEqual(host_honeypot_verdict({"open_ports": list(range(30)), "ports_scanned": list(range(40))}), "port_ratio")
+    self.assertEqual(host_honeypot_verdict({"open_ports": list(range(600)), "ports_scanned": list(range(1000))}), "port_ratio")
 
 
 def fake_get_factory(routes):

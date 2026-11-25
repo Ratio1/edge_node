@@ -54,6 +54,11 @@ def _port_ratio_fires(n_open, n_scanned):
   return bool(n_scanned) and n_open / n_scanned > 0.5 and n_open > 20
 
 
+# The host verdict folds rows, so its ratio rule needs a wide scan: a targeted list of service ports is nearly all
+# open on any real host (RM-268 vulhub regression 1469c783, D66). The per-worker indicator finding keeps the plain rule.
+HOST_RATIO_MIN_SCANNED = 1000
+
+
 def _os_mismatch(os_claims):
   """True when the OS claims name more than one OS family."""
   return len({_normalize_os_family(os_string) for os_string in (os_claims or {}).values()}) > 1 and len(os_claims) >= 2
@@ -67,7 +72,7 @@ def host_honeypot_verdict(report):
   """
   scanned = report.get("ports_scanned")
   scanned = len(scanned) if isinstance(scanned, (list, set, tuple)) else (scanned or 0)
-  if _port_ratio_fires(len(report.get("open_ports") or ()), scanned):
+  if scanned >= HOST_RATIO_MIN_SCANNED and _port_ratio_fires(len(report.get("open_ports") or ()), scanned):
     return "port_ratio"
   if _os_mismatch((report.get("scan_metadata") or {}).get("os_claims")):
     return "os_mismatch"

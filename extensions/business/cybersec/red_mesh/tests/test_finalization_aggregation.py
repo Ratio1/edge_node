@@ -793,7 +793,8 @@ class TestHostHoneypotFoldAtFinalization(unittest.TestCase):
     }
 
   def _report(self, ports, rows):
-    return {"target": "192.0.2.10", "start_port": 1, "end_port": 24, "ports_scanned": 12,
+    # Each worker scans 600 ports, all open: the merged 1200 meet the host rule's wide-scan floor (D66).
+    return {"target": "192.0.2.10", "start_port": 1, "end_port": 1200, "ports_scanned": 600,
             "open_ports": ports, "service_info": {"80": {"_service_info_http": {"findings": rows}}},
             "web_tests_info": {}, "completed_tests": ["port_scan"], "port_protocols": {"80": "http"}}
 
@@ -803,11 +804,11 @@ class TestHostHoneypotFoldAtFinalization(unittest.TestCase):
     owner = FinalizationOwner()
     owner.cfg_llm_agent = {"ENABLED": False}
     owner.job["workers"] = {
-      "node-a": {"finished": True, "report_cid": "ra", "start_port": 1, "end_port": 12},
-      "node-b": {"finished": True, "report_cid": "rb", "start_port": 13, "end_port": 24},
+      "node-a": {"finished": True, "report_cid": "ra", "start_port": 1, "end_port": 600},
+      "node-b": {"finished": True, "report_cid": "rb", "start_port": 601, "end_port": 1200},
     }
-    owner.r1fs.values["ra"] = self._report(list(range(1, 13)), [self._row(1), self._row(2, kev=True)])
-    owner.r1fs.values["rb"] = self._report(list(range(13, 25)), [self._row(1), self._row(3)])
+    owner.r1fs.values["ra"] = self._report(list(range(1, 601)), [self._row(1), self._row(2, kev=True)])
+    owner.r1fs.values["rb"] = self._report(list(range(601, 1201)), [self._row(1), self._row(3)])
     maybe_finalize_pass(owner)
     self.assertEqual(owner.job["job_status"], "FINALIZED")
     stored = [w for w in owner.r1fs.writes if isinstance(w, dict) and "service_info" in w]
@@ -823,7 +824,7 @@ class TestHostHoneypotFoldAtFinalization(unittest.TestCase):
 
   def test_merge_helper_folds_and_a_failing_fold_is_logged_by_type_only(self):
     from extensions.business.cybersec.red_mesh.mixins.report import get_host_aggregated_report
-    merged = {"open_ports": list(range(1, 31)), "ports_scanned": 30,
+    merged = {"open_ports": list(range(1, 601)), "ports_scanned": 1000,
               "service_info": {"80": {"m": {"findings": [self._row(1)]}}}}
     owner = MagicMock()
     owner._get_aggregated_report.return_value = merged
