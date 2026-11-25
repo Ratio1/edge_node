@@ -1074,6 +1074,12 @@ class TestEngagementReplacement(_EngagementDraftCase):
     self.assertFalse(stale())
     ok(self, self.update_child(draft_id, {"authorized_tests": ["web_discovery"]}))
     self.assertTrue(stale())
+    # A pack from before RM-252 stores no contract, nodes or scope: a restricted scope still makes it stale.
+    row = self.stored_child(draft_id)
+    for key in ("pack_scope", "pack_contract_id", "pack_nodes"):
+      row.pop(key, None)
+    self.repo.put("engagement_draft", draft_id, record=row)
+    self.assertTrue(stale())
 
   def test_a_replacement_whose_documents_would_exceed_the_limit_is_refused_at_create(self):
     from extensions.business.cybersec.red_mesh.tenancy import administration

@@ -298,11 +298,11 @@ def completeness(row):
     missing.append(f"item:{DOCUMENT_KIND}")
   # RM-252: the binding or the source's nodes moved after the pack was generated; an old row has no stored keys.
   source_nodes = row.get(SOURCE_NODES)
-  if pack_contract(row) is not None and (
+  stale = pack_contract(row) is not None and (
       pack_contract(row) != (contract_pick(row) or FIRST_CONTRACT_ID)
-      or (PACK_NODES in row and source_nodes is not None and row[PACK_NODES] != source_nodes)
-      # A pack made before the scope printed "all" for both.
-      or row.get(PACK_SCOPE, ["all", "all"]) != list(scope(row))):
+      or (PACK_NODES in row and source_nodes is not None and row[PACK_NODES] != source_nodes))
+  # RM-251: any generated pack, older ones too (no stored keys at all), printed "all" unless it stored a scope.
+  if stale or (row["document"]["generated"] is not None and row.get(PACK_SCOPE, ["all", "all"]) != list(scope(row))):
     missing.append(f"item:{DOCUMENT_KIND}_stale")
   return {"complete": not missing, "missing": missing, "reasons": reasons}
 
