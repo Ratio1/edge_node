@@ -62,7 +62,7 @@ def _make_probe(ssrf_endpoints=None, discovered_forms=None,
 class TestSsrfProbe(unittest.TestCase):
 
   def test_ssrf_reflected(self):
-    """Callback in response body → vulnerable."""
+    """Callback in response body → inconclusive (no out-of-band proof, D29)."""
     ep = SsrfEndpoint(path="/api/fetch/", param="url")
     probe = _make_probe(ssrf_endpoints=[ep])
     session = probe.auth.primary_session
@@ -76,10 +76,10 @@ class TestSsrfProbe(unittest.TestCase):
     session.get.side_effect = [baseline_resp, probe_resp]
 
     probe._test_ssrf()
-    vuln = [f for f in probe.findings if f.scenario_id == "PT-API7-01" and f.status == "vulnerable"]
-    self.assertEqual(len(vuln), 1)
-    self.assertEqual(vuln[0].severity, "HIGH")
-    self.assertIn("CWE-918", vuln[0].cwe)
+    found = [f for f in probe.findings if f.scenario_id == "PT-API7-01"]
+    self.assertEqual([f.status for f in found], ["inconclusive"])
+    self.assertIn("reason=ssrf_reflection_only", found[0].evidence)
+    self.assertIn("CWE-918", found[0].cwe)
 
   def test_ssrf_respects_runtime_assignment_gate(self):
     ep = SsrfEndpoint(path="/api/fetch/", param="url")
@@ -143,7 +143,7 @@ class TestTheTwoSsrfVariantsAreSeparateFindings(unittest.TestCase):
     probe._test_ssrf_body_field()
 
     vuln = [f for f in probe.findings
-            if f.scenario_id == "PT-API7-01" and f.status == "vulnerable"]
+            if f.scenario_id == "PT-API7-01" and f.status == "inconclusive"]
     self.assertEqual(len(vuln), 2, "expected one finding per SSRF variant")
     return [f.to_flat_finding(8000, "http", "_graybox_injection") for f in vuln]
 
@@ -194,7 +194,7 @@ class TestTheTwoSsrfVariantsAreSeparateFindings(unittest.TestCase):
     probe._test_ssrf_body_field()
 
     flat = [f.to_flat_finding(8000, "http", "_graybox_injection")
-            for f in probe.findings if f.status == "vulnerable"]
+            for f in probe.findings if f.status == "inconclusive"]
     self.assertEqual(len(flat), 2)
     self.assertNotEqual(flat[0]["finding_id"], flat[1]["finding_id"])
 
@@ -591,6 +591,7 @@ class TestJsonTypeConfusionPTA0315(unittest.TestCase):
     probe = _make_probe(json_type_endpoints=[ep])
     probe.auth.primary_session.post = MagicMock(side_effect=[
       _mock_response(status=200, text='{"matched":1}'),  # baseline int
+      _mock_response(status=400, text='{"error":"id_must_be_integer"}'),  # control
       _mock_response(status=200, text='{"matched":1}'),  # variant list
     ])
     probe._test_json_type_confusion()
@@ -598,11 +599,58 @@ class TestJsonTypeConfusionPTA0315(unittest.TestCase):
     self.assertEqual(len(f), 1)
     self.assertEqual(f[0].status, "vulnerable")
 
+  def test_pt_a03_15_inconclusive_when_endpoint_ignores_the_field(self):
+    """The invalid-string control is accepted too: nothing validates the field."""
+    ep = JsonLookupEndpoint(path="/api/lookup/", field="id")
+    probe = _make_probe(json_type_endpoints=[ep])
+    probe.auth.primary_session.post = MagicMock(
+      return_value=_mock_response(status=200, text='{"matched":1}'))
+    probe._test_json_type_confusion()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A03-15"]
+    self.assertEqual([x.status for x in f], ["inconclusive"])
+    self.assertIn("reason=json_type_not_validated", f[0].evidence)
+    self.assertIn("endpoint=/api/lookup/", f[0].evidence)
+    self.assertEqual(probe.auth.primary_session.post.call_count, 2)
+
+  def _json_probe(self, responses):
+    probe = _make_probe(json_type_endpoints=[
+      JsonLookupEndpoint(path="/api/lookup/", field="id")])
+    probe.auth.primary_session.post = MagicMock(side_effect=responses)
+    probe._test_json_type_confusion()
+    return probe, [x for x in probe.findings if x.scenario_id == "PT-A03-15"]
+
+  def test_pt_a03_15_200_with_error_body_everywhere_is_not_vulnerable(self):
+    ok = _mock_response(status=200, text='{"matched":1}')
+    err = _mock_response(status=200, text='{"error":"invalid"}')
+    _, f = self._json_probe([ok, err, err, err])
+    self.assertEqual([x.status for x in f], ["not_vulnerable"])
+
+  def test_pt_a03_15_control_with_null_error_counts_as_accepted(self):
+    ok = _mock_response(status=200, text='{"matched":1}')
+    null_err = _mock_response(status=200, text='{"error":null,"matched":0}')
+    _, f = self._json_probe([ok, null_err])
+    self.assertEqual([x.status for x in f], ["inconclusive"])
+    self.assertIn("reason=json_type_not_validated", f[0].evidence)
+
+  def test_pt_a03_15_5xx_control_skips_the_endpoint(self):
+    ok = _mock_response(status=200, text='{"matched":1}')
+    probe, f = self._json_probe([ok, _mock_response(status=500, text="boom")])
+    self.assertEqual(f, [])
+    self.assertEqual(probe.auth.primary_session.post.call_count, 2)
+
+  def test_pt_a03_15_only_the_gt_variant_accepted_is_vulnerable(self):
+    ok = _mock_response(status=200, text='{"matched":1}')
+    bad = _mock_response(status=400, text='{"error":"id_must_be_integer"}')
+    _, f = self._json_probe([ok, bad, bad, _mock_response(status=200, text='{"matched":50}')])
+    self.assertEqual([x.status for x in f], ["vulnerable"])
+    self.assertTrue(any("$gt" in e for e in f[0].evidence))
+
   def test_pt_a03_15_not_vulnerable_when_list_rejected(self):
     ep = JsonLookupEndpoint(path="/api/lookup/", field="id")
     probe = _make_probe(json_type_endpoints=[ep])
     probe.auth.primary_session.post = MagicMock(side_effect=[
       _mock_response(status=200, text='{"matched":1}'),       # baseline OK
+      _mock_response(status=400, text='{"error":"id_must_be_integer"}'),  # control
       _mock_response(status=400, text='{"error":"id_must_be_integer"}'),
       _mock_response(status=400, text='{"error":"id_must_be_integer"}'),
     ])
@@ -790,7 +838,8 @@ class TestReachabilityRuleInjection(unittest.TestCase):
     probe = self._probe("provided")
     redirect = _mock_response(status=302, text="")
     redirect.headers["Location"] = "/records/"
-    probe.auth.primary_session.post = MagicMock(return_value=redirect)
+    probe.auth.primary_session.post = MagicMock(side_effect=[
+      redirect, _mock_response(status=400, text="bad"), redirect])
     probe._test_json_type_confusion()
     found, _ = _reason(probe, "PT-A03-15")
     self.assertEqual([f.status for f in found], ["vulnerable"])
@@ -908,7 +957,7 @@ class TestSsrfReplayNamesPrincipal(unittest.TestCase):
       status=200, text="http://127.0.0.1:1/internal-probe"))
     probe._test_ssrf_body_field()
     vuln = [f for f in probe.findings if f.scenario_id == "PT-API7-01"]
-    self.assertEqual(len(vuln), 1)
+    self.assertEqual([f.status for f in vuln], ["inconclusive"])
     self.assertIn("Authenticate as the regular user.", vuln[0].replay_steps)
     self.assertFalse(any("official" in s for s in vuln[0].replay_steps))
 

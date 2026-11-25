@@ -9,6 +9,66 @@ from ... import cvss_vectors as V
 from ..findings import GrayboxFinding
 
 
+MAX_PARSE_CHARS = 1_000_000  # page text handed to the form-field regexes
+MAX_EVIDENCE_VALUE = 64      # stored values quoted in evidence
+
+
+def _is_checked(attrs):
+  """True for the bare ``checked`` attribute (not ``data-checked`` or a value)."""
+  bare = re.sub(r'"[^"]*"|\'[^\']*\'', '""', attrs)
+  return bool(re.search(r'(?<![\w-])checked(?![\w-])', bare, re.I))
+
+
+def checked_names(page_text):
+  """Names of the checked checkbox and radio inputs, whatever their value."""
+  names = set()
+  for tag in re.finditer(r'<input\b([^>]*)>', (page_text or "")[:MAX_PARSE_CHARS], re.I):
+    attrs = tag.group(1)
+    type_m = re.search(r'type=["\']?(\w+)', attrs, re.I)
+    name_m = re.search(r'name=["\']([^"\']+)', attrs)
+    if (name_m and type_m and type_m.group(1).lower() in ("checkbox", "radio")
+        and _is_checked(attrs)):
+      names.add(name_m.group(1))
+  return names
+
+
+def parse_form_fields(page_text, exclude=None):
+  """Current value of every <input>, <textarea> and selected <select> option.
+
+  A checkbox or radio counts only when ``checked``. ``exclude`` names one
+  field (the CSRF token) to leave out. Shared by the access-control and
+  business-logic probes.
+  """
+  page_text = (page_text or "")[:MAX_PARSE_CHARS]
+  form_fields = {}
+  for tag in re.finditer(r'<input\b([^>]*)>', page_text, re.I):
+    attrs = tag.group(1)
+    name_m = re.search(r'name=["\']([^"\']+)', attrs)
+    val_m = re.search(r'value=["\']([^"\']*)', attrs)
+    type_m = re.search(r'type=["\']?(\w+)', attrs, re.I)
+    if type_m and type_m.group(1).lower() in ("checkbox", "radio"):
+      if not _is_checked(attrs):
+        continue
+    if name_m and name_m.group(1) != exclude:
+      form_fields[name_m.group(1)] = val_m.group(1) if val_m else ""
+  for m in re.finditer(
+    r'<textarea[^>]+name=["\']([^"\']+)["\'][^>]*>(.*?)</textarea>',
+    page_text, re.I | re.DOTALL,
+  ):
+    form_fields[m.group(1)] = m.group(2).strip()
+  for sel in re.finditer(
+    r'<select[^>]+name=["\']([^"\']+)["\'][^>]*>(.*?)</select>',
+    page_text, re.I | re.DOTALL,
+  ):
+    sel_body = sel.group(2)
+    opt = re.search(r'<option[^>]*selected[^>]*value=["\']([^"\']+)', sel_body, re.I)
+    if not opt:
+      opt = re.search(r'<option[^>]*value=["\']([^"\']+)["\'][^>]*selected', sel_body, re.I)
+    if opt:
+      form_fields[sel.group(1)] = opt.group(1)
+  return form_fields
+
+
 class AccessControlProbes(ProbeBase):
   """
   PT-A01-01 IDOR/BOLA, PT-A01-02 function-level authorization bypass,
@@ -385,6 +445,7 @@ class AccessControlProbes(ProbeBase):
     tested = 0
     denied = 0
     accepted_evidence = []
+    unobservable = []
 
     for form_path in form_paths[:5]:  # cap at 5 forms
       self.safety.throttle()
@@ -399,30 +460,7 @@ class AccessControlProbes(ProbeBase):
         denied += 1
         continue
 
-      # Extract form fields
-      form_fields = {}
-      for tag in re.finditer(r'<input\b([^>]*)>', page.text, re.I):
-        attrs = tag.group(1)
-        name_m = re.search(r'name=["\']([^"\']+)', attrs)
-        val_m = re.search(r'value=["\']([^"\']*)', attrs)
-        if name_m:
-          form_fields[name_m.group(1)] = val_m.group(1) if val_m else ""
-      for m in re.finditer(
-        r'<textarea[^>]+name=["\']([^"\']+)["\'][^>]*>(.*?)</textarea>',
-        page.text, re.I | re.DOTALL,
-      ):
-        form_fields[m.group(1)] = m.group(2).strip()
-      for sel in re.finditer(
-        r'<select[^>]+name=["\']([^"\']+)["\'][^>]*>(.*?)</select>',
-        page.text, re.I | re.DOTALL,
-      ):
-        sel_name = sel.group(1)
-        sel_body = sel.group(2)
-        opt = re.search(r'<option[^>]*selected[^>]*value=["\']([^"\']+)', sel_body, re.I)
-        if not opt:
-          opt = re.search(r'<option[^>]*value=["\']([^"\']+)["\'][^>]*selected', sel_body, re.I)
-        if opt:
-          form_fields[sel_name] = opt.group(1)
+      form_fields = parse_form_fields(page.text)
 
       if not form_fields:
         continue
@@ -478,16 +516,40 @@ class AccessControlProbes(ProbeBase):
         verify = self.auth.regular_session.get(url, timeout=10)
       except Exception:
         continue
+      if verify.status_code != 200:
+        unobservable.append((form_path, "verify_not_readable"))
+        continue
 
+      # Only a field that holds the submitted value now and did not before
+      # counts: an <option value="admin"> or a field already set is not
+      # evidence. `form_fields` and `page.text` are the pre-POST snapshot.
       persisted_fields = []
       verify_lower = verify.text.lower()
+      before_lower = page.text.lower()
+      after_fields = parse_form_fields(verify.text)
+      checked_before = checked_names(page.text)
+      checked_after = checked_names(verify.text)
       for field_name, field_value in priv_fields.items():
-        # Check for field=value in response (JSON or HTML attribute)
-        if (f'"{field_name}": "{field_value}"' in verify_lower or
-            f'"{field_name}":"{field_value}"' in verify_lower or
-            f"value=\"{field_value}\"" in verify.text and field_name in verify.text or
-            f'name="{field_name}"' in verify.text and f'value="{field_value}"' in verify.text):
+        json_after = (f'"{field_name}": "{field_value}"' in verify_lower or
+                      f'"{field_name}":"{field_value}"' in verify_lower)
+        json_before = (f'"{field_name}": "{field_value}"' in before_lower or
+                       f'"{field_name}":"{field_value}"' in before_lower)
+        if json_after and not json_before:
           persisted_fields.append(field_name)
+        elif field_name in checked_after:
+          # A checkbox/radio is judged by its checked state, not its value.
+          if field_name not in checked_before:
+            persisted_fields.append(field_name)
+        elif (after_fields.get(field_name) == field_value
+              and form_fields.get(field_name) != field_value):
+          persisted_fields.append(field_name)
+
+      # Accepted, but the page never shows any privilege field: the absence
+      # of the value proves nothing, so this form is not a clean result.
+      if not persisted_fields and not any(
+          f'name="{n}"' in verify.text or f"name='{n}'" in verify.text
+          or f'"{n}"' in verify.text for n in priv_fields):
+        unobservable.append((form_path, "privilege_field_not_observable"))
 
       if persisted_fields:
         accepted_evidence.append(
@@ -513,6 +575,12 @@ class AccessControlProbes(ProbeBase):
                     "Never bind user input directly to model attributes. "
                     "Django: use ModelForm.Meta.fields. Rails: use strong_parameters.",
       ))
+    elif unobservable:
+      path, reason = unobservable[0]
+      self.emit_inconclusive(
+        "PT-A04-01", "Mass assignment — result not observable", "A04:2021", reason,
+      )
+      self.findings[-1].evidence.append(f"endpoint={path}")
     elif tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A04-01",

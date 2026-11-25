@@ -122,8 +122,8 @@ def _direct_vulnerable_constructions(sources=None):
 _INLINE_BASELINE = {
   "access_control.py": 9,
   "business_logic.py": 4,
-  "injection.py": 12,
-  "misconfig.py": 11,
+  "injection.py": 10,  # RM-272 P3: the two SSRF reflection findings became inconclusive
+  "misconfig.py": 10,  # RM-272 P3: PT-A02-18 vulnerable branch removed
 }
 
 

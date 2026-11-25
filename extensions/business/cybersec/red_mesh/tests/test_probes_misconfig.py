@@ -605,7 +605,7 @@ class TestJwtWeakAlgPTA0212(unittest.TestCase):
 
 
 class TestPasswordResetTokenReusePTA0218(unittest.TestCase):
-  """PT-A02-18 — token-not-invalidated detection via two-issue identity check."""
+  """PT-A02-18 — reuse needs a real consume; issuance alone is inconclusive."""
 
   def _make_session(self, post_responses):
     sess = MagicMock()
@@ -614,36 +614,24 @@ class TestPasswordResetTokenReusePTA0218(unittest.TestCase):
     sess.close = MagicMock()
     return sess
 
-  def test_pt_a02_18_vulnerable_when_tokens_identical(self):
-    probe = _make_probe(password_reset_path="/auth/password-reset/request/")
-    sess = self._make_session([
-      _mock_response(status=200, text="<code>reset-admin</code>"),
-      _mock_response(status=200, text="<code>reset-admin</code>"),
-    ])
-    probe.auth.make_anonymous_session = MagicMock(return_value=sess)
+  def test_pt_a02_18_identical_or_rotating_tokens_are_never_a_verdict(self):
+    """Issuing twice proves nothing about reuse: one request, inconclusive."""
+    for first, second in (("reset-admin", "reset-admin"),
+                          ("reset-abcd1234efgh5678", "reset-zyxw9876vutsrqpo")):
+      with self.subTest(first=first, second=second):
+        probe = _make_probe(password_reset_path="/auth/password-reset/request/")
+        sess = self._make_session([
+          _mock_response(status=200, text=f"<code>{first}</code>"),
+          _mock_response(status=200, text=f"<code>{second}</code>"),
+        ])
+        probe.auth.make_anonymous_session = MagicMock(return_value=sess)
 
-    probe._test_password_reset_token_reuse()
+        probe._test_password_reset_token_reuse()
 
-    f = [x for x in probe.findings if x.scenario_id == "PT-A02-18"]
-    self.assertEqual(len(f), 1)
-    self.assertEqual(f[0].status, "vulnerable")
-    self.assertEqual(f[0].severity, "HIGH")
-    self.assertTrue(any("tokens_identical=True" in e for e in f[0].evidence))
-
-  def test_pt_a02_18_not_vulnerable_when_tokens_differ(self):
-    probe = _make_probe(password_reset_path="/auth/password-reset/request/")
-    sess = self._make_session([
-      _mock_response(status=200, text="<code>reset-abcd1234efgh5678</code>"),
-      _mock_response(status=200, text="<code>reset-zyxw9876vutsrqpo</code>"),
-    ])
-    probe.auth.make_anonymous_session = MagicMock(return_value=sess)
-
-    probe._test_password_reset_token_reuse()
-
-    f = [x for x in probe.findings if x.scenario_id == "PT-A02-18"]
-    self.assertEqual(len(f), 1)
-    self.assertEqual(f[0].status, "not_vulnerable")
-    self.assertEqual(f[0].severity, "INFO")
+        f = [x for x in probe.findings if x.scenario_id == "PT-A02-18"]
+        self.assertEqual([x.status for x in f], ["inconclusive"])
+        self.assertIn("reason=reset_consume_needs_current_password", f[0].evidence)
+        self.assertEqual(sess.post.call_count, 1)
 
   def test_pt_a02_18_inconclusive_when_token_not_extractable(self):
     probe = _make_probe(password_reset_path="/auth/password-reset/request/")

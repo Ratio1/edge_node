@@ -262,6 +262,26 @@ class TestWeakAuth(unittest.TestCase):
     probe.auth.try_credentials.assert_not_called()
 
 
+def _stored_record(sess, store=True, amount="100.00", status="draft"):
+  """Fake record page: GET shows the stored fields, POST stores them (or not)."""
+  state = {"amount": amount, "status": status}
+
+  def get(url, **kw):
+    return _reached(
+      f'<form><input name="amount" value="{state["amount"]}">'
+      f'<input name="status" value="{state["status"]}"></form>')
+
+  def post(url, data=None, **kw):
+    if store:
+      state["amount"] = data["amount"]
+      state["status"] = data["status"]
+    return _mock_response(status=302, text="", headers={"Location": "/records/"})
+
+  sess.get = MagicMock(side_effect=get)
+  sess.post = MagicMock(side_effect=post)
+  return state
+
+
 class TestNegativeAmountScenarioPTA0604(unittest.TestCase):
   """PT-A06-04 — Negative monetary amount accepted.
 
@@ -285,10 +305,8 @@ class TestNegativeAmountScenarioPTA0604(unittest.TestCase):
     record_ep = RecordEndpoint(path="/records/1/")
     probe = _make_probe(record_endpoints=[record_ep], allow_stateful=True)
     sess = probe.auth.primary_session
-    # GET form (extract fields), POST returns 302 → accepted
-    sess.get = MagicMock(return_value=self._form_response())
-    sess.post = MagicMock(return_value=_mock_response(
-      status=302, headers={"content-type": "text/html", "Location": "/records/"}))
+    # POST returns 302 and the record page now shows the stored amount
+    _stored_record(sess)
 
     probe._test_validation_bypass()
 
@@ -297,6 +315,56 @@ class TestNegativeAmountScenarioPTA0604(unittest.TestCase):
     self.assertEqual(a06_04[0].status, "vulnerable")
     self.assertEqual(a06_04[0].severity, "MEDIUM")
     self.assertTrue(any("submitted_amount=-9999.99" in e for e in a06_04[0].evidence))
+    self.assertTrue(any("stored_amount=-9999.99" in e for e in a06_04[0].evidence))
+
+  def test_pt_a06_04_accepted_but_not_stored_is_inconclusive(self):
+    """A 302 alone is not acceptance: the record still shows the old amount."""
+    probe = _make_probe(record_endpoints=[RecordEndpoint(path="/records/1/")],
+                        allow_stateful=True)
+    _stored_record(probe.auth.primary_session, store=False)
+
+    probe._test_validation_bypass()
+
+    found = {f.scenario_id: f for f in probe.findings
+             if f.scenario_id in ("PT-A06-02", "PT-A06-04")}
+    for sid in ("PT-A06-02", "PT-A06-04"):
+      self.assertEqual(found[sid].status, "inconclusive")
+      self.assertIn("reason=accepted_value_not_read_back", found[sid].evidence)
+
+  def test_pt_a06_04_residue_from_an_earlier_run_is_inconclusive(self):
+    """The record already holds -9999.99 before the POST: no proof."""
+    probe = _make_probe(record_endpoints=[RecordEndpoint(path="/records/1/")],
+                        allow_stateful=True)
+    _stored_record(probe.auth.primary_session, store=False, amount="-9999.99")
+
+    probe._test_validation_bypass()
+
+    a06_04 = [f for f in probe.findings if f.scenario_id == "PT-A06-04"]
+    self.assertEqual([f.status for f in a06_04], ["inconclusive"])
+    self.assertIn("reason=value_present_before_probe", a06_04[0].evidence)
+    self.assertIn("endpoint=/records/1/", a06_04[0].evidence)
+
+  def test_pt_a06_02_invalid_transition_needs_the_stored_status(self):
+    ep = RecordEndpoint(path="/records/1/",
+                        valid_transitions={"draft": ["open"], "open": ["closed"],
+                                           "closed": []})
+    probe = _make_probe(record_endpoints=[ep], allow_stateful=True)
+    state = _stored_record(probe.auth.primary_session)
+    probe._test_validation_bypass()
+    a06_02 = [f for f in probe.findings if f.scenario_id == "PT-A06-02"]
+    self.assertEqual(a06_02[0].status, "vulnerable")
+    self.assertTrue(any("stored_status=closed" in e for e in a06_02[0].evidence))
+    self.assertEqual(state["status"], "closed")
+
+    probe = _make_probe(record_endpoints=[ep], allow_stateful=True)
+    probe.auth.primary_session.get = MagicMock(
+      return_value=_reached('<input name="amount" value="100.00">'
+                            '<input name="status" value="draft">'))
+    probe.auth.primary_session.post = MagicMock(return_value=_mock_response(
+      status=302, text="", headers={"Location": "/records/"}))
+    probe._test_validation_bypass()
+    a06_02 = [f for f in probe.findings if f.scenario_id == "PT-A06-02"]
+    self.assertEqual(a06_02[0].status, "inconclusive")
 
   def test_pt_a06_04_emits_not_vulnerable_when_amount_rejected(self):
     record_ep = RecordEndpoint(path="/records/1/")
@@ -446,23 +514,23 @@ class TestValidationBypassReachability(unittest.TestCase):
   def test_post_answered_by_redirect_to_non_login_page_is_accepted(self):
     probe = self._probe("provided")
     sess = probe.auth.primary_session
-    sess.get = MagicMock(return_value=_reached(self.FORM))
-    sess.post = MagicMock(return_value=_mock_response(
-      status=302, text="", headers={"Location": "/records/"}))
+    _stored_record(sess)
     probe._test_validation_bypass()
     self.assertEqual({k: v[0] for k, v in self._verdicts(probe).items()}, {
       "PT-A06-02": "vulnerable", "PT-A06-04": "vulnerable"})
 
   def test_post_only_action_405_is_decided_by_the_payload_response(self):
-    """405 on the GET baseline: the form is kept and the payload POST decides."""
+    """405 on the GET baseline: the payload POST decides whether it was accepted,
+    but with no record page to read back the verdict stays inconclusive."""
     probe = self._probe("absent")
     sess = probe.auth.primary_session
     sess.get = MagicMock(return_value=_mock_response(status=405))
     sess.post = MagicMock(return_value=_mock_response(
       status=302, text="", headers={"Location": "/records/"}))
     probe._test_validation_bypass()
-    self.assertEqual({k: v[0] for k, v in self._verdicts(probe).items()}, {
-      "PT-A06-02": "vulnerable", "PT-A06-04": "vulnerable"})
+    self.assertEqual(self._verdicts(probe), {
+      "PT-A06-02": ("inconclusive", ["reason=accepted_value_not_read_back"]),
+      "PT-A06-04": ("inconclusive", ["reason=accepted_value_not_read_back"])})
     probe = self._probe("absent")
     probe.auth.primary_session.get = MagicMock(return_value=_mock_response(status=405))
     probe.auth.primary_session.post = MagicMock(return_value=_mock_response(status=403))

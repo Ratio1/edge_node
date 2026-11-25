@@ -354,7 +354,7 @@ class InjectionProbes(ProbeBase):
     PT-API7-01: SSRF checks on URL-fetch endpoints.
 
     Tests configured endpoints for server-side URL fetching.
-    Detects reflected SSRF and timing-based hints for blind SSRF.
+    Reflection and timing anomalies are inconclusive: no callback proof (D29).
     """
     ssrf_endpoints = self.target_config.injection.ssrf_endpoints
     if not ssrf_endpoints:
@@ -384,11 +384,13 @@ class InjectionProbes(ProbeBase):
         continue
 
       if resp.status_code == 200 and "internal-probe" in resp.text:
+        # Reflection of the payload is an echo, not proof the server fetched
+        # it: without an out-of-band callback this stays inconclusive (D29).
         self.findings.append(GrayboxFinding(
           scenario_id="PT-API7-01",
-          title="Server-side request forgery",
-          status="vulnerable",
-          severity="HIGH",
+          title="Possible SSRF — payload reflected, no out-of-band proof",
+          status="inconclusive",
+          severity="LOW",
           owasp="API7:2023",
           cwe=["CWE-918"],
           attack=["T1190"],
@@ -399,13 +401,14 @@ class InjectionProbes(ProbeBase):
           parameter=ep.param,
           method="GET",
           evidence=[
+            "reason=ssrf_reflection_only",
             f"endpoint={url}",
             f"payload={payload_url}",
             f"status={resp.status_code}",
           ],
           replay_steps=[
             f"Request GET {ep.path} with {ep.param}={payload_url}.",
-            "Observe server-side fetch of local callback URL.",
+            "Confirm with an out-of-band callback that the server fetched the URL.",
           ],
           remediation="Apply strict outbound URL allowlists and block local network ranges.",
         ))
@@ -439,7 +442,7 @@ class InjectionProbes(ProbeBase):
     For each SSRF endpoint configured under `injection.ssrf_endpoints`,
     iterates the configured `api_security.ssrf_body_fields` names and
     POSTs JSON bodies that embed an internal-probe URL under each field.
-    Vulnerable iff the response 200s and reflects the probe marker.
+    A 200 that reflects the probe marker is inconclusive (no out-of-band proof).
     """
     api_security = self.target_config.api_security
     body_fields = api_security.ssrf_body_fields
@@ -462,28 +465,31 @@ class InjectionProbes(ProbeBase):
         except _rq.RequestException:
           continue
         if resp.status_code == 200 and "internal-probe" in (resp.text or ""):
+          # Reflection only; no out-of-band proof (D29), so inconclusive.
           self.findings.append(GrayboxFinding(
             scenario_id="PT-API7-01",
-            title="Server-side request forgery (JSON body field)",
-            status="vulnerable",
-            severity="HIGH",
+            title="Possible SSRF (JSON body field) — payload reflected, "
+                  "no out-of-band proof",
+            status="inconclusive",
+            severity="LOW",
             owasp="API7:2023",
             cwe=["CWE-918"],
             attack=["T1190"],
             # The body field, for the same reason the query variant records its
-            # parameter: one endpoint can be vulnerable through both.
+            # parameter: one endpoint can be flagged through both.
             url=url,
             parameter=body_field,
             method="POST",
-            evidence=[f"endpoint={url}", f"body_field={body_field}",
+            evidence=["reason=ssrf_reflection_only",
+                       f"endpoint={url}", f"body_field={body_field}",
                        f"payload_url={payload_url}",
                        "response_status=200",
                        "reflected_marker=internal-probe"],
             replay_steps=[
               f"Authenticate as {self.principal_label()}.",
               f"POST {url} with JSON body `{{\"{body_field}\": \"{payload_url}\"}}`.",
-              "Observe the response reflects the internal-probe marker, "
-              "confirming the server fetched the user-controlled URL.",
+              "The response reflects the internal-probe marker; confirm with "
+              "an out-of-band callback that the server fetched the URL.",
             ],
             remediation=(
               "Validate URL fields against an allowlist of schemes/hosts. "
@@ -1058,13 +1064,36 @@ class InjectionProbes(ProbeBase):
     elif denied > 0:
       self.emit_endpoint_denied("PT-A03-12")
 
+  @staticmethod
+  def _json_accepted(resp):
+    """One acceptance rule for the control and every variant.
+
+    Accepted = status below 400 and no error indicator: a JSON body with a
+    non-null, non-empty ``error``/``errors``/``detail`` key, or (non-JSON)
+    one of the error words as a whole word.
+    """
+    import json as _json
+    import re as _re
+    if resp.status_code >= 400:
+      return False
+    text = resp.text or ""
+    try:
+      doc = _json.loads(text)
+    except ValueError:
+      doc = None
+    if isinstance(doc, dict):
+      return not any(doc.get(k) not in (None, "", [], {}, False)
+                     for k in ("error", "errors", "detail"))
+    return not _re.search(
+      r"\b(error|invalid|must be|not allowed)\b", text, _re.I)
+
   def _test_json_type_confusion(self):
     """PT-A03-15: detect lax JSON body parsing on typed fields.
 
     Sends ``{"<field>": [1]}`` and ``{"<field>": {"$gt": 0}}`` to
     endpoints expecting an integer; vulnerable when a non-int payload
-    is accepted (HTTP 2xx) or the response distinguishes the variant
-    from a clean rejection.
+    is accepted while a clearly invalid string control is rejected. If the
+    control is accepted too the field is not validated: inconclusive.
     """
     endpoints = self.target_config.injection.json_type_endpoints
     if not endpoints:
@@ -1073,6 +1102,7 @@ class InjectionProbes(ProbeBase):
     import json as _json
 
     vulnerable = []
+    unvalidated = []
     tested = 0
     denied = 0
     for ep in endpoints:
@@ -1094,6 +1124,26 @@ class InjectionProbes(ProbeBase):
         denied += 1
         continue
 
+      # Control: a clearly invalid string. If the endpoint accepts that too,
+      # it does not validate the field at all and the variants prove nothing
+      # about type handling.
+      self.safety.throttle()
+      try:
+        control = self.auth.primary_session.post(
+          url, data=_json.dumps({ep.field: "not-an-integer"}),
+          headers=headers, timeout=10,
+        )
+      except Exception:
+        continue
+      if control.status_code >= 500:
+        continue  # a server error says nothing about validation (as for the baseline)
+      if not self.response_reached(control, validation_ok=True):
+        denied += 1
+        continue
+      if self._json_accepted(control):
+        unvalidated.append(ep.path)
+        continue
+
       # Variant: list
       payloads_to_try = [[1], {"$gt": 0}]
       for variant in payloads_to_try:
@@ -1109,7 +1159,7 @@ class InjectionProbes(ProbeBase):
           denied += 1
           continue
         tested += 1
-        if resp.status_code < 400:
+        if self._json_accepted(resp):
           vulnerable.append(
             f"endpoint={ep.path}; field={ep.field}; "
             f"variant={variant!r}; status={resp.status_code}"
@@ -1140,6 +1190,13 @@ class InjectionProbes(ProbeBase):
                     "lists, dicts, or operator-keys when an integer "
                     "is expected.",
       ))
+    elif unvalidated and not tested:
+      self.emit_inconclusive(
+        "PT-A03-15", "JSON type confusion — endpoint does not validate the "
+        "field at all", "A03:2021", "json_type_not_validated",
+      )
+      self.findings[-1].evidence.append(f"endpoint={unvalidated[0]}")
+      self.findings[-1].evidence.append("variant=control:not-an-integer")
     elif tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-15",
