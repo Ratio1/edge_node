@@ -29,7 +29,7 @@ COMPLETE = {"display_name": " Q4 external ",
 LIST_KEYS = {"engagement_draft_id", "parent", "display_name", "assets_count", "document_state", "created_at",
              "updated_at", "contract_id", "supersedes"}
 # RM-252: an engagement pack's snapshot also names the contract it was printed for (`c_1` for a tenant draft's child).
-PACK_SNAPSHOT = snapshot_of(PLAN, contractId="c_1")
+PACK_SNAPSHOT = snapshot_of(PLAN, contractId="c_1", assets=[])
 SNAPSHOT_SHA256 = hashlib.sha256(PACK_SNAPSHOT.encode("utf-8")).hexdigest()
 
 
@@ -73,6 +73,12 @@ class _EngagementDraftCase(_ActivationCase):
   def pack_snapshot(self, engagement_draft_id, **extra):
     """The snapshot the Navigator sends: the draft's binding (`c_1` for none) and the nodes it holds now."""
     row = self.stored_child(engagement_draft_id)
+    # RM-277: the console names every held asset with its scope ("all" left out).
+    extra.setdefault("assets", [{"assetId": entry["asset_id"], **{
+      name: entry[key] for key, name in (("authorized_ports", "authorizedPorts"), ("authorized_tests", "authorizedTests"))
+      if entry.get(key, "all") != "all"}} for entry in row.get("assets", [])])
+    if extra["assets"] is None:
+      del extra["assets"]  # a snapshot with no list at all
     parent = row["parent"]
     if "draft_id" in parent:
       return snapshot_of(self.stored(parent["draft_id"])["nodes"], contractId="c_1", **extra)
@@ -628,6 +634,7 @@ class TestEngagementDraftActivation(_EngagementDraftCase):
     engagement_draft_id = self.ready_child(tenant_id)
     row = self.stored_child(engagement_draft_id)
     signed, generated = row["document"]["document"], row["document"]["generated"]
+    printed = self.pack_snapshot(engagement_draft_id)
     self.events.clear()
     result = ok(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id))
     engagement_id = "en_" + engagement_draft_id[4:]
@@ -646,7 +653,7 @@ class TestEngagementDraftActivation(_EngagementDraftCase):
       {"document_id": "ed_1", **signed, "kind": "agreement", "title": "Engagement pack",
        "comment": "baseline sha256 " + generated["sha256"]},
       {"document_id": "ed_2", **{key: generated[key] for key in signed}, "kind": "other",
-       "title": "Generated engagement pack (unsigned)", "comment": "snapshot sha256 " + SNAPSHOT_SHA256}])
+       "title": "Generated engagement pack (unsigned)", "comment": "snapshot sha256 " + generated["snapshot_sha256"]}])
     self.assertEqual(self.events, [("engagement_created", {
       "tenant_id": tenant_id, "engagement_id": engagement_id, "engagement_hash": engagement["engagement_hash"],
       "actor": "creator"})])
@@ -661,8 +668,8 @@ class TestEngagementDraftActivation(_EngagementDraftCase):
     # The baseline readers (RM-111, RM-068) find the snapshot in the second document's envelope.
     baseline = self.documents.get(engagement["documents"][1]["ref"])
     self.assertEqual((baseline["role"], baseline["snapshot"], baseline["engagement_draft_id"]),
-                     ("generated", PACK_SNAPSHOT, engagement_draft_id))
-    self.assertEqual(hashlib.sha256(baseline["snapshot"].encode("utf-8")).hexdigest(), SNAPSHOT_SHA256)
+                     ("generated", printed, engagement_draft_id))
+    self.assertEqual(hashlib.sha256(baseline["snapshot"].encode("utf-8")).hexdigest(), generated["snapshot_sha256"])
     self.assertEqual([item["engagement_draft_id"] for item in ok(self, self.plugin.list_engagement_drafts(self.actor, tenant_id))], [])
 
   def test_go_live_with_the_generated_file_as_the_signed_copy_binds_both(self):
@@ -1101,7 +1108,7 @@ class TestEngagementReplacement(_EngagementDraftCase):
     stale = lambda: "item:engagement_pack_stale" in ok(
       self, self.plugin.get_engagement_draft(self.actor, draft_id))["completeness"]["missing"]
     for printed in (narrowed, [{"assetId": net, "authorizedTests": ["web_discovery"]}],
-                    [{"assetId": "ta_" + str(uuid4())}], []):
+                    [{"assetId": "ta_" + str(uuid4())}], [], None):
       refused(self, self.generate_pack_raw(draft_id, self.pack_snapshot(draft_id, assets=printed)), 409, "draft_changed")
     self.assertIsNone(self.stored_child(draft_id)["document"]["generated"])
     # The authorization refuses on its own, before any file is stored.
