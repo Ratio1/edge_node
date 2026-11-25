@@ -254,7 +254,7 @@ class TestAuthManagerNativeApiCredentials(unittest.TestCase):
     return session
 
   def _layered_auth_with_descriptor(self):
-    from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient
+    from .conftest import private_ok_client
     from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
       ApiSecurityConfig, AuthDescriptor, GatewayAuthDescriptor,
     )
@@ -268,7 +268,7 @@ class TestAuthManagerNativeApiCredentials(unittest.TestCase):
         api_key_header_name="X-Gateway-Key",
       ),
     ))
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "http://api.example",
       target_config=cfg,
       gateway_api_key="GATEWAY-KEY",
@@ -476,7 +476,7 @@ class TestLayeredFormAuthGateway(unittest.TestCase):
   def test_form_login_get_and_post_carry_gateway_auth(self, mock_requests):
     from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
     from extensions.business.cybersec.red_mesh.graybox.auth_strategies import FormAuth
-    from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient
+    from .conftest import private_ok_client
     from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
       ApiSecurityConfig, GatewayAuthDescriptor,
     )
@@ -487,7 +487,7 @@ class TestLayeredFormAuthGateway(unittest.TestCase):
         api_key_header_name="X-Gateway-Key",
       ),
     ))
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "http://testapp.local:8000",
       target_config=cfg,
       gateway_api_key="GATEWAY-KEY",
@@ -592,7 +592,7 @@ class TestAuthenticatedSessionHardening(unittest.TestCase):
 
   @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
   def test_anonymous_control_response_uses_gateway_only_session(self, mock_auth_requests):
-    from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient
+    from .conftest import private_ok_client
     from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
       ApiSecurityConfig, AuthDescriptor, GatewayAuthDescriptor,
     )
@@ -608,7 +608,7 @@ class TestAuthenticatedSessionHardening(unittest.TestCase):
         api_key_header_name="X-Gateway-Key",
       ),
     ))
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "http://api.example",
       target_config=cfg,
       gateway_api_key="GATEWAY-KEY",
@@ -1144,9 +1144,9 @@ class TestLoginSuccessIsJudgedOnTheRealClientsResponse(unittest.TestCase):
 
   def _run(self, responses, allowlist):
     from extensions.business.cybersec.red_mesh.graybox.auth_strategies import FormAuth
-    from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient
+    from .conftest import private_ok_client
 
-    client = GrayboxHttpClient("http://testapp.local:8000", allowlist=allowlist)
+    client = private_ok_client("http://testapp.local:8000", allowlist=allowlist)
     underlying = MagicMock()
     underlying.cookies.get_dict.return_value = {"sessionid": "abc"}
     underlying.request.side_effect = responses

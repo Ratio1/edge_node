@@ -6,13 +6,13 @@ from unittest.mock import MagicMock, patch
 import requests
 
 from extensions.business.cybersec.red_mesh.graybox.http_client import (
-  GrayboxHttpClient,
   GrayboxScopeError,
   normalize_request_url,
   path_in_scope,
   validate_target_config_paths,
 )
 from extensions.business.cybersec.red_mesh.tenancy.assets import canonical_digest
+from .conftest import private_ok_client
 from extensions.business.cybersec.red_mesh.tenancy.execution import ExecutionBinding
 
 
@@ -56,7 +56,7 @@ class TestBoundGrayboxHttpClient(unittest.TestCase):
     })
 
   def _client(self, **kwargs):
-    return GrayboxHttpClient(
+    return private_ok_client(
       "https://target.example/api/public", execution_binding=self._binding(),
       **kwargs,
     )
@@ -147,7 +147,7 @@ class TestBoundGrayboxHttpClient(unittest.TestCase):
       for host in (*accepted, *rejected):
         with self.subTest(origin=origin, host=host):
           session, transport = self._session()
-          scoped = GrayboxHttpClient(target["url"], execution_binding=self._binding(target)).wrap_session(session)
+          scoped = private_ok_client(target["url"], execution_binding=self._binding(target)).wrap_session(session)
           if host in accepted:
             scoped.get("/api/public/users", headers={"hOsT": host})
             self.assertEqual(len(transport.sent), 1)
@@ -228,7 +228,7 @@ class TestBoundGrayboxHttpClient(unittest.TestCase):
 
   def test_unbound_host_override_keeps_legacy_behavior(self):
     session, transport = self._session()
-    GrayboxHttpClient("https://target.example").wrap_session(session).get(
+    private_ok_client("https://target.example").wrap_session(session).get(
       "/api/public/users", headers={"Host": "foreign.example"},
     )
     self.assertEqual(transport.sent[0].headers["Host"], "foreign.example")
@@ -253,7 +253,7 @@ class TestBoundGrayboxHttpClient(unittest.TestCase):
 
   def test_wrapping_a_legacy_session_cannot_drop_the_binding(self):
     session, transport = self._session()
-    legacy = GrayboxHttpClient("https://target.example", allowlist=["/"])
+    legacy = private_ok_client("https://target.example", allowlist=["/"])
     scoped = self._client(allowlist=["/"]).wrap_session(legacy.wrap_session(session))
 
     with self.assertRaises(GrayboxScopeError):
@@ -319,7 +319,7 @@ class TestBoundGrayboxHttpClient(unittest.TestCase):
     binding = self._binding().to_dict()
     allowlist = ["/"]
     target_config = GrayboxTargetConfig.from_dict({"discovery": {"scope_prefix": "/"}})
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://target.example/api/public", execution_binding=binding,
       allowlist=allowlist, target_config=target_config,
     )
@@ -430,8 +430,8 @@ class TestGrayboxHttpClient(unittest.TestCase):
 
   def test_legacy_rewrapping_preserves_the_existing_session_scope(self):
     session = self._session()
-    original = GrayboxHttpClient("https://original.example", allowlist=["/api/"])
-    another = GrayboxHttpClient("https://another.example")
+    original = private_ok_client("https://original.example", allowlist=["/api/"])
+    another = private_ok_client("https://another.example")
     another.wrap_session(original.wrap_session(session)).get("/api/users")
     self.assertEqual(session.request.call_args.args[1], "https://original.example/api/users")
 
@@ -440,7 +440,7 @@ class TestGrayboxHttpClient(unittest.TestCase):
     self.assertFalse(path_in_scope("/api/publicity", "/api/public/"))
 
   def test_blocks_cross_host_without_sending_request(self):
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://api.example.com",
       allowlist=["/api/public/"],
     )
@@ -452,7 +452,7 @@ class TestGrayboxHttpClient(unittest.TestCase):
     session.request.assert_not_called()
 
   def test_blocks_encoded_traversal_without_sending_request(self):
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://api.example.com",
       allowlist=["/api/public/"],
     )
@@ -464,7 +464,7 @@ class TestGrayboxHttpClient(unittest.TestCase):
     session.request.assert_not_called()
 
   def test_blocks_publicity_when_public_scope_authorized(self):
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://api.example.com",
       allowlist=["/api/public/"],
     )
@@ -512,7 +512,7 @@ class TestGrayboxHttpClient(unittest.TestCase):
     """Browser-equivalent 302 handling — Django form-login redirect target
     must not receive the original POST body, or the redirected request
     fails CSRF on the new view (the bug behind official_login_failed)."""
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://target.local", allowlist=["/auth/", "/dashboard/"],
     )
     session = MagicMock()
@@ -544,7 +544,7 @@ class TestGrayboxHttpClient(unittest.TestCase):
 
   def test_post_redirect_301_converts_to_get_and_drops_body(self):
     """301 from POST is also browser-equivalent GET (matches `requests`)."""
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://target.local", allowlist=["/old/", "/new/"],
     )
     session = MagicMock()
@@ -563,7 +563,7 @@ class TestGrayboxHttpClient(unittest.TestCase):
 
   def test_post_redirect_307_preserves_method_and_body(self):
     """307 (and 308) explicitly preserve method + body per RFC 7231."""
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://target.local", allowlist=["/api/"],
     )
     session = MagicMock()
@@ -582,7 +582,7 @@ class TestGrayboxHttpClient(unittest.TestCase):
 
   def test_post_redirect_303_still_converts(self):
     """Pre-existing 303 conversion path must keep working (regression guard)."""
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://target.local", allowlist=["/api/", "/done/"],
     )
     session = MagicMock()
@@ -601,7 +601,7 @@ class TestGrayboxHttpClient(unittest.TestCase):
 
   def test_head_on_302_stays_head(self):
     """HEAD is idempotent + has no body; preserve method on redirect."""
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://target.local", allowlist=["/a/", "/b/"],
     )
     session = MagicMock()
@@ -617,7 +617,7 @@ class TestGrayboxHttpClient(unittest.TestCase):
 
   def test_302_without_location_returns_redirect_response(self):
     """No Location header → don't loop; return the redirect response as-is."""
-    client = GrayboxHttpClient("https://target.local", allowlist=["/a/"])
+    client = private_ok_client("https://target.local", allowlist=["/a/"])
     session = MagicMock()
     bad_redirect = MagicMock(status_code=302, headers={})
     session.request.return_value = bad_redirect
@@ -629,7 +629,7 @@ class TestGrayboxHttpClient(unittest.TestCase):
 
   def test_302_to_out_of_scope_location_raises_scope_error(self):
     """Redirect to a path outside the allowlist must abort, not silently follow."""
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://target.local", allowlist=["/auth/"],
     )
     session = MagicMock()
@@ -642,7 +642,7 @@ class TestGrayboxHttpClient(unittest.TestCase):
 
   def test_redirect_loop_caps_at_five_hops(self):
     """A pathological redirect chain stops after 5 hops, returning the last response."""
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://target.local", allowlist=["/loop/"],
     )
     session = MagicMock()
@@ -659,7 +659,7 @@ class TestGrayboxHttpClient(unittest.TestCase):
 
   def test_chained_302_then_302_after_post_settles_on_get(self):
     """POST→302→GET; subsequent 302→GET stays GET (method conversion is sticky)."""
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://target.local",
       allowlist=["/a/", "/b/", "/c/"],
     )
@@ -689,7 +689,7 @@ class TestGrayboxHttpClient(unittest.TestCase):
     happened — which is how the login-form check in `_is_login_success` came to
     reject every authenticated session reached via a redirect.
     """
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://target.local", allowlist=["/a/", "/b/", "/c/"],
     )
     session = MagicMock()
@@ -705,7 +705,7 @@ class TestGrayboxHttpClient(unittest.TestCase):
 
   def test_a_call_that_was_not_redirected_reports_an_empty_chain(self):
     """No redirect means no history — the same answer `requests` gives."""
-    client = GrayboxHttpClient("https://target.local", allowlist=["/a/"])
+    client = private_ok_client("https://target.local", allowlist=["/a/"])
     session = MagicMock()
     final = MagicMock(status_code=200, headers={})
     session.request.side_effect = [final]
@@ -717,7 +717,7 @@ class TestGrayboxHttpClient(unittest.TestCase):
   def test_a_chain_cut_short_by_the_budget_still_reports_its_hops(self):
     """Budget exhaustion returns the last response we did fetch, chain intact."""
     from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://target.local",
       allowlist=["/a/", "/b/", "/c/"],
       # The probe already paid for hop 0, so nothing is left for the redirect.
@@ -901,7 +901,7 @@ class TestRedirectHopBudgetAccounting(unittest.TestCase):
   def test_every_redirect_hop_is_charged_to_the_budget(self):
     from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
     budget = RequestBudget(remaining=10, total=10)
-    client = GrayboxHttpClient("https://h", allowlist=["h"], request_budget=budget)
+    client = private_ok_client("https://h", allowlist=["h"], request_budget=budget)
     session, calls = self._redirecting_session(hops=4)
     client.request(session, "GET", "https://h/start", allow_redirects=True)
     # 5 real requests: the first plus 4 hops. The probe would have consumed the
@@ -912,7 +912,7 @@ class TestRedirectHopBudgetAccounting(unittest.TestCase):
   def test_a_chain_stops_when_the_budget_runs_out(self):
     from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
     budget = RequestBudget(remaining=2, total=10)
-    client = GrayboxHttpClient("https://h", allowlist=["h"], request_budget=budget)
+    client = private_ok_client("https://h", allowlist=["h"], request_budget=budget)
     session, calls = self._redirecting_session(hops=4)
     client.request(session, "GET", "https://h/start", allow_redirects=True)
     # First request, then only as many hops as the budget covers.
@@ -923,7 +923,7 @@ class TestRedirectHopBudgetAccounting(unittest.TestCase):
   def test_a_non_redirecting_call_is_not_charged(self):
     from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
     budget = RequestBudget(remaining=10, total=10)
-    client = GrayboxHttpClient("https://h", allowlist=["h"], request_budget=budget)
+    client = private_ok_client("https://h", allowlist=["h"], request_budget=budget)
     session, calls = self._redirecting_session(hops=0)
     client.request(session, "GET", "https://h/start", allow_redirects=True)
     self.assertEqual(calls["n"], 1)
@@ -934,14 +934,14 @@ class TestRedirectHopBudgetAccounting(unittest.TestCase):
     # contract of ProbeBase.cleanup_budget.
     from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
     budget = RequestBudget(remaining=0, total=10)
-    client = GrayboxHttpClient("https://h", allowlist=["h"], request_budget=budget)
+    client = private_ok_client("https://h", allowlist=["h"], request_budget=budget)
     session, calls = self._redirecting_session(hops=2)
     client.request(session, "GET", "https://h/revert", allow_redirects=True,
                    budget_exempt=True)
     self.assertEqual(calls["n"], 3, "a revert was blocked by an exhausted budget")
 
   def test_it_works_without_a_budget_configured(self):
-    client = GrayboxHttpClient("https://h", allowlist=["h"])
+    client = private_ok_client("https://h", allowlist=["h"])
     session, calls = self._redirecting_session(hops=2)
     client.request(session, "GET", "https://h/start", allow_redirects=True)
     self.assertEqual(calls["n"], 3)

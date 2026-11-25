@@ -198,6 +198,63 @@ def _redact_cookie_header(match: "re.Match") -> str:
   return f"{name}{colon}{';'.join(segments)}"
 
 
+# A key is a secret when its snake-cased form ends in one of these words, so
+# `accessToken`, `x-api-key` and `user_password` match and `monkey` does not.
+# The key run has no length limit: the lookbehind anchors it at the start of a
+# name run, so each run is tried once and backtracks linearly to its separator.
+# A quoted value runs to its closing quote (a backslash-escaped quote does not
+# close it) or, unclosed, to the end of the text (redacted whole, never
+# partway); a bare value runs to whitespace, `&`, `"`, `'`, `;` or `,`. `'`
+# stays a stop, and a `'...'` value must close before a non-word character,
+# because curl replay lines shell-quote with `'`: `Cookie: sid=<redacted>'` and
+# `csrftoken=' 'https://...` keep their quotes. A value that opens with `'` and
+# does not close that way (`'abc'x`, `''abc`), or an empty `""` glued to a
+# value (`""abc`), is redacted to the bare stops.
+# No quantifier nests, so the scan stays linear.
+_SECRET_KEY_RE = re.compile(
+  r"(?:password|passwd|passphrase|secret|secret_(?:access_)?key|token|session_?id|api_?(?:[a-z0-9_]*_)?key|private_key)$")
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_NAMED_KEY_RE = re.compile(
+  r"""(?<![\w.\-])([\w.\-]+)(["']?)(\s*[:=]\s*)"""
+)
+_NAMED_VALUE_RE = re.compile(
+  r"""(?:"((?:[^"\\]|\\[\s\S]|\\\Z)+)(?:"|\Z)|'((?:[^'\\]|\\[\s\S]|\\\Z)+)(?:'(?!\w)|\Z)|('[^\s&";,]+|""[^\s&"';,]+|[^\s&"';,]+))"""
+)
+
+
+class _NamedSecretScrubber:
+  """`re.Pattern.sub` look-alike for the `_SCRUB_PATTERNS` table.
+
+  The key is matched first and the value only for a secret-named key, so a
+  non-secret key (`Error: password=x`, `endpoint=https://h/?api_key=x`) never
+  swallows a secret that follows it.
+  """
+
+  @staticmethod
+  def sub(_repl, text):
+    out, pos, scan = [], 0, 0
+    while True:
+      key_m = _NAMED_KEY_RE.search(text, scan)
+      if not key_m:
+        break
+      key = key_m.group(1)
+      norm = _CAMEL_BOUNDARY_RE.sub("_", key).lower().replace("-", "_").replace(".", "_")
+      val_m = (_NAMED_VALUE_RE.match(text, key_m.end())
+               if _SECRET_KEY_RE.search(norm) else None)
+      if not val_m:
+        scan = key_m.end()
+        continue
+      value = next(g for g in val_m.groups() if g is not None)
+      if value.strip() in (_REDACTED, "<jwt-redacted>"):
+        scan = val_m.end()
+        continue
+      quote = '"' if val_m.group(1) is not None else "'" if val_m.group(2) is not None else ""
+      out.append(text[pos:key_m.end()] + quote + _REDACTED + quote)
+      pos = scan = val_m.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
 _SCRUB_PATTERNS = (
   # Whole-header redaction: redact the full value, which spans until the
   # next field separator (comma/newline) or end of string. Cookies are handled
@@ -222,32 +279,16 @@ _SCRUB_PATTERNS = (
    "<jwt-redacted>"),
   # Bearer schema in body / URL: keep prefix only.
   (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{8,}"), "Bearer <redacted>"),
-  # Common name=value forms (cookie / form / URL query).
-  # `_`-prefixed and compound names count (`_token`, `access_token`,
-  # `client_secret`, `x-api-key`); a joined name (`csrftoken`) and a longer word
-  # (`tokens_count`) do not.
-  (re.compile(r"(?i)(?<![\w-])((?:[\w-]{0,64}?[_-])?"
-              r"(?:password|secret|token|api[_-]?key))=" + _ALREADY_REDACTED
-              + r"([^&\s\";,]+)"),
+  # `name=value`, `name: value`, JSON and Python-repr `'name': 'value'` forms of
+  # a secret-named key (see `_NamedSecretScrubber`).
+  (_NamedSecretScrubber, None),
+  # Login-form and session names the key scrubber does not treat as secrets
+  # (RM-060): literal names behind `(?<![\w-])`, bounded value class, so each
+  # match stays linear. `'` stops the value, as in `_NAMED_VALUE_RE`, so a
+  # shell-quoted curl replay keeps its closing quote.
+  (re.compile(r"(?i)(?<![\w-])(pass|pwd|phpsessid|jsessionid|sid|session)=" + _ALREADY_REDACTED
+              + r"([^&\s\"';,?]+)"),
    r"\1=<redacted>"),
-  # Login-form and session forms a captured request/response carries. Names
-  # are literal alternations behind `(?<![\w-])`, with a bounded value class, so
-  # each match stays linear.
-  (re.compile(r"(?i)(?<![\w-])(pass|pwd|passwd|csrfmiddlewaretoken|authenticity_token"
-              r"|phpsessid|jsessionid|sid|session)=" + _ALREADY_REDACTED
-              + r"([^&\s\";,?]+)"),
-   r"\1=<redacted>"),
-  # `;jsessionid=` path parameter is matched by the rule above (`;` is not a
-  # name character). Headers that carry a token or key by name.
-  (re.compile(r"(?i)\b(x-csrf-token|x-xsrf-token|x-auth-token|x-api-key)\s*:"
-              + _ALREADY_REDACTED + r"\s*[^,\r\n;]+"),
-   r"\1: <redacted>"),
-  # JSON session_id (the generic JSON rule only knows password/secret/token/key).
-  (re.compile(r'(?i)"(session_id|sessionid)"\s*:\s*"[^"]+"'),
-   r'"\1": "<redacted>"'),
-  # JSON-style key:value.
-  (re.compile(r'(?i)"((?:[\w-]{0,64}?[_-])?(?:password|secret|token|api_key|bearer_token|api[\w_-]*key))"\s*:\s*"[^"]+"'),
-   r'"\1": "<redacted>"'),
 )
 
 

@@ -781,6 +781,18 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual({workers[node]["budget_scope"] for node in workers}, {"per_scan"})
     self.assertTrue(workers["node-1"]["assignment_hash"])
 
+  def test_launch_webapp_scan_private_target_needs_the_engagement_flag(self):
+    """RM-273 (D30): a private-range webapp target is refused unless the engagement allows it."""
+    plugin = self._build_mock_plugin(job_id="test-job-private")
+    result = self._launch_webapp(plugin, target_url="https://10.0.0.5/app")
+    self.assertEqual(result.get("error"), "validation_error")
+    self.assertIn("allow_private_targets", result.get("message", ""))
+
+    plugin = self._build_mock_plugin(job_id="test-job-private")
+    allowed = {**_engagement("webapp"), "context": {"client_name": "Example", "allow_private_targets": True}}
+    result = self._launch_webapp(plugin, engagement=allowed, target_url="https://10.0.0.5/app")
+    self.assertNotIn("error", result)
+
   def test_launch_webapp_scan_explicit_mirror_divides_budget_without_opt_in(self):
     """Multi-worker MIRROR without per-worker opt-in must divide the budget."""
     plugin = self._build_mock_plugin(job_id="test-job-mirror-div")

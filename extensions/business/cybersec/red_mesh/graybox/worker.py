@@ -165,6 +165,10 @@ class GrayboxLocalWorker(BaseLocalWorker):
       # five redirects and those extra requests were counted by nobody.
       request_budget=self.request_budget,
       safety=self.safety,
+      # RM-273 (D30): the engagement snapshot's flag; absent means private targets are refused.
+      allow_private_targets=(
+        isinstance(getattr(job_config, "engagement", None), dict)
+        and job_config.engagement.get("allow_private_targets") is True),
       execution_binding=getattr(job_config, "execution_binding", None),
     )
 

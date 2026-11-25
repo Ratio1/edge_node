@@ -4,7 +4,9 @@ Safety controls for graybox scanning.
 Rate limiting, attempt budgeting, and target validation.
 """
 
+import ipaddress
 import random
+import socket
 import time
 from urllib.parse import urlparse
 
@@ -13,6 +15,11 @@ from ..constants import (
   GRAYBOX_WEAK_AUTH_DELAY,
   GRAYBOX_MAX_WEAK_ATTEMPTS,
 )
+
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+# IPv6 forms whose low 32 bits carry an IPv4 address: NAT64, IPv4-compatible, -mapped, -translated.
+_EMBEDS_IPV4 = tuple(ipaddress.ip_network(n) for n in
+                     ("64:ff9b::/96", "::/96", "::ffff:0:0/96", "::ffff:0:0:0/96"))
 
 
 class SafetyControls:
@@ -61,6 +68,38 @@ class SafetyControls:
     hostname = (parsed.hostname or "").lower()
     return hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1",
                         "host.docker.internal")
+
+  @staticmethod
+  def private_target_reason(hostname: str, resolver=None, fail_closed=False) -> str | None:
+    """RM-273 (D30): why `hostname` resolves to a non-public address, else None.
+
+    Covers private, loopback, link-local, CGNAT (100.64/10), unique-local, site-local and
+    IPv6 forms embedding a private IPv4 (mapped, compatible, translated, NAT64). Called at
+    admission and re-checked on every request, so a name that later resolves private is
+    refused at its next request. The gap between this check and the connect is closed by
+    connect-time pinning in RM-273 Phase G. An unresolvable name is refused only when
+    `fail_closed` (per request); at admission the connection fails on its own.
+    """
+    host = (hostname or "").strip("[]")
+    try:
+      addresses = [ipaddress.ip_address(host)]
+    except ValueError:
+      try:
+        addresses = [ipaddress.ip_address(info[4][0].split("%")[0])
+                       for info in (resolver or socket.getaddrinfo)(host, None)]
+      except (OSError, ValueError):
+        return (f"Target {hostname} did not resolve; refused without allow_private_targets."
+                if fail_closed else None)
+    for address in addresses:
+      embedded = (ipaddress.IPv4Address(int(address) & 0xFFFFFFFF) if address.version == 6
+                  and any(address in net for net in _EMBEDS_IPV4) else None)
+      for candidate in filter(None, (address, embedded)):
+        if (candidate.is_private or candidate.is_loopback or candidate.is_link_local
+            or candidate.is_unspecified or candidate in _CGNAT
+            or getattr(candidate, "is_site_local", False)):
+          return (f"Target {hostname} resolves to private address {address}. "
+                  "Set allow_private_targets on the engagement to scan it.")
+    return None
 
   @staticmethod
   def validate_target(target_url: str, authorized: bool) -> str | None:

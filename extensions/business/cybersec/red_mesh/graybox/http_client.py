@@ -344,6 +344,7 @@ class GrayboxHttpClient:
     request_budget=None,
     safety=None,
     execution_binding=None,
+    allow_private_targets=False,
   ):
     # Imported lazily: asset validation itself uses this module's path helper.
     from ..tenancy.execution import binding_value
@@ -359,6 +360,8 @@ class GrayboxHttpClient:
     # client without one and are unaffected.
     self._request_budget = request_budget
     self._safety = safety
+    # RM-273 (D30): the worker passes the engagement's flag; without it private targets are refused.
+    self._allow_private_targets = allow_private_targets
     self.target_url = target_url.rstrip("/")
     self.scopes = path_scopes_from_allowlist(target_url, allowlist)
     discovery = getattr(target_config, "discovery", None)
@@ -497,6 +500,13 @@ class GrayboxHttpClient:
   def validate_url(self, url_or_path: str) -> str:
     url = normalize_request_url(self.target_url, url_or_path)
     self._validate_bound_url(url)
+    if not self._allow_private_targets:
+      from .safety import SafetyControls
+      # Re-checked on every request and fail-closed on a resolve error; connect-time pinning
+      # (closing the check-to-connect gap) is RM-273 Phase G.
+      reason = SafetyControls.private_target_reason(urlsplit(url).hostname, fail_closed=True)
+      if reason:
+        raise GrayboxScopeError(reason)
     path = urlsplit(url).path
     if self.scopes and not any(path_in_scope(path, scope) for scope in self.scopes):
       raise GrayboxScopeError(f"out-of-scope graybox request blocked: {path}")
