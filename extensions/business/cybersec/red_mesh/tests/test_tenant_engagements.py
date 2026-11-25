@@ -246,6 +246,32 @@ class TestTenantEngagements(unittest.TestCase):
     self.refused(self.create(valid_until="2026-10-30T00:00:00Z"), 409, "conflict")
     self.refused(self.create(assets=list(reversed(self.fields()["assets"]))), 409, "conflict")
 
+  def test_a_new_engagement_carries_the_scope_both_keys_and_hashes_as_v5(self):
+    # RM-251: the default is "all" for both; a restricted scope is stored sorted and merged.
+    default = self.create()["data"]
+    self.assertEqual((default["authorizedPorts"], default["authorizedTests"]), ("all", "all"))
+    stored = self.store.get("engagement", self.tenant, default["engagementId"])
+    self.assertEqual((stored["authorized_ports"], stored["authorized_tests"]), ("all", "all"))
+    restricted = self.create(request_id=str(uuid4()), authorized_ports=[[80, 90], [1, 10], [11, 20]],
+                             authorized_tests=["web_discovery", "graybox", "web_discovery"])["data"]
+    self.assertEqual((restricted["authorizedPorts"], restricted["authorizedTests"]),
+                     ([[1, 20], [80, 90]], ["graybox", "web_discovery"]))
+    self.assertNotEqual(restricted["engagementHash"], default["engagementHash"])
+    self.refused(self.create(request_id=str(uuid4()), authorized_ports=[]), 400, "authorized_ports_invalid")
+    self.refused(self.create(request_id=str(uuid4()), authorized_tests=[]), 400, "authorized_tests_invalid")
+    # An id valid for no kind the engagement holds (here a webapp-only one on a network-only engagement).
+    network_only = [pick(self.net)]
+    self.refused(self.create(request_id=str(uuid4()), assets=network_only, authorized_tests=["graybox"]),
+                 400, "authorized_tests_unknown")
+    self.refused(self.create(request_id=str(uuid4()), authorized_tests=["no_such_test"]), 400, "authorized_tests_unknown")
+
+  def test_a_replay_with_another_scope_is_a_conflict(self):
+    first = self.view(self.create(authorized_ports=[[1, 1024]]))
+    self.assertEqual(self.view(self.create(authorized_ports=[[1, 1024]])), first)
+    self.refused(self.create(authorized_ports=[[1, 1025]]), 409, "conflict")
+    self.refused(self.create(authorized_ports=[[1, 1024]], authorized_tests=["graybox"]), 409, "conflict")
+    self.refused(self.create(), 409, "conflict")
+
   def test_roles(self):
     self.owner.account("platform-pentester", memberships=[{"role": "super_pentester", "tenant_id": None}])
     self.owner.account("scoped-pentester", memberships=[{"role": "super_pentester", "tenant_id": self.tenant}])

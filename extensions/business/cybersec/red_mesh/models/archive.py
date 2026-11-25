@@ -137,6 +137,10 @@ class JobConfig:
   engagement_id: str = None
   engagement_hash: str = None
   contract_sha256: str = None
+  # RM-251: the scope the engagement authorized at launch (`"all"` or ranges / catalogue ids). Named for the
+  # engagement: an archive from before RM-128 may carry its own `authorized_ports` string, which is not this.
+  engagement_authorized_ports: str | list = None
+  engagement_authorized_tests: str | list = None
   execution_binding: ExecutionBinding | None = None
 
   def __post_init__(self):
@@ -240,6 +244,8 @@ class JobConfig:
       engagement_id=d.get("engagement_id"),
       engagement_hash=d.get("engagement_hash"),
       contract_sha256=d.get("contract_sha256"),
+      engagement_authorized_ports=d.get("engagement_authorized_ports"),
+      engagement_authorized_tests=d.get("engagement_authorized_tests"),
     )
 
   # -- Phase 3 PR-3.3: convenience accessors for the typed shape --

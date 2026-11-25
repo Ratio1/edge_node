@@ -987,6 +987,94 @@ class TestEngagementReplacement(_EngagementDraftCase):
                      ["agreement", "other"])
     self.assertEqual(self.documents.deleted, [])
 
+  def test_a_replacement_keeps_a_restricted_scope_and_never_widens_it(self):
+    # RM-251: the Replace path, which an amendment copy takes too (both are `supersedes` drafts).
+    restricted = ok(self, self.plugin.create_engagement(
+      self.actor, self.tenant_id, str(uuid4()), "Restricted", COMPLETE["valid_from"], COMPLETE["valid_until"],
+      COMPLETE["context"], [pick(self.asset_in(self.tenant_id))], [],
+      authorized_ports=[[1, 1024]], authorized_tests=["web_discovery"]))["engagementId"]
+    engagement_draft_id = ok(self, self.plugin.create_engagement_draft(
+      self.actor, self.tenant_id, str(uuid4()), "Replaced", supersedes=restricted))["engagement_draft_id"]
+    draft = ok(self, self.plugin.get_engagement_draft(self.actor, engagement_draft_id))
+    self.assertEqual((draft["authorized_ports"], draft["authorized_tests"]), ([[1, 1024]], ["web_discovery"]))
+    self.fill(engagement_draft_id)
+    ok(self, self.upload_pack(engagement_draft_id))
+    ok(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id))
+    new = self.engagement("en_" + engagement_draft_id[4:])
+    self.assertEqual((new["authorized_ports"], new["authorized_tests"]), ([[1, 1024]], ["web_discovery"]))
+    # The same plain replacement of an engagement with no scope keys (`/4`) starts at "all".
+    self.assertEqual(ok(self, self.plugin.get_engagement_draft(
+      self.actor, self.replacement(sign=False)))["authorized_ports"], "all")
+
+  def test_the_scope_is_a_draft_field_default_all_checked_when_written_and_complete_only_if_valid(self):
+    parent = self.tenant_id
+    draft = self.child(parent)
+    self.assertEqual((draft["authorized_ports"], draft["authorized_tests"]), ("all", "all"))
+    # A row written before the scope reads "all".
+    row = self.stored_child(draft["engagement_draft_id"])
+    for key in ("authorized_ports", "authorized_tests"):
+      row.pop(key)
+    self.repo.put("engagement_draft", draft["engagement_draft_id"], record=row)
+    read = ok(self, self.plugin.get_engagement_draft(self.actor, draft["engagement_draft_id"]))
+    self.assertEqual((read["authorized_ports"], read["authorized_tests"]), ("all", "all"))
+    edited = ok(self, self.update_child(draft["engagement_draft_id"], {"authorized_ports": [[20, 30], [1, 25]]}))
+    self.assertEqual(edited["authorized_ports"], [[1, 30]])
+    refused(self, self.update_child(draft["engagement_draft_id"], {"authorized_ports": []}), 400, "authorized_ports_invalid")
+    refused(self, self.update_child(draft["engagement_draft_id"], {"authorized_tests": []}), 400, "authorized_tests_invalid")
+    # With a network asset held, a webapp-only id is refused on write; a later asset change shows in completeness.
+    self.fill(draft["engagement_draft_id"])
+    refused(self, self.update_child(draft["engagement_draft_id"], {"authorized_tests": ["graybox"]}),
+            400, "authorized_tests_unknown")
+    ok(self, self.update_child(draft["engagement_draft_id"], {"authorized_tests": ["web_discovery"]}))
+    other = ok(self, self.update_child(draft["engagement_draft_id"], {"assets": [pick(self.asset_in(parent, WEBAPP))]}))
+    self.assertEqual(other["completeness"]["reasons"], {"authorized_tests": "authorized_tests_unknown"})
+
+  def test_the_pack_prints_the_scope_and_a_later_scope_change_makes_it_stale(self):
+    # RM-251, as RM-252's nodes: the snapshot's scope must be the draft's, and the pack is stale once it moves.
+    draft_id = self.child(self.tenant_id)["engagement_draft_id"]
+    self.fill(draft_id)
+    stale = lambda: "item:engagement_pack_stale" in ok(
+      self, self.plugin.get_engagement_draft(self.actor, draft_id))["completeness"]["missing"]
+    refused(self, self.generate_pack_raw(draft_id, self.pack_snapshot(draft_id, authorizedPorts=[[1, 80]])),
+            409, "draft_changed")
+    self.assertIsNone(self.stored_child(draft_id)["document"]["generated"])
+    # The authorization refuses on its own, before any file is stored.
+    ask = lambda **extra: self.plugin._call_tenant_administration(
+      "authorize_generated_document", self.actor, draft_id=None, engagement_draft_id=draft_id,
+      document_kind="engagement_pack", snapshot=self.pack_snapshot(draft_id, **extra), generated_at=GENERATED_AT,
+      tenant_id=None, contract_id=None)
+    refused(self, ask(authorizedTests=["web_discovery"]), 409, "draft_changed")
+    self.assertEqual(ok(self, ask())["scope"], ["all", "all"])
+    # The scope moves between the authorization and the attach: refused under the lock, nothing written.
+    from extensions.business.cybersec.red_mesh.tenancy.administration import TenantAdministrationService
+    real = TenantAdministrationService._pack_snapshot
+
+    def moved(service, row, snapshot):
+      answer = real(service, row, snapshot)
+      changed = self.stored_child(draft_id)
+      changed["authorized_ports"] = [[1, 80]]
+      self.repo.put("engagement_draft", draft_id, record=changed)
+      return answer
+    with patch.object(TenantAdministrationService, "_pack_snapshot", autospec=True, side_effect=moved):
+      refused(self, self.generate_pack_raw(draft_id, self.pack_snapshot(draft_id)), 409, "draft_changed")
+    self.assertIsNone(self.stored_child(draft_id)["document"]["generated"])
+    ok(self, self.update_child(draft_id, {"authorized_ports": "all"}))
+    self.generate_pack(draft_id)
+    self.assertEqual(self.stored_child(draft_id)["pack_scope"], ["all", "all"])
+    self.assertFalse(stale())
+    ok(self, self.update_child(draft_id, {"authorized_ports": [[1, 80]]}))
+    self.assertTrue(stale())
+    self.generate_pack(draft_id, snapshot=self.pack_snapshot(draft_id, authorizedPorts=[[1, 80]], authorizedTests="all"))
+    self.assertFalse(stale())
+    # A pack stored before the scope has no `pack_scope` and printed "all": stale only once a restriction is set.
+    row = self.stored_child(draft_id)
+    del row["pack_scope"]
+    row["authorized_ports"] = "all"
+    self.repo.put("engagement_draft", draft_id, record=row)
+    self.assertFalse(stale())
+    ok(self, self.update_child(draft_id, {"authorized_tests": ["web_discovery"]}))
+    self.assertTrue(stale())
+
   def test_a_replacement_whose_documents_would_exceed_the_limit_is_refused_at_create(self):
     from extensions.business.cybersec.red_mesh.tenancy import administration
     writes = len(self.store.writes)
