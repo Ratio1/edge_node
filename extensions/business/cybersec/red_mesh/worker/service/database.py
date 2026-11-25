@@ -127,6 +127,31 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           # leads with `5.5.5-`; route it to its own product key.
           cve_product, cve_version = self._mysql_cve_target(version)
           findings += check_cves(cve_product, cve_version)
+
+          # Transport: CLIENT_SSL clear in the greeting means no TLS upgrade.
+          # Only the bytes the packet header declares belong to the greeting.
+          capabilities = self._mysql_lower_capabilities(pkt_payload[:int.from_bytes(data[0:3], 'little')])
+          if capabilities is not None:
+            raw["capabilities"] = capabilities
+            raw["tls_offered"] = bool(capabilities & self._MYSQL_CLIENT_SSL)
+            if not raw["tls_offered"]:
+              product = "MariaDB" if cve_product == "mariadb" else "MySQL"
+              findings.append(Finding(
+                severity=Severity.MEDIUM,
+                cvss_vector=V.WEAK_TRANSPORT,
+                title=f"{product} does not offer TLS (cleartext connections)",
+                description=f"The {product} server on {target}:{port} does not advertise "
+                            "CLIENT_SSL in its handshake, so it cannot upgrade a client "
+                            "session to TLS.",
+                evidence=f"Initial handshake capability flags 0x{capabilities:04x}: "
+                         "CLIENT_SSL (0x0800) clear.",
+                remediation="Enable TLS on the server (ssl_cert/ssl_key, require_secure_transport) "
+                            "and require it for remote accounts.",
+                owasp_id="A02:2021",
+                cwe_id="CWE-319",
+                # A low-entropy scramble marks a deceptive service: its flags are not the word of a real server.
+                confidence="firm" if raw.get("salt_entropy", 8.0) < 2.0 else "certain",
+              ))
         else:
           raw["protocol_byte"] = pkt_payload[0] if pkt_payload else None
           findings.append(Finding(
@@ -296,6 +321,24 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     if 'mariadb' in stripped.lower():
       return "mariadb", stripped
     return "mysql", stripped
+
+  _MYSQL_CLIENT_SSL = 0x0800
+
+  @staticmethod
+  def _mysql_lower_capabilities(pkt_payload):
+    """Return the lower capability flags of a Handshake v10 payload, or None.
+
+    After the version's NUL: thread id (4), auth data part 1 (8), filler
+    (1, always 0x00), then the flags as a little-endian uint16. A payload
+    that ends before the flags or has a non-zero filler gives None.
+    """
+    parts = pkt_payload[1:].split(b'\x00', 1)
+    if len(parts) < 2:
+      return None
+    after_version = parts[1]
+    if len(after_version) < 15 or after_version[12] != 0:
+      return None
+    return struct.unpack('<H', after_version[13:15])[0]
 
   # Affected version ranges for CVE-2012-2122
   _MYSQL_CVE_2012_2122_RANGES = [
@@ -966,6 +1009,34 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           for f in check_cves("postgresql", ver_match.group(1)):
             findings.append(f)
 
+      # --- Transport encryption offered on this listener ---
+      # Only a PostgreSQL-shaped answer (auth request or error) to the StartupMessage earns the check:
+      # a server-first service whose first byte happens to be 'N' is not a PostgreSQL listener.
+      tls_offered = gss_offered = None
+      if data[0:1] in (b'R', b'E'):
+        tls_offered, gss_offered = self._pg_transport_offer(target, port)
+      if tls_offered is not None:
+        raw["tls_offered"] = tls_offered
+      if gss_offered is not None:
+        raw["gss_offered"] = gss_offered
+      if tls_offered == "N":
+        gss = gss_offered == "G"
+        findings.append(Finding(
+          severity=Severity.LOW if gss else Severity.MEDIUM,
+          cvss_vector=V.WEAK_CRYPTO_MARGINAL if gss else V.WEAK_TRANSPORT,
+          title="PostgreSQL does not offer TLS (cleartext connections)",
+          description=f"PostgreSQL on {target}:{port} answers an SSLRequest with 'N': "
+                      "the listener offers no TLS"
+                      + (", only GSSAPI encryption, which needs a Kerberos client." if gss
+                         else ", so every client session on it is cleartext."),
+          evidence="SSLRequest reply 'N'; GSSENCRequest reply "
+                   + (f"'{gss_offered}'" if gss_offered else "not N or G") + ".",
+          remediation="Set ssl = on with a server certificate and use hostssl entries in pg_hba.conf.",
+          owasp_id="A02:2021",
+          cwe_id="CWE-319",
+          confidence="certain",
+        ))
+
       if not findings:
         findings.append(Finding(Severity.INFO, "PostgreSQL probe completed", "No auth weakness detected."))
     except Exception as e:
@@ -1134,6 +1205,47 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           if field[:1] == b'M':
             return field[1:].decode('utf-8', errors='replace')
     return None
+
+  _PG_SSL_REQUEST = struct.pack('!II', 8, 80877103)
+  _PG_GSSENC_REQUEST = struct.pack('!II', 8, 80877104)
+
+  def _pg_transport_offer(self, target, port):
+    """Ask one PostgreSQL connection which transport encryption it offers.
+
+    Sends an SSLRequest; the server answers one byte, 'S' (TLS follows) or
+    'N'. On 'S' the socket is closed without a handshake. On 'N' a
+    GSSENCRequest goes on the same connection ('G' or 'N'; servers before
+    12 answer an error). No credential is sent.
+
+    Returns ``(tls_offered, gss_offered)``: each 'S'/'N' resp. 'G'/'N', or
+    None when the reply is empty or another value. Only one byte is read: a
+    server that sends more is read as its first byte (real servers send one).
+    """
+    def _one_byte(sock, request, allowed):
+      sock.sendall(request)
+      reply = sock.recv(1)
+      if len(reply) == 1 and reply.decode('latin-1') in allowed:
+        return reply.decode('latin-1')
+      return None
+
+    tls_offered = gss_offered = None
+    sock = None
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(self._target_timeout(3))
+      sock.connect((target, port))
+      tls_offered = _one_byte(sock, self._PG_SSL_REQUEST, ('S', 'N'))
+      if tls_offered == 'N':
+        gss_offered = _one_byte(sock, self._PG_GSSENC_REQUEST, ('G', 'N'))
+    except Exception:
+      pass
+    finally:
+      if sock is not None:
+        try:
+          sock.close()
+        except Exception:
+          pass
+    return tls_offered, gss_offered
 
   def _pg_privilege_findings(self, sock, auth_reply, username, raw):
     """CVE-2019-9193: read whether the accepted role may run server programs. Never runs COPY ... PROGRAM.
