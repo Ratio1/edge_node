@@ -76,18 +76,17 @@ class TestTimeoutProfileCallSiteAudit(unittest.TestCase):
           unresolved.append((source.relative_to(root).as_posix(), line_nr, line.strip()))
 
     self.assertGreaterEqual(resolver_uses, 150)
-    self.assertEqual(len(unresolved), 1)
-    path, _line_nr, line = unresolved[0]
-    self.assertEqual(path, "worker/web/injection.py")
-    self.assertIn("requests.get(url_sleep, timeout=5", line)
+    # RM-275: the old SLEEP(2) probe (timeout=5) is gone; SQLi waits come from `_target_timeout`.
+    self.assertEqual(unresolved, [])
 
   def test_dune_and_timing_thresholds_remain_unprofiled(self):
     root = Path(__file__).resolve().parents[1]
     worker_text = (root / "worker" / "pentest_worker.py").read_text(encoding="utf-8")
     injection_text = (root / "worker" / "web" / "injection.py").read_text(encoding="utf-8")
     self.assertIn("time.sleep(delay)", worker_text)
-    self.assertIn("requests.get(url_sleep, timeout=5", injection_text)
-    self.assertIn("if elapsed >= 2.0:", injection_text)
+    # The SQLi time technique keeps its own threshold (graybox `TIME_DELAY`); its request wait is
+    # the profiled timeout plus that delay.
+    self.assertIn("self._target_timeout(3) + TIME_DELAY + 1", injection_text)
 
 
 if __name__ == "__main__":

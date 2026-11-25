@@ -106,6 +106,8 @@ class DiscoveryResult:
   candidates: list[InjectionCandidate] = field(default_factory=list)
   # Seed fetches (robots/sitemap/OpenAPI) that failed and were ignored.
   fetch_failures: int = 0
+  # Form actions whose method is not GET: recorded, never submitted by the crawl.
+  post_forms: list[str] = field(default_factory=list)
 
   def to_tuple(self) -> tuple[list[str], list[str]]:
     return self.routes, self.forms

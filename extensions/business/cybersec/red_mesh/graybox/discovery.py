@@ -94,6 +94,8 @@ class DiscoveryModule:
     self.routes = []
     self.forms = []
     self.fetch_failures = 0
+    # Per-request timeout of a discovery fetch; a network scan sets its own.
+    self.fetch_timeout = 10
     api = getattr(target_config, "api_security", None)
     inv = getattr(api, "inventory_paths", None)
     self._openapi_paths = list(getattr(inv, "openapi_candidates", []) or [])
@@ -201,6 +203,7 @@ class DiscoveryModule:
 
     all_routes = set()
     all_forms = set()
+    post_forms = set()
     candidates = {}
     self.fetch_failures = 0
     self._seed(to_visit, candidates)
@@ -256,9 +259,11 @@ class DiscoveryModule:
       for link in parser.links:
         self._add_query_candidates(self._normalize(link), candidates, link)
       for spec in parser.form_specs:
-        if spec["method"] != "get":
-          continue
         target = self._normalize(spec["action"]) if spec["action"] else path
+        if spec["method"] != "get":
+          if target and self._in_scope(target) and not self._is_logout(target):
+            post_forms.add(target)
+          continue
         for name in spec["inputs"]:
           self._add_candidate(target, name, candidates)
 
@@ -266,7 +271,8 @@ class DiscoveryModule:
     self.forms = sorted(all_forms)
     return DiscoveryResult(
       routes=self.routes, forms=self.forms,
-      candidates=list(candidates.values()), fetch_failures=self.fetch_failures)
+      candidates=list(candidates.values()), fetch_failures=self.fetch_failures,
+      post_forms=sorted(post_forms))
 
   # ── seeds: robots.txt, sitemap.xml, OpenAPI ──────────────────────────
 
@@ -279,7 +285,7 @@ class DiscoveryModule:
     credentials never reach another host.
     """
     for _ in range(MAX_REDIRECTS + 1):
-      resp = session.get(url, timeout=10, allow_redirects=False, stream=True)
+      resp = session.get(url, timeout=self.fetch_timeout, allow_redirects=False, stream=True)
       if resp.status_code in (301, 302, 303, 307, 308):
         url = urljoin(url, resp.headers.get("Location", ""))
         resp.close()

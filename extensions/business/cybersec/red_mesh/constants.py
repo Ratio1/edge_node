@@ -246,6 +246,15 @@ FINGERPRINT_MAX_BANNER = 512   # bytes — max banner stored per port
 FINGERPRINT_HTTP_TIMEOUT = 4   # seconds — active HTTP probe timeout (honeypots may be slow)
 FINGERPRINT_NUDGE_TIMEOUT = 3  # seconds — generic \r\n nudge probe timeout
 
+# Blackbox web injection caps (RM-275). Workers may override any key through a
+# `web_injection_caps` dict attribute; every cap that bites is named in the probe's coverage note.
+WEB_INJECTION_CAPS = {
+  "crawl_max_pages": 30,           # routes fetched by the shared crawl, per base URL
+  "crawl_max_depth": 2,            # link depth from the root
+  "candidates_per_probe": 20,      # (path, parameter) pairs tested by one injection probe
+  "sqli_requests_per_port": 240,   # SQLi requests per port (20 candidates x ~12), controls not counted
+}
+
 # Well-known TCP port → protocol (fallback when banner is unrecognized)
 WELL_KNOWN_PORTS = {
     21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 42: "wins",
