@@ -14,7 +14,7 @@ from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 
-from .budget import RequestBudgetExhausted
+from .budget import RequestRefused
 from .models import DiscoveryResult, InjectionCandidate
 
 # Seed fetches per scan: robots.txt (1) + sitemaps (sitemap.xml, robots
@@ -153,7 +153,7 @@ class DiscoveryModule:
       url = self._origin + path
       try:
         resp = self._get(session, url)
-      except RequestBudgetExhausted:
+      except RequestRefused:
         self.fetch_failures += 1  # stop the crawl, keep what was found
         break
       except requests.RequestException:
@@ -231,7 +231,7 @@ class DiscoveryModule:
       url = self._origin + path
       try:
         resp = self._get(session, url)
-      except RequestBudgetExhausted:
+      except RequestRefused:
         self.fetch_failures += 1  # stop the crawl, keep what was found
         break
       except requests.RequestException:
