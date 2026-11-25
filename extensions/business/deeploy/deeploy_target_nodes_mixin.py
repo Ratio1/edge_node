@@ -218,7 +218,8 @@ class _DeeployTargetNodesMixin:
         raise ValueError(msg)
       else:
         self.P(msg, color='r')
-    return result
+    # EVM lookup may return a bare NetMon key. Plans use the worker's full address.
+    return self.bc.maybe_add_prefix(result) if result is not None else None
 
   def __find_nodes_without_deeployed_apps(self, nodes, apps):
     suitable_nodes = {}
@@ -586,7 +587,8 @@ class _DeeployTargetNodesMixin:
       msg = f"{DEEPLOY_ERRORS.NODES5}: Not enough online nodes available. Required: {inputs.target_nodes_count}, Available: {len(sorted_nodes)}"
       raise ValueError(msg)
 
-    nodes_to_run = sorted_nodes[:inputs.target_nodes_count]
+    # Keep NetMon's keys for scoring. Return full worker identities in the same order.
+    nodes_to_run = [self.bc.maybe_add_prefix(node) for node in sorted_nodes[:inputs.target_nodes_count]]
     self.Pd(f"Nodes to run: {nodes_to_run}")
 
     return nodes_to_run
@@ -659,6 +661,8 @@ class _DeeployTargetNodesMixin:
 
     for node in inputs.target_nodes:
       addr = self._check_and_maybe_convert_address(node)
+      if addr in nodes:  # Two different address formats can resolve to a single worker.
+        raise ValueError(f"{DEEPLOY_ERRORS.NODES2}: Duplicate target node {addr}.")
       is_supervisor = self._parse_node_supervisor_state(self.netmon.network_node_is_supervisor(addr=addr))
       if is_supervisor is not False:
         msg = f"{DEEPLOY_ERRORS.NODES6}: Node {addr} is a supervisor node or has unknown supervisor state and cannot be used for deeployment"
