@@ -273,6 +273,25 @@ GRAYBOX_SCENARIO_CATALOG = (
 )
 
 
+# Catalogued scenarios that no probe emits yet (RM-272 Phase 1, D27/D76). They stay
+# in the catalog and its count, but are not implemented: never report them as tested.
+# Remove an id here when its runner lands; `test_detection_inventory` pins the
+# partition (every id is emitted by a runner or listed here, never both).
+GRAYBOX_NOT_IMPLEMENTED = frozenset({
+  "PT-A01-07", "PT-A01-08", "PT-A01-11", "PT-A01-13",
+  "PT-A01-14", "PT-A01-15", "PT-A01-16", "PT-A01-17",
+  "PT-A01-18", "PT-A01-19", "PT-A01-20", "PT-A02-08",
+  "PT-A02-09", "PT-A02-10", "PT-A02-11", "PT-A02-13",
+  "PT-A02-14", "PT-A02-15", "PT-A02-16", "PT-A03-05",
+  "PT-A03-08", "PT-A03-09", "PT-A03-10", "PT-A03-11",
+  "PT-A03-13", "PT-A03-14", "PT-A03-16", "PT-A03-17",
+  "PT-A03-18", "PT-A04-03", "PT-A04-04", "PT-A04-05",
+  "PT-A04-06", "PT-A04-07", "PT-A04-08", "PT-A06-03",
+  "PT-A06-05", "PT-A06-06", "PT-A06-07", "PT-A06-08",
+  "PT-A06-09", "PT-A06-10",
+})
+
+
 def graybox_scenario_ids() -> set[str]:
   """Return stable graybox scenario IDs."""
   return {entry["id"] for entry in GRAYBOX_SCENARIO_CATALOG}

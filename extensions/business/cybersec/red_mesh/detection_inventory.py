@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .cve_db import CVE_DATABASE
-from .graybox.scenario_catalog import GRAYBOX_SCENARIO_CATALOG
+from .graybox.scenario_catalog import GRAYBOX_SCENARIO_CATALOG, GRAYBOX_NOT_IMPLEMENTED
 from .worker.blackbox_detection_catalog import BLACKBOX_DETECTION_CATALOG
 
 
@@ -23,7 +23,8 @@ class DetectionInventory:
   """Countable detection signature sets.
 
   ``blackbox`` includes unique static CVEs and native black-box non-CVE
-  detector families. ``graybox`` includes authenticated scenario IDs.
+  detector families. ``graybox`` includes authenticated scenario IDs, all
+  catalogued; ``graybox_implemented`` is the subset with a runner (RM-272).
   """
 
   cves: frozenset[str]
@@ -31,6 +32,7 @@ class DetectionInventory:
   graybox_scenarios: frozenset[str]
   # Subset of `cves` whose every catalog row has a product key no probe passes.
   not_probe_reachable: frozenset[str] = frozenset()
+  graybox_implemented: frozenset[str] = frozenset()
 
   @property
   def blackbox(self) -> frozenset[str]:
@@ -47,6 +49,7 @@ class DetectionInventory:
       "blackbox_detectors": len(self.blackbox_detectors),
       "blackbox": len(self.blackbox),
       "graybox": len(self.graybox_scenarios),
+      "graybox_implemented": len(self.graybox_implemented),
       "total": len(self.total),
     }
 
@@ -64,9 +67,14 @@ def build_detection_inventory() -> DetectionInventory:
   graybox_scenarios = frozenset(
     f"GB:{entry['id']}" for entry in GRAYBOX_SCENARIO_CATALOG
   )
+  graybox_implemented = frozenset(
+    f"GB:{entry['id']}" for entry in GRAYBOX_SCENARIO_CATALOG
+    if entry["id"] not in GRAYBOX_NOT_IMPLEMENTED
+  )
   return DetectionInventory(
     cves=cves,
     blackbox_detectors=blackbox_detectors,
     graybox_scenarios=graybox_scenarios,
     not_probe_reachable=not_probe_reachable,
+    graybox_implemented=graybox_implemented,
   )
