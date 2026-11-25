@@ -1009,10 +1009,10 @@ class _ServiceInfraMixin(_ServiceProbeBase):
 
       if admin_shares:
         findings.append(Finding(
-          severity=Severity.HIGH,
-          cvss_vector=V.SENSITIVE_DATA_EXPOSED,
-          title=f"SMB admin shares accessible via null session: {', '.join(admin_shares)}",
-          description="Administrative shares are accessible without authentication.",
+          severity=Severity.MEDIUM,
+          cvss_vector=V.INFO_DISCLOSURE_MEDIUM,
+          title=f"SMB admin shares listed via null session: {', '.join(admin_shares)}",
+          description="An anonymous session lists administrative shares; access to them was not tested.",
           evidence=f"Shares: {share_names}",
           remediation="Disable null session access; restrict admin shares.",
           owasp_id="A01:2021",

@@ -1,7 +1,7 @@
 """RM-271 phase 2: SMB1 share enumeration against recorded replies (vulhub Samba 4.6.3, anonymous)."""
 import struct
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from extensions.business.cybersec.red_mesh.tests.test_rm198_detection_checks import _ScriptedSock, _worker
 from extensions.business.cybersec.red_mesh.worker.pentest_worker import PentestLocalWorker
@@ -263,3 +263,24 @@ class TestTreeConnectMaskRecorded(unittest.TestCase):
     mask, reason = PentestLocalWorker._smb_tree_max_access(_TREE_MYSHARE)
     self.assertEqual((mask, reason), (0x001F01FF, None))
     self.assertTrue(mask & PentestLocalWorker._SMB_WRITE_RIGHTS)
+
+
+class TestAdminShareListing(unittest.TestCase):
+  """A null-session list that names admin shares is disclosure (MEDIUM), not proof of access (T-Pot Dionaea, RM-271)."""
+
+  def test_listed_admin_shares_are_medium_and_say_access_was_not_tested(self):
+    w = _worker(ports=(445,))
+    smb_resp = bytearray(128)
+    smb_resp[0:4] = b"\xffSMB"
+    smb_resp[32] = 17
+    sock = MagicMock()
+    sock.recv.side_effect = [b"\x00\x00\x00\x80", bytes(smb_resp)]
+    shares = [{"name": "ADMIN$", "type": 0, "comment": ""}, {"name": "C$", "type": 0, "comment": ""}]
+    with patch.object(w, "_smb_enum_shares", return_value=shares), \
+         patch.object(w, "_smb_try_null_session", return_value=None), \
+         patch("socket.socket", return_value=sock):
+      result = w._service_info_smb("10.0.0.1", 445)
+    hit = [f for f in result["findings"] if f["title"].startswith("SMB admin shares listed via null session")]
+    self.assertEqual(len(hit), 1)
+    self.assertEqual(hit[0]["severity"], "MEDIUM")
+    self.assertIn("not tested", hit[0]["description"])
