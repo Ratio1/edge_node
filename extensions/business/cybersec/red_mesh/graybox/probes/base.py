@@ -281,6 +281,12 @@ class ProbeBase:
       f = self.findings[i]
       if f.status == "not_vulnerable" or (
           f.status == "vulnerable" and f.scenario_id in ABSENCE_VERDICT_SCENARIOS):
+        if f.rollback_status == "revert_failed":
+          # Where manual cleanup is needed must survive: withdraw the verdict only.
+          self.findings[i] = dataclasses.replace(
+            f, status="inconclusive",
+            evidence=list(f.evidence) + ["reason=budget_exhausted"])
+          continue
         # Neutral shape: the old title and location asserted the verdict being withdrawn.
         self.findings[i] = dataclasses.replace(
           f, title=self._neutral_title(f.scenario_id), status="inconclusive",

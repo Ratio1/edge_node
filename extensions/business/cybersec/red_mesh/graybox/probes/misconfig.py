@@ -492,7 +492,7 @@ class MisconfigProbes(ProbeBase):
       # Re-extract CSRF token each time (some frameworks rotate it)
       if csrf_field and i > 0:
         try:
-          page = session.get(login_url, timeout=10)
+          page = session.get(login_url, timeout=10, throttle_min_delay=0.1)
           csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
         except Exception:
           pass

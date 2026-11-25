@@ -437,9 +437,15 @@ class GrayboxLocalWorker(BaseLocalWorker):
     self.metrics.phase_start("authentication")
     self._phase_open = True
     try:
-      auth_ok = self.auth.authenticate(
-        self._credentials.official, self._credentials.regular,
-      )
+      try:
+        auth_ok = self.auth.authenticate(
+          self._credentials.official, self._credentials.regular,
+        )
+      except RequestBudgetExhausted:
+        self._abort(
+          "Request budget exhausted during authentication.",
+          reason_class="budget_exhausted",
+        )
       self._store_auth_results()
       self.state["completed_tests"].append("graybox_auth")
     finally:

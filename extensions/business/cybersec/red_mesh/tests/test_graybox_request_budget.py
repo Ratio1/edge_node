@@ -425,5 +425,64 @@ class TestDowngradedFindingIsNeutral(unittest.TestCase):
     self.assertNotIn("not enforced", f.title.lower())
 
 
+class TestFinalWave(unittest.TestCase):
+
+  def test_revert_failed_clean_keeps_its_cleanup_evidence_when_downgraded(self):
+    budget = RequestBudget(remaining=1, total=1)
+    _app, _c, session, auth = _probe_env(budget)
+    probe = _probe(MisconfigProbes, budget, auth)
+
+    def family():
+      session.get(fx.BASE + "/api/me/")
+      try:
+        session.get(fx.BASE + "/api/me/")
+      except Exception:
+        pass
+      probe.emit_clean("PT-A01-05", "t", "A01:2021", ["endpoint=/api/records/1/"],
+                       rollback_status="revert_failed")
+    probe.run_safe("family", family)
+    f = [f for f in probe.findings if f.scenario_id == "PT-A01-05"][0]
+    self.assertEqual((f.status, f.rollback_status), ("inconclusive", "revert_failed"))
+    self.assertIn("endpoint=/api/records/1/", f.evidence)
+    self.assertIn("reason=budget_exhausted", f.evidence)
+
+  def test_sqli_paces_after_prepare_and_before_the_clock(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes import sqli
+    order = []
+
+    def prepare():
+      order.append("prepare")
+
+    def send(v, ctx):
+      order.append("send")
+      return MagicMock(status_code=200, text="x")
+    sqli.detect_sqli(send, throttle=lambda: order.append("throttle"), prepare=prepare,
+                     reached=lambda r: True, max_requests=1)
+    self.assertEqual(order[:3], ["prepare", "throttle", "send"])
+
+  def test_refusal_during_login_is_a_classified_abort(self):
+    from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudgetExhausted
+    worker = _worker()
+    worker.auth = MagicMock()
+    worker.auth.authenticate.side_effect = RequestBudgetExhausted()
+    from extensions.business.cybersec.red_mesh.graybox.worker import GrayboxAbort
+    with self.assertRaises(GrayboxAbort) as ctx:
+      worker._run_authentication_phase()
+    self.assertEqual(ctx.exception.reason_class, "budget_exhausted")
+
+  def test_refusal_during_the_crawl_keeps_what_was_found(self):
+    from extensions.business.cybersec.red_mesh.graybox.discovery import DiscoveryModule
+    budget = RequestBudget(remaining=2, total=2)
+    app, client, _s, auth = _probe_env(budget)
+    auth.anon_session = None
+    cfg = _config()
+    disc = DiscoveryModule(target_url=fx.BASE, auth_manager=auth,
+                           safety=SafetyControls(request_delay=0.0, target_is_local=True),
+                           target_config=cfg)
+    result = disc.discover_result()
+    self.assertGreaterEqual(result.fetch_failures, 1)
+    self.assertLessEqual(len(app.log), 2)
+
+
 if __name__ == "__main__":
   unittest.main()

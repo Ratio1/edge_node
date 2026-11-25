@@ -143,8 +143,6 @@ def detect_sqli(send, throttle=None, reached=None, budget=None,
       raise _Stop("capped")
     if budget is not None and not budget():
       raise _Stop("budget")
-    if throttle:
-      throttle()
     count["n"] += 1
     if cap is not None:
       cap["left"] -= 1
@@ -156,6 +154,10 @@ def detect_sqli(send, throttle=None, reached=None, budget=None,
       raise _Stop("csrf_unavailable")
     except Exception:
       return None, 0.0
+    # Pace last, after any prepare() request, so the gap before the timed send is
+    # already served and the client adds none inside the clock.
+    if throttle:
+      throttle()
     started = time.monotonic()
     try:
       resp = send(value, ctx) if prepare else send(value)
