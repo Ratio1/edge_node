@@ -14,9 +14,22 @@ Static reference tables used by the PTES-aligned report generator.
 
 ## Refresh procedure
 
-OWASP data stays on the 2021 edition, although OWASP published the 2025 edition (December 2025):
-probes and findings carry `A0x:2021` codes, so moving to 2025 is a code migration, not a refresh.
-A refresh checks the 2021 pages (`https://top10.owasp.org/2021/`) for changes.
+OWASP data stays on the 2021 edition, although OWASP has published the 2025 edition
+(`https://top10.owasp.org/2025/`; release candidate 2025-11-06, final early 2026, the OWASP pages
+give no date). Moving to 2025 is a code migration, not a refresh, for two reasons:
+
+- `owasp_id` is part of finding identity (`models/finding_identity.py` `_classification`, read by
+  `dedup_key`). A new code gives every probe and graybox finding a new `finding_id` (CVE findings
+  are stamped before `owasp_id` is set), so triage stops carrying over to rescans and scan
+  comparisons see those findings as lost and new.
+- The 2025 edition renumbers and splits categories (2021 A03 Injection is 2025 A05; 2025 A03 is
+  Software Supply Chain Failures; 2021 A10 SSRF folds into 2025 A01; 2025 A10 is new), and the
+  Navigator names a category by the code before the colon, ignoring the year. Mixed editions would
+  show the wrong name. (The OWASP API Top 10 2023 codes, `API1:2023` and so on, are a separate list.)
+
+A migration needs an edition-independent identity first, and a plan for the graybox scenario ids
+(`PT-A0x-nn`, also in `dedup_key`), whose numbers follow neither edition consistently. A refresh
+checks the 2021 pages (`https://top10.owasp.org/2021/`) for changes.
 
 1. Pull the latest from each source (links in each JSON's `source` field).
 2. Update the `last_refreshed` field to today's ISO date (`YYYY-MM-DD`).

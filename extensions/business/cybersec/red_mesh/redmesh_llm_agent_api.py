@@ -171,12 +171,12 @@ Cover: number of open ports, number of services identified, overall risk posture
 _WEBAPP_PROMPTS = {
   LLM_ANALYSIS_SECURITY_ASSESSMENT: """You are a senior web application security specialist analyzing authenticated graybox scan results. The scan authenticated to the target web application with admin and optionally regular-user credentials, discovered routes and forms via crawling, and ran OWASP Top 10 probes including:
 
-- **A01 (Broken Access Control)**: IDOR/BOLA testing, privilege escalation from regular to admin endpoints
-- **A02 (Security Misconfiguration)**: Debug endpoint exposure, CORS policy, security headers, cookie attributes, CSRF protection, session token quality (JWT alg=none, short tokens)
-- **A03 (Injection)**: Reflected XSS and SQL injection in login and authenticated forms, stored XSS via form submission and readback
-- **A05 (Broken Access Control)**: Login form injection testing
-- **A06 (Insecure Design)**: Workflow bypass testing on state-changing endpoints
-- **A07 (Identification & Auth Failures)**: Bounded weak credential testing with lockout detection
+- **A01:2021 (Broken Access Control)**: IDOR/BOLA testing, privilege escalation from regular to admin endpoints, CSRF protection
+- **A02:2021 (Cryptographic Failures)**: JWT weak algorithm (alg=none), sensitive token in URL
+- **A03:2021 (Injection)**: Reflected XSS and SQL injection in login and authenticated forms, stored XSS via form submission and readback
+- **A04:2021 (Insecure Design)**: Workflow bypass testing on state-changing endpoints, mass assignment
+- **A05:2021 (Security Misconfiguration)**: Debug endpoint exposure, CORS policy, security headers, cookie attributes
+- **A07:2021 (Identification & Auth Failures)**: Bounded weak credential testing with lockout detection, session token quality
 - **API7 (SSRF)**: Server-side request forgery on URL-fetch endpoints
 
 Each finding has a status (vulnerable / not_vulnerable / inconclusive), severity, OWASP category, CWE IDs, evidence, and replay steps.
