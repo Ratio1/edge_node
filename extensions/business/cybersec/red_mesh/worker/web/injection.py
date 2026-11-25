@@ -2,12 +2,18 @@ import json as _json
 import re as _re
 import http.client
 import ssl
-import time
+import hashlib
+import secrets
 import requests
+from html.parser import HTMLParser
 from types import SimpleNamespace
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
-from ...findings import Evidence, Finding, Severity, probe_result, probe_error
+from ...findings import AffectedAsset, Evidence, Finding, Severity, probe_result, probe_error
+from ...graybox.probes.sqli import (
+  DBMS_ERRORS, SCAN_TIME_ALLOWANCE, SQLI_STRIP, TIME_DELAY, _signature, dbms_from_text, detect_sqli,
+)
+from .route_crawl import finish_coverage, label, plan_candidates, web_caps
 from ...cve_db import HINT_SPRING_FRAMEWORK, HINT_STRUTS2, probe_cve_fields
 from ..response_fingerprint import sanitize_excerpt
 from ... import cvss_vectors as V
@@ -114,36 +120,201 @@ def _raw_path_get(scheme, host, port, path, timeout):
     conn.close()
 
 
-class _InjectionTestBase:
-  """Shared execution engine for injection-style web tests."""
+MAX_INJECTION_BODY_BYTES = 1024 * 1024  # largest injection response body kept; more is truncated
+MAX_PARAM = 64    # chars of a target-controlled parameter name kept in a finding
+MAX_PATH = 200    # chars of a target-controlled route path kept in a finding
+_SQLI_GUESSED_PARAMS = ("id", "page", "q", "user", "item", "cat")
+_XSS_GUESSED_PARAMS = ("q", "search", "id", "name", "page", "input", "text")
+_ANSWERS_ANY = ("The endpoint answers any parameter name the same way (a random parameter name "
+                "reproduced it): possible catch-all or honeypot.")
+_CONTROL_FAILED = "The control request under a random parameter name could not run, so the hit is unconfirmed."
+# Elements whose content is not parsed as markup: a marker tag inside one is no injection.
+_RAW_TEXT_TAGS = frozenset({"textarea", "title", "noscript", "xmp", "plaintext", "iframe", "noembed"})
 
-  def _run_injection_test(self, target, port, *, params, payloads, check_fn,
-                          finding_factory, max_findings=3):
-    """
-    Iterate params x payloads, call check_fn(response, needle) for each,
-    create findings via finding_factory(param, payload, response, url).
-    """
-    scheme = "https" if port in (443, 8443) else "http"
-    base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
-    findings = []
 
-    for param in params:
-      if len(findings) >= max_findings:
+def _web_base_url(target, port):
+  scheme = "https" if port in (443, 8443) else "http"
+  return f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
+
+
+def _request_url(base_url, path, param, value):
+  return f"{base_url}{path}?{urlencode({param: value})}"
+
+
+def _injection_get(url, timeout, params=None):
+  """One injection GET: no redirects, body read in chunks and kept up to MAX_INJECTION_BODY_BYTES."""
+  resp = requests.get(url, params=params, timeout=timeout, verify=False,
+                      allow_redirects=False, stream=True)
+  if isinstance(resp, requests.Response):
+    body = b""
+    for chunk in resp.iter_content(65536):
+      body += chunk
+      if len(body) >= MAX_INJECTION_BODY_BYTES:
         break
-      for payload, needle in payloads:
-        try:
-          url = f"{base_url}?{param}={payload}"
-          resp = requests.get(url, timeout=self._target_timeout(3), verify=False)
-          if check_fn(resp, needle):
-            findings.append(finding_factory(param, payload, resp, url))
-            break  # Found for this param, next param
-        except Exception:
-          pass
-
-    return findings
+    resp._content, resp._content_consumed = body[:MAX_INJECTION_BODY_BYTES], True
+    resp.close()
+  return resp
 
 
-class _WebInjectionMixin(_InjectionTestBase):
+def _stopped(worker):
+  event = getattr(worker, "stop_event", None)
+  return bool(event is not None and event.is_set())
+
+
+def _stop_run(coverage, candidates, reason):
+  """List the candidates not run, with why."""
+  coverage["not_tested"] += [label(c) for c in candidates]
+  coverage["not_tested_reason"] = "; ".join(filter(None, (coverage["not_tested_reason"], reason)))
+
+
+def _control_name():
+  return "rm" + secrets.token_hex(4)
+
+
+def _cut(text, limit):
+  """A target-controlled name, cut for a finding (the request keeps the full text)."""
+  return text if text is None or len(text) <= limit else text[:limit] + "..."
+
+
+def _asset(target, port, path, param):
+  return (AffectedAsset(host=target, port=port, url=path, parameter=param, method="GET"),)
+
+
+class _MarkerParser(HTMLParser):
+  """Sees whether a start tag named `marker` appears outside raw-text elements."""
+
+  def __init__(self, marker):
+    super().__init__(convert_charrefs=True)
+    self.marker, self.open, self.parsed = marker, [], False
+
+  def handle_starttag(self, tag, attrs):
+    if tag == self.marker:
+      self.parsed = self.parsed or not self.open
+    elif tag in _RAW_TEXT_TAGS:
+      self.open.append(tag)
+
+  def handle_endtag(self, tag):
+    if tag in self.open:
+      del self.open[len(self.open) - 1 - self.open[::-1].index(tag):]
+
+
+def _xss_payload(seed=None):
+  """(marker tag name, payload); the payload ends a script and an attribute first.
+
+  A reported request passes `seed` (base URL, path, parameter) so the marker, which lands in the
+  finding's evidence, is the same every scan and the finding keeps its identity. A control request
+  passes none: its marker is random and never reported.
+  """
+  marker = "rmx" + (hashlib.sha1("|".join(seed).encode()).hexdigest()[:8] if seed else secrets.token_hex(4))
+  return marker, f"'\"></script><{marker}>"
+
+
+def _xss_verdict(resp, marker, payload):
+  """(confidence, context) for one reflected marker: firm when HTML and the tag parses, tentative on
+  a raw echo that does not, (None, "") when nothing or only an escaped form came back."""
+  text = resp.text if isinstance(getattr(resp, "text", None), str) else ""
+  parser = _MarkerParser(marker)
+  try:
+    parser.feed(text)
+    parser.close()
+  except Exception:
+    pass
+  at = text.find(payload)
+  head = text[:at] if at >= 0 else ""
+  if at < 0:
+    context = "unknown"
+  elif head.lower().rfind("<script") > head.lower().rfind("</script"):
+    context = "script"
+  else:
+    context = "attribute" if head.rfind("<") > head.rfind(">") else "text"
+  content_type = str((getattr(resp, "headers", None) or {}).get("Content-Type", "")).lower()
+  if parser.parsed and "html" in content_type:
+    return "firm", context
+  if at >= 0 or f"<{marker}>" in text:
+    return "tentative", context
+  return None, ""
+
+
+def _xss_control_note(fetch):
+  """"" when the marker does not parse under a random parameter name; else the finding's caveat."""
+  marker, payload = _xss_payload()
+  try:
+    confidence, _ = _xss_verdict(fetch(_control_name(), payload), marker, payload)
+  except Exception:
+    return _CONTROL_FAILED
+  return _ANSWERS_ANY if confidence == "firm" else ""
+
+
+def _xss_finding(target, port, base_url, path, param, confidence, context, resp, payload, note):
+  path, param = _cut(path, MAX_PATH), _cut(param, MAX_PARAM)
+  url = _request_url(base_url, path, param, payload) if param else f"{base_url}/{payload}"
+  where = f"?{param}= parameter" if param else "URL path"
+  parsed = "parsed as a tag" if confidence == "firm" or note else "echoed raw but not parsed as a tag"
+  return Finding(
+    severity=Severity.HIGH,
+    cvss_vector=V.XSS_REFLECTED,
+    title=f"Reflected XSS via {where}",
+    description=f"A marker payload sent in the {where} came back {parsed} ({context} context)."
+                + (f" {note}" if note else ""),
+    evidence=f"URL: {url}; marker {parsed}, context {context}",
+    evidence_items=_traversal_evidence(url, getattr(resp, "text", "") or "", (payload,)),
+    remediation=f"HTML-encode the '{param}' parameter in output." if param
+                else "Encode output; implement Content-Security-Policy.",
+    owasp_id="A03:2021",
+    cwe_id="CWE-79",
+    confidence=confidence,
+    affected_assets=_asset(target, port, path, param),
+  )
+
+
+def _sqli_control_note(hit, fetch):
+  """"" when a random parameter name does not reproduce an error or boolean hit; else the caveat.
+
+  `fetch(name, value)` sends under a name. One random name serves the whole control. Error: the same
+  DBMS error. Boolean: the base value, TRUE and FALSE sent under it show the hit's own pattern (TRUE
+  like the base, FALSE not), i.e. the endpoint reacts to any parameter; a page that only echoes its
+  query string does not. A control that raises leaves the hit unconfirmed.
+  """
+  name = _control_name()
+  try:
+    if hit["technique"] == "error":
+      reproduced = dbms_from_text(fetch(name, hit["payload_true"]).text) == hit["dbms"]
+    else:
+      base = _signature(fetch(name, "1"), SQLI_STRIP, "1")
+      reproduced = (_signature(fetch(name, hit["payload_true"]), SQLI_STRIP, "1") == base
+                    and _signature(fetch(name, hit["payload_false"]), SQLI_STRIP, "1") != base)
+  except Exception:
+    return _CONTROL_FAILED
+  return _ANSWERS_ANY if reproduced else ""
+
+
+def _sqli_finding(target, port, base_url, cand, hit, note):
+  technique, param, path = hit["technique"], _cut(cand.param, MAX_PARAM), _cut(cand.path, MAX_PATH)
+  url = _request_url(base_url, path, param, hit["payload_true"])
+  text = getattr(hit.get("response"), "text", "") or ""
+  match = DBMS_ERRORS[hit["dbms"]].search(text) if technique == "error" and hit["dbms"] in DBMS_ERRORS else None
+  how = {
+    "error": f"A quote payload produced a {hit['dbms']} error that the baseline request did not show.",
+    "boolean": "A TRUE condition matched the baseline and a FALSE condition changed the response, twice.",
+    "time": f"A {hit['dbms']} sleep payload delayed the response twice while a benign control stayed at baseline.",
+  }[technique]
+  return Finding(
+    severity=Severity.HIGH,
+    cvss_vector=V.INJECTION_DATA_ACCESS,
+    title=f"SQL injection ({technique}-based) via ?{param}=",
+    description=f"{how} Parameter '{param}' on {path}." + (f" {note}" if note else ""),
+    evidence=f"URL: {url}; payload {hit['payload_true']!r}"
+             + (f", false payload {hit['payload_false']!r}" if hit["payload_false"] else ""),
+    evidence_items=_traversal_evidence(url, text, (match.group(0),) if match else ()),
+    remediation=f"Use parameterized queries for '{param}'.",
+    owasp_id="A03:2021",
+    cwe_id="CWE-89",
+    confidence="tentative" if note else hit["confidence"],
+    affected_assets=_asset(target, port, path, param),
+  )
+
+
+class _WebInjectionMixin:
   """
   Non-destructive probes for path traversal, reflected XSS,
   and SQL injection (OWASP WSTG-INPV).
@@ -252,6 +423,7 @@ class _WebInjectionMixin(_InjectionTestBase):
               owasp_id="A01:2021",
               cwe_id="CWE-22",
               confidence="certain",
+              affected_assets=_asset(target, port, "/", param),
             ))
             break
         except Exception:
@@ -263,7 +435,7 @@ class _WebInjectionMixin(_InjectionTestBase):
 
   @register_probe(
     display_name="Reflected XSS",
-    description="Reflect-back XSS detection across common parameters.",
+    description="Reflect-back XSS detection on discovered GET parameters, with an HTML context check.",
     category=CATEGORY_WEB_TEST,
     default_cwe=(79,),
     default_owasp=("A03:2021",),
@@ -271,9 +443,12 @@ class _WebInjectionMixin(_InjectionTestBase):
   )
   def _web_test_xss(self, target, port):
     """
-    Probe reflected XSS via URL path injection and query parameters.
+    Probe reflected XSS on the URL path and on GET parameters found by the shared crawl.
 
-    Tests multiple payloads across common parameter names.
+    One marker payload per request, derived from the base URL, path and parameter (stable across
+    scans). Firm needs the response to be HTML and its parser to see a start tag named by the marker
+    outside raw-text elements; a raw echo without that is tentative; an escaped echo is no finding. A firm hit is repeated under a random parameter name: if that parses
+    too, the endpoint answers any parameter and the hit is tentative.
 
     Parameters
     ----------
@@ -285,76 +460,58 @@ class _WebInjectionMixin(_InjectionTestBase):
     Returns
     -------
     dict
-      Structured findings.
+      Structured findings; `coverage` names what was not tested.
     """
     findings_list = []
-    scheme = "https" if port in (443, 8443) else "http"
-    base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
+    base_url = _web_base_url(target, port)
+    timeout = self._target_timeout(3)
+    candidates, coverage = plan_candidates(self, base_url, _XSS_GUESSED_PARAMS)
 
-    xss_payloads = [
-      ('<img src=x onerror=alert(1)>', 'onerror=alert'),
-      ('<svg onload=alert(1)>', 'onload=alert'),
-      ('<script>alert(1)</script>', '<script>alert(1)'),
-      ('" onfocus="alert(1)" autofocus="', 'onfocus='),
-    ]
-
-    # --- 1. Path injection ---
-    for payload, needle in xss_payloads:
-      if findings_list:
-        break
-      try:
-        url = base_url.rstrip("/") + f"/{payload}"
-        resp = requests.get(url, timeout=self._target_timeout(3), verify=False)
-        if needle in resp.text:
-          findings_list.append(Finding(
-            severity=Severity.HIGH,
-            cvss_vector=V.XSS_REFLECTED,
-            title=f"Reflected XSS via URL path",
-            description=f"Payload '{payload[:40]}' reflected in response body.",
-            evidence=f"URL: {url}, needle '{needle}' found in body",
-            remediation="Encode output; implement Content-Security-Policy.",
-            owasp_id="A03:2021",
-            cwe_id="CWE-79",
-            confidence="certain",
-          ))
-          break
-      except Exception:
-        pass
+    # --- 1. Path injection (one request) ---
+    marker, payload = _xss_payload((base_url, "/", ""))
+    url = base_url.rstrip("/") + f"/{payload}"
+    try:
+      resp = _injection_get(url, timeout)
+      confidence, context = _xss_verdict(resp, marker, payload)
+      note = ""
+      if confidence == "firm" and self._host_is_catch_all(base_url):
+        confidence, note = "tentative", "The host answers 200 to random paths, so the echo may come from a catch-all page."
+      if confidence:
+        # The asset names the root, not the payload path, so the identity does not depend on the marker.
+        findings_list.append(_xss_finding(
+          target, port, base_url, "/", None, confidence, context, resp, payload, note))
+    except Exception:
+      pass
 
     # --- 2. Query parameter injection ---
-    params = ["q", "search", "id", "name", "page", "input", "text"]
+    for i, cand in enumerate(candidates):
+      if _stopped(self):
+        _stop_run(coverage, candidates[i:], "stopped")
+        coverage["candidates_tested"] = i
+        break
+      def fetch(param, value, path=cand.path):
+        return _injection_get(base_url + path, timeout, {param: value})
+      marker, payload = _xss_payload((base_url, cand.path, cand.param))
+      try:
+        resp = fetch(cand.param, payload)
+        confidence, context = _xss_verdict(resp, marker, payload)
+        if not confidence:
+          continue
+        note = ""
+        if confidence == "firm":
+          note = _xss_control_note(fetch)
+          if note:
+            confidence = "tentative"
+        findings_list.append(_xss_finding(
+          target, port, base_url, cand.path, cand.param, confidence, context, resp, payload, note))
+      except Exception as exc:
+        coverage["inconclusive"][label(cand)] = type(exc).__name__
 
-    def _xss_check(resp, needle):
-      return needle in resp.text
-
-    def _xss_finding(param, payload, resp, url):
-      return Finding(
-        severity=Severity.HIGH,
-        cvss_vector=V.XSS_REFLECTED,
-        title=f"Reflected XSS via ?{param}= parameter",
-        description=f"Payload '{payload[:40]}' reflected unescaped via '{param}'.",
-        evidence=f"URL: {url}",
-        remediation=f"HTML-encode the '{param}' parameter in output.",
-        owasp_id="A03:2021",
-        cwe_id="CWE-79",
-        confidence="certain",
-      )
-
-    findings_list += self._run_injection_test(
-      target, port,
-      params=params,
-      payloads=xss_payloads,
-      check_fn=_xss_check,
-      finding_factory=_xss_finding,
-      max_findings=3 - len(findings_list),
-    )
-
-    return probe_result(findings=findings_list)
-
+    return probe_result(raw_data={"coverage": finish_coverage(coverage)}, findings=findings_list)
 
   @register_probe(
     display_name="SQL injection",
-    description="Error-based + boolean-based + time-based SQLi probes against parameters.",
+    description="Error-based + boolean-based + time-based SQLi probes against discovered GET parameters.",
     category=CATEGORY_WEB_TEST,
     default_cwe=(89,),
     default_owasp=("A03:2021",),
@@ -362,7 +519,12 @@ class _WebInjectionMixin(_InjectionTestBase):
   )
   def _web_test_sql_injection(self, target, port):
     """
-    Multi-technique SQL injection probe: error-based, boolean-blind, time-based.
+    SQL injection on GET parameters found by the shared crawl: error, boolean and time techniques.
+
+    The decision logic is the graybox `detect_sqli` (baseline, stability, repeat, control), so a bare
+    keyword in a page is no finding. An error or boolean hit is repeated under a random parameter name:
+    if that reproduces it, the endpoint answers any parameter and the hit is tentative. One request
+    cap per port (`sqli_requests_per_port`) bounds the run; later candidates go into `coverage`.
 
     Parameters
     ----------
@@ -374,116 +536,44 @@ class _WebInjectionMixin(_InjectionTestBase):
     Returns
     -------
     dict
-      Structured findings.
+      Structured findings; `coverage` names what was not tested.
     """
     findings_list = []
-    raw = {}
-    scheme = "https" if port in (443, 8443) else "http"
-    base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
+    base_url = _web_base_url(target, port)
+    candidates, coverage = plan_candidates(self, base_url, _SQLI_GUESSED_PARAMS)
+    timeout = self._target_timeout(3) + TIME_DELAY + 1  # the time technique needs room to fire
+    left = self.__dict__.setdefault("_web_sqli_time_left", {"s": SCAN_TIME_ALLOWANCE})
+    cap = {"left": web_caps(self)["sqli_requests_per_port"]}
+    tested = 0
 
-    sql_error_keywords = [
-      "sql", "syntax", "mysql", "psql", "postgres", "sqlite", "ora-",
-      "microsoft ole db", "odbc", "unclosed quotation", "unterminated",
-      "you have an error in your sql",
-    ]
-    params = ["id", "page", "q", "user", "item", "cat"]
+    def fetch(path, param, value):
+      return _injection_get(base_url + path, timeout, {param: value})
 
-    # --- 1. Error-based ---
-    error_payloads = [
-      ("'", None),
-      ("1'--", None),
-      ("1 UNION SELECT NULL--", None),
-      ("1' OR '1'='1", None),
-    ]
+    for i, cand in enumerate(candidates):
+      if _stopped(self):
+        _stop_run(coverage, candidates[i:], "stopped")
+        break
+      if left["s"] < TIME_DELAY:  # the shared time allowance is spent: detect_sqli skips its time technique
+        coverage["time_skipped"].append(label(cand))
+      res = detect_sqli(lambda v: fetch(cand.path, cand.param, v), time_left=left, cap=cap)
+      outcome = res["outcome"]
+      if outcome in ("capped", "rate_limited"):
+        coverage["inconclusive"][label(cand)] = outcome
+        _stop_run(coverage, candidates[i + 1:], "request_cap" if outcome == "capped" else "rate_limited")
+        break
+      tested += 1
+      if outcome == "hit":
+        note = ""
+        if res["technique"] in ("error", "boolean"):
+          note = _sqli_control_note(res, lambda n, v: fetch(cand.path, n, v))
+        findings_list.append(_sqli_finding(target, port, base_url, cand, res, note))
+      elif outcome != "clean":
+        coverage["inconclusive"][label(cand)] = outcome
+    coverage["candidates_tested"] = tested
+    coverage["sqli_requests_left"] = cap["left"]
+    coverage["sqli_time_allowance_s"] = {"allowance": SCAN_TIME_ALLOWANCE, "left": round(left["s"], 1)}
 
-    def _sqli_error_check(resp, _needle):
-      body = resp.text.lower()
-      return any(kw in body for kw in sql_error_keywords)
-
-    def _sqli_error_finding(param, payload, resp, url):
-      return Finding(
-        severity=Severity.HIGH,
-        cvss_vector=V.INJECTION_DATA_ACCESS,
-        title=f"SQL injection (error-based) via ?{param}=",
-        description=f"SQL error keywords in response to payload '{payload}'.",
-        evidence=f"URL: {url}",
-        remediation=f"Use parameterized queries for '{param}'.",
-        owasp_id="A03:2021",
-        cwe_id="CWE-89",
-        confidence="firm",
-      )
-
-    findings_list += self._run_injection_test(
-      target, port,
-      params=params,
-      payloads=error_payloads,
-      check_fn=_sqli_error_check,
-      finding_factory=_sqli_error_finding,
-      max_findings=3,
-    )
-
-    # --- 2. Boolean-blind (only if error-based found nothing) ---
-    if not findings_list:
-      for param in params[:3]:
-        if findings_list:
-          break
-        try:
-          url_true = f"{base_url}?{param}=1 AND 1=1"
-          url_false = f"{base_url}?{param}=1 AND 1=2"
-          url_base = f"{base_url}?{param}=1"
-
-          resp_base = requests.get(url_base, timeout=self._target_timeout(3), verify=False)
-          resp_true = requests.get(url_true, timeout=self._target_timeout(3), verify=False)
-          resp_false = requests.get(url_false, timeout=self._target_timeout(3), verify=False)
-
-          # Baseline should match true, differ from false
-          if (resp_base.status_code == resp_true.status_code and
-              abs(len(resp_base.text) - len(resp_true.text)) < 50 and
-              abs(len(resp_true.text) - len(resp_false.text)) > 50):
-            findings_list.append(Finding(
-              severity=Severity.HIGH,
-              cvss_vector=V.INJECTION_DATA_ACCESS,
-              title=f"SQL injection (boolean-blind) via ?{param}=",
-              description=f"Response differs between AND 1=1 and AND 1=2.",
-              evidence="Responses for AND 1=1 and AND 1=2 differ in size while the baseline matches the true case.",
-              remediation=f"Use parameterized queries for '{param}'.",
-              owasp_id="A03:2021",
-              cwe_id="CWE-89",
-              confidence="tentative",
-            ))
-        except Exception:
-          pass
-
-    # --- 3. Time-based (last resort, max 2 params) ---
-    if not findings_list:
-      for param in params[:2]:
-        if findings_list:
-          break
-        try:
-          url_sleep = f"{base_url}?{param}=" + quote("' AND SLEEP(2)--")
-          start = time.time()
-          requests.get(url_sleep, timeout=5, verify=False)
-          elapsed = time.time() - start
-          if elapsed >= 2.0:
-            raw.setdefault("time_based_delays", {})[param] = round(elapsed, 1)
-            findings_list.append(Finding(
-              severity=Severity.HIGH,
-              cvss_vector=V.INJECTION_DATA_ACCESS,
-              title=f"SQL injection (time-based) via ?{param}=",
-              # The measured delay is per-request wall clock; it belongs in
-              # raw_data, not in two fields of the report layer's dedup key.
-              description="A SLEEP(2) payload delayed the response past the "
-                          "2-second threshold.",
-              evidence=f"URL: {url_sleep}",
-              remediation=f"Use parameterized queries for '{param}'.",
-              owasp_id="A03:2021",
-              cwe_id="CWE-89",
-              confidence="firm",
-            ))
-        except Exception:
-          pass
-
-    return probe_result(raw_data=raw, findings=findings_list)
+    return probe_result(raw_data={"coverage": finish_coverage(coverage)}, findings=findings_list)
 
 
   # ── SSTI (Server-Side Template Injection) ────────────────────────────
@@ -567,6 +657,7 @@ class _WebInjectionMixin(_InjectionTestBase):
               owasp_id="A03:2021",
               cwe_id="CWE-1336",
               confidence="certain",
+              affected_assets=_asset(target, port, "/", param),
             ))
             break
         except Exception:

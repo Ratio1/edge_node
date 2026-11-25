@@ -59,6 +59,10 @@ TIME_PAYLOADS = (
   ("postgresql", f"1' AND 1=(SELECT 1 FROM pg_sleep({TIME_DELAY}))-- -"),
 )
 
+# Every payload a response may echo: removed before two responses are compared.
+SQLI_STRIP = ([p for pair in BOOLEAN_PAIRS for p in pair] + list(ERROR_PAYLOADS)
+              + [p for _, p in TIME_PAYLOADS])
+
 # Dynamic content that differs per request: long opaque tokens, long numbers.
 _TOKEN_RE = re.compile(r"[A-Za-z0-9+/_=-]{16,}|\d{6,}")
 
@@ -129,8 +133,7 @@ def detect_sqli(send, throttle=None, reached=None, budget=None,
   capped. A hit also carries technique, payload_true, payload_false, dbms,
   confidence, requests, response (the response that proved it).
   """
-  strip = [p for pair in BOOLEAN_PAIRS for p in pair] + list(ERROR_PAYLOADS)
-  strip += [p for _, p in TIME_PAYLOADS]
+  strip = SQLI_STRIP
   count = {"n": 0}
 
   def req(value):

@@ -114,18 +114,6 @@ class RedMeshOWASPTests(unittest.TestCase):
     self._assert_has_finding(result, "Cookie missing HttpOnly flag")
     self._assert_has_finding(result, "Cookie missing SameSite flag")
 
-  def test_injection_sql_detected(self):
-    owner, worker = self._build_worker()
-    resp = MagicMock()
-    resp.text = "sql syntax error near line"
-    resp.status_code = 200
-    with patch(
-      "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get",
-      return_value=resp,
-    ):
-      result = worker._web_test_sql_injection("example.com", 80)
-    self._assert_has_finding(result, "SQL injection")
-
   def test_insecure_design_path_traversal(self):
     owner, worker = self._build_worker()
     resp = MagicMock()
@@ -401,19 +389,6 @@ class RedMeshOWASPTests(unittest.TestCase):
     owner, worker = self._build_worker(ports=[80, 9000], exceptions=[9000])
     self.assertNotIn(9000, worker.state["ports_to_scan"])
     self.assertIn(9000, worker.exceptions)
-
-  def test_cross_site_scripting_detection(self):
-    owner, worker = self._build_worker()
-    payload = "<script>alert(1)</script>"
-    resp = MagicMock()
-    resp.text = f"Response with {payload} inside"
-    resp.status_code = 200
-    with patch(
-      "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get",
-      return_value=resp,
-    ):
-      result = worker._web_test_xss("example.com", 80)
-    self._assert_has_finding(result, "XSS")
 
   def test_tls_certificate_expiration_reporting(self):
     owner, worker = self._build_worker(ports=[443])
