@@ -1382,6 +1382,30 @@ class RedMeshOWASPTests(unittest.TestCase):
 
     self.assertEqual(worker.state["port_protocols"][1024], "modbus")
 
+  def test_fingerprint_modbus_exception_reply_halts_in_ics_safe_mode(self):
+    """RM-061 R2: a Modbus exception reply (function 0xAB) also proves Modbus and halts in ICS Safe Mode."""
+    owner, worker = self._build_worker(ports=[1024])
+    worker.state["open_ports"] = [1024]
+    worker.state["port_protocols"] = {1024: "unknown"}
+    worker.state["port_banners"] = {1024: ""}
+    worker.state["port_banner_confirmed"] = {1024: False}
+    worker.target = "10.0.0.1"
+    worker.ics_safe_mode = True
+    exception_reply = b'\x00\x01\x00\x00\x00\x03\x01\xab\x01'
+    call_index = [0]
+
+    def fake_socket_factory(*args, **kwargs):
+      mock_sock = MagicMock()
+      mock_sock.recv.return_value = exception_reply if call_index[0] == 2 else b""
+      call_index[0] += 1
+      return mock_sock
+
+    with patch("extensions.business.cybersec.red_mesh.worker.pentest_worker.socket.socket", side_effect=fake_socket_factory):
+      worker._active_fingerprint_ports()
+
+    self.assertEqual(worker.state["port_protocols"][1024], "modbus")
+    self.assertTrue(worker._ics_detected)
+
   def test_fingerprint_non_modbus_stays_unknown(self):
     """Port with no recognizable response should remain unknown after active probes."""
     owner, worker = self._build_worker(ports=[1024])

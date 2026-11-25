@@ -26,13 +26,32 @@ _JAVA_MARKERS = ("jsessionid", "whitelabel error page", "apache tomcat", "apache
                  "org.springframework")
 
 
-def _has_java_evidence(*resps):
-  """True when a response shows Java/Spring: JSESSIONID, Whitelabel page, Tomcat/Spring fingerprint."""
+_BOOT_ERROR_KEYS = frozenset({"timestamp", "status", "error", "path"})
+
+
+def _java_marker(*resps):
+  """Name of the first Java/Spring marker seen in the responses, else None.
+
+  Markers: JSESSIONID, Whitelabel page, Tomcat/Spring fingerprint, or the Spring
+  Boot JSON error body (a parsed object holding timestamp, status, error and path).
+  """
   for resp in resps:
     seen = (" ".join(str(v) for v in (getattr(resp, "headers", None) or {}).values()) + " " + str(resp.text)).lower()
-    if any(m in seen for m in _JAVA_MARKERS):
-      return True
-  return False
+    for m in _JAVA_MARKERS:
+      if m in seen:
+        return m
+    try:
+      data = _json.loads(resp.text)
+    except (TypeError, ValueError):
+      continue
+    if isinstance(data, dict) and _BOOT_ERROR_KEYS <= data.keys():
+      return "spring_boot_json_error"
+  return None
+
+
+def _has_java_evidence(*resps):
+  """True when a response shows Java/Spring evidence (see `_java_marker`)."""
+  return _java_marker(*resps) is not None
 
 
 def _looks_like_actuator_body(text):
@@ -1203,7 +1222,7 @@ class _WebInjectionMixin(_InjectionTestBase):
         )
         if (resp_urls.status_code in (400, 500) and
             resp_urls_ctrl.status_code == 200 and
-            _has_java_evidence(resp_control, resp_cl, resp_urls)):
+            (java_marker := _java_marker(resp_control, resp_cl, resp_urls))):
           # Spring tried to bind classLoader.URLs[0] and got a type error,
           # while the control was ignored — confirms Spring binding
           findings_list.append(Finding(
@@ -1216,7 +1235,8 @@ class _WebInjectionMixin(_InjectionTestBase):
                         "binding (type error on URLs[0] vs ignored control), "
                         "confirming Spring4Shell attack surface.",
             evidence=f"classLoader.URLs[0]=0 → {resp_urls.status_code}, "
-                     f"control.URLs[0]=0 → {resp_urls_ctrl.status_code}.",
+                     f"control.URLs[0]=0 → {resp_urls_ctrl.status_code}, "
+                     f"java_marker={java_marker}.",
             remediation="Upgrade Spring Framework to >= 5.3.18 or >= 5.2.20.",
             owasp_id="A03:2021",
             cwe_id="CWE-94",
@@ -1231,8 +1251,8 @@ class _WebInjectionMixin(_InjectionTestBase):
           verify=False,
         )
         # Java/Spring evidence first: a PHP 500 on URLs[0] is not a binding error
-        java_ok = _has_java_evidence(resp_control, resp_cl, resp2)
-        if resp2.status_code == 200 and java_ok:
+        java_marker = _java_marker(resp_control, resp_cl, resp2)
+        if resp2.status_code == 200 and java_marker:
           findings_list.append(Finding(
             severity=Severity.HIGH,
             cvss_vector=V.RCE_UNCONFIRMED,
@@ -1242,13 +1262,13 @@ class _WebInjectionMixin(_InjectionTestBase):
             description="Spring MVC accepts class.module.classLoader parameter "
                         "binding, which is the attack surface for Spring4Shell RCE.",
             evidence=f"GET with class.module.classLoader parameter → 200, "
-                     f"URLs[0] → {resp2.status_code}.",
+                     f"URLs[0] → {resp2.status_code}, java_marker={java_marker}.",
             remediation="Upgrade Spring Framework to >= 5.3.18 or >= 5.2.20.",
             owasp_id="A03:2021",
             cwe_id="CWE-94",
             confidence="tentative",
           ))
-        elif resp2.status_code in (400, 500) and java_ok:
+        elif resp2.status_code in (400, 500) and java_marker:
           # 400/500 = Spring tried to bind classLoader but failed on type
           # conversion — stronger evidence than silent acceptance
           findings_list.append(Finding(
@@ -1261,7 +1281,8 @@ class _WebInjectionMixin(_InjectionTestBase):
                         "binding (type error on URLs[0]), confirming Spring4Shell "
                         "attack surface.",
             evidence=f"GET with class.module.classLoader → 200, "
-                     f"URLs[0] → {resp2.status_code} (binding attempted).",
+                     f"URLs[0] → {resp2.status_code} (binding attempted), "
+                     f"java_marker={java_marker}.",
             remediation="Upgrade Spring Framework to >= 5.3.18 or >= 5.2.20.",
             owasp_id="A03:2021",
             cwe_id="CWE-94",

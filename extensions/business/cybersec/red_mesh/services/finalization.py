@@ -17,6 +17,7 @@ from ..constants import (
   RUN_MODE_SINGLEPASS,
 )
 from ..credential_redaction import redact_credential_text
+from ..mixins.report import get_host_aggregated_report
 from ..models import (
   AggregatedScanData,
   PassReport,
@@ -657,7 +658,7 @@ def maybe_finalize_pass(owner):
       except Exception:
         worker_cls = None
       aggregated = (
-        owner._get_aggregated_report(node_reports, worker_cls=worker_cls)
+        get_host_aggregated_report(owner, node_reports, worker_cls=worker_cls)
         if node_reports else {}
       )
       if node_reports:

@@ -2032,10 +2032,16 @@ class _ServiceInfraMixin(_ServiceProbeBase):
 
     return probe_result(raw_data=raw, findings=findings)
 
+  @staticmethod
+  def _is_modbus_reply(data, function_code):
+    """True for a valid Modbus/TCP reply (or exception reply) to ``function_code``."""
+    return (len(data) >= 8 and data[2:4] == b'\x00\x00'
+            and data[7] in (function_code, function_code | 0x80))
+
   @register_probe(
     display_name="Modbus service detection",
     description=(
-      "Modbus/TCP read-only function-code 17 (Report Server ID) "
+      "Modbus/TCP read-only function 0x2B / MEI 0x0E (Read Device Identification) "
       "probe. Detects ICS/SCADA exposure on the public internet."
     ),
     category=CATEGORY_SERVICE_INFO,
@@ -2065,12 +2071,22 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(self._target_timeout(3))
       sock.connect((target, port))
-      request = b'\x00\x01\x00\x00\x00\x06\x01\x2b\x0e\x01\x00'
+      request = b'\x00\x01\x00\x00\x00\x05\x01\x2b\x0e\x01\x00'  # MBAP length 5: unit + 4 PDU bytes
       sock.sendall(request)
       data = sock.recv(256)
       if data:
         readable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
         raw["banner"] = readable.strip()[:120]
+      if data and not self._is_modbus_reply(data, 0x2b):
+        findings.append(Finding(
+          severity=Severity.INFO,
+          title="Port answered, not Modbus-confirmed",
+          description=f"{target}:{port} replied to a Modbus request, but the reply is not a valid Modbus/TCP frame.",
+          evidence="Reply failed Modbus validation (length, protocol id or function code).",
+          remediation="Verify the service on this port manually.",
+          confidence="tentative",
+        ))
+      elif data:
         findings.append(Finding(
           severity=Severity.CRITICAL,
           title="Modbus device responded to identification request",

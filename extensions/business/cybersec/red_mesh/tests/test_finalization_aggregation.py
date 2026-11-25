@@ -10,6 +10,7 @@ structure in both nested and legacy flat shapes.
 """
 
 import unittest
+import unittest.mock
 from unittest.mock import MagicMock
 
 from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
@@ -796,3 +797,64 @@ class TestAggregatedCountsAndCoverage(unittest.TestCase):
     agg = self._aggregate(worker)
     self.assertEqual(agg["nr_open_ports"], 1)
     self.assertEqual(agg["scan_metrics"], worker["scan_metrics"])
+
+
+class TestHostHoneypotFoldAtFinalization(unittest.TestCase):
+  """RM-061 R4 (D54): two node reports that meet the port-ratio rule only once merged."""
+
+  @staticmethod
+  def _row(n, kev=False):
+    return {
+      "finding_id": f"id-{n}", "cve": [f"CVE-2020-{n:04d}"], "vulndb_build_id": "b1", "severity": "HIGH",
+      "confidence": "firm", "confidence_reason": "nvd_range", "kev": kev, "cvss_score": 7.5,
+      "title": f"CVE-2020-{n:04d}: apache 2.2.22", "description": "apache 2.2.22 is vulnerable to CVE.",
+      "evidence": "Detected version: 2.2.22, affected: <2.4", "finding_signature": f"sig-{n}",
+    }
+
+  def _report(self, ports, rows):
+    # Each worker scans 600 ports, all open: the merged 1200 meet the host rule's wide-scan floor (D66).
+    return {"target": "192.0.2.10", "start_port": 1, "end_port": 1200, "ports_scanned": 600,
+            "open_ports": ports, "service_info": {"80": {"_service_info_http": {"findings": rows}}},
+            "web_tests_info": {}, "completed_tests": ["port_scan"], "port_protocols": {"80": "http"}}
+
+  def test_pass_findings_are_folded_by_the_host_verdict(self):
+    from extensions.business.cybersec.red_mesh.services.finalization import maybe_finalize_pass
+    from .test_tenant_execution_finalization import FinalizationOwner
+    owner = FinalizationOwner()
+    owner.cfg_llm_agent = {"ENABLED": False}
+    owner.job["workers"] = {
+      "node-a": {"finished": True, "report_cid": "ra", "start_port": 1, "end_port": 600},
+      "node-b": {"finished": True, "report_cid": "rb", "start_port": 601, "end_port": 1200},
+    }
+    owner.r1fs.values["ra"] = self._report(list(range(1, 601)), [self._row(1), self._row(2, kev=True)])
+    owner.r1fs.values["rb"] = self._report(list(range(601, 1201)), [self._row(1), self._row(3)])
+    maybe_finalize_pass(owner)
+    self.assertEqual(owner.job["job_status"], "FINALIZED")
+    stored = [w for w in owner.r1fs.writes if isinstance(w, dict) and "service_info" in w]
+    self.assertTrue(stored)
+    rows = {r["finding_id"]: r for m in stored[0]["service_info"].values() for i in m.values() for r in i["findings"]}
+    self.assertEqual(set(rows), {"id-1", "id-2", "id-3"})
+    for fid in ("id-1", "id-3"):
+      self.assertEqual((rows[fid]["confidence"], rows[fid]["confidence_reason"]), ("tentative", "banner_unverified"))
+      self.assertIn("demoted_from=firm:nvd_range", rows[fid]["evidence"])
+      self.assertIn("honeypot_verdict=port_ratio", rows[fid]["evidence"])
+    self.assertEqual(rows["id-2"]["confidence"], "firm")  # KEV stays possible, never folded
+    self.assertNotIn("honeypot_verdict", rows["id-2"]["evidence"])
+
+  def test_merge_helper_folds_and_a_failing_fold_is_logged_by_type_only(self):
+    from extensions.business.cybersec.red_mesh.mixins.report import get_host_aggregated_report
+    merged = {"open_ports": list(range(1, 601)), "ports_scanned": 1000,
+              "service_info": {"80": {"m": {"findings": [self._row(1)]}}}}
+    owner = MagicMock()
+    owner._get_aggregated_report.return_value = merged
+    self.assertIs(get_host_aggregated_report(owner, {"n": {}}, log_details=False), merged)
+    owner._get_aggregated_report.assert_called_once_with({"n": {}}, log_details=False)
+    self.assertEqual(merged["service_info"]["80"]["m"]["findings"][0]["confidence"], "tentative")
+    broken = MagicMock()
+    broken._get_aggregated_report.return_value = {"open_ports": [1]}
+    with unittest.mock.patch("extensions.business.cybersec.red_mesh.mixins.report.apply_host_honeypot_verdict",
+                             side_effect=ValueError("secret-token")):
+      self.assertEqual(get_host_aggregated_report(broken, {"n": {}}), {"open_ports": [1]})
+    logged = str(broken.P.call_args)
+    self.assertIn("ValueError", logged)
+    self.assertNotIn("secret-token", logged)

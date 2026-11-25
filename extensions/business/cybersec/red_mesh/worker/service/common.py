@@ -1905,18 +1905,6 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       "system_info": None,
     }
 
-    findings.append(Finding(
-      severity=Severity.MEDIUM,
-      cvss_vector=V.WEAK_TRANSPORT,
-      title="Telnet service is running (unencrypted remote access).",
-      description="Telnet transmits all data including credentials in cleartext.",
-      evidence=f"Telnet port {port} is open on {target}.",
-      remediation="Replace Telnet with SSH for encrypted remote access.",
-      owasp_id="A02:2021",
-      cwe_id="CWE-319",
-      confidence="certain",
-    ))
-
     # --- 1. Banner grab + IAC negotiation parsing ---
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1938,7 +1926,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     i = 0
     text_parts = []
     while i < len(raw):
-      if raw[i] == 0xFF and i + 2 < len(raw):
+      if raw[i] == 0xFF and i + 2 < len(raw) and 250 <= raw[i + 1] <= 254:  # IAC SB/WILL/WONT/DO/DONT <option>
         cmd = cmd_names.get(raw[i + 1], f"CMD_{raw[i+1]}")
         opt = opt_names.get(raw[i + 2], f"OPT_{raw[i+2]}")
         iac_options.append(f"{cmd} {opt}")
@@ -1956,6 +1944,29 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     else:
       result["banner"] = "(no banner)"
     result["negotiation_options"] = iac_options
+
+    if banner_text or iac_options:
+      findings.append(Finding(
+        severity=Severity.MEDIUM,
+        cvss_vector=V.WEAK_TRANSPORT,
+        title="Telnet service is running (unencrypted remote access).",
+        description="Telnet transmits all data including credentials in cleartext.",
+        evidence=f"Telnet port {port} is open on {target}.",
+        remediation="Replace Telnet with SSH for encrypted remote access.",
+        owasp_id="A02:2021",
+        cwe_id="CWE-319",
+        confidence="certain",
+      ))
+    else:
+      findings.append(Finding(
+        severity=Severity.INFO,
+        title="Telnet port accepted a connection, no banner or negotiation",
+        description="The port accepted a TCP connection but sent no Telnet negotiation or banner.",
+        evidence=(f"Telnet port {port} on {target} sent {len(raw)} byte(s), no Telnet negotiation or text banner."
+                  if raw else f"Telnet port {port} on {target} sent no bytes."),
+        remediation="Verify the service on this port manually.",
+        confidence="tentative",
+      ))
 
     # --- 2–4. Default credential check with system fingerprint ---
     def _try_telnet_login(user, passwd, act=False):
