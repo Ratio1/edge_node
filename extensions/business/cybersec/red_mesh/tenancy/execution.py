@@ -21,7 +21,7 @@ _ENGAGEMENT_ASSET_ID = re.compile(r"ea_[1-9][0-9]*")
 # `asset_environment` is the registered asset's environment (None when unset or unknown).
 _POLICY_FIELDS = frozenset({"engagement", "asset_environment"})
 _ENGAGEMENT_FIELDS = frozenset({"engagement_id", "engagement_hash", "context", "authorization",
-                                "contract_sha256"})
+                                "contract_sha256", "authorized_ports", "authorized_tests"})
 
 
 def _validate_facts(value, *, failure_policy=True):

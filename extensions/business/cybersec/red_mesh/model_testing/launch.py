@@ -7,6 +7,7 @@ from ..constants import JOB_STATUS_RUNNING, RUN_MODE_SINGLEPASS
 from ..models import CStoreJobRunning, WorkerProgress
 from ..repositories import ArtifactRepository, JobStateRepository
 from ..services.config import get_model_testing_config
+from ..services.launch_api import scope_exceeded
 from ..services.soc_export_policy import required_soc_launch_error
 from ..tenancy.effective_targets import resolve_model_launch_provider, validate_model_provider
 from .artifacts import MODEL_TEST_JOB_CONFIG_SCHEMA
@@ -443,6 +444,12 @@ def launch_model_test(
   )
   if selection_err:
     return _validation_error(selection_err)
+  if engagement is not None and engagement["authorized_tests"] != "all":
+    # RM-251: the requested question sets must be inside the engagement's scope.
+    refusal = scope_exceeded(owner, execution_context, MODEL_TEST_JOB_TYPE, "", tests=sorted(
+      {test_set["id"] for test_set in normalized_test_sets} - set(engagement["authorized_tests"])))
+    if refusal:
+      return refusal
   if _raw_evidence_requested(raw_evidence) and not cfg["RAW_EVIDENCE_ENABLED"]:
     return _validation_error(
       "raw_evidence is disabled by policy",
@@ -525,7 +532,9 @@ def launch_model_test(
     sanitized_config.update({
       "engagement": engagement["context"],
       "authorization": engagement["authorization"], "engagement_id": engagement["engagement_id"],
-      "engagement_hash": engagement["engagement_hash"], "contract_sha256": engagement["contract_sha256"]})
+      "engagement_hash": engagement["engagement_hash"], "contract_sha256": engagement["contract_sha256"],
+      "engagement_authorized_ports": engagement["authorized_ports"],
+      "engagement_authorized_tests": engagement["authorized_tests"]})
 
   persisted_config, secret_ref = attach_model_test_provider_secret(
     owner,

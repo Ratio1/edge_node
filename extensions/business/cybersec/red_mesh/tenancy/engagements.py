@@ -33,7 +33,12 @@ MAX_ENGAGEMENT_ASSETS = 64
 _ASSET_NAME_MAX = 200
 # RM-125: /3 drops the per-engagement test, scan-mode and run-mode picks (every test, both run modes).
 # RM-128: /4 drops the rules of engagement and the network assets' authorized ports.
-HASH_SCHEMA = "redmesh.engagement/4"
+# RM-251: /5 brings the authorized ports and tests back. The schema follows the keys a row holds (D-10):
+# a row with neither is `/4`, read as scope "all", and keeps its stored hash; new rows carry both.
+HASH_SCHEMA = "redmesh.engagement/5"
+HASH_SCHEMA_V4 = "redmesh.engagement/4"
+MAX_SCOPE_ENTRIES = 64
+_TEST_ID = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 # v1 fields a v2 row can never carry: their presence means a v1 record (refused, never migrated).
 _V1_FIELDS = ("engagement_kind", "roe_document", "authorization_document")
 
@@ -61,6 +66,66 @@ def feature_ids_for_kind(kind):
     return tuple(test_set["id"] for test_set in MODEL_TEST_CATALOG)
   categories = _KIND_CATEGORIES.get(kind, ())
   return tuple(item["id"] for item in FEATURE_CATALOG if item["category"] in categories)
+
+
+def normalize_authorized_ports(value):
+  """RM-251: `"all"` or the ranges as stored: `[start, end]` within 1-65535, sorted and merged."""
+  if value == "all":
+    return value
+  if not isinstance(value, list) or not 1 <= len(value) <= MAX_SCOPE_ENTRIES:
+    raise EngagementInvalid("authorized_ports_invalid")
+  merged = []
+  for entry in value:
+    if (not isinstance(entry, (list, tuple)) or len(entry) != 2 or any(type(port) is not int for port in entry)
+        or not 1 <= entry[0] <= entry[1] <= 65535):
+      raise EngagementInvalid("authorized_ports_invalid")
+  for start, end in sorted(tuple(entry) for entry in value):
+    if merged and start <= merged[-1][1] + 1:
+      merged[-1][1] = max(merged[-1][1], end)
+    else:
+      merged.append([start, end])
+  return merged
+
+
+def normalize_authorized_tests(value, kinds=None):
+  """RM-251: `"all"` or the catalogue ids, sorted. With `kinds` (the asset kinds the engagement holds)
+  each id must be valid for one of them; without, the shape only (a catalogue change never makes a
+  record unreadable)."""
+  if value == "all":
+    return value
+  if (not isinstance(value, list) or not 1 <= len(value) <= MAX_SCOPE_ENTRIES
+      or any(not isinstance(test, str) or not _TEST_ID.fullmatch(test) for test in value)):
+    raise EngagementInvalid("authorized_tests_invalid")
+  if kinds is not None and not set(value) <= {test for kind in kinds for test in feature_ids_for_kind(kind)}:
+    raise EngagementInvalid("authorized_tests_unknown")
+  return sorted(set(value))
+
+
+def scope_of(record):
+  """RM-251: `(authorized_ports, authorized_tests)`; a `/4` row (no scope keys) is `all`."""
+  return record.get("authorized_ports", "all"), record.get("authorized_tests", "all")
+
+
+def _scope_valid(record):
+  if ("authorized_ports" in record) != ("authorized_tests" in record):
+    return False
+  try:
+    ports, tests = scope_of(record)
+    return normalize_authorized_ports(ports) == ports and normalize_authorized_tests(tests) == tests
+  except EngagementInvalid:
+    return False
+
+
+def ports_outside(ports, authorized):
+  """RM-251: the `[start, end]` ranges of `ports` (a set) that `authorized` (ranges) does not cover."""
+  stray = sorted(port for port in ports if not any(start <= port <= end for start, end in authorized))
+  ranges = []
+  for port in stray:
+    if ranges and port == ranges[-1][1] + 1:
+      ranges[-1][1] = port
+    else:
+      ranges.append([port, port])
+  return ranges
 
 
 def engagement_id_for(request_id):
@@ -267,8 +332,9 @@ def _asset_entry_valid(index, entry):
 
 def hashed_fields(record):
   """The exact content the engagement hash commits to (and RM-068 will later sign)."""
+  scoped = "authorized_ports" in record and "authorized_tests" in record
   return {
-    "schema": HASH_SCHEMA, "tenant_id": record["tenant_id"], "engagement_id": record["engagement_id"],
+    "schema": HASH_SCHEMA if scoped else HASH_SCHEMA_V4, "tenant_id": record["tenant_id"], "engagement_id": record["engagement_id"],
     "display_name": record["display_name"],
     "valid_from": record["valid_from"], "valid_until": record["valid_until"],
     "contract_sha256": record["contract_sha256"],
@@ -278,6 +344,7 @@ def hashed_fields(record):
     "supersedes": record.get("supersedes"),
     # In stored order: `ea_<n>` is positional, and launches and reports name assets by it.
     "context": record["context"], "assets": record["assets"],
+    **({"authorized_ports": record["authorized_ports"], "authorized_tests": record["authorized_tests"]} if scoped else {}),
   }
 
 
@@ -287,6 +354,31 @@ def engagement_hash(record):
 
 def _utc(value):
   return isinstance(value, str) and datetime.fromisoformat(value).tzinfo == timezone.utc
+
+
+# RM-248: suspend is a state like revoke, outside the hash. `suspended` is absent on a legacy row.
+SUSPEND_FIELDS = ("suspended_by", "suspended_at", "suspend_reason")
+RESUME_FIELDS = ("resumed_by", "resumed_at")
+SUSPEND_STATE_KEYS = ("suspended", *SUSPEND_FIELDS, *RESUME_FIELDS)
+
+
+def _valid_attribution(row, by, at):
+  return (bool(row.get(by)) and canonical_account_id(row[by]) == row[by] and _utc(row.get(at)))
+
+
+def _suspend_state_valid(row):
+  """RM-248: the shape of the suspend and resume fields; a revoked row carries none of them."""
+  if not row["active"]:
+    return not any(key in row for key in SUSPEND_STATE_KEYS)
+  if "suspended" in row and type(row["suspended"]) is not bool:
+    return False
+  if row.get("suspended") is True:
+    return (_valid_attribution(row, "suspended_by", "suspended_at")
+            and normalize_name(row.get("suspend_reason"), 500) == row["suspend_reason"]
+            and not any(key in row for key in RESUME_FIELDS))
+  if any(key in row for key in SUSPEND_FIELDS):
+    return False
+  return not any(key in row for key in RESUME_FIELDS) or _valid_attribution(row, "resumed_by", "resumed_at")
 
 
 def validate_engagement(row, ids):
@@ -310,6 +402,11 @@ def validate_engagement(row, ids):
       or not _documents_valid(row.get("documents"))
       or not ("supersedes" not in row
               or (valid_engagement_id(row["supersedes"]) and row["supersedes"] != ids[1]))
+      # RM-248: the replacement link, outside the hash like revoke; `revoke_superseded` rides on a replacement.
+      or not ("superseded_by" not in row
+              or (valid_engagement_id(row["superseded_by"]) and row["superseded_by"] != ids[1]))
+      or not ("revoke_superseded" not in row
+              or (type(row["revoke_superseded"]) is bool and "supersedes" in row))
       # Shape only for the context: `EngagementContext` may gain fields; the hash covers the content.
       or not isinstance(row.get("context"), dict)
       or not isinstance(assets, list) or not 1 <= len(assets) <= MAX_ENGAGEMENT_ASSETS
@@ -317,6 +414,7 @@ def validate_engagement(row, ids):
       or len({entry["target_digest"] for entry in assets}) != len(assets)
       or len({entry["asset_id"] for entry in assets}) != len(assets)
       or not valid_digest(row.get("create_intent_digest"))
+      or not _scope_valid(row)
       or row.get("engagement_hash") != engagement_hash(row)):
     raise ValueError("Invalid engagement")
   if not row.get("created_by") or canonical_account_id(row["created_by"]) != row["created_by"]:
@@ -331,4 +429,6 @@ def validate_engagement(row, ids):
         or not _utc(row.get("revoked_at"))
         or normalize_name(row.get("revoke_reason"), 500) != row["revoke_reason"]):
     raise ValueError("Invalid engagement revoke")
+  if not _suspend_state_valid(row):
+    raise ValueError("Invalid engagement suspend state")
   canonical_digest(row)

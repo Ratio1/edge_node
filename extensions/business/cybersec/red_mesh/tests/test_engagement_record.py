@@ -9,8 +9,8 @@ from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administratio
 from extensions.business.cybersec.red_mesh.tenancy.assets import canonical_digest
 from extensions.business.cybersec.red_mesh.tenancy.engagements import (
   EngagementInvalid, build_engagement_assets, engagement_hash, normalize_asset_requests, feature_ids_for_kind, normalize_context, normalize_document_labels,
-  normalize_engagement_assets, normalize_instant, normalize_window,
-  validate_engagement)
+  normalize_authorized_ports, normalize_authorized_tests, normalize_engagement_assets, normalize_instant,
+  normalize_window, ports_outside, scope_of, validate_engagement)
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
 from .test_tenant_administration import FakeAdministrationStore
 
@@ -207,11 +207,12 @@ class TestEngagementHash(unittest.TestCase):
         documents[0][label] = value
         self.assertNotEqual(record(documents=documents)["engagement_hash"], base)
 
-  def test_the_hash_schema_is_v3(self):
+  def test_the_hash_schema_is_v5_and_a_row_without_the_scope_keys_stays_v4(self):
     from extensions.business.cybersec.red_mesh.tenancy.engagements import HASH_SCHEMA, hashed_fields
-    self.assertEqual(HASH_SCHEMA, "redmesh.engagement/4")
+    self.assertEqual(HASH_SCHEMA, "redmesh.engagement/5")
     fields = hashed_fields(record())
     self.assertEqual(fields["schema"], "redmesh.engagement/4")
+    self.assertNotIn("authorized_ports", fields)
     self.assertNotIn("allowed_run_modes", fields)
     self.assertNotIn("roe", fields)
 
@@ -289,6 +290,11 @@ class TestEngagementValidator(unittest.TestCase):
       "revoked without reason": record(active=False, revoked_by="creator", revoked_at="2026-10-02T00:00:00+00:00"),
       "window not canonical": record(valid_from="2026-10-01T00:00:00+00:00"),
       "self supersedes": record(supersedes=ENGAGEMENT),
+      # RM-248: the replacement link and the revoke option.
+      "superseded by itself": record(superseded_by=ENGAGEMENT),
+      "superseded by a non-id": record(superseded_by="bad"),
+      "revoke option without supersedes": record(revoke_superseded=True),
+      "revoke option not a bool": record(supersedes="en_" + "2" * 8 + "-2222-4222-8222-" + "2" * 12, revoke_superseded="yes"),
       "contract ref instead of hash": record(contract_sha256={"ref": "doc-1"}),
       "no contract": record(contract_sha256=None),
       "document ids out of order": record(documents=[document(2, SHA_A)]),
@@ -305,6 +311,85 @@ class TestEngagementValidator(unittest.TestCase):
     for name, row in cases.items():
       with self.subTest(name), self.assertRaises((ValueError, TypeError, KeyError)):
         validate_engagement(row, (TENANT, ENGAGEMENT))
+
+
+class TestEngagementScope(unittest.TestCase):
+  """RM-251: the authorized ports and tests, the key-presence hash schema (D-10) and the reader."""
+
+  def scoped(self, ports="all", tests="all", **changes):
+    return record(authorized_ports=ports, authorized_tests=tests, **changes)
+
+  def test_a_row_without_the_scope_keys_is_v4_reads_all_and_keeps_its_hash(self):
+    row = record()
+    # The `/4` content as it was hashed before the scope: nothing of it moved.
+    legacy = {"schema": "redmesh.engagement/4", "tenant_id": TENANT, "engagement_id": ENGAGEMENT,
+              "display_name": row["display_name"], "valid_from": row["valid_from"], "valid_until": row["valid_until"],
+              "contract_sha256": SHA_C, "documents": sorted([d["kind"], d["sha256"], d["title"], d["comment"]]
+                                                           for d in row["documents"]),
+              "supersedes": None, "context": row["context"], "assets": row["assets"]}
+    self.assertEqual(row["engagement_hash"], canonical_digest(legacy))
+    validate_engagement(row, (TENANT, ENGAGEMENT))
+    self.assertEqual(scope_of(row), ("all", "all"))
+
+  def test_both_keys_make_a_v5_row_and_one_key_alone_is_refused(self):
+    base = record()
+    scoped = self.scoped()
+    validate_engagement(scoped, (TENANT, ENGAGEMENT))
+    self.assertNotEqual(scoped["engagement_hash"], base["engagement_hash"])
+    self.assertNotEqual(self.scoped([[1, 1024]])["engagement_hash"], scoped["engagement_hash"])
+    self.assertNotEqual(self.scoped(tests=["graybox"])["engagement_hash"], scoped["engagement_hash"])
+    for name, row in (("added to a /4 row", {**base, "authorized_ports": "all", "authorized_tests": "all"}),
+                      ("removed from a /5 row", {key: value for key, value in scoped.items() if key != "authorized_tests"}),
+                      ("ports alone", {**base, "authorized_ports": "all"}),
+                      ("tests alone", {**base, "authorized_tests": "all"})):
+      with self.subTest(name), self.assertRaises(ValueError):
+        validate_engagement(row, (TENANT, ENGAGEMENT))
+    # Revoke keeps the schema.
+    validate_engagement({**scoped, "active": False, "revoked_by": "creator", "revoked_at": "2026-10-02T00:00:00+00:00",
+                         "revoke_reason": "done"}, (TENANT, ENGAGEMENT))
+
+  def test_a_malformed_stored_scope_is_refused_but_an_unknown_test_id_reads(self):
+    for ports, tests in (([], "all"), ([[5, 1]], "all"), ([[1, 5], [3, 9]], "all"), ("1-5", "all"),
+                         ("all", []), ("all", ["b", "a"]), ("all", "graybox")):
+      with self.subTest(ports=ports, tests=tests), self.assertRaises(ValueError):
+        validate_engagement(self.scoped(ports, tests), (TENANT, ENGAGEMENT))
+    validate_engagement(self.scoped([[1, 1024]], ["retired_test_id"]), (TENANT, ENGAGEMENT))
+
+  def test_ports_are_sorted_and_merged_and_a_bad_shape_is_refused(self):
+    self.assertEqual(normalize_authorized_ports([[80, 90], (1, 10), [11, 20], [85, 100]]), [[1, 20], [80, 100]])
+    for value in ([], None, "80", [[0, 5]], [[1, 65536]], [[5, 1]], [[1, 2, 3]], [["1", "2"]], [[True, 2]], [80],
+                  [[n, n] for n in range(1, 66, 1)] * 2):
+      with self.subTest(value=value), self.assertRaises(EngagementInvalid) as caught:
+        normalize_authorized_ports(value)
+      self.assertEqual(caught.exception.code, "authorized_ports_invalid")
+
+  def test_an_unknown_test_id_is_refused_on_write_for_the_kinds_held_only(self):
+    self.assertEqual(normalize_authorized_tests(["web_discovery", "service_info_common", "web_discovery"], {"network"}),
+                     ["service_info_common", "web_discovery"])
+    self.assertEqual(normalize_authorized_tests(["graybox"], {"webapp"}), ["graybox"])
+    for value, kinds in ((["no_such_test"], {"network"}), (["graybox"], {"network"}), (["web_discovery"], {"webapp"})):
+      with self.subTest(value=value), self.assertRaises(EngagementInvalid) as caught:
+        normalize_authorized_tests(value, kinds)
+      self.assertEqual(caught.exception.code, "authorized_tests_unknown")
+    for value in ([], "graybox", [1], None):
+      with self.subTest(value=value), self.assertRaises(EngagementInvalid) as caught:
+        normalize_authorized_tests(value, {"network"})
+      self.assertEqual(caught.exception.code, "authorized_tests_invalid")
+
+  def test_every_catalogue_and_question_set_id_fits_the_id_bound_and_a_malformed_one_does_not(self):
+    for kind in ("network", "webapp", "model"):
+      ids = list(feature_ids_for_kind(kind))
+      self.assertEqual(normalize_authorized_tests(ids, {kind}), sorted(ids))
+    for value in ("x" * 65, "Upper", "has space", "-lead", "a\n", ""):
+      with self.subTest(value=value), self.assertRaises(EngagementInvalid) as caught:
+        normalize_authorized_tests([value])
+      self.assertEqual(caught.exception.code, "authorized_tests_invalid")
+    with self.assertRaises(ValueError):
+      validate_engagement(self.scoped(tests=["x" * 65]), (TENANT, ENGAGEMENT))
+
+  def test_ports_outside_names_the_uncovered_ranges(self):
+    self.assertEqual(ports_outside({22, 80, 443, 9000}, [[1, 100], [443, 443]]), [[9000, 9000]])
+    self.assertEqual(ports_outside({101, 102, 103, 200}, [[1, 100]]), [[101, 103], [200, 200]])
 
 
 class TestEngagementStoreKind(unittest.TestCase):

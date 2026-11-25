@@ -235,6 +235,23 @@ class TestTenantEngagementPlugin(unittest.TestCase):
                               "engagement_hash": engagement["engagementHash"], "actor": "creator"}),
     ])
 
+  def test_suspend_and_resume_need_the_revoke_permission_and_are_audited_once_with_a_reason(self):
+    # RM-248
+    engagement = self.create()["data"]
+    self.events.clear()
+    for actor in ({"account_id": "platform-pentester"}, {"account_id": "viewer"}):
+      for method in ("suspend_engagement", "resume_engagement"):
+        self.refused(self.call_json(method, actor=actor, tenant_id=self.tenant,
+                                    engagement_id=engagement["engagementId"], reason="x"), 403, "forbidden")
+    self.assertEqual(self.events, [])
+    for method in ("suspend_engagement", "suspend_engagement", "resume_engagement", "resume_engagement"):
+      result = self.call_json(method, actor=self.actor, tenant_id=self.tenant,
+                              engagement_id=engagement["engagementId"], reason="Amended")
+      self.assertTrue(result["success"], result)
+    base = {"tenant_id": self.tenant, "engagement_id": engagement["engagementId"],
+            "engagement_hash": engagement["engagementHash"], "actor": "creator", "reason": "Amended"}
+    self.assertEqual(self.events, [("engagement_suspended", base), ("engagement_resumed", base)])
+
   def test_capability_status_advertises_engagements(self):
     self.assertEqual(self.plugin.get_capability_status()["engagements"], {"enabled": True, "schema": 2})
 

@@ -15,6 +15,7 @@ from ..super_tenant_integrations import validate_super_tenant_integration
 from ..super_tenant_profile import validate_super_tenant_profile
 from ..tenant_assets import validate_tenant_asset
 from ..tenant_contracts import validate_tenant_contract_draft
+from ..supporting_documents import validate_supporting_document
 
 MAX_ENUMERATED_RECORDS = 10000
 # RM-107 retired the tenant `asset` kind (the engagement owns its targets): a kind outside this list
@@ -27,9 +28,10 @@ MAX_ENUMERATED_RECORDS = 10000
 # RM-134: `super_tenant_branding` is one row per deployment, keyed `deployment` (as the profile).
 # RM-139: `super_tenant_integration` is the STA override of one deployment integration, keyed by its id.
 # RM-155: `account_profile` is the person behind an account, keyed by the account id.
+# RM-261: `supporting_document` is keyed `(tenant_id, owner_id, sd_<uuid>)`; its owner is an engagement or a contract.
 _KINDS = frozenset({"tenant", "receipt", "domain", "tenant_node", "integration", "engagement", "tenant_draft",
                     "engagement_draft", "super_tenant_profile", "tenant_asset", "tenant_contract_draft",
-                    "super_tenant_branding", "super_tenant_integration", "account_profile"})
+                    "super_tenant_branding", "super_tenant_integration", "account_profile", "supporting_document"})
 
 
 class CstoreTenantAdministrationStore:
@@ -124,6 +126,11 @@ class CstoreTenantAdministrationStore:
         validate_tenant_contract_draft(raw, ids)
       except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
         raise TenantStoreError("Invalid tenant contract draft storage record") from exc
+    if kind == "supporting_document":
+      try:
+        validate_supporting_document(raw, ids)
+      except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
+        raise TenantStoreError("Invalid supporting document storage record") from exc
     return raw
 
   def put(self, kind, *ids, record):
@@ -247,6 +254,13 @@ class CstoreTenantAdministrationStore:
   def list_engagements(self, tenant_id):
     self._location("engagement", (tenant_id,))
     return [self._validate(raw, "engagement", ids) for ids, raw in self._fields("engagement", tenant_id)]
+
+  def list_supporting_documents(self, tenant_id, owner_id):
+    """RM-261. One owner's supporting documents, oldest first; a malformed one fails the read closed."""
+    self._location("supporting_document", (tenant_id, owner_id))
+    rows = [self._validate(raw, "supporting_document", ids)
+            for ids, raw in self._fields("supporting_document", tenant_id) if ids[0:2] == [tenant_id, owner_id]]
+    return sorted(rows, key=lambda row: (row["uploaded_at"], row["document_id"]))
 
   def list_tenant_drafts(self):
     """RM-109. Every draft of the namespace; a malformed one fails the read closed."""

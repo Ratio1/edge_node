@@ -80,6 +80,19 @@ class TestTenantExecutionModel(unittest.TestCase):
     self.assertEqual((result.get("error"), result.get("message")), ("validation_error", "unknown test set: no_such_set"))
     self.assertEqual(captured, [])
 
+  def test_requested_question_sets_outside_the_authorized_tests_are_refused(self):
+    # RM-251: the whole catalog (no selection) is outside a scope of one set, as is any other set.
+    scoped = self.model_context({**self.engagement, "authorized_tests": ["cbrn_safety_v1"]})
+    for selection in ({"test_set_id": None}, {"test_set_id": None, "test_sets": [{"id": "prompt_injection_v1"}]}):
+      with self.subTest(selection=selection):
+        result, captured = self.launch(scoped, **selection)
+        self.assertEqual((result.get("error"), result.get("status_code"), result.get("tests")),
+                         ("scope_exceeded", 400, ["prompt_injection_v1"]), result)
+        self.assertEqual(captured, [])
+    result, captured = self.launch(scoped, test_set_id=None, test_sets=[{"id": "cbrn_safety_v1"}])
+    self.assertNotIn("error", result, result)
+    self.assertEqual(captured[0]["engagement_authorized_tests"], ["cbrn_safety_v1"])
+
   def test_a_model_launch_on_a_scan_asset_is_a_target_mismatch(self):
     from .test_tenant_execution_effects import context
     for selection in ({"test_set_id": None}, {}):

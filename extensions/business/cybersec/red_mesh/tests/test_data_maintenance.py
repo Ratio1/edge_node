@@ -465,7 +465,7 @@ class TestDataMaintenance(unittest.TestCase):
   # RM-133: a contract draft is keyed by its tenant and takes the related-tenant rule; the tenant
   # row that counts its contracts stays current.
   def test_a_contract_draft_is_current_under_its_tenant_with_its_files_and_old_without(self):
-    created = self.plugin.create_tenant_contract_draft(self.actor, self.tenant, str(uuid4()))
+    created = self.plugin.create_tenant_contract_draft(self.actor, self.tenant, str(uuid4()), supersedes="c_1")
     self.assertTrue(created["success"], created)
     field = json.dumps(["tenant_contract_draft", "deployment", self.tenant, created["data"]["contract_id"]],
                        separators=(",", ":"))
