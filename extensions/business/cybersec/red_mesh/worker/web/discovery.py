@@ -1,4 +1,5 @@
 import re as _re
+from html.parser import HTMLParser as _HTMLParser
 import uuid as _uuid
 import requests
 
@@ -55,6 +56,28 @@ def _looks_like_dotenv(body):
     return False
   return bool(_re.search(r"^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_.]*\s*=", body, _re.M))
 
+
+
+
+class _AnchorHrefs(_HTMLParser):
+  def __init__(self):
+    super().__init__()
+    self.hrefs = []
+
+  def handle_starttag(self, tag, attrs):
+    if tag == "a":
+      self.hrefs.extend(v for k, v in attrs if k == "href" and v)
+
+
+def _anchor_hrefs(body):
+  """The `href` values of the `<a>` tags in an HTML body; text inside `<script>` is not a tag."""
+  parser = _AnchorHrefs()
+  try:
+    parser.feed(body[:200_000])
+    parser.close()
+  except Exception:
+    return []
+  return parser.hrefs
 
 class _WebDiscoveryMixin:
   """
@@ -164,8 +187,9 @@ class _WebDiscoveryMixin:
       if resp.status_code == 200 and looks_right(resp.text or ""):
         return base_url + path
     body = (listing.text or "") if listing.status_code == 200 else ""
-    # A directory index links its entries; a page that only mentions the words is not one.
-    if _re.search(r'href="(\./)?HEAD"', body) and _re.search(r'href="(\./)?(refs|objects)/?"', body):
+    # A directory index links its entries (`<a href>` tags); a page that only mentions the words is not one.
+    links = {h.lstrip("./").rstrip("/") for h in _anchor_hrefs(body)}
+    if "HEAD" in links and links & {"refs", "objects"}:
       return base_url + "/.git/"
     return None
 

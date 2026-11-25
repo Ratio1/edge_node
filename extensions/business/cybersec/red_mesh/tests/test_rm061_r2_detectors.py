@@ -74,6 +74,7 @@ class TestTelnetGate(unittest.TestCase):
     for reply in (b"\xff", b"\xff\x00\x00", b"\x00\xff"):
       f = self._exposed(reply)
       self.assertEqual([(x["severity"], x["confidence"]) for x in f], [("INFO", "tentative")], reply)
+      self.assertIn(f"sent {len(reply)} byte(s), no Telnet negotiation or text banner", f[0]["evidence"])
 
   def test_no_bytes_is_info_tentative(self):
     f = self._exposed(b"")

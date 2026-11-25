@@ -1962,7 +1962,8 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         severity=Severity.INFO,
         title="Telnet port accepted a connection, no banner or negotiation",
         description="The port accepted a TCP connection but sent no Telnet negotiation or banner.",
-        evidence=f"Telnet port {port} on {target} sent no bytes.",
+        evidence=(f"Telnet port {port} on {target} sent {len(raw)} byte(s), no Telnet negotiation or text banner."
+                  if raw else f"Telnet port {port} on {target} sent no bytes."),
         remediation="Verify the service on this port manually.",
         confidence="tentative",
       ))

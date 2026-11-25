@@ -228,6 +228,11 @@ class BodyCheckTests(unittest.TestCase):
   def test_html_page_mentioning_head_and_refs_is_not_a_git_listing(self):
     page = "<html><title>HEAD refs and objects in Git</title></html>"
     self.assertNotIn("Accessible resource: /.git/", self.titles({"/.git/": (200, page)}))
+    script = '<html><script>var s = \'href="HEAD" href="refs/"\';</script></html>'
+    self.assertNotIn("Accessible resource: /.git/", self.titles({"/.git/": (200, script)}))
+
+  def test_git_listing_with_single_quoted_links_is_reported(self):
+    self.assertIn("Accessible resource: /.git/", self.titles({"/.git/": (200, "<a href='HEAD'>HEAD</a> <a href='objects/'>objects/</a>")}))
 
   def test_git_403_and_plain_html_are_not_reported(self):
     self.assertNotIn("Accessible resource: /.git/", self.titles({"/.git/": (403, "Forbidden")}))
