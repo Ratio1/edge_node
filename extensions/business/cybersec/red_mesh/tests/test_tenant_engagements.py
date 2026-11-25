@@ -9,6 +9,7 @@ from .asset_fixture import pick, register_asset
 from .test_tenant_administration import FakeAdministrationStore
 from .contract_fixture import CONTRACT_SHA256, contract_terms
 from extensions.business.cybersec.red_mesh.tenancy.administration import TenantAdministrationService
+from extensions.business.cybersec.red_mesh.tenancy.engagements import scope_of
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administration import CstoreTenantAdministrationStore
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity import CstoreAuthAccountReader
 
@@ -110,15 +111,18 @@ class TestTenantEngagements(unittest.TestCase):
                      {"engagementAssetId": "ea_1", "assetId": self.net, "displayName": "Edge gateway",
                       "kind": "network", "target": NETWORK})
     self.assertRegex(network_asset["targetDigest"], r"^[a-f0-9]{64}$")
-    self.assertNotIn("authorizedPorts", network_asset)
+    # RM-277: the scope is on each asset; only a network asset has ports. None of it on the engagement.
+    self.assertEqual((network_asset["authorizedPorts"], network_asset["authorizedTests"]), ("all", "all"))
     self.assertEqual((webapp["engagementAssetId"], webapp["kind"]), ("ea_2", "webapp"))
     self.assertNotIn("authorizedPorts", webapp)
+    self.assertEqual(webapp["authorizedTests"], "all")
     self.assertEqual((model["engagementAssetId"], model["kind"], model["target"]), ("ea_3", "model", MODEL))
-    # RM-125: no test, scan mode or run mode picks on the engagement or its assets.
+    self.assertNotIn("authorizedPorts", model)
+    # RM-125: no scan mode or run mode picks; RM-277: no scope on the engagement itself.
     for entry in engagement["assets"]:
-      for gone in ("authorizedTests", "authorizedScanModes"):
-        self.assertNotIn(gone, entry)
-    self.assertNotIn("allowedRunModes", engagement)
+      self.assertNotIn("authorizedScanModes", entry)
+    for gone in ("allowedRunModes", "authorizedPorts", "authorizedTests"):
+      self.assertNotIn(gone, engagement)
     self.assertEqual([(item["documentId"], item["kind"], item["title"], item["comment"], item["sha256"])
                       for item in engagement["documents"]],
                      [("ed_1", "agreement", "Rules of engagement", "", SHA_ROE),
@@ -148,11 +152,6 @@ class TestTenantEngagements(unittest.TestCase):
     self.refused(self.service.authorize_engagement_create(self.actor, legacy), 400, "contract_required")
     self.assertEqual(len(self.owner.writes), writes)
 
-  def test_a_network_asset_carries_no_port_scope(self):
-    # RM-128: the engagement no longer binds ports.
-    engagement = self.create(assets=[pick(self.net)])["data"]
-    self.assertNotIn("authorizedPorts", engagement["assets"][0])
-
   def test_asset_refusals(self):
     network, portal = pick(self.net), pick(self.web)
     cases = [
@@ -163,10 +162,7 @@ class TestTenantEngagements(unittest.TestCase):
       ([dict(network, display_name="Edge")], "engagement_asset_invalid"),
       ([dict(network, kind="network")], "engagement_asset_invalid"),
       ([{"display_name": "Edge", "target": NETWORK}], "engagement_asset_invalid"),
-      ([dict(network, authorized_tests=["service_info_common"])], "engagement_asset_invalid"),
       ([dict(network, authorized_scan_modes=["connect"])], "engagement_asset_invalid"),
-      # RM-128: the dropped ports key is refused.
-      ([dict(network, authorized_ports="443")], "engagement_asset_invalid"),
       ([network] * 2, "engagement_asset_invalid"),
       ([], "engagement_asset_invalid"),
     ]
@@ -181,7 +177,8 @@ class TestTenantEngagements(unittest.TestCase):
     asset = self.store.get("tenant_asset", self.net)
     self.assertEqual(stored[0], {"engagement_asset_id": "ea_1", "asset_id": self.net,
                                  "display_name": asset["display_name"], "kind": "network", "target": asset["target"],
-                                 "target_digest": asset["target_digest"]})
+                                 "target_digest": asset["target_digest"],
+                                 "authorized_ports": "all", "authorized_tests": "all"})
     # A later change to the library does not reach the signed record.
     self.assertTrue(self.service.update_tenant_asset(self.actor, self.net, {"display_name": "Renamed"})["success"])
     self.assertEqual(self.service.get_engagement(self.actor, self.tenant, engagement["engagementId"])
@@ -246,31 +243,40 @@ class TestTenantEngagements(unittest.TestCase):
     self.refused(self.create(valid_until="2026-10-30T00:00:00Z"), 409, "conflict")
     self.refused(self.create(assets=list(reversed(self.fields()["assets"]))), 409, "conflict")
 
-  def test_a_new_engagement_carries_the_scope_both_keys_and_hashes_as_v5(self):
-    # RM-251: the default is "all" for both; a restricted scope is stored sorted and merged.
+  def test_each_asset_carries_its_scope_and_the_engagement_hashes_as_v5(self):
+    # RM-251, RM-277: the default is "all"; a restricted scope is stored sorted and merged, per asset.
     default = self.create()["data"]
-    self.assertEqual((default["authorizedPorts"], default["authorizedTests"]), ("all", "all"))
     stored = self.store.get("engagement", self.tenant, default["engagementId"])
-    self.assertEqual((stored["authorized_ports"], stored["authorized_tests"]), ("all", "all"))
-    restricted = self.create(request_id=str(uuid4()), authorized_ports=[[80, 90], [1, 10], [11, 20]],
-                             authorized_tests=["web_discovery", "graybox", "web_discovery"])["data"]
-    self.assertEqual((restricted["authorizedPorts"], restricted["authorizedTests"]),
-                     ([[1, 20], [80, 90]], ["graybox", "web_discovery"]))
+    self.assertEqual([scope_of(entry) for entry in stored["assets"]], [("all", "all")] * 3)
+    self.assertEqual(stored["engagement_hash"], default["engagementHash"])
+    self.assertNotIn("authorized_tests", stored)
+    network = dict(pick(self.net), authorized_ports=[[80, 90], [1, 10], [11, 20]],
+                   authorized_tests=["web_discovery", "service_info_common", "web_discovery"])
+    web = dict(pick(self.web), authorized_tests=["graybox_injection"])
+    model = dict(pick(self.model), authorized_tests=["cbrn_safety_v1"])
+    restricted = self.create(request_id=str(uuid4()), assets=[network, web, model])["data"]
+    self.assertEqual([(entry.get("authorizedPorts"), entry["authorizedTests"]) for entry in restricted["assets"]],
+                     [([[1, 20], [80, 90]], ["service_info_common", "web_discovery"]),
+                      (None, ["graybox_injection"]), (None, ["cbrn_safety_v1"])])
     self.assertNotEqual(restricted["engagementHash"], default["engagementHash"])
-    self.refused(self.create(request_id=str(uuid4()), authorized_ports=[]), 400, "authorized_ports_invalid")
-    self.refused(self.create(request_id=str(uuid4()), authorized_tests=[]), 400, "authorized_tests_invalid")
-    # An id valid for no kind the engagement holds (here a webapp-only one on a network-only engagement).
-    network_only = [pick(self.net)]
-    self.refused(self.create(request_id=str(uuid4()), assets=network_only, authorized_tests=["graybox"]),
-                 400, "authorized_tests_unknown")
-    self.refused(self.create(request_id=str(uuid4()), authorized_tests=["no_such_test"]), 400, "authorized_tests_unknown")
+    for entry, error in ((dict(pick(self.net), authorized_ports=[]), "authorized_ports_invalid"),
+                         (dict(pick(self.net), authorized_tests=[]), "authorized_tests_invalid"),
+                         (dict(pick(self.web), authorized_ports=[[1, 80]]), "authorized_ports_invalid"),
+                         # An id valid for another kind than the asset's.
+                         (dict(pick(self.net), authorized_tests=["graybox_injection"]), "authorized_tests_unknown"),
+                         (dict(pick(self.web), authorized_tests=["web_discovery"]), "authorized_tests_unknown"),
+                         (dict(pick(self.model), authorized_tests=["no_such_test"]), "authorized_tests_unknown")):
+      with self.subTest(error=error, entry=entry):
+        self.refused(self.create(request_id=str(uuid4()), assets=[entry]), 400, error)
 
   def test_a_replay_with_another_scope_is_a_conflict(self):
-    first = self.view(self.create(authorized_ports=[[1, 1024]]))
-    self.assertEqual(self.view(self.create(authorized_ports=[[1, 1024]])), first)
-    self.refused(self.create(authorized_ports=[[1, 1025]]), 409, "conflict")
-    self.refused(self.create(authorized_ports=[[1, 1024]], authorized_tests=["graybox"]), 409, "conflict")
-    self.refused(self.create(), 409, "conflict")
+    def assets(ports, tests="all"):
+      return [dict(pick(self.net), authorized_ports=ports, authorized_tests=tests), pick(self.web)]
+    first = self.view(self.create(assets=assets([[1, 1024]])))
+    self.assertEqual(self.view(self.create(assets=assets([[1, 1024]]))), first)
+    self.refused(self.create(assets=assets([[1, 1025]])), 409, "conflict")
+    self.refused(self.create(assets=assets([[1, 1024]], ["web_discovery"])), 409, "conflict")
+    self.refused(self.create(assets=[pick(self.net), pick(self.web)]), 409, "conflict")
 
   def test_roles(self):
     self.owner.account("platform-pentester", memberships=[{"role": "super_pentester", "tenant_id": None}])

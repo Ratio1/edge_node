@@ -71,11 +71,15 @@ def record(**changes):
 
 class TestEngagementValues(unittest.TestCase):
   def test_feature_ids_follow_the_scan_strategy_categories(self):
-    for kind, strategy in (("network", SCAN_STRATEGIES["network"]), ("webapp", SCAN_STRATEGIES["webapp"])):
-      self.assertEqual(feature_ids_for_kind(kind), tuple(
-        item["id"] for item in FEATURE_CATALOG if item["category"] in strategy.catalog_categories))
+    strategy = SCAN_STRATEGIES["network"]
+    self.assertEqual(feature_ids_for_kind("network"), tuple(
+      item["id"] for item in FEATURE_CATALOG if item["category"] in strategy.catalog_categories))
     self.assertIn("service_info_common", feature_ids_for_kind("network"))
-    self.assertEqual(feature_ids_for_kind("webapp"), ("graybox",))
+    # RM-277: a webapp asset's tests are the graybox probe families, the probe methods without the underscore.
+    graybox = next(item for item in FEATURE_CATALOG if item["id"] == "graybox")
+    self.assertEqual(feature_ids_for_kind("webapp"), tuple(method.lstrip("_") for method in graybox["methods"]))
+    self.assertIn("graybox_access_control", feature_ids_for_kind("webapp"))
+    self.assertIn("graybox_weak_auth", feature_ids_for_kind("webapp"))
     # A model asset's tests are the Model Testing question sets.
     self.assertEqual(feature_ids_for_kind("model"), ("cbrn_safety_v1", "prompt_injection_v1"))
 
@@ -129,9 +133,12 @@ class TestEngagementAssets(unittest.TestCase):
 
   def test_assets_are_copied_from_the_rows_and_numbered_in_the_order_given(self):
     assets = self.build([{"asset_id": ASSET_1}, {"asset_id": ASSET_2}, {"asset_id": ASSET_3}])
+    # RM-277: a new entry carries the scope keys of its kind, "all" unless the request restricted them.
     self.assertEqual(assets[0], {
       "engagement_asset_id": "ea_1", "asset_id": ASSET_1, "display_name": "Edge gateway", "kind": "network",
-      "target": NETWORK_TARGET, "target_digest": canonical_digest(NETWORK_TARGET)})
+      "target": NETWORK_TARGET, "target_digest": canonical_digest(NETWORK_TARGET),
+      "authorized_ports": "all", "authorized_tests": "all"})
+    self.assertEqual({key for key in assets[1] if key.startswith("authorized")}, {"authorized_tests"})
     self.assertEqual([(entry["engagement_asset_id"], entry["kind"]) for entry in assets],
                      [("ea_1", "network"), ("ea_2", "webapp"), ("ea_3", "model")])
 
@@ -153,20 +160,37 @@ class TestEngagementAssets(unittest.TestCase):
 
   def test_refusals(self):
     network = {"asset_id": ASSET_1}
-    # RM-128: the request is exactly `{asset_id}`; any other key (including the dropped
-    # `authorized_ports`) is refused.
+    # RM-277: the request is `{asset_id}` and the asset's scope; any other key is refused.
     values = ([], None, [{"asset_id": "as_x"}], [{"asset_id": "ta_x"}], [{}], ["ta"],
-              # The request never carries the target, name, kind, tests or ports.
+              # The request never carries the target, name or kind.
               [dict(network, target=NETWORK_TARGET)], [dict(network, display_name="Edge")],
               [dict(network, kind="network")],
-              [dict(network, authorized_tests=["service_info_common"])],
               [dict(network, authorized_scan_modes=["connect"])],
-              [dict(network, authorized_ports="443")],
               [{"display_name": "Edge", "target": NETWORK_TARGET}])
     for value in values:
       with self.subTest(value=value), self.assertRaises(EngagementInvalid) as caught:
         self.build(value)
       self.assertEqual(caught.exception.code, "engagement_asset_invalid")
+
+  def test_each_asset_carries_its_own_scope_valid_for_its_kind(self):
+    assets = self.build([{"asset_id": ASSET_1, "authorized_ports": [[80, 90], [1, 10]], "authorized_tests": ["web_discovery"]},
+                         {"asset_id": ASSET_2, "authorized_tests": ["graybox_injection", "graybox_access_control"]},
+                         {"asset_id": ASSET_3}])
+    self.assertEqual([scope_of(entry) for entry in assets], [([[1, 10], [80, 90]], ["web_discovery"]),
+      ("all", ["graybox_access_control", "graybox_injection"]), ("all", "all")])
+    self.assertNotIn("authorized_ports", assets[1])
+    # An explicit "all" is the default, so a request that sends it replays as one that does not.
+    self.assertEqual(normalize_asset_requests([{"asset_id": ASSET_1, "authorized_ports": "all", "authorized_tests": "all"}]),
+                     [{"asset_id": ASSET_1}])
+    for request, code in (({"asset_id": ASSET_2, "authorized_ports": [[1, 80]]}, "authorized_ports_invalid"),
+                          ({"asset_id": ASSET_1, "authorized_tests": ["graybox_injection"]}, "authorized_tests_unknown"),
+                          ({"asset_id": ASSET_2, "authorized_tests": ["web_discovery"]}, "authorized_tests_unknown"),
+                          ({"asset_id": ASSET_3, "authorized_tests": ["no_such_set"]}, "authorized_tests_unknown"),
+                          ({"asset_id": ASSET_1, "authorized_ports": []}, "authorized_ports_invalid"),
+                          ({"asset_id": ASSET_1, "authorized_tests": []}, "authorized_tests_invalid")):
+      with self.subTest(request=request), self.assertRaises(EngagementInvalid) as caught:
+        self.build([request])
+      self.assertEqual(caught.exception.code, code)
 
   def test_two_assets_with_the_same_target_are_refused(self):
     rows = library()
@@ -207,9 +231,9 @@ class TestEngagementHash(unittest.TestCase):
         documents[0][label] = value
         self.assertNotEqual(record(documents=documents)["engagement_hash"], base)
 
-  def test_the_hash_schema_is_v5_and_a_row_without_the_scope_keys_stays_v4(self):
+  def test_the_hash_schema_is_v6_and_a_row_without_the_scope_keys_stays_v4(self):
     from extensions.business.cybersec.red_mesh.tenancy.engagements import HASH_SCHEMA, hashed_fields
-    self.assertEqual(HASH_SCHEMA, "redmesh.engagement/5")
+    self.assertEqual(HASH_SCHEMA, "redmesh.engagement/6")
     fields = hashed_fields(record())
     self.assertEqual(fields["schema"], "redmesh.engagement/4")
     self.assertNotIn("authorized_ports", fields)
@@ -276,10 +300,12 @@ class TestEngagementValidator(unittest.TestCase):
     phase_one["assets"][0]["asset_id"] = "as_0a7e3c52-9d0e-4f6f-8a3c-5f2d1b9e7c41"
     same_asset = record()
     same_asset["assets"][1] = {**same_asset["assets"][1], "asset_id": ASSET_1}
-    network_with_ports = record()
-    network_with_ports["assets"][0]["authorized_ports"] = "80"
-    picked_tests = record()
-    picked_tests["assets"][0]["authorized_tests"] = ["service_info_common"]
+    ports_without_tests = record()
+    ports_without_tests["assets"][0]["authorized_ports"] = "all"
+    one_asset_scoped = record()
+    one_asset_scoped["assets"][0].update(authorized_ports="all", authorized_tests="all")
+    webapp_with_ports = TestEngagementScope.scoped()
+    webapp_with_ports["assets"][1]["authorized_ports"] = "all"
     cases = {
       "hash": {**record(), "engagement_hash": "0" * 64},
       "ids": record(engagement_id="en_" + "3" * 8 + "-3333-4333-8333-" + "3" * 12),
@@ -304,8 +330,8 @@ class TestEngagementValidator(unittest.TestCase):
       "21 documents": record(documents=[document(index + 1, "%064x" % index) for index in range(21)]),
       "v1 kind": {**record(), "engagement_kind": "continuous"},
       "v1 documents": {**record(), "roe_document": doc_ref(), "authorization_document": doc_ref(SHA_B)},
-      "network with a dropped ports key": network_with_ports,
-      "asset test picks": picked_tests,
+      "ports without tests": ports_without_tests, "scope on one asset only": one_asset_scoped,
+      "ports on a webapp asset": webapp_with_ports,
       "context not an object": record(context="Example"),
     }
     for name, row in cases.items():
@@ -314,10 +340,16 @@ class TestEngagementValidator(unittest.TestCase):
 
 
 class TestEngagementScope(unittest.TestCase):
-  """RM-251: the authorized ports and tests, the key-presence hash schema (D-10) and the reader."""
+  """RM-251, RM-277: the authorized ports and tests of each asset (`/6`), the RM-251 engagement-level pair (`/5`,
+  read-only), the key-presence hash schema (D-10) and the reader."""
 
-  def scoped(self, ports="all", tests="all", **changes):
-    return record(authorized_ports=ports, authorized_tests=tests, **changes)
+  @staticmethod
+  def scoped(ports="all", tests="all", web="all", **changes):
+    """A `/5` row: every asset carries its keys (the webapp asset has no ports)."""
+    assets = copy.deepcopy(record()["assets"])
+    assets[0].update(authorized_ports=ports, authorized_tests=tests)
+    assets[1].update(authorized_tests=web)
+    return record(assets=assets, **changes)
 
   def test_a_row_without_the_scope_keys_is_v4_reads_all_and_keeps_its_hash(self):
     row = record()
@@ -329,30 +361,67 @@ class TestEngagementScope(unittest.TestCase):
               "supersedes": None, "context": row["context"], "assets": row["assets"]}
     self.assertEqual(row["engagement_hash"], canonical_digest(legacy))
     validate_engagement(row, (TENANT, ENGAGEMENT))
-    self.assertEqual(scope_of(row), ("all", "all"))
+    self.assertEqual([scope_of(entry) for entry in row["assets"]], [("all", "all")] * 2)
 
-  def test_both_keys_make_a_v5_row_and_one_key_alone_is_refused(self):
+  def test_the_keys_on_every_asset_make_a_v6_row_and_a_mix_or_an_engagement_level_key_is_refused(self):
+    from extensions.business.cybersec.red_mesh.tenancy.engagements import hashed_fields
     base = record()
     scoped = self.scoped()
     validate_engagement(scoped, (TENANT, ENGAGEMENT))
+    self.assertEqual(hashed_fields(scoped)["schema"], "redmesh.engagement/6")
     self.assertNotEqual(scoped["engagement_hash"], base["engagement_hash"])
     self.assertNotEqual(self.scoped([[1, 1024]])["engagement_hash"], scoped["engagement_hash"])
-    self.assertNotEqual(self.scoped(tests=["graybox"])["engagement_hash"], scoped["engagement_hash"])
-    for name, row in (("added to a /4 row", {**base, "authorized_ports": "all", "authorized_tests": "all"}),
-                      ("removed from a /5 row", {key: value for key, value in scoped.items() if key != "authorized_tests"}),
-                      ("ports alone", {**base, "authorized_ports": "all"}),
-                      ("tests alone", {**base, "authorized_tests": "all"})):
+    self.assertNotEqual(self.scoped(web=["graybox_misconfig"])["engagement_hash"], scoped["engagement_hash"])
+    mixed = copy.deepcopy(scoped)
+    del mixed["assets"][1]["authorized_tests"]
+    mixed["engagement_hash"] = engagement_hash(mixed)
+    for name, row in (("a mix of scoped and unscoped assets", mixed),
+                      ("one engagement-level key alone", {**base, "authorized_tests": "all"}),
+                      ("engagement-level plus asset scope", {**scoped, "authorized_ports": "all", "authorized_tests": "all"})):
       with self.subTest(name), self.assertRaises(ValueError):
         validate_engagement(row, (TENANT, ENGAGEMENT))
     # Revoke keeps the schema.
     validate_engagement({**scoped, "active": False, "revoked_by": "creator", "revoked_at": "2026-10-02T00:00:00+00:00",
                          "revoke_reason": "done"}, (TENANT, ENGAGEMENT))
 
+  @staticmethod
+  def rm251(ports="all", tests="all"):
+    """A row as 2.10.810 wrote and hashed it (origin/main): the pair on the engagement, `/5`, none on the assets."""
+    row = record(authorized_ports=ports, authorized_tests=tests)
+    fields = {"schema": "redmesh.engagement/5", "tenant_id": TENANT, "engagement_id": ENGAGEMENT,
+              "display_name": row["display_name"], "valid_from": row["valid_from"], "valid_until": row["valid_until"],
+              "contract_sha256": SHA_C, "documents": sorted([d["kind"], d["sha256"], d["title"], d["comment"]]
+                                                           for d in row["documents"]),
+              "supersedes": None, "context": row["context"], "assets": row["assets"],
+              "authorized_ports": ports, "authorized_tests": tests}
+    return {**row, "engagement_hash": canonical_digest(fields)}
+
+  def test_an_rm251_row_reads_with_its_hash_and_each_assets_scope_is_derived_from_it(self):
+    from extensions.business.cybersec.red_mesh.tenancy.engagements import asset_scope
+    row = self.rm251([[1, 1024]], ["graybox", "web_discovery"])
+    self.assertEqual(row["engagement_hash"], engagement_hash(row))
+    validate_engagement(row, (TENANT, ENGAGEMENT))
+    network, webapp = row["assets"]
+    # Ports bind the network asset; `graybox` was every graybox family; ids of another kind drop out.
+    self.assertEqual(asset_scope(row, network), ([[1, 1024]], ["web_discovery"]))
+    self.assertEqual(asset_scope(row, webapp), ("all", sorted(feature_ids_for_kind("webapp"))))
+    # A restricted list holding no id for the kind authorizes nothing there (the gate refuses the launch).
+    self.assertEqual(asset_scope(self.rm251("all", ["graybox"]), network), ("all", []))
+    self.assertEqual(asset_scope(self.rm251("all", ["web_discovery"]), webapp), ("all", []))
+    self.assertEqual(asset_scope(self.rm251(), network), ("all", "all"))
+    # A /6 row answers its own entry.
+    scoped = self.scoped([[5, 9]])
+    self.assertEqual(asset_scope(scoped, scoped["assets"][0]), ([[5, 9]], "all"))
+    for bad in (self.rm251([], "all"), self.rm251("all", ["b", "a"])):
+      with self.assertRaises(ValueError):
+        validate_engagement(bad, (TENANT, ENGAGEMENT))
+
   def test_a_malformed_stored_scope_is_refused_but_an_unknown_test_id_reads(self):
-    for ports, tests in (([], "all"), ([[5, 1]], "all"), ([[1, 5], [3, 9]], "all"), ("1-5", "all"),
-                         ("all", []), ("all", ["b", "a"]), ("all", "graybox")):
-      with self.subTest(ports=ports, tests=tests), self.assertRaises(ValueError):
-        validate_engagement(self.scoped(ports, tests), (TENANT, ENGAGEMENT))
+    for ports, tests, web in (([], "all", "all"), ([[5, 1]], "all", "all"), ([[1, 5], [3, 9]], "all", "all"),
+                              ("1-5", "all", "all"), ("all", [], "all"), ("all", ["b", "a"], "all"),
+                              ("all", "graybox", "all"), ("all", "all", [])):
+      with self.subTest(ports=ports, tests=tests, web=web), self.assertRaises(ValueError):
+        validate_engagement(self.scoped(ports, tests, web), (TENANT, ENGAGEMENT))
     validate_engagement(self.scoped([[1, 1024]], ["retired_test_id"]), (TENANT, ENGAGEMENT))
 
   def test_ports_are_sorted_and_merged_and_a_bad_shape_is_refused(self):
@@ -366,8 +435,9 @@ class TestEngagementScope(unittest.TestCase):
   def test_an_unknown_test_id_is_refused_on_write_for_the_kinds_held_only(self):
     self.assertEqual(normalize_authorized_tests(["web_discovery", "service_info_common", "web_discovery"], {"network"}),
                      ["service_info_common", "web_discovery"])
-    self.assertEqual(normalize_authorized_tests(["graybox"], {"webapp"}), ["graybox"])
-    for value, kinds in ((["no_such_test"], {"network"}), (["graybox"], {"network"}), (["web_discovery"], {"webapp"})):
+    self.assertEqual(normalize_authorized_tests(["graybox_weak_auth"], {"webapp"}), ["graybox_weak_auth"])
+    for value, kinds in ((["no_such_test"], {"network"}), (["graybox_injection"], {"network"}),
+                         (["web_discovery"], {"webapp"}), (["graybox"], {"webapp"})):
       with self.subTest(value=value), self.assertRaises(EngagementInvalid) as caught:
         normalize_authorized_tests(value, kinds)
       self.assertEqual(caught.exception.code, "authorized_tests_unknown")

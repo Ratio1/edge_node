@@ -24,8 +24,8 @@ from .deployment_nodes import named_entry, node_readiness
 from .assets import canonical_digest, normalize_name, valid_digest
 from .integrations import integration_ids, valid_integration_id
 from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, SUSPEND_STATE_KEYS, EngagementInvalid, document_id_for, engagement_hash,
-                          engagement_id_for, normalize_asset_requests, normalize_authorized_ports, normalize_authorized_tests,
-                          normalize_context, scope_of,
+                          engagement_id_for, normalize_asset_requests,
+                          normalize_context, asset_scope, with_scope,
                           build_engagement_assets, normalize_engagement_assets, normalize_window, valid_doc_ref, valid_engagement_id)
 from . import (account_profile, drafts, engagement_drafts, super_tenant_branding, super_tenant_integrations, super_tenant_profile,
                supporting_documents, tenant_assets, tenant_contracts)
@@ -887,8 +887,8 @@ class TenantAdministrationService:
       "engagement_id": row["engagement_id"], "engagement_hash": row["engagement_hash"],
       "contract_sha256": row["contract_sha256"],
       "context": row["context"],
-      # RM-251: the scope the launch is held to; a `/4` row reads as "all".
-      **dict(zip(("authorized_ports", "authorized_tests"), scope_of(row))),
+      # RM-251, RM-277: the scope of the asset the launch targets; a `/4` entry reads as "all".
+      **dict(zip(("authorized_ports", "authorized_tests"), asset_scope(row, entry) if entry else ("all", "all"))),
       # `AuthorizationRef` shape, so reports, exports and SIEM hooks read the job snapshot as
       # before. The signed basis is the engagement's contract, signed by the tenant's legal signer. No
       # document reference: the job is readable under `reports:view`, while the contract itself is
@@ -1149,7 +1149,11 @@ class TenantAdministrationService:
     contract_id, superseded_by = self._engagement_contract(tenant, row["contract_sha256"])
     assets = [{"engagementAssetId": entry["engagement_asset_id"], "assetId": entry["asset_id"],
                "displayName": entry["display_name"], "kind": entry["kind"], "target": entry["target"],
-               "targetDigest": entry["target_digest"]} for entry in row["assets"]]
+               "targetDigest": entry["target_digest"],
+               # RM-277: the asset's scope; a `/4` entry reads as "all", only a network asset has ports.
+               "authorizedTests": asset_scope(row, entry)[1],
+               **({"authorizedPorts": asset_scope(row, entry)[0]} if entry["kind"] == "network" else {})}
+              for entry in row["assets"]]
     return {
       "tenantId": row["tenant_id"], "engagementId": row["engagement_id"],
       "displayName": row["display_name"],
@@ -1160,7 +1164,6 @@ class TenantAdministrationService:
                      **self._engagement_document(document)} for document in row["documents"]],
       "supersedes": row.get("supersedes"), "supersededBy": row.get("superseded_by"), "context": row["context"],
       "assets": assets, "engagementHash": row["engagement_hash"],
-      **dict(zip(("authorizedPorts", "authorizedTests"), scope_of(row))),
       # No registry function anchors an arbitrary hash yet (owner, 2026-09-28): always pending.
       "anchor": {"status": "pending"},
       "active": row["active"], "createdBy": row["created_by"], "createdAt": row["created_at"],
@@ -1256,8 +1259,7 @@ class TenantAdministrationService:
 
   @staticmethod
   def _engagement_request(display_name, valid_from, valid_until, context, assets,
-                          documents, supersedes, creator, contract_id=None,
-                          authorized_ports="all", authorized_tests="all"):
+                          documents, supersedes, creator, contract_id=None):
     """The request as sent, normalized without any store read: the replay intent. RM-109 phase 4:
     `creator` None skips the uploader rule (an engagement draft's packs are checked for the platform
     role instead, by `activate_engagement_draft`). RM-133: `contract_id` enters the intent only when
@@ -1285,10 +1287,8 @@ class TenantAdministrationService:
     # RM-125 phase 2b: only the request form `{asset_id}`, so the replay intent
     # needs no store read; `_engagement_assets` copies the asset rows at write time, after the replay.
     try:
+      # RM-277: each entry's scope is the shape only; the ids are checked against its kind once the assets are copied.
       assets = normalize_asset_requests(assets)
-      # RM-251: the shape only; the ids are checked against the asset kinds once the assets are copied.
-      authorized_ports = normalize_authorized_ports(authorized_ports)
-      authorized_tests = normalize_authorized_tests(authorized_tests)
     except EngagementInvalid as exc:
       raise AdministrationDenied(400, exc.code) from None
     return {"display_name": display_name, "valid_from": valid_from, "valid_until": valid_until,
@@ -1296,15 +1296,11 @@ class TenantAdministrationService:
             "documents": [[document[key] for key in ("kind", "sha256", "title", "comment")]
                           for document in documents],
             "supersedes": supersedes, "assets": assets,
-            **({"contract_id": contract_id} if contract_id is not None else {}),
-            # RM-251: in the intent only when restricted, so an "all" request replays as before the scope.
-            **{key: value for key, value in (("authorized_ports", authorized_ports),
-                                             ("authorized_tests", authorized_tests)) if value != "all"}}
+            **({"contract_id": contract_id} if contract_id is not None else {})}
 
   @_endpoint
   def create_engagement(self, actor, tenant_id, request_id, display_name, valid_from,
-                        valid_until, context, assets, documents=None, supersedes=None, contract_id=None,
-                        authorized_ports="all", authorized_tests="all"):
+                        valid_until, context, assets, documents=None, supersedes=None, contract_id=None):
     """`documents` are the references `services.engagement_documents.resolve_engagement_document`
     verified outside this lock, in the order they are numbered (`ed_1`, `ed_2`, ...). RM-133:
     `contract_id` picks one of the tenant's contracts; absent, `c_1` as before. RM-248: a replacement
@@ -1321,7 +1317,7 @@ class TenantAdministrationService:
     documents = [] if documents is None else documents
     request = self._engagement_request(
       display_name, valid_from, valid_until, context, assets, documents,
-      supersedes, account.account_id, contract_id, authorized_ports, authorized_tests)
+      supersedes, account.account_id, contract_id)
     record = self._engagement_record(account, tenant_id, request_id, request, contract_sha256, documents, supersedes)
     # Replay is decided on the request alone.
     existing = self.store.get("engagement", tenant_id, engagement_id)
@@ -1331,10 +1327,6 @@ class TenantAdministrationService:
         raise AdministrationDenied(409, "conflict")
       return {**self._engagement_row(existing, tenant), "replayed": True}
     assets = self._engagement_assets(request["assets"], {"tenant_id": tenant_id})
-    try:
-      normalize_authorized_tests(record["authorized_tests"], {entry["kind"] for entry in assets})
-    except EngagementInvalid as exc:
-      raise AdministrationDenied(400, exc.code) from None
     record = self._with_assets(record, assets)
     self.store.put("engagement", tenant_id, engagement_id, record=record)
     # `replayed` says whether this call wrote, decided under the lock (the plugin audits on it).
@@ -1380,8 +1372,6 @@ class TenantAdministrationService:
       **({"supersedes": supersedes} if supersedes is not None else {}),
       "context": request["context"],
       "assets": request["assets"],
-      "authorized_ports": request.get("authorized_ports", "all"),
-      "authorized_tests": request.get("authorized_tests", "all"),
       "active": True, "created_by": account.account_id,
       "created_at": datetime.now(timezone.utc).isoformat(),
       "create_intent_digest": canonical_digest(intent),
@@ -2887,13 +2877,13 @@ class TenantAdministrationService:
 
   def _draft_assets(self, requests, parent, previous):
     """RM-125 phase 2b: an `assets` change as stored entries (an empty list clears them). An asset
-    the draft already holds keeps its stored copy, only its ports change; a newly picked one is
-    copied from the parent's registered assets now. A later rename or archive of a held asset
+    the draft already holds keeps its stored copy and, unless the request names it, its stored
+    scope (an explicit "all" resets it); a newly picked one is copied from the parent's registered assets now. A later rename or archive of a held asset
     therefore never reaches the draft (contract: remove and re-pick to take a newer copy)."""
     if requests == []:
       return []
     try:
-      requests = normalize_asset_requests(requests)
+      requests = normalize_asset_requests(requests, keep_all=True)
     except EngagementInvalid as exc:
       raise AdministrationDenied(400, exc.code) from None
     return self._engagement_assets(requests, parent, previous)
@@ -3180,12 +3170,27 @@ class TenantAdministrationService:
     nodes = self._snapshot_nodes(snapshot)
     source = self._pack_source(row)
     self._refuse_archived_source(row, source[0])
-    # RM-251: the scope the pack printed (absent keys read "all") must be the draft's now.
-    scope = [printed.get("authorizedPorts", "all"), printed.get("authorizedTests", "all")]
+    scope = self._snapshot_scope(row, printed)
     if (contract_id != source[0] or (source[1] is not None and nodes != source[1])
-        or scope != list(engagement_drafts.scope(row))):
+        or scope != engagement_drafts.scope(row)):
       raise AdministrationDenied(409, "draft_changed")
     return {"contractId": contract_id, "nodes": nodes, "scope": scope}
+
+  @staticmethod
+  def _snapshot_scope(row, printed):
+    """RM-277: the scope the pack printed by asset, `{asset_id: [ports, tests]}`, from the snapshot's
+    `assets` (`{assetId, authorizedPorts, authorizedTests}`; absent keys read "all"). The list names
+    every asset the draft holds; a missing list, one left out, one the draft does not hold, or a malformed
+    list answers a scope the draft never has."""
+    entries = printed.get("assets")
+    if (not isinstance(entries, list)
+        or any(not isinstance(entry, dict) or not isinstance(entry.get("assetId"), str) for entry in entries)
+        or len({entry["assetId"] for entry in entries}) != len(entries)
+        or {entry["assetId"] for entry in entries} != {entry["asset_id"] for entry in row["assets"]}):
+      return None
+    printed_scope = {entry["assetId"]: [entry.get("authorizedPorts", "all"), entry.get("authorizedTests", "all")]
+                     for entry in entries}
+    return {entry["asset_id"]: printed_scope[entry["asset_id"]] for entry in row["assets"]}
 
   @staticmethod
   def _snapshot_nodes(snapshot):
@@ -3228,7 +3233,7 @@ class TenantAdministrationService:
       source = self._pack_source(previous)
       self._refuse_archived_source(previous, source[0])
       if (pack_contract != source[0] or (source[1] is not None and nodes != source[1])
-          or pack_scope != list(engagement_drafts.scope(previous))):
+          or pack_scope != engagement_drafts.scope(previous)):
         raise AdministrationDenied(409, "draft_changed")
     if with_nodes and (nodes != previous["nodes"] or (contract_id and note != previous.get("note"))):
       raise AdministrationDenied(409, "draft_changed")
@@ -3384,16 +3389,14 @@ class TenantAdministrationService:
         raise AdministrationDenied(409, "carried_withdrawn", document=entry["document_id"])
     # RM-248: the carried documents are the old engagement's files, bound as they were.
     packs += engagement_drafts.carried_refs(row)
-    scope = engagement_drafts.scope(row)
     request = self._engagement_request(
       row["display_name"], row["valid_from"], row["valid_until"],
-      row["context"], engagement_drafts.asset_requests(row["assets"]), packs, supersedes, None,
-      authorized_ports=scope[0], authorized_tests=scope[1])
+      row["context"], engagement_drafts.asset_requests(row["assets"]), packs, supersedes, None)
     if preflight:
       return None
     record = self._engagement_record(account, tenant_id, request_id, request, contract_sha256, packs, supersedes)
     # The draft's own copies (already validated by `completeness`); the library is not read.
-    record = self._with_assets(record, normalize_engagement_assets(row["assets"]))
+    record = self._with_assets(record, normalize_engagement_assets([with_scope(entry) for entry in row["assets"]]))
     if supersedes is not None:
       record["revoke_superseded"] = revoke_superseded
     self.store.put("engagement", tenant_id, engagement_id, record=record)
