@@ -63,6 +63,14 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       return probe_error(target, port, "TLS", Exception("unverified connect failed"))
 
     raw["protocol"], raw["cipher"] = proto, cipher
+    # RM-265: a completed handshake on a web TLS port is the HTTPS counterpart of the host-level redirect rule.
+    # Without fingerprinting (no protocol recorded) the well-known web TLS ports count.
+    state = getattr(self, "state", None) or {}
+    protocol = (state.get("port_protocols") or {}).get(port)
+    if protocol == "https" or (protocol is None and port in (443, 8443)):
+      meta = state.get("scan_metadata")
+      if meta is not None:
+        meta.setdefault("web_root", {}).setdefault(port, {})["tls"] = True
     findings += self._tls_check_protocol(proto, cipher)
 
     # Pass 1b: SAN parsing and signature check from DER cert

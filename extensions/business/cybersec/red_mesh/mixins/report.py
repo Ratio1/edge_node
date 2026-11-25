@@ -12,7 +12,7 @@ import struct as _struct
 
 from ..worker import PentestLocalWorker
 from ..connection_metrics import RESPONSIVE_CONNECTION_OUTCOMES
-from ..worker.correlation import apply_host_honeypot_verdict
+from ..worker.correlation import apply_host_honeypot_verdict, http_without_https_redirect_findings
 from .live_progress import _LiveProgressMixin
 from ..models import UiAggregate
 from ..cve_view import apply_triage, drop_closed, filter_listed
@@ -359,6 +359,15 @@ def get_host_aggregated_report(owner, node_reports, worker_cls=None, log_details
         owner.P(f"Host honeypot verdict {verdict}: CVE rows folded")
     except Exception as exc:
       owner.P(f"Host honeypot fold failed: {type(exc).__name__}", color='y')
+    try:
+      # RM-265: needs the whole host (the HTTP and TLS ports sit on different workers); idempotent on a re-merge.
+      new_rows = http_without_https_redirect_findings(aggregated)
+      if new_rows:
+        rows = aggregated.setdefault("correlation_findings", [])
+        seen = {r.get("finding_id") for r in rows if isinstance(r, dict)}
+        rows.extend(r for r in new_rows if r.get("finding_id") not in seen)
+    except Exception as exc:
+      owner.P(f"HTTP-without-HTTPS correlation failed: {type(exc).__name__}", color='y')
   return aggregated
 
 
