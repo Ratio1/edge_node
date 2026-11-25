@@ -12,10 +12,36 @@ import time
 from urllib.parse import urlparse
 
 from ..constants import (
+  GRAYBOX_BREAKER_THRESHOLD,
   GRAYBOX_DEFAULT_DELAY,
   GRAYBOX_WEAK_AUTH_DELAY,
   GRAYBOX_MAX_WEAK_ATTEMPTS,
 )
+
+from .budget import TargetThrottled
+
+# Backoff and pacing sleeps poll the kill switch at least this often (seconds).
+_STOP_POLL = 0.25
+
+
+class GrayboxAbort(Exception):
+  """Signal that the graybox pipeline must stop immediately.
+
+  Raised from phase methods when a fatal safety or policy gate fails (unauthorized
+  target, preflight rejection, unrecoverable auth failure), and from the HTTP
+  admission gate when a stop is requested (reason_class "stopped"). The final
+  handler is GrayboxLocalWorker.execute_job. Code that holds partial results may
+  catch it only to keep them (ProbeBase._run_guarded, the worker's probe and
+  stateful-flow runners, the weak-auth lockout check), and must re-raise it. A gate
+  abort records its fatal finding via _record_fatal before raising; a stop records none.
+  Defined here so safety can raise it; re-exported by graybox.worker.
+  """
+
+  def __init__(self, reason: str, reason_class: str = "unknown"):
+    self.reason = reason
+    self.reason_class = reason_class
+    super().__init__(reason)
+
 
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 # IPv6 forms whose low 32 bits carry an IPv4 address: NAT64, IPv4-compatible, -mapped, -translated.
@@ -27,12 +53,19 @@ class SafetyControls:
   """Rate limiting, attempt budgeting, and target validation."""
 
   def __init__(self, request_delay=None, request_delay_max=None, weak_auth_delay=None,
-               target_is_local=False):
+               target_is_local=False, stop_check=None):
     self._request_delay = request_delay or GRAYBOX_DEFAULT_DELAY
     self._request_delay_max = request_delay_max or self._request_delay
     self._weak_auth_delay = weak_auth_delay or GRAYBOX_WEAK_AUTH_DELAY
     self._last_request_at = 0.0
     self._prepaid = 0
+    # Kill switch and circuit breaker (RM-273 Phase F). Refusals are counted so a probe
+    # run that swallowed one can be downgraded by ProbeBase._run_guarded.
+    self._stop_check = stop_check
+    self._consecutive_throttles = 0
+    self._breaker_open = False
+    self.refusals = 0
+    self.last_refusal = ""
     # Enforce minimum delay for non-local targets to avoid
     # triggering WAF blocking or causing DoS on resource-constrained targets.
     if not target_is_local and self._request_delay < GRAYBOX_DEFAULT_DELAY:
@@ -59,14 +92,68 @@ class SafetyControls:
     finally:
       self._prepaid -= 1
 
-  def throttle(self, min_delay=None):
+  @property
+  def breaker_open(self):
+    return self._breaker_open
+
+  @property
+  def prepaid_active(self):
+    return self._prepaid > 0
+
+  def _refuse(self, reason, exc):
+    self.refusals += 1
+    self.last_refusal = reason
+    raise exc
+
+  def _check_stop(self):
+    if self._stop_check is not None and self._stop_check():
+      self._refuse("stopped", GrayboxAbort("stop requested", reason_class="stopped"))
+
+  def check_admission(self, exempt=False):
+    """Refuse a non-exempt hop while a stop is requested or the breaker is open.
+
+    Exempt hops (rollbacks) are never refused: an undo must complete.
+    """
+    if exempt:
+      return
+    self._check_stop()
+    if self._breaker_open:
+      self._refuse("target_throttled", TargetThrottled())
+
+  def record_response(self, status_code):
+    """Count consecutive 429/503 responses; any other status resets the count."""
+    if status_code in (429, 503):
+      self._consecutive_throttles += 1
+      if self._consecutive_throttles >= GRAYBOX_BREAKER_THRESHOLD:
+        self._breaker_open = True
+    else:
+      self._consecutive_throttles = 0
+
+  def reset_breaker(self):
+    self._consecutive_throttles = 0
+    self._breaker_open = False
+
+  def sleep(self, seconds, interruptible=True):
+    """Sleep, waking on a stop request (at most `_STOP_POLL` late) unless not interruptible."""
+    if not (interruptible and self._stop_check is not None):
+      time.sleep(seconds)
+      return
+    end = time.time() + seconds
+    while True:
+      self._check_stop()
+      left = end - time.time()
+      if left <= 0:
+        return
+      time.sleep(min(left, _STOP_POLL))
+
+  def throttle(self, min_delay=None, interruptible=True):
     """Enforce minimum delay between requests."""
     if self._prepaid and min_delay is None:
       return
     delay = min_delay if min_delay is not None else self._next_request_delay()
     elapsed = time.time() - self._last_request_at
     if elapsed < delay:
-      time.sleep(delay - elapsed)
+      self.sleep(delay - elapsed, interruptible)
     self._last_request_at = time.time()
 
   def throttle_auth(self):

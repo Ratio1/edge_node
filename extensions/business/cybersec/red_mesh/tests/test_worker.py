@@ -1,7 +1,7 @@
 """Tests for GrayboxLocalWorker."""
 
 import unittest
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import ANY, MagicMock, patch, PropertyMock
 
 from extensions.business.cybersec.red_mesh.graybox.worker import GrayboxLocalWorker
 from extensions.business.cybersec.red_mesh.worker.base import BaseLocalWorker
@@ -169,6 +169,7 @@ class TestBaseLocalWorkerIntegration(unittest.TestCase):
       request_delay=3.0,
       request_delay_max=10.0,
       target_is_local=False,
+      stop_check=ANY,
     )
 
 

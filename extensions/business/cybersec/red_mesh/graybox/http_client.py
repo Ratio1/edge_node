@@ -7,12 +7,40 @@ keeping the existing probe-facing ``requests.Session`` shape.
 from __future__ import annotations
 
 import posixpath
+import time
 from collections.abc import Mapping
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import parse_qsl, urlencode, unquote, urljoin, urlsplit, urlunsplit
 
 import requests
 
+from ..constants import (
+  GRAYBOX_BACKOFF_DEADLINE,
+  GRAYBOX_RETRY_AFTER_MAX,
+  GRAYBOX_RETRY_MAX,
+)
 from .budget import RequestBudgetExhausted
+
+_RETRYABLE_METHODS = ("GET", "HEAD", "OPTIONS")
+
+
+def _retry_after_seconds(value):
+  """Seconds from a Retry-After header (delta-seconds or HTTP-date); None when absent or invalid."""
+  text = str(value or "").strip()
+  if not text:
+    return None
+  try:
+    seconds = float(text)
+  except ValueError:
+    try:
+      date = parsedate_to_datetime(text)
+      if date.tzinfo is None:  # "-0000" means UTC, not local time
+        date = date.replace(tzinfo=timezone.utc)
+      seconds = date.timestamp() - time.time()
+    except (TypeError, ValueError, IndexError, OverflowError):
+      return None
+  return seconds if seconds >= 0 else None  # negative or NaN: invalid
 
 
 class GrayboxScopeError(requests.RequestException):
@@ -556,17 +584,39 @@ class GrayboxHttpClient:
       raise GrayboxScopeError("Host header is outside the bound graybox target") from exc
 
   def _admit(self, budget_exempt=False, min_delay=None):
-    """Gate every hop before it is sent: charge the budget, then pace it.
+    """Gate every hop before it is sent: stop check, breaker, charge, pace.
 
     The one admission point for outbound traffic. A refused hop raises and
-    sends nothing; callers never receive a stand-in response. Pre-request
-    checks (kill switch, breaker) belong here.
+    sends nothing; callers never receive a stand-in response. A stop seen during
+    pacing leaves that one hop charged and unsent. The stop check runs again
+    after pacing: no request leaves once a stop is seen.
     """
+    if self._safety is not None:
+      self._safety.check_admission(budget_exempt)
     if self._request_budget is not None:
       if not self._request_budget.consume(1, exempt=budget_exempt):
         raise RequestBudgetExhausted()
     if self._safety is not None:
-      self._safety.throttle(min_delay)
+      if budget_exempt:
+        self._safety.throttle(min_delay, interruptible=False)
+      else:
+        self._safety.throttle(min_delay)
+      self._safety.check_admission(budget_exempt)
+
+  def _backoff_wait(self, method, response, retries, deadline, allowed):
+    """Seconds to wait before retrying a throttled safe request, or None for no retry."""
+    if (not allowed or self._safety is None or self._safety.breaker_open
+        or method.upper() not in _RETRYABLE_METHODS
+        or response.status_code not in (429, 503) or retries >= GRAYBOX_RETRY_MAX
+        or self._safety.prepaid_active):
+      return None
+    wait = _retry_after_seconds(response.headers.get("Retry-After"))
+    if wait is None:
+      wait = float(2 ** retries)
+    # Never retry earlier than the target asked; when it asks for too long, do not retry.
+    if wait > GRAYBOX_RETRY_AFTER_MAX or time.time() + wait > deadline:
+      return None
+    return wait
 
   def request(self, session, method, url, **kwargs):
     allow_redirects = bool(kwargs.pop("allow_redirects", False))
@@ -575,6 +625,9 @@ class GrayboxHttpClient:
     budget_exempt = bool(kwargs.pop("budget_exempt", False))
     # Per-request pacing override (e.g. a rate-limit burst's tighter spacing).
     throttle_min_delay = kwargs.pop("throttle_min_delay", None)
+    # A caller whose verdict reads the 429 itself opts out of the backoff retry.
+    throttle_retry = bool(kwargs.pop("throttle_retry", True))
+    deadline = time.time() + GRAYBOX_BACKOFF_DEADLINE
     safe_url = self.validate_url(url)
     self._guard_transport(session)
     if self._bound_target is not None:
@@ -596,20 +649,37 @@ class GrayboxHttpClient:
     # reported "not vulnerable". Record the chain we consumed so the attribute
     # means what the `requests` contract says it means.
     history = []
-    # One loop issues every request: a call without redirects is one hop.
-    for hop in range(5 if allow_redirects else 1):
+    # One loop issues every request: a call without redirects or retries is one hop.
+    max_hops = 5 if allow_redirects else 1
+    hop = 0
+    retries = 0
+    retrying = False
+    while hop < max_hops:
       # Every hop, the first included, is charged and paced here, so the budget
       # equals the requests really sent whichever probe (or discovery, or auth)
       # sent them. Redirect hops were once charged to nobody: one redirecting
-      # call issued five real requests against a single consume.
-      if response is not None:
+      # call issued five real requests against a single consume. A backoff retry
+      # is a hop like any other.
+      if response is not None and not retrying:
         history.append(response)
+      retrying = False
       if hop and self._bound_target is not None:
         self._validate_bound_headers(session.headers)
         self._validate_bound_headers(kwargs.get("headers"))
       # Last gate before the wire, after every validation: a charged hop is a sent hop.
       self._admit(budget_exempt, throttle_min_delay)
       response = session.request(method, current_url, allow_redirects=False, **kwargs)
+      if self._safety is not None:
+        self._safety.record_response(response.status_code)
+      # An exempt hop (rollback, cleanup logout) is never backoff-retried: no sleep outlives a stop.
+      wait = self._backoff_wait(method, response, retries, deadline,
+                                throttle_retry and not budget_exempt)
+      if wait is not None:
+        response.close()
+        self._safety.sleep(wait)
+        retries += 1
+        retrying = True
+        continue
       if not allow_redirects:
         return response
       if response.status_code not in (301, 302, 303, 307, 308):
@@ -621,6 +691,7 @@ class GrayboxHttpClient:
       if not isinstance(previous_url, str) or not previous_url:
         previous_url = current_url
       current_url = self.validate_url(urljoin(previous_url, location))
+      hop += 1
       if response.status_code in (301, 302, 303) and method != "HEAD":
         method = "GET"
         kwargs.pop("data", None)

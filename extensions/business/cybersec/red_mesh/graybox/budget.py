@@ -26,11 +26,25 @@ import threading
 from dataclasses import dataclass, field
 
 
-class RequestBudgetExhausted(RuntimeError):
+class RequestRefused(RuntimeError):
+  """A request was refused (and not sent); `reason` names why (budget_exhausted | target_throttled)."""
+
+  reason = "refused"
+
+  def __init__(self, message=None):
+    super().__init__(message or self.reason)
+
+
+class RequestBudgetExhausted(RequestRefused):
   """A request was refused (and not sent) because the scan budget is spent."""
 
-  def __init__(self, message="budget_exhausted"):
-    super().__init__(message)
+  reason = "budget_exhausted"
+
+
+class TargetThrottled(RequestRefused):
+  """A request was refused (and not sent) because the target keeps throttling (breaker open)."""
+
+  reason = "target_throttled"
 
 
 @dataclass

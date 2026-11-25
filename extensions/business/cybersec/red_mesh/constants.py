@@ -30,6 +30,12 @@ GRAYBOX_PROBE_REGISTRY = [
 
 # Graybox timing and limits
 GRAYBOX_DEFAULT_DELAY = 0.2
+# RM-273 Phase F: bounded 429/503 backoff, circuit breaker, per-call deadline. The breaker
+# resets per phase and per registry entry (one probe class), not per scenario.
+GRAYBOX_RETRY_MAX = 2
+GRAYBOX_RETRY_AFTER_MAX = 30
+GRAYBOX_BACKOFF_DEADLINE = 60
+GRAYBOX_BREAKER_THRESHOLD = 5
 GRAYBOX_WEAK_AUTH_DELAY = 1.0
 GRAYBOX_MAX_WEAK_ATTEMPTS = 20
 GRAYBOX_SESSION_MAX_AGE = 1800

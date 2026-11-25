@@ -311,7 +311,7 @@ class ApiAbuseProbes(ProbeBase):
         break
       for _ in range(10):
         try:
-          resp = session.get(self.target_url + ep.path, timeout=10)
+          resp = session.get(self.target_url + ep.path, timeout=10, throttle_retry=False)
         except requests.RequestException:
           break
         if resp.status_code == 429:
@@ -390,6 +390,8 @@ class ApiAbuseProbes(ProbeBase):
           try:
             resp = self._flow_request(
               session, _flow.method, _url, _body, timeout=10,
+              # The 429 is the evidence, and a mutating step is never replayed.
+              throttle_retry=False,
             )
           except requests.RequestException:
             return self.MUTATION_ATTEMPTED_UNKNOWN
@@ -480,12 +482,13 @@ class ApiAbuseProbes(ProbeBase):
         # while reporting "no mutation needed" is unsafe.
         mutation_sent = False
         try:
+          # A mutating step is never replayed, whatever its method.
           r1 = self._flow_request(
-            session, _flow.method, _url, _body, timeout=10,
+            session, _flow.method, _url, _body, timeout=10, throttle_retry=False,
           )
           mutation_sent = True
           r2 = self._flow_request(
-            session, _flow.method, _url, _body, timeout=10,
+            session, _flow.method, _url, _body, timeout=10, throttle_retry=False,
           )
         except requests.RequestException:
           if mutation_sent:

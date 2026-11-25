@@ -19,9 +19,9 @@ from .findings import (
 )
 from .auth import AuthManager
 from .discovery import DiscoveryModule
-from .budget import RequestBudgetExhausted
+from .budget import RequestRefused
 from .http_client import GrayboxHttpClient
-from .safety import SafetyControls
+from .safety import GrayboxAbort, SafetyControls
 from .rollback import RollbackJournalRepository
 from .scenario_runtime import GrayboxWorkerAssignment
 from .models import (
@@ -62,20 +62,7 @@ def _first_non_empty_str(values):
   return ""
 
 
-class GrayboxAbort(Exception):
-  """Signal that the graybox pipeline must stop immediately.
-
-  Raised only from inside phase methods when a fatal safety or policy
-  gate fails (unauthorized target, preflight rejection, unrecoverable
-  auth failure). Caught exclusively by GrayboxLocalWorker.execute_job
-  — do not catch elsewhere. The fatal finding is always recorded via
-  _record_fatal before the exception is raised.
-  """
-
-  def __init__(self, reason: str, reason_class: str = "unknown"):
-    self.reason = reason
-    self.reason_class = reason_class
-    super().__init__(reason)
+# GrayboxAbort lives in graybox.safety (the HTTP gate raises it); re-exported here.
 
 
 class GrayboxLocalWorker(BaseLocalWorker):
@@ -151,6 +138,8 @@ class GrayboxLocalWorker(BaseLocalWorker):
       request_delay=job_config.scan_min_delay or None,
       request_delay_max=job_config.scan_max_delay or None,
       target_is_local=SafetyControls.is_local_target(target_url),
+      # The stop_event is created in start(), after this client: pass the method.
+      stop_check=self._check_stopped,
     )
     self.http_client = GrayboxHttpClient(
       self.target_url,
@@ -332,6 +321,10 @@ class GrayboxLocalWorker(BaseLocalWorker):
       self._run_lockout_checks(discovery_result)
 
     except GrayboxAbort as exc:
+      if exc.reason_class == "stopped":
+        # An operator stop seen at the HTTP gate: canceled, not aborted.
+        self.state["canceled"] = True
+        return
       self.state["aborted"] = True
       self.state["abort_reason"] = exc.reason
       self.state["abort_phase"] = self._phase
@@ -387,6 +380,12 @@ class GrayboxLocalWorker(BaseLocalWorker):
     self._record_fatal(reason)
     raise GrayboxAbort(reason, reason_class=reason_class)
 
+  def _abort_refused(self, exc, where):
+    """Abort the scan because a request was refused (budget spent or target throttling)."""
+    what = ("Request budget exhausted" if exc.reason == "budget_exhausted"
+            else "Target kept throttling requests")
+    self._abort(f"{what} during {where}.", reason_class=exc.reason)
+
   def _run_preflight_phase(self):
     self._set_phase("preflight")
     self.metrics.phase_start("preflight")
@@ -405,7 +404,10 @@ class GrayboxLocalWorker(BaseLocalWorker):
       if target_error:
         self._abort(target_error, reason_class="unauthorized_target")
 
-      preflight_error = self.auth.preflight_check()
+      try:
+        preflight_error = self.auth.preflight_check()
+      except RequestRefused as exc:
+        self._abort_refused(exc, "preflight")
       if preflight_error:
         self._abort(preflight_error, reason_class="preflight_error")
 
@@ -441,11 +443,8 @@ class GrayboxLocalWorker(BaseLocalWorker):
         auth_ok = self.auth.authenticate(
           self._credentials.official, self._credentials.regular,
         )
-      except RequestBudgetExhausted:
-        self._abort(
-          "Request budget exhausted during authentication.",
-          reason_class="budget_exhausted",
-        )
+      except RequestRefused as exc:
+        self._abort_refused(exc, "authentication")
       self._store_auth_results()
       self.state["completed_tests"].append("graybox_auth")
     finally:
@@ -571,6 +570,9 @@ class GrayboxLocalWorker(BaseLocalWorker):
           )
           self._store_findings("_graybox_weak_auth", weak_findings)
           self.metrics.record_probe("_graybox_weak_auth", "completed")
+        except GrayboxAbort:
+          self._keep_partial("_graybox_weak_auth", bl_probe)
+          raise
         except Exception as exc:
           self._record_probe_error("_graybox_weak_auth", exc)
           self.metrics.record_probe("_graybox_weak_auth", "failed")
@@ -591,18 +593,31 @@ class GrayboxLocalWorker(BaseLocalWorker):
     if "graybox" in excluded or "_graybox_misconfig" in excluded:
       return
     store_key = "_graybox_lockout_checks"
+    probe = None
     try:
       probe = MisconfigProbes(**self._build_probe_kwargs(discovery_result).to_kwargs())
       self._store_findings(store_key, probe.run_lockout_checks())
       self.metrics.record_probe(store_key, "completed")
+    except GrayboxAbort:
+      self._keep_partial(store_key, probe)
+      raise
     except Exception as exc:
       self._record_probe_error(store_key, exc)
       self.metrics.record_probe(store_key, "failed")
+
+  def _keep_partial(self, key, probe):
+    """A stop (or abort) interrupted a probe: keep the findings it had collected."""
+    if probe is not None:
+      self._store_findings(key, probe.findings)
+      self.metrics.record_probe(key, "stopped")
 
   def _run_registered_probe(self, entry, probe_context: GrayboxProbeContext):
     """Run one registered probe through a shared capability and error boundary."""
     probe_def = GrayboxProbeDefinition.from_entry(entry)
     store_key = probe_def.key
+    # The breaker window is one registry entry (one probe class, which may run several
+    # scenarios) and one phase: a throttled entry must not starve the next.
+    self.safety.reset_breaker()
     probe_cls = self._import_probe(probe_def.cls_path)
 
     if probe_cls.is_stateful and not probe_context.allow_stateful:
@@ -633,15 +648,16 @@ class GrayboxLocalWorker(BaseLocalWorker):
         self._credentials.official,
         self._credentials.regular if require_regular or self._credentials.regular else None,
       )
-    except RequestBudgetExhausted as exc:
+    except RequestRefused as exc:
       # The refresh itself was refused: record this family and go on to the next.
       self._record_probe_error(store_key, exc)
-      self.metrics.record_probe(store_key, "failed:budget_exhausted")
+      self.metrics.record_probe(store_key, f"failed:{exc.reason}")
       return
     if not refreshed:
       self.metrics.record_probe(store_key, "failed:auth_refresh")
       return
 
+    probe = None
     try:
       from_context = getattr(probe_cls, "from_context", None)
       has_explicit_from_context = "from_context" in getattr(probe_cls, "__dict__", {})
@@ -652,6 +668,9 @@ class GrayboxLocalWorker(BaseLocalWorker):
       run_result = self._normalize_probe_run_result(probe.run())
       self._store_findings(store_key, run_result)
       self.metrics.record_probe(store_key, run_result.outcome)
+    except GrayboxAbort:
+      self._keep_partial(store_key, probe)
+      raise
     except Exception as exc:
       self._record_probe_error(store_key, exc)
       self.metrics.record_probe(store_key, "failed")
@@ -668,11 +687,8 @@ class GrayboxLocalWorker(BaseLocalWorker):
         self._credentials.official,
         self._credentials.regular if require_regular or self._credentials.regular else None,
       )
-    except RequestBudgetExhausted:
-      self._abort(
-        f"Request budget exhausted during {scope.replace('_', ' ')}.",
-        reason_class="budget_exhausted",
-      )
+    except RequestRefused as exc:
+      self._abort_refused(exc, scope.replace("_", " "))
     if auth_ok:
       return True
 
@@ -882,6 +898,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
 
   def _set_phase(self, phase):
     self._phase = phase
+    self.safety.reset_breaker()  # breaker window: one phase, or one registry entry (see _run_registered_probe)
 
   def _compute_scenario_stats(self):
     """Compute scenario stats from graybox_results."""

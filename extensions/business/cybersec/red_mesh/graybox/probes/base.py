@@ -10,7 +10,8 @@ import dataclasses
 
 import requests
 
-from ..budget import RequestBudgetExhausted
+from ..budget import RequestRefused
+from ..safety import GrayboxAbort
 from ..findings import (
   GrayboxEvidenceArtifact,
   evidence_content_sha256,
@@ -250,20 +251,45 @@ class ProbeBase:
     self.auth.regular_session as-is.
     """
     budget = getattr(self, "request_budget", None)
+    safety = getattr(self, "safety", None)
     refusals_before = budget.exhausted_count if budget is not None else 0
+    safety_before = self._safety_refusals(safety)
     mark = len(self.findings)
+    abort = None
     try:
       probe_fn()
-    except RequestBudgetExhausted:
+    except RequestRefused:
       pass  # recorded below with the other refusals
+    except GrayboxAbort as exc:
+      abort = exc  # re-raised below, after the downgrade
     except requests.exceptions.ConnectionError as exc:
       self._record_error(probe_name, self._error_with_detail("target_unreachable", exc))
     except requests.exceptions.Timeout as exc:
       self._record_error(probe_name, self._error_with_detail("request_timeout", exc))
     except Exception as exc:
       self._record_error(probe_name, self._sanitize_error(str(exc)))
-    if budget is not None and budget.exhausted_count > refusals_before:
-      self._downgrade_after_refusal(probe_name, mark)
+    reason = None
+    if self._safety_refusals(safety) > safety_before:
+      reason = safety.last_refusal
+    elif budget is not None and budget.exhausted_count > refusals_before:
+      reason = "budget_exhausted"
+    if reason:
+      self._downgrade_after_refusal(probe_name, mark, reason)
+    if abort is not None:
+      raise abort
+    if reason == "stopped":
+      # A probe swallowed the refusal: the stop must still end the run.
+      raise GrayboxAbort("stop requested", reason_class="stopped")
+
+  @staticmethod
+  def _safety_refusals(safety):
+    """Refusal count of a SafetyControls (0 for a missing or stand-in one).
+
+    The isinstance guard exists for the MagicMock `safety` fixtures of about ten probe test
+    files; fixing them all costs more than this guard.
+    """
+    count = getattr(safety, "refusals", 0)
+    return count if isinstance(count, int) else 0
 
   @staticmethod
   def _neutral_title(scenario_id):
@@ -273,7 +299,7 @@ class ProbeBase:
     except ImportError:
       return scenario_id
 
-  def _downgrade_after_refusal(self, probe_name, mark):
+  def _downgrade_after_refusal(self, probe_name, mark, reason="budget_exhausted"):
     """A request was refused during this run, so it may have been swallowed by a
     probe's own error handling: a clean verdict (and an absence-based vulnerable
     one) is no longer proven. Findings backed by fetched evidence stay."""
@@ -285,17 +311,17 @@ class ProbeBase:
           # Where manual cleanup is needed must survive: withdraw the verdict only.
           self.findings[i] = dataclasses.replace(
             f, status="inconclusive",
-            evidence=list(f.evidence) + ["reason=budget_exhausted"])
+            evidence=list(f.evidence) + [f"reason={reason}"])
           continue
         # Neutral shape: the old title and location asserted the verdict being withdrawn.
         self.findings[i] = dataclasses.replace(
           f, title=self._neutral_title(f.scenario_id), status="inconclusive",
           severity="INFO", cwe=[], attack=[], confidence="",
           url=None, parameter=None, method=None,
-          evidence=["reason=budget_exhausted"], evidence_artifacts=[],
+          evidence=[f"reason={reason}"], evidence_artifacts=[],
           replay_steps=[], remediation="", cvss_score=None, cvss_vector="",
         )
-    self._record_error(probe_name, "budget_exhausted")
+    self._record_error(probe_name, reason)
 
   def scenario_enabled(self, scenario_id: str) -> bool:
     """Return whether this worker is allowed to execute ``scenario_id``."""
@@ -450,7 +476,7 @@ class ProbeBase:
         mutation_attempted_unknown = True
       else:
         mutated = bool(mutate_result)
-    except RequestBudgetExhausted:
+    except (RequestRefused, GrayboxAbort):
       # A refusal part-way through mutate may follow a request that already
       # landed: treat the mutation as attempted so the revert still runs
       # (revert traffic is exempt from the budget).

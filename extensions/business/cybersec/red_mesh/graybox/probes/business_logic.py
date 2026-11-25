@@ -4,7 +4,8 @@ Business logic probes — A06 workflow bypass + A07 weak auth.
 
 from .access_control import MAX_EVIDENCE_VALUE, parse_form_fields
 from .base import ProbeBase
-from ..budget import RequestBudgetExhausted
+from ..budget import RequestRefused
+from ..safety import GrayboxAbort
 from ..findings import GrayboxFinding
 
 
@@ -51,7 +52,7 @@ class BusinessLogicProbes(ProbeBase):
 
     attempts = 0
     successes = []
-    refused = False
+    refused = ""
     for cred in candidates[:budget]:
       if ":" not in cred:
         continue
@@ -59,8 +60,8 @@ class BusinessLogicProbes(ProbeBase):
       self.safety.throttle_auth()
       try:
         session = self.auth.try_credentials(username, password)
-      except RequestBudgetExhausted:
-        refused = True  # keep the successes already found; the rest is unproven
+      except RequestRefused as exc:
+        refused = exc.reason  # keep the successes already found; the rest is unproven
         break
       attempts += 1
       if session:
@@ -70,7 +71,7 @@ class BusinessLogicProbes(ProbeBase):
         check_session = self.auth.make_anonymous_session()
         try:
           login_url = self.auth.target_url + self.auth.target_config.login_path
-          resp = check_session.get(login_url, timeout=10)
+          resp = check_session.get(login_url, timeout=10, throttle_retry=False)
           body_lower = resp.text.lower()
           if resp.status_code == 429 or any(m in body_lower for m in lockout_markers):
             self.findings.append(GrayboxFinding(
@@ -86,6 +87,8 @@ class BusinessLogicProbes(ProbeBase):
               ],
             ))
             return self.findings
+        except GrayboxAbort:
+          raise
         except Exception:
           pass
         finally:
@@ -95,7 +98,7 @@ class BusinessLogicProbes(ProbeBase):
 
     if refused:
       self.emit_inconclusive(
-        "PT-A07-01", "Weak credential check incomplete", "A07:2021", "budget_exhausted")
+        "PT-A07-01", "Weak credential check incomplete", "A07:2021", refused)
     if successes:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A07-01",

@@ -475,7 +475,8 @@ class ApiAccessProbes(ProbeBase):
         if not self.budget_available(2):
           raise RuntimeError("budget_exhausted")
         try:
-          plain_resp = _method_fn(_url, timeout=10, allow_redirects=False)
+          plain_resp = _method_fn(_url, timeout=10, allow_redirects=False,
+                                      throttle_retry=False)
         except requests.RequestException:
           return self.MUTATION_ATTEMPTED_UNKNOWN
         base["plain_status"] = plain_resp.status_code
@@ -579,7 +580,7 @@ class ApiAccessProbes(ProbeBase):
         if not self.budget_available():
           raise RuntimeError("budget_exhausted")
         try:
-          resp = _method_fn(_url, timeout=10)
+          resp = _method_fn(_url, timeout=10, throttle_retry=False)
         except requests.RequestException:
           return self.MUTATION_ATTEMPTED_UNKNOWN
         base["mutate_status"] = resp.status_code
