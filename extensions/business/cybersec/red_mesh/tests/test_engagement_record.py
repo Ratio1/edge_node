@@ -82,7 +82,7 @@ class TestEngagementValues(unittest.TestCase):
   def test_context_is_strict_and_never_coerces(self):
     empty = normalize_context({})
     self.assertEqual(empty, normalize_context(None))
-    self.assertEqual(empty["methodology"], "PTES + OWASP WSTG + CVSS v3.1")
+    self.assertEqual(empty["methodology"], "PTES + OWASP WSTG + CVSS v3.1 and v4.0")
     self.assertIsNone(empty["point_of_contact"])
     full = normalize_context({"client_name": " Example ", "asset_exposure": "internal",
                               "point_of_contact": {"name": "Ana", "email": "ana@example.com"}})

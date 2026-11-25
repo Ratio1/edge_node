@@ -65,6 +65,10 @@ def _sample_findings():
       "confidence": "certain",
       "cvss_score": 9.8,
       "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+      "cvss": [
+        {"version": "3.1", "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", "score": 9.8, "source": "nvd"},
+        {"version": "4.0", "vector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N", "score": 9.3, "source": "nvd"},
+      ],
       "port": 443,
       "protocol": "https",
       "probe": "_web_test_sql_injection",
@@ -351,6 +355,48 @@ class TestBuildMispEvent(unittest.TestCase):
     cvss = [a for a in sqli_vuln.attributes if a.object_relation == "cvss-score"]
     self.assertEqual(len(cvss), 1)
     self.assertEqual(cvss[0].value, "9.8")
+
+    # Both vectors, v3.1 first; a finding without cvss[] falls back to cvss_vector or none
+    strings = [a for a in sqli_vuln.attributes if a.object_relation == "cvss-string"]
+    self.assertEqual([a.value for a in strings], ["CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"])
+    self.assertEqual(strings[0].comment, "CVSS v4.0: CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N (9.3)")
+    self.assertEqual([a for a in vuln_objects[1].attributes if a.object_relation == "cvss-string"], [])
+
+  def _vuln(self, **extra):
+    base = {"finding_id": "x", "severity": "HIGH", "title": "t", "cvss_score": 8.0}
+    event = _build_misp_event(
+      target="10.0.0.1", scan_type="network", task_name="", job_id="j", risk_score=1, report_cid="",
+      distribution=0, findings=[dict(base, **extra)], open_ports=[],
+      port_banners={}, port_protocols={}, quick_summary=None)
+    return next(o for o in event.objects if o.name == "vulnerability")
+
+  def _assert_strict(self, obj):
+    from pymisp import MISPObject
+    strict = MISPObject("vulnerability", strict=True)
+    for a in obj.attributes:
+      strict.add_attribute(a.object_relation, value=a.value)  # raises on a repeated single-value relation
+    strict._validate()
+
+  def test_vulnerability_object_passes_strict_template_with_duplicate_entries(self):
+    v31 = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    v4 = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"
+    obj = self._vuln(cvss_vector=v31, cvss=[
+      {"version": "3.1", "vector": v31, "score": 9.8, "source": "nvd"},
+      {"version": "3.1", "vector": v31, "score": 9.8, "source": "cna"},
+      {"version": "4.0", "vector": v4, "score": 9.3, "source": "nvd"},
+      {"version": "4.0", "vector": v4, "score": 9.3, "source": "cna"}])
+    self._assert_strict(obj)
+    self.assertEqual(len([a for a in obj.attributes if a.object_relation == "cvss-string"]), 1)
+
+  def test_label_vector_without_cvss_list_is_exported(self):
+    v31 = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    obj = self._vuln(cvss_vector=v31)
+    self.assertEqual([a.value for a in obj.attributes if a.object_relation == "cvss-string"], [v31])
+    self._assert_strict(obj)
+
+  def test_invalid_vector_is_not_exported(self):
+    obj = self._vuln(cvss_vector="not a vector", cvss=[{"version": "3.1", "vector": "junk"}])
+    self.assertEqual([a for a in obj.attributes if a.object_relation == "cvss-string"], [])
 
   def test_graybox_attack_ids_tagged(self):
     finding = dict(_sample_findings()[3])  # The IDOR finding with attack_ids
