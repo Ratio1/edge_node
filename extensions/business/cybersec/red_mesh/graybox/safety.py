@@ -105,6 +105,11 @@ class SafetyControls:
     self.last_refusal = reason
     raise exc
 
+  def note_degraded(self, reason):
+    """Count a non-raising degradation so `_run_guarded` downgrades the run's clean verdicts."""
+    self.refusals += 1
+    self.last_refusal = reason
+
   def _check_stop(self):
     if self._stop_check is not None and self._stop_check():
       self._refuse("stopped", GrayboxAbort("stop requested", reason_class="stopped"))

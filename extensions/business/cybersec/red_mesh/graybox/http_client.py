@@ -392,6 +392,10 @@ class GrayboxHttpClient:
     # client without one and are unaffected.
     self._request_budget = request_budget
     self._safety = safety
+    # RM-273 P2: session recovery hook (see `set_session_recovery`); `_recovering` keeps the
+    # liveness and login requests the hook itself sends from recursing into it.
+    self._recover = None
+    self._recovering = False
     # RM-273 (D30): the worker passes the engagement's flag; without it private targets are refused.
     self._allow_private_targets = allow_private_targets
     self.target_url = target_url.rstrip("/")
@@ -603,6 +607,21 @@ class GrayboxHttpClient:
         self._safety.throttle(min_delay)
       self._safety.check_admission(budget_exempt)
 
+  def set_session_recovery(self, fn):
+    """Register `fn(raw_session, response) -> "reauthenticated" | "lost" | None`.
+
+    Called after a 401/403/3xx on a non-exempt hop; the manager decides whether the session
+    is really dead (a 403 is usually an authorization denial) and re-authenticates it in place.
+    """
+    self._recover = fn
+
+  def _recover_session(self, session, response):
+    self._recovering = True
+    try:
+      return self._recover(session, response)
+    finally:
+      self._recovering = False
+
   def _backoff_wait(self, method, response, retries, deadline, allowed):
     """Seconds to wait before retrying a throttled safe request, or None for no retry."""
     if (not allowed or self._safety is None or self._safety.breaker_open
@@ -654,6 +673,7 @@ class GrayboxHttpClient:
     hop = 0
     retries = 0
     retrying = False
+    recovered = False
     while hop < max_hops:
       # Every hop, the first included, is charged and paced here, so the budget
       # equals the requests really sent whichever probe (or discovery, or auth)
@@ -671,6 +691,20 @@ class GrayboxHttpClient:
       response = session.request(method, current_url, allow_redirects=False, **kwargs)
       if self._safety is not None:
         self._safety.record_response(response.status_code)
+      status = response.status_code
+      if (self._recover is not None and not budget_exempt and not self._recovering
+          and not recovered and (status in (401, 403) or 300 <= status < 400)):
+        outcome = self._recover_session(session, response)
+        if outcome in ("lost", "reauthenticated"):
+          recovered = True
+          if outcome == "reauthenticated" and method.upper() in _RETRYABLE_METHODS:
+            response.close()
+            retrying = True
+            continue
+          # A POST is never replayed: the caller sees the original response, flagged degraded.
+          if self._safety is not None:
+            self._safety.note_degraded(
+              "session_lost" if outcome == "lost" else "session_reauthenticated")
       # An exempt hop (rollback, cleanup logout) is never backoff-retried: no sleep outlives a stop.
       wait = self._backoff_wait(method, response, retries, deadline,
                                 throttle_retry and not budget_exempt)

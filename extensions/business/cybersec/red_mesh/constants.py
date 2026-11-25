@@ -39,6 +39,7 @@ GRAYBOX_BREAKER_THRESHOLD = 5
 GRAYBOX_WEAK_AUTH_DELAY = 1.0
 GRAYBOX_MAX_WEAK_ATTEMPTS = 20
 GRAYBOX_SESSION_MAX_AGE = 1800
+GRAYBOX_REAUTH_MAX = 3  # mid-family re-logins per principal; every login counts toward lockout
 
 
 FEATURE_CATALOG = [

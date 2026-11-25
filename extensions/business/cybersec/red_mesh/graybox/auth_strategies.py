@@ -19,11 +19,15 @@ must NOT capture credentials beyond the active session lifetime — call
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from abc import ABC, abstractmethod
 from typing import Optional
+from urllib.parse import urlsplit
 
 import requests
+
+from .http_client import GrayboxScopeError
 
 
 class AuthStrategy(ABC):
@@ -381,12 +385,60 @@ class BearerAuth(AuthStrategy):
     self._creds = creds
     return session
 
-  def refresh(self, creds) -> bool:
-    """Default behaviour: re-stamp the same token. Phase 9 OAuth2 follow-up
-    can replace this with a real refresh-grant call against
-    `bearer_refresh_url` using `creds.bearer_refresh_token`.
+  def refresh_grant(self, creds):
+    """RFC 6749 section 6 refresh grant: ``(access_token, refresh_token_or_None)`` or None.
+
+    None without ``bearer_refresh_url`` and a refresh token, or on any failure; the failed
+    response (never its body) stays in ``last_response`` for the caller's diagnostic. Sent
+    through the scoped client, so it is charged, paced and refused off-origin.
     """
+    url = (self._auth_desc.bearer_refresh_url or "").strip()
+    refresh_token = creds.bearer_refresh_token
+    self.last_response = None
+    self.last_error = ""  # no token or URL value: only a class of failure
+    if not url or not refresh_token:
+      return None
+    session = self.make_session()
+    try:
+      resp = session.post(
+        url if urlsplit(url).scheme else f"{self.target_url}/{url.lstrip('/')}",
+        data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+        headers={"Accept": "application/json"}, timeout=10, allow_redirects=False,
+      )
+    except GrayboxScopeError:
+      self.last_error = "scope_refused"
+      return None
+    except requests.RequestException:
+      self.last_error = "transport_error"
+      return None
+    finally:
+      session.close()
+    self.last_response = resp
+    if not 200 <= resp.status_code < 300:
+      return None
+    try:
+      body = resp.json()
+    except ValueError:
+      return None
+    access = body.get("access_token") if isinstance(body, dict) else None
+    if not isinstance(access, str) or not access:
+      return None
+    rotated = body.get("refresh_token")
+    return access, (rotated if isinstance(rotated, str) and rotated else None)
+
+  def refresh(self, creds) -> bool:
+    """Real refresh grant when configured, else re-stamp the same token.
+
+    The new tokens live only in the session: the caller's ``creds`` is not written (the
+    manager keeps rotated tokens).
+    """
+    grant = self.refresh_grant(creds)
+    if grant is None and self._auth_desc.bearer_refresh_url and creds.bearer_refresh_token:
+      return False  # a refresh was configured and failed: do not re-stamp the dead token
     self.cleanup()
+    if grant is not None:
+      creds = dataclasses.replace(
+        creds, bearer_token=grant[0], bearer_refresh_token=grant[1] or creds.bearer_refresh_token)
     return self.authenticate(creds) is not None
 
   def cleanup(self) -> None:

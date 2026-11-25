@@ -353,7 +353,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
   def _safe_cleanup(self):
     """Run auth.cleanup without letting its errors mask an earlier abort."""
     try:
-      self.auth.cleanup()
+      self.auth.cleanup(final=True)
     except Exception as exc:
       self.P(
         "[GRAYBOX] auth.cleanup raised during shutdown: %s"
