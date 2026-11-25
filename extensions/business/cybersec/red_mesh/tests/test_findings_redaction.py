@@ -364,6 +364,10 @@ class TestScrubNamedSecretShapes(unittest.TestCase):
     ("repr_both_quote_kinds", """{'password': 'a\\'b"cSECRET'}""", "SECRET"),
     ("json_escaped_quote", '{"password": "ab\\"cdSECRET"}', "SECRET"),
     ("aligned_separator", '{"password"          :          "SECRET"}', "SECRET"),
+    ("django_secret_key", "SECRET_KEY=django-insecure-LEAKVAL", "LEAKVAL"),
+    ("aws_secret_access_key", "aws_secret_access_key=SECRET", "SECRET"),
+    ("passphrase", "passphrase: SECRET", "SECRET"),
+    ("trailing_backslash_unclosed", 'password="SECRET\\', "SECRET"),
   )
   UNCHANGED = (
     "username=admin",

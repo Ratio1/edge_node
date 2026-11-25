@@ -208,7 +208,11 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
   _track(job_specs.get("job_config_cid"), "job_specs.job_config_cid")
   artifacts = _artifact_repo(owner)
   unreadable = []
-  job_config = artifacts.get_job_config(job_specs) if job_specs.get("job_config_cid") else {}
+  try:
+    job_config = artifacts.get_job_config(job_specs) if job_specs.get("job_config_cid") else {}
+  except Exception as e:
+    owner.P(f"[PURGE] Failed to fetch job config: {e}", color='r')
+    job_config = None
   if isinstance(job_config, dict):
     for secret_ref in collect_secret_refs_from_job_config(job_config):
         _track(secret_ref, "job_config.secret_ref")
@@ -358,6 +362,7 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
       if success:
         deleted += 1
         done.add(cid)
+        _save_progress()
         # Irreversible. A later raise must not reach the caller as "nothing happened".
         if ledger is not None:
           ledger.record(EffectState.DELIVERED)
@@ -485,6 +490,14 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
       owner.P(f"[PURGE_ALL_FORCE] Could not inspect shared CID references for {job_id}; retaining rows.", color='r')
       return 0, len(job_submission_cids)
   cids.update(job_submission_cids - shared_submission_cids)
+  progress_hkey = f"{owner.cfg_instance_id}:purge_progress"
+  try:
+    stored = owner.chainstore_hget(hkey=progress_hkey, key=job_id)
+  except Exception:
+    stored = None
+  if isinstance(stored, dict):  # children of parents an earlier purge already deleted (RM-273)
+    gone = set(stored.get("deleted") or ())
+    cids.update(c for c in stored.get("cids") or () if isinstance(c, str) and c not in gone)
   cids.difference_update(shared_submission_cids)
   cids = sorted(cids)
   cids_deleted = 0
@@ -547,10 +560,11 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
         except Exception as exc:
           errors.append({"job_id": job_id, "scope": hkey, "message": type(exc).__name__})
 
-  try:
-    owner.chainstore_hset(hkey=cfg_instance_id, key=job_id, value=None)
-  except Exception as exc:
-    errors.append({"job_id": job_id, "scope": cfg_instance_id, "message": type(exc).__name__})
+  for hkey in (cfg_instance_id, progress_hkey):
+    try:
+      owner.chainstore_hset(hkey=hkey, key=job_id, value=None)
+    except Exception as exc:
+      errors.append({"job_id": job_id, "scope": hkey, "message": type(exc).__name__})
 
   owner.P(f"[PURGE_ALL_FORCE] Force-purged {job_id}: {cids_deleted}/{len(cids)} CIDs deleted.")
   return cids_deleted, cids_failed
@@ -941,6 +955,7 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None,
   _sweep_host_triage()
   _sweep_hash(rulebook_review_hkey, dict)
   _sweep_hash(rulebook_review_audit_hkey, list)
+  _sweep_hash(f"{cfg_instance_id}:purge_progress", dict)
   _sweep_submission_hash()
   integration_status_rows_deleted = 0
   if jobs_failed == 0 and cids_failed == 0:

@@ -470,7 +470,10 @@ class TestPurgeKeepsEverythingWhenAChildIsUnreadable(unittest.TestCase):
     artifacts.delete.side_effect = lambda cid, **kw: cid not in failing
     if job_config is not None:
       job["job_config_cid"] = "cid-config"
-      artifacts.get_job_config.return_value = job_config
+      if isinstance(job_config, Exception):
+        artifacts.get_job_config.side_effect = job_config
+      else:
+        artifacts.get_job_config.return_value = job_config
     for target, value in ((artifacts.get_json, archive), (artifacts.get_pass_report, pass_report)):
       if isinstance(value, Exception):
         target.side_effect = value
@@ -507,6 +510,12 @@ class TestPurgeKeepsEverythingWhenAChildIsUnreadable(unittest.TestCase):
     result, _, _ = self._run(archive=RuntimeError("gone"), pass_report=None, with_pass_report=True)
     self.assertEqual(result["unreadable"], {"archive": 1, "pass_report": 1})
     self.assertNotIn("cid-", repr(result))
+
+  def test_a_job_config_fetch_error_deletes_nothing(self):
+    result, artifacts, delete_record = self._run(archive={"passes": []}, job_config=RuntimeError("r1fs down"))
+    self.assertEqual((result["status"], result["unreadable"]), ("partial", {"job_config": 1}))
+    artifacts.delete.assert_not_called()
+    delete_record.assert_not_called()
 
   def test_a_retry_after_a_partial_delete_completes(self):
     # Round 1 deletes the archive and fails on its child; round 2 cannot read the archive any more,

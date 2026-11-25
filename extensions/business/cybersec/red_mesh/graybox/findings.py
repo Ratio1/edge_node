@@ -212,13 +212,13 @@ def _redact_cookie_header(match: "re.Match") -> str:
 # value (`""abc`), is redacted to the bare stops.
 # No quantifier nests, so the scan stays linear.
 _SECRET_KEY_RE = re.compile(
-  r"(?:password|passwd|secret|token|session_?id|api_?(?:[a-z0-9_]*_)?key|private_key)$")
+  r"(?:password|passwd|passphrase|secret|secret_(?:access_)?key|token|session_?id|api_?(?:[a-z0-9_]*_)?key|private_key)$")
 _CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _NAMED_KEY_RE = re.compile(
   r"""(?<![\w.\-])([\w.\-]+)(["']?)(\s*[:=]\s*)"""
 )
 _NAMED_VALUE_RE = re.compile(
-  r"""(?:"((?:[^"\\]|\\.)+)(?:"|\Z)|'((?:[^'\\]|\\.)+)(?:'(?!\w)|\Z)|('[^\s&";,]+|""[^\s&"';,]+|[^\s&"';,]+))"""
+  r"""(?:"((?:[^"\\]|\\.|\\\Z)+)(?:"|\Z)|'((?:[^'\\]|\\.|\\\Z)+)(?:'(?!\w)|\Z)|('[^\s&";,]+|""[^\s&"';,]+|[^\s&"';,]+))"""
 )
 
 
