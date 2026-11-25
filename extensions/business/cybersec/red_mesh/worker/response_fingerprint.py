@@ -221,12 +221,15 @@ def normalize_content_type(content_type):
   return sanitize_excerpt(content_type.split(";")[0].strip().lower())
 
 
-def resolve_host(host, timeout=None):
+def resolve_host(host, timeout=None, ordered=False):
   """
   Resolve a target host to its sorted, deduplicated A/AAAA set.
 
   Each vantage resolves independently — this is what makes geo-DNS
-  divergence observable at all.
+  divergence observable at all. `ordered` keeps the resolver's own order
+  instead of sorting, for callers that dial in turn. IPv6 scope ids are not
+  kept (getaddrinfo reports them separately): a link-local record fails to dial
+  and the walk moves on.
 
   Returns
   -------
@@ -263,8 +266,49 @@ def resolve_host(host, timeout=None):
       return [], "DNS resolution timed out"
     if error is not None:
       return [], str(error)
+  if ordered:
+    return list(dict.fromkeys(info[4][0] for info in infos if info[4])), None
   addresses = {info[4][0] for info in infos if info[4]}
   return sorted(addresses), None
+
+
+def dial_within_budget(host, port, timeout):
+  """
+  Connect to `host`, trying its addresses in order under one shared deadline.
+
+  `socket.create_connection` applies its timeout per resolved address, so a
+  target publishing N blackholed A records in its own zone costs N x `timeout`.
+  Here the whole leg is bounded by `timeout`: each later attempt gets only what
+  is left of it. Addresses that fail fast (refused, unreachable) still fall
+  through to the next record. The connected peer is the address to pin the
+  remaining legs to, so they cannot be steered to a different record.
+
+  The lookup is bounded the same way and counts against the same budget. A
+  literal IP is dialed as given. A name that does not resolve in time, or at all,
+  is unreachable: handing it to `create_connection` would resolve it again with
+  no bound, so it is unreachable too when the lookup returns no address. IPv6
+  link-local scope ids are not kept: such a record fails fast and is skipped.
+  """
+  deadline = time.monotonic() + timeout
+  addresses, error = resolve_host(host, timeout=timeout, ordered=True)
+  if error:
+    raise OSError(error)
+  if not addresses:
+    try:
+      ipaddress.ip_address(host)
+    except ValueError:
+      raise OSError(f"no address for {host}")
+  candidates = addresses or [host]
+  error = None
+  for index, address in enumerate(candidates):
+    budget = min(timeout, deadline - time.monotonic()) if (addresses or index) else timeout
+    if budget <= 0:
+      break
+    try:
+      return socket.create_connection((address, port), timeout=budget)
+    except OSError as exc:
+      error = exc
+  raise error or socket.timeout("connect budget exhausted")
 
 
 def redirect_stays_on_target(next_url, host, port):
@@ -360,7 +404,7 @@ def release_response_connection(response, log=None):
       log(f"Response connection shutdown failed: {exc}", color='y')
 
 
-def _socket_recording_pool_classes(registry):
+def _socket_recording_pool_classes(registry, dial_address=None):
   """
   Pool classes whose connections append their socket to `registry` on connect.
 
@@ -373,13 +417,24 @@ def _socket_recording_pool_classes(registry):
   keyword because pool keywords are folded into the connection-pool cache key,
   which rejects unknown names.
   """
+  def _pin(connection):
+    # urllib3 dials `_dns_host` but also derives `host` (the Host header and the
+    # default SNI) from it, so overwriting it alone would present the IP to the
+    # server. SNI is restored here; the Host header is set by the caller.
+    if dial_address:
+      if isinstance(connection, HTTPSConnection) and connection.server_hostname is None:
+        connection.server_hostname = connection.host
+      connection._dns_host = dial_address
+
   class _RecordingHTTPConnection(HTTPConnection):
     def connect(self):
+      _pin(self)
       super().connect()
       registry.append(self.sock)
 
   class _RecordingHTTPSConnection(HTTPSConnection):
     def connect(self):
+      _pin(self)
       super().connect()
       # Post-handshake, so this is the TLS socket: shutting it down unblocks a
       # reader stalled inside the wrapped stream, which the raw socket would not.
@@ -400,14 +455,15 @@ def _socket_recording_pool_classes(registry):
 class _SocketRecordingAdapter(HTTPAdapter):
   """A transport adapter that exposes the sockets it opens."""
 
-  def __init__(self, socket_registry, **kwargs):
+  def __init__(self, socket_registry, dial_address=None, **kwargs):
     self._socket_registry = socket_registry
+    self._dial_address = dial_address
     super().__init__(**kwargs)
 
   def init_poolmanager(self, connections, maxsize, block=DEFAULT_POOLBLOCK, **pool_kwargs):
     super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
     self.poolmanager.pool_classes_by_scheme = _socket_recording_pool_classes(
-      self._socket_registry
+      self._socket_registry, self._dial_address
     )
 
   def build_response(self, req, resp):
@@ -443,7 +499,7 @@ class _SocketRecordingAdapter(HTTPAdapter):
     # control.
     manager = super().proxy_manager_for(proxy, **proxy_kwargs)
     manager.pool_classes_by_scheme = _socket_recording_pool_classes(
-      self._socket_registry
+      self._socket_registry, self._dial_address
     )
     return manager
 
@@ -717,18 +773,20 @@ class _ResponseFingerprintMixin:
     entry = {"reachable": False, "tls": None, "http": None, "excerpt": None}
 
     try:
-      with socket.create_connection(
-        (self.target, port),
-        timeout=self._target_timeout(FINGERPRINT_TIMEOUT),
-      ):
+      with dial_within_budget(
+        self.target, port, self._target_timeout(FINGERPRINT_TIMEOUT),
+      ) as probe:
         entry["reachable"] = True
+        # The address that answered. TLS and HTTP are pinned to it, so all three
+        # legs observe one endpoint and the target's zone cannot steer them apart.
+        pinned = probe.getpeername()[0]
     except Exception:
       # An unreachable port is itself a comparable result: a target that
       # refuses one vantage and serves another is the divergence we are
       # looking for, so this is recorded rather than treated as an error.
       return entry
 
-    _proto, _cipher, cert_der = self._tls_unverified_connect(self.target, port)
+    _proto, _cipher, cert_der = self._tls_unverified_connect(self.target, port, dial_host=pinned)
     if cert_der:
       identity = certificate_identity(cert_der)
       if identity:
@@ -737,12 +795,12 @@ class _ResponseFingerprintMixin:
         entry["tls"] = identity
 
     scheme = "https" if entry["tls"] else "http"
-    http, excerpt = self._fingerprint_http(scheme, port)
+    http, excerpt = self._fingerprint_http(scheme, port, dial_host=pinned)
     entry["http"] = http
     entry["excerpt"] = excerpt
     return entry
 
-  def _fingerprint_http(self, scheme, port):
+  def _fingerprint_http(self, scheme, port, dial_host=None):
     """Issue one GET and reduce the response to comparable attributes."""
     url = f"{scheme}://{self.target}:{port}/"
     session = requests.Session()
@@ -755,13 +813,18 @@ class _ResponseFingerprintMixin:
     session.trust_env = False
     # Per-call, so concurrent probes never observe each other's sockets.
     sockets = []
-    adapter = _SocketRecordingAdapter(sockets)
+    adapter = _SocketRecordingAdapter(sockets, dial_address=dial_host)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     resp = None
     try:
       user_agent = getattr(self, "scanner_user_agent", "")
       headers = {"User-Agent": user_agent} if user_agent else {}
+      if dial_host and dial_host != self.target:
+        # Dialing the pinned address must not change what the virtual host sees.
+        name = f"[{self.target}]" if ":" in self.target else self.target
+        default_port = 443 if scheme == "https" else 80
+        headers["Host"] = name if port == default_port else f"{name}:{port}"
       timeout = self._target_timeout(FINGERPRINT_HTTP_TIMEOUT)
       deadline = time.monotonic() + timeout
       current_url = url

@@ -10,6 +10,7 @@ import requests
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
 from ...cve_db import check_cves, probe_cve_fields, _stamp_identity
+from ..response_fingerprint import dial_within_budget
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
 
@@ -117,13 +118,16 @@ class _ServiceTlsMixin(_ServiceProbeBase):
 
     return probe_result(raw_data=raw, findings=findings)
 
-  def _tls_unverified_connect(self, target, port):
-    """Unverified TLS connect to get protocol, cipher, and DER cert."""
+  def _tls_unverified_connect(self, target, port, dial_host=None):
+    """Unverified TLS connect to get protocol, cipher, and DER cert.
+
+    `dial_host` pins the connection to one address while `target` stays the SNI name.
+    """
     try:
       ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
       ctx.check_hostname = False
       ctx.verify_mode = ssl.CERT_NONE
-      with socket.create_connection((target, port), timeout=self._target_timeout(3)) as sock:
+      with dial_within_budget(dial_host or target, port, self._target_timeout(3)) as sock:
         with ctx.wrap_socket(sock, server_hostname=target) as ssock:
           proto = ssock.version()
           cipher_info = ssock.cipher()
@@ -171,7 +175,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
     findings = []
     try:
       ctx = ssl.create_default_context()
-      with socket.create_connection((target, port), timeout=self._target_timeout(3)) as sock:
+      with dial_within_budget(target, port, self._target_timeout(3)) as sock:
         with ctx.wrap_socket(sock, server_hostname=target) as ssock:
           cert = ssock.getpeercert()
           subj = dict(x[0] for x in cert.get("subject", ()))

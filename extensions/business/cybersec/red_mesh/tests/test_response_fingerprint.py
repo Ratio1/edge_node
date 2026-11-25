@@ -362,23 +362,24 @@ class _Peer:
   """
 
   def __init__(self, script, declared, headers=b"Content-Type: text/html\r\n",
-               header_script=None):
+               header_script=None, bind_host="127.0.0.1"):
     self._script = script
     self._declared = declared
     self._headers = headers
     self._header_script = header_script
+    self.requests = []
     self._stop = threading.Event()
-    self._server = socket.socket()
+    self._server = socket.socket(socket.AF_INET6 if ":" in bind_host else socket.AF_INET)
     self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    self._server.bind(("127.0.0.1", 0))
+    self._server.bind((bind_host, 0))
     self._server.listen(1)
     self.port = self._server.getsockname()[1]
     threading.Thread(target=self._serve, daemon=True).start()
 
   @classmethod
-  def serving(cls, body):
+  def serving(cls, body, **kwargs):
     """A peer that returns one complete body and closes."""
-    return cls(lambda: [(body, 0)], declared=len(body))
+    return cls(lambda: [(body, 0)], declared=len(body), **kwargs)
 
   @classmethod
   def dripping(cls, prefix=b"", interval=0.05):
@@ -426,7 +427,7 @@ class _Peer:
 
   def _handle(self, conn):
     try:
-      conn.recv(65536)
+      self.requests.append(conn.recv(65536))
       if self._header_script is not None:
         for payload, delay in self._header_script():
           if self._stop.is_set():
@@ -468,6 +469,7 @@ class _TlsPeer(_Peer):
   """A `_Peer` behind a real TLS handshake, using an in-memory self-signed cert."""
 
   _context = None
+  server_names = []  # SNI names presented by clients, across all peers
 
   @classmethod
   def _server_context(cls):
@@ -507,6 +509,7 @@ class _TlsPeer(_Peer):
       bundle.close()
       context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
       context.load_cert_chain(bundle.name)
+      context.sni_callback = lambda _sock, name, _ctx: cls.server_names.append(name)
     finally:
       try:
         os.unlink(bundle.name)
@@ -1568,6 +1571,194 @@ class TestAggregationAttribution(unittest.TestCase):
   def test_response_evidence_is_not_a_cross_worker_aggregated_field(self):
     fields = PentestLocalWorker.get_worker_specific_result_fields()
     self.assertNotIn("response_evidence", fields)
+
+
+class TestDnsMultiplicityBound(unittest.TestCase):
+  """
+  RM-067: a target that publishes N blackholed A records must not multiply the
+  connect legs that run ahead of the HTTP request, and the three legs must all
+  observe the one address the reachability leg connected to.
+
+  The blackhole is simulated at `socket.socket.connect`, below
+  `create_connection` and urllib3 alike, so every dial path is subject to it
+  and the test does not depend on what a real non-routable address does.
+  """
+
+  CONNECT_TIMEOUT = 0.2
+  SLOW = "192.0.2."       # consumes the socket's whole timeout, then times out
+  FAST = "198.51.100."    # fails at once, as a refused or unreachable record does
+
+  def setUp(self):
+    self.dials = []
+    real_connect = socket.socket.connect
+    test = self
+
+    def _connect(sock, address):
+      host = address[0]
+      test.dials.append(host)
+      if host.startswith(test.SLOW):
+        time.sleep(sock.gettimeout() or 0)
+        raise socket.timeout("timed out")
+      if host.startswith(test.FAST):
+        raise ConnectionRefusedError("refused")
+      return real_connect(sock, address)
+
+    patcher = patch.object(socket.socket, "connect", _connect)
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
+  def _zone(self, bad_prefix, count, live_port):
+    """The hostile name answers `count - 1` bad records, then the live one."""
+    real = socket.getaddrinfo
+    records = [
+      (socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"{bad_prefix}{n}", live_port))
+      for n in range(1, count)
+    ] + [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", live_port))]
+
+    def _lookup(host, *args, **kwargs):
+      return records if host == "multi.test" else real(host, *args, **kwargs)
+
+    patcher = patch("socket.getaddrinfo", side_effect=_lookup)
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
+  def _worker(self, port):
+    worker = _make_worker(target="multi.test", comparison_ports=[port])
+    worker._target_timeout = lambda _standard: self.CONNECT_TIMEOUT
+    return worker
+
+  def test_a_port_probe_is_bounded_whatever_the_address_count(self):
+    peer = _Peer.serving(b"ok")
+    self.addCleanup(peer.close)
+    for count in (10, 20):
+      with self.subTest(addresses=count):
+        self._zone(self.SLOW, count, peer.port)
+        worker = self._worker(peer.port)
+        started = time.monotonic()
+        entry = worker._fingerprint_port(peer.port)
+        elapsed = time.monotonic() - started
+        # Unfixed this is (count - 1) x 0.2 s for the reachability leg alone.
+        self.assertLess(
+          elapsed, self.CONNECT_TIMEOUT * 3,
+          f"{count} A-records held one port probe for {elapsed:.1f}s",
+        )
+        self.assertFalse(entry["reachable"])  # no record answered within the budget
+
+  def test_both_tls_connects_are_bounded_whatever_the_address_count(self):
+    peer = _Peer.serving(b"ok")
+    self.addCleanup(peer.close)
+    for count in (10, 20):
+      for name in ("_tls_unverified_connect", "_tls_check_certificate"):
+        with self.subTest(addresses=count, connect=name):
+          self._zone(self.SLOW, count, peer.port)
+          worker = self._worker(peer.port)
+          args = ("multi.test", peer.port) + (({},) if name == "_tls_check_certificate" else ())
+          started = time.monotonic()
+          getattr(worker, name)(*args)
+          elapsed = time.monotonic() - started
+          self.assertLess(
+            elapsed, self.CONNECT_TIMEOUT * 3,
+            f"{count} A-records held {name} for {elapsed:.1f}s",
+          )
+
+  def _assert_one_endpoint(self, peer, scheme, expected_host):
+    """All three legs reach the live record, never re-walking the bad ones."""
+    for count in (10, 20):
+      with self.subTest(addresses=count):
+        self.dials.clear()
+        self._zone(self.FAST, count, peer.port)
+        worker = self._worker(peer.port)
+        entry = worker._fingerprint_port(peer.port)
+        self.assertTrue(entry["reachable"], "the live record answered within the budget")
+        self.assertEqual(
+          sum(1 for host in self.dials if host.startswith(self.FAST)), count - 1,
+          "the bad records were walked once, by the reachability leg only",
+        )
+        self.assertEqual({h for h in self.dials if not h.startswith(self.FAST)}, {"127.0.0.1"})
+        self.assertEqual(entry["http"]["status"], 200)
+    request = next(r for r in reversed(peer.requests) if r.startswith(b"GET"))
+    self.assertIn(f"Host: {expected_host}\r\n".encode(), request)
+
+  def test_all_three_legs_use_one_address_and_send_the_hostname_over_http(self):
+    peer = _Peer.serving(b"ok")
+    self.addCleanup(peer.close)
+    self._assert_one_endpoint(peer, "http", f"multi.test:{peer.port}")
+
+  def test_all_three_legs_use_one_address_and_keep_hostname_for_sni_and_host(self):
+    peer = _TlsPeer.serving(b"ok")
+    self.addCleanup(peer.close)
+    _TlsPeer.server_names.clear()
+    self._assert_one_endpoint(peer, "https", f"multi.test:{peer.port}")
+    # An IP-literal handshake sends no SNI at all, which is how the hazard shows.
+    self.assertIn("multi.test", _TlsPeer.server_names)
+    self.assertEqual(set(_TlsPeer.server_names), {"multi.test"})
+
+  def test_the_general_tls_probe_keeps_working_for_a_hostname_target(self):
+    peer = _TlsPeer.serving(b"ok")
+    self.addCleanup(peer.close)
+    _TlsPeer.server_names.clear()
+    self._zone(self.FAST, 5, peer.port)
+    proto, cipher, cert_der = self._worker(peer.port)._tls_unverified_connect("multi.test", peer.port)
+    self.assertTrue(proto and cipher and cert_der)
+    self.assertEqual(set(_TlsPeer.server_names), {"multi.test"})
+
+  def test_a_literal_ip_target_is_dialed_without_a_lookup(self):
+    worker = self._worker(443)
+    with patch("socket.getaddrinfo") as lookup, \
+         patch("socket.create_connection", side_effect=OSError("stop")) as dial:
+      worker._tls_unverified_connect("127.0.0.1", 443)
+    lookup.assert_not_called()
+    self.assertEqual(dial.call_args.args[0], ("127.0.0.1", 443))
+
+  def test_an_unresolvable_target_is_unreachable_and_never_dialed_by_name(self):
+    worker = self._worker(443)
+    with patch("socket.getaddrinfo", side_effect=socket.gaierror("no such host")), \
+         patch("socket.create_connection") as dial:
+      self.assertEqual(worker._tls_unverified_connect("nx.test", 443), (None, None, None))
+    dial.assert_not_called()
+
+  def test_an_empty_resolution_is_unreachable_and_never_dialed_by_name(self):
+    worker = self._worker(443)
+    with patch("socket.getaddrinfo", return_value=[]), \
+         patch("socket.create_connection") as dial:
+      self.assertEqual(worker._tls_unverified_connect("empty.test", 443), (None, None, None))
+    dial.assert_not_called()
+
+  def test_a_slow_resolver_is_bounded_by_the_same_budget(self):
+    worker = self._worker(443)
+
+    def _slow(*_args, **_kwargs):
+      time.sleep(self.CONNECT_TIMEOUT * 5)
+      return []
+
+    with patch("socket.getaddrinfo", side_effect=_slow), \
+         patch("socket.create_connection") as dial:
+      started = time.monotonic()
+      self.assertEqual(worker._tls_unverified_connect("slow.test", 443), (None, None, None))
+      elapsed = time.monotonic() - started
+    dial.assert_not_called()
+    self.assertLess(elapsed, self.CONNECT_TIMEOUT * 3)
+
+  def test_a_refused_ipv4_record_falls_through_to_the_ipv6_record_and_pins_it(self):
+    try:
+      peer = _Peer.serving(b"ok", bind_host="::1")
+    except OSError:
+      self.skipTest("IPv6 loopback unavailable")
+    self.addCleanup(peer.close)
+    real = socket.getaddrinfo
+    records = [
+      (socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"{self.FAST}1", peer.port)),
+      (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", peer.port, 0, 0)),
+    ]
+    lookup = lambda host, *a, **k: records if host == "multi.test" else real(host, *a, **k)
+    with patch("socket.getaddrinfo", side_effect=lookup):
+      entry = self._worker(peer.port)._fingerprint_port(peer.port)
+    self.assertTrue(entry["reachable"])
+    self.assertEqual(entry["http"]["status"], 200)
+    self.assertEqual(self.dials[0], f"{self.FAST}1")
+    self.assertEqual(set(self.dials[1:]), {"::1"})
+    request = next(r for r in reversed(peer.requests) if r.startswith(b"GET"))
+    self.assertIn(f"Host: multi.test:{peer.port}\r\n".encode(), request)
 
 
 if __name__ == "__main__":

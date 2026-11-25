@@ -2,6 +2,7 @@ import json
 import re as _re
 import sys
 import struct
+import socket
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -476,6 +477,9 @@ class RedMeshOWASPTests(unittest.TestCase):
       return DummyContextUnverified()
 
     with patch(
+      "socket.getaddrinfo",  # RM-067: the dial resolves first; keep these tests offline
+      return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+    ), patch(
       "extensions.business.cybersec.red_mesh.worker.service.tls.socket.create_connection",
       return_value=DummyConn(),
     ), patch(
@@ -535,6 +539,9 @@ class RedMeshOWASPTests(unittest.TestCase):
     import ssl
 
     with patch(
+      "socket.getaddrinfo",  # RM-067: the dial resolves first; keep these tests offline
+      return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+    ), patch(
       "extensions.business.cybersec.red_mesh.worker.service.tls.socket.create_connection",
       return_value=DummyConn(),
     ), patch(
