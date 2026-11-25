@@ -16,6 +16,7 @@ from functools import cmp_to_key
 from pathlib import Path
 
 from ..cve_db import _compare_debian_revision, _compare_versions, _parse_version
+from ..cvss_entries import cvss_v4_nomenclature
 from .models import SUPPORTED_MODELS
 
 DB_PATH = Path(__file__).resolve().parent / "vulndb.sqlite"
@@ -389,8 +390,10 @@ def load_reader(db_path=DB_PATH, pin_path=PIN_PATH):
       rows = (row for row in conn.execute(_AFFECTED) if row[0] in vulns)
       cvss = {}
       for cve_id, version, vector, score, source in _optional(conn, _CVSS):
-        cvss.setdefault(cve_id, []).append(
-          {"version": version, "vector": vector, "score": score, "source": source})
+        entry = {"version": version, "vector": vector, "score": score, "source": source}
+        if version == "4.0" and isinstance(vector, str):
+          entry["nomenclature"] = cvss_v4_nomenclature(vector)  # RM-170: findings carry the v4.0 nomenclature
+        cvss.setdefault(cve_id, []).append(entry)
       cvss = {k: tuple(v) for k, v in cvss.items()}
       eol = dict(_optional(conn, _EOL))
       # A file without the snapshot key of a distribution, or without the table (schema 1.0.0), has no data for it.

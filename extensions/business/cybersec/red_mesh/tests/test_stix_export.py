@@ -198,7 +198,7 @@ class TestStixExport(unittest.TestCase):
     vulns = [o for o in bundle["objects"] if o["type"] == "vulnerability"]
     entries = vulns[0]["x_redmesh_context"]["cvss"]
     self.assertEqual([e["version"] for e in entries], ["3.1", "4.0"])
-    self.assertEqual(entries[1], {"version": "4.0", "vector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N", "score": 9.3, "source": "nvd"})
+    self.assertEqual(entries[1], {"version": "4.0", "vector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N", "score": 9.3, "source": "nvd", "nomenclature": "CVSS-B"})
     self.assertNotIn("cvss", vulns[1]["x_redmesh_context"])
 
   def test_stix_context_drops_duplicates_and_bad_entries(self):
@@ -220,6 +220,13 @@ class TestStixExport(unittest.TestCase):
                                  {"version": "4.0", "vector": v4.replace("U:Red", "U:Purple")},
                                  {"version": "4.0", "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]})
     self.assertEqual([(e["version"], e["vector"]) for e in got], [("4.0", v4)])
+    self.assertEqual(got[0]["nomenclature"], "CVSS-B")
+
+  def test_v4_nomenclature(self):
+    from extensions.business.cybersec.red_mesh.cvss_entries import cvss_v4_nomenclature
+    base = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"
+    self.assertEqual([cvss_v4_nomenclature(base + s) for s in ("", "/E:X", "/E:A", "/CR:H", "/E:P/MAV:L", "/U:Red/R:A")],
+                     ["CVSS-B", "CVSS-B", "CVSS-BT", "CVSS-BE", "CVSS-BTE", "CVSS-B"])
 
   def test_every_sdo_carries_the_job_tenant_label(self):
     """RM-139: the label OpenCTI and TAXII consumers filter one tenant's objects by."""

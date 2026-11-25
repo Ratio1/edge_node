@@ -212,7 +212,7 @@ def build():
       finding["cvss"] = [
         {"version": finding["cvss_version"], "vector": finding["cvss_vector"],
          "score": finding["cvss_score"], "source": finding["cvss_source"]},
-        {"version": "4.0", "vector": _CVSS_V4_VECTOR, "score": 7.3, "source": "nvd"},
+        {"version": "4.0", "vector": _CVSS_V4_VECTOR, "score": 7.3, "source": "nvd", "nomenclature": "CVSS-B"},
       ]
   flat = sorted(flat, key=lambda f: (f["probe"], f["port"], f["title"], f["finding_id"]))
   return {

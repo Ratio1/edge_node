@@ -207,11 +207,12 @@ def _build_misp_event(target, scan_type, task_name, job_id, risk_score,
     if not is_cvss_vector(label):
       label = next((e["vector"] for e in entries if e["version"] != "4.0"), None)
     if label is None and v4:
-      label, v4 = v4["vector"], None
+      label = v4["vector"]
     if label:
       comment = ""
-      if v4:
-        comment = f"CVSS v4.0: {v4['vector']}" + (f" ({v4['score']})" if "score" in v4 else "")
+      if v4:  # names the v4.0 entry; its vector is left out when it already is the cvss-string
+        comment = f"CVSS v4.0 ({v4['nomenclature']})" + ("" if v4["vector"] == label else f": {v4['vector']}")
+        comment += f" score {v4['score']}" if "score" in v4 else ""
       vuln.add_attribute("cvss-string", label, comment=comment) if comment else vuln.add_attribute("cvss-string", label)
 
     # References as individual link attributes

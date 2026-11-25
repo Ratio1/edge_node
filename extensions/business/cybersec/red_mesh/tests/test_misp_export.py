@@ -359,7 +359,7 @@ class TestBuildMispEvent(unittest.TestCase):
     # Both vectors, v3.1 first; a finding without cvss[] falls back to cvss_vector or none
     strings = [a for a in sqli_vuln.attributes if a.object_relation == "cvss-string"]
     self.assertEqual([a.value for a in strings], ["CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"])
-    self.assertEqual(strings[0].comment, "CVSS v4.0: CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N (9.3)")
+    self.assertEqual(strings[0].comment, "CVSS v4.0 (CVSS-B): CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N score 9.3")
     self.assertEqual([a for a in vuln_objects[1].attributes if a.object_relation == "cvss-string"], [])
 
   def _vuln(self, **extra):
@@ -392,6 +392,13 @@ class TestBuildMispEvent(unittest.TestCase):
     v31 = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
     obj = self._vuln(cvss_vector=v31)
     self.assertEqual([a.value for a in obj.attributes if a.object_relation == "cvss-string"], [v31])
+    self._assert_strict(obj)
+
+  def test_v4_only_finding_keeps_its_score(self):
+    v4 = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N/E:A"
+    obj = self._vuln(cvss_vector="", cvss=[{"version": "4.0", "vector": v4, "score": 9.3, "source": "nvd"}])
+    strings = [a for a in obj.attributes if a.object_relation == "cvss-string"]
+    self.assertEqual([(a.value, a.comment) for a in strings], [(v4, "CVSS v4.0 (CVSS-BT) score 9.3")])
     self._assert_strict(obj)
 
   def test_invalid_vector_is_not_exported(self):

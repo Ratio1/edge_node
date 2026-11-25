@@ -8,6 +8,15 @@ from typing import Any
 CVSS_VECTOR_RE = re.compile(r"^CVSS:[0-9.]+(/(?:U:(?:Clear|Green|Amber|Red)|[A-Z]+:[A-Z]))+$")
 MAX_CVSS_VECTOR_CHARS = 256
 _VERSION_ORDER = {"3.1": 0, "3.0": 1, "4.0": 2}
+# v4.0 threat metric (E) and environmental metrics; `X` means "not defined". Supplemental metrics do not count.
+_V4_THREAT = {"E"}
+_V4_ENV = {"CR", "IR", "AR", "MAV", "MAC", "MAT", "MPR", "MUI", "MVC", "MVI", "MVA", "MSC", "MSI", "MSA"}
+
+
+def cvss_v4_nomenclature(vector: str) -> str:
+  """CVSS v4.0 nomenclature of a vector (spec section 1.3): CVSS-B, CVSS-BT, CVSS-BE or CVSS-BTE."""
+  metrics = {m for m, _, v in (p.partition(":") for p in vector.split("/")[1:]) if v != "X"}
+  return "CVSS-B" + ("T" if metrics & _V4_THREAT else "") + ("E" if metrics & _V4_ENV else "")
 
 
 def is_cvss_vector(value: Any) -> bool:
@@ -38,6 +47,8 @@ def cvss_entries(finding: dict) -> list[dict]:
     if isinstance(score, (int, float)) and not isinstance(score, bool):
       item["score"] = score
     if entry.get("source"):
-      item["source"] = str(entry["source"])
+      item["source"] = str(entry["source"])[:32]
+    if version == "4.0":
+      item["nomenclature"] = cvss_v4_nomenclature(vector)
     out.append(item)
   return sorted(out, key=lambda e: _VERSION_ORDER[e["version"]])

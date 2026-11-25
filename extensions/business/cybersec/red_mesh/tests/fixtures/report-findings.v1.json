@@ -317,6 +317,7 @@
           "version": "3.1"
         },
         {
+          "nomenclature": "CVSS-B",
           "score": 7.3,
           "source": "nvd",
           "vector": "CVSS:4.0/AV:L/AC:H/AT:N/PR:L/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
