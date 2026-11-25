@@ -335,8 +335,12 @@ class FormAuth(AuthStrategy):
     return resp, None, cfg_url
 
   def _submit(self, session, creds, resp, form, login_url):
-    # Auto-detect or use configured CSRF field
-    csrf_field, csrf_token = self._extract_csrf(resp.text)
+    # Anti-forgery token: a detected form's own (never another form's on the
+    # page); otherwise auto-detect or the configured field, page-wide.
+    if form is not None:
+      csrf_field, csrf_token = self._form_csrf(form.fields)
+    else:
+      csrf_field, csrf_token = self._extract_csrf(resp.text)
     if csrf_field:
       self.last_detected_csrf_field = csrf_field
 
@@ -354,8 +358,6 @@ class FormAuth(AuthStrategy):
     payload[user_field] = creds.username
     payload[pass_field] = creds.password
     headers = {"Referer": login_url}
-    if form is not None and csrf_field in form.fields:
-      csrf_token = form.fields[csrf_field]  # the form's own token, not another form's
     if csrf_token and csrf_field:
       payload[csrf_field] = csrf_token
       headers["X-CSRFToken"] = csrf_token
@@ -420,11 +422,13 @@ class FormAuth(AuthStrategy):
     # that as a rejection aborts the entire authenticated scan — the mirror of
     # the bug above, with the same end result of findings never being looked for.
     # Back on the login page (the form's page, or its action) is not navigation.
-    # Detected form: exact path+query (a root action must not match every URL);
+    # Detected form: same path as the action or the page, query ignored
+    # (`/login?error` is still the login page; a root action matches only `/`);
     # legacy configured path: the historical substring rule.
     final = response.url or ""
     if page_url:
-      on_login = _path_query(final) in (_path_query(login_url), _path_query(page_url))
+      on_login = _path_query(final)[0] in (
+        _path_query(login_url)[0], _path_query(page_url)[0])
     else:
       on_login = login_url in final
     navigated_away = bool(response.history) and not on_login
@@ -436,6 +440,17 @@ class FormAuth(AuthStrategy):
     # the authenticated probe path check in
     # `AuthManager._validate_authenticated_session` when one is configured.
     return bool(session.cookies.get_dict())
+
+  def _form_csrf(self, fields):
+    """``(field_name, token_value)`` among a detected form's own fields."""
+    configured = getattr(self.target_config, "csrf_field", "") or ""
+    for name in (configured, *_FORM_AUTH_CSRF_FIELDS):
+      if name and fields.get(name):
+        return (name, fields[name])
+    for name, value in fields.items():
+      if value and ("csrf" in name.lower() or "token" in name.lower()):
+        return (name, value)
+    return (None, None)
 
   def _extract_csrf(self, html):
     """Return ``(field_name, token_value)`` or ``(None, None)``.

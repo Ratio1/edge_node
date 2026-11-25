@@ -360,6 +360,37 @@ class TestFormSearch(unittest.TestCase):
     self._login(site)
     self.assertEqual(site.posts[0][1]["_token"], "LOGIN")
 
+  def test_another_forms_token_of_a_different_name_is_not_sent(self):
+    news = ('<form method="post" action="/news"><input type="hidden" '
+            'name="csrfmiddlewaretoken" value="NEWS"><input name="email"></form>')
+    login = AUDIT_FORM.replace('<input name="user_login">',
+                               '<input type="hidden" name="_token" value="LOGIN"><input name="user_login">')
+    site = FakeSite({"/auth/login/": (200, news + login), "/dashboard": DASHBOARD})
+    headers = []
+    real_post = site.post
+
+    def post(url, **kw):
+      headers.append(kw.get("headers") or {})
+      return real_post(url, **kw)
+    site.post = post
+    self._login(site)
+    self.assertNotIn("csrfmiddlewaretoken", site.posts[0][1])
+    self.assertEqual(headers[0].get("X-CSRFToken"), "LOGIN")
+
+  def test_failed_login_back_to_the_login_page_with_a_query_is_rejected(self):
+    form = AUDIT_FORM.replace('action="/signin"', 'action="/login"')
+    site = FakeSite({"/auth/login/": (302, "", {"Location": "/login"}), "/login": (200, form),
+                     "/login?error": (200, form)})
+    real_post = site.post
+
+    def post(url, **kw):
+      real_post(url, **kw)
+      site.cookies["JSESSIONID"] = "pre"
+      return FakeResp(302, "", {"Location": "/login?error"}, HOST + "/login")
+    site.post = post
+    _, session = self._login(site)
+    self.assertIsNone(session)
+
   def test_a_root_action_login_reaching_a_page_with_a_password_widget_succeeds(self):
     form = AUDIT_FORM.replace('action="/signin"', 'action="/"')
     site = FakeSite({
