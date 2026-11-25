@@ -33,6 +33,9 @@ def is_view_finding(f):
 
 
 def _subject(f):
+  """`(product, version)`: a probe CVE finding's structured fields (RM-263), else read from the description."""
+  if f.get("product"):
+    return (str(f["product"]), str(f.get("version") or ""))
   m = _SUBJECT.match(str(f.get("description") or ""))
   return (m.group(1), m.group(2)) if m else ("", "")
 
@@ -124,9 +127,13 @@ def _rank(f):
 
 
 def _fix_version(product, members):
-  """Highest `<` upper bound among the members' constraints; None when a member has none."""
+  """Highest `<` upper bound among the members' constraints; None when a member has none.
+
+  A member with no `affected:` evidence (a probe finding, RM-263) says nothing about the fix and is skipped when
+  another member has some."""
   best = None
-  for f in members:
+  with_evidence = [f for f in members if _AFFECTED.search(str(f.get("evidence") or ""))]
+  for f in with_evidence or members:
     match = _AFFECTED.search(str(f.get("evidence") or ""))
     bounds = []
     for clause in (match.group(1).split(",") if match else ()):
@@ -244,7 +251,8 @@ def build_cve_view(findings, not_applicable=(), triage=None, now=None):
     services.append({
       "port": port,
       "product": product,
-      "version": _subject(min(members, key=_rank))[1],
+      # The best-ranked member that names a version: a probe member has none (RM-263).
+      "version": next((v for v in (_subject(f)[1] for f in sorted(members, key=_rank)) if v), ""),
       "listed": [f["finding_id"] for f in listed],
       "rollup": _rollup(product, sorted(rest, key=_rank)) if rest else None,
       "possible": _possible(tentative) if tentative else None,

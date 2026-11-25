@@ -131,6 +131,7 @@ class VulndbReader:
     self._vulns = vulns
     self._exact = {}   # (product, normalised numbers, tail) -> [affected row]
     self._ranges = {}  # product -> [(clauses, affected row)]
+    self._products = None  # cve_id -> {product}, built on first `probe_record`
     self._exact_sorted = {}  # product -> [(key, affected row)] sorted by key, built on the first span query
     self._distro = {}  # (distro, product) -> {cve_id: [(release, package, status, fixed_version, source)]}
     self._distro_releases = {}  # (distro, product) -> {upstream: {release}}, from the rows that name a fixed version
@@ -176,6 +177,25 @@ class VulndbReader:
     """KEV flag of `cve_id` in this build; None when the build has no `vuln` row for it."""
     vuln = self._vulns.get(cve_id)
     return None if vuln is None else bool(vuln[Match._fields.index("kev") - Match._fields.index("title")])
+
+  def probe_record(self, cve_id):
+    """`(epss, cvss, products)` of `cve_id` in this build, for a finding a probe confirmed itself; None when the build
+    has no `vuln` row for it. `cvss` is the `{version, vector, score, source}` list; `products` the sorted products
+    the build's affected rows name for the CVE (rows that do not parse are not counted, as in `query`)."""
+    vuln = self._vulns.get(cve_id)
+    if vuln is None:
+      return None
+    if self._products is None:
+      products = {}
+      for rows in self._exact.values():
+        for row in rows:
+          products.setdefault(row[0], set()).add(row[1])
+      for rows in self._ranges.values():
+        for _, row in rows:
+          products.setdefault(row[0], set()).add(row[1])
+      self._products = products  # one assignment: probes run on worker threads
+    return vuln[Match._fields.index("epss") - Match._fields.index("title")], self._cvss.get(cve_id, ()), \
+      tuple(sorted(self._products.get(cve_id, ())))
 
   def _release(self, package, product):
     """The release a node's package belongs to, or None (unknown, or more than one candidate)."""

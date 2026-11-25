@@ -752,14 +752,24 @@ def set_vulndb_reader(reader) -> None:
 
 
 def probe_cve_fields(cve_id: str) -> dict:
-  """KEV and build for a CVE a probe confirmed itself (Heartbleed), not matched by `check_cves`.
+  """Database fields for a CVE a probe confirmed itself (Heartbleed), not matched by `check_cves`.
 
-  `static`: KEV not evaluated. `generated`: the build is named; KEV is None when the build has no row for the CVE.
+  `static`: KEV not evaluated, nothing else. `generated`: the build is named; KEV is None when the build has no row
+  for the CVE. With a row, the finding also gets the row's EPSS and `cvss[]` list, and the CVE view's subject
+  `product`: the one product the build's rows name for the CVE, none when it names several. Never `cvss_score`, vector or severity: those stay the probe's call (RM-263).
   """
   reader = _VULNDB_READER
   if reader is None:
     return {"kev": None}
-  return {"kev": reader.kev(cve_id), "vulndb_build_id": reader.build_id}
+  fields = {"kev": reader.kev(cve_id), "vulndb_build_id": reader.build_id}
+  record = reader.probe_record(cve_id)
+  if record is None:
+    return fields
+  epss, cvss, products = record
+  fields.update(epss_score=epss, cvss=tuple(dict(c) for c in cvss))
+  if len(products) == 1:
+    fields["product"] = products[0]
+  return fields
 
 
 def set_dynamic_reference_cache(dynamic_cache):
