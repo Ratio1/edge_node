@@ -73,6 +73,7 @@ import threading
 import time
 import socket
 import subprocess
+from naeural_core.utils.process_credentials import child_environment, launch_with_tunnel_token, redact_command
 from enum import Enum
 from dataclasses import dataclass
 from typing import Optional
@@ -1945,8 +1946,27 @@ class ContainerAppRunnerPlugin(
     return
 
 
-  def run_tunnel_command(self, command):
-    """Launch a main tunnel without a shell or credential-bearing logs."""
+  def run_tunnel_command(self, command, *, token=None):
+    """Start the main tunnel as a direct subprocess.
+
+    A managed Cloudflare connection receives its credential on stdin.
+
+    Parameters
+    ----------
+    command : str or list or tuple
+      Tunnel invocation after selecting its origin and protocol.
+    token : str or None, optional
+      Managed Cloudflare credential for the one-use pipe.
+
+    Returns
+    -------
+    subprocess.Popen or None
+      Running connector, or None if launching it failed.
+
+    Examples
+    --------
+    >>> plugin.run_tunnel_command(["cloudflared", "--version"])  # doctest: +SKIP
+    """
     if not command:
       return None
 
@@ -1964,24 +1984,23 @@ class ContainerAppRunnerPlugin(
     if not command:
       return None
 
-    token = self.get_cloudflare_token()
-    safe_command = list(command)
-    if self.use_cloudflare():
-      safe_command = self._redact_tunnel_command(safe_command)
-    elif token:
-      safe_command = ["[REDACTED]" if part == str(token) else part for part in safe_command]
+    # Cover credentials in both managed and explicitly supplied tunnel commands.
+    safe_command = redact_command(command, os.environ, extra_values=(token,))
 
     try:
       self.P(f"Running tunnel command: {' '.join(safe_command)}")
+      # A managed connector receives its scoped credential only through the pipe below.
       popen_kwargs = dict(
         args=command,
+        env=child_environment(os.environ, extra_values=(token,)),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0,
       )
       if os.name != "nt":
         popen_kwargs["start_new_session"] = True
-      process = subprocess.Popen(**popen_kwargs)
+      # Do not expose the credential as an argument or subprocess environment value.
+      process = launch_with_tunnel_token(token, **popen_kwargs)
       self._remember_process_group(process)
 
       logs_reader = self.LogReader(process.stdout, size=100, daemon=None)
@@ -1999,7 +2018,23 @@ class ContainerAppRunnerPlugin(
 
 
   def run_tunnel_engine(self):
-    """Build the primary Cloudflare command as an argument vector."""
+    """Launch the main configured tunnel for the selected engine.
+
+    Cloudflare's normalized main-port credential travels on stdin.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    subprocess.Popen or None
+      Started connector process, when configured.
+
+    Examples
+    --------
+    >>> plugin.run_tunnel_engine()  # doctest: +SKIP
+    """
     if not self.use_cloudflare():
       return super(ContainerAppRunnerPlugin, self).run_tunnel_engine()
 
@@ -2014,7 +2049,8 @@ class ContainerAppRunnerPlugin(
       tunnel_config.get("token"),
       tunnel_config.get("protocol", "http"),
     )
-    return self.run_tunnel_command(command)
+    # Ship the credential on stdin independently of the CLI arguments.
+    return self.run_tunnel_command(command, token=tunnel_config["token"])
 
   def _get_main_tunnel_config(self):
     """
@@ -2416,7 +2452,7 @@ class ContainerAppRunnerPlugin(
     container_port : int
         Container port to tunnel
     token : str
-        Cloudflare tunnel token
+        Managed tunnel credential. Its presence selects the token-file form.
     protocol : str, optional
         Tunnel origin protocol (default "http")
     no_tls_verify : bool, optional
@@ -2426,37 +2462,33 @@ class ContainerAppRunnerPlugin(
     -------
     list or None
         Command list to execute, or None if error
+
+    Examples
+    --------
+    >>> plugin._build_tunnel_command(8080, "configured")  # doctest: +SKIP
     """
     host_port = self._get_host_port_for_container_port(container_port)
     if not host_port:
       self.P(f"No host port found for container port {container_port}", color='r')
       return None
 
-    # Return list to avoid shell injection - use list-based subprocess
+    if not token:
+      return None
+
+    # Preserve individual argument boundaries and send the credential on stdin.
     command = [
       "cloudflared",
       "tunnel",
       "--no-autoupdate",
       "run",
-      "--token",
-      str(token),
+      "--token-file",
+      "/dev/stdin",
       "--url",
       f"{protocol}://127.0.0.1:{host_port}"
     ]
     if no_tls_verify:
       command.append("--no-tls-verify")
     return command
-
-
-  def _redact_tunnel_command(self, command):
-    """Return a log-safe copy of a cloudflared command."""
-    redacted = list(command)
-    try:
-      token_index = redacted.index("--token") + 1
-      redacted[token_index] = "[REDACTED]"
-    except (ValueError, IndexError):
-      pass
-    return redacted
 
 
   def _should_start_main_tunnel(self):
@@ -2501,6 +2533,10 @@ class ContainerAppRunnerPlugin(
     -------
     bool
         True if tunnel started successfully, False otherwise
+
+    Examples
+    --------
+    >>> plugin._start_extra_tunnel(8081, {"token": "configured"})  # doctest: +SKIP
     """
     if isinstance(tunnel_config, dict):
       token = tunnel_config.get("token")
@@ -2526,18 +2562,20 @@ class ContainerAppRunnerPlugin(
     try:
       host_port = self._get_host_port_for_container_port(container_port)
       self.P(f"Starting Cloudflare tunnel for container port {container_port} (host port {host_port})...")
-      self.Pd(f"  Command: {' '.join(self._redact_tunnel_command(command))}")
+      self.Pd(f"  Command: {' '.join(redact_command(command, os.environ, extra_values=(token,)))}")
 
-      # Use list-based subprocess to prevent shell injection
+      # Preserve argument boundaries and pass the scoped credential through stdin.
       popen_kwargs = dict(
         args=command,
+        env=child_environment(os.environ, extra_values=(token,)),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0,
       )
       if os.name != "nt":
         popen_kwargs["start_new_session"] = True
-      process = subprocess.Popen(**popen_kwargs)
+      # Each initial launch and restart receives a fresh one-use pipe.
+      process = launch_with_tunnel_token(token, **popen_kwargs)
       self._remember_process_group(process)
 
       # Create log readers for this tunnel
@@ -2558,8 +2596,8 @@ class ContainerAppRunnerPlugin(
       self.P(f"Extra tunnel for port {container_port} started (PID: {process.pid})")
       return True
 
-    except Exception as e:
-      self.P(f"Failed to start extra tunnel for port {container_port}: {e}", color='r')
+    except Exception as exc:
+      self.P(f"Failed to start extra tunnel for port {container_port}: {type(exc).__name__}", color='r')
       # Record failure for backoff tracking
       self._record_tunnel_restart_failure(container_port)
       return False
