@@ -33,8 +33,9 @@ SYSTEM_NAMESPACES = (
 SYSTEM_HASH_KEYS = (
   # dAuth: job secrets, their revisions, revoked unlicensed nodes, and the request log of the dAuth manager.
   "DAUTH_JOB_SECRETS", "DAUTH_JOB_SECRET_REVISIONS", "DAUTH_REVOKED_UNLICENSED_NODES", "DAUTH_REQUESTS",
-  # Deeploy: the jobs hash, the operation and node-operation hashes, and the request log of the Deeploy manager.
+  # Deeploy: jobs, deployment status, terminal refusal proofs and the manager's request log.
   "DEEPLOY_DEPLOYED_JOBS", "DEEPLOY_OPERATIONS", "DEEPLOY_NODE_OPERATIONS", "DEEPLOY_REQUESTS",
+  "DEEPLOY_REPLACEMENT_REFUSALS",
   # Node key rotations.
   "NODE_KEY_ROTATIONS",
   # Tunnels Manager: tunnel credentials and TCP routes (the plugin's default TCP_ROUTES_HKEY).

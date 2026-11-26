@@ -32,10 +32,10 @@ OTHER_TENANT = "tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f"
 ))
 def test_denials_never_prepare_or_submit_analysis(fault, status):
   with read_endpoint_fixture(bound=True, role="super_tenant_admin") as fixture:
-    account = fixture.store.data[("auth", "reader")]
+    account = fixture.store.data[("deployment:auth", "reader")]
     actor, tenant_id = fixture.actor, allow_pentester(fixture)
     if fault == "actor": actor = None
-    elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
+    elif fault == "deleted": fixture.store.data.pop(("deployment:auth", "reader"))
     elif fault == "inactive": fixture.store.account("reader", active=False)
     elif fault == "none_scope": account["memberships"] = []
     elif fault == "tenant_user": as_role(fixture, "tenant_user")
@@ -46,7 +46,7 @@ def test_denials_never_prepare_or_submit_analysis(fault, status):
       allow_pentester(fixture, False)
     elif fault == "missing_tenant": tenant_id = None
     elif fault == "unknown_tenant": tenant_id = OTHER_TENANT
-    elif fault == "identity_store": fixture.store.fail_hkey = "auth"
+    elif fault == "identity_store": fixture.store.fail_hkey = "deployment:auth"
 
     result = fixture.Plugin.analyze_job(fixture.owner, **BODY, request_actor=actor,
                                         tenant_id=tenant_id)

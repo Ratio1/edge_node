@@ -45,8 +45,9 @@ class TestCveCvssTable(unittest.TestCase):
     self.assertEqual(missing, [], "rerun tools/fill_cve_vectors.py")
 
   def test_the_v2_only_list_only_shrinks(self):
-    # NVD publishes no v3.x metric for these; a CVE joins only after checking NVD by hand.
-    self.assertLessEqual(CVE_WITHOUT_V3, {"CVE-2013-4547", "CVE-2014-3704", "CVE-2015-3337"})
+    # NVD publishes no v3.x metric for these; a CVE joins only after checking NVD by hand
+    # (CVE-2012-2122: NVD v2 only, checked 2026-11-14, RM-168).
+    self.assertLessEqual(CVE_WITHOUT_V3, {"CVE-2013-4547", "CVE-2014-3704", "CVE-2015-3337", "CVE-2012-2122"})
 
   def test_no_row_outside_the_catalog(self):
     self.assertEqual(sorted((set(CVE_CVSS_VECTORS) | CVE_WITHOUT_V3) - set(_catalog_labels())), [])

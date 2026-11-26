@@ -151,3 +151,23 @@ def redact_credential_strings(obj, *, allow_keys=IDENTITY_KEYS):
   if isinstance(obj, tuple):
     return tuple(redact_credential_strings(value, allow_keys=allow_keys) for value in obj)
   return obj
+
+
+# Lists of accepted `user:pass` pairs carry no lead phrase, so the walker above passes them through.
+# `_redact_report` masks them with this same rule (mixins/report.py, `accepted_credentials`/`accepted`).
+ACCEPTED_PAIR_KEYS = ("accepted_credentials", "accepted")
+
+
+def redact_accepted_pairs(obj):
+  """Mask the password of every bare `user:pass` string in an `accepted_credentials` or `accepted` list
+  anywhere in `obj`, in place (`root:toor` -> `root:***`). Returns `obj`."""
+  if isinstance(obj, dict):
+    for key, value in obj.items():
+      if key in ACCEPTED_PAIR_KEYS and isinstance(value, list):
+        obj[key] = [re.sub(r'^(\S+?):(.+)$', r'\1:***', c) if isinstance(c, str) else c for c in value]
+      else:
+        redact_accepted_pairs(value)
+  elif isinstance(obj, list):
+    for value in obj:
+      redact_accepted_pairs(value)
+  return obj

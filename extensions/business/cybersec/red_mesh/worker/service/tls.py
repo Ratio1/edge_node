@@ -3,12 +3,14 @@ import re as _re
 import socket
 import struct
 import ssl
+from dataclasses import replace
 
 import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
-from ...cve_db import check_cves
+from ...cve_db import check_cves, probe_cve_fields, _stamp_identity
+from ..response_fingerprint import dial_within_budget
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
 
@@ -61,6 +63,14 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       return probe_error(target, port, "TLS", Exception("unverified connect failed"))
 
     raw["protocol"], raw["cipher"] = proto, cipher
+    # RM-265: a completed handshake on a web TLS port is the HTTPS counterpart of the host-level redirect rule.
+    # Without fingerprinting (no protocol recorded) the well-known web TLS ports count.
+    state = getattr(self, "state", None) or {}
+    protocol = (state.get("port_protocols") or {}).get(port)
+    if protocol == "https" or (protocol is None and port in (443, 8443)):
+      meta = state.get("scan_metadata")
+      if meta is not None:
+        meta.setdefault("web_root", {}).setdefault(port, {})["tls"] = True
     findings += self._tls_check_protocol(proto, cipher)
 
     # Pass 1b: SAN parsing and signature check from DER cert
@@ -93,10 +103,20 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       # OpenSSL package version is in [1.0.1, 1.0.1g). Walk the catalog at
       # the upper bound (1.0.1f) and emit every additional row that fires.
       # Skip the Heartbleed row itself — already emitted above.
-      for inferred in check_cves("openssl", "1.0.1f"):
+      for inferred in check_cves("openssl", "1.0.1f", inferred_span=("1.0.1", "1.0.1f")):
         if "CVE-2014-0160" in (inferred.cve or ()):
           continue
-        findings.append(inferred)
+        # Display and evidence name the proven span; matching above already used it. Identity stays on 1.0.1f.
+        label = "openssl 1.0.1-1.0.1f"
+        relabelled = replace(
+          inferred,
+          # CVE rows name the version in a "(openssl 1.0.1f)" suffix; the end-of-life row in its "Unsupported version:" text.
+          title=(inferred.title.replace("(openssl 1.0.1f)", f"({label})") if inferred.cve
+                 else inferred.title.replace("openssl 1.0.1f", label)),
+          description=inferred.description.replace("openssl 1.0.1f", label),
+          evidence=inferred.evidence.replace("Detected version: 1.0.1f,", "Detected version: 1.0.1-1.0.1f,"),
+        )
+        findings.append(_stamp_identity(relabelled, "openssl", "1.0.1f", inferred.cve[0] if inferred.cve else "eol"))
 
     # Pass 5: Downgrade attacks (POODLE / BEAST)
     findings += self._tls_check_downgrade(target, port)
@@ -106,13 +126,16 @@ class _ServiceTlsMixin(_ServiceProbeBase):
 
     return probe_result(raw_data=raw, findings=findings)
 
-  def _tls_unverified_connect(self, target, port):
-    """Unverified TLS connect to get protocol, cipher, and DER cert."""
+  def _tls_unverified_connect(self, target, port, dial_host=None):
+    """Unverified TLS connect to get protocol, cipher, and DER cert.
+
+    `dial_host` pins the connection to one address while `target` stays the SNI name.
+    """
     try:
       ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
       ctx.check_hostname = False
       ctx.verify_mode = ssl.CERT_NONE
-      with socket.create_connection((target, port), timeout=self._target_timeout(3)) as sock:
+      with dial_within_budget(dial_host or target, port, self._target_timeout(3)) as sock:
         with ctx.wrap_socket(sock, server_hostname=target) as ssock:
           proto = ssock.version()
           cipher_info = ssock.cipher()
@@ -160,7 +183,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
     findings = []
     try:
       ctx = ssl.create_default_context()
-      with socket.create_connection((target, port), timeout=self._target_timeout(3)) as sock:
+      with dial_within_budget(target, port, self._target_timeout(3)) as sock:
         with ctx.wrap_socket(sock, server_hostname=target) as ssock:
           cert = ssock.getpeercert()
           subj = dict(x[0] for x in cert.get("subject", ()))
@@ -404,12 +427,14 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       try:
         raw_after = tls_sock.unwrap()
         raw_after.sendall(tls_record)
-        raw_after.settimeout(self._target_timeout(3))
-        response = raw_after.recv(65536)
+        response, alert_only = self._tls_read_heartbeat(raw_after)
         raw_after.close()
       except (ssl.SSLError, OSError):
         # If unwrap fails, try closing and testing with a new raw connection
         tls_sock.close()
+        return self._tls_heartbleed_raw(target, port, tls_ver_bytes)
+      if response is None and alert_only:
+        # Only the shutdown alert came back: the unwrapped socket proved nothing, try the raw path.
         return self._tls_heartbleed_raw(target, port, tls_ver_bytes)
 
       if response and len(response) >= 7:
@@ -436,14 +461,45 @@ class _ServiceTlsMixin(_ServiceProbeBase):
               owasp_id="A06:2021",
               cwe_id="CWE-126",
               confidence="certain",
+              **probe_cve_fields("CVE-2014-0160"),
             )
-        # TLS Alert (ContentType=21) = not vulnerable (server rejected heartbeat)
-        elif response[0] == 21:
-          return None
 
     except Exception:
       pass
     return None
+
+  def _tls_read_heartbeat(self, sock):
+    """Read TLS records until a heartbeat record, skipping alerts (close_notify from `unwrap()`).
+
+    Stops at a heartbeat record, an unknown record, EOF or timeout, a 3 s deadline, or 70000 bytes.
+
+    Returns
+    -------
+    (bytes or None, bool)
+      The buffer starting at the heartbeat record (or None), and whether an alert was skipped.
+    """
+    deadline = self._deadline_in(self._target_timeout(3))
+    buf, alert = b"", False
+    while len(buf) < 70000:
+      try:
+        chunk = self._recv_by(sock, 65536, deadline)
+      except (socket.timeout, OSError):
+        break
+      if not chunk:
+        break
+      buf += chunk
+      while len(buf) >= 5:
+        if buf[0] == 24:
+          if len(buf) >= 7:
+            return buf, alert
+          break
+        end = 5 + struct.unpack(">H", buf[3:5])[0]
+        if buf[0] != 21:
+          return None, alert
+        if len(buf) < end:
+          break
+        buf, alert = buf[end:], True
+    return None, alert
 
   def _tls_heartbleed_raw(self, target, port, tls_ver_bytes):
     """Fallback Heartbleed test using a raw TLS ClientHello with heartbeat extension.
@@ -521,11 +577,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       sock.sendall(hb_record)
 
       # Read response
-      sock.settimeout(self._target_timeout(3))
-      try:
-        response = sock.recv(65536)
-      except (socket.timeout, OSError):
-        response = b""
+      response, _ = self._tls_read_heartbeat(sock)
       sock.close()
 
       if response and len(response) >= 7 and response[0] == 24:
@@ -544,6 +596,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
             owasp_id="A06:2021",
             cwe_id="CWE-126",
             confidence="certain",
+            **probe_cve_fields("CVE-2014-0160"),
           )
     except Exception:
       pass
@@ -574,6 +627,8 @@ class _ServiceTlsMixin(_ServiceProbeBase):
           severity=Severity.LOW,
           cvss_vector=V.SSLV3_POODLE,
           title="Server accepts SSLv3 — vulnerable to POODLE (CVE-2014-3566)",
+          cve=("CVE-2014-3566",),
+          **probe_cve_fields("CVE-2014-3566"),
           description=f"TLS on {target}:{port} accepts SSLv3 connections. "
                       "The POODLE attack allows decrypting SSLv3 traffic using CBC cipher padding oracles.",
           evidence=f"Negotiated {negotiated} when SSLv3 was forced.",
@@ -606,6 +661,8 @@ class _ServiceTlsMixin(_ServiceProbeBase):
             severity=Severity.MEDIUM,
             cvss_vector=V.WEAK_TRANSPORT,
             title="TLS 1.0 with CBC cipher — BEAST risk (CVE-2011-3389)",
+            cve=("CVE-2011-3389",),
+            **probe_cve_fields("CVE-2011-3389"),
             description=f"TLS on {target}:{port} accepts TLS 1.0 with CBC-mode cipher '{cipher_name}'. "
                         "The BEAST attack exploits predictable IVs in TLS 1.0 CBC mode.",
             evidence=f"Negotiated {negotiated} with cipher {cipher_name}.",

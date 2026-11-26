@@ -20,6 +20,7 @@ from the @register_probe decorator metadata + dynamic CVE DB lookup.
 
 import inspect
 import json
+import math
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, asdict, replace
@@ -148,7 +149,7 @@ class Finding:
   cvss_score_env: float | None = None    # Environmental score
   cvss_vector_env: str = ""              # Environmental vector
   cvss_data_freshness: str = ""          # ISO 8601 — when CVSS was fetched from NVD
-  kev: bool = False                      # CISA Known Exploited Vulnerabilities
+  kev: bool | None = False              # CISA Known Exploited Vulnerabilities; None = not evaluated (CVE findings)
   epss_score: float | None = None        # FIRST EPSS score 0.0-1.0
 
   # Classification (modern)
@@ -188,6 +189,17 @@ class Finding:
   # (`models.finding_schema.AUTHENTICATED_ACTIONS`); "" otherwise. Not identity
   # and not content: `finding_identity` reads neither (RM-118).
   authenticated_action: str = ""
+
+  # RM-169, CVE findings: the one reason behind `confidence`, the database build, every CVSS score.
+  # Not content fields: they do not move `finding_signature`.
+  confidence_reason: str = ""
+  vulndb_build_id: str | None = None
+  cvss: tuple = ()
+  # RM-263, probe CVE findings: the service the CVE view files the finding under. `cve_db.probe_cve_fields` sets
+  # `product` when the database names exactly one product for the CVE; `version` is reserved and stays empty (no probe
+  # reports one yet). Not content fields: they do not move `finding_signature`.
+  product: str = ""
+  version: str = ""
 
   # Metadata
   ai_generated: bool = False             # P12 invariant — must stay False for finding data
@@ -255,6 +267,15 @@ class Finding:
       "remediation": self.remediation or "",
       "cvss_score": self.cvss_score,
       "cvss_vector": self.cvss_vector or "",
+      # Enrichment is content (`_CONTENT_FIELDS`). `kev` stays raw: None (not
+      # evaluated) and False (evaluated, not listed) are different states.
+      # `references` is a list; `content_hash` sorts it. Not
+      # `cvss_data_freshness`: a fetch timestamp would fork worker signatures.
+      "kev": self.kev,
+      "epss_score": epss_band(self.epss_score),
+      "cvss_score_env": self.cvss_score_env,
+      "cvss_vector_env": self.cvss_vector_env or "",
+      "references": list(self.references),
       "owasp_id": self.owasp_id,
       "cwe_id": self.cwe_id,
       "affected_assets": [_asset_as_dict(asset) for asset in self.affected_assets],
@@ -306,6 +327,23 @@ class Finding:
     return Finding(**_revive_finding_dict(data))
 
 
+def epss_band(score):
+  """EPSS as a coarse band for the signature, so daily score updates do not churn it.
+
+  Lower bound inclusive. None (unknown) stays None, distinct from "<0.01"; so does a value that is not a
+  finite number (NaN, a string, a bool), which no producer writes today.
+  """
+  if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
+    return None
+  if score < 0.01:
+    return "<0.01"
+  if score < 0.1:
+    return "0.01-0.1"
+  if score < 0.5:
+    return "0.1-0.5"
+  return ">=0.5"
+
+
 def _asset_as_dict(asset) -> dict:
   """One `AffectedAsset` in the dict shape the shared identity model reads."""
   if isinstance(asset, dict):
@@ -339,7 +377,7 @@ def _revive_finding_dict(data: dict) -> dict:
   if isinstance(out.get("remediation_structured"), dict):
     out["remediation_structured"] = Remediation(**out["remediation_structured"])
   # tuples stored as lists in JSON
-  for k in ("cwe", "cve", "owasp_top10", "references", "steps_to_reproduce", "tags"):
+  for k in ("cwe", "cve", "owasp_top10", "references", "steps_to_reproduce", "tags", "cvss"):
     if isinstance(out.get(k), list):
       out[k] = tuple(out[k])
   return out
@@ -588,9 +626,13 @@ def _finding_to_jsonable(f: Finding) -> dict:
   d["severity"] = f.severity.value if isinstance(f.severity, Severity) else str(f.severity)
   # Normalize tuples → lists so json.dumps doesn't trip on them later
   for k in ("cwe", "cve", "owasp_top10", "references", "steps_to_reproduce", "tags",
-            "affected_assets", "evidence_items"):
+            "affected_assets", "evidence_items", "cvss"):
     if isinstance(d.get(k), tuple):
       d[k] = list(d[k])
+  # Absent unless set, so a finding with no CVE keeps its shape (report-findings.md, Per-finding fields).
+  for k in ("confidence_reason", "vulndb_build_id", "cvss", "product", "version"):
+    if not d.get(k):
+      d.pop(k, None)
   return d
 
 

@@ -51,7 +51,13 @@ class ApiConfigProbes(ProbeBase):
   # ── helpers ────────────────────────────────────────────────────────
 
   def _session(self):
-    return self.auth.official_session or self.auth.regular_session
+    return self.auth.primary_session
+
+  def _session_for(self, ep):
+    """Session for a function endpoint: regular for user/anon privilege."""
+    if getattr(ep, "privilege", "admin") in ("user", "anon"):
+      return self.auth.regular_session or self.auth.primary_session
+    return self.auth.primary_session
 
   def _anon_session(self):
     if hasattr(self.auth, "make_anonymous_session"):
@@ -81,22 +87,31 @@ class ApiConfigProbes(ProbeBase):
       )
       return
     found_any = False
+    denied_any = False
     for ep in api_security.function_endpoints:
-      if not self.budget():
+      if not self.budget_available():
         self.emit_inconclusive(
           "PT-OAPI8-01", "API permissive CORS configuration",
           "API8:2023", "budget_exhausted",
         )
         return
       url = self.target_url + ep.path
-      self.safety.throttle()
+      ep_session = self._session_for(ep)
+      # Baseline: a plain GET as the principal this endpoint expects.
       try:
-        resp = session.get(
+        baseline = ep_session.get(url, timeout=10, allow_redirects=False)
+      except requests.RequestException:
+        continue
+      try:
+        resp = ep_session.get(
           url, headers={"Origin": "https://evil.example"},
           timeout=10, allow_redirects=False,
         )
       except requests.RequestException:
         continue
+      marker = getattr(ep, "auth_required_marker", "")
+      reached = (self.response_reached(baseline, auth_required_marker=marker)
+                 and self.response_reached(resp, auth_required_marker=marker))
 
       acao = resp.headers.get("Access-Control-Allow-Origin", "")
       acac = (resp.headers.get("Access-Control-Allow-Credentials") or "").lower()
@@ -108,6 +123,10 @@ class ApiConfigProbes(ProbeBase):
       elif acao == "*":
         severity, vector = "LOW", V.CORS_UNCREDENTIALED
       else:
+        if not reached:
+          # Headers on a denied response may show a flaw but never clear one.
+          denied_any = True
+          continue
         self.emit_clean(
           "PT-OAPI8-01", "API permissive CORS configuration", "API8:2023",
           [f"endpoint={url}", f"acao={acao or '<absent>'}",
@@ -131,6 +150,9 @@ class ApiConfigProbes(ProbeBase):
       )
       found_any = True
     if not found_any:
+      if denied_any:
+        self.emit_endpoint_denied("PT-OAPI8-01")
+        return
       self.emit_inconclusive(
         "PT-OAPI8-01", "API permissive CORS configuration",
         "API8:2023", "no_evaluable_responses",
@@ -155,19 +177,22 @@ class ApiConfigProbes(ProbeBase):
         "API8:2023", "no_authenticated_session",
       )
       return
+    reported_any = False
+    denied_any = False
     for ep in api_security.function_endpoints:
-      if not self.budget():
+      if not self.budget_available():
         self.emit_inconclusive(
           "PT-OAPI8-02", "API response missing security headers",
           "API8:2023", "budget_exhausted",
         )
         return
       url = self.target_url + ep.path
-      self.safety.throttle()
       try:
-        resp = session.get(url, timeout=10, allow_redirects=False)
+        resp = self._session_for(ep).get(url, timeout=10, allow_redirects=False)
       except requests.RequestException:
         continue
+      reached = self.response_reached(
+        resp, auth_required_marker=getattr(ep, "auth_required_marker", ""))
       missing = []
       headers_lower = {k.lower(): v for k, v in resp.headers.items()}
       if "x-content-type-options" not in headers_lower:
@@ -190,12 +215,19 @@ class ApiConfigProbes(ProbeBase):
           ),
           response=resp,
         )
-      else:
+        reported_any = True
+      elif reached:
         self.emit_clean(
           "PT-OAPI8-02", "API response missing security headers",
           "API8:2023",
           [f"endpoint={url}", "all_expected_headers_present"],
         )
+        reported_any = True
+      else:
+        # Headers on a denied response may show a flaw but never clear one.
+        denied_any = True
+    if denied_any and not reported_any:
+      self.emit_endpoint_denied("PT-OAPI8-02")
 
   # ── PT-OAPI8-03 — Debug endpoint exposed ─────────────────────────
 
@@ -211,14 +243,13 @@ class ApiConfigProbes(ProbeBase):
       )
       return
     for path in api_security.debug_path_candidates:
-      if not self.budget():
+      if not self.budget_available():
         self.emit_inconclusive(
           "PT-OAPI8-03", "API debug endpoint exposed",
           "API8:2023", "budget_exhausted",
         )
         return
       url = self.target_url + path
-      self.safety.throttle()
       try:
         resp = session.get(url, timeout=10, allow_redirects=False)
       except requests.RequestException:
@@ -268,14 +299,13 @@ class ApiConfigProbes(ProbeBase):
       )
       return
     for ep in opted_in:
-      if not self.budget():
+      if not self.budget_available():
         self.emit_inconclusive(
           "PT-OAPI8-04", "API verbose error response leaks internals",
           "API8:2023", "budget_exhausted",
         )
         return
       url = self.target_url + ep.path
-      self.safety.throttle()
       try:
         resp = session.post(
           url, data='{"x":', headers={"Content-Type": "application/json"},
@@ -319,14 +349,13 @@ class ApiConfigProbes(ProbeBase):
       return
     risky = {"TRACE", "PUT", "DELETE", "PATCH"}
     for ep in api_security.function_endpoints:
-      if not self.budget():
+      if not self.budget_available():
         self.emit_inconclusive(
           "PT-OAPI8-05", "API advertises unexpected HTTP methods",
           "API8:2023", "budget_exhausted",
         )
         return
       url = self.target_url + ep.path
-      self.safety.throttle()
       try:
         resp = session.options(url, timeout=10, allow_redirects=False)
       except requests.RequestException:
@@ -365,14 +394,13 @@ class ApiConfigProbes(ProbeBase):
     if session is None:
       return
     for path in inv.openapi_candidates:
-      if not self.budget():
+      if not self.budget_available():
         self.emit_inconclusive(
           "PT-OAPI9-01", "API OpenAPI/Swagger specification publicly exposed",
           "API9:2023", "budget_exhausted",
         )
         return
       url = self.target_url + path
-      self.safety.throttle()
       try:
         resp = session.get(url, timeout=10, allow_redirects=False)
       except requests.RequestException:
@@ -442,7 +470,7 @@ class ApiConfigProbes(ProbeBase):
       canonical = "/" + canonical
 
     for sibling in inv.version_sibling_candidates:
-      if not self.budget():
+      if not self.budget_available():
         self.emit_inconclusive(
           "PT-OAPI9-02", "API legacy version still live (version sprawl)",
           "API9:2023", "budget_exhausted",
@@ -453,7 +481,6 @@ class ApiConfigProbes(ProbeBase):
         continue
       sib_path = canonical.replace(current, sib, 1)
       sib_url = self.target_url + sib_path
-      self.safety.throttle()
       try:
         resp = session.get(sib_url, timeout=10, allow_redirects=False)
       except requests.RequestException:
@@ -490,14 +517,13 @@ class ApiConfigProbes(ProbeBase):
     if session is None:
       return
     for path in inv.deprecated_paths:
-      if not self.budget():
+      if not self.budget_available():
         self.emit_inconclusive(
           "PT-OAPI9-03", "API deprecated path still serving requests",
           "API9:2023", "budget_exhausted",
         )
         return
       url = self.target_url + path
-      self.safety.throttle()
       try:
         resp = session.get(url, timeout=10, allow_redirects=False)
       except requests.RequestException:

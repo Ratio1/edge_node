@@ -207,7 +207,7 @@ class DeeployProcessRequestTests(unittest.TestCase):
         plugin.deepcopy = copy.deepcopy
         plugin.uuid = lambda size=7: "retry-id"[:size]
         plugin.cfg_deeploy_verbose = 0
-        plugin._operation_records = lambda: {str(i): record for i, record in enumerate(records)}
+        plugin._operation_records = lambda **scope: {str(i): record for i, record in enumerate(records)}
         plugin.bc = SimpleNamespace(get_evm_network=lambda: "mainnet", get_job_details=lambda **kwargs: {
           "escrowOwner": paid_owner, "startTimestamp": 1, "jobType": 1,
         })

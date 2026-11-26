@@ -3,10 +3,8 @@ import json
 import unittest
 from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity import (
-  AUTH_HKEY_ENV,
   CstoreAuthAccountReader,
 )
 from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView, TenantMembership, resolve_actor
@@ -205,13 +203,12 @@ class TestIdentityPolicyBoundary(unittest.TestCase):
     from .test_account_record_v1 import T1, T2, record
     raw = json.dumps(record("operator", memberships=[{"role": "tenant_pentester", "tenant_id": T1}]))
     store = {"operator": raw}
-    reader = CstoreAuthAccountReader(SimpleNamespace(chainstore_hget=lambda **kw: store.get(kw["key"])))
+    reader = CstoreAuthAccountReader(SimpleNamespace(_stream_id="test-policy", chainstore_hget=lambda **kw: store.get(kw["key"])))
     forged = {"account_id": " OPERATOR ", "role": "super_tenant_admin", "tenant_id": T2,
               "scope": "*", "owner": "operator", "tenant_memberships": [
                 {"role": "super_tenant_admin", "tenant_id": None},
               ]}
-    with patch.dict("os.environ", {AUTH_HKEY_ENV: "test-policy-auth"}):
-      actor, error = resolve_actor(forged, reader)
+    actor, error = resolve_actor(forged, reader)
     self.assertIsNone(error)
     self.assertTrue(authorize_tenant_operation(actor, "reports:export", TenantPolicyContext(T1, True, True)).allowed)
     self.assertEqual(authorize_tenant_operation(actor, "reports:export", TenantPolicyContext(T2, True, True)),
@@ -221,23 +218,22 @@ class TestIdentityPolicyBoundary(unittest.TestCase):
     from .test_account_record_v1 import T2, record
     platform = [{"role": "super_tenant_admin", "tenant_id": None}]
     store = {"operator": json.dumps(record("operator", memberships=platform))}
-    reader = CstoreAuthAccountReader(SimpleNamespace(chainstore_hget=lambda **kw: store.get(kw["key"])))
+    reader = CstoreAuthAccountReader(SimpleNamespace(_stream_id="test-policy", chainstore_hget=lambda **kw: store.get(kw["key"])))
     tenant = TenantPolicyContext("tn_12345678-1234-4234-8234-123456789abc", True, True)
     stamp = {"stateChangedAt": "2026-01-02T00:00:00.000Z", "stateChangedBy": "admin.user"}
-    with patch.dict("os.environ", {AUTH_HKEY_ENV: "test-policy-auth"}):
-      actor, error = resolve_actor({"account_id": "operator"}, reader)
-      self.assertIsNone(error)
-      self.assertTrue(authorize_tenant_operation(actor, "allow_pentester:update", tenant).allowed)
-      for revoked in (record("operator", memberships=[]),
-                      {**record("operator"), "memberships": None},
-                      record("operator", memberships=platform, state="deleting", **stamp),
-                      record("operator", memberships=platform, state="deactivated", **stamp),
-                      record("operator", memberships=[{"role": "tenant_user", "tenant_id": T2}])):
-        with self.subTest(revoked=revoked):
-          store["operator"] = json.dumps(revoked)
-          actor, _ = resolve_actor({"account_id": "operator"}, reader)
-          self.assertEqual(authorize_tenant_operation(actor, "allow_pentester:update", tenant),
-                           PolicyDecision(False, 404, "not_found"))
+    actor, error = resolve_actor({"account_id": "operator"}, reader)
+    self.assertIsNone(error)
+    self.assertTrue(authorize_tenant_operation(actor, "allow_pentester:update", tenant).allowed)
+    for revoked in (record("operator", memberships=[]),
+                    {**record("operator"), "memberships": None},
+                    record("operator", memberships=platform, state="deleting", **stamp),
+                    record("operator", memberships=platform, state="deactivated", **stamp),
+                    record("operator", memberships=[{"role": "tenant_user", "tenant_id": T2}])):
+      with self.subTest(revoked=revoked):
+        store["operator"] = json.dumps(revoked)
+        actor, _ = resolve_actor({"account_id": "operator"}, reader)
+        self.assertEqual(authorize_tenant_operation(actor, "allow_pentester:update", tenant),
+                         PolicyDecision(False, 404, "not_found"))
 
 
 class TestNoAccountRole(unittest.TestCase):

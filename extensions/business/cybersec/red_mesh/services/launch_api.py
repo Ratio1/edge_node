@@ -30,6 +30,7 @@ from ..graybox.models.target_config import (
   validate_target_config_secret_ref_positions,
 )
 from ..graybox.http_client import validate_target_config_paths
+from ..graybox.safety import SafetyControls
 from ..repositories import JobStateRepository
 from ..tenancy.effective_targets import resolve_launch_target, validate_effective_config
 from ..graybox.scenario_runtime import (
@@ -42,7 +43,7 @@ from ..graybox.scenario_runtime import (
 from .config import get_graybox_budgets_config
 from .event_hooks import emit_attestation_status_event, emit_lifecycle_event
 from .secrets import persist_job_config_with_secrets
-from ..tenancy.engagements import SCAN_MODES
+from ..tenancy.engagements import SCAN_MODES, feature_ids_for_kind, ports_outside
 from ..tenancy.tenant_assets import ENVIRONMENT_POLICY, launch_environment
 from .soc_export_policy import required_soc_launch_error
 
@@ -331,13 +332,13 @@ def _validate_graybox_numeric_fields(canonical: dict | None):
 
 def _validate_api_auth_descriptor(auth_desc):
   auth_type = getattr(auth_desc, "auth_type", "form") or "form"
-  if auth_type not in ("bearer", "api_key"):
+  if auth_type not in ("bearer", "api_key", "basic"):
     return None
   probe_path = (getattr(auth_desc, "authenticated_probe_path", "") or "").strip()
   allow_unverified = bool(getattr(auth_desc, "allow_unverified_auth", False))
   if not probe_path and not allow_unverified:
     return validation_error(
-      "api_security.auth.authenticated_probe_path is required for bearer/api_key "
+      "api_security.auth.authenticated_probe_path is required for bearer/api_key/basic "
       "auth unless allow_unverified_auth=true"
     )
   if not probe_path:
@@ -365,6 +366,8 @@ def _auth_descriptor_carrier(auth_desc, *, default_auth_type="form"):
   if auth_type == "bearer":
     header_name = getattr(auth_desc, "bearer_token_header_name", "Authorization")
     return ("header", _normalize_carrier_name(header_name), header_name or "Authorization")
+  if auth_type == "basic":
+    return ("header", "authorization", "Authorization")
   if auth_type == "api_key":
     location = _normalize_carrier_name(getattr(auth_desc, "api_key_location", "header")) or "header"
     if location == "query":
@@ -730,6 +733,23 @@ def resolve_enabled_features(owner, excluded_features, scan_type=ScanType.NETWOR
   return excluded_features, enabled_features
 
 
+def unknown_feature_error(owner, requested):
+  """I-185: an exclusion the request names that the node does not know, for any scan type, is refused,
+  not dropped. The console sends exclusions from the all-types catalog, so another type's method is
+  known (and dropped later by `resolve_enabled_features`). Config exclusions (cfg_excluded_features) are
+  not checked here: a stale one is logged and dropped."""
+  all_features = owner._get_all_features(scan_type=None)
+  unknown = [str(f)[:64] for f in (requested or []) if f not in all_features]
+  if not unknown:
+    return None
+  unknown = unknown[:20]  # a bounded echo of the request
+  return {
+    "error": "unknown_feature", "status_code": 400,
+    "message": f"Unknown excluded feature(s): {', '.join(unknown)}.",
+    "features": unknown,
+  }
+
+
 def resolve_active_peers(owner, selected_peers):
   """Validate selected peers against chainstore peers and return active peers."""
   chainstore_peers = owner.cfg_chainstore_peers
@@ -1022,7 +1042,7 @@ _REFUSAL_FIELD_MAX = 256
 
 
 def log_launch_refusal(owner, *, reason, scan_type, target, tenant_id, engagement_id,
-                       engagement_asset_id, actor):
+                       engagement_asset_id, actor, outside=None):
   """Audit one refused launch. Call only once the tenant is verified: the row is read per tenant.
 
   The row carries the selectors, the target as requested (truncated) and the actor; never the
@@ -1035,6 +1055,8 @@ def log_launch_refusal(owner, *, reason, scan_type, target, tenant_id, engagemen
       "tenant_id": clip(tenant_id), "engagement_id": clip(engagement_id),
       "engagement_asset_id": clip(engagement_asset_id), "scan_type": clip(scan_type),
       "target": clip(target), "reason": reason, "actor": clip(actor),
+      # RM-251: what a `scope_exceeded` launch asked for outside the scope, bounded as the response.
+      **(outside or {}),
     })
   except Exception:
     pass
@@ -1048,6 +1070,52 @@ def _log_target_mismatch(owner, execution_context, scan_type, target):
   log_launch_refusal(owner, reason="target_mismatch", scan_type=scan_type, target=target,
     tenant_id=facts["tenant_id"], engagement_id=facts["engagement_id"],
     engagement_asset_id=facts["engagement_asset_id"], actor=facts["actor_id"])
+
+
+_SCOPE_ECHO_MAX = 20
+
+
+def scope_exceeded(owner, execution_context, scan_type, target, *, ports=(), tests=()):
+  """RM-251: the refusal of a launch outside its engagement's authorized ports or tests (400), audited
+  as `launch_refused`. Names what is outside, bounded as `unknown_feature`. None when nothing is."""
+  if not ports and not tests:
+    return None
+  facts = execution_context.to_dict()
+  ports, tests = [list(span) for span in ports[:_SCOPE_ECHO_MAX]], [str(test)[:64] for test in tests[:_SCOPE_ECHO_MAX]]
+  log_launch_refusal(owner, reason="scope_exceeded", scan_type=scan_type, target=target,
+    tenant_id=facts["tenant_id"], engagement_id=facts["engagement_id"],
+    engagement_asset_id=facts["engagement_asset_id"], actor=facts["actor_id"],
+    outside={"ports": ports, "tests": tests})
+  named = [", ".join(f"{start}-{end}" for start, end in ports), ", ".join(tests)]
+  return {
+    "error": "scope_exceeded", "status_code": 400,
+    "message": "The launch is outside the engagement's authorized scope: " + "; ".join(n for n in named if n) + ".",
+    "ports": ports, "tests": tests,
+  }
+
+
+def _launch_scope_error(owner, execution_context, engagement, *, scan_type, target, start_port, end_port,
+                        exceptions, comparison_ports, enabled_features):
+  """RM-251: ports (network: the range plus the comparison tier, minus exceptions) and enabled methods
+  (after the comparison bundle) must lie inside the scope of the targeted asset (RM-277: the facts carry it
+  as the engagement's); exclusions only narrow."""
+  authorized_ports, authorized_tests = engagement["authorized_ports"], engagement["authorized_tests"]
+  stray_ports = []
+  if authorized_ports != "all" and scan_type == ScanType.NETWORK.value:
+    # The worker subtracts the exceptions from every port, the comparison tier included.
+    effective = (set(range(start_port, end_port + 1)) | set(comparison_ports or ())) - set(exceptions or ())
+    stray_ports = ports_outside(effective, authorized_ports)
+  stray_tests = []
+  if authorized_tests != "all":
+    # RM-277: a webapp test is a graybox probe family, named as its method without the leading underscore.
+    owner_of = {method: method.lstrip("_") if item["id"] == "graybox" else item["id"]
+                for item in FEATURE_CATALOG for method in item.get("methods", [])}
+    stray_tests = sorted({owner_of.get(method, method) for method in enabled_features} - set(authorized_tests))
+    # A kind with no authorized id is outside even when no method is enabled (the port scan or crawl still runs).
+    kind_ids = feature_ids_for_kind(scan_type)
+    if not set(authorized_tests) & set(kind_ids):
+      stray_tests = sorted(set(stray_tests) | set(kind_ids))
+  return scope_exceeded(owner, execution_context, scan_type, target, ports=stray_ports, tests=stray_tests)
 
 
 def _redmesh_release(console_version, report_pipeline_version):
@@ -1133,6 +1201,9 @@ def announce_launch(
   if release_error:
     return release_error
   comparison_mode = bool(comparison_mode)
+  feature_error = unknown_feature_error(owner, excluded_features)
+  if feature_error:
+    return feature_error
   excluded_features, enabled_features = resolve_enabled_features(
     owner,
     excluded_features,
@@ -1166,6 +1237,12 @@ def announce_launch(
 
   binding = None
   if execution_context is not None:
+    scope_error = _launch_scope_error(
+      owner, execution_context, engagement, scan_type=scan_type, target=target or target_url,
+      start_port=start_port, end_port=end_port, exceptions=exceptions, comparison_ports=comparison_ports,
+      enabled_features=enabled_features)
+    if scope_error:
+      return scope_error
     if not workers:
       return validation_error("Empty execution assignment")
     if scan_type == ScanType.NETWORK.value:
@@ -1235,7 +1312,9 @@ def announce_launch(
     **({"engagement": engagement["context"],
         "authorization": engagement["authorization"], "engagement_id": engagement["engagement_id"],
         "engagement_hash": engagement["engagement_hash"],
-        "contract_sha256": engagement["contract_sha256"]} if engagement is not None else {}),
+        "contract_sha256": engagement["contract_sha256"],
+        "engagement_authorized_ports": engagement["authorized_ports"],
+        "engagement_authorized_tests": engagement["authorized_tests"]} if engagement is not None else {}),
     # OWASP API Top 10 (Subphase 1.5 commit #8): runtime-only secret
     # fields. Blanked by `_blank_graybox_secret_fields` before persistence;
     # `has_bearer_token` / `has_api_key` capability flags are set on the
@@ -1448,6 +1527,8 @@ def launch_network_scan(
     return scan_mode_error
   start_port = int(start_port)
   end_port = int(end_port)
+  if not (1 <= start_port <= 65535 and 1 <= end_port <= 65535):
+    return validation_error("start_port and end_port must be between 1 and 65535")
   if start_port > end_port:
     return validation_error("start_port must be less than end_port")
 
@@ -1693,7 +1774,7 @@ def launch_webapp_scan(
   # auth mode. Admin/privileged credentials are optional comparison context.
   auth_desc = typed_target_config.api_security.auth
   auth_type = auth_desc.auth_type
-  if auth_type == "form":
+  if auth_type in ("form", "basic"):
     if not regular_username or not regular_password:
       return validation_error("regular credentials required for webapp form auth")
     if bool(official_username) != bool(official_password):
@@ -1744,6 +1825,11 @@ def launch_webapp_scan(
   )
   if auth_error:
     return auth_error
+  # RM-273 (D30): a private-range target needs the engagement's allow_private_targets.
+  allow_private = ((engagement or {}).get("context") or {}).get("allow_private_targets") is True
+  private_reason = None if allow_private else SafetyControls.private_target_reason(target)
+  if private_reason:
+    return validation_error(private_reason)
   path_scope_errors = validate_target_config_paths(
     target_url,
     raw_target_config,

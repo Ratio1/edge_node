@@ -14,15 +14,17 @@ Without a cache the function behaves as before — static severity only
 
 import re
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from .cve_catalog_expansion import EXPANDED_CVE_ROWS
 from .cve_cvss_vectors import CVE_CVSS_VECTORS
 from .cvss import cvss31_base_score
 from .findings import Finding, Remediation, Severity, _template_band_agrees, current_probe_port
 from .references import cwe_to_owasp
 
-CVE_DB_LAST_UPDATED = "2026-05-08"
+CVE_DB_LAST_UPDATED = "2026-11-14"
 _CURRENT_DYNAMIC_CACHE: ContextVar = ContextVar("redmesh_dynamic_reference_cache", default=None)
+_VULNDB_READER = None  # `generated` source (RM-169); None means the frozen `CVE_DATABASE`
 # Scan-local `{"<port>/<cve_id>": entry}` of CVEs the matcher evaluated and
 # skipped as not applicable (RM-103 item 6). None outside a worker run.
 _CURRENT_NOT_APPLICABLE: ContextVar = ContextVar("redmesh_cves_not_applicable", default=None)
@@ -84,7 +86,6 @@ CVE_DATABASE: list = [
   CveEntry("elasticsearch", "<1.2",   "CVE-2014-3120", Severity.HIGH, "MVEL scripting RCE", "CWE-94"),
   CveEntry("elasticsearch", "<1.4.3", "CVE-2015-1427", Severity.CRITICAL, "Groovy sandbox escape RCE", "CWE-94"),
   CveEntry("elasticsearch", "<1.4.5", "CVE-2015-3337", Severity.HIGH, "Directory traversal via site plugin", "CWE-22"),
-  CveEntry("elasticsearch", "<5.6.5", "CVE-2017-11480", Severity.HIGH, "XSS via URL access control bypass", "CWE-79"),
   CveEntry("elasticsearch", "<6.4.3", "CVE-2018-17244", Severity.MEDIUM, "Security bypass in token generation", "CWE-287"),
   CveEntry("elasticsearch", ">=7.0.0,<7.17.19", "CVE-2024-23450", Severity.HIGH, "Ingest pipeline DoS via deep nesting", "CWE-400"),
 
@@ -96,7 +97,7 @@ CVE_DATABASE: list = [
   #
   # Bounds are written WITHOUT the `p` suffix on purpose. `_SSH_LIBRARY_PATTERNS`
   # captures `(\d+\.\d+(?:\.\d+)?)`, so the matcher is handed "9.8", never
-  # "9.8p1" — and `_parse_version` encodes the suffix as extra tuple components,
+  # "9.8p1" — and `_parse_version` ranks the suffix in the key's tail,
   # making 9.8 sort *below* 9.8p1. Writing the published `p`-suffixed bounds
   # here shifted both boundaries by a release: a patched 9.8p1 server reported
   # CRITICAL, and vulnerable 8.5p1 servers were missed.
@@ -110,11 +111,22 @@ CVE_DATABASE: list = [
   CveEntry("openssh", "<7.0",  "CVE-2016-6210", Severity.MEDIUM, "User enumeration via timing", "CWE-200"),
 
   # ── Redis ──────────────────────────────────────────────────────────
-  CveEntry("redis", "<6.0.8",  "CVE-2021-32761", Severity.HIGH, "Integer overflow in BITFIELD", "CWE-190"),
+  # One row per branch: a single `<X` bound across branches fired on patched
+  # servers of the other branches. Ranges are the vendor's (CVE.org CNA) and
+  # NVD's; the lowest branch of each CVE keeps the CNA's open lower bound.
+  CveEntry("redis", ">=2.2,<5.0.13",  "CVE-2021-32761", Severity.HIGH, "BITFIELD integer overflow (32-bit builds only)", "CWE-190"),
+  CveEntry("redis", ">=6.0,<6.0.15",  "CVE-2021-32761", Severity.HIGH, "BITFIELD integer overflow (32-bit builds only)", "CWE-190"),
+  CveEntry("redis", ">=6.2,<6.2.5",   "CVE-2021-32761", Severity.HIGH, "BITFIELD integer overflow (32-bit builds only)", "CWE-190"),
   CveEntry("redis", "<6.2.7",  "CVE-2022-24735", Severity.HIGH, "Lua sandbox escape via EVAL", "CWE-94"),
-  CveEntry("redis", "<7.0.5",  "CVE-2022-35951", Severity.CRITICAL, "Integer overflow in XAUTOCLAIM", "CWE-190"),
-  CveEntry("redis", "<6.2.16", "CVE-2024-31449", Severity.HIGH, "Lua bit library stack buffer overflow RCE", "CWE-121"),
-  CveEntry("redis", "<7.2.7",  "CVE-2024-46981", Severity.CRITICAL, "Lua GC use-after-free RCE", "CWE-416"),
+  CveEntry("redis", ">=7.0.0,<7.0.5", "CVE-2022-35951", Severity.CRITICAL, "Integer overflow in XAUTOCLAIM", "CWE-190"),
+  CveEntry("redis", ">=2.6,<6.2.16",  "CVE-2024-31449", Severity.HIGH, "Lua bit library stack buffer overflow RCE", "CWE-121"),
+  CveEntry("redis", ">=7.0.0,<7.2.6", "CVE-2024-31449", Severity.HIGH, "Lua bit library stack buffer overflow RCE", "CWE-121"),
+  CveEntry("redis", ">=7.3.0,<7.4.1", "CVE-2024-31449", Severity.HIGH, "Lua bit library stack buffer overflow RCE", "CWE-121"),
+  # `<6.2.17` has no lower bound on purpose: 6.0 and earlier are end-of-life and
+  # unassessed by the vendor, and are reported (RM-169 labels them `eol_unassessed`).
+  CveEntry("redis", "<6.2.17",  "CVE-2024-46981", Severity.CRITICAL, "Lua GC use-after-free RCE", "CWE-416"),
+  CveEntry("redis", ">=7.2.0,<7.2.7", "CVE-2024-46981", Severity.CRITICAL, "Lua GC use-after-free RCE", "CWE-416"),
+  CveEntry("redis", ">=7.4.0,<7.4.2", "CVE-2024-46981", Severity.CRITICAL, "Lua GC use-after-free RCE", "CWE-416"),
 
   # ── MySQL ──────────────────────────────────────────────────────────
   CveEntry("mysql", ">=5.5,<5.5.52",  "CVE-2016-6662", Severity.CRITICAL, "Config file injection RCE", "CWE-94"),
@@ -122,16 +134,49 @@ CVE_DATABASE: list = [
   CveEntry("mysql", ">=5.7,<5.7.15",  "CVE-2016-6662", Severity.CRITICAL, "Config file injection RCE", "CWE-94"),
   CveEntry("mysql", ">=5.5,<5.5.52",  "CVE-2016-6664", Severity.HIGH, "Privilege escalation via mysqld_safe", "CWE-269"),
   CveEntry("mysql", ">=8.0,<8.0.23",  "CVE-2021-2022", Severity.MEDIUM, "InnoDB buffer pool corruption", "CWE-787"),
-  CveEntry("mysql", ">=5.7,<5.7.44",  "CVE-2024-20973", Severity.MEDIUM, "Optimizer DoS via low-privilege network attack", "CWE-404"),
+  CveEntry("mysql", ">=8.0.0,<=8.0.35", "CVE-2024-20973", Severity.MEDIUM, "Optimizer DoS via low-privilege network attack", "CWE-404"),
+  CveEntry("mysql", ">=8.1.0,<=8.2.0",  "CVE-2024-20973", Severity.MEDIUM, "Optimizer DoS via low-privilege network attack", "CWE-404"),
+  # Oracle MySQL 5.1.x before 5.1.63, 5.5.x before 5.5.24, 5.6.x before 5.6.6 (NVD
+  # description). NVD publishes a v2 vector only (MEDIUM).
+  CveEntry("mysql", ">=5.1,<5.1.63", "CVE-2012-2122", Severity.MEDIUM, "Authentication bypass via memcmp token comparison", "CWE-287"),
+  CveEntry("mysql", ">=5.5,<5.5.24", "CVE-2012-2122", Severity.MEDIUM, "Authentication bypass via memcmp token comparison", "CWE-287"),
+  CveEntry("mysql", ">=5.6,<5.6.6",  "CVE-2012-2122", Severity.MEDIUM, "Authentication bypass via memcmp token comparison", "CWE-287"),
+  CveEntry("mariadb", ">=5.1,<5.1.62",  "CVE-2012-2122", Severity.MEDIUM, "Authentication bypass via memcmp token comparison", "CWE-287"),
+  CveEntry("mariadb", ">=5.2,<5.2.12",  "CVE-2012-2122", Severity.MEDIUM, "Authentication bypass via memcmp token comparison", "CWE-287"),
+  CveEntry("mariadb", ">=5.3,<5.3.6",  "CVE-2012-2122", Severity.MEDIUM, "Authentication bypass via memcmp token comparison", "CWE-287"),
+  CveEntry("mariadb", ">=5.5,<5.5.23",  "CVE-2012-2122", Severity.MEDIUM, "Authentication bypass via memcmp token comparison", "CWE-287"),
 
   # ── PostgreSQL (new) ───────────────────────────────────────────────
-  CveEntry("postgresql", "<17.3",  "CVE-2025-1094", Severity.HIGH, "libpq quoting SQL injection leading to RCE", "CWE-89",
+  # One row per supported branch, each at its own fixed minor. The lowest branch
+  # has no lower bound: 11 and older are end-of-life and unassessed by the
+  # vendor, and are reported (RM-169 labels them `eol_unassessed`).
+  CveEntry("postgresql", "<13.19",  "CVE-2025-1094", Severity.HIGH, "libpq quoting SQL injection leading to RCE", "CWE-89",
            applicability=CLIENT_APPLICABILITY),
-  CveEntry("postgresql", "<17.1",  "CVE-2024-10979", Severity.HIGH, "PL/Perl env variable manipulation to RCE", "CWE-94"),
-  CveEntry("postgresql", "<17.1",  "CVE-2024-10976", Severity.MEDIUM, "Row security policy bypass via role confusion", "CWE-862"),
+  CveEntry("postgresql", ">=14.0,<14.16", "CVE-2025-1094", Severity.HIGH, "libpq quoting SQL injection leading to RCE", "CWE-89",
+           applicability=CLIENT_APPLICABILITY),
+  CveEntry("postgresql", ">=15.0,<15.11", "CVE-2025-1094", Severity.HIGH, "libpq quoting SQL injection leading to RCE", "CWE-89",
+           applicability=CLIENT_APPLICABILITY),
+  CveEntry("postgresql", ">=16.0,<16.7", "CVE-2025-1094", Severity.HIGH, "libpq quoting SQL injection leading to RCE", "CWE-89",
+           applicability=CLIENT_APPLICABILITY),
+  CveEntry("postgresql", ">=17.0,<17.3", "CVE-2025-1094", Severity.HIGH, "libpq quoting SQL injection leading to RCE", "CWE-89",
+           applicability=CLIENT_APPLICABILITY),
+  CveEntry("postgresql", "<12.21", "CVE-2024-10979", Severity.HIGH, "PL/Perl env variable manipulation to RCE", "CWE-94"),
+  CveEntry("postgresql", ">=13.0,<13.17", "CVE-2024-10979", Severity.HIGH, "PL/Perl env variable manipulation to RCE", "CWE-94"),
+  CveEntry("postgresql", ">=14.0,<14.14", "CVE-2024-10979", Severity.HIGH, "PL/Perl env variable manipulation to RCE", "CWE-94"),
+  CveEntry("postgresql", ">=15.0,<15.9", "CVE-2024-10979", Severity.HIGH, "PL/Perl env variable manipulation to RCE", "CWE-94"),
+  CveEntry("postgresql", ">=16.0,<16.5", "CVE-2024-10979", Severity.HIGH, "PL/Perl env variable manipulation to RCE", "CWE-94"),
+  CveEntry("postgresql", ">=17.0,<17.1", "CVE-2024-10979", Severity.HIGH, "PL/Perl env variable manipulation to RCE", "CWE-94"),
+  CveEntry("postgresql", "<12.21", "CVE-2024-10976", Severity.MEDIUM, "Row security policy bypass via role confusion", "CWE-862"),
+  CveEntry("postgresql", ">=13.0,<13.17", "CVE-2024-10976", Severity.MEDIUM, "Row security policy bypass via role confusion", "CWE-862"),
+  CveEntry("postgresql", ">=14.0,<14.14", "CVE-2024-10976", Severity.MEDIUM, "Row security policy bypass via role confusion", "CWE-862"),
+  CveEntry("postgresql", ">=15.0,<15.9", "CVE-2024-10976", Severity.MEDIUM, "Row security policy bypass via role confusion", "CWE-862"),
+  CveEntry("postgresql", ">=16.0,<16.5", "CVE-2024-10976", Severity.MEDIUM, "Row security policy bypass via role confusion", "CWE-862"),
+  CveEntry("postgresql", ">=17.0,<17.1", "CVE-2024-10976", Severity.MEDIUM, "Row security policy bypass via role confusion", "CWE-862"),
 
   # ── MongoDB (new) ──────────────────────────────────────────────────
-  CveEntry("mongodb", "<4.4.30", "CVE-2024-8207", Severity.MEDIUM, "Privilege escalation via untrusted library load", "CWE-284"),
+  CveEntry("mongodb", ">=5.0.0,<5.0.14", "CVE-2024-8207", Severity.MEDIUM, "Privilege escalation via untrusted library load", "CWE-284"),
+  CveEntry("mongodb", ">=6.0.0,<6.0.3",  "CVE-2024-8207", Severity.MEDIUM, "Privilege escalation via untrusted library load", "CWE-284"),
+  CveEntry("mongodb", ">=6.1.0,<6.1.1",  "CVE-2024-8207", Severity.MEDIUM, "Privilege escalation via untrusted library load", "CWE-284"),
 
   # ── Exim ───────────────────────────────────────────────────────────
   CveEntry("exim", "<4.98",   "CVE-2024-39929", Severity.MEDIUM, "RFC 2231 header parsing bypass — malware delivery", "CWE-20"),
@@ -143,9 +188,11 @@ CVE_DATABASE: list = [
   # ── Apache httpd ───────────────────────────────────────────────────
   CveEntry("apache", ">=2.4.0,<2.4.60",  "CVE-2024-38475", Severity.CRITICAL, "mod_rewrite escaping flaw — SSRF / RCE", "CWE-116"),
   CveEntry("apache", ">=2.4.0,<2.4.60",  "CVE-2024-38476", Severity.CRITICAL, "Backend header exploit — SSRF / local script exec", "CWE-829"),
-  CveEntry("apache", ">=2.4.49,<2.4.51", "CVE-2021-41773", Severity.CRITICAL, "Path traversal + RCE", "CWE-22"),
+  CveEntry("apache", ">=2.4.49,<2.4.50", "CVE-2021-41773", Severity.CRITICAL, "Path traversal + RCE", "CWE-22"),
   CveEntry("apache", ">=2.4.0,<2.4.52",  "CVE-2021-44790", Severity.CRITICAL, "mod_lua buffer overflow", "CWE-787"),
-  CveEntry("apache", ">=2.4.0,<2.4.62",  "CVE-2024-40725", Severity.MEDIUM, "HTTP request smuggling via mod_proxy", "CWE-444"),
+  CveEntry("apache", ">=2.4.60,<2.4.62", "CVE-2024-40725", Severity.MEDIUM, "Source code disclosure with handlers configured via AddType", "CWE-668"),
+  CveEntry("apache", ">=2.4.60,<2.4.69", "CVE-2026-42356", Severity.LOW, "Limited RCE for some internal redirects to non-CGI files in CGI directories", "CWE-430"),
+  CveEntry("apache", ">=2.4.68,<2.4.69", "CVE-2026-56449", Severity.HIGH, "mod_proxy_html crash in dump_content", "CWE-787"),
   CveEntry("apache", "<2.4.49",           "CVE-2021-40438", Severity.CRITICAL, "mod_proxy SSRF", "CWE-918"),
   CveEntry("apache", "<2.2.34",           "CVE-2017-7679", Severity.CRITICAL, "mod_mime buffer overread", "CWE-126"),
 
@@ -159,10 +206,18 @@ CVE_DATABASE: list = [
   CveEntry("postfix", "<3.5.23", "CVE-2023-51764", Severity.MEDIUM, "SMTP smuggling via pipelining", "CWE-345"),
 
   # ── OpenSSL ────────────────────────────────────────────────────────
-  CveEntry("openssl", "<1.1.1",  "CVE-2020-1971", Severity.MEDIUM, "NULL dereference in GENERAL_NAME_cmp", "CWE-476"),
-  CveEntry("openssl", "<3.0.7",  "CVE-2022-3602", Severity.HIGH, "X.509 email address buffer overflow", "CWE-120"),
-  CveEntry("openssl", ">=3.2.0,<3.2.4",  "CVE-2024-12797", Severity.MEDIUM, "RPK verification bypass enabling MitM", "CWE-392"),
-  CveEntry("openssl", "<3.0.14", "CVE-2024-4741", Severity.HIGH, "SSL_free_buffers use-after-free", "CWE-416"),
+  # Branch ranges as published (NVD, CVE.org CNA). Where a row has no lower
+  # bound it is on purpose: 0.9.x to 1.1.0 are end-of-life branches the vendor
+  # never assessed, and they are reported (RM-169 labels them `eol_unassessed`).
+  CveEntry("openssl", "<1.0.2x",  "CVE-2020-1971", Severity.MEDIUM, "NULL dereference in GENERAL_NAME_cmp", "CWE-476"),
+  CveEntry("openssl", ">=1.1.0,<1.1.1i",  "CVE-2020-1971", Severity.MEDIUM, "NULL dereference in GENERAL_NAME_cmp", "CWE-476"),
+  CveEntry("openssl", ">=3.0.0,<3.0.7",  "CVE-2022-3602", Severity.HIGH, "X.509 email address buffer overflow", "CWE-120"),
+  CveEntry("openssl", ">=3.2.0,<3.2.4",  "CVE-2024-12797", Severity.HIGH, "RPK verification bypass enabling MitM", "CWE-392"),
+  CveEntry("openssl", "<1.1.1y", "CVE-2024-4741", Severity.CRITICAL, "SSL_free_buffers use-after-free", "CWE-416"),
+  CveEntry("openssl", ">=3.0.0,<3.0.14", "CVE-2024-4741", Severity.CRITICAL, "SSL_free_buffers use-after-free", "CWE-416"),
+  CveEntry("openssl", ">=3.1.0,<3.1.6", "CVE-2024-4741", Severity.CRITICAL, "SSL_free_buffers use-after-free", "CWE-416"),
+  CveEntry("openssl", ">=3.2.0,<3.2.2", "CVE-2024-4741", Severity.CRITICAL, "SSL_free_buffers use-after-free", "CWE-416"),
+  CveEntry("openssl", ">=3.3.0,<3.3.1", "CVE-2024-4741", Severity.CRITICAL, "SSL_free_buffers use-after-free", "CWE-416"),
 
   # ── ProFTPD ────────────────────────────────────────────────────────
   CveEntry("proftpd", "<1.3.6",  "CVE-2019-12815", Severity.CRITICAL, "Arbitrary file copy via mod_copy", "CWE-284"),
@@ -187,8 +242,12 @@ CVE_DATABASE: list = [
   CveEntry("samba", ">=3.5.0,<4.6.4", "CVE-2017-7494", Severity.CRITICAL, "SambaCry — writable share RCE via shared library upload", "CWE-94"),
 
   # ── Asterisk / FreePBX (new — for SIP probe) ──────────────────────
-  CveEntry("asterisk", "<20.11.0", "CVE-2024-42365", Severity.HIGH, "AMI manager injection via caller ID", "CWE-94"),
-  CveEntry("asterisk", "<18.24.0", "CVE-2023-49786", Severity.MEDIUM, "PJSIP request smuggling via multipart parser", "CWE-444"),
+  CveEntry("asterisk", "<18.24.2", "CVE-2024-42365", Severity.HIGH, "AMI manager injection via caller ID", "CWE-94"),
+  CveEntry("asterisk", ">=19.0.0,<20.9.2", "CVE-2024-42365", Severity.HIGH, "AMI manager injection via caller ID", "CWE-94"),
+  CveEntry("asterisk", ">=21.0.0,<21.4.2", "CVE-2024-42365", Severity.HIGH, "AMI manager injection via caller ID", "CWE-94"),
+  CveEntry("asterisk", "<18.20.1", "CVE-2023-49786", Severity.MEDIUM, "PJSIP request smuggling via multipart parser", "CWE-444"),
+  CveEntry("asterisk", ">=19.0.0,<20.5.1", "CVE-2023-49786", Severity.MEDIUM, "PJSIP request smuggling via multipart parser", "CWE-444"),
+  CveEntry("asterisk", ">=21.0.0,<21.0.1", "CVE-2023-49786", Severity.MEDIUM, "PJSIP request smuggling via multipart parser", "CWE-444"),
 
   # ── OpenSMTPD ────────────────────────────────────────────────────
   CveEntry("opensmtpd", "<6.6.2",  "CVE-2020-7247", Severity.CRITICAL, "RCE via crafted MAIL FROM command", "CWE-78"),
@@ -211,7 +270,17 @@ CVE_DATABASE: list = [
            "CWE-134"),
 
   # ── Erlang OTP SSH ──────────────────────────────────────────────
-  CveEntry("erlang_ssh", "<5.2.2", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
+  # The probe reports whichever number the banner carries: the ssh application
+  # version (`Erlang/5.2.9`, <= 5.x) or the OTP release (`Erlang/27.3.2`, >= 17).
+  # The two ranges do not overlap, so each branch gets its own rows. Fixed in
+  # ssh 5.2.10 / 5.1.4.8 / 4.15.3.12 and OTP 27.3.3 / 26.2.5.11 / 25.3.2.20
+  # (Erlang/OTP security advisory for CVE-2025-32433); every older release is affected.
+  CveEntry("erlang_ssh", "<4.15.3.12", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
+  CveEntry("erlang_ssh", ">=5.0,<5.1.4.8", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
+  CveEntry("erlang_ssh", ">=5.2,<5.2.10", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
+  CveEntry("erlang_ssh", ">=17,<25.3.2.20", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
+  CveEntry("erlang_ssh", ">=26,<26.2.5.11", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
+  CveEntry("erlang_ssh", ">=27,<27.3.3", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
 
   # ── CouchDB ──────────────────────────────────────────────────────
   CveEntry("couchdb", "<3.2.2",           "CVE-2022-24706", Severity.CRITICAL, "Default Erlang cookie RCE via cluster protocol", "CWE-1188"),
@@ -258,18 +327,25 @@ CVE_DATABASE: list = [
   CveEntry("weblogic", ">=12.1.3.0,<12.1.3.1", "CVE-2017-10271", Severity.HIGH, "XMLDecoder deserialization RCE via wls-wsat", "CWE-502"),
   CveEntry("weblogic", ">=10.3.6.0,<10.3.6.1", "CVE-2020-14882", Severity.CRITICAL, "Console unauthenticated takeover RCE", "CWE-306"),
   CveEntry("weblogic", ">=12.1.3.0,<12.2.1.5", "CVE-2020-14882", Severity.CRITICAL, "Console unauthenticated takeover RCE", "CWE-306"),
-  CveEntry("weblogic", ">=12.2.1.3,<12.2.1.4", "CVE-2023-21839", Severity.HIGH, "IIOP/T3 protocol deserialization RCE", "CWE-502"),
+  CveEntry("weblogic", ">=14.1.1.0,<14.1.1.1", "CVE-2020-14882", Severity.CRITICAL, "Console unauthenticated takeover RCE", "CWE-306"),
+  # Oracle lists 12.2.1.3.0, 12.2.1.4.0 and 14.1.1.0.0; 12.2.1.4 and 14.1.1 are the current KEV targets.
+  CveEntry("weblogic", ">=12.2.1.3,<12.2.1.5", "CVE-2023-21839", Severity.HIGH, "IIOP/T3 protocol deserialization RCE", "CWE-502"),
+  CveEntry("weblogic", ">=14.1.1.0,<14.1.2", "CVE-2023-21839", Severity.HIGH, "IIOP/T3 protocol deserialization RCE", "CWE-502"),
 
   # ── Apache Tomcat ────────────────────────────────────────────
   CveEntry("tomcat", ">=9.0.0,<9.0.31",   "CVE-2020-1938", Severity.CRITICAL, "Ghostcat: AJP connector file read/inclusion RCE", "CWE-20"),
   CveEntry("tomcat", ">=8.5.0,<8.5.51",   "CVE-2020-1938", Severity.CRITICAL, "Ghostcat: AJP connector file read/inclusion RCE", "CWE-20"),
   CveEntry("tomcat", ">=7.0.0,<7.0.100",  "CVE-2020-1938", Severity.CRITICAL, "Ghostcat: AJP connector file read/inclusion RCE", "CWE-20"),
   CveEntry("tomcat", ">=7.0.0,<7.0.81",   "CVE-2017-12615", Severity.HIGH, "PUT method JSP file upload RCE", "CWE-434"),
+  CveEntry("tomcat", ">=8.5.0,<=8.5.100", "CVE-2025-24813", Severity.CRITICAL, "Partial PUT deserialization RCE", "CWE-502"),
   CveEntry("tomcat", ">=9.0.0,<9.0.99",   "CVE-2025-24813", Severity.CRITICAL, "Partial PUT deserialization RCE", "CWE-502"),
   CveEntry("tomcat", ">=10.1.0,<10.1.35", "CVE-2025-24813", Severity.CRITICAL, "Partial PUT deserialization RCE", "CWE-502"),
+  CveEntry("tomcat", ">=11.0.0,<11.0.3",  "CVE-2025-24813", Severity.CRITICAL, "Partial PUT deserialization RCE", "CWE-502"),
 
   # ── JBoss Application Server ─────────────────────────────────
   CveEntry("jboss", ">=4.0,<7.0",   "CVE-2017-12149", Severity.CRITICAL, "Java deserialization RCE via /invoker/readonly", "CWE-502"),
+  # NVD: "Red Hat Jboss Application Server <= Jboss 4.X" (CPE up to 4.0, CNA "4.x").
+  CveEntry("jboss", "<5.0", "CVE-2017-7504", Severity.CRITICAL, "JbossMQ HTTP invocation layer deserialization RCE", "CWE-502"),
 
   # ── Spring Framework ─────────────────────────────────────────
   CveEntry("spring_framework", ">=5.3.0,<5.3.18", "CVE-2022-22965", Severity.CRITICAL, "Spring4Shell: ClassLoader manipulation RCE", "CWE-94"),
@@ -286,10 +362,19 @@ CVE_DATABASE: list = [
   CveEntry("jetty", ">=9.4.0,<9.4.51", "CVE-2023-40167", Severity.MEDIUM, "HTTP request smuggling via invalid Transfer-Encoding", "CWE-444"),
 
   # ── BIND (DNS) ──────────────────────────────────────────────────
-  CveEntry("bind", "<9.11.37",  "CVE-2022-2795", Severity.MEDIUM, "Flooding targeted resolver with queries DoS", "CWE-400"),
-  CveEntry("bind", "<9.16.33",  "CVE-2022-3080", Severity.HIGH, "TKEY assertion failure DoS on DNAME resolution", "CWE-617"),
-  CveEntry("bind", "<9.16.42",  "CVE-2023-2828", Severity.HIGH, "Cache exhaustion DoS via crafted queries", "CWE-770"),
-  CveEntry("bind", "<9.18.24",  "CVE-2023-4408", Severity.HIGH, "DNS message parsing CPU exhaustion DoS", "CWE-400"),
+  # One row per branch (NVD, ISC CNA). `-S` and `-P` editions sort after the plain release.
+  CveEntry("bind", ">=9.0.0,<9.16.33",  "CVE-2022-2795", Severity.MEDIUM, "Flooding targeted resolver with queries DoS", "CWE-400"),
+  CveEntry("bind", ">=9.18.0,<9.18.7",  "CVE-2022-2795", Severity.MEDIUM, "Flooding targeted resolver with queries DoS", "CWE-400"),
+  CveEntry("bind", ">=9.19.0,<9.19.5",  "CVE-2022-2795", Severity.MEDIUM, "Flooding targeted resolver with queries DoS", "CWE-400"),
+  CveEntry("bind", ">=9.16.14,<9.16.33",  "CVE-2022-3080", Severity.HIGH, "TKEY assertion failure DoS on DNAME resolution", "CWE-617"),
+  CveEntry("bind", ">=9.18.0,<9.18.7",  "CVE-2022-3080", Severity.HIGH, "TKEY assertion failure DoS on DNAME resolution", "CWE-617"),
+  CveEntry("bind", ">=9.19.0,<9.19.5",  "CVE-2022-3080", Severity.HIGH, "TKEY assertion failure DoS on DNAME resolution", "CWE-617"),
+  CveEntry("bind", ">=9.11.0,<9.16.42",  "CVE-2023-2828", Severity.HIGH, "Cache exhaustion DoS via crafted queries", "CWE-770"),
+  CveEntry("bind", ">=9.18.0,<9.18.16",  "CVE-2023-2828", Severity.HIGH, "Cache exhaustion DoS via crafted queries", "CWE-770"),
+  CveEntry("bind", ">=9.19.0,<9.19.14",  "CVE-2023-2828", Severity.HIGH, "Cache exhaustion DoS via crafted queries", "CWE-770"),
+  CveEntry("bind", ">=9.0.0,<9.16.46",  "CVE-2023-4408", Severity.HIGH, "DNS message parsing CPU exhaustion DoS", "CWE-400"),
+  CveEntry("bind", ">=9.18.0,<9.18.22",  "CVE-2023-4408", Severity.HIGH, "DNS message parsing CPU exhaustion DoS", "CWE-400"),
+  CveEntry("bind", ">=9.19.0,<9.19.20",  "CVE-2023-4408", Severity.HIGH, "DNS message parsing CPU exhaustion DoS", "CWE-400"),
   CveEntry("bind", "<9.11.31",  "CVE-2021-25216", Severity.CRITICAL, "GSSAPI SPNEGO buffer overflow RCE", "CWE-120"),
   CveEntry("bind", "<9.11.19",  "CVE-2020-8617", Severity.MEDIUM, "TSIG validity check assertion failure DoS", "CWE-617"),
   CveEntry("bind", "<9.10.4",   "CVE-2016-2776", Severity.HIGH, "Crafted query buffer.c assertion failure DoS", "CWE-617"),
@@ -328,22 +413,34 @@ _DISTRO_PACKAGE_RE = re.compile(
 )
 
 
+# `Apache/2.4.38 (Debian)`: the distribution marker without a package revision (RM-240).
+_DISTRO_NO_REVISION_RE = re.compile(r"[_\s/](?P<upstream>\d[\w.]*?)\s+\((?P<distro>Ubuntu|Debian)\)", re.IGNORECASE)
+
+
+_DISTRO_PARSE_LIMIT = 256
+
+
 def parse_distro_package(text):
   """The distribution package a banner or version string announces, or None.
 
-  None means "no distribution suffix": an upstream build, or a distribution
-  that does not stamp its revision into the banner. It does not mean
-  "not backported"; that state is `unknown` below.
+  None means "no distribution marker": an upstream build. It does not mean
+  "not backported"; that state is `unknown` below. A bare `(Debian)` or
+  `(Ubuntu)` after the version gives `revision=""`: the distribution is
+  known, the revision is not.
   """
   if not isinstance(text, str):
     return None
+  cut = len(text) > _DISTRO_PARSE_LIMIT
+  text = text[:_DISTRO_PARSE_LIMIT]  # a hostile banner must not set the regex cost
   m = _DISTRO_PACKAGE_RE.search(text)
   if not m:
+    m = _DISTRO_NO_REVISION_RE.search(text)
+  if not m or (cut and m.end() == len(text)):  # a match that ends at the cut may have lost the rest of its revision
     return None
   return DistroPackage(
     distro=m.group("distro").lower(),
     upstream=m.group("upstream"),
-    revision=m.group("revision"),
+    revision=m.groupdict().get("revision") or "",
   )
 
 
@@ -402,9 +499,14 @@ BACKPORT_FIXES = {
 BACKPORT_FIXED = "fixed"
 BACKPORT_NOT_FIXED = "not_fixed"
 BACKPORT_UNKNOWN = "unknown"
+# `generated` only: the distribution's table says the package never carried the CVE.
+BACKPORT_NOT_AFFECTED = "not_affected"
 # The banner announced no distribution package at all, so there is nothing to
 # assess. Stated rather than left as "" so a report can always print a state.
 BACKPORT_UNKNOWN_NO_PACKAGE = "unknown_no_package"
+# `generated` only: the banner carries a positive upstream-build marker (`Apache/x (Unix)`, RM-204), so no
+# distribution backport applies. Set by the caller through `check_cves(upstream_build=True)`, never inferred here.
+BACKPORT_UPSTREAM_BUILD = "upstream_build"
 
 
 def _backport_row(product: str, cve_id: str, package):
@@ -418,27 +520,64 @@ def _backport_row(product: str, cve_id: str, package):
   return None
 
 
-def backport_status(product: str, cve_id: str, package) -> str:
-  """`fixed`, `not_fixed`, `unknown` or `unknown_no_package` for a CVE on a distribution package."""
-  if package is None:
-    return BACKPORT_UNKNOWN_NO_PACKAGE
-  row = _backport_row(product, cve_id, package)
-  if row is None:
-    return BACKPORT_UNKNOWN
-  if _compare_debian_revision(package.revision, row[1]) >= 0:
-    return BACKPORT_FIXED
-  return BACKPORT_NOT_FIXED
+def _distro_verdict(product: str, cve_id: str, package):
+  """The `generated` distro table's `(state, fixed_revision, release, source)`, or None (`static`, or nothing for it)."""
+  lookup = getattr(_VULNDB_READER, "distro_status", None)
+  return lookup(product, cve_id, package) if lookup and package is not None else None
 
+
+_DISTRO_STATE = {"fixed": BACKPORT_FIXED, "not_fixed": BACKPORT_NOT_FIXED, "not_affected": BACKPORT_NOT_AFFECTED}
+
+
+def _backport_state(product: str, cve_id: str, package):
+  """`(status, distro verdict or None)`; the verdict is set only when the distro table decided (overlay rows win)."""
+  if package is None:
+    return BACKPORT_UNKNOWN_NO_PACKAGE, None
+  row = _backport_row(product, cve_id, package)
+  if row is not None and not package.revision:
+    return BACKPORT_UNKNOWN, None  # a row matches by upstream: without a revision an equal upstream cannot say fixed or not
+  if row is None:
+    verdict = _distro_verdict(product, cve_id, package)
+    if verdict is None:
+      return BACKPORT_UNKNOWN, None
+    status = _DISTRO_STATE.get(verdict[0])
+    return (status, verdict) if status else (BACKPORT_UNKNOWN, None)  # an unexpected state is unknown
+  try:
+    fixed = _compare_debian_revision(package.revision, row[1]) >= 0
+  except ValueError:  # a revision with an absurd digit run (int-string limit): unknown, never an error out of a scan
+    return BACKPORT_UNKNOWN, None
+  return (BACKPORT_FIXED if fixed else BACKPORT_NOT_FIXED), None
+
+
+def backport_status(product: str, cve_id: str, package) -> str:
+  """`fixed`, `not_fixed`, `not_affected`, `unknown` or `unknown_no_package` for a CVE on a distribution package.
+
+  A `BACKPORT_FIXES` row wins; then, under `generated`, the distro table; then `unknown`. `static` never reads the table.
+  """
+  return _backport_state(product, cve_id, package)[0]
+
+
+# The `banner_verified` contract of `check_cves` and `_confidence_reason` (RM-200). Owner ruling 2026-11-17:
+# "firm only on a verified banner" applies where a banner check exists (SSH, SMTP) and nowhere else.
+#   BANNER_NOT_ASSESSABLE (the default): no banner check exists for the product; confidence is unchanged.
+#   None:  a check exists but could not run (no KEXINIT, no EHLO reply); a database-firm row is tentative `banner_only`.
+#   True:  the protocol behaviour matches the announced implementation; confidence is unchanged.
+#   False: it contradicts it (an emulator); every row is tentative `banner_unverified`.
+BANNER_NOT_ASSESSABLE = "not_assessable"
 
 # Why a CVE whose version range matched was still not reported.
 NOT_APPLICABLE_CLIENT_SIDE = "client_side"
 NOT_APPLICABLE_BACKPORT_FIXED = "backport_fixed"
+# The distribution's table lists the package as not affected by the CVE (`generated` only).
+NOT_APPLICABLE_DISTRO_NOT_AFFECTED = "distro_not_affected"
+# A probe read the service's own protocol behaviour and it clears the CVE (RM-200: Terrapin, from the KEXINIT).
+NOT_APPLICABLE_BEHAVIOUR_CLEARED = "behaviour_cleared"
 
 
-def _record_not_applicable(entry, product: str, version: str, package, reason: str) -> None:
+def _record_not_applicable(entry, product: str, version: str, package, reason: str, verdict=None) -> None:
   """Note a matched-but-skipped CVE in the scan-local collector, if one is set.
 
-  Only the two reasons a reader could dispute are recorded. A version outside
+  Only the reasons a reader could dispute are recorded (client side, backport fixed, distro not affected, behaviour cleared). A version outside
   the CVE's range was never a candidate, so listing it would bury these rows
   under the whole catalog for the product.
   """
@@ -449,18 +588,70 @@ def _record_not_applicable(entry, product: str, version: str, package, reason: s
   key = f"{port if port is not None else ''}/{entry.cve_id}"
   if key in collector:
     return
-  row = _backport_row(product, entry.cve_id, package) if reason == NOT_APPLICABLE_BACKPORT_FIXED else None
+  row = None
+  if reason in (NOT_APPLICABLE_BACKPORT_FIXED, NOT_APPLICABLE_DISTRO_NOT_AFFECTED):
+    row = _backport_row(product, entry.cve_id, package)
+    if row is None and verdict:
+      row = (package.upstream, verdict[1] or "", verdict[3])  # advisory = the table's source
   collector[key] = {
     "cve_id": entry.cve_id,
     "title": entry.title,
     "product": product,
     "version": version,
-    "package": f"{package.distro} {package.upstream}-{package.revision}" if package else "",
+    "package": (f"{package.distro} {package.upstream}" + (f"-{package.revision}" if package.revision else "")) if package else "",
     "port": port,
     "reason": reason,
     "advisory": row[2] if row else "",
     "fixed_revision": row[1] if row else "",
   }
+
+
+def clear_cve(findings: list, cve_id: str, product: str, version: str, package, reason: str) -> list:
+  """`findings` without the banner row of `cve_id`, which a probe's own evidence cleared (RM-200).
+
+  The row is not deleted silently: it is recorded as not applicable with `reason` (keyed by the current
+  probe port and the CVE), as a backport fix is.
+  """
+  kept = []
+  for f in findings:
+    if cve_id in (f.cve or ()):
+      _record_not_applicable(SimpleNamespace(cve_id=cve_id, title=f.title), product, version, package, reason)
+    else:
+      kept.append(f)
+  return kept
+
+
+def withdraw_not_applicable(cve_id: str) -> None:
+  """Drop this probe port's `backport_fixed` record of `cve_id`: the probe's own evidence says the CVE applies."""
+  collector = _CURRENT_NOT_APPLICABLE.get()
+  if collector is None:
+    return
+  port = current_probe_port()
+  key = f"{port if port is not None else ''}/{cve_id}"
+  if (collector.get(key) or {}).get("reason") in (NOT_APPLICABLE_BACKPORT_FIXED, NOT_APPLICABLE_DISTRO_NOT_AFFECTED):
+    del collector[key]
+
+
+def _stamp_identity(finding, product: str, version: str, tail: str):
+  """`finding` with both identity keys over `product:version:tail` (a CVE id, or `eol`)."""
+  identity = {"probe_id": f"cve:{product}", "asset_canonical": f"{product}:{version}:{tail}"}
+  return finding.with_identity(
+    finding_signature=finding.compute_signature(**identity),
+    finding_id=finding.compute_dedup_key(**identity),
+  )
+
+
+def confirm_cve(finding, product: str, version: str, evidence: str, reason: str = "behaviour_confirmed",
+                unverified: bool = False):
+  """`finding` with a probe's own evidence (RM-200: Terrapin from the KEXINIT); identity is recomputed.
+
+  Certain, unless the banner is unverified: an emulator's behaviour proves nothing about a real server, so the
+  row keeps the evidence but stays tentative `banner_unverified`.
+  """
+  confidence, reason = ("tentative", "banner_unverified") if unverified else ("certain", reason)
+  confirmed = replace(finding, confidence=confidence, confidence_reason=reason,
+                      evidence=f"{finding.evidence}; {evidence}" if finding.evidence else evidence)
+  return _stamp_identity(confirmed, product, version, finding.cve[0])
 
 
 def check_cves(
@@ -470,6 +661,9 @@ def check_cves(
   applicability: str = SERVER_APPLICABILITY,
   dynamic_cache=None,
   package=None,
+  inferred_span=None,
+  banner_verified=BANNER_NOT_ASSESSABLE,
+  upstream_build=False,
 ) -> list:
   """Match version against CVE database. Returns list of Findings.
 
@@ -483,18 +677,53 @@ def check_cves(
   announced one. A CVE the distribution has fixed by backport at or below
   the package's revision is not reported; every other match on a
   distribution package states its backport status explicitly (RM-070).
+
+  ``inferred_span`` is a pair of versions a probe proved (Heartbleed: ``1.0.1`` to ``1.0.1f``). Under
+  ``generated`` only rows that hold across the span keep their confidence; the rest are tentative
+  ``inferred_version``. ``static`` ignores it.
+
+  ``banner_verified`` is the probe's verdict on the banner (RM-200); the contract is stated at
+  ``BANNER_NOT_ASSESSABLE``. Omitted: no check exists for the product and nothing changes. ``None``: the check
+  could not run, so a database-firm row is tentative ``banner_only``. ``True``: unchanged. ``False``: every row is
+  tentative ``banner_unverified``, under ``static`` too.
+
+  ``upstream_build`` is True when the banner carries a positive upstream-build marker (RM-204). Under ``generated``
+  and with no package, a backported product's rows lose the ``banner_only`` reason. ``static`` ignores it.
   """
   if dynamic_cache is None:
     dynamic_cache = get_dynamic_reference_cache()
 
   findings = []
   seen_cves = set()
+  reader = _VULNDB_READER
+  if reader is not None:
+    # `generated`: the reader returns one row per CVE, strongest first, so no `seen_cves` here.
+    for match in reader.query(product, version, inferred_span):
+      if applicability and (CLIENT_APPLICABILITY if match.client_side else SERVER_APPLICABILITY) != applicability:
+        if match.client_side:
+          _record_not_applicable(match, product, version, package, NOT_APPLICABLE_CLIENT_SIDE)
+        continue
+      status, verdict = _backport_state(product, match.cve_id, package)
+      if upstream_build and status == BACKPORT_UNKNOWN_NO_PACKAGE:
+        status = BACKPORT_UPSTREAM_BUILD
+      # A banner proven false (an emulator) cannot vouch for a distribution's verdict: the table does not drop the row, it
+      # stays tentative `banner_unverified`. An overlay row (`verdict` None) keeps dropping, as before.
+      if status in (BACKPORT_FIXED, BACKPORT_NOT_AFFECTED) and not (verdict and banner_verified is False):
+        reason = NOT_APPLICABLE_BACKPORT_FIXED if status == BACKPORT_FIXED else NOT_APPLICABLE_DISTRO_NOT_AFFECTED
+        _record_not_applicable(match, product, version, package, reason, verdict)
+        continue
+      findings.append(_build_finding(match, product, version, dynamic_cache, backport_status=status, reader=reader,
+                                     banner_verified=banner_verified, distro=verdict))
+    oldest = reader.unsupported(product, version) if applicability in ("", SERVER_APPLICABILITY) else None
+    if oldest:
+      findings.append(_unsupported_finding(product, version, oldest, reader))
+    return findings
   for entry in CVE_DATABASE:
     if entry.product != product:
       continue
     # Range first, so an entry skipped below is one the version did match and
     # the skip can be recorded as a judgement rather than a non-match.
-    if not _matches_constraint(version, entry.constraint):
+    if not _matches_constraint(version, entry.constraint, product):
       continue
     if applicability and entry_applicability(entry) != applicability:
       if entry_applicability(entry) == CLIENT_APPLICABILITY:
@@ -509,8 +738,47 @@ def check_cves(
     if status == BACKPORT_FIXED:
       _record_not_applicable(entry, product, version, package, NOT_APPLICABLE_BACKPORT_FIXED)
       continue
-    findings.append(_build_finding(entry, product, version, dynamic_cache, backport_status=status))
+    findings.append(_build_finding(entry, product, version, dynamic_cache, backport_status=status, banner_verified=banner_verified))
   return findings
+
+
+def set_vulndb_reader(reader) -> None:
+  """Select the source for `check_cves`: a `VulndbReader` (`generated`) or None (`static`).
+
+  Deployment-wide, set once at plugin init: probes run on worker threads, so a ContextVar would not reach them.
+  """
+  global _VULNDB_READER
+  _VULNDB_READER = reader
+
+
+# Database product keys a probe passes as `product_hint` for a CVE the build lists under several products (RM-263).
+# Kept here, beside the database code: no probe matches these products by version.
+HINT_STRUTS2 = "struts2"
+HINT_SPRING_FRAMEWORK = "spring_framework"
+
+
+def probe_cve_fields(cve_id: str, product_hint: str = "") -> dict:
+  """Database fields for a CVE a probe confirmed itself (Heartbleed), not matched by `check_cves`.
+
+  `static`: KEV not evaluated, nothing else. `generated`: the build is named; KEV is None when the build has no row
+  for the CVE. With a row, the finding also gets the row's EPSS and `cvss[]` list, and the CVE view's subject
+  `product`: the one product the build's rows name for the CVE; when it names several, the probe's `product_hint` if the
+  build names that product, else none. Never `cvss_score`, vector or severity: those stay the probe's call (RM-263).
+  """
+  reader = _VULNDB_READER
+  if reader is None:
+    return {"kev": None}
+  fields = {"kev": reader.kev(cve_id), "vulndb_build_id": reader.build_id}
+  record = reader.probe_record(cve_id)
+  if record is None:
+    return fields
+  epss, cvss, products = record
+  fields.update(epss_score=epss, cvss=tuple(dict(c) for c in cvss))
+  if len(products) == 1:
+    fields["product"] = products[0]
+  elif product_hint and product_hint in products:
+    fields["product"] = product_hint
+  return fields
 
 
 def set_dynamic_reference_cache(dynamic_cache):
@@ -538,12 +806,75 @@ def reset_not_applicable_collector(token) -> None:
   _CURRENT_NOT_APPLICABLE.reset(token)
 
 
-def _build_finding(entry, product: str, version: str, dynamic_cache, backport_status: str = ""):
+# Products distributions package and backport fixes for, so a plain banner cannot settle `generated` rows (RM-169).
+_BACKPORTED_PRODUCTS = frozenset({
+  "openssh", "openssl", "apache", "nginx", "mysql", "mariadb", "postgresql", "php", "bind", "samba", "exim",
+  "proftpd", "redis", "memcached", "mongodb", "couchdb", "tomcat", "vsftpd", "dovecot", "postfix",
+})
+# Order in which one reason wins when several apply (report-findings.md, Per-finding fields).
+# `banner_unverified` is first: the version itself is untrusted, so no other reason is worth stating (RM-200).
+_TENTATIVE_REASON_ORDER = ("banner_unverified", "eol_unassessed", "inferred_version", "platform_dependent", "local_vector", "backport_unknown", "banner_only", "nvd_exact", "cna_range")
+
+
+def _static_cwe_id(cve_id: str) -> str:
+  """The static catalog classification of a CVE: frozen into finding identity whichever source made the finding."""
+  global _STATIC_CWE
+  if _STATIC_CWE is None:
+    _STATIC_CWE = {}
+    for e in CVE_DATABASE:
+      if e.cwe_id and e.cve_id not in _STATIC_CWE:
+        _STATIC_CWE[e.cve_id] = e.cwe_id
+  return _STATIC_CWE.get(cve_id, "")
+
+
+_STATIC_CWE = None
+
+
+def _local_vector_only(match) -> bool:
+  """True when the CVE has v3 vectors and every one is AV:L or AV:P: a network banner cannot show it applies."""
+  vectors = [str(c.get("vector", "")) for c in (getattr(match, "cvss", None) or ()) if str(c.get("version", "")).startswith("3.")]
+  return bool(vectors) and all(re.search(r"/AV:[LP](/|$)", v) for v in vectors)
+
+
+def _confidence_reason(backport_status: str, match, product: str, banner_verified=BANNER_NOT_ASSESSABLE) -> tuple:
+  """`(confidence, reason)` of a CVE finding. `match` is a reader `Match`, or None under `static`.
+
+  `banner_verified`: see `check_cves`. False wins over everything, under `static` too.
+  """
+  if banner_verified is False:
+    return "tentative", "banner_unverified"
+  if backport_status == BACKPORT_NOT_FIXED and not (match and match.platform_dependent):
+    return "firm", "distro_package"
+  if match is None:
+    return "tentative", "backport_unknown" if backport_status == BACKPORT_UNKNOWN else "banner_only"
+  reasons = set()
+  if match.platform_dependent:
+    reasons.add("platform_dependent")
+  if _local_vector_only(match):
+    reasons.add("local_vector")
+  if product in _BACKPORTED_PRODUCTS and backport_status not in (BACKPORT_NOT_FIXED, BACKPORT_UPSTREAM_BUILD):
+    reasons.add("backport_unknown" if backport_status == BACKPORT_UNKNOWN else "banner_only")
+  if match.confidence == "tentative":
+    reasons.add(match.reason)  # a reason this node does not know passes through (readers ignore it)
+  for reason in _TENTATIVE_REASON_ORDER + tuple(sorted(reasons - set(_TENTATIVE_REASON_ORDER))):
+    if reason in reasons:
+      return "tentative", reason
+  if banner_verified is None and match.confidence != "tentative":
+    # A database-firm row rests on the announced version alone: unproven for a banner no probe could check.
+    return "tentative", "banner_only"
+  if backport_status == BACKPORT_UPSTREAM_BUILD:
+    return match.confidence, "upstream_build"
+  return match.confidence, match.reason
+
+
+def _build_finding(entry, product: str, version: str, dynamic_cache, backport_status: str = "", reader=None,
+                   banner_verified=BANNER_NOT_ASSESSABLE, distro=None):
   """Construct a Finding for a matched CveEntry, optionally enriched
-  via the dynamic reference cache."""
+  via the dynamic reference cache. With a `reader`, `entry` is a reader `Match` (`generated`)."""
+  generated = reader is not None
   # Parse the legacy "CWE-22" format into an int CWE id for the
   # list-form `cwe` field on Finding.
-  cwe_int = _parse_cwe_int(entry.cwe_id)
+  cwe_int = _parse_cwe_int(entry.cwe if generated else entry.cwe_id)
   cwe_list = (cwe_int,) if cwe_int else ()
 
   # Static OWASP mapping from the cwe_to_owasp reference table.
@@ -557,10 +888,26 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
   cvss_version = "3.1"
   cvss_source = ""
   cvss_freshness = ""
-  kev = False
+  # `None` is "not evaluated": nothing consulted a database or a live cache (report-findings.md, KEV).
+  kev = None
   epss_score = None
   references_list: list[str] = [f"https://nvd.nist.gov/vuln/detail/{entry.cve_id}"]
   severity = entry.severity
+  cvss_list = ()
+  if generated:
+    # The database is the only source: the dynamic cache is not consulted. UNKNOWN (no score, no overlay
+    # severity) lists as MEDIUM so an unscored CVE is not hidden.
+    dynamic_cache = None
+    severity = Severity(entry.severity) if entry.severity in Severity.__members__ else Severity.MEDIUM
+    kev = bool(entry.kev)
+    epss_score = entry.epss
+    cvss_list = tuple(dict(c) for c in entry.cvss)
+    cvss_freshness = reader.built_at or ""
+    # The label is v3.x only; a 4.0 or 2.0 display CVSS stays in `cvss[]` (report-findings.md).
+    if str(entry.cvss_version or "").startswith("3."):
+      cvss_score, cvss_version, cvss_source = entry.cvss_score, entry.cvss_version, entry.cvss_source or ""
+      cvss_vector = next((c["vector"] for c in cvss_list
+                          if c["version"] == cvss_version and c["source"] == cvss_source and c["score"] == cvss_score), "")
 
   if dynamic_cache is not None:
     try:
@@ -594,7 +941,7 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
   # Catalog labels are NVD's band (`test_cve_cvss_vectors.py`); the band check
   # still guards a refetched table that moved ahead of the catalog, withholding
   # the vector as a disagreeing probe template is (RM-064).
-  if not cvss_vector and cvss_score is None:
+  if not generated and not cvss_vector and cvss_score is None:
     static_vector = CVE_CVSS_VECTORS.get(entry.cve_id, "")
     if static_vector and _template_band_agrees(static_vector, severity):
       cvss_vector = static_vector
@@ -607,18 +954,26 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
   # left to the reader (RM-070). `not_fixed` is the one case the evidence
   # supports beyond the upstream version, so it is the one case that is not
   # `tentative`.
-  if backport_status == BACKPORT_NOT_FIXED:
+  confidence, confidence_reason = _confidence_reason(backport_status, entry if generated else None, product, banner_verified)
+  if backport_status == BACKPORT_NOT_FIXED and distro and distro[1] is None:
+    backport_note = " The distribution lists this CVE as open: no fixed package is published for this release."
+  elif backport_status in (BACKPORT_FIXED, BACKPORT_NOT_AFFECTED):
+    backport_note = (
+      " The distribution's data says this package is fixed or not affected, but the banner could not be verified, "
+      "so the finding is tentative."
+    )
+  elif backport_status == BACKPORT_NOT_FIXED:
     backport_note = (
       " The distribution package is below the revision that carries the fix, "
       "so the backport does not apply."
     )
-    confidence = "firm"
+  elif backport_status == BACKPORT_UPSTREAM_BUILD:
+    backport_note = " The banner announces an upstream build with no distribution package, so no backport applies."
   elif backport_status == BACKPORT_UNKNOWN:
     backport_note = (
       " Backport status unknown: a distribution package was detected but no "
       "advisory data covers this CVE for it, so the fix may already be applied."
     )
-    confidence = "tentative"
   else:
     # BACKPORT_UNKNOWN_NO_PACKAGE, or "" from a caller that passed no status.
     backport_note = (
@@ -627,7 +982,6 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
       "security fixes without changing the upstream version number — this "
       "may be a false positive."
     )
-    confidence = "tentative"
     backport_status = backport_status or BACKPORT_UNKNOWN_NO_PACKAGE
 
   finding = Finding(
@@ -636,8 +990,11 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
     description=f"{product} {version} is vulnerable to {entry.cve_id}.{backport_note}",
     evidence=f"Detected version: {version}, affected: {entry.constraint}",
     remediation=f"Upgrade {product} to a patched version, or verify backport status with the OS vendor.",
-    cwe_id=entry.cwe_id,
+    cwe_id=_static_cwe_id(entry.cve_id) if generated else entry.cwe_id,
     confidence=confidence,
+    confidence_reason=confidence_reason,
+    vulndb_build_id=reader.build_id if generated else None,
+    cvss=cvss_list,
     backport_status=backport_status,
     # Phase 1 / Phase 2 enriched fields
     cvss_score=cvss_score,
@@ -665,14 +1022,27 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
   # dedup key to be recomputed downstream by `enrich_finding_for_probe` from the
   # *probe* name with no override, so the finding travelled with a signature
   # built over one identity basis and a dedup key built over another.
-  identity = {
-    "probe_id": f"cve:{product}",
-    "asset_canonical": f"{product}:{version}:{entry.cve_id}",
-  }
-  return finding.with_identity(
-    finding_signature=finding.compute_signature(**identity),
-    finding_id=finding.compute_dedup_key(**identity),
+  return _stamp_identity(finding, product, version, entry.cve_id)
+
+
+def _unsupported_finding(product: str, version: str, oldest: str, reader):
+  """HIGH finding: `version` is older than the oldest branch the vendor supports (`eol` table).
+
+  Not a CVE finding: no `cve`, so it is outside the CVE view's `raw`; the `vulndb_eol` tag lets the view name it.
+  """
+  finding = Finding(
+    severity=Severity.HIGH,
+    title=f"Unsupported version: {product} {version} (oldest supported {oldest})",
+    description=f"{product} {version} is older than the oldest supported branch ({oldest}); it no longer receives security fixes.",
+    evidence=f"Detected version: {version}, oldest supported: {oldest}",
+    remediation=f"Upgrade {product} to a supported release (>= {oldest}).",
+    confidence="firm",
+    confidence_reason="eol",
+    vulndb_build_id=reader.build_id,
+    tags=("vulndb_eol", product),
+    kev=False,
   )
+  return _stamp_identity(finding, product, version, "eol")
 
 
 def _parse_cwe_int(cwe_str: str) -> int:
@@ -691,76 +1061,112 @@ def _parse_cwe_int(cwe_str: str) -> int:
     return 0
 
 
-def _matches_constraint(version: str, constraint: str) -> bool:
+def _matches_constraint(version: str, constraint: str, product: str = "") -> bool:
   """Parse version constraint string and compare.
 
   Supports: ``<1.4.3``, ``>=2.4.49,<2.4.51``, ``<7.0``.
-  Comma-separated constraints are ANDed.
+  Comma-separated constraints are ANDed. ``product`` selects the product-specific
+  reading of single-letter release tags (see ``_parse_version``).
   """
   parts = [c.strip() for c in constraint.split(",")]
-  parsed = _parse_version(version)
+  parsed = _parse_version(version, product)
   if parsed is None:
     return False
   for part in parts:
-    if not _check_single(parsed, part):
+    if not _check_single(parsed, part, product):
       return False
   return True
 
 
-def _parse_version(version: str):
-  """Extract the first numeric version tuple from common banner strings.
+# Pre-release tags sort BEFORE the release they precede. Ascending rank:
+# dev < alpha < beta < milestone < rc/pre/preview/prerelease; `a`/`b` are alpha/beta.
+_PRE_RANK = {
+  "dev": 0, "alpha": 1, "a": 1, "beta": 2, "b": 2,
+  "milestone": 3, "m": 3, "rc": 4, "pre": 4, "preview": 4, "prerelease": 4,
+}
+# Products whose single-letter suffix is a release (openssl 1.0.1f, proftpd
+# 1.3.5b), not a pre-release.
+_LETTER_RELEASE_PRODUCTS = ("openssl", "proftpd", "samba")
+
+
+def _parse_version(version: str, product: str = ""):
+  """Reduce a banner or constraint version to a comparable key ``(numbers, tail)``.
 
   Handles values like ``Apache/2.4.57 (Ubuntu)``, ``OpenSSH_8.9p1``,
-  ``nginx/1.22.1``, and the older leading-version form
-  ``1.4.3-beta``.
+  ``nginx/1.22.1``, ``1:8.9p1-3ubuntu0.10`` and pre-releases such as
+  ``3.0.0rc1``, ``1.4.3-beta``, ``9.0.0.M1``, ``8.1.0-dev``.
+
+  ``tail`` orders what follows the numbers: a pre-release ``(-1, tag, n)`` sorts
+  before the release ``(0, 0, 0)``; a letter suffix ``9.8p1`` / ``1.0.1f`` or a
+  BIND edition or patch level (``-S1``, ``-P4``) sorts after it. Compare keys with ``_compare_versions``.
   """
   if not isinstance(version, str):
     return None
-  version = version.strip()
+  # Banners are untrusted: bound the work and the digit runs `int()` must parse.
+  version = version[:128].strip()
   # Strip a Debian/RPM epoch before searching. `1:8.9p1-3ubuntu0.10` otherwise
   # matches on the leading `1` and returns (1,), reading the epoch as the
   # upstream version — which makes an OpenSSH 8.9 host match every CVE for 1.x.
-  # Latent today because `_ssh_identify_library` reduces the banner to "8.9"
-  # before the matcher sees it, but live the moment the full package string is
-  # carried through, which RM-064 item 5 asks for.
   version = re.sub(r"^\s*\d+:", "", version)
-  m = re.search(r"(\d+(?:\.\d+)*)([a-z]+)?(\d*)", version, re.IGNORECASE)
+  m = re.search(r"(\d+(?:\.\d+)*)(.*)$", version, re.DOTALL)
   if not m:
     return None
-  parts = [int(x) for x in m.group(1).split(".")]
-  suffix = m.group(2) or ""
-  suffix_number = m.group(3) or ""
-  if suffix:
-    suffix_value = 0
-    for char in suffix.lower():
-      suffix_value = suffix_value * 26 + (ord(char) - ord("a") + 1)
-    parts.append(suffix_value)
-  if suffix_number:
-    parts.append(int(suffix_number))
-  return tuple(parts)
+  numbers = [int(x) for x in m.group(1).split(".")]
+  rest = m.group(2).lower()
+  tail = (0, 0, 0)
+  # `(?![a-z])`: the tag ends there, so `-precise` and `-devel` are not `pre` and `dev`.
+  pre = re.match(r"^[-_.~]?(alpha|beta|rc|prerelease|preview|pre|dev|milestone|m|a|b)(\d*)(?![a-z])", rest)
+  if pre:
+    tag, num = pre.group(1), pre.group(2)
+    # A bare single letter is a release letter, not a pre-release, unless a
+    # number follows (`1.0a1`, `9.0.0.M1`) and the product does not use letter
+    # releases.
+    single = len(tag) == 1
+    if (not single or num) and not (single and product in _LETTER_RELEASE_PRODUCTS):
+      tail = (-1, _PRE_RANK[tag], int(num or 0))
+  if tail == (0, 0, 0):
+    edition = re.match(r"^-([sp])(\d+)(?![a-z0-9])", rest)  # BIND `-S1` edition, `-P4` patch level
+    letter = re.match(r"^([a-z]{1,2})(\d*)(?=$|[-_.~+ ])", rest)  # 1.0.1f, 8.9p1, 1.3.5b
+    if edition:
+      tail = (1, ord(edition.group(1)) - 96, int(edition.group(2)))
+    elif letter:
+      value = 0
+      for char in letter.group(1):
+        value = value * 26 + ord(char) - 96
+      tail = (1, value, int(letter.group(2) or 0))
+  return numbers, tail
 
 
-def _check_single(parsed: tuple, expr: str) -> bool:
+def _compare_versions(a, b) -> int:
+  """Three-way compare of two ``_parse_version`` keys."""
+  na, ta = a
+  nb, tb = b
+  size = max(len(na), len(nb))
+  na = na + [0] * (size - len(na))
+  nb = nb + [0] * (size - len(nb))
+  if na != nb:
+    return -1 if na < nb else 1
+  return (ta > tb) - (ta < tb)
+
+
+def _check_single(parsed, expr: str, product: str = "") -> bool:
   """Evaluate one comparison like '<1.4.3' or '>=2.4.49'."""
   m = re.match(r"(>=|<=|>|<|==)(.+)", expr.strip())
   if not m:
     return False
   op, ver_str = m.group(1), m.group(2)
-  target = _parse_version(ver_str)
+  target = _parse_version(ver_str, product)
   if target is None:
     return False
-  # Normalize lengths for comparison
-  max_len = max(len(parsed), len(target))
-  a = parsed + (0,) * (max_len - len(parsed))
-  b = target + (0,) * (max_len - len(target))
+  c = _compare_versions(parsed, target)
   if op == "<":
-    return a < b
+    return c < 0
   elif op == "<=":
-    return a <= b
+    return c <= 0
   elif op == ">":
-    return a > b
+    return c > 0
   elif op == ">=":
-    return a >= b
+    return c >= 0
   elif op == "==":
-    return a == b
+    return c == 0
   return False

@@ -99,9 +99,13 @@ class PassReportRef:
   pass_nr: int
   report_cid: str
   risk_score: float = 0
+  pass_changes_cid: str = None  # RM-121: the pass's engagement-ledger artifact; absent outside an engagement
 
   def to_dict(self) -> dict:
-    return asdict(self)
+    d = asdict(self)
+    if d["pass_changes_cid"] is None:
+      d.pop("pass_changes_cid")
+    return d
 
   @classmethod
   def from_dict(cls, d: dict) -> PassReportRef:
@@ -109,6 +113,7 @@ class PassReportRef:
       pass_nr=d["pass_nr"],
       report_cid=d["report_cid"],
       risk_score=d.get("risk_score", 0),
+      pass_changes_cid=d.get("pass_changes_cid"),
     )
 
 
@@ -154,6 +159,9 @@ class CStoreJobRunning:
   end_attestation_required: bool = False
   failure_class: str = ""
   failure_message: str = ""
+  # RM-221: end-attestation outcome of a finished scan: submitted | failed | submitting.
+  attestation_status: str = None
+  attestation_failure_reason: str = None
   job_type: str = None
   model_test_summary: dict = None
   model_test_node_selection: dict = None
@@ -211,6 +219,8 @@ class CStoreJobRunning:
       end_attestation_required=d.get("end_attestation_required", False),
       failure_class=d.get("failure_class", ""),
       failure_message=d.get("failure_message", ""),
+      attestation_status=d.get("attestation_status"),
+      attestation_failure_reason=d.get("attestation_failure_reason"),
       job_type=d.get("job_type"),
       model_test_summary=d.get("model_test_summary"),
       model_test_node_selection=d.get("model_test_node_selection"),
@@ -260,6 +270,10 @@ class CStoreJobFinalized:
   end_attestation_required: bool = False
   failure_class: str = ""
   failure_message: str = ""
+  # RM-221: end-attestation outcome of a finished scan: submitted | failed | submitting.
+  attestation_status: str = None
+  attestation_failure_reason: str = None
+  redmesh_test_attestation: dict = None  # the end attestation a retry submitted; the archive stays as written
   job_type: str = None
   model_test_summary: dict = None
   model_test_node_selection: dict = None
@@ -315,6 +329,9 @@ class CStoreJobFinalized:
       end_attestation_required=d.get("end_attestation_required", False),
       failure_class=d.get("failure_class", ""),
       failure_message=d.get("failure_message", ""),
+      attestation_status=d.get("attestation_status"),
+      attestation_failure_reason=d.get("attestation_failure_reason"),
+      redmesh_test_attestation=d.get("redmesh_test_attestation"),
       job_type=d.get("job_type"),
       model_test_summary=d.get("model_test_summary"),
       model_test_node_selection=d.get("model_test_node_selection"),

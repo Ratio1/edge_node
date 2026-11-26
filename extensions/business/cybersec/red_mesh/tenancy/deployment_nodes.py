@@ -13,11 +13,14 @@ IP is self-reported by the node, not authenticated.
 """
 from datetime import datetime, timedelta, timezone
 import ipaddress
+import math
 
 # naeural_core.main.net_mon.MISSING_ID: what `network_node_eeid` answers for an unknown node.
 MISSING_ID = "missing_id"
 # A node republishes at least hourly; an older entry is a node that stopped publishing.
 NODE_INFO_MAX_AGE = timedelta(hours=2)
+# naeural_core.main.net_mon: what `network_node_last_seen(as_sec=True)` answers for a node never seen.
+UNSEEN_SECONDS = 9999999999
 
 
 def global_ip(value):
@@ -50,10 +53,11 @@ def published_ip(info, now):
 
 def node_directory(netmon, addresses, node_info=None, now=None):
   """`{address: {"alias": str | None, "tags": [str], "ip": str | None}}` for every address, in the
-  given order. `node_info` is the `<instance_id>:node_info` hash as read; None or malformed names no IP."""
+  given order, plus RM-212 `"online": bool | None` and `"last_seen": ISO UTC | None` (see `_liveness`). `node_info` is the `<instance_id>:node_info` hash as read; None or malformed names no IP."""
   now = now or datetime.now(timezone.utc)
   info = node_info if isinstance(node_info, dict) else {}
-  return {address: {**_entry(netmon, address), "ip": published_ip(info.get(address), now)} for address in addresses}
+  return {address: {**_entry(netmon, address), **_liveness(netmon, address, now),
+                    "ip": published_ip(info.get(address), now)} for address in addresses}
 
 
 def _entry(netmon, address):
@@ -74,6 +78,48 @@ def _entry(netmon, address):
   except Exception:
     tags = []
   return {"alias": alias, "tags": tags}
+
+
+def _liveness(netmon, address, now):
+  """RM-212: `{"online", "last_seen"}` from the monitor; None when it is missing or fails. `online` is the
+  soft summary-backed check (`network_node_is_online_for_control`, falling back to `network_node_is_online`
+  as `deeploy_mixin` does): it lags by about 60 to 240 s. `last_seen` is `now` minus the monitor's
+  elapsed seconds; the unseen sentinel, a negative or a non-finite value is None."""
+  online, last_seen = None, None
+  if netmon is None:
+    return {"online": online, "last_seen": last_seen}
+  try:
+    checker = getattr(netmon, "network_node_is_online_for_control", None)
+    found = checker(address) if callable(checker) else netmon.network_node_is_online(address)
+    online = found if isinstance(found, bool) else None
+  except Exception:
+    online = None
+  try:
+    elapsed = netmon.network_node_last_seen(address, as_sec=True)
+    if (isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool) and math.isfinite(elapsed)
+        and 0 <= elapsed < UNSEEN_SECONDS):
+      last_seen = (now - timedelta(seconds=elapsed)).isoformat()
+  except Exception:
+    last_seen = None
+  return {"online": online, "last_seen": last_seen}
+
+
+def node_readiness(directory, address, in_deployment):
+  """RM-212: `{online, lastSeen, inDeployment, state}` for one node, advisory and never stored.
+  `in_deployment` is True or False, or None when the peer list could not be read. `state`: `not_in_deployment`
+  when False; else `unknown` when the monitor said nothing or `in_deployment` is None; else `ready` when
+  online, else `offline`. `ready` means online and a configured peer; it does not prove RedMesh runs there."""
+  entry = directory.get(address) if isinstance(directory, dict) else None
+  entry = entry if isinstance(entry, dict) else {}
+  online = entry.get("online") if isinstance(entry.get("online"), bool) else None
+  last_seen = entry.get("last_seen") if isinstance(entry.get("last_seen"), str) else None
+  if in_deployment is False:
+    state = "not_in_deployment"
+  elif online is None or in_deployment is None:
+    state = "unknown"
+  else:
+    state = "ready" if online else "offline"
+  return {"online": online, "lastSeen": last_seen, "inDeployment": in_deployment, "state": state}
 
 
 def named_entry(directory, address):

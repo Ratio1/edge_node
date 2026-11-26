@@ -30,9 +30,19 @@ GRAYBOX_PROBE_REGISTRY = [
 
 # Graybox timing and limits
 GRAYBOX_DEFAULT_DELAY = 0.2
+# RM-273 Phase F: bounded 429/503 backoff, circuit breaker, per-call deadline. The breaker
+# resets per phase and per registry entry (one probe class), not per scenario.
+GRAYBOX_RETRY_MAX = 2
+GRAYBOX_RETRY_AFTER_MAX = 30
+GRAYBOX_BACKOFF_DEADLINE = 60
+GRAYBOX_BREAKER_THRESHOLD = 5
 GRAYBOX_WEAK_AUTH_DELAY = 1.0
 GRAYBOX_MAX_WEAK_ATTEMPTS = 20
 GRAYBOX_SESSION_MAX_AGE = 1800
+# RM-273 Phase 2b: (connect, read) seconds for a graybox request whose caller passes no timeout;
+# requests would otherwise wait forever on a target that accepts and never answers.
+GRAYBOX_HTTP_TIMEOUT = (10, 30)
+GRAYBOX_REAUTH_MAX = 3  # mid-family re-logins per principal; every login counts toward lockout
 
 
 FEATURE_CATALOG = [
@@ -75,7 +85,9 @@ FEATURE_CATALOG = [
       "_service_info_mongodb",
       "_service_info_modbus",
       "_service_info_couchdb",
-      "_service_info_influxdb"
+      "_service_info_influxdb",
+      "_service_info_ajp",
+      "_service_info_erlang_dist"
     ]
   },
   {
@@ -109,7 +121,7 @@ FEATURE_CATALOG = [
   {
     "id": "web_auth_design",
     "label": "Authentication & design flaws",
-    "description": "Detect account enumeration, missing rate limiting, and IDOR indicators (OWASP A04).",
+    "description": "Detect account enumeration, missing rate limiting, and IDOR indicators (OWASP A04). The account-enumeration and rate-limit tests send login attempts and run only when Credential testing is on.",
     "category": "web",
     "methods": ["_web_test_account_enumeration", "_web_test_rate_limiting", "_web_test_idor_indicators"]
   },
@@ -123,7 +135,7 @@ FEATURE_CATALOG = [
   {
     "id": "active_auth",
     "label": "Credential testing",
-    "description": "Test default/weak credentials on database and remote access services. May trigger account lockout.",
+    "description": "Send login attempts: default/weak credential guesses on SSH, FTP, Telnet, databases and HTTP Basic, the SNMP `public` community, random-credential controls, authentication-bypass payloads, and web login-form POSTs. Turn off to send no credential guess; the FTP anonymous login, SSH `auth_none` check and PostgreSQL startup message still run. May trigger account lockout.",
     "category": "service",
     "methods": ["_service_info_mysql_creds", "_service_info_postgresql_creds", "_service_info_http_basic_auth"]
   },
@@ -154,6 +166,16 @@ NETWORK_FEATURE_REGISTRY = {
   )
   for category in NETWORK_FEATURE_CATEGORIES
 }
+# Methods of the `active_auth` group. Its presence in a job's enabled methods is the
+# one switch for every credential guess (see PentestLocalWorker._login_attempts_allowed).
+ACTIVE_AUTH_METHODS = tuple(
+  method
+  for item in FEATURE_CATALOG
+  if item.get("id") == "active_auth"
+  for method in item.get("methods", [])
+)
+# Raw-result record left by a login-attempt path that the closed gate skipped.
+AUTH_SKIPPED = {"skipped": "active_auth disabled"}
 NETWORK_FEATURE_METHODS = tuple(
   method
   for category in NETWORK_FEATURE_CATEGORIES
@@ -234,6 +256,15 @@ FINGERPRINT_MAX_BANNER = 512   # bytes — max banner stored per port
 FINGERPRINT_HTTP_TIMEOUT = 4   # seconds — active HTTP probe timeout (honeypots may be slow)
 FINGERPRINT_NUDGE_TIMEOUT = 3  # seconds — generic \r\n nudge probe timeout
 
+# Blackbox web injection caps (RM-275). Workers may override any key through a
+# `web_injection_caps` dict attribute; the candidate, request, page and time caps are named in the probe's coverage note.
+WEB_INJECTION_CAPS = {
+  "crawl_max_pages": 30,           # routes fetched by the shared crawl, per base URL
+  "crawl_max_depth": 2,            # link depth from the root
+  "candidates_per_probe": 20,      # (path, parameter) pairs tested by one injection probe
+  "sqli_requests_per_port": 240,   # SQLi requests per port (20 candidates x ~12), controls not counted
+}
+
 # Well-known TCP port → protocol (fallback when banner is unrecognized)
 WELL_KNOWN_PORTS = {
     21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 42: "wins",
@@ -278,6 +309,8 @@ PROBE_PROTOCOL_MAP = {
     "_service_info_rsync":   frozenset({"rsync"}),
     "_service_info_couchdb":    frozenset({"http", "https"}),
     "_service_info_influxdb":   frozenset({"http", "https"}),
+    "_service_info_ajp":        frozenset({"ajp13"}),
+    "_service_info_erlang_dist": frozenset({"epmd"}),
     "_service_info_generic": frozenset({"unknown"}),
     "_service_info_mysql_creds": frozenset({"mysql"}),
     "_service_info_postgresql_creds": frozenset({"postgresql"}),

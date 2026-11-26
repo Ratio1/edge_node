@@ -105,6 +105,7 @@ def _make_api_auth_probe(*, allowed_scenario_ids=None, unverified_api_auth=False
   auth = MagicMock()
   auth.official_session = MagicMock()
   auth.regular_session = MagicMock()
+  auth.primary_session = auth.official_session
   auth.verify_tls = True
   auth.make_anonymous_session = MagicMock(return_value=MagicMock())
   safety = MagicMock()
@@ -413,3 +414,40 @@ class TestScenarioAssignmentGates(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestLegacyFamiliesPinnedUnderSlice(unittest.TestCase):
+  """RM-060 P2.6: legacy families run on the slice-index-0 worker only."""
+
+  def _runs_legacy(self, assigned):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = ProbeBase(
+      target_url="http://t", auth_manager=MagicMock(), target_config=MagicMock(),
+      safety=MagicMock(), allowed_scenario_ids=assigned,
+    )
+    ran = []
+    probe.run_safe("legacy", lambda: ran.append(1))
+    return bool(ran)
+
+  def test_slice_runs_legacy_on_first_worker_only(self):
+    assignments, _ = build_graybox_worker_assignments(
+      ["a", "b", "c"], strategy=GRAYBOX_ASSIGNMENT_SLICE,
+    )
+    ran = [self._runs_legacy(assignments[n]["assigned_scenario_ids"]) for n in "abc"]
+    self.assertEqual(ran, [True, False, False])
+
+  def test_mirror_runs_legacy_on_every_worker(self):
+    assignments, _ = build_graybox_worker_assignments(
+      ["a", "b"], strategy=GRAYBOX_ASSIGNMENT_MIRROR,
+      allow_mirror_per_worker_budget=True,
+    )
+    self.assertTrue(all(
+      self._runs_legacy(assignments[n]["assigned_scenario_ids"]) for n in "ab"
+    ))
+
+  def test_single_worker_and_no_assignment_run_legacy(self):
+    assignments, _ = build_graybox_worker_assignments(
+      ["a"], strategy=GRAYBOX_ASSIGNMENT_SLICE,
+    )
+    self.assertTrue(self._runs_legacy(assignments["a"]["assigned_scenario_ids"]))
+    self.assertTrue(self._runs_legacy(None))

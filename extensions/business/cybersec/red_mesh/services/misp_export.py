@@ -17,6 +17,7 @@ import math
 
 from pymisp import MISPEvent, MISPObject, MISPAttribute, PyMISP
 
+from ..cvss_entries import cvss_entries, is_cvss_vector
 from ..repositories import ArtifactRepository, JobStateRepository
 from ..tenancy.administration import AdministrationDenied
 from ..tenancy.effects import EffectState
@@ -198,6 +199,21 @@ def _build_misp_event(target, scan_type, task_name, job_id, risk_score,
       vuln.add_attribute("description", description[:4096])
     if cvss is not None:
       vuln.add_attribute("cvss-score", str(cvss))
+    # One cvss-string (the template allows one): the label vector, else the first v3 entry, else v4.
+    # The v4.0 vector and score go in that attribute's comment.
+    entries = cvss_entries(finding)
+    v4 = next((e for e in entries if e["version"] == "4.0"), None)
+    label = finding.get("cvss_vector")
+    if not is_cvss_vector(label):
+      label = next((e["vector"] for e in entries if e["version"] != "4.0"), None)
+    if label is None and v4:
+      label = v4["vector"]
+    if label:
+      comment = ""
+      if v4:  # names the v4.0 entry; its vector is left out when it already is the cvss-string
+        comment = f"CVSS v4.0 ({v4['nomenclature']})" + ("" if v4["vector"] == label else f": {v4['vector']}")
+        comment += f" score {v4['score']}" if "score" in v4 else ""
+      vuln.add_attribute("cvss-string", label, comment=comment) if comment else vuln.add_attribute("cvss-string", label)
 
     # References as individual link attributes
     if cwe_id:

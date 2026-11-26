@@ -104,8 +104,11 @@ _CONFIG = {
   "DEFAULT_MAX_TOKENS": 1024,
   "DEFAULT_TOP_P": 1.0,
 
-  # HTTP timeouts
-  "REQUEST_TIMEOUT_SECONDS": 120,
+  # HTTP timeouts. RM-217: both stay above the Pentester API's LOCAL_STRUCTURED_CHUNK_TIMEOUT
+  # (270 s), or this API gives up before the chunk call does. REQUEST_TIMEOUT is the HTTP front
+  # (504 after it; naeural_core default 120), REQUEST_TIMEOUT_SECONDS the call to the model.
+  "REQUEST_TIMEOUT": 300,
+  "REQUEST_TIMEOUT_SECONDS": 300,
 
   # Debug/logging
   "REDMESH_VERBOSE": 10,
@@ -168,12 +171,12 @@ Cover: number of open ports, number of services identified, overall risk posture
 _WEBAPP_PROMPTS = {
   LLM_ANALYSIS_SECURITY_ASSESSMENT: """You are a senior web application security specialist analyzing authenticated graybox scan results. The scan authenticated to the target web application with admin and optionally regular-user credentials, discovered routes and forms via crawling, and ran OWASP Top 10 probes including:
 
-- **A01 (Broken Access Control)**: IDOR/BOLA testing, privilege escalation from regular to admin endpoints
-- **A02 (Security Misconfiguration)**: Debug endpoint exposure, CORS policy, security headers, cookie attributes, CSRF protection, session token quality (JWT alg=none, short tokens)
-- **A03 (Injection)**: Reflected XSS and SQL injection in login and authenticated forms, stored XSS via form submission and readback
-- **A05 (Broken Access Control)**: Login form injection testing
-- **A06 (Insecure Design)**: Workflow bypass testing on state-changing endpoints
-- **A07 (Identification & Auth Failures)**: Bounded weak credential testing with lockout detection
+- **A01:2021 (Broken Access Control)**: IDOR/BOLA testing, privilege escalation from regular to admin endpoints, CSRF protection
+- **A02:2021 (Cryptographic Failures)**: JWT weak algorithm (alg=none)
+- **A03:2021 (Injection)**: Reflected XSS and SQL injection in login and authenticated forms, stored XSS via form submission and readback
+- **A04:2021 (Insecure Design)**: Workflow bypass testing on state-changing endpoints, mass assignment
+- **A05:2021 (Security Misconfiguration)**: Debug endpoint exposure, CORS policy, security headers, cookie attributes
+- **A07:2021 (Identification & Auth Failures)**: Bounded weak credential testing with lockout detection, session token quality
 - **API7 (SSRF)**: Server-side request forgery on URL-fetch endpoints
 
 Each finding has a status (vulnerable / not_vulnerable / inconclusive), severity, OWASP category, CWE IDs, evidence, and replay steps.
@@ -194,7 +197,7 @@ Provide a comprehensive security assessment. Structure your response as:
 
 Reference specific scenario IDs, endpoints, and evidence from the scan data. For inconclusive findings, explain what manual testing would confirm or rule out the issue.""",
 
-  LLM_ANALYSIS_VULNERABILITY_SUMMARY: """You are a senior web application security specialist analyzing authenticated graybox scan results. The scan tested OWASP Top 10 categories (A01-A07, API7) against the target application using admin and regular-user sessions.
+  LLM_ANALYSIS_VULNERABILITY_SUMMARY: """You are a senior web application security specialist analyzing authenticated graybox scan results. The scan tested OWASP Top 10 2021 categories (A01-A05, A07) and OWASP API Top 10 2023 categories against the target application using admin and regular-user sessions.
 
 Each finding has: scenario_id, status (vulnerable/not_vulnerable/inconclusive), severity, OWASP category, CWE IDs, evidence, and replay steps.
 

@@ -4,11 +4,8 @@ kmonitor
 # the oracle-only secret's constants and holder, and oracle sync relies on get_pickle's plain-data loader.
 # A lower floor would let an image build without them.
 ratio1>=3.5.72
-# naeural_core 7.7.359 is the first core version with this change's core parts: the chain-store write's
-# wait=False (at most 1 ms on the store's lock) and result_info, which the request trace, the tunnel secrets and
-# the dAuth secret record pass (an older core's write raises TypeError on them), and the request monitor hook
-# that writes the trace. A lower floor would let an image build without them.
-naeural_core>=7.7.359
+# Core 7.7.363 adds the stateless replacement start and its durable worker fence.
+naeural_core>=7.7.363
 decentra-vision
 python-telegram-bot[rate-limiter]
 protobuf

@@ -190,7 +190,6 @@ class TestTenantReadAccessAdmitsTheEffectOperations(unittest.TestCase):
 
   def setUp(self):
     from uuid import uuid4
-    from unittest.mock import patch
     from extensions.business.cybersec.red_mesh.repositories import JobStateRepository
     from extensions.business.cybersec.red_mesh.tenancy.administration import (
       AdministrationDenied, TenantAdministrationService)
@@ -203,9 +202,6 @@ class TestTenantReadAccessAdmitsTheEffectOperations(unittest.TestCase):
     from .test_tenant_read_access import ReadStore
 
     self.AdministrationDenied = AdministrationDenied
-    env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    env.start()
-    self.addCleanup(env.stop)
     self.store = ReadStore()
     administration = TenantAdministrationService(
       CstoreAuthAccountReader(self.store), CstoreTenantAdministrationStore(self.store, "deployment"))
@@ -381,7 +377,9 @@ class TestNoEndpointBecameTenantReachable(unittest.TestCase):
                   "publish_to_taxii", "correlate_suricata_eve", "generate_rulebook_assessment",
                   "save_rulebook_review_draft", "submit_rulebook_review", "reopen_rulebook_review",
                   "update_rulebook_review", "delete_job_engagement",
-                  "approve_report", "reject_report"}
+                  "approve_report", "reject_report",
+                  # RM-169 step 4a: `findings:triage`, tenant required, only the caller's own selector forwarded.
+                  "update_finding_triage"}
     enclosing = {}
     for node in ast.walk(tree):
       if isinstance(node, ast.FunctionDef):

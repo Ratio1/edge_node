@@ -1,9 +1,13 @@
+# The node can advertise source policy as soon as it admits a pipeline, before plugin construction.
+DEPLOYMENT_SOURCE_MODES = True
+
 from naeural_core.constants import ADMIN_PIPELINE, ADMIN_PIPELINE_FILTER, ADMIN_PIPELINE_EXCLUSIONS
 
 
 ADMIN_PIPELINE_FILTER = [
   *ADMIN_PIPELINE_FILTER,
   "ORACLE_SYNC_01",
+  "DEEPLOY_MANAGER_API",  # Receive encrypted repair requests and replies on the existing admin listener.
 ]
 
 

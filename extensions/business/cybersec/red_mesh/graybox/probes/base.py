@@ -6,16 +6,27 @@ Probes receive fully initialized collaborators — they don't manage
 sessions or credentials themselves.
 """
 
+import dataclasses
+
 import requests
 
+from ..budget import RequestRefused
+from ..safety import GrayboxAbort
 from ..findings import (
   GrayboxEvidenceArtifact,
+  evidence_content_sha256,
   GrayboxFinding,
   location_from_evidence as _location_from_evidence,
 )
 from ..models import GrayboxProbeContext, GrayboxProbeRunResult
 from ..rollback import MUTATION_ATTEMPTED_UNKNOWN, StatefulMutationPlan
+from ..scenario_runtime import owns_legacy_families
 
+
+# Scenarios that report "vulnerable" because something was NOT seen (no block,
+# no lockout, no limit). A refused request looks like "nothing seen", so these
+# verdicts do not survive a refusal during their run.
+ABSENCE_VERDICT_SCENARIOS = frozenset({"PT-A02-07", "PT-OAPI4-03", "PT-OAPI6-01"})
 
 _SNAPSHOT_MAX_CHARS = 2048
 _SCRUB_WINDOW_CHARS = _SNAPSHOT_MAX_CHARS * 2
@@ -119,7 +130,6 @@ def _artifact_from_response(response, scrub):
   through the caller's scrubber before anything is retained: an artifact must
   not become a new route for archiving what the scrubber removes elsewhere.
   """
-  import hashlib
   from datetime import datetime, timezone
 
   if response is None:
@@ -159,9 +169,7 @@ def _artifact_from_response(response, scrub):
       latency_ms = 0
 
   # Hashed after scrubbing, so the digest describes what is actually retained.
-  digest = hashlib.sha256(
-    (request_snapshot + "\x00" + response_snapshot).encode("utf-8", "replace")
-  ).hexdigest()
+  digest = evidence_content_sha256(request_snapshot, response_snapshot)
 
   return GrayboxEvidenceArtifact(
     summary=f"{method} {url} -> HTTP {status}"[:_SNAPSHOT_MAX_CHARS],
@@ -192,6 +200,7 @@ class ProbeBase:
 
   def __init__(self, target_url, auth_manager, target_config, safety,
                discovered_routes=None, discovered_forms=None,
+               discovered_candidates=None,
                regular_username="", allow_stateful=False,
                request_budget=None, allowed_scenario_ids=None,
                rollback_journal=None, job_id="", worker_id="",
@@ -202,10 +211,12 @@ class ProbeBase:
     self.safety = safety
     self.discovered_routes = discovered_routes or []
     self.discovered_forms = discovered_forms or []
+    self.discovered_candidates = discovered_candidates or []
     self.regular_username = regular_username
     self._allow_stateful = allow_stateful
     # OWASP API Top 10 — Subphase 1.7. Optional shared RequestBudget.
-    # When None, `self.budget()` always returns True (no enforcement).
+    # Charged by GrayboxHttpClient; probes only peek via `budget_available()`.
+    # When None there is no enforcement.
     self.request_budget = request_budget
     self.allowed_scenario_ids = (
       None if allowed_scenario_ids is None else set(allowed_scenario_ids)
@@ -222,21 +233,95 @@ class ProbeBase:
     return cls(**context.to_kwargs())
 
   def run_safe(self, probe_name, probe_fn):
+    """Run a legacy (non-manifest) family, on the legacy-owning worker only.
+
+    Under SLICE the manifest divides the API scenarios but not these
+    families, so every worker would repeat them; only slice index 0 runs them.
+    """
+    if not owns_legacy_families(getattr(self, "allowed_scenario_ids", None)):
+      return
+    self._run_guarded(probe_name, probe_fn)
+
+  def _run_guarded(self, probe_name, probe_fn):
     """
     Run a probe with error recovery.
 
     Does NOT call ensure_sessions — the worker is responsible for session
-    lifecycle. Probes just use self.auth.official_session /
+    lifecycle. Probes just use self.auth.primary_session /
     self.auth.regular_session as-is.
     """
+    budget = getattr(self, "request_budget", None)
+    safety = getattr(self, "safety", None)
+    refusals_before = budget.exhausted_count if budget is not None else 0
+    safety_before = self._safety_refusals(safety)
+    mark = len(self.findings)
+    abort = None
     try:
       probe_fn()
+    except RequestRefused:
+      pass  # recorded below with the other refusals
+    except GrayboxAbort as exc:
+      abort = exc  # re-raised below, after the downgrade
     except requests.exceptions.ConnectionError as exc:
       self._record_error(probe_name, self._error_with_detail("target_unreachable", exc))
     except requests.exceptions.Timeout as exc:
       self._record_error(probe_name, self._error_with_detail("request_timeout", exc))
     except Exception as exc:
       self._record_error(probe_name, self._sanitize_error(str(exc)))
+    reason = None
+    if self._safety_refusals(safety) > safety_before:
+      reason = safety.last_refusal
+    elif budget is not None and budget.exhausted_count > refusals_before:
+      reason = "budget_exhausted"
+    if reason:
+      self._downgrade_after_refusal(probe_name, mark, reason)
+    if abort is not None:
+      raise abort
+    if reason == "stopped":
+      # A probe swallowed the refusal: the stop must still end the run.
+      raise GrayboxAbort("stop requested", reason_class="stopped")
+
+  @staticmethod
+  def _safety_refusals(safety):
+    """Refusal count of a SafetyControls (0 for a missing or stand-in one).
+
+    The isinstance guard exists for the MagicMock `safety` fixtures of about ten probe test
+    files; fixing them all costs more than this guard.
+    """
+    count = getattr(safety, "refusals", 0)
+    return count if isinstance(count, int) else 0
+
+  @staticmethod
+  def _neutral_title(scenario_id):
+    try:
+      from ..scenario_catalog import graybox_scenario
+      return (graybox_scenario(scenario_id) or {}).get("title") or scenario_id
+    except ImportError:
+      return scenario_id
+
+  def _downgrade_after_refusal(self, probe_name, mark, reason="budget_exhausted"):
+    """A request was refused during this run, so it may have been swallowed by a
+    probe's own error handling: a clean verdict (and an absence-based vulnerable
+    one) is no longer proven. Findings backed by fetched evidence stay."""
+    for i in range(mark, len(self.findings)):
+      f = self.findings[i]
+      if f.status == "not_vulnerable" or (
+          f.status == "vulnerable" and f.scenario_id in ABSENCE_VERDICT_SCENARIOS):
+        if f.rollback_status == "revert_failed":
+          # Where manual cleanup is needed must survive: withdraw the verdict only.
+          self.findings[i] = dataclasses.replace(
+            f, status="inconclusive",
+            evidence=list(f.evidence) + [f"reason={reason}"])
+          continue
+        # Neutral shape: the old title and location asserted the verdict being withdrawn.
+        self.findings[i] = dataclasses.replace(
+          f, title=self._neutral_title(f.scenario_id), status="inconclusive",
+          severity="INFO", cwe=[], attack=[], confidence="",
+          url=None, parameter=None, method=None,
+          evidence=[f"reason={reason}"], evidence_artifacts=[],
+          replay_steps=[], remediation="", cvss_score=None, cvss_vector="",
+        )
+    self._record_error(probe_name, reason)
 
   def scenario_enabled(self, scenario_id: str) -> bool:
     """Return whether this worker is allowed to execute ``scenario_id``."""
@@ -253,7 +338,7 @@ class ProbeBase:
     if auth is None:
       return False
     auth_type = getattr(auth, "auth_type", "form") or "form"
-    if auth_type not in ("bearer", "api_key"):
+    if auth_type not in ("bearer", "api_key", "basic"):
       return False
     probe_path = (getattr(auth, "authenticated_probe_path", "") or "").strip()
     return bool(getattr(auth, "allow_unverified_auth", False)) and not probe_path
@@ -287,7 +372,7 @@ class ProbeBase:
     if self._is_api_security_scenario(scenario_id) and self._api_auth_unverified():
       self._emit_auth_unverified(scenario_id)
       return
-    self.run_safe(probe_name, probe_fn)
+    self._run_guarded(probe_name, probe_fn)
 
   def run_runtime_scenarios(self, probe_key: str):
     """Run assigned runtime-manifest scenarios for one probe family."""
@@ -391,6 +476,12 @@ class ProbeBase:
         mutation_attempted_unknown = True
       else:
         mutated = bool(mutate_result)
+    except (RequestRefused, GrayboxAbort):
+      # A refusal part-way through mutate may follow a request that already
+      # landed: treat the mutation as attempted so the revert still runs
+      # (revert traffic is exempt from the budget).
+      mutated = True
+      mutation_attempted_unknown = True
     except Exception as exc:
       self.emit_inconclusive(
         scenario_id, title, owasp,
@@ -511,26 +602,14 @@ class ProbeBase:
       )
       return False
 
-  def budget(self, n: int = 1) -> bool:
-    """Consume ``n`` requests from the shared per-scan RequestBudget.
+  def budget_available(self, n: int = 1) -> bool:
+    """True when the shared budget could cover ``n`` more requests.
 
-    Returns False (and records an exhaustion event on the budget object)
-    when the budget can't cover the request. Probes that hit this should
-    stop iteration and emit `inconclusive` with reason
-    ``budget_exhausted``. Returns True when no budget is configured
-    (legacy callers / tests without a budget).
+    A peek, not a charge: `GrayboxHttpClient` charges each request as it is
+    sent. Use it to skip a multi-request burst up front and emit
+    ``inconclusive`` / ``budget_exhausted`` instead of sending half of it.
     """
-    if self.request_budget is None:
-      return True
-    return self.request_budget.consume(n)
-
-  def cleanup_budget(self, n: int = 1) -> bool:
-    """Return True for cleanup/revert requests.
-
-    Cleanup requests are deliberately exempt from the normal probe
-    request budget; budget exhaustion must not prevent rollback.
-    """
-    return True
+    return self.request_budget is None or self.request_budget.remaining >= n
 
   def request(self, session, method: str, url: str, **kwargs):
     """Probe-facing HTTP helper.
@@ -544,6 +623,227 @@ class ProbeBase:
   def stateful_request(self, session, method: str, url: str, **kwargs):
     """Issue a state-changing request through the scoped session wrapper."""
     return self.request(session, method, url, **kwargs)
+
+  # ── Reachability rule (RM-219) ──────────────────────────────────────
+  #
+  # A denied endpoint is not a clean endpoint. A response "reached the
+  # handler" only when it is a 2xx that is not the login page (after
+  # redirects), or a 3xx whose Location is not the login page. 401/403/404/405
+  # and a redirect to login all mean "not reached"; a list of denial codes is
+  # not enough because the target may deny with 404 or a login redirect.
+
+  def _login_url_path(self) -> str:
+    """Path of the configured login page, base-path aware, no trailing slash."""
+    login_path = getattr(self.target_config, "login_path", "")
+    if not isinstance(login_path, str) or not login_path:
+      return ""
+    from urllib.parse import urlparse
+    return urlparse(self.target_url + "/" + login_path.lstrip("/")).path.rstrip("/")
+
+  def _is_login_location(self, location, base_url="") -> bool:
+    """True when ``location`` points at the configured login page.
+
+    A relative ``location`` is resolved against ``base_url`` (the request
+    URL), so ``login?next=`` and ``/app/login`` both match a login page that
+    lives under a base path. Query and trailing slash are ignored.
+    """
+    location = _as_text(location)
+    login = self._login_url_path()
+    if not login or not location:
+      return False
+    from urllib.parse import urljoin, urlparse
+    base_url = _as_text(base_url) or (self.target_url + "/")
+    target = urlparse(urljoin(base_url, location)).path.rstrip("/")
+    return target == login
+
+  def _has_login_form(self, text) -> bool:
+    """True when the body is a login form: password input plus username field.
+
+    A page that only pre-fills a username next to a change-password form is
+    not a login page, so a form with an action must post to the login path.
+    A form posting to itself (no action, empty, "#" or query-only) needs a
+    login shape: one password input, at most 3 visible fields.
+    """
+    import re
+    text = _as_text(text)
+    if not re.search(r'<input[^>]+type=["\']?password', text, re.IGNORECASE):
+      return False
+    username_field = getattr(self.target_config, "username_field", "")
+    if isinstance(username_field, str) and username_field and re.search(
+      r'<input[^>]+name=["\']?' + re.escape(username_field) + r'["\'\s>]',
+      text, re.IGNORECASE,
+    ) is None:
+      return False
+    actions = re.findall(
+      r'<form[^>]*\baction=(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))', text, re.IGNORECASE)
+    actions = ["".join(groups) for groups in actions]
+    if any(self._is_login_location(a) for a in actions):
+      return True
+    # No action, or an empty, "#" or query-only one, posts back to the page
+    # itself: a login form rendered inline at the protected URL. An admin
+    # "create user" page posts to itself too, so the inline form counts only
+    # with exactly one password input and at most 3 visible fields.
+    if actions and not any(
+      not a.strip() or a.strip().startswith(("#", "?")) for a in actions
+    ):
+      return False
+    passwords = re.findall(r'<input[^>]+type=["\']?password', text, re.IGNORECASE)
+    visible = [
+      tag for tag in re.findall(r'<input\b[^>]*>', text, re.IGNORECASE)
+      if not re.search(r'type=["\']?(hidden|submit|button|image|reset)\b',
+                       tag, re.IGNORECASE)
+    ] + re.findall(r'<(?:select|textarea)\b', text, re.IGNORECASE)
+    return len(passwords) == 1 and len(visible) <= 3
+
+  def response_reached(self, resp, validation_ok=False, auth_required_marker="") -> bool:
+    """Shared reachability check: did ``resp`` come from the endpoint's handler.
+
+    ``validation_ok`` counts 400/415/422 as reached: the handler parsed the
+    request and rejected the input, which is the secure result of a
+    type-confusion probe and not a denial of the principal.
+    ``auth_required_marker`` is the endpoint's configured auth-required body
+    marker: a 2xx that carries it is a denial page, not the handler.
+    """
+    if resp is None:
+      return False
+    status = getattr(resp, "status_code", None)
+    if not isinstance(status, int):
+      return False
+    if validation_ok and status in (400, 415, 422):
+      return True
+    request_url = _as_text(getattr(resp, "url", "")) or _as_text(
+      getattr(getattr(resp, "request", None), "url", ""))
+    headers = getattr(resp, "headers", None)
+    if 300 <= status < 400:
+      # Only seen when the caller sent allow_redirects=False. A redirect with
+      # no Location is not a handled request.
+      try:
+        location = headers.get("Location", "") if headers is not None else ""
+      except Exception:
+        location = ""
+      location = _as_text(location)
+      if not location:
+        return False
+      return not self._is_login_location(location, request_url)
+    if not 200 <= status < 300:
+      return False
+    if self._is_login_location(request_url):
+      return False
+    history = getattr(resp, "history", None)
+    if isinstance(history, (list, tuple)):
+      for hop in history:
+        hop_headers = getattr(hop, "headers", None)
+        try:
+          hop_location = hop_headers.get("Location", "") if hop_headers is not None else ""
+        except Exception:
+          hop_location = ""
+        hop_url = _as_text(getattr(hop, "url", ""))
+        if self._is_login_location(hop_location, hop_url):
+          return False
+    text = getattr(resp, "text", "")
+    if (isinstance(auth_required_marker, str) and auth_required_marker.strip()
+        and auth_required_marker.strip().lower() in _as_text(text).lower()):
+      return False
+    return not self._has_login_form(text)
+
+  def is_logout_path(self, path) -> bool:
+    """True when ``path`` is the logout URL (trailing slash and query ignored)."""
+    logout = getattr(self.target_config, "logout_path", "")
+    path = _as_text(path)
+    if not isinstance(logout, str) or not logout or not path:
+      return False
+    from urllib.parse import urlparse
+    return (urlparse(path).path.rstrip("/")
+            == urlparse(logout).path.rstrip("/"))
+
+  def baseline_reached(self, session, url, **kwargs):
+    """Plain GET baseline of ``url``: True/False for reached, None on a
+    transport failure (the caller skips the endpoint)."""
+    try:
+      resp = session.get(url, timeout=10, **kwargs)
+    except Exception:
+      return None
+    return self.response_reached(resp)
+
+  def _admin_baseline_reached(self, url) -> bool:
+    """True when the admin session got a reached response on ``url``.
+
+    Only meaningful with admin credentials: it tells a real denial of the
+    regular user (admin gets 2xx on the same endpoint) from a mistyped path
+    (admin gets 404 too). Always a plain GET, whatever verb the probe uses:
+    the baseline must never mutate state under the admin principal.
+    """
+    if getattr(self.auth, "admin_context", "") != "provided":
+      return False
+    admin = getattr(self.auth, "official_session", None)
+    if admin is None:
+      return False
+    cache = self.__dict__.setdefault("_admin_baseline_cache", {})
+    if url not in cache:
+      try:
+        resp = self.request(admin, "GET", url, timeout=10,
+                            allow_redirects=False)
+        cache[url] = self.response_reached(resp)
+      except Exception:
+        cache[url] = False
+    return cache[url]
+
+  def exempt_denial(self, resp, url) -> str:
+    """Reason string when ``resp`` is a denial of the scan principal, else "".
+
+    For scenarios where a denial is the secure result: 401/403, a login
+    redirect, and a 404 only when an admin baseline reached the endpoint.
+    """
+    if resp is None:
+      return ""
+    status = getattr(resp, "status_code", None)
+    if not isinstance(status, int):
+      return ""
+    if status in (401, 403):
+      return f"status_{status}"
+    if self.response_reached(resp):
+      return ""
+    if 200 <= status < 400:
+      return "login_redirect"
+    if status == 404 and self._admin_baseline_reached(url):
+      return "status_404_admin_reached"
+    return ""
+
+  def bare_not_found(self, resp, url) -> bool:
+    """True for a 404 that no admin baseline explains: skip, never clean."""
+    return (
+      getattr(resp, "status_code", None) == 404
+      and not self._admin_baseline_reached(url)
+    )
+
+  def denial_reason(self) -> str:
+    """Reason code for an endpoint that denied the scan principal."""
+    if getattr(self.auth, "admin_context", "") == "absent":
+      return "admin_context_absent"
+    return "endpoint_denied"
+
+  def emit_endpoint_denied(self, scenario_id):
+    """Inconclusive finding for a scenario whose every endpoint was denied."""
+    try:
+      from ..scenario_catalog import graybox_scenario
+      entry = graybox_scenario(scenario_id) or {}
+    except ImportError:
+      entry = {}
+    self.emit_inconclusive(
+      scenario_id,
+      entry.get("title") or scenario_id,
+      entry.get("owasp") or "",
+      self.denial_reason(),
+    )
+
+  def principal_label(self) -> str:
+    """Human name of the primary scan principal, for replay steps."""
+    principal = getattr(self.auth, "primary_principal", "")
+    if principal == "regular":
+      return "the regular user"
+    if principal == "official":
+      return "the official user"
+    return "the scan user"
 
   def _record_error(self, probe_name, error_msg):
     """Store a non-fatal error as an INFO GrayboxFinding."""
@@ -625,6 +925,15 @@ class ProbeBase:
     except TypeError:
       sanitized = self.safety.sanitize_error(str(value))
     return self._scrub_for_emission(sanitized)
+
+  def evidence_from(self, response):
+    """Evidence artifacts for a finding built directly with `GrayboxFinding`.
+
+    Same artifact `emit_vulnerable(response=...)` builds, without changing how
+    the finding itself is constructed. Empty when there is no response.
+    """
+    built = _best_effort(_artifact_from_response, response, self._scrub_for_emission)
+    return self._scrub_for_emission([built]) if built is not None else []
 
   def emit_vulnerable(self, scenario_id, title, severity, owasp, cwe,
                        evidence, *, attack=None, evidence_artifacts=None,

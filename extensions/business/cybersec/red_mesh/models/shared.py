@@ -59,6 +59,8 @@ class RiskBreakdown:
   reference_data_enabled: bool = None  # NVD/KEV/EPSS consulted for this pass
   credential_floor_applied: bool = None  # an accepted credential lifted the score
   constants: dict = None            # weights, multipliers, ceiling, penalty, floor
+  possible_cves: int = None         # RM-169, generated CVE view: findings left out of the score as "possible"
+  cve_view_counts: dict = None      # RM-169: { raw, listed, rolled_up, possible, folded, closed, dropped }
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -78,6 +80,8 @@ class RiskBreakdown:
       reference_data_enabled=d.get("reference_data_enabled"),
       credential_floor_applied=d.get("credential_floor_applied"),
       constants=d.get("constants"),
+      possible_cves=d.get("possible_cves"),
+      cve_view_counts=d.get("cve_view_counts"),
     )
 
 

@@ -439,3 +439,138 @@ class TestApi5BflaStateful(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+# ── RM-219 reachability rule ────────────────────────────────────────────
+
+def _login_page(url="http://api.example/auth/login/?next=/api/admin/export/"):
+  """A login redirect already followed by `requests`: 200 plus the login form."""
+  r = _mock_response(
+    status=200, content_type="text/html",
+    text="<input name='username'><input type='password' name='password'>",
+  )
+  r.url = url
+  r.history = []
+  return r
+
+
+def _set_admin(p, admin_context, admin_status=200):
+  p.auth.admin_context = admin_context
+  p.auth.official_session = MagicMock()
+  p.auth.official_session.request = MagicMock(return_value=_mock_response(
+    status=admin_status, json_body={"ok": True}))
+
+
+class TestExemptApiDenial(unittest.TestCase):
+  """PT-OAPI1-01 / 5-01 / 5-02: a denial is the secure result."""
+
+  def _bfla(self, response, admin_context, admin_status=200, anon=False):
+    ep = ApiFunctionEndpoint(path="/api/admin/export/", method="GET",
+                             privilege="admin")
+    p = _make_probe(function_endpoints=[ep])
+    _set_admin(p, admin_context, admin_status)
+    sid = "PT-OAPI5-02" if anon else "PT-OAPI5-01"
+    if anon:
+      p.auth.make_anonymous_session.return_value.get.return_value = response
+      p._test_bfla_anon_as_user()
+    else:
+      p.auth.regular_session.get.return_value = response
+      p._test_bfla_regular_as_admin()
+    return [f for f in p.findings if f.scenario_id == sid]
+
+  def test_login_redirect_is_clean_not_vulnerable(self):
+    redirect = _mock_response(status=302, text="", content_type="text/html")
+    redirect.headers["Location"] = "/auth/login/?next=/api/admin/export/"
+    for admin in ("provided", "absent"):
+      for anon in (False, True):
+        for name, resp in (("302", redirect), ("followed", _login_page())):
+          with self.subTest(admin=admin, anon=anon, form=name):
+            found = self._bfla(resp, admin, anon=anon)
+            self.assertEqual([f.status for f in found], ["not_vulnerable"])
+
+  def test_403_is_clean_with_and_without_admin(self):
+    for admin in ("provided", "absent"):
+      with self.subTest(admin=admin):
+        found = self._bfla(_mock_response(status=403), admin)
+        self.assertEqual([f.status for f in found], ["not_vulnerable"])
+
+  def test_404_is_clean_only_when_admin_reached_the_endpoint(self):
+    found = self._bfla(_mock_response(status=404), "provided", 200)
+    self.assertEqual([f.status for f in found], ["not_vulnerable"])
+    self.assertIn("denied_status_404_admin_reached", "\n".join(found[0].evidence))
+
+  def test_404_is_skipped_without_admin_or_when_admin_also_404(self):
+    for admin, admin_status in (("absent", 200), ("provided", 404)):
+      with self.subTest(admin=admin, admin_status=admin_status):
+        found = self._bfla(_mock_response(status=404), admin, admin_status)
+        self.assertEqual([f.status for f in found], ["inconclusive"])
+        self.assertIn("no_evaluable_function_endpoints", found[0].evidence[0])
+
+  def test_bola_denial_is_clean_and_bare_404_is_skipped(self):
+    ep = ApiObjectEndpoint(path="/api/records/{id}/", test_ids=[99],
+                           owner_field="owner")
+    for name, resp, admin, admin_status, expected in (
+      ("403", _mock_response(status=403), "absent", 200, ["not_vulnerable"]),
+      ("login", _login_page(), "absent", 200, ["not_vulnerable"]),
+      ("404+admin", _mock_response(status=404), "provided", 200, ["not_vulnerable"]),
+      ("404", _mock_response(status=404), "absent", 200, ["inconclusive"]),
+    ):
+      with self.subTest(case=name):
+        p = _make_probe(object_endpoints=[ep])
+        _set_admin(p, admin, admin_status)
+        p.auth.regular_session.get.return_value = resp
+        p._test_api_bola()
+        self.assertEqual(
+          [f.status for f in p.findings if f.scenario_id == "PT-OAPI1-01"], expected)
+
+  def test_mutating_bfla_post_redirected_to_login_is_not_accepted(self):
+    ep = ApiFunctionEndpoint(
+      path="/api/admin/users/7/promote/", method="POST", privilege="admin",
+      revert_path="/api/admin/users/7/demote/",
+    )
+    p = _make_probe(function_endpoints=[ep], allow_stateful=True)
+    _set_admin(p, "absent")
+    p.auth.regular_session.post.side_effect = [
+      _login_page("http://api.example/auth/login/?next=/api/admin/users/7/promote/"),
+      _mock_response(status=200),  # revert request
+    ]
+    p.run_safe("api_bfla_regular_as_admin_mutating",
+               p._test_bfla_regular_as_admin_mutating)
+    self.assertEqual(
+      [f for f in p.findings
+       if f.scenario_id == "PT-OAPI5-04" and f.status == "vulnerable"], [])
+
+  def test_mutating_bfla_post_answered_by_non_login_redirect_is_accepted(self):
+    ep = ApiFunctionEndpoint(
+      path="/api/admin/users/7/promote/", method="POST", privilege="admin",
+      revert_path="/api/admin/users/7/demote/",
+    )
+    p = _make_probe(function_endpoints=[ep], allow_stateful=True)
+    _set_admin(p, "provided")
+    redirect = _mock_response(status=302, text="")
+    redirect.headers["Location"] = "/api/admin/users/"
+    p.auth.regular_session.post.side_effect = [redirect, _mock_response(status=200)]
+    p.run_safe("api_bfla_regular_as_admin_mutating",
+               p._test_bfla_regular_as_admin_mutating)
+    self.assertEqual(
+      len([f for f in p.findings
+           if f.scenario_id == "PT-OAPI5-04" and f.status == "vulnerable"]), 1)
+
+  def test_method_override_login_redirect_on_plain_method_counts_as_denied(self):
+    ep = ApiFunctionEndpoint(
+      path="/api/admin/users/7/promote/", method="POST", privilege="admin",
+      revert_path="/api/admin/users/7/demote/",
+    )
+    p = _make_probe(function_endpoints=[ep], allow_stateful=True)
+    _set_admin(p, "absent")
+    redirect = _mock_response(status=302, text="")
+    redirect.headers["Location"] = "/auth/login/"
+    p.auth.regular_session.post.side_effect = [
+      redirect,                        # plain POST bounces to login
+      _mock_response(status=403),      # override denied too
+      _mock_response(status=200),      # revert
+    ]
+    p.run_safe("api_bfla_method_override", p._test_bfla_method_override)
+    self.assertEqual(
+      [f.status for f in p.findings if f.scenario_id == "PT-OAPI5-03"],
+      ["not_vulnerable"])

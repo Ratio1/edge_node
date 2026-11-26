@@ -30,7 +30,7 @@ def _engagement(kind="network", **ignored):
   """
   return {
     "engagement_id": "en_00000000-0000-4000-8000-000000000003", "engagement_hash": "e" * 64,
-    "contract_sha256": "c" * 64,
+    "contract_sha256": "c" * 64, "authorized_ports": "all", "authorized_tests": "all",
     "context": {"client_name": "Example"},
     "authorization": {"document_cid": "", "authorized_signer_name": "Ana Pop", "authorized_signer_role": "CISO",
                       "document_sha256": "a" * 64},
@@ -490,6 +490,150 @@ class TestPhase1ConfigCID(unittest.TestCase):
           self.assertNotIn("error", launch(plugin, run_mode=run_mode))
           self.assertEqual(self._latest_job_config(plugin)["run_mode"], expected)
 
+  def test_a_port_outside_1_to_65535_is_refused(self):
+    # I-117: both bounds are checked before anything is stored.
+    for start, end in ((0, 100), (1, 65536), (-5, 10), (70000, 80000)):
+      with self.subTest(start=start, end=end):
+        plugin = self._build_mock_plugin(job_id="port-range")
+        result = self._launch_network(plugin, start_port=start, end_port=end)
+        self.assertEqual(result["error"], "validation_error", result)
+        plugin.r1fs.add_json.assert_not_called()
+
+  def _scoped(self, **scope):
+    return {**_engagement(), **scope}
+
+  def test_a_launch_outside_the_authorized_ports_is_refused_by_range_and_audited(self):
+    # RM-251: the range minus the exceptions must lie inside the ranges; a restriction of "all" refuses nothing.
+    engagement = self._scoped(authorized_ports=[[1, 1024]])
+    plugin = self._build_mock_plugin(job_id="scope-ports")
+    self.assertNotIn("error", self._launch_network(plugin, engagement=engagement, end_port=1024))
+    plugin = self._build_mock_plugin(job_id="scope-ports")
+    result = self._launch_network(plugin, engagement=engagement, end_port=2000, exceptions=[1500])
+    self._refused(plugin, result, "scope_exceeded", ports=[[1025, 1499], [1501, 2000]], tests=[])
+    self.assertIn("1025-1499", result["message"])
+    self.assertEqual(plugin._log_audit_event.call_args.args[0], "launch_refused")
+    audited = plugin._log_audit_event.call_args.args[1]
+    self.assertEqual((audited["reason"], audited["ports"], audited["tests"]),
+                     ("scope_exceeded", [[1025, 1499], [1501, 2000]], []))
+    # An exception inside the gap narrows the launch back into the scope.
+    plugin = self._build_mock_plugin(job_id="scope-ports")
+    self.assertNotIn("error", self._launch_network(
+      plugin, engagement=self._scoped(authorized_ports=[[1, 1024], [2000, 2000]]), end_port=2000,
+      exceptions=list(range(1025, 2000))))
+
+  def test_the_comparison_tier_outside_the_authorized_ports_is_refused(self):
+    engagement = self._scoped(authorized_ports=[[1, 100]])
+    plugin = self._build_mock_plugin(job_id="scope-tier")
+    self.assertNotIn("error", self._launch_network(plugin, engagement=engagement, end_port=100))
+    plugin = self._build_mock_plugin(job_id="scope-tier")
+    result = self._launch_network(plugin, engagement=engagement, end_port=100, comparison_mode=True)
+    self.assertEqual(result["error"], "scope_exceeded", result)
+    self.assertIn([443, 443], result["ports"])
+    plugin.r1fs.add_json.assert_not_called()
+
+  def test_exceptions_narrow_the_comparison_tier_too(self):
+    from extensions.business.cybersec.red_mesh.constants import COMMON_PORTS
+    engagement = self._scoped(authorized_ports=[[1, 100]])
+    plugin = self._build_mock_plugin(job_id="scope-tier-exc")
+    result = self._launch_network(plugin, engagement=engagement, end_port=100, comparison_mode=True,
+                                  exceptions=[port for port in COMMON_PORTS if port > 100])
+    self.assertNotIn("error", result, result)
+
+  def test_a_kind_with_no_authorized_test_is_refused_even_when_nothing_is_enabled(self):
+    from extensions.business.cybersec.red_mesh.tenancy.engagements import feature_ids_for_kind
+    for kind, launch, other in (("network", self._launch_network, "graybox_injection"), ("webapp", self._launch_webapp, "web_discovery")):
+      with self.subTest(kind):
+        plugin = self._build_mock_plugin(job_id="scope-empty-kind")
+        features = self._get_features(plugin, kind)
+        result = launch(plugin, engagement=self._scoped(authorized_tests=[other]), excluded_features=features)
+        self._refused(plugin, result, "scope_exceeded")
+        self.assertEqual(result["tests"], sorted(feature_ids_for_kind(kind))[:20])
+
+  def _get_features(self, plugin, kind):
+    self._bind_launch_helpers(plugin)  # mocks the base modules before the plugin is imported
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    return PentesterApi01Plugin._get_all_features(plugin, scan_type=kind)
+
+  def test_the_enabled_tests_must_be_inside_the_authorized_tests_and_an_exclusion_narrows(self):
+    from extensions.business.cybersec.red_mesh.constants import FEATURE_CATALOG
+    methods = {item["id"]: item["methods"] for item in FEATURE_CATALOG}
+    scoped = self._scoped(authorized_tests=["service_info_common"])
+    plugin = self._build_mock_plugin(job_id="scope-tests")
+    result = self._launch_network(plugin, engagement=scoped)
+    self._refused(plugin, result, "scope_exceeded", ports=[])
+    self.assertIn("web_discovery", result["tests"])
+    self.assertNotIn("service_info_common", result["tests"])
+    # Excluding every method of the other items launches inside the scope.
+    outside = [method for item, found in methods.items() if item != "service_info_common" for method in found]
+    plugin = self._build_mock_plugin(job_id="scope-tests")
+    self.assertNotIn("error", self._launch_network(plugin, engagement=scoped, excluded_features=outside))
+    self.assertEqual(self._latest_job_config(plugin)["engagement_authorized_tests"], ["service_info_common"])
+
+  def test_a_webapp_asset_limited_to_some_graybox_families_is_held_to_them(self):
+    # RM-277: a webapp test is a graybox probe family (the probe method without the leading underscore).
+    from extensions.business.cybersec.red_mesh.tenancy.engagements import feature_ids_for_kind
+    families = ["graybox_access_control", "graybox_weak_auth"]
+    scoped = self._scoped(authorized_tests=families)
+    plugin = self._build_mock_plugin(job_id="scope-families")
+    result = self._launch_webapp(plugin, engagement=scoped)
+    self._refused(plugin, result, "scope_exceeded", ports=[])
+    self.assertEqual(result["tests"], sorted(set(feature_ids_for_kind("webapp")) - set(families))[:20])
+    plugin = self._build_mock_plugin(job_id="scope-families")
+    outside = [method for method in self._get_features(plugin, "webapp") if method.lstrip("_") not in families]
+    self.assertNotIn("error", self._launch_webapp(plugin, engagement=scoped, excluded_features=outside))
+    self.assertEqual(self._latest_job_config(plugin)["engagement_authorized_tests"], families)
+
+  def test_a_comparison_bundle_forced_on_is_held_to_the_authorized_tests(self):
+    # The bundle re-enables `web_discovery` methods the request excluded, so the check follows it.
+    plugin = self._build_mock_plugin(job_id="scope-bundle")
+    self._mock_plugin_modules()  # before the plugin is imported
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    original = PentesterApi01Plugin._get_supported_features
+    # The webapp worker supports one bundle method, as a deployment that registers it would.
+    widened = lambda host, scan_type=None, categs=False: (
+      [*original(host, scan_type=scan_type), "_web_test_common"] if str(scan_type) == "webapp" else original(
+        host, scan_type=scan_type, categs=categs))
+    from extensions.business.cybersec.red_mesh.tenancy.engagements import feature_ids_for_kind
+    scoped = self._scoped(authorized_tests=sorted(feature_ids_for_kind("webapp")))
+    with patch.object(PentesterApi01Plugin, "_get_supported_features", widened):
+      result = self._launch_webapp(plugin, engagement=scoped, comparison_mode=True,
+                                   excluded_features=["_web_test_common"])
+    self._refused(plugin, result, "scope_exceeded", tests=["web_discovery"])
+
+  def test_the_job_config_snapshots_the_authorized_scope(self):
+    plugin = self._build_mock_plugin(job_id="scope-snapshot")
+    result = self._launch_network(plugin, engagement=self._scoped(authorized_ports=[[1, 1024]]), end_port=100,
+                                  excluded_features=[m for item in __import__(
+                                    "extensions.business.cybersec.red_mesh.constants", fromlist=["x"]).FEATURE_CATALOG
+                                                     for m in item["methods"]])
+    self.assertNotIn("error", result, result)
+    config = self._latest_job_config(plugin)
+    self.assertEqual((config["engagement_authorized_ports"], config["engagement_authorized_tests"]),
+                     ([[1, 1024]], "all"))
+
+  def test_an_unknown_request_exclusion_is_refused_by_name_on_every_launch_path(self):
+    # I-185: catalogue ids such as `graybox` are not feature names; no alias, no silent drop.
+    for name, launch in (("network", self._launch_network), ("webapp", self._launch_webapp)):
+      with self.subTest(name):
+        plugin = self._build_mock_plugin(job_id="unknown-feature")
+        result = launch(plugin, excluded_features=["graybox", "no_such_test"])
+        self._refused(plugin, result, "unknown_feature", features=["graybox", "no_such_test"])
+        self.assertIn("graybox", result["message"])
+
+  def test_another_scan_types_method_is_a_known_exclusion(self):
+    # The console sends exclusions from the all-types catalog, so a webapp method on a network launch
+    # (and the reverse) is known, not refused.
+    for name, launch, other in (("network", self._launch_network, "_graybox_weak_auth"),
+                                ("webapp", self._launch_webapp, "_service_info_http")):
+      with self.subTest(name):
+        self.assertNotIn("error", launch(self._build_mock_plugin(job_id="cross-" + name), excluded_features=[other]))
+
+  def test_a_stale_config_exclusion_is_dropped_and_does_not_refuse_the_launch(self):
+    plugin = self._build_mock_plugin(job_id="stale-config-exclusion")
+    plugin.cfg_excluded_features = ["removed_test"]
+    self.assertNotIn("error", self._launch_network(plugin))
+    self.assertEqual(self._latest_job_config(plugin)["excluded_features"], [])
+
   def test_engagement_comparison_mode_still_launches_a_webapp(self):
     # Comparison mode force-enables the graybox bundle; no test allow-list gates it (RM-125).
     plugin = self._build_mock_plugin(job_id="engagement-bundle")
@@ -636,6 +780,18 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(workers["node-2"]["graybox_assignment_strategy"], "SLICE")
     self.assertEqual({workers[node]["budget_scope"] for node in workers}, {"per_scan"})
     self.assertTrue(workers["node-1"]["assignment_hash"])
+
+  def test_launch_webapp_scan_private_target_needs_the_engagement_flag(self):
+    """RM-273 (D30): a private-range webapp target is refused unless the engagement allows it."""
+    plugin = self._build_mock_plugin(job_id="test-job-private")
+    result = self._launch_webapp(plugin, target_url="https://10.0.0.5/app")
+    self.assertEqual(result.get("error"), "validation_error")
+    self.assertIn("allow_private_targets", result.get("message", ""))
+
+    plugin = self._build_mock_plugin(job_id="test-job-private")
+    allowed = {**_engagement("webapp"), "context": {"client_name": "Example", "allow_private_targets": True}}
+    result = self._launch_webapp(plugin, engagement=allowed, target_url="https://10.0.0.5/app")
+    self.assertNotIn("error", result)
 
   def test_launch_webapp_scan_explicit_mirror_divides_budget_without_opt_in(self):
     """Multi-worker MIRROR without per-worker opt-in must divide the budget."""
@@ -971,6 +1127,25 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(result["error"], "validation_error")
     self.assertIn("regular_api_key", result["message"])
     self.assertFalse(plugin.r1fs.add_json.called)
+
+  def test_launch_webapp_basic_auth_rules(self):
+    from extensions.business.cybersec.red_mesh.services.launch_api import (
+      _auth_descriptor_carrier, _validate_api_auth_descriptor,
+    )
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import AuthDescriptor
+    basic = AuthDescriptor(auth_type="basic")
+    self.assertIn("authenticated_probe_path", _validate_api_auth_descriptor(basic)["message"])
+    self.assertIsNone(_validate_api_auth_descriptor(
+      AuthDescriptor(auth_type="basic", authenticated_probe_path="/me")))
+    self.assertEqual(_auth_descriptor_carrier(basic)[:2], ("header", "authorization"))
+
+    plugin = self._build_mock_plugin(job_id="test-job-basic-regular-required")
+    result = self._launch_webapp(
+      plugin, regular_username="", regular_password="",
+      target_config={"api_security": {"auth": {
+        "auth_type": "basic", "authenticated_probe_path": "/me"}}})
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("regular credentials", result["message"])
 
   def test_launch_webapp_rejects_unconfirmed_security_downgrades(self):
     plugin = self._build_mock_plugin(job_id="test-job-webapp-unsafe")
@@ -3129,6 +3304,197 @@ class TestPhase2PassFinalization(unittest.TestCase):
       },
     )
 
+  @staticmethod
+  def _serve_stored_r1fs(plugin):
+    """R1FS reads return what the run stored (by CID); anything else is the job config."""
+    config = plugin.r1fs.get_json.return_value
+    def stored(cid, *args, **kwargs):
+      cids = {f"QmCID{i + 1}": c.args[0] for i, c in enumerate(plugin.r1fs.add_json.call_args_list)}
+      value = cids.get(cid, config)
+      return json.loads(value) if isinstance(value, str) else value
+    plugin.r1fs.get_json.side_effect = stored
+
+  def _crash_after_finalizing_write(self, plugin):
+    class _Exit(BaseException):
+      pass
+    target = "extensions.business.cybersec.red_mesh.services.finalization._ensure_rulebook_assessment_after_pass"
+    with patch(target, side_effect=_Exit), self.assertRaises(_Exit):
+      self._get_plugin_class()._maybe_finalize_pass(plugin)
+    self._serve_stored_r1fs(plugin)
+
+  def test_crash_after_finalizing_write_resumes_the_tail_without_rerunning_the_pass(self):
+    """I-268: a launcher that exits between the FINALIZING write and the archive leaves a job that
+    the next loop finishes from its stored artifacts: no second report, score or attestation."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    self._crash_after_finalizing_write(plugin)
+    self.assertEqual((job_specs["job_status"], len(job_specs["pass_reports"])), ("FINALIZING", 1))
+    plugin._build_job_archive.assert_not_called()
+    stores = plugin.r1fs.add_json.call_count
+
+    ledger = "extensions.business.cybersec.red_mesh.services.finalization._record_engagement_ledger_after_pass"
+    with patch(ledger, side_effect=lambda owner, key, specs, *a, **kw: specs) as hook:
+      PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
+    self.assertEqual(plugin.r1fs.add_json.call_count, stores)  # nothing stored again
+    plugin._compute_risk_and_findings.assert_called_once()
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+    self.assertEqual(hook.call_args.kwargs["pass_report_cid"], job_specs["pass_reports"][0]["report_cid"])
+    events = [c.args[1] for c in plugin._emit_timeline_event.call_args_list]
+    self.assertEqual(events.count("scan_completed"), 1)  # the crashed run never reached it
+    plugin._log_audit_event.assert_called_once_with(
+      "stale_finalizing_recovery",
+      {"job_id": job_specs["job_id"], "launcher": "launcher-node", "run_mode": "SINGLEPASS", "pass_nr": 1},
+    )
+
+  def test_resume_waits_while_the_stored_artifacts_are_unreadable_and_retries_once_a_minute(self):
+    """I-268: no end state is picked on a guess; the retry is throttled and audited once."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    self._crash_after_finalizing_write(plugin)
+    plugin.r1fs.get_json.side_effect = lambda *a, **kw: None
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)  # same minute: skipped
+
+    self.assertEqual(job_specs["job_status"], "FINALIZING")
+    plugin._build_job_archive.assert_not_called()
+    self.assertEqual(plugin.r1fs.get_json.call_count, 1)
+    self._serve_stored_r1fs(plugin)
+    plugin.time.return_value += 61
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertEqual(plugin._log_audit_event.call_count, 1)
+
+  def test_resume_waits_while_one_worker_report_is_unreadable(self):
+    """I-268: a partial worker-report read is not enough to finish the pass."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    self._crash_after_finalizing_write(plugin)
+    reports = plugin._collect_node_reports.return_value
+    plugin._collect_node_reports.return_value = {"worker-A": reports["worker-A"]}
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FINALIZING")
+    plugin._build_job_archive.assert_not_called()
+
+  def test_finalizing_wedge_after_an_empty_abort_fails_the_job(self):
+    """I-268: the resumed tail keeps the uninterrupted outcome of a first pass that tested nothing."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    plugin._get_aggregated_report.return_value = {
+      **plugin._get_aggregated_report.return_value, "aborted": True, "abort_phase": "authentication",
+      "abort_reason": "login failed", "abort_reason_class": "auth_failed"}
+    self._crash_after_finalizing_write(plugin)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual((job_specs["job_status"], job_specs["failure_class"]), ("FAILED", "scan_aborted"))
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+
+  def test_continuous_finalizing_wedge_schedules_the_next_pass(self):
+    """I-268: a continuous job stuck in FINALIZING with its pass report goes back to RUNNING."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    self._crash_after_finalizing_write(plugin)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "RUNNING")
+    self.assertEqual(job_specs["next_pass_at"], 1000100.0 + 60)
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
+    plugin._build_job_archive.assert_not_called()
+
+  def test_continuous_finalizing_wedge_keeps_a_soft_stop(self):
+    """I-268: a soft stop scheduled before the crash stops the job instead of starting a new pass."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    job_specs["job_status"] = "SCHEDULED_FOR_STOP"
+    job_specs["timeline"].append({"type": "scheduled_for_stop", "label": "Stop scheduled", "date": 1000050.0})
+    self._crash_after_finalizing_write(plugin)
+    self.assertEqual(job_specs["job_status"], "FINALIZING")
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "STOPPED")
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+
+  def test_resume_whose_archive_fails_keeps_the_end_state_for_the_archive_retry(self):
+    """I-268: the end state is written before the archive, so a failed archive leaves STOPPED, not
+    FINALIZING, and the stop is not re-sent."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    job_specs["job_status"] = "SCHEDULED_FOR_STOP"
+    job_specs["timeline"].append({"type": "scheduled_for_stop", "label": "Stop scheduled", "date": 1000050.0})
+    self._crash_after_finalizing_write(plugin)
+    stored = {**job_specs, "job_status": "FINALIZING"}  # CStore; the archive build (a mock) writes nothing
+    plugin.chainstore_hget.side_effect = lambda *a, **kw: dict(stored)
+
+    target = "extensions.business.cybersec.red_mesh.services.finalization._write_job_record"
+    with patch(target, side_effect=lambda owner, key, specs, context: specs) as write:
+      PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    kept = [c.args[2]["job_status"] for c in write.call_args_list
+            if c.kwargs.get("context") == "finalize_terminal"]
+    self.assertEqual(kept, ["STOPPED"])
+
+  def test_soft_stop_writes_the_end_state_before_the_archive(self):
+    """I-268: on the uninterrupted path too, a failed archive leaves STOPPED for the archive retry,
+    so the next tick does not resume the tail and send the stop event again."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    job_specs["job_status"] = "SCHEDULED_FOR_STOP"
+    order = []
+    plugin._build_job_archive.side_effect = lambda *a, **kw: order.append("archive")
+
+    target = "extensions.business.cybersec.red_mesh.services.finalization._write_job_record"
+    def write(owner, key, specs, context):
+      order.append((context, specs["job_status"]))
+      return specs
+    with patch(target, side_effect=write):
+      PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertLess(order.index(("finalize_terminal", "STOPPED")), order.index("archive"))
+
+  def test_continuous_finalizing_wedge_at_the_pass_cap_stops_with_its_events(self):
+    """I-268: the resumed pass-cap tail is the uninterrupted one, events included."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(job_pass=MAX_CONTINUOUS_PASSES, run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    self._crash_after_finalizing_write(plugin)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "STOPPED")
+    events = [c.args[1] for c in plugin._emit_timeline_event.call_args_list]
+    self.assertIn("pass_cap_reached", events)
+    self.assertIn("stopped", events)
+
+  def test_continuous_stale_collecting_on_a_later_pass_is_recovered(self):
+    """I-268: an earlier pass's report does not block recovery of the current pass."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(job_pass=2, run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    job_specs["job_status"] = "COLLECTING"
+    job_specs["pass_reports"] = [{"pass_nr": 1, "report_cid": "QmPass1", "risk_score": 10}]
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual([ref["pass_nr"] for ref in job_specs["pass_reports"]], [1, 2])
+    self.assertEqual(job_specs["job_status"], "RUNNING")
+    plugin._collect_node_reports.assert_called_once()
+
   def test_cstore_risk_score_updated(self):
     """After pass, risk_score on CStore matches pass result."""
     PentesterApi01Plugin = self._get_plugin_class()
@@ -3216,7 +3582,7 @@ class TestPhase2PassFinalization(unittest.TestCase):
     self.assertEqual(pass_report_dict["redmesh_test_attestation"]["tx_hash"], "0xend")
     plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
 
-  def test_finalization_required_end_attestation_failure_marks_failed(self):
+  def test_finalization_required_end_attestation_failure_keeps_job_finalized(self):
     PentesterApi01Plugin = self._get_plugin_class()
     plugin, job_specs = self._build_finalize_plugin()
     job_specs["blockchain_attestation_enabled"] = True
@@ -3243,9 +3609,12 @@ class TestPhase2PassFinalization(unittest.TestCase):
 
     PentesterApi01Plugin._maybe_finalize_pass(plugin)
 
-    self.assertEqual(job_specs["job_status"], "FAILED")
-    self.assertEqual(job_specs["failure_class"], "attestation_failed")
-    self.assertIn("terminal blockchain attestation", job_specs["failure_message"])
+    # RM-221: the scan finished; only the attestation is failed, and the results stay.
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertEqual(job_specs["attestation_status"], "failed")
+    self.assertIn(job_specs["attestation_failure_reason"], {"attestation_disabled", "no_tenant_key", "submit_failed"})
+    self.assertFalse(job_specs.get("failure_class"))
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
     plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
     event_types = [c.args[1] for c in plugin._emit_timeline_event.call_args_list]
     self.assertIn("attestation_failed", event_types)
@@ -3402,8 +3771,8 @@ class TestPhase4UiAggregate(unittest.TestCase):
     plugin._extract_graybox_ui_stats = lambda aggregated, latest_pass=None: Plugin._extract_graybox_ui_stats(
       plugin, aggregated, latest_pass
     )
-    plugin._compute_ui_aggregate = lambda passes, agg, job_config=None: Plugin._compute_ui_aggregate(
-      plugin, passes, agg, job_config=job_config
+    plugin._compute_ui_aggregate = lambda passes, agg, job_config=None, triage=None: Plugin._compute_ui_aggregate(
+      plugin, passes, agg, job_config=job_config, triage=triage
     )
     plugin.SEVERITY_ORDER = Plugin.SEVERITY_ORDER
     plugin.CONFIDENCE_ORDER = Plugin.CONFIDENCE_ORDER
@@ -3606,6 +3975,35 @@ class TestPhase4UiAggregate(unittest.TestCase):
     self.assertEqual(result["total_scenarios"], 3)
     self.assertEqual(result["total_scenarios_vulnerable"], 1)
 
+  def test_regular_only_report_states_coverage_and_does_not_claim_admin(self):
+    """RM-219: the archive carries the coverage note, the principal and admin_context."""
+    plugin, _ = self._make_plugin()
+    p = self._make_pass(findings=[self._make_finding(severity="HIGH", finding_id="gb1")])
+    agg = self._make_webapp_aggregated()
+    agg["service_info"]["443"]["_graybox_discovery"]["coverage_note"] = (
+      "Crawled as the regular user; admin-only pages not reached.")
+    agg["service_info"]["443"]["_graybox_auth"] = {
+      "official_success": False, "regular_success": True,
+      "admin_context": "absent", "primary_principal": "regular",
+    }
+    result = plugin._compute_ui_aggregate([p], agg, job_config={"scan_type": "webapp"}).to_dict()
+    self.assertIn("admin-only pages not reached", result["graybox_coverage_note"])
+    self.assertEqual(result["graybox_admin_context"], "absent")
+    self.assertEqual(result["graybox_primary_principal"], "regular")
+    from extensions.business.cybersec.red_mesh.models.archive import UiAggregate
+    restored = UiAggregate.from_dict(result)
+    self.assertEqual(restored.graybox_admin_context, "absent")
+
+  def test_report_with_admin_carries_no_coverage_note(self):
+    plugin, _ = self._make_plugin()
+    p = self._make_pass(findings=[self._make_finding(severity="HIGH", finding_id="gb1")])
+    agg = self._make_webapp_aggregated()
+    agg["service_info"]["443"]["_graybox_auth"] = {
+      "admin_context": "provided", "primary_principal": "official"}
+    result = plugin._compute_ui_aggregate([p], agg, job_config={"scan_type": "webapp"}).to_dict()
+    self.assertEqual(result["graybox_coverage_note"], "")
+    self.assertEqual(result["graybox_admin_context"], "provided")
+
 
 
 class TestPhase3Archive(unittest.TestCase):
@@ -3781,8 +4179,8 @@ class TestPhase3Archive(unittest.TestCase):
 
     # Bind real methods for archive building
     Plugin = self._get_plugin_class()
-    plugin._compute_ui_aggregate = lambda passes, agg, job_config=None: Plugin._compute_ui_aggregate(
-      plugin, passes, agg, job_config=job_config
+    plugin._compute_ui_aggregate = lambda passes, agg, job_config=None, triage=None: Plugin._compute_ui_aggregate(
+      plugin, passes, agg, job_config=job_config, triage=triage
     )
     plugin._count_services = lambda si: Plugin._count_services(plugin, si)
     plugin._dedupe_items = lambda items: Plugin._dedupe_items(items)
@@ -3811,6 +4209,19 @@ class TestPhase3Archive(unittest.TestCase):
     self.assertEqual(len(archive_dict["passes"]), 1)
     self.assertIn("ui_aggregate", archive_dict)
     self.assertIn("total_open_ports", archive_dict["ui_aggregate"])
+
+  def test_archive_top_findings_read_the_live_host_triage_map(self):
+    """RM-169 4a: a closed finding takes no top_findings slot; the stored pass stays unstamped."""
+    from extensions.business.cybersec.red_mesh.repositories.cstore import JobStateRepository
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin()
+    with patch.object(JobStateRepository, "list_triage_for_record",
+                      return_value={"f1a": {"status": "false_positive"}}) as read:
+      Plugin._build_job_archive(plugin, "test-job", job_specs)
+    read.assert_called_once()
+    archive_dict = plugin.r1fs.add_json.call_args[0][0]
+    self.assertNotIn("top_findings", archive_dict["ui_aggregate"])  # the only HIGH was closed
+    self.assertEqual([f["finding_id"] for f in archive_dict["passes"][0]["findings"]], ["f1a", "f1b"])
 
   def test_duplicate_archive_finalization_reuses_existing_cid(self):
     """Retrying finalization after prune is harmless and writes no artifact."""
@@ -4229,8 +4640,9 @@ class TestPhase5Endpoints(unittest.TestCase):
     }
     plugin.r1fs.get_json.return_value = archive_data
     plugin.chainstore_hget.side_effect = lambda hkey, key: (
-      {"job_id": "fin-job", "finding_id": "f-1", "status": "accepted_risk", "note": "documented"}
-      if hkey == "test-instance:triage" and key == "fin-job:f-1" else None)
+      {"job_id": "fin-job", "finding_id": "f-1", "status": "accepted_risk", "note": "documented",
+       "tenant_id": self._tenant_id, "host": "192.0.2.10"}
+      if hkey == f"test-instance:triage:t:{self._tenant_id}" and key == "192.0.2.10\x1ff-1" else None)
 
     result = Plugin.get_job_archive(plugin, job_id="fin-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
     self.assertEqual(result["job_id"], "fin-job")
@@ -5361,45 +5773,27 @@ class TestPhase5Endpoints(unittest.TestCase):
     }
     plugin.time.return_value = 123.0
     plugin._log_audit_event = MagicMock()
-    triage_store = {}
-    triage_audit_store = {}
+    binding = binding_payload()
+    stub["execution_binding"] = binding
+    stub["launcher"] = plugin.ee_addr
+    plugin.r1fs.get_json.return_value["job_config"] = {"execution_binding": binding}
+    rows = {}
 
-    def _chainstore_hget(hkey, key):
-      if hkey.endswith(":triage"):
-        return triage_store.get(key)
-      if hkey.endswith(":triage:audit"):
-        return triage_audit_store.get(key)
-      return {"fin-job": stub}.get(key)
+    plugin.chainstore_hget.side_effect = lambda hkey, key: (
+      {"fin-job": stub}.get(key) if hkey == "test-instance" else rows.get((hkey, key)))
+    plugin.chainstore_hgetall.side_effect = lambda hkey: (
+      {"fin-job": stub} if hkey == "test-instance" else {k: v for (h, k), v in rows.items() if h == hkey})
+    plugin.chainstore_hset.side_effect = lambda hkey, key, value: rows.__setitem__((hkey, key), value) or True
+    plugin.chainstore_hkeys.side_effect = lambda hkey: [k for (h, k) in rows if h == hkey]
 
-    def _chainstore_hgetall(hkey):
-      if hkey.endswith(":triage"):
-        return dict(triage_store)
-      if hkey.endswith(":triage:audit"):
-        return dict(triage_audit_store)
-      return {"fin-job": stub}
+    result = update_finding_triage(plugin, "fin-job", "f-1", "accepted_risk", note="Approved by analyst",
+                                   actor="alice", review_at=456.0)
 
-    def _chainstore_hset(hkey, key, value):
-      if hkey.endswith(":triage"):
-        triage_store[key] = value
-      elif hkey.endswith(":triage:audit"):
-        triage_audit_store[key] = value
-
-    plugin.chainstore_hget.side_effect = _chainstore_hget
-    plugin.chainstore_hgetall.side_effect = _chainstore_hgetall
-    plugin.chainstore_hset.side_effect = _chainstore_hset
-
-    result = update_finding_triage(plugin,
-      job_id="fin-job",
-      finding_id="f-1",
-      status="accepted_risk",
-      note="Approved by analyst",
-      actor="alice",
-      review_at=456.0,
-    )
-
-    self.assertEqual(result["triage"]["status"], "accepted_risk")
-    self.assertEqual(result["audit"][-1]["actor"], "alice")
-    self.assertEqual(triage_store["fin-job:f-1"]["review_at"], 456.0)
+    member = result["results"][0]
+    self.assertEqual(member["triage"]["status"], "accepted_risk")
+    self.assertEqual(member["audit"]["actor"], "alice")
+    hkey = f"test-instance:triage:t:{binding['tenant_id']}"
+    self.assertEqual(rows[(hkey, "192.0.2.10\x1ff-1")]["review_at"], 456.0)
     plugin._log_audit_event.assert_called_once()
 
   def test_get_job_triage_not_found(self):

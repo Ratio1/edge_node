@@ -624,6 +624,7 @@ def make_lifecycle_runner(docker_client=None, mock_container=None, **cfg_overrid
 
   # Image update
   plugin.current_image_hash = None
+  plugin._prepared_update_image = None
   plugin.cfg_image_pull_policy = "always"
 
   # Commands

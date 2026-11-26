@@ -64,14 +64,17 @@ class TestOpenSslServerHeaderExtraction(unittest.TestCase):
       "CVE-2021-42013", cves,
       f"Apache CVEs should fire from 2.4.50; got {sorted(cves)}",
     )
-    # OpenSSL 1.0.2k is vulnerable to several CVEs whose constraint covers it
-    # (CVE-2020-1971 <1.1.1, CVE-2022-3602 <3.0.7, CVE-2024-4741 <3.0.14, etc.).
-    openssl_post_heartbleed = {
-      "CVE-2020-1971", "CVE-2022-3602", "CVE-2024-4741",
-    }
+    # OpenSSL 1.0.2k is in the affected range of CVE-2020-1971 (1.0.2 < 1.0.2x)
+    # and CVE-2024-4741 (end-of-life branches are reported, not assessed).
     self.assertTrue(
-      openssl_post_heartbleed & cves,
+      {"CVE-2020-1971", "CVE-2024-4741"} <= cves,
       f"OpenSSL co-disclosed CVEs should fire on 1.0.2k; got {sorted(cves)}",
+    )
+    # CVE-2022-3602 affects 3.0.0-3.0.6 only; firing it on a 1.x server was a
+    # false positive (RM-168).
+    self.assertNotIn(
+      "CVE-2022-3602", cves,
+      f"CVE-2022-3602 must not fire on 1.0.2k; got {sorted(cves)}",
     )
 
   def test_openssl_1_0_2k_does_not_fire_heartbleed(self):

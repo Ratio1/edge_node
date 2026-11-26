@@ -137,5 +137,62 @@ class TestSafetyControls(unittest.TestCase):
     self.assertFalse(SafetyControls.is_local_target("http://example.com"))
 
 
+def _resolving(*addresses):
+  return lambda host, port: [(2, 1, 6, "", (a, 0)) for a in addresses]
+
+
+class TestPrivateTargetAuthority(unittest.TestCase):
+  """RM-273 (D30): private-range targets need the engagement's allow_private_targets."""
+
+  def test_public_address_is_allowed(self):
+    self.assertIsNone(SafetyControls.private_target_reason("app.example", _resolving("93.184.216.34")))
+    self.assertIsNone(SafetyControls.private_target_reason("8.8.8.8"))
+
+  def test_each_private_range_is_refused(self):
+    for address in ("10.225.0.10", "172.16.0.1", "192.168.1.1", "127.0.0.1", "169.254.169.254",
+                    "100.64.0.1", "fd00::1", "fe80::1", "::1", "::ffff:10.0.0.1", "0.0.0.0",
+                    "64:ff9b::a00:1", "::127.0.0.1", "::ffff:0:a00:1", "fec0::1"):
+      reason = SafetyControls.private_target_reason(address)
+      self.assertIn("allow_private_targets", reason or "", address)
+      self.assertIn("allow_private_targets", SafetyControls.private_target_reason(
+        "app.example", _resolving(address)) or "", address)
+
+  def test_unresolvable_name_is_left_to_the_connection(self):
+    def fail(host, port):
+      raise OSError("no such host")
+    self.assertIsNone(SafetyControls.private_target_reason("nope.example", fail))
+    self.assertIn("allow_private_targets",
+                  SafetyControls.private_target_reason("nope.example", fail, fail_closed=True))
+
+  def test_public_ipv4_behind_nat64_is_allowed(self):
+    self.assertIsNone(SafetyControls.private_target_reason("64:ff9b::808:808"))
+
+  def test_client_refuses_a_name_that_does_not_resolve(self):
+    from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient, GrayboxScopeError
+    def fail(host, port):
+      raise OSError("no such host")
+    with patch("socket.getaddrinfo", fail), self.assertRaises(GrayboxScopeError):
+      GrayboxHttpClient("http://app.example").validate_url("/x")
+
+  def test_client_refuses_private_unless_engagement_allows(self):
+    from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient, GrayboxScopeError
+    with patch("socket.getaddrinfo", _resolving("10.225.0.10")):
+      with self.assertRaises(GrayboxScopeError):
+        GrayboxHttpClient("http://app.example", allow_private_targets=False).validate_url("/x")
+      self.assertEqual(
+        GrayboxHttpClient("http://app.example", allow_private_targets=True).validate_url("/x"),
+        "http://app.example/x")
+
+  def test_private_answer_is_re_checked_on_every_request(self):
+    # Re-checked per request, not pinned at connect: that gap is closed by RM-273 Phase G.
+    from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient, GrayboxScopeError
+    client = GrayboxHttpClient("http://app.example", allow_private_targets=False)
+    answers = iter(["93.184.216.34", "10.0.0.5"])
+    with patch("socket.getaddrinfo", lambda host, port: _resolving(next(answers))(host, port)):
+      self.assertEqual(client.validate_url("/a"), "http://app.example/a")
+      with self.assertRaises(GrayboxScopeError):
+        client.validate_url("/b")
+
+
 if __name__ == '__main__':
   unittest.main()

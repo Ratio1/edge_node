@@ -1,12 +1,15 @@
+import hashlib
+import random
 import re as _re
 import socket
 import struct
 
 import requests
 
+from ...constants import AUTH_SKIPPED
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
-from ...cve_db import check_cves
+from ...cve_db import check_cves, probe_cve_fields
 from ...models.finding_schema import AUTHENTICATED_ACTION_NOT_APPLICABLE
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
@@ -120,8 +123,35 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           except Exception:
             pass
 
-          # CVE check
-          findings += check_cves("mysql", version)
+          # CVE check — MariaDB speaks the MySQL protocol and its 10.x banner
+          # leads with `5.5.5-`; route it to its own product key.
+          cve_product, cve_version = self._mysql_cve_target(version)
+          findings += check_cves(cve_product, cve_version)
+
+          # Transport: CLIENT_SSL clear in the greeting means no TLS upgrade.
+          # Only the bytes the packet header declares belong to the greeting.
+          capabilities = self._mysql_lower_capabilities(pkt_payload[:int.from_bytes(data[0:3], 'little')])
+          if capabilities is not None:
+            raw["capabilities"] = capabilities
+            raw["tls_offered"] = bool(capabilities & self._MYSQL_CLIENT_SSL)
+            if not raw["tls_offered"]:
+              product = "MariaDB" if cve_product == "mariadb" else "MySQL"
+              findings.append(Finding(
+                severity=Severity.MEDIUM,
+                cvss_vector=V.WEAK_TRANSPORT,
+                title=f"{product} does not offer TLS (cleartext connections)",
+                description=f"The {product} server on {target}:{port} does not advertise "
+                            "CLIENT_SSL in its handshake, so it cannot upgrade a client "
+                            "session to TLS.",
+                evidence=f"Initial handshake capability flags 0x{capabilities:04x}: "
+                         "CLIENT_SSL (0x0800) clear.",
+                remediation="Enable TLS on the server (ssl_cert/ssl_key, require_secure_transport) "
+                            "and require it for remote accounts.",
+                owasp_id="A02:2021",
+                cwe_id="CWE-319",
+                # A low-entropy scramble marks a deceptive service: its flags are not the word of a real server.
+                confidence="firm" if raw.get("salt_entropy", 8.0) < 2.0 else "certain",
+              ))
         else:
           raw["protocol_byte"] = pkt_payload[0] if pkt_payload else None
           findings.append(Finding(
@@ -156,7 +186,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
   )
   def _service_info_mysql_creds(self, target, port):  # default port: 3306
     """
-    MySQL default credential testing (opt-in via active_auth feature group).
+    MySQL default credential testing (runs unless the active_auth feature group is excluded).
 
     Attempts mysql_native_password auth with a small list of default credentials.
 
@@ -265,27 +295,75 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       ))
 
     # --- CVE-2012-2122 auth bypass test ---
-    # Affected: MySQL 5.1.x < 5.1.63, 5.5.x < 5.5.25, MariaDB < 5.5.23
+    # Affected (as the catalog rows): MySQL 5.1.x < 5.1.63, 5.5.x < 5.5.24, 5.6.x < 5.6.6. MariaDB is not probed:
+    # its 5.x banners are skipped below, and 10.x is not affected.
     # Bug: memcmp return value truncation means ~1/256 chance of auth bypass
-    cve_bypass = self._mysql_test_cve_2012_2122(target, port)
+    cve_trace = {}
+    cve_bypass = self._mysql_test_cve_2012_2122(target, port, trace=cve_trace)
+    if cve_trace:
+      raw["cve_2012_2122_trace"] = cve_trace
     if cve_bypass:
       findings.append(cve_bypass)
       raw["cve_2012_2122"] = True
 
     return probe_result(raw_data=raw, findings=findings)
 
+  @staticmethod
+  def _mysql_cve_target(banner):
+    """Return ``(cve_db product, version)`` for a MySQL-protocol server banner.
+
+    MariaDB 10.x announces itself as ``5.5.5-10.11.6-MariaDB`` (the fake
+    ``5.5.5-`` prefix keeps old clients working); that prefix is not the server
+    version. ``*-MariaDB`` goes to the ``mariadb`` key, everything else to
+    ``mysql``.
+    """
+    stripped = _re.sub(r'^5\.5\.5-(?=\d)', '', banner or '')
+    if 'mariadb' in stripped.lower():
+      return "mariadb", stripped
+    return "mysql", stripped
+
+  _MYSQL_CLIENT_SSL = 0x0800
+
+  @staticmethod
+  def _mysql_lower_capabilities(pkt_payload):
+    """Return the lower capability flags of a Handshake v10 payload, or None.
+
+    After the version's NUL: thread id (4), auth data part 1 (8), filler
+    (1, always 0x00), then the flags as a little-endian uint16. A payload
+    that ends before the flags or has a non-zero filler gives None.
+    """
+    parts = pkt_payload[1:].split(b'\x00', 1)
+    if len(parts) < 2:
+      return None
+    after_version = parts[1]
+    if len(after_version) < 15 or after_version[12] != 0:
+      return None
+    return struct.unpack('<H', after_version[13:15])[0]
+
   # Affected version ranges for CVE-2012-2122
   _MYSQL_CVE_2012_2122_RANGES = [
     ((5, 1, 0), (5, 1, 63)),   # MySQL 5.1.x < 5.1.63
-    ((5, 5, 0), (5, 5, 25)),   # MySQL 5.5.x < 5.5.25
+    ((5, 5, 0), (5, 5, 24)),   # MySQL 5.5.x < 5.5.24
+    ((5, 6, 0), (5, 6, 6)),    # MySQL 5.6.x < 5.6.6
   ]
 
-  def _mysql_test_cve_2012_2122(self, target, port):
+  # ~98% hit rate at 1/256 per attempt; the time and error bounds keep a dead host from stalling the probe.
+  _MYSQL_CVE_2012_2122_ATTEMPTS = 1000
+  _MYSQL_CVE_2012_2122_MAX_SECONDS = 120
+  _MYSQL_CVE_2012_2122_MAX_ERRORS = 5
+  _MYSQL_CVE_2012_2122_MAX_TOTAL_ERRORS = 8
+
+  def _mysql_test_cve_2012_2122(self, target, port, trace=None):
     """Test for MySQL CVE-2012-2122 timing-based authentication bypass.
 
     On affected versions, memcmp() return value is cast to char, giving
-    a ~1/256 chance that any password is accepted. 300 attempts gives
-    ~69% probability of detection.
+    a ~1/256 chance that any password is accepted. 1000 attempts gives
+    ~98% probability of detection.
+
+    ``trace`` (dict, optional) receives ``attempts`` (logins sent), ``ended_by``
+    (``attempts_exhausted``, ``time_limit``, ``consecutive_errors``,
+    ``error_limit``, ``stopped``, ``bad_handshake``, ``version_probe_error``
+    or ``bypass_confirmed``) and ``last_error``.
 
     Returns
     -------
@@ -294,6 +372,10 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     """
     import hashlib
     import random
+    import time
+
+    if trace is None:
+      trace = {}
 
     # First, connect to get version
     try:
@@ -302,7 +384,10 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       sock.connect((target, port))
       data = sock.recv(256)
       sock.close()
-    except Exception:
+    except Exception as exc:
+      trace["ended_by"] = "version_probe_error"
+      trace["last_error"] = f"{type(exc).__name__}: {exc}"
+      self.P(f"MySQL CVE-2012-2122 version read on {target}:{port} failed: {trace['last_error']}", color='y')
       return None
 
     if not data or len(data) < 5:
@@ -312,6 +397,12 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       return None
 
     version_str = pkt_payload[1:].split(b'\x00')[0].decode('utf-8', errors='ignore')
+    # Gate on a real MySQL banner. MariaDB 10.x reports `5.5.5-10.x-MariaDB`,
+    # which read as MySQL 5.5.5 is in range and drew 300 auth attempts. The gate
+    # also skips MariaDB 5.x below 5.5.23, a true positive that is given up.
+    cve_product, version_str = self._mysql_cve_target(version_str)
+    if cve_product != "mysql":
+      return None
     version_tuple = tuple(int(x) for x in _re.findall(r'\d+', version_str)[:3])
     if len(version_tuple) < 3:
       return None
@@ -327,77 +418,119 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
     # Attempt rapid auth with random passwords
     self.P(f"MySQL {version_str} in CVE-2012-2122 range — testing auth bypass ({target}:{port})", color='y')
-    attempts = 300
+    attempts = self._MYSQL_CVE_2012_2122_ATTEMPTS
+    trace["attempts"] = 0
+    trace["ended_by"] = "attempts_exhausted"
+    started = time.monotonic()
+    consecutive_errors = total_errors = 0
+    sock = None
 
     try:
-      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(self._target_timeout(5))
-      sock.connect((target, port))
-
       for _ in range(attempts):
-        # Read handshake
-        data = sock.recv(512)
-        if not data or len(data) < 5:
+        if self.stop_event is not None and self.stop_event.is_set():
+          trace["ended_by"] = "stopped"
           break
-        pkt_payload = data[4:]
-        if not pkt_payload or pkt_payload[0] != 0x0a:
+        if time.monotonic() - started >= self._MYSQL_CVE_2012_2122_MAX_SECONDS:
+          trace["ended_by"] = "time_limit"
           break
+        try:
+          if sock is None:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self._target_timeout(3))
+            sock.connect((target, port))
+          # Read handshake
+          data = sock.recv(512)
+          if not data or len(data) < 5:
+            trace["ended_by"] = "bad_handshake"
+            break
+          pkt_payload = data[4:]
+          if not pkt_payload or pkt_payload[0] != 0x0a:
+            trace["ended_by"] = "bad_handshake"
+            break
 
-        # Extract salt
-        parts = pkt_payload[1:].split(b'\x00', 1)
-        rest = parts[1] if len(parts) > 1 else b''
-        if len(rest) < 13:
-          break
-        salt1 = rest[5:13]
-        salt2 = rest[28:40].rstrip(b'\x00') if len(rest) >= 28 else b''
-        salt = salt1 + salt2
+          # Extract salt
+          parts = pkt_payload[1:].split(b'\x00', 1)
+          rest = parts[1] if len(parts) > 1 else b''
+          if len(rest) < 13:
+            trace["ended_by"] = "bad_handshake"
+            break
+          salt1 = rest[5:13]
+          salt2 = rest[28:40].rstrip(b'\x00') if len(rest) >= 28 else b''
+          salt = salt1 + salt2
 
-        # Auth with random password
-        rand_pass = random.randbytes(20)
-        sha1_pass = hashlib.sha1(rand_pass).digest()
-        sha1_sha1 = hashlib.sha1(sha1_pass).digest()
-        sha1_salt = hashlib.sha1(salt + sha1_sha1).digest()
-        auth_data = bytes(a ^ b for a, b in zip(sha1_pass, sha1_salt))
+          # Auth with random password
+          rand_pass = random.randbytes(20)
+          sha1_pass = hashlib.sha1(rand_pass).digest()
+          sha1_sha1 = hashlib.sha1(sha1_pass).digest()
+          sha1_salt = hashlib.sha1(salt + sha1_sha1).digest()
+          auth_data = bytes(a ^ b for a, b in zip(sha1_pass, sha1_salt))
 
-        client_flags = struct.pack('<I', 0x0003a685)
-        max_pkt = struct.pack('<I', 16777216)
-        charset = b'\x21'
-        reserved = b'\x00' * 23
-        user_bytes = b'root\x00'
-        auth_len = bytes([len(auth_data)])
-        auth_plugin = b'mysql_native_password\x00'
+          client_flags = struct.pack('<I', 0x0003a685)
+          max_pkt = struct.pack('<I', 16777216)
+          charset = b'\x21'
+          reserved = b'\x00' * 23
+          user_bytes = b'root\x00'
+          auth_len = bytes([len(auth_data)])
+          auth_plugin = b'mysql_native_password\x00'
 
-        payload = client_flags + max_pkt + charset + reserved + user_bytes + auth_len + auth_data + auth_plugin
-        pkt_len = struct.pack('<I', len(payload))[:3]
-        seq = b'\x01'
-        sock.sendall(pkt_len + seq + payload)
+          payload = client_flags + max_pkt + charset + reserved + user_bytes + auth_len + auth_data + auth_plugin
+          pkt_len = struct.pack('<I', len(payload))[:3]
+          seq = b'\x01'
+          sock.sendall(pkt_len + seq + payload)
+          trace["attempts"] += 1
 
-        resp = sock.recv(256)
-        if resp and len(resp) >= 5 and resp[4] == 0x00:
+          resp = sock.recv(256)
+          consecutive_errors = 0
+          if resp and len(resp) >= 5 and resp[4] == 0x00:
+            trace["ended_by"] = "bypass_confirmed"
+            return Finding(
+              severity=Severity.CRITICAL,
+              cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
+              title=f"MySQL authentication bypass confirmed (CVE-2012-2122)",
+              cve=("CVE-2012-2122",),
+              **probe_cve_fields("CVE-2012-2122"),
+              description=f"MySQL {version_str} on {target}:{port} accepted login with a random password "
+                          "due to CVE-2012-2122 memcmp truncation bug. Any attacker can gain root access.",
+              evidence=f"Auth succeeded with random password on attempt (version {version_str})",
+              remediation="Upgrade MySQL to at least 5.1.63 / 5.5.25 / MariaDB 5.5.23.",
+              owasp_id="A07:2021",
+              cwe_id="CWE-305",
+              confidence="certain",
+            )
+
+          # The server closes the connection after a rejected login: reconnect.
+          if resp and len(resp) >= 5 and resp[4] == 0xFF:
+            sock.close()
+            sock = None
+        except Exception as exc:
+          consecutive_errors += 1
+          total_errors += 1
+          trace["last_error"] = f"{type(exc).__name__}: {exc}"
+          if sock is not None:
+            try:
+              sock.close()
+            except Exception:
+              pass
+            sock = None
+          if consecutive_errors >= self._MYSQL_CVE_2012_2122_MAX_ERRORS:
+            trace["ended_by"] = "consecutive_errors"
+            break
+          # Stay under max_connect_errors (default 10 on the targeted versions before 5.6.6;
+          # the version read and earlier probes also count) so the scanner host is not blocked.
+          if total_errors >= self._MYSQL_CVE_2012_2122_MAX_TOTAL_ERRORS:
+            trace["ended_by"] = "error_limit"
+            break
+    finally:
+      self.P(
+        f"MySQL CVE-2012-2122 loop on {target}:{port} ended: attempts={trace['attempts']}, "
+        f"ended_by={trace['ended_by']}, last_error={trace.get('last_error')}",
+        color='y',
+      )
+      if sock is not None:
+        try:
           sock.close()
-          return Finding(
-            severity=Severity.CRITICAL,
-            cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
-            title=f"MySQL authentication bypass confirmed (CVE-2012-2122)",
-            description=f"MySQL {version_str} on {target}:{port} accepted login with a random password "
-                        "due to CVE-2012-2122 memcmp truncation bug. Any attacker can gain root access.",
-            evidence=f"Auth succeeded with random password on attempt (version {version_str})",
-            remediation="Upgrade MySQL to at least 5.1.63 / 5.5.25 / MariaDB 5.5.23.",
-            owasp_id="A07:2021",
-            cwe_id="CWE-305",
-            confidence="certain",
-          )
-
-        # If error packet, server closes connection — reconnect
-        if resp and len(resp) >= 5 and resp[4] == 0xFF:
-          sock.close()
-          sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-          sock.settimeout(self._target_timeout(3))
-          sock.connect((target, port))
-
-      sock.close()
-    except Exception:
-      pass
+        except Exception:
+          pass
     return None
 
   # SAFETY: Read-only commands only. NEVER add CONFIG SET, SLAVEOF, MODULE LOAD, EVAL, DEBUG.
@@ -876,6 +1009,34 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           for f in check_cves("postgresql", ver_match.group(1)):
             findings.append(f)
 
+      # --- Transport encryption offered on this listener ---
+      # Only a PostgreSQL-shaped answer (auth request or error) to the StartupMessage earns the check:
+      # a server-first service whose first byte happens to be 'N' is not a PostgreSQL listener.
+      tls_offered = gss_offered = None
+      if data[0:1] in (b'R', b'E'):
+        tls_offered, gss_offered = self._pg_transport_offer(target, port)
+      if tls_offered is not None:
+        raw["tls_offered"] = tls_offered
+      if gss_offered is not None:
+        raw["gss_offered"] = gss_offered
+      if tls_offered == "N":
+        gss = gss_offered == "G"
+        findings.append(Finding(
+          severity=Severity.LOW if gss else Severity.MEDIUM,
+          cvss_vector=V.WEAK_CRYPTO_MARGINAL if gss else V.WEAK_TRANSPORT,
+          title="PostgreSQL does not offer TLS (cleartext connections)",
+          description=f"PostgreSQL on {target}:{port} answers an SSLRequest with 'N': "
+                      "the listener offers no TLS"
+                      + (", only GSSAPI encryption, which needs a Kerberos client." if gss
+                         else ", so every client session on it is cleartext."),
+          evidence="SSLRequest reply 'N'; GSSENCRequest reply "
+                   + (f"'{gss_offered}'" if gss_offered else "not N or G") + ".",
+          remediation="Set ssl = on with a server certificate and use hostssl entries in pg_hba.conf.",
+          owasp_id="A02:2021",
+          cwe_id="CWE-319",
+          confidence="certain",
+        ))
+
       if not findings:
         findings.append(Finding(Severity.INFO, "PostgreSQL probe completed", "No auth weakness detected."))
     except Exception as e:
@@ -893,7 +1054,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
   )
   def _service_info_postgresql_creds(self, target, port):  # default port: 5432
     """
-    PostgreSQL default credential testing (opt-in via active_auth feature group).
+    PostgreSQL default credential testing (runs unless the active_auth feature group is excluded).
 
     Attempts cleartext password auth with common defaults.
 
@@ -938,6 +1099,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
               cwe_id="CWE-287",
               confidence="certain",
             ))
+            findings += self._pg_privilege_findings(sock, data, username, raw)
           elif auth_code == 3:
             # Send cleartext password
             pwd_bytes = password.encode() + b'\x00'
@@ -962,6 +1124,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
                   authenticated_action=AUTHENTICATED_ACTION_NOT_APPLICABLE,
                 ))
                 findings += self._pg_extract_version_findings(resp)
+                findings += self._pg_privilege_findings(sock, resp, username, raw)
           elif auth_code == 5 and len(data) >= 13:
             # MD5 auth: server sends 4-byte salt at bytes 9:13
             import hashlib
@@ -990,6 +1153,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
                   authenticated_action=AUTHENTICATED_ACTION_NOT_APPLICABLE,
                 ))
                 findings += self._pg_extract_version_findings(resp)
+                findings += self._pg_privilege_findings(sock, resp, username, raw)
         raw["tested_credentials"] += 1
         sock.close()
       except Exception:
@@ -1004,6 +1168,136 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       ))
 
     return probe_result(raw_data=raw, findings=findings)
+
+  # Read-only SELECT. Direct membership in pg_execute_server_program is looked up in the catalog because
+  # `pg_has_role` raises on PostgreSQL before 11, where that role does not exist.
+  _PG_PRIVILEGE_QUERY = (
+    "SELECT r.rolsuper, EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles p ON p.oid = m.roleid "
+    "WHERE p.rolname = 'pg_execute_server_program' AND m.member = r.oid) "
+    "FROM pg_roles r WHERE r.rolname = current_user"
+  )
+
+  @staticmethod
+  def _pg_read_until_ready(sock, buf):
+    """Backend messages from `buf` plus the socket up to and including ReadyForQuery, as (type, body)."""
+    messages = []
+    for _ in range(16):
+      while len(buf) >= 5:
+        length = struct.unpack('!I', buf[1:5])[0]
+        if len(buf) < 1 + length:
+          break
+        messages.append((buf[0:1], buf[5:1 + length]))
+        buf = buf[1 + length:]
+        if messages[-1][0] == b'Z':
+          return messages
+      chunk = sock.recv(4096)
+      if not chunk:
+        break
+      buf += chunk
+    return messages
+
+  @staticmethod
+  def _pg_error_text(messages):
+    """The `M` (message) field of the first ErrorResponse in `messages`, or None."""
+    for kind, body in messages:
+      if kind == b'E':
+        for field in body.split(b'\x00'):
+          if field[:1] == b'M':
+            return field[1:].decode('utf-8', errors='replace')
+    return None
+
+  _PG_SSL_REQUEST = struct.pack('!II', 8, 80877103)
+  _PG_GSSENC_REQUEST = struct.pack('!II', 8, 80877104)
+
+  def _pg_transport_offer(self, target, port):
+    """Ask one PostgreSQL connection which transport encryption it offers.
+
+    Sends an SSLRequest; the server answers one byte, 'S' (TLS follows) or
+    'N'. On 'S' the socket is closed without a handshake. On 'N' a
+    GSSENCRequest goes on the same connection ('G' or 'N'; servers before
+    12 answer an error). No credential is sent.
+
+    Returns ``(tls_offered, gss_offered)``: each 'S'/'N' resp. 'G'/'N', or
+    None when the reply is empty or another value. Only one byte is read: a
+    server that sends more is read as its first byte (real servers send one).
+    """
+    def _one_byte(sock, request, allowed):
+      sock.sendall(request)
+      reply = sock.recv(1)
+      if len(reply) == 1 and reply.decode('latin-1') in allowed:
+        return reply.decode('latin-1')
+      return None
+
+    tls_offered = gss_offered = None
+    sock = None
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(self._target_timeout(3))
+      sock.connect((target, port))
+      tls_offered = _one_byte(sock, self._PG_SSL_REQUEST, ('S', 'N'))
+      if tls_offered == 'N':
+        gss_offered = _one_byte(sock, self._PG_GSSENC_REQUEST, ('G', 'N'))
+    except Exception:
+      pass
+    finally:
+      if sock is not None:
+        try:
+          sock.close()
+        except Exception:
+          pass
+    return tls_offered, gss_offered
+
+  def _pg_privilege_findings(self, sock, auth_reply, username, raw):
+    """CVE-2019-9193: read whether the accepted role may run server programs. Never runs COPY ... PROGRAM.
+
+    Runs once per probe call, only when the login-attempt gate is open and a credential was accepted (under
+    trust auth every pair is accepted). A failure is logged and recorded in `raw`, not read as "no privilege".
+    Only the role name is logged or reported, never the password.
+    """
+    if not self._login_attempts_allowed() or "role_privileges" in raw or "privilege_read_error" in raw:
+      return []
+    try:
+      self._pg_read_until_ready(sock, auth_reply)
+      query = self._PG_PRIVILEGE_QUERY.encode() + b'\x00'
+      sock.sendall(b'Q' + struct.pack('!I', len(query) + 4) + query)
+      reply = self._pg_read_until_ready(sock, b'')
+      rows = [body for kind, body in reply if kind == b'D']
+      if not rows:
+        error = self._pg_error_text(reply) or "no row for current_user"
+        self.P(f"PostgreSQL privilege read for role {username} returned no row: {error}", color='y')
+        raw["privilege_read_error"] = error
+        return []
+      ncols = struct.unpack('!H', rows[0][:2])[0]
+      pos, values = 2, []
+      for _ in range(ncols):
+        size = struct.unpack('!i', rows[0][pos:pos + 4])[0]
+        values.append(rows[0][pos + 4:pos + 4 + max(size, 0)] == b't')
+        pos += 4 + max(size, 0)
+    except Exception as exc:
+      self.P(f"PostgreSQL privilege read failed for role {username}: {exc}", color='y')
+      raw["privilege_read_error"] = str(exc)
+      return []
+    is_super, program_role = (values + [False, False])[:2]
+    raw["role_privileges"] = {"role": username, "rolsuper": is_super, "pg_execute_server_program": program_role}
+    if not (is_super or program_role):
+      return []
+    held = "superuser" if is_super else "pg_execute_server_program membership"
+    return [Finding(
+      severity=Severity.CRITICAL,
+      cvss_vector=V.UNAUTHENTICATED_READ_WRITE,
+      title=f"CVE-2019-9193: PostgreSQL role {username} may run server programs (COPY ... PROGRAM)",
+      cve=("CVE-2019-9193",),
+      **probe_cve_fields("CVE-2019-9193"),
+      description=f"The accepted role {username} holds {held}, which lets it run operating-system commands through "
+                  "COPY ... PROGRAM. The CVE is disputed by the vendor (documented behaviour); the risk is the "
+                  "reachable privileged role. A read-only catalog query was sent; COPY ... PROGRAM was not run.",
+      evidence=f"Catalog read for role {username}: rolsuper={is_super}, pg_execute_server_program={program_role}",
+      remediation="Change the default password, restrict the role, and revoke superuser and pg_execute_server_program.",
+      owasp_id="A01:2021",
+      cwe_id="CWE-78",
+      confidence="firm",
+      confidence_reason="behaviour_confirmed",
+    )]
 
   def _pg_extract_version_findings(self, data):
     """Parse ParameterStatus messages after PG auth success for version + CVEs."""
@@ -1462,4 +1756,158 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
     if not findings:
       findings.append(Finding(Severity.INFO, "InfluxDB probe clean", "No issues detected."))
+    return probe_result(raw_data=raw, findings=findings)
+
+  # ── Erlang distribution (epmd and the node's dist port) ─────────
+
+  _ERLANG_DEADLINE = 10  # seconds for epmd NAMES, or for the whole handshake
+  _ERLANG_DEFAULT_COOKIE = "monster"  # CouchDB's published default (CVE-2022-24706)
+  # EXTENDED_REFERENCES, FUN_TAGS, NEW_FUN_TAGS, EXTENDED_PIDS_PORTS, EXPORT_PTR_TAG, BIT_BINARIES,
+  # NEW_FLOATS, UTF8_ATOMS, MAP_TAG, BIG_CREATION. Not PUBLISHED: the node joins as a hidden peer.
+  _ERLANG_DIST_FLAGS = 0x4 | 0x10 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800 | 0x10000 | 0x20000 | 0x40000
+
+  def _erlang_recv_packet(self, sock, max_len, deadline):
+    """Read one 2-byte-length-prefixed handshake packet; None on EOF or a length above `max_len`."""
+    def read(size):
+      out = b""
+      while len(out) < size:
+        chunk = self._recv_by(sock, size - len(out), deadline)
+        if not chunk:
+          return None
+        out += chunk
+      return out
+    head = read(2)
+    want = struct.unpack(">H", head)[0] if head else None
+    if want is None or want > max_len:
+      return None
+    return read(want)
+
+  def _erlang_handshake(self, target, dist_port, cookie):
+    """
+    Run the distribution handshake as far as the challenge_ack check, then close.
+
+    Returns one of: "authenticated", "bad_digest", "not_allowed", "alive", "nok", "unsupported",
+    "timeout", "error". Sends no RPC and no tick.
+    OTP 23 and 24 answer our old-style 'n' challenge. OTP 25 and later reject a peer that does not
+    offer HANDSHAKE_23, so the outcome there is "nok" or "error" and the default cookie goes undetected.
+    """
+    deadline = self._deadline_in(self._ERLANG_DEADLINE)
+    sock = None
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(self._target_timeout(3))
+      sock.connect((target, dist_port))
+      name = b"redmesh@probe"
+      send_name = b"n" + struct.pack(">HI", 5, self._ERLANG_DIST_FLAGS) + name
+      sock.sendall(struct.pack(">H", len(send_name)) + send_name)
+      status = self._erlang_recv_packet(sock, 32, deadline)
+      if status is None:
+        return "error"
+      if status == b"snot_allowed":
+        return "not_allowed"
+      if status == b"salive":
+        return "alive"
+      if status[:1] != b"s" or status[1:3] != b"ok":
+        return "nok"
+      challenge = self._erlang_recv_packet(sock, 300, deadline)
+      if challenge is None or challenge[:1] != b"n" or len(challenge) < 11:
+        return "unsupported"  # not the old-style 'n' challenge
+      their_challenge = struct.unpack(">I", challenge[7:11])[0]
+      my_challenge = random.getrandbits(32)
+      digest = hashlib.md5(cookie.encode() + str(their_challenge).encode()).digest()
+      reply = b"r" + struct.pack(">I", my_challenge) + digest
+      sock.sendall(struct.pack(">H", len(reply)) + reply)
+      ack = self._erlang_recv_packet(sock, 17, deadline)
+      if ack is None:
+        return "error"
+      expected = hashlib.md5(cookie.encode() + str(my_challenge).encode()).digest()
+      return "authenticated" if ack == b"a" + expected else "bad_digest"
+    except socket.timeout:
+      return "timeout"
+    except Exception:
+      return "error"
+    finally:
+      if sock:
+        sock.close()
+
+  @register_probe(
+    display_name="Erlang distribution default cookie (CouchDB)",
+    description=(
+      "epmd NAMES to list nodes; for a CouchDB node, the distribution handshake with the "
+      "published default cookie, stopping after the challenge_ack. Gated by credential testing."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(1188,),
+    default_owasp=("A07:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
+  def _service_info_erlang_dist(self, target, port):  # default port: 4369 (epmd)
+    """
+    epmd NAMES (ungated), then the default-cookie handshake against a CouchDB node when
+    `_login_attempts_allowed()`. The dist port is whatever epmd reports.
+    """
+    raw = {"epmd_nodes": []}
+    sock = None
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(self._target_timeout(3))
+      sock.connect((target, port))
+      sock.sendall(b"\x00\x01n")
+      data, deadline = b"", self._deadline_in(self._ERLANG_DEADLINE)
+      try:
+        while len(data) < 4096:
+          chunk = self._recv_by(sock, 1024, deadline)
+          if not chunk:
+            break
+          data += chunk
+      except socket.timeout:
+        if not data:
+          raise
+        data = data[:data.rfind(b"\n") + 1]  # keep the complete node lines; a cut line could misread its port
+    except Exception as exc:
+      raw["epmd_error"] = str(exc)[:120]
+      return probe_result(raw_data=raw, findings=[])
+    finally:
+      if sock:
+        sock.close()
+
+    for line in data[4:].decode("utf-8", errors="replace").splitlines():
+      match = _re.match(r"name (\S+) at port (\d+)", line)
+      if match:
+        raw["epmd_nodes"].append({"name": match.group(1), "port": int(match.group(2))})
+    couch = [n for n in raw["epmd_nodes"] if n["name"] == "couchdb"]
+    if not couch:
+      return probe_result(raw_data=raw, findings=[])
+    if not self._login_attempts_allowed():
+      raw["auth_control"] = dict(AUTH_SKIPPED)  # the cookie is a credential
+      return probe_result(raw_data=raw, findings=[])
+
+    # epmd names the port, so the target (not the operator) chose it: stay inside the job's scope.
+    scope = getattr(self, "job_ports", None)
+    if scope is not None and couch[0]["port"] not in scope:
+      outcome = "out_of_scope"
+    else:
+      outcome = self._erlang_handshake(target, couch[0]["port"], self._ERLANG_DEFAULT_COOKIE)
+    raw["erlang_handshake"] = {"dist_port": couch[0]["port"], "outcome": outcome}
+    findings = []
+    if outcome == "authenticated":
+      findings.append(Finding(
+        severity=Severity.CRITICAL,
+        cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
+        title="CouchDB Erlang default cookie accepted (CVE-2022-24706)",
+        cve=("CVE-2022-24706",),
+        **probe_cve_fields("CVE-2022-24706"),
+        description=f"The CouchDB node on {target} (distribution port {couch[0]['port']}) accepted the "
+                    "published default Erlang cookie. Any peer with this cookie can run code on the node. "
+                    "The check stopped after the handshake: no RPC and no tick were sent. A completed "
+                    "handshake joins the node as a hidden peer for a moment.",
+        evidence=f"Distribution handshake with the default cookie completed; challenge_ack digest verified "
+                 f"(node couchdb, port {couch[0]['port']})",
+        remediation="Upgrade CouchDB to 3.2.2 or later; set a unique cookie in vm.args; "
+                    "do not expose epmd (4369) or the distribution ports.",
+        owasp_id="A07:2021",
+        cwe_id="CWE-1188",
+        confidence="certain",
+        confidence_reason="behaviour_confirmed",
+      ))
     return probe_result(raw_data=raw, findings=findings)

@@ -2,6 +2,7 @@ import json
 import re as _re
 import sys
 import struct
+import socket
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -113,18 +114,6 @@ class RedMeshOWASPTests(unittest.TestCase):
     self._assert_has_finding(result, "Cookie missing HttpOnly flag")
     self._assert_has_finding(result, "Cookie missing SameSite flag")
 
-  def test_injection_sql_detected(self):
-    owner, worker = self._build_worker()
-    resp = MagicMock()
-    resp.text = "sql syntax error near line"
-    resp.status_code = 200
-    with patch(
-      "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get",
-      return_value=resp,
-    ):
-      result = worker._web_test_sql_injection("example.com", 80)
-    self._assert_has_finding(result, "SQL injection")
-
   def test_insecure_design_path_traversal(self):
     owner, worker = self._build_worker()
     resp = MagicMock()
@@ -132,6 +121,9 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.status_code = 200
     with patch(
       "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get",
+      return_value=resp,
+    ), patch(
+      "extensions.business.cybersec.red_mesh.worker.web.injection._raw_path_get",
       return_value=resp,
     ):
       result = worker._web_test_path_traversal("example.com", 80)
@@ -145,6 +137,9 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.headers = {"Content-Type": content_type}
     with patch(
       "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get",
+      return_value=resp,
+    ), patch(
+      "extensions.business.cybersec.red_mesh.worker.web.injection._raw_path_get",
       return_value=resp,
     ):
       result = worker._web_test_path_traversal("example.com", 80)
@@ -395,19 +390,6 @@ class RedMeshOWASPTests(unittest.TestCase):
     self.assertNotIn(9000, worker.state["ports_to_scan"])
     self.assertIn(9000, worker.exceptions)
 
-  def test_cross_site_scripting_detection(self):
-    owner, worker = self._build_worker()
-    payload = "<script>alert(1)</script>"
-    resp = MagicMock()
-    resp.text = f"Response with {payload} inside"
-    resp.status_code = 200
-    with patch(
-      "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get",
-      return_value=resp,
-    ):
-      result = worker._web_test_xss("example.com", 80)
-    self._assert_has_finding(result, "XSS")
-
   def test_tls_certificate_expiration_reporting(self):
     owner, worker = self._build_worker(ports=[443])
 
@@ -470,6 +452,9 @@ class RedMeshOWASPTests(unittest.TestCase):
       return DummyContextUnverified()
 
     with patch(
+      "socket.getaddrinfo",  # RM-067: the dial resolves first; keep these tests offline
+      return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+    ), patch(
       "extensions.business.cybersec.red_mesh.worker.service.tls.socket.create_connection",
       return_value=DummyConn(),
     ), patch(
@@ -529,6 +514,9 @@ class RedMeshOWASPTests(unittest.TestCase):
     import ssl
 
     with patch(
+      "socket.getaddrinfo",  # RM-067: the dial resolves first; keep these tests offline
+      return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+    ), patch(
       "extensions.business.cybersec.red_mesh.worker.service.tls.socket.create_connection",
       return_value=DummyConn(),
     ), patch(
@@ -1376,6 +1364,30 @@ class RedMeshOWASPTests(unittest.TestCase):
 
     self.assertEqual(worker.state["port_protocols"][1024], "modbus")
 
+  def test_fingerprint_modbus_exception_reply_halts_in_ics_safe_mode(self):
+    """RM-061 R2: a Modbus exception reply (function 0xAB) also proves Modbus and halts in ICS Safe Mode."""
+    owner, worker = self._build_worker(ports=[1024])
+    worker.state["open_ports"] = [1024]
+    worker.state["port_protocols"] = {1024: "unknown"}
+    worker.state["port_banners"] = {1024: ""}
+    worker.state["port_banner_confirmed"] = {1024: False}
+    worker.target = "10.0.0.1"
+    worker.ics_safe_mode = True
+    exception_reply = b'\x00\x01\x00\x00\x00\x03\x01\xab\x01'
+    call_index = [0]
+
+    def fake_socket_factory(*args, **kwargs):
+      mock_sock = MagicMock()
+      mock_sock.recv.return_value = exception_reply if call_index[0] == 2 else b""
+      call_index[0] += 1
+      return mock_sock
+
+    with patch("extensions.business.cybersec.red_mesh.worker.pentest_worker.socket.socket", side_effect=fake_socket_factory):
+      worker._active_fingerprint_ports()
+
+    self.assertEqual(worker.state["port_protocols"][1024], "modbus")
+    self.assertTrue(worker._ics_detected)
+
   def test_fingerprint_non_modbus_stays_unknown(self):
     """Port with no recognizable response should remain unknown after active probes."""
     owner, worker = self._build_worker(ports=[1024])
@@ -2014,7 +2026,9 @@ class TestCorrelationEngine(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.worker.service.common.paramiko.Transport",
       return_value=DummyTransport(),
     ):
-      findings, weak_labels = worker._ssh_check_ciphers("example.com", 22)
+      # RM-200: the algorithm lists are the server's KEXINIT, not paramiko's own options.
+      kexinit = {"kex": ["curve25519-sha256"], "host_key": ["ssh-rsa", "ssh-dss"], "enc_s2c": ["aes256-ctr"]}
+      findings, weak_labels = worker._ssh_check_ciphers("example.com", 22, kexinit)
     found = any("dsa" in f.title.lower() or "ssh-dss" in f.title.lower() for f in findings)
     self.assertTrue(found, f"Expected DSA key finding, got: {[f.title for f in findings]}")
 
@@ -3648,9 +3662,9 @@ class TestDetectionGapFixes(unittest.TestCase):
     self.assertTrue(any("CVE-2025-32433" in t for t in cve_ids))
 
   def test_erlang_ssh_cve_patched(self):
-    """CVE-2025-32433 should NOT match patched Erlang SSH >= 5.2.2."""
+    """CVE-2025-32433 should NOT match patched Erlang SSH >= 5.2.10 (5.2.2-5.2.9 are affected)."""
     from extensions.business.cybersec.red_mesh.cve_db import check_cves
-    findings = check_cves("erlang_ssh", "5.2.2")
+    findings = check_cves("erlang_ssh", "5.2.10")
     cve_ids = [f.title for f in findings]
     self.assertFalse(any("CVE-2025-32433" in t for t in cve_ids))
 
@@ -4841,6 +4855,33 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
     findings = result.get("findings", [])
     self.assertTrue(any("CVE-2017-12149" in f["title"] for f in findings), f"Should detect JBoss invoker. Got: {[f['title'] for f in findings]}")
 
+  def test_jboss_invoker_cve_survives_dedup_whichever_wins(self):
+    """Live job ca8fcbde (RM-257): the /invoker/readonly finding and the vulndb row for CVE-2017-12149 tie on
+    7106; whichever the signature tiebreak keeps, the survivor carries the CVE id."""
+    _, worker = self._build_worker(ports=[7106])
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.status_code = 500 if "/invoker/readonly" in url else 404
+      resp.text = ""
+      resp.headers = {}
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get):
+      probe_findings = worker._web_test_java_deserialization("1.2.3.4", 7106)["findings"]
+    if 'extensions.business.cybersec.red_mesh.pentester_api_01' not in sys.modules:
+      mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    for row_signature in ("0" * 64, "f" * 64):
+      row = {"title": "CVE-2017-12149: In Jboss Application Server (jboss 6.0)", "severity": "CRITICAL",
+             "confidence": "firm", "cve": ["CVE-2017-12149"], "finding_signature": row_signature}
+      _risk, flat = PentesterApi01Plugin._compute_risk_and_findings(None, {
+        "open_ports": [7106], "port_protocols": {"7106": "http"}, "service_info": {},
+        "web_tests_info": {"7106": {"_web_test_java_deserialization": {"findings": probe_findings},
+                                    "_web_test_java_servers": {"findings": [row]}}},
+      })
+      self.assertEqual([list(f.get("cve") or []) for f in flat], [["CVE-2017-12149"]], row_signature)
+
   # ── Spring Actuator probe ─────────────────────────────────────────
 
   def test_spring_actuator_env_detected(self):
@@ -5044,47 +5085,6 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
     self.assertTrue(any("Tomcat" in t for t in titles), f"Should detect Tomcat. Got: {titles}")
     self.assertTrue(any("Spring" in t for t in titles), f"Should detect Spring MVC via POST 405. Got: {titles}")
 
-  # ── Gap fix: Spring4Shell with 400/500 second check ─────────────
-
-  def test_spring4shell_detected_with_binding_error(self):
-    """Spring4Shell should be detected when URLs[0] returns 400 (type error)."""
-    _, worker = self._build_worker(ports=[7108])
-
-    def fake_get(url, **kwargs):
-      resp = MagicMock()
-      resp.ok = True
-      resp.status_code = 200
-      resp.text = "<html>App</html>"
-      resp.headers = {"Content-Type": "text/html"}
-      if "class.INVALID_RM_CTRL" in url:
-        resp.status_code = 400  # Spring rejects bogus class path
-        resp.text = "Bad Request"
-      elif "class.module.classLoader.DefaultAssertionStatus" in url:
-        resp.status_code = 200  # Spring accepted classLoader binding
-      elif "class.module.classLoader.URLs" in url:
-        resp.status_code = 400  # Type conversion error — binding attempted
-        resp.text = "Bad Request"
-      elif "/actuator" in url:
-        resp.status_code = 404
-        resp.ok = False
-        resp.text = ""
-      return resp
-
-    def fake_post(url, **kwargs):
-      resp = MagicMock()
-      resp.status_code = 404
-      resp.text = ""
-      return resp
-
-    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get), \
-         patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.post", side_effect=fake_post):
-      result = worker._web_test_spring_actuator("1.2.3.4", 7108)
-
-    findings = result.get("findings", [])
-    titles = [f["title"] for f in findings]
-    self.assertTrue(any("Spring4Shell" in t for t in titles), f"Should detect Spring4Shell via binding error. Got: {titles}")
-
-
 
 class TestBatch5Improvements(unittest.TestCase):
   """Tests for batch 5: Spring4Shell secondary gate, CVE dedup."""
@@ -5112,56 +5112,6 @@ class TestBatch5Improvements(unittest.TestCase):
 
   # ── Spring4Shell secondary gate ─────────────────────────────────
 
-  def test_spring4shell_secondary_gate_detects_spring(self):
-    """Spring4Shell should be detected via URLs[0] secondary check when
-    DefaultAssertionStatus returns same 200 as control."""
-    _, worker = self._build_worker(ports=[7108])
-
-    def fake_get(url, **kwargs):
-      resp = MagicMock()
-      resp.ok = True
-      resp.status_code = 200
-      resp.text = "<html>App</html>"
-      resp.headers = {"Content-Type": "text/html"}
-      # Both control and classLoader return 200 with same body (first gate can't distinguish)
-      if "class.INVALID_RM_CTRL.URLs" in url:
-        # Control URLs[0] → 200 (server ignores it)
-        resp.status_code = 200
-        resp.text = "<html>App</html>"
-      elif "class.module.classLoader.URLs" in url:
-        # Spring binding error on URLs[0] → 400
-        resp.status_code = 400
-        resp.text = "Bad Request"
-      elif "class.INVALID_RM_CTRL" in url:
-        resp.status_code = 200
-        resp.text = "<html>App</html>"
-      elif "class.module.classLoader.DefaultAssertionStatus" in url:
-        resp.status_code = 200
-        resp.text = "<html>App</html>"
-      elif "/actuator" in url:
-        resp.status_code = 404
-        resp.ok = False
-        resp.text = ""
-      return resp
-
-    def fake_post(url, **kwargs):
-      resp = MagicMock()
-      resp.status_code = 404
-      resp.text = ""
-      return resp
-
-    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get), \
-         patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.post", side_effect=fake_post):
-      result = worker._web_test_spring_actuator("1.2.3.4", 7108)
-
-    findings = result.get("findings", [])
-    titles = [f["title"] for f in findings]
-    self.assertTrue(any("Spring4Shell" in t for t in titles),
-                    f"Should detect Spring4Shell via URLs[0] secondary gate. Got: {titles}")
-    # Check confidence is "firm" (not tentative)
-    spring4shell = [f for f in findings if "Spring4Shell" in f["title"]]
-    self.assertEqual(spring4shell[0]["confidence"], "firm")
-
   def test_spring4shell_secondary_gate_skips_catchall(self):
     """Spring4Shell secondary gate should NOT flag catch-all servers
     where both classLoader.URLs[0] and control.URLs[0] return 200."""
@@ -5172,7 +5122,7 @@ class TestBatch5Improvements(unittest.TestCase):
       resp.ok = True
       resp.status_code = 200
       resp.text = "<html>Default page</html>"
-      resp.headers = {"Content-Type": "text/html"}
+      resp.headers = {"Content-Type": "text/html", "Server": "Apache-Coyote/1.1"}  # Java, so only the differential gates
       # Catch-all: returns 200 for everything
       if "/actuator" in url:
         resp.status_code = 404

@@ -252,7 +252,7 @@ def capture_deployment_admission(plugin, captured, counters=None):
   test_deployment_operations. These fixtures exercise real normalization,
   authorization, validation, planning and secret extraction before admission.
   """
-  plugin._operation_records = lambda: {}
+  plugin._operation_records = lambda **scope: {}
   build = plugin._build_create_pipeline_configs
   pending = {}
   def build_and_capture(**kwargs):

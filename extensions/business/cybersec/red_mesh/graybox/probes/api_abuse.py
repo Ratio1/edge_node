@@ -35,7 +35,7 @@ class ApiAbuseProbes(ProbeBase):
     return self.run_runtime_scenarios(self.probe_key)
 
   def _session(self):
-    return self.auth.official_session or self.auth.regular_session
+    return self.auth.primary_session
 
   def _low_priv_session(self):
     return self.auth.regular_session
@@ -49,11 +49,11 @@ class ApiAbuseProbes(ProbeBase):
       parsed = default
     return max(minimum, min(parsed, maximum))
 
-  def _flow_request(self, session, method, url, body, timeout=10):
+  def _flow_request(self, session, method, url, body, timeout=10, **extra):
     req = getattr(session, (method or "POST").lower(), session.post)
     if (method or "POST").upper() in ("GET", "DELETE"):
-      return req(url, params=dict(body or {}), timeout=timeout)
-    return req(url, json=dict(body or {}), timeout=timeout)
+      return req(url, params=dict(body or {}), timeout=timeout, **extra)
+    return req(url, json=dict(body or {}), timeout=timeout, **extra)
 
   def _flow_template_context(self, flow):
     job_id = self.job_id or "local"
@@ -116,9 +116,6 @@ class ApiAbuseProbes(ProbeBase):
   def _flow_verify(self, session, flow):
     if not flow.verify_path:
       return True
-    if not self.budget():
-      raise RuntimeError("budget_exhausted")
-    self.safety.throttle()
     resp = self._flow_request(
       session,
       flow.verify_method,
@@ -131,15 +128,13 @@ class ApiAbuseProbes(ProbeBase):
   def _flow_revert(self, session, flow, revert_body):
     if not flow.revert_path:
       return False
-    if not self.cleanup_budget():
-      return False
-    self.safety.throttle()
     resp = self._flow_request(
       session,
       flow.revert_method,
       self.target_url + flow.revert_path,
       revert_body,
       timeout=10,
+      budget_exempt=True,
     )
     return resp.status_code < 400
 
@@ -186,7 +181,7 @@ class ApiAbuseProbes(ProbeBase):
           "PT-OAPI4-01", title, owasp, "high_limit_probe_not_authorized",
         )
         continue
-      if not self.budget(2):
+      if not self.budget_available(2):
         self.emit_inconclusive("PT-OAPI4-01", title, owasp, "budget_exhausted")
         return
       url = self.target_url + ep.path
@@ -197,21 +192,26 @@ class ApiAbuseProbes(ProbeBase):
           "PT-OAPI4-01", title, owasp, "invalid_limit_bounds",
         )
         continue
-      self.safety.throttle()
       try:
         baseline = session.get(
           url, params={ep.limit_param: baseline_limit}, timeout=10,
         )
       except requests.RequestException:
         continue
-      self.safety.throttle()
+      if not self.response_reached(baseline):
+        self.emit_endpoint_denied("PT-OAPI4-01")
+        continue
       try:
         abuse = session.get(
           url, params={ep.limit_param: abuse_limit}, timeout=10,
         )
       except requests.RequestException:
         continue
-      if baseline.status_code >= 400 or abuse.status_code >= 400:
+      if not self.response_reached(abuse):
+        # A 400/415/422 rejects the high limit (the handler ran): no verdict,
+        # as before. Anything else not reached is a denial of the principal.
+        if not self.response_reached(abuse, validation_ok=True):
+          self.emit_endpoint_denied("PT-OAPI4-01")
         continue
       base_size = len((baseline.text or "").encode())
       abuse_size = len((abuse.text or "").encode())
@@ -256,13 +256,12 @@ class ApiAbuseProbes(ProbeBase):
           "PT-OAPI4-02", title, owasp, "oversized_payload_probe_not_authorized",
         )
         continue
-      if not self.budget():
+      if not self.budget_available():
         self.emit_inconclusive("PT-OAPI4-02", title, owasp, "budget_exhausted")
         return
       body_bytes = max(1, min(int(getattr(ep, "oversized_payload_bytes", 65_536) or 65_536), 262_144))
       big = "A" * body_bytes
       url = self.target_url + ep.path
-      self.safety.throttle()
       try:
         resp = session.post(url, json={"x": big}, timeout=15)
       except requests.RequestException:
@@ -297,6 +296,8 @@ class ApiAbuseProbes(ProbeBase):
     if session is None:
       self.emit_inconclusive("PT-OAPI4-03", title, owasp, "no_authenticated_session")
       return
+    reached_any = False
+    denied_any = False
     for ep in self.target_config.api_security.resource_endpoints:
       if not ep.rate_limit_expected:
         continue  # FP guard — only fire when operator marked endpoint
@@ -304,19 +305,27 @@ class ApiAbuseProbes(ProbeBase):
       saw_429 = False
       saw_retry_after = False
       saw_ratelimit_header = False
+      # "No limit seen" is an absence verdict: send all ten or none.
+      if not self.budget_available(10):
+        self.emit_inconclusive("PT-OAPI4-03", title, owasp, "budget_exhausted")
+        break
       for _ in range(10):
-        if not self.budget():
-          self.emit_inconclusive("PT-OAPI4-03", title, owasp, "budget_exhausted")
-          break
-        self.safety.throttle()
         try:
-          resp = session.get(self.target_url + ep.path, timeout=10)
+          resp = session.get(self.target_url + ep.path, timeout=10, throttle_retry=False)
         except requests.RequestException:
           break
-        n += 1
         if resp.status_code == 429:
+          n += 1
           saw_429 = True
           break
+        # The first GET is the baseline: a denied endpoint says nothing about
+        # its rate limit, so it is not counted as tested.
+        if not self.response_reached(resp):
+          denied_any = True
+          n = 0
+          break
+        reached_any = True
+        n += 1
         if resp.headers.get("Retry-After"):
           saw_retry_after = True
         if any(h.lower().startswith("x-ratelimit") for h in resp.headers):
@@ -334,6 +343,10 @@ class ApiAbuseProbes(ProbeBase):
           ),
           response=resp,
         )
+    if denied_any and not reached_any and not any(
+      f.scenario_id == "PT-OAPI4-03" for f in self.findings
+    ):
+      self.emit_endpoint_denied("PT-OAPI4-03")
 
   # ── PT-OAPI6-01 — flow no rate limit (STATEFUL) ────────────────────
 
@@ -370,13 +383,15 @@ class ApiAbuseProbes(ProbeBase):
         attempts = 0
         captcha = False
         mfa = False
+        # All five or none: a refusal mid-burst would leave a sent mutation unreverted.
+        if not self.budget_available(5):
+          raise RuntimeError("budget_exhausted")
         for _ in range(5):
-          if not self.budget():
-            raise RuntimeError("budget_exhausted")
-          self.safety.throttle()
           try:
             resp = self._flow_request(
               session, _flow.method, _url, _body, timeout=10,
+              # The 429 is the evidence, and a mutating step is never replayed.
+              throttle_retry=False,
             )
           except requests.RequestException:
             return self.MUTATION_ATTEMPTED_UNKNOWN
@@ -459,7 +474,7 @@ class ApiAbuseProbes(ProbeBase):
 
       def mutate(_b, _flow=flow, _url=url, _body=body,
                  _probe_state=probe_state):
-        if not self.budget(2):
+        if not self.budget_available(2):
           raise RuntimeError("budget_exhausted")
         # Track whether the first mutating request was already issued so a
         # transport failure on the second send still triggers revert
@@ -467,14 +482,13 @@ class ApiAbuseProbes(ProbeBase):
         # while reporting "no mutation needed" is unsafe.
         mutation_sent = False
         try:
-          self.safety.throttle()
+          # A mutating step is never replayed, whatever its method.
           r1 = self._flow_request(
-            session, _flow.method, _url, _body, timeout=10,
+            session, _flow.method, _url, _body, timeout=10, throttle_retry=False,
           )
           mutation_sent = True
-          self.safety.throttle()
           r2 = self._flow_request(
-            session, _flow.method, _url, _body, timeout=10,
+            session, _flow.method, _url, _body, timeout=10, throttle_retry=False,
           )
         except requests.RequestException:
           if mutation_sent:

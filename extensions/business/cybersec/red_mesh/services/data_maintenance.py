@@ -29,6 +29,8 @@ from ..tenancy.compliance import KIND as ASSESSMENT_KIND
 from ..tenancy.adapters.cstore_identity import CstoreAuthAccountReader
 from ..tenancy.execution import BINDING_SCHEMA_VERSION, ExecutionBinding
 from ..tenancy.super_tenant_integrations import KIND as INTEGRATION_OVERRIDE_KIND, withheld_for_backup
+from .engagement_ledger import LedgerFoldError
+from .engagement_ledger_store import EngagementLedgerRecorder, EngagementLedgerStore, LedgerStoreError, valid_field
 from .integration_status import _STATUS_BUILDERS
 
 
@@ -45,6 +47,8 @@ _TERMINAL = (JOB_STATUS_FINALIZED, JOB_STATUS_STOPPED, JOB_STATUS_FAILED)
 _CID = re.compile(r"(?:Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{58,})\Z")
 _FILENAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}\Z")
 _TENANT_STATUS_HKEY = re.compile(r":integrations:(tn_[0-9a-f-]{36})\Z")
+# RM-169 step 4a: host-scoped finding triage and its audit log, one hkey per tenant (not per job).
+_TENANT_TRIAGE_HKEY = re.compile(r":triage:(t|audit):(tn_[0-9a-f-]{36})\Z")
 # Keys that hold a file reference. `ref` is a tenant document; `cid` a rulebook submission.
 _REFERENCE_KEYS = frozenset({"cid", "ref", "secret_ref", "model_provider_secret_ref", "authorization_ref"})
 # Per-job hkeys: suffix, the stored value type, and whether the field is `<job_id>:<rest>`.
@@ -53,6 +57,7 @@ _PER_JOB = (
   (":triage", dict, True),
   (":triage:audit", list, True),
   (":model_test_raw_evidence", dict, False),
+  (":purge_progress", dict, False),
   (":rulebook_review", dict, True),
   (":rulebook_review:audit", list, True),
   (":rulebook_review:submissions", dict, True),
@@ -63,7 +68,8 @@ _PER_JOB = (
 # RM-139: the tenant `integration` kind is retired: its rows classify old and are never restored.
 _TENANCY_KINDS = ("tenant", "receipt", "domain", "tenant_node", "engagement", "tenant_draft",
                   "engagement_draft", "super_tenant_profile", "tenant_asset", "tenant_contract_draft",
-                  "super_tenant_branding", "super_tenant_integration", "account_profile")
+                  "super_tenant_branding", "super_tenant_integration", "account_profile",
+                  "supporting_document")
 # Graybox credentials that job configs held inline before they moved to an encrypted secret file.
 # Such a config is stored under the engine's fixed default secret, so its bytes are as good as
 # plaintext: it is withheld from the backup (owner, 2026-09-29: no plaintext credential leaves the node).
@@ -150,6 +156,7 @@ class Inventory:
     # them readable and the row's file list complete for the retry.
     self._containers = set()
     self._tenants = None
+    self._ledgers = None
     # Files this request deleted: another old row that shares one does not delete it again.
     self.deleted = set()
 
@@ -231,14 +238,38 @@ class Inventory:
     self._tenants = sorted(item for item in found if _TENANT_STATUS_HKEY.match(f":integrations:{item}"))
     return self._tenants
 
+  def ledgers(self):
+    """RM-121: `{hkey: (tenant_id, engagement_id, engagement_asset_id)}`, the finding-ledger hkey of
+    every asset of every stored engagement row (hkey names cannot be listed). Fixed for the request,
+    as `tenant_ids`."""
+    if self._ledgers is None:
+      self._ledgers = {}
+      for _, kind, ids, value in self._tenancy_fields():
+        if kind != "engagement" or len(ids) != 2 or not isinstance(value, dict):
+          continue
+        for entry in value["assets"] if isinstance(value.get("assets"), list) else ():
+          asset_id = entry.get("engagement_asset_id") if isinstance(entry, dict) else None
+          try:
+            hkey = EngagementLedgerStore(self._owner, self._namespace, ids[0], ids[1], asset_id).hkey
+          except LedgerStoreError:
+            continue
+          self._ledgers[hkey] = (ids[0], ids[1], asset_id)
+    return self._ledgers
+
+  def namespace(self):
+    return self._namespace
+
   def hkeys(self):
     """The registry, in a stable order. The index into it is the export's paging cursor."""
     names = [self._instance] + [self._instance + suffix for suffix, _, _ in _PER_JOB]
     names.append(f"{self._instance}:integrations")
     names.extend(f"{self._instance}:integrations:{tenant}" for tenant in self.tenant_ids())
+    for tenant in self.tenant_ids():
+      names.extend([f"{self._instance}:triage:t:{tenant}", f"{self._instance}:triage:audit:{tenant}"])
     # RM-127: each node's self-published public IP, keyed by the node's address.
     names.append(f"{self._instance}:node_info")
     names.extend([self._tenancy_hkey, self._compliance_hkey, self._account_hkey])
+    names.extend(sorted(self.ledgers()))
     return names
 
   def accepts(self, hkey):
@@ -247,7 +278,8 @@ class Inventory:
       return False
     prefix = f"{self._instance}:integrations:"
     return (hkey in self.hkeys()
-            or hkey.startswith(prefix) and _TENANT_STATUS_HKEY.match(hkey[len(self._instance):]) is not None)
+            or hkey.startswith(prefix) and _TENANT_STATUS_HKEY.match(hkey[len(self._instance):]) is not None
+            or self._triage_tenant(hkey) is not None)
 
   def is_account_hkey(self, hkey):
     return hkey == self._account_hkey
@@ -337,9 +369,9 @@ class Inventory:
     if kind == "engagement" and isinstance(value, dict) and any(
         name in value for name in _ENGAGEMENT_V1_FIELDS):
       return OLD, "engagement_v1"
-    # RM-125 phase 2b: an entry without `asset_id`, or still with the v2 `authorized_tests`.
+    # RM-125 phase 2b: an entry without `asset_id`. RM-277: `authorized_tests` is the asset's scope now.
     if kind in ("engagement", "engagement_draft") and isinstance(value, dict) and any(
-        isinstance(entry, dict) and ("asset_id" not in entry or "authorized_tests" in entry)
+        isinstance(entry, dict) and "asset_id" not in entry
         for entry in (value["assets"] if isinstance(value.get("assets"), list) else ())):
       return OLD, "engagement_v2" if kind == "engagement" else "engagement_draft_v1"
     try:
@@ -395,6 +427,37 @@ class Inventory:
       return OLD, "unrecognized"
     return CURRENT, ""
 
+  def _triage_tenant(self, hkey):
+    """`(kind, tenant_id)` of a host-triage hkey of this instance (`t` rows, `audit` rows), else None."""
+    if not isinstance(hkey, str) or not hkey.startswith(self._instance):
+      return None
+    match = _TENANT_TRIAGE_HKEY.fullmatch(hkey[len(self._instance):])
+    return (match.group(1), match.group(2)) if match else None
+
+  def _triage_class(self, kind, tenant_id, field, value):
+    """A row is current while its tenant is live, its field names a host and finding, and the value has the
+    shape and identity the writer stores; with the tenant gone it is an orphan (or old when the tenant row is
+    stored but not current), as an integration status row is."""
+    if tenant_id not in self._live_tenants():
+      stored = any(k == "tenant" and ids == [tenant_id] and row is not None
+                   for _, k, ids, row in self._tenancy_fields())
+      return (OLD, "old_tenant") if stored else (ORPHAN, "tenant_gone")
+    return (CURRENT, "") if self._triage_identity_ok(kind, tenant_id, field, value) else (OLD, "unrecognized")
+
+  @staticmethod
+  def _triage_identity_ok(kind, tenant_id, field, value):
+    """A `t` row is `host, finding`; an audit entry is `host, finding, entry id`; the value must name the same
+    tenant, host and finding, as the writer stores it (a restored row is read by unchecked readers)."""
+    parts = field.split("\x1f") if isinstance(field, str) else []
+    return (len(parts) == (2 if kind == "t" else 3) and all(parts) and isinstance(value, dict)
+            and value.get("tenant_id") == tenant_id and value.get("host") == parts[0]
+            and value.get("finding_id") == parts[1])
+
+  def is_mismatched_triage(self, hkey, field, value):
+    """A host-triage row whose field or value does not match its hkey: a restore never writes it."""
+    triage = self._triage_tenant(hkey)
+    return triage is not None and not self._triage_identity_ok(*triage, field, value)
+
   def is_status_hkey(self, hkey):
     return isinstance(hkey, str) and hkey.startswith(f"{self._instance}:integrations")
 
@@ -419,9 +482,26 @@ class Inventory:
       return self._compliance_class(field, value)
     if self.is_status_hkey(hkey):
       return self._status_class(hkey, field, value)
+    triage = self._triage_tenant(hkey)
+    if triage:
+      return self._triage_class(*triage, field, value)
     if hkey == f"{self._instance}:node_info":
       return (CURRENT, "") if isinstance(value, dict) and set(value) == {"ip", "published_at"} else (OLD, "unrecognized")
+    if hkey in self.ledgers():
+      return self._ledger_class(hkey, field, value)
     raise MaintenanceError(400, "invalid_request")
+
+  def _ledger_class(self, hkey, field, value):
+    """RM-121: a finding-ledger field is current while the adapter would read it and its tenant is
+    live; its pass entries' pass-changes files are then kept (`files`)."""
+    if not valid_field(field, value):
+      return OLD, "unrecognized"
+    tenant_id = self.ledgers()[hkey][0]
+    if tenant_id not in self._live_tenants():
+      known = any(k == "tenant" and i == [tenant_id] and v is not None
+                  for _, k, i, v in self._tenancy_fields())
+      return (OLD, "old_tenant") if known else (ORPHAN, "tenant_gone")
+    return CURRENT, ""
 
   def _compliance_class(self, field, value):
     """RM-120: an assessment row is current while its validator passes and its tenant is live;
@@ -430,7 +510,7 @@ class Inventory:
       ids = json.loads(field) if isinstance(field, str) else None
     except (ValueError, RecursionError):
       ids = None
-    if not (isinstance(ids, list) and len(ids) in (4, 5) and ids[0] == ASSESSMENT_KIND
+    if not (isinstance(ids, list) and len(ids) in (3, 4, 5, 6) and ids[0] in (ASSESSMENT_KIND, "framework_assessment_review", "compliance_profile")
             and ids[1] == self._namespace):
       return OLD, "unrecognized"
     try:
@@ -458,7 +538,12 @@ class Inventory:
     if key in self._files:
       return self._files[key]
     found, complete = {}, True
-    if value is not None and hkey != self._account_hkey:
+    if hkey in self.ledgers():
+      # RM-121: a pass entry owns its pass-changes file only; the pass report it also names is the job's.
+      cid = value.get("pass_changes_cid") if isinstance(value, dict) and str(field).startswith("pass:") else None
+      if valid_cid(cid):
+        found[cid] = "pass_changes_cid"
+    elif value is not None and hkey != self._account_hkey:
       for cid, role in references(value):
         found.setdefault(cid, role)
       self._withheld |= fallback_key_files(value)
@@ -793,6 +878,37 @@ def _clean_row(owner, inventory, target, delete_file, job_id=None):
   return result
 
 
+def maintain_ledgers(owner, inventory, artifacts, now):
+  """RM-121 (continuous-monitoring.md §2.1): for each finding ledger of a live tenant, fill the
+  `skipped` entries a dead launcher left out (24 hours after a later pass of the job) and run the folds
+  and replays the post-pass hook and the reads left pending, with no replay cap."""
+  outcomes = []
+  for hkey, (tenant_id, engagement_id, asset_id) in sorted(inventory.ledgers().items()):
+    if tenant_id not in inventory._live_tenants():
+      continue
+    store = EngagementLedgerStore(owner, inventory.namespace(), tenant_id, engagement_id, asset_id)
+    try:
+      filled, written = EngagementLedgerRecorder(owner, store, None).maintain(artifacts, now)
+      outcome = "folded" if written else "current"
+    except (LedgerStoreError, LedgerFoldError, KeyError, TypeError, ValueError) as exc:
+      # A malformed restored checkpoint or artifact fails this asset only. Type and hkey, no values.
+      owner.P(f"[LEDGER] {hkey}: maintenance failed ({type(exc).__name__})", color='r')
+      filled, outcome = 0, "failed"
+    outcomes.append({"hkey": hkey, "outcome": outcome, "skipped_filled": filled})
+  return {"outcomes": outcomes}
+
+
+def _is_pruned_triage_audit(owner, inventory, listed, hkey, field):
+  """A triage audit entry the prune tombstoned: the field is listed but reads None. A backup taken before the
+  prune must not bring it back outside the kept window."""
+  triage = inventory._triage_tenant(hkey)
+  if triage is None or triage[0] != "audit":
+    return False
+  if hkey not in listed:
+    listed[hkey] = set(owner.chainstore_hkeys(hkey=hkey) or [])
+  return field in listed[hkey] and owner.chainstore_hget(hkey=hkey, key=field) is None
+
+
 def restore_records(owner, inventory, rows):
   if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_TARGETS:
     raise MaintenanceError(400, "invalid_request")
@@ -802,11 +918,14 @@ def restore_records(owner, inventory, rows):
         or not isinstance(row["hkey"], str) or not isinstance(row["field"], str)
         or not row["field"] or row["value"] is None):
       raise MaintenanceError(400, "invalid_request")
+  tombstoned = {}  # audit hkey -> its fields as listed: a listed field that reads None was pruned
   for row in rows:
     hkey, field, value = row["hkey"], row["field"], row["value"]
     outcome = "written"
     if (not inventory.accepts(hkey) or inventory.is_retired_field(hkey, field)
-        or inventory.is_unreadable_override(hkey, field, value)):
+        or inventory.is_unreadable_override(hkey, field, value)
+        or inventory.is_mismatched_triage(hkey, field, value)
+        or _is_pruned_triage_audit(owner, inventory, tombstoned, hkey, field)):
       outcome = "refused"
     else:
       stored = owner.chainstore_hget(hkey=hkey, key=field)
@@ -863,6 +982,10 @@ def run(owner, namespace, operation, **arguments):
       data = write_stored_file(ipfs_home=ipfs_home(), **arguments)
     elif operation == "restore_records":
       data = restore_records(owner, inventory(), arguments["rows"])
+    elif operation == "maintain_ledgers":
+      if arguments.pop("confirm", None) is not True:
+        raise MaintenanceError(400, "invalid_request")
+      data = maintain_ledgers(owner, inventory(), owner._get_artifact_repository(), owner.time())
     else:
       raise MaintenanceError(400, "invalid_request")
   except MaintenanceError as exc:

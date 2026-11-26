@@ -24,22 +24,30 @@ class MisconfigProbes(ProbeBase):
     self.run_safe("login_rate_limiting", self._test_login_rate_limiting)
     self.run_safe("password_reset_token", self._test_password_reset_token)
     self.run_safe("password_reset_token_reuse", self._test_password_reset_token_reuse)
-    self.run_safe("account_enumeration_timing", self._test_account_enumeration_timing)
     self.run_safe("jwt_weak_alg", self._test_jwt_weak_alg)
     self.run_safe("session_fixation", self._test_session_fixation)
+    return self.findings
+
+  def run_lockout_checks(self):
+    """PT-A02-17 and PT-A07-04: wrong-password logins for the configured username.
+
+    The worker runs these after every probe and after the weak_auth phase, so a
+    lockout they trigger cannot make a later session refresh fail (RM-219).
+    """
+    self.run_safe("account_enumeration_timing", self._test_account_enumeration_timing)
     self.run_safe("account_enumeration", self._test_account_enumeration)
     return self.findings
 
   def _test_debug_exposure(self):
     """PT-A02-01: check debug/config endpoints for information disclosure."""
-    session = self.auth.anon_session or self.auth.official_session
+    session = self.auth.anon_session or self.auth.primary_session
     if not session:
       return
 
     debug_paths = self.target_config.misconfig.debug_paths
     exposed = []
+    exposed_response = None
     for path in debug_paths:
-      self.safety.throttle()
       url = self.target_url + path
       try:
         resp = session.get(url, timeout=10)
@@ -47,6 +55,8 @@ class MisconfigProbes(ProbeBase):
         continue
       if resp.status_code == 200 and len(resp.text) > 50:
         exposed.append(path)
+        if exposed_response is None:
+          exposed_response = resp
 
     if exposed:
       self.findings.append(GrayboxFinding(
@@ -54,10 +64,11 @@ class MisconfigProbes(ProbeBase):
         title="Debug/config endpoint exposed",
         status="vulnerable",
         severity="MEDIUM",
-        owasp="A02:2021",
+        owasp="A05:2021",
         cwe=["CWE-200"],
         evidence=[f"exposed_paths={', '.join(exposed)}"],
         remediation="Disable debug endpoints in production. Restrict access by IP or authentication.",
+        evidence_artifacts=self.evidence_from(exposed_response),
       ))
     else:
       self.findings.append(GrayboxFinding(
@@ -65,7 +76,7 @@ class MisconfigProbes(ProbeBase):
         title="Debug endpoints — not exposed",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A02:2021",
+        owasp="A05:2021",
         evidence=[f"paths_tested={len(debug_paths)}"],
       ))
 
@@ -75,7 +86,7 @@ class MisconfigProbes(ProbeBase):
     Tests both the root URL and discovered API routes, since many apps
     only set CORS headers on API endpoints (e.g. /api/*).
     """
-    session = self.auth.anon_session or self.auth.official_session
+    session = self.auth.anon_session or self.auth.primary_session
     if not session:
       return
 
@@ -103,7 +114,6 @@ class MisconfigProbes(ProbeBase):
 
     worst_finding = None
     for path in unique_paths:
-      self.safety.throttle()
       try:
         resp = session.get(
           self.target_url + path,
@@ -124,7 +134,7 @@ class MisconfigProbes(ProbeBase):
           status="vulnerable",
           severity="HIGH" if acac == "true" else "LOW",
           cvss_vector=V.CORS_CREDENTIALED if acac == "true" else V.CORS_UNCREDENTIALED,
-          owasp="A02:2021",
+          owasp="A05:2021",
           cwe=["CWE-942"],
           evidence=[
             f"path={path}",
@@ -132,6 +142,7 @@ class MisconfigProbes(ProbeBase):
             f"allow_credentials={acac}",
           ],
           remediation="Restrict Access-Control-Allow-Origin to trusted domains. Never use * with credentials.",
+          evidence_artifacts=self.evidence_from(resp),
         )
         if not worst_finding or finding.severity == "HIGH":
           worst_finding = finding
@@ -142,7 +153,7 @@ class MisconfigProbes(ProbeBase):
           status="vulnerable",
           severity="HIGH" if acac == "true" else "LOW",
           cvss_vector=V.CORS_CREDENTIALED if acac == "true" else V.CORS_UNCREDENTIALED,
-          owasp="A02:2021",
+          owasp="A05:2021",
           cwe=["CWE-942"],
           evidence=[
             f"path={path}",
@@ -150,8 +161,9 @@ class MisconfigProbes(ProbeBase):
             f"allow_credentials={acac}",
           ],
           remediation="Validate the Origin header against an allowlist. Do not reflect arbitrary origins.",
+          evidence_artifacts=self.evidence_from(resp),
         )
-        if not worst_finding or severity == "HIGH":
+        if not worst_finding or finding.severity == "HIGH":
           worst_finding = finding
 
     if worst_finding:
@@ -162,17 +174,16 @@ class MisconfigProbes(ProbeBase):
         title="CORS configuration — no misconfiguration detected",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A02:2021",
+        owasp="A05:2021",
         evidence=[f"paths_tested={len(unique_paths)}"],
       ))
 
   def _test_security_headers(self):
     """PT-A02-03: check for missing security headers."""
-    session = self.auth.anon_session or self.auth.official_session
+    session = self.auth.anon_session or self.auth.primary_session
     if not session:
       return
 
-    self.safety.throttle()
     try:
       resp = session.get(self.target_url + "/", timeout=10)
     except Exception:
@@ -197,10 +208,11 @@ class MisconfigProbes(ProbeBase):
         title="Missing security headers",
         status="vulnerable",
         severity="LOW",
-        owasp="A02:2021",
+        owasp="A05:2021",
         cwe=["CWE-693"],
         evidence=[f"missing_headers={', '.join(missing)}"],
         remediation="Add security headers: " + ", ".join(missing),
+        evidence_artifacts=self.evidence_from(resp),
       ))
     else:
       self.findings.append(GrayboxFinding(
@@ -208,16 +220,16 @@ class MisconfigProbes(ProbeBase):
         title="Security headers — all present",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A02:2021",
+        owasp="A05:2021",
         evidence=[f"headers_checked={len(checked)}"],
       ))
 
   def _test_cookie_attributes(self):
     """PT-A02-04: check session cookie security attributes."""
-    if not self.auth.official_session:
+    if not self.auth.primary_session:
       return
 
-    cookies = self.auth.official_session.cookies
+    cookies = self.auth.primary_session.cookies
     issues = []
     for cookie in cookies:
       if not cookie.secure:
@@ -234,7 +246,7 @@ class MisconfigProbes(ProbeBase):
         title="Insecure cookie attributes",
         status="vulnerable",
         severity="LOW",
-        owasp="A02:2021",
+        owasp="A05:2021",
         cwe=["CWE-614"],
         evidence=issues,
         remediation="Set Secure, HttpOnly, and SameSite=Strict on all session cookies.",
@@ -245,7 +257,7 @@ class MisconfigProbes(ProbeBase):
         title="Cookie attributes — all secure",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A02:2021",
+        owasp="A05:2021",
         evidence=["all_cookies_have_secure_attributes"],
       ))
 
@@ -256,7 +268,7 @@ class MisconfigProbes(ProbeBase):
     Submit POST without CSRF token to state-changing endpoints.
     If the server accepts → CSRF bypass detected.
     """
-    if not self.auth.official_session:
+    if not self.auth.primary_session:
       return
 
     csrf_test_endpoints = []
@@ -272,24 +284,82 @@ class MisconfigProbes(ProbeBase):
       return
 
     tested = 0
+    denied = 0
     vulnerable_endpoints = []
+    vulnerable_response = None
+    csrf_field = self.auth.detected_csrf_field
     for path in csrf_test_endpoints[:5]:
-      self.safety.throttle()
+      # A POST to the logout URL ends the scan session.
+      if self.is_logout_path(path):
+        continue
       url = self.target_url + path
+      # Baseline: the principal must be allowed to use this endpoint, else a
+      # tokenless 403 proves nothing about CSRF. With allow_stateful the
+      # baseline is the same POST with a valid token; without it a GET of the
+      # endpoint, so no state-changing request is sent as the baseline.
+      baseline_ok = True
+      if self._allow_stateful:
+        baseline_data = {"test": "csrf_probe"}
+        baseline_headers = {"Referer": url}
+        if csrf_field:
+          try:
+            page = self.auth.primary_session.get(url, timeout=10)
+            token = self.auth.extract_csrf_value(page.text, csrf_field)
+          except Exception:
+            token = None
+          if token:
+            baseline_data[csrf_field] = token
+            baseline_headers["X-CSRFToken"] = token
+        try:
+          baseline = self.auth.primary_session.post(
+            url, data=baseline_data, timeout=10, headers=baseline_headers,
+          )
+        except Exception:
+          continue
+        if not self.response_reached(baseline, validation_ok=True):
+          denied += 1
+          continue
+      else:
+        try:
+          baseline = self.auth.primary_session.get(url, timeout=10)
+        except Exception:
+          continue
+        if baseline.status_code == 405:
+          # POST-only action: no GET baseline, the tokenless response decides.
+          baseline_ok = False
+        elif not self.response_reached(baseline):
+          denied += 1
+          continue
       try:
-        resp = self.auth.official_session.post(
+        resp = self.auth.primary_session.post(
           url, data={"test": "csrf_probe"}, timeout=10,
           headers={"Referer": "http://evil.example.com"},
         )
       except Exception:
         continue
-      tested += 1
+      # Not reached (login redirect, 404): denied. After a reached baseline a
+      # 401/403 is left to the CSRF-rejection checks below.
+      if not self.response_reached(resp, validation_ok=True) and (
+          not baseline_ok or resp.status_code not in (401, 403)):
+        denied += 1
+        continue
       body_lower = resp.text.lower()
+      # Without the valid-token POST baseline (allow_stateful), a GET that
+      # reached the page does not show the user may POST there: a bare 401/403
+      # may be an authorization denial, so only a CSRF-specific rejection counts.
+      if (not self._allow_stateful and resp.status_code in (401, 403)
+          and "csrf" not in body_lower and "token" not in body_lower):
+        denied += 1
+        continue
+      tested += 1
       csrf_rejected = any(m in body_lower for m in [
         "csrf", "forbidden", "token", "invalid request",
       ]) or resp.status_code == 403
-      if not csrf_rejected and resp.status_code < 400:
+      if (not csrf_rejected and resp.status_code < 400
+          and self.response_reached(resp)):
         vulnerable_endpoints.append(path)
+        if vulnerable_response is None:
+          vulnerable_response = resp
 
     if vulnerable_endpoints:
       self.findings.append(GrayboxFinding(
@@ -297,7 +367,7 @@ class MisconfigProbes(ProbeBase):
         title="CSRF protection bypass",
         status="vulnerable",
         severity="HIGH",
-        owasp="A02:2021",
+        owasp="A01:2021",
         cwe=["CWE-352"],
         attack=["T1185"],
         evidence=[
@@ -311,6 +381,7 @@ class MisconfigProbes(ProbeBase):
         ],
         remediation="Enforce CSRF tokens on all state-changing endpoints. "
                     "Use SameSite=Strict cookies as defense-in-depth.",
+        evidence_artifacts=self.evidence_from(vulnerable_response),
       ))
     elif tested > 0:
       self.findings.append(GrayboxFinding(
@@ -318,9 +389,11 @@ class MisconfigProbes(ProbeBase):
         title="CSRF protection — no bypass detected",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A02:2021",
+        owasp="A01:2021",
         evidence=[f"endpoints_tested={tested}"],
       ))
+    elif denied > 0:
+      self.emit_endpoint_denied("PT-A02-05")
 
   def _test_session_token(self):
     """
@@ -328,7 +401,7 @@ class MisconfigProbes(ProbeBase):
 
     Tests JWT alg=none, short session IDs.
     """
-    if not self.auth.official_session:
+    if not self.auth.primary_session:
       return
 
     import base64
@@ -336,7 +409,7 @@ class MisconfigProbes(ProbeBase):
     evidence = []
     status = "not_vulnerable"
 
-    cookies = self.auth.official_session.cookies.get_dict()
+    cookies = self.auth.primary_session.cookies.get_dict()
     for name, value in cookies.items():
       parts = value.split(".")
       if len(parts) == 3:
@@ -355,7 +428,7 @@ class MisconfigProbes(ProbeBase):
           pass
 
       if len(value) < 16 and any(c.isalnum() for c in value):
-        evidence.append(f"short_session_token={name}; length={len(value)}")
+        evidence.append(f"short_session_cookie={name}; length={len(value)}")
         if status == "not_vulnerable":
           status = "inconclusive"
 
@@ -368,7 +441,7 @@ class MisconfigProbes(ProbeBase):
       status=status,
       severity=severity,
       cvss_vector=V.AUTH_DEFEATABLE,
-      owasp="A02:2021",
+      owasp="A07:2021",
       cwe=["CWE-331", "CWE-345"] if evidence else [],
       evidence=evidence or ["all_tokens_appear_adequate"],
       remediation="Use cryptographically random session IDs (128+ bits). "
@@ -382,8 +455,19 @@ class MisconfigProbes(ProbeBase):
     Sends a bounded burst of failed login attempts and checks whether the
     server blocks, throttles, or continues to accept them unchanged.
     """
-    session = self.auth.make_anonymous_session()
     login_url = self.target_url + self.target_config.login_path
+    csrf_field = self.auth.detected_csrf_field
+    attempts = 8
+    # Worst case: the page, every POST, and a CSRF refetch before each later POST.
+    # "Not enforced" is a verdict from absence, so a burst the budget cannot cover
+    # in full is not sent: half a burst proves nothing.
+    if not self.budget_available(1 + attempts + (attempts - 1 if csrf_field else 0)):
+      self.emit_inconclusive(
+        "PT-A02-07", "Login rate limiting could not be evaluated",
+        "A07:2021", "budget_exhausted",
+      )
+      return
+    session = self.auth.make_anonymous_session()
 
     try:
       page = session.get(login_url, timeout=10)
@@ -391,27 +475,25 @@ class MisconfigProbes(ProbeBase):
       session.close()
       return
 
-    csrf_field = self.auth.detected_csrf_field
     csrf_token = None
     if csrf_field:
       csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
 
     # Use a non-existent username to avoid locking a real account
     test_username = "ratelimit_probe_user_nonexist"
-    attempts = 8
     blocked = False
+    last_response = None
     lockout_markers = [
       "account locked", "too many attempts", "temporarily blocked",
       "account suspended", "try again later", "rate limit",
     ]
 
     for i in range(attempts):
-      self.safety.throttle(min_delay=0.1)
-
       # Re-extract CSRF token each time (some frameworks rotate it)
       if csrf_field and i > 0:
         try:
-          page = session.get(login_url, timeout=10)
+          page = session.get(login_url, timeout=10, throttle_min_delay=0.1,
+                             throttle_retry=False)
           csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
         except Exception:
           pass
@@ -427,10 +509,11 @@ class MisconfigProbes(ProbeBase):
         resp = session.post(
           login_url, data=payload,
           headers={"Referer": login_url},
-          timeout=10,
+          timeout=10, throttle_min_delay=0.1,
         )
       except Exception:
         continue
+      last_response = resp
 
       if resp.status_code == 429:
         blocked = True
@@ -442,13 +525,19 @@ class MisconfigProbes(ProbeBase):
 
     session.close()
 
-    if not blocked:
+    if not blocked and last_response is None:
+      # Every login POST raised: nothing was observed, so "not enforced" is unproven.
+      self.emit_inconclusive(
+        "PT-A02-07", "Login rate limiting could not be evaluated",
+        "A07:2021", "no_login_response",
+      )
+    elif not blocked:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A02-07",
         title="Login rate limiting not enforced",
         status="vulnerable",
         severity="MEDIUM",
-        owasp="A02:2021",
+        owasp="A07:2021",
         cwe=["CWE-307"],
         attack=["T1110"],
         evidence=[
@@ -463,6 +552,7 @@ class MisconfigProbes(ProbeBase):
         ],
         remediation="Implement account lockout after repeated failures. "
                     "Add rate limiting (e.g. 429 responses) on login endpoints.",
+        evidence_artifacts=self.evidence_from(last_response),
       ))
     else:
       self.findings.append(GrayboxFinding(
@@ -470,7 +560,7 @@ class MisconfigProbes(ProbeBase):
         title="Login rate limiting — enforced",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A02:2021",
+        owasp="A07:2021",
         evidence=[
           f"endpoint={login_url}",
           f"lockout_triggered_after={attempts}_or_fewer_attempts",
@@ -516,7 +606,6 @@ class MisconfigProbes(ProbeBase):
     import re
     tokens = []
     for i in range(2):
-      self.safety.throttle()
       if i > 0:
         try:
           page = session.get(reset_url, timeout=10)
@@ -631,19 +720,14 @@ class MisconfigProbes(ProbeBase):
     """
     PT-A02-18: detect password reset tokens that aren't invalidated on use.
 
-    Two requests for the same user produce the same token string when the
-    reset table never marks rows ``is_used=True`` after consumption — the
-    canonical "token not invalidated" bug. Issuing a fresh token twice and
-    observing identity is a non-destructive proxy that still flags the
-    underlying server-side issue.
-
-    Conservative: emits ``inconclusive`` INFO when the reset endpoint is
-    configured but tokens couldn't be extracted (probe couldn't observe
-    the bug); ``vulnerable`` HIGH when both issued tokens are identical;
-    ``not_vulnerable`` INFO when the issued tokens differ.
-
-    Stays read-only — does NOT consume tokens or mutate user passwords.
-    Destructive verification (true two-consume test) is tracked separately.
+    Reuse means one issued token is accepted twice. Two issuance requests
+    returning the same string, or different strings, say nothing about that
+    (the token column is unique, so a second issuance collides or rotates),
+    so neither is a verdict. Proving reuse needs a confirm POST, and a
+    confirm sets a new password: the probe has no current password to set,
+    and it must never change the scan account's password. So this check
+    issues one token, proves the flow is reachable, and stays ``inconclusive``
+    with a reason code until a safe consume (current password supplied) exists.
     """
     reset_path = self.target_config.password_reset_path
     if not reset_path:
@@ -678,94 +762,59 @@ class MisconfigProbes(ProbeBase):
       re.compile(r'(reset-\w+)', re.I),
     ]
 
-    issued = []
-    for _ in range(2):
-      self.safety.throttle()
-      csrf_token = None
-      try:
-        page = session.get(reset_url, timeout=10)
-        csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
-      except Exception:
-        pass
+    csrf_token = None
+    try:
+      page = session.get(reset_url, timeout=10)
+      csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
+    except Exception:
+      pass
 
-      payload = {"username": test_username}
-      headers = {"Referer": reset_url}
-      if csrf_token and csrf_field:
-        payload[csrf_field] = csrf_token
-        # Django checks the X-CSRFToken header against the cookie too —
-        # send both so the form-protected POST is accepted.
-        headers["X-CSRFToken"] = csrf_token
+    payload = {"username": test_username}
+    headers = {"Referer": reset_url}
+    if csrf_token and csrf_field:
+      payload[csrf_field] = csrf_token
+      # Django checks the X-CSRFToken header against the cookie too —
+      # send both so the form-protected POST is accepted.
+      headers["X-CSRFToken"] = csrf_token
 
-      try:
-        resp = session.post(
-          reset_url, data=payload, headers=headers,
-          timeout=10, allow_redirects=True,
-        )
-      except Exception:
-        continue
-
-      for pat in token_patterns:
-        m = pat.search(resp.text)
-        if m:
-          issued.append(m.group(1))
-          break
-
+    body = ""
+    try:
+      body = session.post(
+        reset_url, data=payload, headers=headers,
+        timeout=10, allow_redirects=True,
+      ).text
+    except Exception:
+      pass
     session.close()
 
-    if len(issued) < 2:
+    token_seen = any(pat.search(body) for pat in token_patterns)
+    if not token_seen:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A02-18",
-        title="Password reset token reuse — could not extract two tokens",
+        title="Password reset token reuse — could not extract a token",
         status="inconclusive",
         severity="INFO",
         owasp="A07:2021",
         evidence=[
-          f"tokens_extracted={len(issued)}",
+          "tokens_extracted=0",
           f"reset_endpoint={reset_path}",
           "reason=insufficient_response_visibility",
         ],
       ))
       return
 
-    if issued[0] == issued[1]:
-      self.findings.append(GrayboxFinding(
-        scenario_id="PT-A02-18",
-        title="Password reset token not invalidated between requests",
-        status="vulnerable",
-        severity="HIGH",
-        owasp="A07:2021",
-        cwe=["CWE-640", "CWE-294"],
-        attack=["T1110"],
-        evidence=[
-          f"reset_endpoint={reset_path}",
-          f"tokens_observed={len(issued)}",
-          f"first_token={issued[0]}",
-          "tokens_identical=True",
-        ],
-        replay_steps=[
-          f"POST {reset_path} for {test_username} (request #1).",
-          f"POST {reset_path} for {test_username} (request #2).",
-          "Compare tokens in the response bodies — observe identity.",
-          "Confirms the issued token persists across requests, "
-          "implying it is not invalidated on consumption either.",
-        ],
-        remediation="Issue a fresh, single-use token on every reset request. "
-                    "Mark the prior token consumed AND invalidated when a new "
-                    "one is issued. Treat reset tokens like one-time bearer "
-                    "credentials with short TTL.",
-      ))
-    else:
-      self.findings.append(GrayboxFinding(
-        scenario_id="PT-A02-18",
-        title="Password reset token rotates between requests",
-        status="not_vulnerable",
-        severity="INFO",
-        owasp="A07:2021",
-        evidence=[
-          f"reset_endpoint={reset_path}",
-          "tokens_identical=False",
-        ],
-      ))
+    self.findings.append(GrayboxFinding(
+      scenario_id="PT-A02-18",
+      title="Password reset token reuse — not verified (no safe consume)",
+      status="inconclusive",
+      severity="INFO",
+      owasp="A07:2021",
+      evidence=[
+        "tokens_extracted=1",
+        f"reset_endpoint={reset_path}",
+        "reason=reset_consume_needs_current_password",
+      ],
+    ))
 
   def _test_account_enumeration_timing(self):
     """
@@ -813,10 +862,13 @@ class MisconfigProbes(ProbeBase):
       headers = {"Referer": login_url}
       if csrf_token:
         headers["X-CSRFToken"] = csrf_token
+      # Pace before the clock: the timed request must not include the client's sleep.
+      self.safety.throttle()
       t0 = _time.monotonic()
       try:
-        session.post(login_url, data=payload, headers=headers,
-                     timeout=10, allow_redirects=False)
+        with self.safety.prepaid():
+          session.post(login_url, data=payload, headers=headers,
+                       timeout=10, allow_redirects=False)
       except Exception:
         session.close()
         return None
@@ -827,12 +879,10 @@ class MisconfigProbes(ProbeBase):
     known_timings = []
     unknown_timings = []
     for _ in range(sample_size):
-      self.safety.throttle()
       v = _measure(known_user)
       if v is not None:
         known_timings.append(v)
     for _ in range(sample_size):
-      self.safety.throttle()
       v = _measure("nx-" + secrets.token_hex(4))
       if v is not None:
         unknown_timings.append(v)
@@ -936,12 +986,15 @@ class MisconfigProbes(ProbeBase):
     # Use the official credentials we already authenticated with — the
     # AuthManager doesn't expose them directly, but we can read from the
     # env shape passed at probe-init time.
+    # Only the configured issuer account: falling back to the regular username
+    # would send it a wrong password and could lock the account later probes
+    # need (RM-219).
     issue_creds = {
-      "username": jwt_cfg.username or self.regular_username or "admin",
+      "username": jwt_cfg.username or "",
       "password": jwt_cfg.password or "",
     }
-    if not issue_creds["password"]:
-      # Without a password we can't issue a baseline token.
+    if not issue_creds["username"] or not issue_creds["password"]:
+      # Without issuer credentials we can't issue a baseline token.
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A02-12",
         title="JWT weak-alg probe — issuer credentials not configured",
@@ -949,7 +1002,7 @@ class MisconfigProbes(ProbeBase):
         severity="INFO",
         owasp="A02:2021",
         evidence=[f"token_path={jwt_cfg.token_path}",
-                  "reason=jwt_endpoints.password not set in target_config"],
+                  "reason=jwt_endpoints.username or password not set in target_config"],
       ))
       return
 
@@ -1058,6 +1111,7 @@ class MisconfigProbes(ProbeBase):
                       "(or any algorithm not in an explicit allowlist). "
                       "Pin the verification algorithm server-side rather "
                       "than reading it from the untrusted header.",
+          evidence_artifacts=self.evidence_from(me),
         ))
         return
 
@@ -1087,7 +1141,7 @@ class MisconfigProbes(ProbeBase):
     post-auth cookies on the already-established official session.
     Read-only: does not perform additional logins.
     """
-    if not self.auth.official_session:
+    if not self.auth.primary_session:
       return
 
     login_url = self.target_url + self.target_config.login_path
@@ -1095,7 +1149,7 @@ class MisconfigProbes(ProbeBase):
     # Step 1: GET login page with a fresh session, capture pre-auth cookies
     pre_session = self.auth.make_anonymous_session()
     try:
-      pre_session.get(login_url, timeout=10, allow_redirects=True)
+      pre_response = pre_session.get(login_url, timeout=10, allow_redirects=True)
     except Exception:
       pre_session.close()
       return
@@ -1112,7 +1166,7 @@ class MisconfigProbes(ProbeBase):
       return  # no pre-auth cookies → can't test fixation
 
     # Step 2: get post-auth cookies from the existing official session
-    post_cookies = self.auth.official_session.cookies
+    post_cookies = self.auth.primary_session.cookies
     if hasattr(post_cookies, "get_dict"):
       post_cookies = post_cookies.get_dict()
     else:
@@ -1159,6 +1213,7 @@ class MisconfigProbes(ProbeBase):
         remediation="Regenerate session ID after successful authentication. "
                     "Django: this is automatic. Flask: call session.regenerate(). "
                     "Rails: call reset_session in the login action.",
+        evidence_artifacts=self.evidence_from(pre_response),
       ))
     else:
       self.findings.append(GrayboxFinding(
@@ -1203,7 +1258,7 @@ class MisconfigProbes(ProbeBase):
     session = self.auth.make_anonymous_session()
 
     def _submit_login(username):
-      """Submit a failed login and return (status_code, body, content_length)."""
+      """Submit a failed login and return (status_code, body, content_length, response)."""
       try:
         page = session.get(login_url, timeout=10)
       except Exception:
@@ -1230,11 +1285,9 @@ class MisconfigProbes(ProbeBase):
       except Exception:
         return None
 
-      return (resp.status_code, resp.text, len(resp.text))
+      return (resp.status_code, resp.text, len(resp.text), resp)
 
-    self.safety.throttle()
     result_valid = _submit_login(valid_username)
-    self.safety.throttle()
     result_invalid = _submit_login(invalid_username)
 
     session.close()
@@ -1242,8 +1295,8 @@ class MisconfigProbes(ProbeBase):
     if not result_valid or not result_invalid:
       return
 
-    status_valid, body_valid, len_valid = result_valid
-    status_invalid, body_invalid, len_invalid = result_invalid
+    status_valid, body_valid, len_valid, resp_valid = result_valid
+    status_invalid, body_invalid, len_invalid, _ = result_invalid
 
     differences = []
 
@@ -1299,6 +1352,7 @@ class MisconfigProbes(ProbeBase):
         remediation="Return identical error messages for all failed login attempts. "
                     "Use generic text like 'Invalid credentials' regardless of "
                     "whether the username exists.",
+        evidence_artifacts=self.evidence_from(resp_valid),
       ))
     else:
       self.findings.append(GrayboxFinding(

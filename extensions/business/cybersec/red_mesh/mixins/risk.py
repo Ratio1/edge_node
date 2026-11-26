@@ -21,6 +21,8 @@ from ..models.finding_identity import (
   dedup_key as _dedup_key,
   parse_cwe_list as _parse_cwe_list,
 )
+from ..findings import epss_band
+from ..cve_view import apply_triage, build_cve_view, drop_closed, is_view_finding, view_members
 from ..constants import (
   RISK_SEVERITY_WEIGHTS,
   RISK_CONFIDENCE_MULTIPLIERS,
@@ -84,7 +86,7 @@ def normalize_risk_score(raw_total):
 class _RiskScoringMixin:
   """Risk scoring and findings extraction methods for PentesterApi01Plugin."""
 
-  def _compute_risk_and_findings(self, aggregated_report):
+  def _compute_risk_and_findings(self, aggregated_report, triage=None):
     """
     Compute risk score AND extract flat findings in a single walk.
 
@@ -131,7 +133,8 @@ class _RiskScoringMixin:
         )
 
     def normalize_flat_finding(finding, port, protocol, probe_name, category):
-      item = {k: v for k, v in finding.items()}
+      # A worker's finding never carries host triage: only the live host map (read on the launcher) does.
+      item = {k: v for k, v in finding.items() if k != "triage"}
       normalized_confidence, recognised = _normalize_confidence(
         item.get("confidence", "firm"),
       )
@@ -255,7 +258,7 @@ class _RiskScoringMixin:
       )
       item["finding_signature"] = (
         item.get("finding_signature") or item.get("content_hash")
-        or _content_hash(item)
+        or _content_hash({**item, "epss_score": epss_band(item.get("epss_score"))})
       )
       item.pop("dedup_key", None)
       item.pop("content_hash", None)
@@ -507,7 +510,29 @@ class _RiskScoringMixin:
     finding_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
     coverage_counts = {status: 0 for status in COVERAGE_STATUSES}
     cred_count = 0
-    for f in flat_findings:
+    # RM-169, generated CVE findings only (`static` has no view): findings folded into a rollup or a possible row
+    # leave the walk, and so do closed ones (the triage map). A rollup scores once, as its highest-severity member (that member's confidence); possible
+    # findings add 0. Non-CVE tentative findings keep the 0.5 multiplier.
+    # The host triage map: a closed finding leaves the walk; a confirmed possible one is certain from here on.
+    # The stamped copies only score; the returned list stays unstamped, because it is persisted in R1FS and a
+    # triage record there would outlive its removal (readers stamp the live map on read).
+    stamped = apply_triage(flat_findings, triage)
+    cve_view = build_cve_view(stamped, (aggregated_report.get("cves_not_applicable") or {}).values(), triage)
+    scored = stamped
+    if cve_view:
+      listed_ids = view_members(cve_view)[0]
+      by_id = {f["finding_id"]: f for f in stamped if is_view_finding(f) and f.get("finding_id")}
+      rollup_tops = [
+        max((by_id[i] for i in service["rollup"]["member_finding_ids"]),
+            key=lambda m: (SEVERITY_RANK.get(str(m.get("severity")).upper(), 0),
+                           CONFIDENCE_RANK.get(str(m.get("confidence")).lower(), 0)))
+        for service in cve_view["services"] if service["rollup"]
+      ]
+      # A view finding scores only when listed; a closed one leaves with the folded ones.
+      scored = [f for f in stamped
+                if not is_view_finding(f) or f["finding_id"] in listed_ids] + rollup_tops
+    scored = drop_closed(scored, triage)  # every closed finding, CVE or not, leaves the walk
+    for f in scored:
       if _is_coverage_result(f):
         status = str(f.get("status") or "").lower()
         coverage_counts[status] = coverage_counts.get(status, 0) + 1
@@ -604,6 +629,9 @@ class _RiskScoringMixin:
         },
       },
     }
+    if cve_view:
+      risk_result["breakdown"]["possible_cves"] = cve_view["counts"]["possible"]
+      risk_result["breakdown"]["cve_view_counts"] = dict(cve_view["counts"])
     return risk_result, flat_findings
 
   def _count_services(self, service_info):

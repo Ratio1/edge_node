@@ -2,11 +2,26 @@
 Injection probes — A03 + A05 + API7.
 """
 
+import dataclasses
 import re
+from urllib.parse import urlparse
 
 from .base import ProbeBase
 from ... import cvss_vectors as V
 from ..findings import GrayboxFinding
+from ..models.target_config import ReflectiveEndpoint
+from ..scenario_catalog import graybox_scenario
+from .sqli import (
+  BudgetRefused, CsrfUnavailable, LOGIN_MAX_PER_FIELD, LOGIN_MAX_PER_SCAN, SCAN_TIME_ALLOWANCE,
+  detect_sqli, status_reached,
+)
+
+
+_SQLI_REASONS = {  # "capped", "field_capped", "rate_limited", "csrf_unavailable" end silently
+  "unstable": "sqli_baseline_unstable",
+  "timeout": "sqli_time_timeout",
+  "budget": "sqli_budget_exhausted",
+}
 
 
 class InjectionProbes(ProbeBase):
@@ -23,8 +38,9 @@ class InjectionProbes(ProbeBase):
 
   def run(self):
     self.run_safe("login_injection", self._test_login_injection)
-    if self.auth.official_session:
+    if self.auth.primary_session:
       self.run_safe("authenticated_injection", self._test_authenticated_injection)
+      self.run_safe("sqli_get", self._test_sqli_get)
       if self._allow_stateful:
         self.run_safe("stored_xss", self._test_stored_xss)
       else:
@@ -46,7 +62,7 @@ class InjectionProbes(ProbeBase):
         "PT-API7-01", "ssrf_body_field", self._test_ssrf_body_field,
       )
     self.run_safe("open_redirect", self._test_open_redirect)
-    if self.auth.official_session:
+    if self.auth.primary_session:
       self.run_safe("path_traversal", self._test_path_traversal)
       self.run_safe("reflected_xss", self._test_reflected_xss)
       self.run_safe("template_injection", self._test_template_injection)
@@ -54,6 +70,187 @@ class InjectionProbes(ProbeBase):
       self.run_safe("header_injection", self._test_header_injection)
       self.run_safe("json_type_confusion", self._test_json_type_confusion)
     return self.findings
+
+  def _emit_no_endpoint(self, scenario_id, kind):
+    """Inconclusive coverage row for a family with no configured endpoint.
+
+    Without it the family returns silently and the coverage view cannot tell
+    "not tested" from "tested and clean".
+    """
+    entry = graybox_scenario(scenario_id) or {}
+    self.emit_inconclusive(
+      scenario_id,
+      entry.get("title") or scenario_id,
+      entry.get("owasp") or "",
+      f"no_configured_{kind}_endpoints",
+    )
+
+  def _reflective_endpoints(self, configured):
+    """The one boundary where discovered candidates join configured endpoints.
+
+    - precedence: configured entries come first, are never capped, and win a
+      (path, param) tie;
+    - base path: discovery paths are origin-absolute and probes prefix
+      ``target_url``, so the target's base path is stripped here and
+      candidates outside it are dropped;
+    - cap: at most ``max_candidates_per_family`` (clamped to the ceiling);
+    - tag: discovered entries carry ``source="discovered"`` into evidence.
+    A family with discovered candidates is not "no endpoint".
+    """
+    merged = list(configured)
+    seen = {(ep.path, ep.param) for ep in merged}
+    cap = self.target_config.discovery.max_candidates_per_family
+    base = urlparse(self.target_url).path.rstrip("/")
+    added = 0
+    for cand in self.discovered_candidates:
+      if cand.method != "GET" or added >= cap:
+        continue
+      path = cand.path
+      if base:
+        if not (path == base or path.startswith(base + "/")):
+          continue  # outside the target's base path: not ours to request
+        path = path[len(base):] or "/"
+      key = (path, cand.param)
+      if key in seen:
+        continue
+      seen.add(key)
+      added += 1
+      merged.append(ReflectiveEndpoint(
+        path=path, param=cand.param, source=cand.source))
+    return merged
+
+  @staticmethod
+  def _source_tag(ep):
+    return "; source=discovered" if ep.source == "discovered" else ""
+
+  def _sqli_finding(self, scenario_id, url, param, hit, authenticated, method,
+                    source=""):
+    """One vulnerable finding for a confirmed SQL injection (typed parameter)."""
+    pair = hit["payload_true"] + (
+      f" / {hit['payload_false']}" if hit["payload_false"] else "")
+    finding = GrayboxFinding(
+      scenario_id=scenario_id,
+      title=f"SQL injection ({hit['technique']}-based) confirmed",
+      status="vulnerable",
+      severity="HIGH",
+      cvss_vector=V.INJECTION_DATA_ACCESS,
+      owasp="A03:2021",
+      cwe=["CWE-89"],
+      attack=["T1190"],
+      parameter=param,
+      confidence=hit["confidence"],
+      evidence=[
+        f"endpoint={url}",
+        f"parameter={param}",
+        f"technique={hit['technique']}",
+        f"payload={pair}",
+        f"dbms={hit['dbms']}",
+        f"confidence={hit['confidence']}",
+        f"requests={hit['requests']}",
+      ] + ([f"source={source}"] if source == "discovered" else []),
+      replay_steps=[
+        f"{method} {url} with {param} set to {hit['payload_true']}.",
+        "Compare the response with the unmodified request"
+        + (f" and with {hit['payload_false']}." if hit["payload_false"] else "."),
+      ],
+      remediation="Use parameterized queries; never build SQL from request input.",
+      evidence_artifacts=self.evidence_from(hit.get("response")),
+    )
+    if authenticated:
+      finding = dataclasses.replace(
+        finding, cvss_vector=V.INJECTION_DATA_ACCESS_AUTHENTICATED)
+    return finding
+
+  def _sqli_run(self, scenario_id, url, param, send, method, authenticated,
+                prepare=None, allow_time=False, reached=None, caps=None,
+                source=""):
+    """Run the techniques on one parameter; emit the finding. Returns the
+    outcome (hit | clean | denied | unstable | timeout | budget | capped).
+    Once the request budget refuses, the whole SQLi family stops for this
+    worker (one inconclusive); ``caps`` is the login-form limit."""
+    state = self.__dict__
+    if state.get("_sqli_stopped"):
+      return "budget"
+    left = state.setdefault("_sqli_time_left", {"s": SCAN_TIME_ALLOWANCE})
+    res = detect_sqli(
+      send, throttle=self.safety.throttle,  # paced before the clock; sends run prepaid
+      reached=reached or self.response_reached,
+      budget=self.budget_available, time_left=left, prepare=prepare,
+      allow_time=allow_time, **(caps or {}))
+    outcome = res["outcome"]
+    if outcome == "budget":
+      state["_sqli_stopped"] = True
+    if outcome == "hit":
+      self.findings.append(self._sqli_finding(
+        scenario_id, url, param, res, authenticated, method, source))
+    elif outcome in _SQLI_REASONS:
+      seen = state.setdefault("_sqli_unstable_seen", set())
+      if outcome == "unstable":
+        if url in seen:
+          return outcome  # one per endpoint, not per parameter
+        seen.add(url)
+      self.findings.append(GrayboxFinding(
+        scenario_id=scenario_id,
+        title="SQL injection check incomplete",
+        status="inconclusive",
+        severity="INFO",
+        owasp="A03:2021",
+        parameter=param,
+        evidence=[f"endpoint={url}", f"parameter={param}",
+                  f"reason={_SQLI_REASONS[outcome]}"]
+                 + ([f"source={source}"] if source == "discovered" else []),
+      ))
+    return outcome
+
+  def _sqli_csrf_prepare(self, session, page_url):
+    """Untimed step before each POST: a fresh CSRF token (None when the app
+    has no CSRF field). A refused budget raises BudgetRefused: no POST."""
+    field = self.auth.detected_csrf_field
+    if not field:
+      return None
+    try:
+      page = session.get(page_url, timeout=10)
+    except BudgetRefused:
+      raise
+    except Exception:
+      raise CsrfUnavailable()  # no token, no POST; ends this form's check only
+    return self.auth.extract_csrf_value(page.text, field)
+
+  def _sqli_send_get(self, session, url, param):
+    """Request builder: one GET query parameter."""
+    def send(v):
+      with self.safety.prepaid():
+        return session.get(url, params={param: v}, timeout=15)
+    return send
+
+  def _sqli_send_post(self, session, url, fields, target, page_url):
+    """Request builder for one POSTed field: returns (send, prepare). The
+    other fields keep their benign value; each POST uses a fresh token."""
+    def prepare():
+      return self._sqli_csrf_prepare(session, page_url)
+
+    def send(value, token):
+      data = dict(fields)
+      data[target] = value
+      if token:
+        data[self.auth.detected_csrf_field] = token
+      with self.safety.prepaid():
+        return session.post(url, data=data, timeout=15)
+    return send, prepare
+
+  def _test_sqli_get(self):
+    """PT-A03-01: SQL injection on reflective GET parameters (configured
+    and discovered). Silent when clean: the reflective families carry coverage."""
+    endpoints = self._reflective_endpoints(
+      self.target_config.injection.xss_endpoints)
+    session = self.auth.primary_session
+    for ep in endpoints:
+      url = self.target_url + ep.path
+      outcome = self._sqli_run(
+        "PT-A03-01", url, ep.param, self._sqli_send_get(session, url, ep.param),
+        "GET", True, allow_time=True, source=ep.source)
+      if outcome in ("budget", "rate_limited"):
+        return
 
   def _test_login_injection(self):
     """PT-A05-01: inject into login form fields (unauthenticated)."""
@@ -79,7 +276,6 @@ class InjectionProbes(ProbeBase):
 
     vulnerable = []
     for label, payload, cwe in payloads:
-      self.safety.throttle()
       form_data = {
         self.target_config.username_field: payload,
         self.target_config.password_field: "test",
@@ -94,19 +290,57 @@ class InjectionProbes(ProbeBase):
 
       # Check for reflection
       if payload in resp.text:
-        vulnerable.append((label, cwe, payload))
+        vulnerable.append((label, cwe, payload, resp))
 
+    sqli_hit = False
+    login_cap = {"left": LOGIN_MAX_PER_SCAN}
+    for field in (self.target_config.username_field,
+                  self.target_config.password_field):
+      fields = {self.target_config.username_field: "test",
+                self.target_config.password_field: "test"}
+      send, prepare = self._sqli_send_post(
+        session, login_url, fields, field, login_url)
+      # Login form: status-based reachability, boolean + error only, capped.
+      outcome = self._sqli_run(
+        "PT-A05-01", login_url, field, send, "POST", False,
+        prepare=prepare, reached=status_reached,
+        caps={"max_requests": LOGIN_MAX_PER_FIELD, "cap": login_cap})
+      if outcome == "hit":
+        sqli_hit = True
+        break
+      if outcome in ("budget", "capped", "rate_limited", "csrf_unavailable"):
+        break  # a per-field cap ("field_capped") moves on to the next field
     session.close()
 
     if vulnerable:
-      for label, cwe, payload in vulnerable:
+      for label, cwe, payload, proof in vulnerable:
+        if label == "sqli":
+          if sqli_hit:
+            continue  # confirmed above; reflection is not a second finding
+          # Reflection alone proves echo, not SQL injection.
+          self.findings.append(GrayboxFinding(
+            scenario_id="PT-A05-01",
+            title="SQL injection payload reflected in login form: not confirmed",
+            status="inconclusive",
+            severity="LOW",
+            owasp="A03:2021",
+            cwe=[cwe],
+            evidence=[
+              f"endpoint={login_url}",
+              f"field={self.target_config.username_field}",
+              f"payload={payload}",
+              "payload_reflected=True",
+              "reason=sqli_reflection_only",
+            ],
+          ))
+          continue
         self.findings.append(GrayboxFinding(
           scenario_id="PT-A05-01",
           title=f"Reflected {label.upper()} in login form",
           status="vulnerable",
-          severity="HIGH" if label == "sqli" else "MEDIUM",
-          cvss_vector=V.INJECTION_DATA_ACCESS if label == "sqli" else V.XSS_UNAUTHENTICATED,
-          owasp="A05:2021" if label == "sqli" else "A03:2021",
+          severity="MEDIUM",
+          cvss_vector=V.XSS_UNAUTHENTICATED,
+          owasp="A03:2021",
           cwe=[cwe],
           evidence=[
             f"endpoint={login_url}",
@@ -119,14 +353,15 @@ class InjectionProbes(ProbeBase):
             "Observe payload reflected in the response.",
           ],
           remediation="Apply input validation and output encoding on all form fields.",
+          evidence_artifacts=self.evidence_from(proof),
         ))
-    else:
+    elif not sqli_hit:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A05-01",
         title="Login form injection — no reflection detected",
         status="not_vulnerable",
         severity="INFO",
-        owasp="A05:2021",
+        owasp="A03:2021",
         evidence=[f"payloads_tested={len(payloads)}"],
       ))
 
@@ -146,29 +381,48 @@ class InjectionProbes(ProbeBase):
     ]
     login_path = self.target_config.login_path
     tested = 0
+    denied = 0
     vulnerable_forms = []
+    sqli_hits = set()
+    stateful_skipped = []
 
     for form_action in self.discovered_forms:
       if form_action == login_path:
         continue
-      self.safety.throttle()
       url = self.target_url + form_action
 
       try:
-        page = self.auth.official_session.get(url, timeout=10)
+        page = self.auth.primary_session.get(url, timeout=10)
       except Exception:
         continue
+      # 405: a POST-only action. The GET baseline does not apply and there is
+      # no form to read, so the payload POST with common field names decides.
+      # Such actions often create or delete records, so only with allow_stateful.
+      post_only = page.status_code == 405
+      if post_only and not self._allow_stateful:
+        stateful_skipped.append(form_action)
+        continue
+      if not post_only and not self.response_reached(page):
+        denied += 1
+        continue
+      # The payload POST may write data to the target: only with allow_stateful.
+      if not self._allow_stateful:
+        stateful_skipped.append(form_action)
+        continue
+      page_text = "" if post_only else page.text
 
       # Extract input field names
       input_names = re.findall(
         r'<input[^>]+name=["\']([^"\']+)["\'][^>]*type=["\']?text',
-        page.text, re.IGNORECASE,
+        page_text, re.IGNORECASE,
       )
       textarea_names = re.findall(
         r'<textarea[^>]+name=["\']([^"\']+)["\']',
-        page.text, re.IGNORECASE,
+        page_text, re.IGNORECASE,
       )
       all_inputs = input_names + textarea_names
+      if post_only:
+        all_inputs = ["title", "name", "comment", "message", "description"]
       if not all_inputs:
         continue
 
@@ -176,31 +430,66 @@ class InjectionProbes(ProbeBase):
       csrf_field = self.auth.detected_csrf_field
       csrf_token = None
       if csrf_field:
-        csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
+        csrf_token = self.auth.extract_csrf_value(page_text, csrf_field)
 
       for label, payload, cwe in payloads:
-        self.safety.throttle()
         form_data = {name: payload for name in all_inputs}
         if csrf_token and csrf_field:
           form_data[csrf_field] = csrf_token
 
         try:
-          resp = self.auth.official_session.post(url, data=form_data, timeout=10)
+          resp = self.auth.primary_session.post(url, data=form_data, timeout=10)
         except Exception:
+          continue
+        if not self.response_reached(resp):
+          denied += 1
           continue
         tested += 1
 
         if payload in resp.text:
-          vulnerable_forms.append((form_action, label, cwe, all_inputs[0]))
+          vulnerable_forms.append((form_action, label, cwe, all_inputs[0], resp))
 
-    for form_action, label, cwe, field in vulnerable_forms:
+      # Real SQLi check per input: POSTs to discovered forms are stateful-gated
+      # (a POST can write); POST-only actions stay skipped. Time is GET only.
+      if not post_only and self._allow_stateful:
+        fields = {n: "test" for n in all_inputs}
+        for name in all_inputs[:3]:
+          send, prepare = self._sqli_send_post(
+            self.auth.primary_session, url, fields, name, url)
+          outcome = self._sqli_run(
+            "PT-A03-01", url, name, send, "POST", True, prepare=prepare)
+          if outcome == "hit":
+            sqli_hits.add(form_action)
+            break
+          if outcome in ("budget", "rate_limited", "csrf_unavailable"):
+            break
+
+    for form_action, label, cwe, field, proof in vulnerable_forms:
+      if label == "sqli":
+        if form_action in sqli_hits:
+          continue  # confirmed above; reflection is not a second finding
+        # Reflection alone proves echo, not SQL injection.
+        self.findings.append(GrayboxFinding(
+          scenario_id="PT-A03-01",
+          title="SQL injection payload reflected in authenticated form: not confirmed",
+          status="inconclusive",
+          severity="LOW",
+          owasp="A03:2021",
+          cwe=[cwe],
+          evidence=[
+            f"endpoint={self.target_url + form_action}",
+            f"field={field}",
+            "payload_reflected=True",
+            "reason=sqli_reflection_only",
+          ],
+        ))
+        continue
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-01",
         title=f"Reflected {label.upper()} in authenticated form",
         status="vulnerable",
-        severity="HIGH" if label == "sqli" else "MEDIUM",
-        cvss_vector=(V.INJECTION_DATA_ACCESS_AUTHENTICATED if label == "sqli"
-                     else V.XSS_AUTHENTICATED),
+        severity="MEDIUM",
+        cvss_vector=V.XSS_AUTHENTICATED,
         owasp="A03:2021",
         cwe=[cwe],
         evidence=[
@@ -214,9 +503,21 @@ class InjectionProbes(ProbeBase):
           "Observe payload reflected in the response.",
         ],
         remediation="Apply input validation and output encoding on all form fields.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
 
-    if tested > 0 and not vulnerable_forms:
+    if stateful_skipped:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A03-01",
+        title="Authenticated form injection skipped: stateful probes disabled",
+        status="inconclusive",
+        severity="INFO",
+        owasp="A03:2021",
+        evidence=["stateful_probes_disabled=True",
+                  "reason=stateful_probes_disabled",
+                  f"forms_skipped={len(stateful_skipped)}"],
+      ))
+    if tested > 0 and not vulnerable_forms and not sqli_hits:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-01",
         title="Authenticated injection — no reflection detected",
@@ -225,6 +526,8 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"forms_tested={tested}"],
       ))
+    elif denied > 0 and not vulnerable_forms and not sqli_hits and tested == 0:
+      self.emit_endpoint_denied("PT-A03-01")
 
   def _test_stored_xss(self):
     """
@@ -242,15 +545,18 @@ class InjectionProbes(ProbeBase):
     skip_paths = {self.target_config.login_path, self.target_config.logout_path}
 
     tested = 0
+    denied = 0
     for form_action in self.discovered_forms[:3]:
       if form_action in skip_paths:
         continue
-      self.safety.throttle()
       url = self.target_url + form_action
 
       try:
-        page = self.auth.official_session.get(url, timeout=10)
+        page = self.auth.primary_session.get(url, timeout=10)
       except Exception:
+        continue
+      if not self.response_reached(page):
+        denied += 1
         continue
 
       input_names = re.findall(
@@ -273,16 +579,21 @@ class InjectionProbes(ProbeBase):
           form_data[csrf_field] = csrf_token
 
       try:
-        self.auth.official_session.post(url, data=form_data, timeout=10)
+        resp = self.auth.primary_session.post(url, data=form_data, timeout=10)
       except Exception:
+        continue
+      if not self.response_reached(resp):
+        denied += 1
+        continue
+
+      try:
+        readback = self.auth.primary_session.get(url, timeout=10)
+      except Exception:
+        continue
+      if not self.response_reached(readback):
+        denied += 1
         continue
       tested += 1
-
-      self.safety.throttle()
-      try:
-        readback = self.auth.official_session.get(url, timeout=10)
-      except Exception:
-        continue
 
       if canary in readback.text and payload in readback.text:
         self.findings.append(GrayboxFinding(
@@ -306,6 +617,7 @@ class InjectionProbes(ProbeBase):
           ],
           remediation="Apply output encoding on all user-supplied content. "
                       "Use Content-Security-Policy to mitigate impact.",
+          evidence_artifacts=self.evidence_from(readback),
         ))
         return
 
@@ -318,16 +630,19 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"forms_tested={tested}"],
       ))
+    elif denied > 0:
+      self.emit_endpoint_denied("PT-A03-02")
 
   def _test_ssrf(self):
     """
     PT-API7-01: SSRF checks on URL-fetch endpoints.
 
     Tests configured endpoints for server-side URL fetching.
-    Detects reflected SSRF and timing-based hints for blind SSRF.
+    Reflection and timing anomalies are inconclusive: no callback proof (D29).
     """
     ssrf_endpoints = self.target_config.injection.ssrf_endpoints
     if not ssrf_endpoints:
+      self._emit_no_endpoint("PT-API7-01", "ssrf")
       return
 
     import time as _time
@@ -335,30 +650,35 @@ class InjectionProbes(ProbeBase):
     baseline_url = "http://example.invalid/nonexistent"
 
     for ep in ssrf_endpoints:
-      self.safety.throttle()
       url = self.target_url + "/" + ep.path.lstrip("/")
-      session = self.auth.official_session or self.auth.anon_session
+      session = self.auth.primary_session or self.auth.anon_session
 
       try:
+        self.safety.throttle()  # pace before the clock, not inside the timed window
         t0 = _time.monotonic()
-        session.get(url, params={ep.param: baseline_url}, timeout=10)
+        with self.safety.prepaid():
+          session.get(url, params={ep.param: baseline_url}, timeout=10)
         baseline_ms = (_time.monotonic() - t0) * 1000
       except Exception:
         continue
 
       try:
+        self.safety.throttle()
         t0 = _time.monotonic()
-        resp = session.get(url, params={ep.param: payload_url}, timeout=10)
+        with self.safety.prepaid():
+          resp = session.get(url, params={ep.param: payload_url}, timeout=10)
         probe_ms = (_time.monotonic() - t0) * 1000
       except Exception:
         continue
 
       if resp.status_code == 200 and "internal-probe" in resp.text:
+        # Reflection of the payload is an echo, not proof the server fetched
+        # it: without an out-of-band callback this stays inconclusive (D29).
         self.findings.append(GrayboxFinding(
           scenario_id="PT-API7-01",
-          title="Server-side request forgery",
-          status="vulnerable",
-          severity="HIGH",
+          title="Possible SSRF — payload reflected, no out-of-band proof",
+          status="inconclusive",
+          severity="LOW",
           owasp="API7:2023",
           cwe=["CWE-918"],
           attack=["T1190"],
@@ -369,15 +689,17 @@ class InjectionProbes(ProbeBase):
           parameter=ep.param,
           method="GET",
           evidence=[
+            "reason=ssrf_reflection_only",
             f"endpoint={url}",
             f"payload={payload_url}",
             f"status={resp.status_code}",
           ],
           replay_steps=[
             f"Request GET {ep.path} with {ep.param}={payload_url}.",
-            "Observe server-side fetch of local callback URL.",
+            "Confirm with an out-of-band callback that the server fetched the URL.",
           ],
           remediation="Apply strict outbound URL allowlists and block local network ranges.",
+          evidence_artifacts=self.evidence_from(resp),
         ))
         return
 
@@ -409,7 +731,7 @@ class InjectionProbes(ProbeBase):
     For each SSRF endpoint configured under `injection.ssrf_endpoints`,
     iterates the configured `api_security.ssrf_body_fields` names and
     POSTs JSON bodies that embed an internal-probe URL under each field.
-    Vulnerable iff the response 200s and reflects the probe marker.
+    A 200 that reflects the probe marker is inconclusive (no out-of-band proof).
     """
     api_security = self.target_config.api_security
     body_fields = api_security.ssrf_body_fields
@@ -418,7 +740,7 @@ class InjectionProbes(ProbeBase):
       return
 
     payload_url = "http://127.0.0.1:1/internal-probe"
-    session = self.auth.official_session or getattr(self.auth, "anon_session", None)
+    session = self.auth.primary_session or getattr(self.auth, "anon_session", None)
     if session is None:
       return
 
@@ -426,40 +748,43 @@ class InjectionProbes(ProbeBase):
     for ep in ssrf_endpoints:
       url = self.target_url + "/" + ep.path.lstrip("/")
       for body_field in body_fields:
-        self.safety.throttle()
         try:
           resp = session.post(url, json={body_field: payload_url}, timeout=10)
         except _rq.RequestException:
           continue
         if resp.status_code == 200 and "internal-probe" in (resp.text or ""):
+          # Reflection only; no out-of-band proof (D29), so inconclusive.
           self.findings.append(GrayboxFinding(
             scenario_id="PT-API7-01",
-            title="Server-side request forgery (JSON body field)",
-            status="vulnerable",
-            severity="HIGH",
+            title="Possible SSRF (JSON body field) — payload reflected, "
+                  "no out-of-band proof",
+            status="inconclusive",
+            severity="LOW",
             owasp="API7:2023",
             cwe=["CWE-918"],
             attack=["T1190"],
             # The body field, for the same reason the query variant records its
-            # parameter: one endpoint can be vulnerable through both.
+            # parameter: one endpoint can be flagged through both.
             url=url,
             parameter=body_field,
             method="POST",
-            evidence=[f"endpoint={url}", f"body_field={body_field}",
+            evidence=["reason=ssrf_reflection_only",
+                       f"endpoint={url}", f"body_field={body_field}",
                        f"payload_url={payload_url}",
                        "response_status=200",
                        "reflected_marker=internal-probe"],
             replay_steps=[
-              "Authenticate as the official user.",
+              f"Authenticate as {self.principal_label()}.",
               f"POST {url} with JSON body `{{\"{body_field}\": \"{payload_url}\"}}`.",
-              "Observe the response reflects the internal-probe marker, "
-              "confirming the server fetched the user-controlled URL.",
+              "The response reflects the internal-probe marker; confirm with "
+              "an out-of-band callback that the server fetched the URL.",
             ],
             remediation=(
               "Validate URL fields against an allowlist of schemes/hosts. "
               "Reject loopback / link-local / private ranges before issuing "
               "the outbound request."
             ),
+            evidence_artifacts=self.evidence_from(resp),
           ))
           return  # one body-field demo per scan is sufficient
 
@@ -473,7 +798,7 @@ class InjectionProbes(ProbeBase):
 
     Read-only: only sends GET requests with modified query parameters.
     """
-    session = self.auth.official_session or self.auth.anon_session
+    session = self.auth.primary_session or self.auth.anon_session
     if not session:
       return
 
@@ -485,10 +810,12 @@ class InjectionProbes(ProbeBase):
     payload = "//evil.example.com"
     payload_alt = "https://evil.example.com"
 
-    # Test against: login page (common redirect after login), discovered routes
-    test_paths = [self.target_config.login_path, self.target_config.logout_path]
+    # Test against: login page (common redirect after login), discovered routes.
+    # Never the logout path: a GET there ends the scan session.
+    test_paths = [self.target_config.login_path]
     for route in self.discovered_routes:
-      test_paths.append(route)
+      if not self.is_logout_path(route):
+        test_paths.append(route)
     # Deduplicate
     seen = set()
     unique_paths = []
@@ -498,11 +825,41 @@ class InjectionProbes(ProbeBase):
         unique_paths.append(p)
 
     tested = 0
+    denied = 0
     vulnerable_evidence = []
+    login_path = self.target_config.login_path
+
+    def _evil_redirect(resp):
+      # Parsed host, not substring: a login redirect that echoes ?next=//evil
+      # carries the payload in its query, not as the redirect target.
+      from urllib.parse import urlparse
+      if resp.status_code not in (301, 302, 303, 307, 308):
+        return ""
+      location = resp.headers.get("Location", "")
+      try:
+        host = urlparse(location).hostname or ""
+      except ValueError:
+        return ""
+      return location if host.lower() == "evil.example.com" else ""
+
+    def _counts(path, resp):
+      # The login page is reachable without a session: any non-error answer
+      # counts. Other paths must reach their handler.
+      if path == login_path:
+        return resp.status_code < 400
+      return self.response_reached(resp)
 
     for path in unique_paths[:10]:  # cap to avoid excessive requests
+      if path != login_path:
+        # Baseline: plain GET of the same URL. The login page is exempt, it is
+        # the classic ?next= target and is reachable without a session.
+        reached = self.baseline_reached(session, self.target_url + path, allow_redirects=False)
+        if reached is None:
+          continue
+        if not reached:
+          denied += 1
+          continue
       for param in redirect_params:
-        self.safety.throttle()
         url = self.target_url + path
         try:
           resp = session.get(
@@ -511,20 +868,22 @@ class InjectionProbes(ProbeBase):
           )
         except Exception:
           continue
+        if not _counts(path, resp):
+          denied += 1
+          continue
         tested += 1
 
         # Check for redirect to evil domain
-        if resp.status_code in (301, 302, 303, 307, 308):
-          location = resp.headers.get("Location", "")
-          if "evil.example.com" in location:
-            vulnerable_evidence.append(
-              f"endpoint={path}; param={param}; location={location}"
-            )
-            break  # one redirect per path is enough
+        location = _evil_redirect(resp)
+        if location:
+          vulnerable_evidence.append((
+            path, param, f"endpoint={path}; param={param}; location={location}",
+            resp,
+          ))
+          break  # one redirect per path is enough
 
         # Also test the alternate payload (full URL)
-        if not vulnerable_evidence or vulnerable_evidence[-1].split(";")[0] != f"endpoint={path}":
-          self.safety.throttle()
+        if not vulnerable_evidence or vulnerable_evidence[-1][0] != path:
           try:
             resp2 = session.get(
               url, params={param: payload_alt},
@@ -532,20 +891,23 @@ class InjectionProbes(ProbeBase):
             )
           except Exception:
             continue
+          if not _counts(path, resp2):
+            denied += 1
+            continue
           tested += 1
 
-          if resp2.status_code in (301, 302, 303, 307, 308):
-            location2 = resp2.headers.get("Location", "")
-            if "evil.example.com" in location2:
-              vulnerable_evidence.append(
-                f"endpoint={path}; param={param}; location={location2}"
-              )
-              break
+          location2 = _evil_redirect(resp2)
+          if location2:
+            vulnerable_evidence.append((
+              path, param, f"endpoint={path}; param={param}; location={location2}",
+              resp2,
+            ))
+            break
 
       if len(vulnerable_evidence) >= 3:
         break  # enough evidence
 
-    if vulnerable_evidence:
+    for path, param, item, proof in vulnerable_evidence:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-04",
         title="Open redirect via URL parameter",
@@ -554,18 +916,18 @@ class InjectionProbes(ProbeBase):
         owasp="A01:2021",
         cwe=["CWE-601"],
         attack=["T1566"],
-        evidence=vulnerable_evidence,
+        evidence=[item],
         replay_steps=[
-          "Navigate to the vulnerable endpoint with redirect parameter.",
-          f"Set parameter to {payload} or {payload_alt}.",
+          f"GET {path}?{param}={payload} (or {payload_alt}).",
           "Observe 3xx redirect to attacker-controlled domain.",
         ],
         remediation="Validate redirect targets against a server-side allowlist. "
                     "Use relative paths only, or verify the destination host "
                     "matches your domain. Never pass user input directly to "
                     "Location headers.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
-    elif tested > 0:
+    if not vulnerable_evidence and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-04",
         title="Open redirect — no vulnerability detected",
@@ -574,6 +936,8 @@ class InjectionProbes(ProbeBase):
         owasp="A01:2021",
         evidence=[f"parameters_tested={tested}"],
       ))
+    elif not vulnerable_evidence and denied > 0:
+      self.emit_endpoint_denied("PT-A01-04")
 
   def _test_path_traversal(self):
     """
@@ -585,7 +949,7 @@ class InjectionProbes(ProbeBase):
 
     Read-only: only sends GET requests with modified parameters.
     """
-    session = self.auth.official_session
+    session = self.auth.primary_session
     if not session:
       return
 
@@ -610,37 +974,52 @@ class InjectionProbes(ProbeBase):
       test_routes.append("/")
 
     tested = 0
+    denied = 0
     vulnerable_evidence = []
 
     for route in test_routes[:10]:  # cap to avoid excessive requests
       url = self.target_url + route
+      route_hit = False
+
+      # Baseline: a plain GET must reach the handler before the route counts.
+      reached = self.baseline_reached(session, url)
+      if reached is None:
+        continue
+      if not reached:
+        denied += 1
+        continue
 
       # Strategy 1: inject via query parameters
       for param in file_params:
         if tested > 60:
           break  # hard cap on total requests
         for payload, markers in traversal_payloads:
-          self.safety.throttle()
           try:
             resp = session.get(url, params={param: payload}, timeout=10)
           except Exception:
+            continue
+          if not self.response_reached(resp):
+            denied += 1
             continue
           tested += 1
 
           if resp.status_code == 200:
             body = resp.text
             if any(m in body for m in markers):
-              vulnerable_evidence.append(
-                f"endpoint={route}; param={param}; payload={payload}"
-              )
+              vulnerable_evidence.append((
+                route, param, payload,
+                f"endpoint={route}; param={param}; payload={payload}",
+                resp,
+              ))
+              route_hit = True
               break  # one hit per route+param is enough
-        if vulnerable_evidence:
+        if route_hit:
           break  # found a hit on this route, move on
 
       if len(vulnerable_evidence) >= 3:
         break
 
-    if vulnerable_evidence:
+    for route, param, payload, item, proof in vulnerable_evidence:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-03",
         title="Path traversal — file content disclosed",
@@ -649,18 +1028,19 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         cwe=["CWE-22"],
         attack=["T1083"],
-        evidence=vulnerable_evidence,
+        evidence=[item],
         replay_steps=[
           "Log in as authenticated user.",
-          f"Request GET with traversal payload in file parameter.",
+          f"Request GET {route}?{param}={payload}.",
           "Observe OS file contents (e.g. /etc/passwd) in response body.",
         ],
         remediation="Validate and sanitize all file path inputs server-side. "
                     "Use a whitelist of allowed files, canonicalize paths, "
                     "and ensure they stay within the application's base directory. "
                     "Never pass user input directly to file system operations.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
-    elif tested > 0:
+    if not vulnerable_evidence and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-03",
         title="Path traversal — no vulnerability detected",
@@ -669,6 +1049,8 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"requests_tested={tested}"],
       ))
+    elif not vulnerable_evidence and denied > 0:
+      self.emit_endpoint_denied("PT-A03-03")
 
   # ── Batch 2 — A03 family expansion ──────────────────────────────────────
 
@@ -678,8 +1060,10 @@ class InjectionProbes(ProbeBase):
     Sends a script payload to each configured xss_endpoint and looks
     for unescaped reflection in the response body.
     """
-    endpoints = self.target_config.injection.xss_endpoints
+    endpoints = self._reflective_endpoints(
+      self.target_config.injection.xss_endpoints)
     if not endpoints:
+      self._emit_no_endpoint("PT-A03-04", "xss")
       return
 
     payload = "<script>alert(1)</script>"
@@ -687,21 +1071,31 @@ class InjectionProbes(ProbeBase):
 
     vulnerable = []
     tested = 0
+    denied = 0
     for ep in endpoints:
       url = self.target_url + ep.path
-      self.safety.throttle()
+      reached = self.baseline_reached(self.auth.primary_session, url)
+      if reached is None:
+        continue
+      if not reached:
+        denied += 1
+        continue
       try:
-        resp = self.auth.official_session.get(
+        resp = self.auth.primary_session.get(
           url, params={ep.param: payload}, timeout=10,
         )
       except Exception:
         continue
+      if not self.response_reached(resp):
+        denied += 1
+        continue
       tested += 1
       if resp.status_code == 200 and sentinel in resp.text:
-        vulnerable.append(f"endpoint={ep.path}; param={ep.param}; payload_reflected_unescaped=True")
-        break
+        vulnerable.append((ep,
+          f"endpoint={ep.path}; param={ep.param}; payload_reflected_unescaped=True"
+          + self._source_tag(ep), resp))
 
-    if vulnerable:
+    for ep, item, proof in vulnerable:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-04",
         title="Reflected XSS — payload echoed unescaped",
@@ -710,16 +1104,18 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         cwe=["CWE-79"],
         attack=["T1059.007"],
-        evidence=vulnerable,
+        parameter=ep.param,
+        evidence=[item],
         replay_steps=[
-          f"GET {endpoints[0].path}?{endpoints[0].param}=<script>alert(1)</script>",
+          f"GET {ep.path}?{ep.param}=<script>alert(1)</script>",
           "Observe payload returned in body without HTML escaping.",
         ],
         remediation="Escape user input on output (Django ``|escape``, "
                     "Jinja autoescape, etc.). Apply a Content Security "
                     "Policy that disallows inline scripts.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
-    elif tested > 0:
+    if not vulnerable and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-04",
         title="Reflected XSS — payload escaped or not reflected",
@@ -728,6 +1124,8 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"endpoints_tested={tested}"],
       ))
+    elif not vulnerable and denied > 0:
+      self.emit_endpoint_denied("PT-A03-04")
 
   def _test_template_injection(self):
     """PT-A03-06: detect server-side template injection.
@@ -735,8 +1133,10 @@ class InjectionProbes(ProbeBase):
     Sends ``${7*7}`` and ``{{7*7}}`` to each ssti_endpoint; vulnerable
     if the response body contains ``49``.
     """
-    endpoints = self.target_config.injection.ssti_endpoints
+    endpoints = self._reflective_endpoints(
+      self.target_config.injection.ssti_endpoints)
     if not endpoints:
+      self._emit_no_endpoint("PT-A03-06", "ssti")
       return
 
     payloads = ["${7*7}", "{{7*7}}", "{{ 7*7 }}"]
@@ -744,15 +1144,24 @@ class InjectionProbes(ProbeBase):
 
     vulnerable = []
     tested = 0
+    denied = 0
     for ep in endpoints:
       url = self.target_url + ep.path
+      reached = self.baseline_reached(self.auth.primary_session, url)
+      if reached is None:
+        continue
+      if not reached:
+        denied += 1
+        continue
       for payload in payloads:
-        self.safety.throttle()
         try:
-          resp = self.auth.official_session.get(
+          resp = self.auth.primary_session.get(
             url, params={ep.param: payload}, timeout=10,
           )
         except Exception:
+          continue
+        if not self.response_reached(resp):
+          denied += 1
           continue
         tested += 1
         # Avoid false positives on echo-only sinks: require the body to
@@ -760,15 +1169,15 @@ class InjectionProbes(ProbeBase):
         # would reflect both the payload and the sentinel).
         if (resp.status_code == 200 and sentinel in resp.text
             and "7*7" not in resp.text):
-          vulnerable.append(
+          vulnerable.append((ep,
             f"endpoint={ep.path}; param={ep.param}; "
             f"payload={payload}; sentinel_in_body=True"
-          )
+            + self._source_tag(ep),
+            resp,
+          ))
           break
-      if vulnerable:
-        break
 
-    if vulnerable:
+    for ep, item, proof in vulnerable:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-06",
         title="Server-side template injection — expression evaluated",
@@ -777,16 +1186,18 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         cwe=["CWE-94", "CWE-1336"],
         attack=["T1059"],
-        evidence=vulnerable,
+        parameter=ep.param,
+        evidence=[item],
         replay_steps=[
-          f"GET {endpoints[0].path}?{endpoints[0].param}=" + r"${7*7}",
+          f"GET {ep.path}?{ep.param}=" + r"${7*7}",
           "Observe the response body contains 49 (the evaluated result).",
         ],
         remediation="Never render user-controlled data through a template "
                     "engine. If templates must be dynamic, use a sandbox "
                     "or precompiled templates only.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
-    elif tested > 0:
+    if not vulnerable and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-06",
         title="Template injection — no expression evaluation observed",
@@ -795,6 +1206,8 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"requests_tested={tested}"],
       ))
+    elif not vulnerable and denied > 0:
+      self.emit_endpoint_denied("PT-A03-06")
 
   def _test_command_injection(self):
     """PT-A03-07: detect OS command injection via shell metacharacters.
@@ -802,8 +1215,10 @@ class InjectionProbes(ProbeBase):
     Sends payloads ``;id`` and ``$(id)``; vulnerable if the response
     body shows the canonical ``uid=`` prefix from ``id(1)``.
     """
-    endpoints = self.target_config.injection.cmd_endpoints
+    endpoints = self._reflective_endpoints(
+      self.target_config.injection.cmd_endpoints)
     if not endpoints:
+      self._emit_no_endpoint("PT-A03-07", "cmd")
       return
 
     payloads = [";id", "$(id)", "`id`", "|id"]
@@ -812,27 +1227,36 @@ class InjectionProbes(ProbeBase):
 
     vulnerable = []
     tested = 0
+    denied = 0
     for ep in endpoints:
       url = self.target_url + ep.path
+      reached = self.baseline_reached(self.auth.primary_session, url)
+      if reached is None:
+        continue
+      if not reached:
+        denied += 1
+        continue
       for payload in payloads:
-        self.safety.throttle()
         try:
-          resp = self.auth.official_session.get(
+          resp = self.auth.primary_session.get(
             url, params={ep.param: payload}, timeout=10,
           )
         except Exception:
           continue
+        if not self.response_reached(resp):
+          denied += 1
+          continue
         tested += 1
         if resp.status_code == 200 and sentinel.search(resp.text):
-          vulnerable.append(
+          vulnerable.append((ep,
             f"endpoint={ep.path}; param={ep.param}; "
             f"payload={payload}; uid_marker_in_body=True"
-          )
+            + self._source_tag(ep),
+            resp,
+          ))
           break
-      if vulnerable:
-        break
 
-    if vulnerable:
+    for ep, item, proof in vulnerable:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-07",
         title="OS command injection — shell metacharacters honored",
@@ -841,9 +1265,10 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         cwe=["CWE-78"],
         attack=["T1059.004"],
-        evidence=vulnerable,
+        parameter=ep.param,
+        evidence=[item],
         replay_steps=[
-          f"GET {endpoints[0].path}?{endpoints[0].param}=;id",
+          f"GET {ep.path}?{ep.param}=;id",
           "Observe ``uid=...`` from id(1) in the response body.",
         ],
         remediation="Never invoke a shell with user-controlled input. "
@@ -851,8 +1276,9 @@ class InjectionProbes(ProbeBase):
                     "(``subprocess.run([...], shell=False)``) and pass "
                     "the input as an argv element, never a substring of "
                     "the command line.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
-    elif tested > 0:
+    if not vulnerable and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-07",
         title="Command injection — shell metacharacters had no effect",
@@ -861,6 +1287,8 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"requests_tested={tested}"],
       ))
+    elif not vulnerable and denied > 0:
+      self.emit_endpoint_denied("PT-A03-07")
 
   def _test_header_injection(self):
     """PT-A03-12: detect HTTP header injection via CRLF.
@@ -869,8 +1297,10 @@ class InjectionProbes(ProbeBase):
     response carries the injected header (or splits/loses the
     location header in a way that proves CRLF was honored).
     """
-    endpoints = self.target_config.injection.header_endpoints
+    endpoints = self._reflective_endpoints(
+      self.target_config.injection.header_endpoints)
     if not endpoints:
+      self._emit_no_endpoint("PT-A03-12", "header")
       return
 
     inject_name = "X-Injected"
@@ -879,25 +1309,35 @@ class InjectionProbes(ProbeBase):
 
     vulnerable = []
     tested = 0
+    denied = 0
     for ep in endpoints:
       url = self.target_url + ep.path
-      self.safety.throttle()
+      reached = self.baseline_reached(self.auth.primary_session, url, allow_redirects=False)
+      if reached is None:
+        continue
+      if not reached:
+        denied += 1
+        continue
       try:
-        resp = self.auth.official_session.get(
+        resp = self.auth.primary_session.get(
           url, params={ep.param: payload},
           allow_redirects=False, timeout=10,
         )
       except Exception:
         continue
+      if not self.response_reached(resp):
+        denied += 1
+        continue
       tested += 1
       if resp.headers.get(inject_name) == inject_value:
-        vulnerable.append(
+        vulnerable.append((ep,
           f"endpoint={ep.path}; param={ep.param}; "
           f"injected_header={inject_name}: {inject_value}"
-        )
-        break
+          + self._source_tag(ep),
+          resp,
+        ))
 
-    if vulnerable:
+    for ep, item, proof in vulnerable:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-12",
         title="HTTP header injection via CRLF",
@@ -906,9 +1346,10 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         cwe=["CWE-93", "CWE-113"],
         attack=["T1190"],
-        evidence=vulnerable,
+        parameter=ep.param,
+        evidence=[item],
         replay_steps=[
-          f"GET {endpoints[0].path}?{endpoints[0].param}=/x"
+          f"GET {ep.path}?{ep.param}=/x"
           + r"\r\nX-Injected: pwned",
           "Observe the X-Injected response header set with the "
           "attacker-supplied value.",
@@ -916,8 +1357,9 @@ class InjectionProbes(ProbeBase):
         remediation="Strip ``\\r`` and ``\\n`` from values before they "
                     "land in response headers. Validate redirect "
                     "targets against an allowlist of paths.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
-    elif tested > 0:
+    if not vulnerable and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-12",
         title="Header injection — CRLF stripped or not reflected",
@@ -926,31 +1368,58 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"requests_tested={tested}"],
       ))
+    elif not vulnerable and denied > 0:
+      self.emit_endpoint_denied("PT-A03-12")
+
+  @staticmethod
+  def _json_accepted(resp):
+    """One acceptance rule for the control and every variant.
+
+    Accepted = status below 400 and no error indicator: a JSON body with a
+    non-null, non-empty ``error``/``errors``/``detail`` key, or (non-JSON)
+    one of the error words as a whole word.
+    """
+    import json as _json
+    import re as _re
+    if resp.status_code >= 400:
+      return False
+    text = resp.text or ""
+    try:
+      doc = _json.loads(text)
+    except ValueError:
+      doc = None
+    if isinstance(doc, dict):
+      return not any(doc.get(k) not in (None, "", [], {}, False)
+                     for k in ("error", "errors", "detail"))
+    return not _re.search(
+      r"\b(error|invalid|must be|not allowed)\b", text, _re.I)
 
   def _test_json_type_confusion(self):
     """PT-A03-15: detect lax JSON body parsing on typed fields.
 
     Sends ``{"<field>": [1]}`` and ``{"<field>": {"$gt": 0}}`` to
     endpoints expecting an integer; vulnerable when a non-int payload
-    is accepted (HTTP 2xx) or the response distinguishes the variant
-    from a clean rejection.
+    is accepted while a clearly invalid string control is rejected. If the
+    control is accepted too the field is not validated: inconclusive.
     """
     endpoints = self.target_config.injection.json_type_endpoints
     if not endpoints:
+      self._emit_no_endpoint("PT-A03-15", "json_type")
       return
 
     import json as _json
 
     vulnerable = []
+    unvalidated = []
     tested = 0
+    denied = 0
     for ep in endpoints:
       url = self.target_url + ep.path
       headers = {"Content-Type": "application/json"}
 
       # Baseline: clean integer
-      self.safety.throttle()
       try:
-        baseline = self.auth.official_session.post(
+        baseline = self.auth.primary_session.post(
           url, data=_json.dumps({ep.field: 1}),
           headers=headers, timeout=10,
         )
@@ -958,29 +1427,51 @@ class InjectionProbes(ProbeBase):
         continue
       if baseline.status_code >= 500:
         continue
+      if not self.response_reached(baseline, validation_ok=True):
+        denied += 1
+        continue
+
+      # Control: a clearly invalid string. If the endpoint accepts that too,
+      # it does not validate the field at all and the variants prove nothing
+      # about type handling. A 5xx is a rejection (the type is not handled
+      # gracefully), not a denial: the variants still run.
+      try:
+        control = self.auth.primary_session.post(
+          url, data=_json.dumps({ep.field: "not-an-integer"}),
+          headers=headers, timeout=10,
+        )
+      except Exception:
+        continue
+      if control.status_code < 500 and not self.response_reached(control, validation_ok=True):
+        denied += 1
+        continue
+      if self._json_accepted(control):
+        unvalidated.append(ep.path)
+        continue
 
       # Variant: list
       payloads_to_try = [[1], {"$gt": 0}]
       for variant in payloads_to_try:
-        self.safety.throttle()
         try:
-          resp = self.auth.official_session.post(
+          resp = self.auth.primary_session.post(
             url, data=_json.dumps({ep.field: variant}),
             headers=headers, timeout=10,
           )
         except Exception:
           continue
+        if not self.response_reached(resp, validation_ok=True):
+          denied += 1
+          continue
         tested += 1
-        if resp.status_code < 400:
-          vulnerable.append(
+        if self._json_accepted(resp):
+          vulnerable.append((ep,
             f"endpoint={ep.path}; field={ep.field}; "
-            f"variant={variant!r}; status={resp.status_code}"
-          )
+            f"variant={variant!r}; status={resp.status_code}",
+            resp,
+          ))
           break
-      if vulnerable:
-        break
 
-    if vulnerable:
+    for ep, item, proof in vulnerable:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-15",
         title="JSON body type confusion — non-integer accepted",
@@ -989,11 +1480,11 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         cwe=["CWE-843", "CWE-704"],
         attack=["T1190"],
-        evidence=vulnerable,
+        evidence=[item],
         replay_steps=[
-          f"POST {endpoints[0].path} with body "
-          f'``{{"{endpoints[0].field}": [1]}}`` or '
-          f'``{{"{endpoints[0].field}": {{"$gt": 0}}}}``',
+          f"POST {ep.path} with body "
+          f'``{{"{ep.field}": [1]}}`` or '
+          f'``{{"{ep.field}": {{"$gt": 0}}}}``',
           "Observe the server processes the request without rejecting "
           "the type mismatch.",
         ],
@@ -1001,8 +1492,17 @@ class InjectionProbes(ProbeBase):
                     "(pydantic, marshmallow, JSON Schema). Reject "
                     "lists, dicts, or operator-keys when an integer "
                     "is expected.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
-    elif tested > 0:
+    if not vulnerable and unvalidated:
+      # An unvalidated endpoint stays reported even when another is clean.
+      self.emit_inconclusive(
+        "PT-A03-15", "JSON type confusion — endpoint does not validate the "
+        "field at all", "A03:2021", "json_type_not_validated",
+      )
+      self.findings[-1].evidence.extend(f"endpoint={p}" for p in unvalidated)
+      self.findings[-1].evidence.append("variant=control:not-an-integer")
+    elif not vulnerable and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-15",
         title="JSON type confusion — typed validation in place",
@@ -1011,3 +1511,5 @@ class InjectionProbes(ProbeBase):
         owasp="A03:2021",
         evidence=[f"requests_tested={tested}"],
       ))
+    elif not vulnerable and denied > 0:
+      self.emit_endpoint_denied("PT-A03-15")

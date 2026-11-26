@@ -254,7 +254,7 @@ class TestAuthManagerNativeApiCredentials(unittest.TestCase):
     return session
 
   def _layered_auth_with_descriptor(self):
-    from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient
+    from .conftest import private_ok_client
     from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
       ApiSecurityConfig, AuthDescriptor, GatewayAuthDescriptor,
     )
@@ -268,7 +268,7 @@ class TestAuthManagerNativeApiCredentials(unittest.TestCase):
         api_key_header_name="X-Gateway-Key",
       ),
     ))
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "http://api.example",
       target_config=cfg,
       gateway_api_key="GATEWAY-KEY",
@@ -476,7 +476,7 @@ class TestLayeredFormAuthGateway(unittest.TestCase):
   def test_form_login_get_and_post_carry_gateway_auth(self, mock_requests):
     from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
     from extensions.business.cybersec.red_mesh.graybox.auth_strategies import FormAuth
-    from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient
+    from .conftest import private_ok_client
     from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
       ApiSecurityConfig, GatewayAuthDescriptor,
     )
@@ -487,7 +487,7 @@ class TestLayeredFormAuthGateway(unittest.TestCase):
         api_key_header_name="X-Gateway-Key",
       ),
     ))
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "http://testapp.local:8000",
       target_config=cfg,
       gateway_api_key="GATEWAY-KEY",
@@ -592,7 +592,7 @@ class TestAuthenticatedSessionHardening(unittest.TestCase):
 
   @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
   def test_anonymous_control_response_uses_gateway_only_session(self, mock_auth_requests):
-    from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient
+    from .conftest import private_ok_client
     from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
       ApiSecurityConfig, AuthDescriptor, GatewayAuthDescriptor,
     )
@@ -608,7 +608,7 @@ class TestAuthenticatedSessionHardening(unittest.TestCase):
         api_key_header_name="X-Gateway-Key",
       ),
     ))
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "http://api.example",
       target_config=cfg,
       gateway_api_key="GATEWAY-KEY",
@@ -757,7 +757,7 @@ class TestFormAuthIsVerifiedLikeEveryOtherAuthType(unittest.TestCase):
     # Under the short-circuit this returned success without issuing a request.
     auth = self._auth()
     sess = self._session(status=302)
-    sess.get.return_value.headers = {"location": "/login"}
+    sess.get.return_value.headers = {"location": "/auth/login/?next=/account"}
     valid, _retryable = auth._validate_authenticated_session(sess)
     self.assertFalse(valid, "form auth was accepted without being validated")
     self.assertTrue(
@@ -1026,6 +1026,13 @@ class TestAuthManagerLifecycle(unittest.TestCase):
     self.assertEqual(state.refresh_count, 2)
     self.assertEqual(state.auth_errors, ("official_login_failed",))
 
+  def test_regular_only_state_has_an_authenticated_session(self):
+    auth = _make_auth()
+    auth.regular_session = MagicMock()
+    self.assertTrue(auth.auth_state.has_authenticated_session)
+    auth.regular_session = None
+    self.assertFalse(auth.auth_state.has_authenticated_session)
+
   def test_cleanup_closes_sessions(self):
     """cleanup() closes all sessions."""
     auth = _make_auth()
@@ -1099,11 +1106,11 @@ class TestAuthManagerLifecycle(unittest.TestCase):
 
   @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
   def test_preflight_login_404(self, mock_requests):
-    """preflight_check returns error if login page returns 404."""
+    """preflight_check returns error if an override login page returns 404."""
     mock_requests.head.return_value = _mock_response(status=200)
     mock_requests.get.return_value = _mock_response(status=404)
     mock_requests.RequestException = Exception
-    auth = _make_auth()
+    auth = _make_auth(target_config=GrayboxTargetConfig(login_path="/custom/login"))
     err = auth.preflight_check()
     self.assertIsNotNone(err)
     self.assertIn("404", err)
@@ -1137,9 +1144,9 @@ class TestLoginSuccessIsJudgedOnTheRealClientsResponse(unittest.TestCase):
 
   def _run(self, responses, allowlist):
     from extensions.business.cybersec.red_mesh.graybox.auth_strategies import FormAuth
-    from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient
+    from .conftest import private_ok_client
 
-    client = GrayboxHttpClient("http://testapp.local:8000", allowlist=allowlist)
+    client = private_ok_client("http://testapp.local:8000", allowlist=allowlist)
     underlying = MagicMock()
     underlying.cookies.get_dict.return_value = {"sessionid": "abc"}
     underlying.request.side_effect = responses
@@ -1199,6 +1206,378 @@ class TestLoginSuccessIsJudgedOnTheRealClientsResponse(unittest.TestCase):
         allowlist=["/auth/"],
       ),
     )
+
+
+class TestRegularOnlyAuthentication(unittest.TestCase):
+  """RM-219: a scan with regular credentials only, admin (official) absent."""
+
+  def _form_session(self, cookies=None, rejected=False):
+    session = MagicMock()
+    session.get.return_value = _mock_response(
+      text='<input type="hidden" name="csrfmiddlewaretoken" value="tok">'
+    )
+    if rejected:
+      session.post.return_value = _mock_response(
+        url="http://testapp.local:8000/auth/login/",
+        text='<input type="password" name="password">',
+      )
+      session.cookies.get_dict.return_value = {"csrftoken": "c"}
+    else:
+      session.post.return_value = _mock_response(
+        url="http://testapp.local:8000/dashboard/", history=[MagicMock()],
+      )
+      jar = dict(cookies or {"sessionid": "s", "csrftoken": "c"})
+      session.cookies.get_dict.side_effect = lambda: dict(jar)
+      session._jar = jar
+    return session
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_form_regular_only_logs_in_as_regular_with_no_official_request(self, mock_requests):
+    session = self._form_session()
+    mock_requests.Session.return_value = session
+    auth = _make_auth()
+
+    ok = auth.authenticate({"username": "", "password": ""},
+                           {"username": "user", "password": "pw"})
+
+    self.assertTrue(ok)
+    self.assertIsNone(auth.official_session)
+    self.assertIs(auth.regular_session, session)
+    self.assertIs(auth.primary_session, session)
+    self.assertEqual(auth.primary_principal, "regular")
+    self.assertEqual(auth.admin_context, "absent")
+    # One login: one GET of the login page and one POST, both as regular.
+    self.assertEqual(session.post.call_count, 1)
+    self.assertEqual(session.post.call_args.kwargs["data"]["username"], "user")
+
+  def test_bearer_and_api_key_regular_only(self):
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      ApiSecurityConfig, AuthDescriptor,
+    )
+    for auth_type, creds, header in (
+      ("bearer", {"bearer_token": "REG-TOKEN"}, "Authorization"),
+      ("api_key", {"api_key": "REG-KEY"}, "X-Api-Key"),
+    ):
+      with self.subTest(auth_type=auth_type), patch(
+        "extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests",
+      ) as mock_requests:
+        session = MagicMock()
+        session.headers = {}
+        session.params = {}
+        mock_requests.Session.return_value = session
+        cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(
+          auth=AuthDescriptor(auth_type=auth_type),
+        ))
+        auth = AuthManager("http://api.example", cfg, verify_tls=False)
+
+        self.assertTrue(auth.authenticate(None, creds))
+        self.assertIsNone(auth.official_session)
+        self.assertIs(auth.primary_session, session)
+        self.assertIn(header, session.headers)
+        # Only the regular principal built a session.
+        self.assertEqual(mock_requests.Session.call_count, 1)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_rejected_regular_login_fails_and_names_the_principal(self, mock_requests):
+    mock_requests.Session.return_value = self._form_session(rejected=True)
+    auth = _make_auth()
+
+    self.assertFalse(auth.authenticate(None, {"username": "user", "password": "bad"}))
+    reason = auth.failure_reason()
+    self.assertIn("Regular login rejected", reason)
+    self.assertIn("no official credentials configured", reason)
+    self.assertIn("login_rejected", reason)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_no_credentials_at_all_sends_nothing(self, mock_requests):
+    auth = _make_auth()
+    self.assertFalse(auth.authenticate(None, None))
+    mock_requests.Session.assert_not_called()
+    self.assertIn("no official or regular credentials", auth.failure_reason())
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_rejected_official_login_names_official(self, mock_requests):
+    mock_requests.Session.return_value = self._form_session(rejected=True)
+    auth = _make_auth()
+    self.assertFalse(auth.authenticate({"username": "admin", "password": "bad"},
+                                       {"username": "user", "password": "pw"}))
+    self.assertTrue(auth.failure_reason().startswith("Official (admin) login rejected"))
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_ensure_sessions_does_not_reauthenticate_without_official(self, mock_requests):
+    session = self._form_session()
+    mock_requests.Session.return_value = session
+    auth = _make_auth()
+    regular = {"username": "user", "password": "pw"}
+    self.assertTrue(auth.authenticate(None, regular))
+
+    for _ in range(5):
+      self.assertTrue(auth.ensure_sessions(None, regular))
+
+    self.assertEqual(auth._refresh_count, 0)
+    self.assertEqual(session.post.call_count, 1)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_server_side_logout_triggers_relogin(self, mock_requests):
+    first = self._form_session()
+    second = self._form_session()
+    mock_requests.Session.side_effect = [first, second]
+    auth = _make_auth()
+    regular = {"username": "user", "password": "pw"}
+    self.assertTrue(auth.authenticate(None, regular))
+
+    # The server ended the session: the session cookie is gone, CSRF stays.
+    del first._jar["sessionid"]
+    self.assertTrue(auth.needs_refresh())
+    self.assertTrue(auth.ensure_sessions(None, regular))
+    self.assertIs(auth.primary_session, second)
+    self.assertEqual(auth._refresh_count, 1)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_a_one_shot_flash_cookie_disappearing_is_not_a_logout(self, mock_requests):
+    session = self._form_session(
+      cookies={"sessionid": "s", "messages": "flash", "csrftoken": "c"})
+    mock_requests.Session.return_value = session
+    auth = _make_auth()
+    self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+    del session._jar["messages"]
+    self.assertFalse(auth.needs_refresh())
+    del session._jar["sessionid"]  # every login cookie gone: logged out
+    self.assertTrue(auth.needs_refresh())
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_probe_path_revalidates_the_primary_session_at_most_once_a_minute(self, mock_requests):
+    import time
+    mock_requests.Session.return_value = self._form_session()
+    auth = _make_auth()
+    self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+    def rejected(session):
+      auth._auth_diagnostics.append({"stage": "authenticated_probe_rejected"})
+      return False, False
+    with patch.object(auth, "_authenticated_probe_path", return_value="/api/me"), \
+         patch.object(auth, "_validate_authenticated_session",
+                      side_effect=rejected) as validate:
+      # Just authenticated: inside the 60 s window, no extra request.
+      self.assertFalse(auth.needs_refresh())
+      validate.assert_not_called()
+      # Window over, and the probe path now rejects the session (a logout that
+      # keeps the cookie, or a revoked bearer token): refresh.
+      auth._liveness_checked_at = time.time() - 61
+      self.assertTrue(auth.needs_refresh())
+      self.assertEqual(validate.call_count, 1)
+      validate.assert_called_with(auth.primary_session)
+      # Checked again within the window: no further request.
+      self.assertFalse(auth.needs_refresh())
+      self.assertEqual(validate.call_count, 1)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_probe_path_login_page_without_marker_or_identity_is_a_logout(self, mock_requests):
+    """A 200 login page at the probe path lacks the configured marker or
+    identity, or (form one-hop rule) a public page the anonymous control also
+    gets: the session ended."""
+    import time
+    for stage in ("authenticated_probe_marker_missing",
+                  "authenticated_probe_identity_missing",
+                  "authenticated_probe_public_control"):
+      with self.subTest(stage=stage):
+        mock_requests.Session.return_value = self._form_session()
+        auth = _make_auth()
+        self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+        auth._liveness_checked_at = time.time() - 61
+
+        def login_page(session, stage=stage):
+          auth._auth_diagnostics.append({"stage": stage, "status": 200})
+          return False, False
+        with patch.object(auth, "_authenticated_probe_path", return_value="/api/me"), \
+             patch.object(auth, "_validate_authenticated_session", side_effect=login_page):
+          self.assertTrue(auth.needs_refresh())
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_probe_path_429_or_5xx_is_not_a_logout(self, mock_requests):
+    import time
+    mock_requests.Session.return_value = self._form_session()
+    auth = _make_auth()
+    self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+    auth._liveness_checked_at = time.time() - 61
+
+    def throttled(session):
+      auth._auth_diagnostics.append({"stage": "authenticated_probe_error", "status": 429})
+      return False, False
+    with patch.object(auth, "_authenticated_probe_path", return_value="/api/me"), \
+         patch.object(auth, "_validate_authenticated_session", side_effect=throttled):
+      self.assertFalse(auth.needs_refresh())
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_probe_path_transport_error_is_not_a_logout(self, mock_requests):
+    import time
+    mock_requests.Session.return_value = self._form_session()
+    auth = _make_auth()
+    self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+    auth._liveness_checked_at = time.time() - 61
+    with patch.object(auth, "_authenticated_probe_path", return_value="/api/me"), \
+         patch.object(auth, "_validate_authenticated_session",
+                      return_value=(False, True)):
+      self.assertFalse(auth.needs_refresh())
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_no_probe_path_means_no_liveness_request(self, mock_requests):
+    import time
+    mock_requests.Session.return_value = self._form_session()
+    auth = _make_auth()
+    self.assertTrue(auth.authenticate(None, {"username": "user", "password": "pw"}))
+    auth._liveness_checked_at = time.time() - 61
+    with patch.object(auth, "_validate_authenticated_session") as validate:
+      self.assertFalse(auth.needs_refresh())
+      validate.assert_not_called()
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_form_authenticate_resets_last_response(self, mock_requests):
+    from extensions.business.cybersec.red_mesh.graybox.auth_strategies import FormAuth
+    mock_requests.Session.return_value = self._form_session()
+    strategy = FormAuth(
+      "http://testapp.local:8000", GrayboxTargetConfig(), verify_tls=False)
+    strategy.last_response = "stale"
+    with patch.object(strategy, "make_session", side_effect=RuntimeError("stop")):
+      with self.assertRaises(RuntimeError):
+        strategy.authenticate({"username": "u", "password": "p"})
+    self.assertIsNone(strategy.last_response)
+
+  def test_cleanup_closes_each_distinct_session_once(self):
+    auth = _make_auth()
+    shared = MagicMock()
+    auth.official_session = shared
+    auth.regular_session = shared
+    auth.cleanup()
+    shared.close.assert_called_once()
+    self.assertEqual(shared.get.call_count, 1)  # one logout request
+
+
+class TestFormAuthFollowsOneInScopeRedirect(unittest.TestCase):
+  """RM-071 Phase 2: a cookie session may be redirected; a bearer token may not."""
+
+  def _authenticate(self, app, probe_path):
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      ApiSecurityConfig, AuthDescriptor,
+    )
+    from .conftest import private_ok_client
+    from . import graybox_app_fixture as fx
+    cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(auth=AuthDescriptor(
+      auth_type="form", authenticated_probe_path=probe_path)))
+    client = private_ok_client(fx.BASE)
+    auth = AuthManager(fx.BASE, cfg, verify_tls=False, http_client=client)
+    with patch("requests.Session", side_effect=app.session_factory), patch("time.sleep"):
+      ok = auth.authenticate("", {"username": "alice", "password": "pw"})
+    return auth, ok
+
+  def test_append_slash_301_after_login_authenticates_after_exactly_one_hop(self):
+    from . import graybox_app_fixture as fx
+    app = fx.DjangoApp()
+    _auth, ok = self._authenticate(app, "/dashboard")
+    self.assertTrue(ok)
+    paths = [p for _sid, _m, p in app.log]
+    start = paths.index("/dashboard")  # the login's own redirect to /dashboard/ comes before it
+    # the probe and its one hop, then the anonymous control on the destination
+    self.assertEqual(paths[start:], ["/dashboard", "/dashboard/", "/dashboard/"])
+
+  def test_a_redirect_to_the_login_path_is_rejected_without_following_it(self):
+    from . import graybox_app_fixture as fx
+    app = fx.DjangoApp(mfa_pending=True)
+    auth, ok = self._authenticate(app, "/dashboard/")
+    self.assertFalse(ok)
+    self.assertEqual(auth._auth_diagnostics[-1]["stage"], "authenticated_probe_redirect")
+    log = app.log
+    last = max(i for i, (_s, _m, p) in enumerate(log) if p == "/dashboard/")
+    self.assertNotIn(fx.LOGIN, [p for _s, _m, p in log[last + 1:]])
+
+  def test_a_form_redirect_to_another_origin_is_not_requested(self):
+    auth = self._form_auth()
+    sess = MagicMock()
+    sess.get.return_value = _mock_response(
+      status=302, headers={"Location": "http://evil.example/account/"})
+    self.assertEqual(auth._validate_authenticated_session(sess), (False, False))
+    self.assertEqual(sess.get.call_count, 1)
+    self.assertEqual(auth._auth_diagnostics[-1]["stage"], "authenticated_probe_redirect")
+
+  def _form_auth(self, **kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      ApiSecurityConfig, AuthDescriptor,
+    )
+    cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(auth=AuthDescriptor(
+      auth_type="form", authenticated_probe_path="/account", **kwargs)))
+    return AuthManager("http://api.example", cfg, verify_tls=False)
+
+  def test_a_target_sent_bad_port_in_location_rejects_instead_of_raising(self):
+    auth = self._form_auth()
+    for location in ("http://api.example:99999/account/", "http://[bad/"):
+      with self.subTest(location=location):
+        sess = MagicMock()
+        sess.get.return_value = _mock_response(status=302, headers={"Location": location})
+        self.assertEqual(auth._validate_authenticated_session(sess), (False, False))
+        self.assertEqual(sess.get.call_count, 1)
+
+  def test_a_form_redirect_to_the_logout_path_is_not_followed(self):
+    # Following it would end the very session being checked.
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      ApiSecurityConfig, AuthDescriptor,
+    )
+    cfg = GrayboxTargetConfig(logout_path="/auth/logout/", api_security=ApiSecurityConfig(
+      auth=AuthDescriptor(auth_type="form", authenticated_probe_path="/account")))
+    auth = AuthManager("http://api.example", cfg, verify_tls=False)
+    sess = MagicMock()
+    sess.get.return_value = _mock_response(status=302, headers={"Location": "/auth/logout/"})
+    self.assertEqual(auth._validate_authenticated_session(sess), (False, False))
+    self.assertEqual(sess.get.call_count, 1)
+
+  def test_an_explicit_default_port_is_the_same_origin(self):
+    auth = self._form_auth()
+    sess = MagicMock()
+    sess.get.side_effect = [
+      _mock_response(status=301, headers={"Location": "http://api.example:80/account/"}),
+      _mock_response(status=200),
+    ]
+    with patch.object(auth, "_anonymous_control_response",
+                      return_value=_mock_response(status=302)):
+      self.assertEqual(auth._validate_authenticated_session(sess), (True, False))
+    self.assertEqual(sess.get.call_args.args[0], "http://api.example/account/")
+
+  def test_a_form_redirect_to_a_public_page_is_rejected_by_the_control(self):
+    # The hop lands on a 200 page the anonymous control also gets: nothing proves the login.
+    auth = self._form_auth()
+    sess = MagicMock()
+    sess.get.side_effect = [
+      _mock_response(status=302, headers={"Location": "/welcome/"}),
+      _mock_response(status=200, text="public"),
+    ]
+    with patch.object(auth, "_anonymous_control_response",
+                      return_value=_mock_response(status=200, text="public")) as control:
+      self.assertEqual(auth._validate_authenticated_session(sess), (False, False))
+    self.assertEqual(control.call_args.args[1], "http://api.example/welcome/")
+    self.assertEqual(auth._auth_diagnostics[-1]["stage"], "authenticated_probe_public_control")
+
+  def test_a_form_303_after_a_post_probe_is_followed_with_get(self):
+    auth = self._form_auth(
+      authenticated_probe_method="POST", allow_non_readonly_auth_validation_method=True)
+    sess = MagicMock()
+    sess.post.return_value = _mock_response(status=303, headers={"Location": "/account/"})
+    sess.get.return_value = _mock_response(status=200)
+    with patch.object(auth, "_anonymous_control_response",
+                      return_value=_mock_response(status=401)) as control:
+      auth._validate_authenticated_session(sess)
+    self.assertEqual(sess.post.call_count, 1)
+    self.assertEqual(sess.get.call_args.args[0], "http://api.example/account/")
+    self.assertEqual(control.call_args.args[0], "GET")
+
+  def test_bearer_still_rejects_a_non_login_301_without_following_it(self):
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      ApiSecurityConfig, AuthDescriptor,
+    )
+    cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(auth=AuthDescriptor(
+      auth_type="bearer", authenticated_probe_path="/api/me")))
+    auth = AuthManager("http://api.example", cfg, verify_tls=False)
+    sess = MagicMock()
+    sess.get.return_value = _mock_response(status=301, headers={"Location": "/api/me/"})
+    self.assertEqual(auth._validate_authenticated_session(sess), (False, False))
+    self.assertEqual(sess.get.call_count, 1)
 
 
 if __name__ == '__main__':

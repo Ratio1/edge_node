@@ -17,6 +17,7 @@ from ..constants import (
   RUN_MODE_SINGLEPASS,
 )
 from ..credential_redaction import redact_credential_text
+from ..mixins.report import get_host_aggregated_report
 from ..models import (
   AggregatedScanData,
   PassReport,
@@ -26,8 +27,12 @@ from ..models import (
 )
 from ..repositories import ArtifactRepository, JobStateRepository
 from ..tenancy.execution import binding_from_record
+from ..tenancy.identity import IdentityStoreError
+from ..tenancy.ports import TenantStoreError
 from .config import get_attestation_config
 from .control import stop_monitoring
+from .engagement_ledger import port_ranges
+from .engagement_ledger_store import EngagementLedgerRecorder
 from .config import get_llm_agent_config
 from .event_hooks import (
   emit_attestation_status_event as _emit_attestation_status_event,
@@ -61,28 +66,104 @@ def _write_job_record(owner, job_key, job_specs, context):
   return job_specs
 
 
-def _execution_operation_allowed(owner, job_specs, *, operation="current", config=None):
-  """Check current bound ownership for effects; local report finalization is separate."""
-  checker = getattr(type(owner), "_execution_operation_allowed", None)
-  if callable(checker):
-    checker = checker.__get__(owner, type(owner))
-  else:
-    checker = owner.__dict__.get("_execution_operation_allowed")
-  if not callable(checker):
-    return False
+def _owner_method(owner, name):
+  method = getattr(type(owner), name, None)
+  if callable(method):
+    return method.__get__(owner, type(owner))
+  method = owner.__dict__.get(name)
+  return method if callable(method) else None
+
+
+def _execution_denial_reason(owner, job_specs, *, operation="current", config=None):
+  """Why launcher-side execution is refused, as a short code, or None when it is allowed (RM-221).
+
+  Local report finalization is separate; this checks current bound ownership for effects.
+  """
+  reason_for = _owner_method(owner, "_execution_denial_reason")
+  checker = _owner_method(owner, "_execution_operation_allowed")
+  if reason_for is None and checker is None:
+    return "forbidden"
   try:
     # RM-108 phase 5: admission never yields a job with no execution_binding, so this reauthorizes
     # against the current stored record unconditionally rather than only for a bound snapshot.
     current = _job_repo(owner).get_job(job_specs["job_id"])
-    if (not isinstance(current, dict)
-        or _execution_identity(current) != _execution_identity(job_specs)
-        or current.get("launcher") != owner.ee_addr
-        or is_terminal_job_status(current.get("job_status"))):
-      return False
-    job_specs = current
-    return checker(job_specs, operation=operation, config=config) is True
+    if not isinstance(current, dict) or _execution_identity(current) != _execution_identity(job_specs):
+      return "identity_mismatch"
+    if current.get("launcher") != owner.ee_addr:
+      return "not_launcher"
+    if is_terminal_job_status(current.get("job_status")):
+      return "job_terminal"
+    if reason_for is None:  # an owner that only answers yes or no
+      return None if checker(current, operation=operation, config=config) is True else "forbidden"
+    # One reauthorization call: the boolean is derived from the reason, never asked twice.
+    reason = reason_for(current, operation=operation, config=config)
+    return reason if reason is None or (isinstance(reason, str) and reason) else "forbidden"
+  except (IdentityStoreError, TenantStoreError):
+    return "store_unavailable"
+  except Exception as exc:
+    owner.P(f"[EXECUTION] denial check raised {type(exc).__name__}", color='y')
+    return "internal_error"
+
+
+def _execution_operation_allowed(owner, job_specs, *, operation="current", config=None):
+  return _execution_denial_reason(owner, job_specs, operation=operation, config=config) is None
+
+
+def _record_execution_denied(owner, job_specs, *, operation, reason, pass_nr):
+  """One `execution_denied` timeline entry and log line per pass and operation (launcher gates only)."""
+  for event in job_specs.get("timeline") or []:
+    meta = event.get("meta") if isinstance(event, dict) else None
+    if (isinstance(meta, dict) and event.get("type") == "execution_denied"
+        and meta.get("operation") == operation and meta.get("pass_nr") == pass_nr):
+      return
+  owner.P(f"[EXECUTION] {job_specs.get('job_id')} pass {pass_nr}: {operation} refused ({reason})", color='y')
+  owner._emit_timeline_event(
+    job_specs, "execution_denied", f"Execution refused for {operation}: {reason}",
+    actor_type="system", meta={"operation": operation, "reason": reason, "pass_nr": pass_nr},
+  )
+
+
+_ANALYSIS_DENIED_MESSAGE = "Automatic analysis execution unavailable"
+
+
+class _AnalysisDenied(RuntimeError):
+  pass
+
+
+def _llm_failure_reason(owner):
+  """Why the last structured narrative failed, from the issues the provider path recorded."""
+  validation = getattr(owner, "_last_structured_llm_validation", None)
+  errors = validation.get("errors") if isinstance(validation, dict) else None
+  if not errors:
+    return "provider_error"  # the call itself raised before any validation ran
+  for error in errors:
+    if error.get("code") == "llm_call_failed":
+      # The authority check runs inside the provider call (before_provider_call); its raise lands here.
+      return ("execution_authority_denied"
+              if _ANALYSIS_DENIED_MESSAGE in str(error.get("message")) else "provider_error")
+  if any(error.get("code") == "empty_response" for error in errors):
+    return "provider_error"
+  return "validation_failed"
+
+
+def _check_execution(owner, job_specs, *, operation, pass_nr, config=None):
+  """The denial reason, or None when allowed; a denial is recorded on the job timeline."""
+  reason = _execution_denial_reason(owner, job_specs, config=config)
+  if reason is not None:
+    _record_execution_denied(owner, job_specs, operation=operation, reason=reason, pass_nr=pass_nr)
+  return reason
+
+
+def attestation_unsubmitted_reason(owner):
+  """Why a submit that returned nothing (not raised) submitted nothing: its own early returns."""
+  try:
+    if not get_attestation_config(owner)["ENABLED"]:
+      return "attestation_disabled"
+    if owner._attestation_get_tenant_private_key() is None:
+      return "no_tenant_key"
   except Exception:
-    return False
+    pass
+  return "submit_failed"
 
 
 def _execution_identity(job_specs):
@@ -98,7 +179,7 @@ def _execution_identity(job_specs):
 
 def _check_automatic_analysis_authority(owner, job_specs):
   if not _execution_operation_allowed(owner, job_specs):
-    raise RuntimeError("Automatic analysis execution unavailable")
+    raise RuntimeError(_ANALYSIS_DENIED_MESSAGE)
 
 
 def emit_attestation_status_event(owner, job_specs, **kwargs):
@@ -167,6 +248,7 @@ def _stop_if_engagement_ended(owner, job_specs, *, due):
   if not isinstance(result, dict) or result.get("error"):
     return False
   checks.pop(job_id, None)
+  (getattr(owner, "_pass_holds", None) or {}).pop(job_id, None)
   owner._log_audit_event("continuous_stopped_engagement_ended", {
     "job_id": job_id, "engagement_id": engagement_id, "reason": reason, "pass_nr": job_specs.get("job_pass", 1),
   })
@@ -185,12 +267,21 @@ def _all_workers_finished_with_reports(workers):
   return True
 
 
+def _current_pass_ref(job_specs):
+  """The stored `PassReportRef` dict of the current pass, or None."""
+  job_pass = job_specs.get("job_pass", 1)
+  return next((ref for ref in job_specs.get("pass_reports") or []
+               if isinstance(ref, dict) and ref.get("pass_nr") == job_pass), None)
+
+
 def _is_stale_intermediate_recovery_candidate(job_specs, workers, job_status, next_pass_at):
   if not is_intermediate_job_status(job_status):
     return False
   if job_specs.get("job_cid"):
     return False
-  if job_specs.get("pass_reports"):
+  # A current pass that already has its report is not re-run (it would store a second report);
+  # an earlier pass's report does not block the current pass (I-268).
+  if _current_pass_ref(job_specs) is not None:
     return False
   if next_pass_at is not None:
     return False
@@ -216,6 +307,67 @@ def _record_stale_intermediate_recovery(owner, job_specs, previous_status, worke
       "pass_nr": pass_nr,
       "worker_count": worker_count,
     })
+
+
+def _stop_scheduled(job_specs, job_status):
+  """A soft stop is due: the status says so, or its timeline entry is pending. The entry survives the
+  COLLECTING and FINALIZING writes that replace the status, and a job is stopped once it acts on it."""
+  return job_status == JOB_STATUS_SCHEDULED_FOR_STOP or any(
+    isinstance(event, dict) and event.get("type") == "scheduled_for_stop"
+    for event in job_specs.get("timeline") or [])
+
+
+def _resume_finalizing_tail(owner, job_key, job_specs, workers, ref):
+  """I-268: finish a pass whose launcher exited after the FINALIZING write (pass report stored, no
+  archive). The steps after that write run from the stored artifacts: the pass is not scored, stored,
+  attested or announced again. Retried at most once a minute; audited once per job."""
+  job_id = job_specs.get("job_id")
+  job_pass = job_specs.get("job_pass", 1)
+  retries = getattr(owner, "_finalizing_recovery", None)
+  if not isinstance(retries, dict):
+    retries = owner._finalizing_recovery = {}
+  last = retries.get(job_id)
+  if last is not None and owner.time() - last < ENGAGEMENT_RECHECK_SECONDS:
+    return
+  retries[job_id] = owner.time()
+  if last is None:
+    owner.P(f"[STUCK RECOVERY] {job_id} is FINALIZING with pass {job_pass} stored — resuming finalization",
+            color='y')
+    log_audit_event = getattr(owner, "_log_audit_event", None)
+    if callable(log_audit_event):
+      log_audit_event("stale_finalizing_recovery", {
+        "job_id": job_id, "launcher": job_specs.get("launcher"),
+        "run_mode": job_specs.get("run_mode", RUN_MODE_SINGLEPASS), "pass_nr": job_pass})
+  artifacts = _artifact_repo(owner)
+  stored = artifacts.get_pass_report(ref.get("report_cid"))
+  aggregated_cid = stored.get("aggregated_report_cid") if isinstance(stored, dict) else None
+  aggregated = artifacts.get_json(aggregated_cid) if aggregated_cid else None
+  node_reports = owner._collect_node_reports(workers) if isinstance(aggregated, dict) else None
+  if not isinstance(aggregated, dict) or not isinstance(node_reports, dict) or set(node_reports) != set(workers):
+    # Not finished on a guess: an unreadable report (one worker's is enough) could hide an aborted
+    # pass or a ledger range. Retried next minute.
+    owner.P(f"[STUCK RECOVERY] {job_id} pass {job_pass} artifacts unreadable — retrying later", color='y')
+    return
+  job_config = owner._get_job_config(job_specs, resolve_secrets=False) or {}
+  abort_state = _pass_abort_state(aggregated, node_reports)
+  date_completed = stored.get("date_completed") or owner.time()
+  job_specs = _ensure_rulebook_assessment_after_pass(owner, job_specs, job_id=job_id, pass_nr=job_pass)
+  if not ref.get("pass_changes_cid"):
+    job_specs = _record_engagement_ledger_after_pass(
+      owner, job_key, job_specs, artifacts, job_id=job_id, pass_nr=job_pass,
+      pass_report_cid=ref.get("report_cid"), node_reports=node_reports, workers=workers,
+      date_completed=date_completed, flat_findings=stored.get("findings") or [], aggregated=aggregated,
+      pass_metrics=stored.get("scan_metrics"), abort_state=abort_state, job_config=job_config,
+    )
+  _finish_pass(
+    owner, job_key, job_specs, workers=workers, job_config=job_config, abort_state=abort_state,
+    redmesh_test_attestation=stored.get("redmesh_test_attestation"),
+    pass_date_started=stored.get("date_started"), pass_date_completed=date_completed,
+    pass_window_egress_ips=[meta.get("node_ip") for meta in (stored.get("worker_reports") or {}).values()
+                            if isinstance(meta, dict) and meta.get("node_ip")],
+    pass_window_report_refs={"pass_report_cid": ref.get("report_cid"), "aggregated_report_cid": aggregated_cid},
+    stop_scheduled=_stop_scheduled(job_specs, job_specs.get("job_status")),
+  )
 
 
 def _automatic_analysis_report_identity(workers):
@@ -291,14 +443,16 @@ def _poll_automatic_analysis(owner, all_jobs):
       color='y',
     )
     sections = None
-    failed = True
+    failed, reason = True, "provider_error"
   else:
     failed = bool(getattr(owner, "_last_structured_llm_failed", None))
+    reason = _llm_failure_reason(owner) if failed else None
   owner._automatic_analysis_state = None
   return {
     "state": state,
     "sections": sections,
     "failed": failed,
+    "reason": reason,
   }, False
 
 
@@ -310,16 +464,22 @@ def _attestation_required(job_specs, job_config) -> bool:
   return False
 
 
-def _mark_attestation_failed(owner, job_key, job_specs, *, job_id, pass_nr, message):
-  job_specs["failure_class"] = "attestation_failed"
+def _enqueue_misp_auto_push(owner, job_specs, pass_nr):
+  # RM-221 (owner): no automatic push while the end attestation is failed; a manual push stays possible.
+  if job_specs.get("attestation_status") != "failed":
+    enqueue_misp_auto_push(owner, job_specs, pass_nr)
+
+
+def _mark_job_failed(owner, job_key, job_specs, *, job_id, pass_nr, failure_class, message, meta=None):
+  job_specs["failure_class"] = failure_class
   job_specs["failure_message"] = message
   set_job_status(job_specs, JOB_STATUS_FAILED)
   owner._emit_timeline_event(
     job_specs,
-    "attestation_failed",
+    failure_class,
     message,
     actor_type="system",
-    meta={"pass_nr": pass_nr, "failure_class": "attestation_failed"},
+    meta={"pass_nr": pass_nr, "failure_class": failure_class, **(meta or {})},
   )
   emit_lifecycle_event(
     owner,
@@ -329,7 +489,7 @@ def _mark_attestation_failed(owner, job_key, job_specs, *, job_id, pass_nr, mess
     event_outcome="failure",
     pass_nr=pass_nr,
   )
-  _write_job_record(owner, job_key, job_specs, context="attestation_failed")
+  _write_job_record(owner, job_key, job_specs, context=failure_class)
   owner._build_job_archive(job_key, job_specs)
   owner._clear_live_progress(job_id, list((job_specs.get("workers") or {}).keys()))
 
@@ -383,38 +543,6 @@ def _abort_reason_text(reason):
   return text[:_ABORT_REASON_MAX_CHARS] or "no reason recorded"
 
 
-def _mark_scan_aborted(owner, job_key, job_specs, *, job_id, pass_nr, abort_state):
-  """Mirror of `_mark_attestation_failed` for a first pass that tested nothing."""
-  phase = abort_state["abort_phase"] or "unknown"
-  message = f"Scan aborted during {phase}: {_abort_reason_text(abort_state['abort_reason'])}"
-  job_specs["failure_class"] = "scan_aborted"
-  job_specs["failure_message"] = message
-  set_job_status(job_specs, JOB_STATUS_FAILED)
-  owner._emit_timeline_event(
-    job_specs,
-    "scan_aborted",
-    message,
-    actor_type="system",
-    meta={
-      "pass_nr": pass_nr,
-      "failure_class": "scan_aborted",
-      "abort_phase": phase,
-      "abort_reason_class": abort_state["abort_reason_class"],
-    },
-  )
-  emit_lifecycle_event(
-    owner,
-    job_specs,
-    event_type="redmesh.job.failed",
-    event_action="failed",
-    event_outcome="failure",
-    pass_nr=pass_nr,
-  )
-  _write_job_record(owner, job_key, job_specs, context="scan_aborted")
-  owner._build_job_archive(job_key, job_specs)
-  owner._clear_live_progress(job_id, list((job_specs.get("workers") or {}).keys()))
-
-
 def _ensure_rulebook_assessment_after_pass(owner, job_specs, *, job_id, pass_nr):
   try:
     result = ensure_rulebook_assessment(owner, job_id, pass_nr=pass_nr)
@@ -433,6 +561,229 @@ def _ensure_rulebook_assessment_after_pass(owner, job_specs, *, job_id, pass_nr)
   )
   refreshed = owner._get_job_from_cstore(job_id)
   return refreshed if isinstance(refreshed, dict) else job_specs
+
+
+def _record_skipped_ledger_pass(owner, job_specs, *, job_id, pass_nr, date_completed):
+  """RM-121: a pass left without a stored pass report still gets a `skipped` ledger entry, so the
+  job's later passes are folded. Non-fatal."""
+  try:
+    recorder = EngagementLedgerRecorder.for_job(owner, job_specs)
+    if recorder is not None:
+      recorder.record_skipped(job_id=job_id, pass_nr=pass_nr, date_completed=date_completed)
+  except Exception as exc:
+    owner.P(f"[LEDGER] Skipped entry for job {job_id} pass {pass_nr} not written ({type(exc).__name__})",
+            color='y')
+
+
+def _completed_port_ranges(node_reports, workers):
+  """The port runs of the workers whose report the pass collected: the worker's own port list when it
+  has one (comparison mode slices are not contiguous), else its `[start_port, end_port]`."""
+  ranges = []
+  for address, report in (node_reports or {}).items():
+    if not isinstance(report, dict):
+      continue
+    entry = (workers or {}).get(address) or {}
+    ports = report.get("target_ports") or entry.get("target_ports")
+    if ports:
+      ranges.extend(port_ranges(ports))
+    else:
+      ranges.append([int(report.get("start_port") or 0), int(report.get("end_port") or 0)])
+  return ranges
+
+
+def _record_engagement_ledger_after_pass(owner, job_key, job_specs, artifacts, *, job_id, pass_nr,
+                                         pass_report_cid, node_reports, workers, **facts):
+  """RM-121: the engagement finding ledger's post-pass hook (launcher only, every pass, non-fatal).
+
+  Stores the pass-changes artifact, puts its CID on the pass's `PassReportRef`, then writes the
+  asset's pass entry and folds (`continuous-monitoring.md` §2.1). A failure is logged and leaves a
+  `skipped` entry when the pass has none yet; the pass and the job go on.
+  """
+  recorder = None
+  try:
+    recorder = EngagementLedgerRecorder.for_job(owner, job_specs)
+    if recorder is None:
+      return job_specs
+    completed_ranges = _completed_port_ranges(node_reports, workers)
+    changes_cid = recorder.store_pass_changes(
+      artifacts, job_id=job_id, pass_nr=pass_nr, pass_report_cid=pass_report_cid,
+      completed_ranges=completed_ranges, **facts)
+    refs = job_specs.get("pass_reports") or []
+    for index, ref in enumerate(refs):
+      if ref.get("pass_nr") == pass_nr and ref.get("report_cid") == pass_report_cid:
+        refs[index] = PassReportRef.from_dict({**ref, "pass_changes_cid": changes_cid}).to_dict()
+    written = _write_job_record(owner, job_key, job_specs, context="finalize_engagement_ledger")
+    if written is not None:  # None: the write was not confirmed; the job record keeps the pass as it was
+      job_specs = written
+    recorder.record_pass(
+      artifacts, job_id=job_id, pass_nr=pass_nr, date_completed=facts["date_completed"],
+      pass_report_cid=pass_report_cid, pass_changes_cid=changes_cid)
+  except Exception as exc:
+    owner.P(f"[LEDGER] Engagement ledger not updated for job {job_id} pass {pass_nr} ({type(exc).__name__})",
+            color='y')
+    try:
+      if recorder is not None:
+        recorder.record_skipped(job_id=job_id, pass_nr=pass_nr, date_completed=facts.get("date_completed"))
+    except Exception as skipped_exc:
+      owner.P(f"[LEDGER] Skipped entry for job {job_id} pass {pass_nr} not written ({type(skipped_exc).__name__})",
+              color='y')
+  return job_specs
+
+
+def _finish_pass(owner, job_key, job_specs, *, workers, job_config, abort_state, redmesh_test_attestation,
+                 pass_date_started, pass_date_completed, pass_window_egress_ips, pass_window_report_refs,
+                 stop_scheduled):
+  """The steps after a pass's FINALIZING write and its ledger hook: the run-mode end state (FINALIZED,
+  STOPPED, FAILED scan_aborted, or RUNNING with the next pass due), its events and the archive. Shared by
+  the uninterrupted pass and the resume of a pass whose launcher exited after that write (I-268)."""
+  job_id = job_specs.get("job_id")
+  job_pass = job_specs.get("job_pass", 1)
+  run_mode = job_specs.get("run_mode", RUN_MODE_SINGLEPASS)
+  empty_abort = bool(abort_state and abort_state["empty"])
+  if empty_abort and job_pass <= 1:
+    phase = abort_state["abort_phase"] or "unknown"
+    _mark_job_failed(
+      owner, job_key, job_specs, job_id=job_id, pass_nr=job_pass,
+      failure_class="scan_aborted",
+      message=f"Scan aborted during {phase}: {_abort_reason_text(abort_state['abort_reason'])}",
+      meta={"abort_phase": phase, "abort_reason_class": abort_state["abort_reason_class"]},
+    )
+    return
+  if empty_abort:
+    # A monitor whose target was unreachable for one pass is not a failed
+    # job; the pass says so and the schedule continues.
+    owner._emit_timeline_event(
+      job_specs,
+      "pass_aborted",
+      f"Pass {job_pass} aborted during {abort_state['abort_phase'] or 'unknown'}: "
+      f"{_abort_reason_text(abort_state['abort_reason'])}",
+      actor_type="system",
+      meta={
+        "pass_nr": job_pass,
+        "abort_phase": abort_state["abort_phase"],
+        "abort_reason_class": abort_state["abort_reason_class"],
+      },
+    )
+
+  if run_mode == RUN_MODE_SINGLEPASS:
+    set_job_status(job_specs, JOB_STATUS_FINALIZED)
+    owner._emit_timeline_event(job_specs, "scan_completed", "Scan completed")
+    if redmesh_test_attestation is not None:
+      owner._emit_timeline_event(
+        job_specs, "blockchain_submit",
+        "Job-finished attestation submitted",
+        actor_type="system",
+        meta={**redmesh_test_attestation, "network": owner.REDMESH_ATTESTATION_NETWORK}
+      )
+    owner.P(f"[SINGLEPASS] Job {job_id} complete. Status set to FINALIZED.")
+    owner._emit_timeline_event(job_specs, "finalized", "Job finalized")
+    # End state first: a failed archive build leaves it, not FINALIZING, so the terminal archive
+    # retry takes over and this tail (and its stop events) does not run again (I-268).
+    _write_job_record(owner, job_key, job_specs, context="finalize_terminal")
+    owner._build_job_archive(job_key, job_specs)
+    _enqueue_misp_auto_push(owner, job_specs, job_pass)
+    owner._clear_live_progress(job_id, list(workers.keys()))
+    return
+
+  if stop_scheduled:
+    set_job_status(job_specs, JOB_STATUS_STOPPED)
+    owner._emit_timeline_event(job_specs, "scan_completed", f"Scan completed (pass {job_pass})")
+    emit_lifecycle_event(
+      owner,
+      job_specs,
+      event_type="redmesh.job.stopped",
+      event_action="stopped",
+      event_outcome="success",
+      pass_nr=job_pass,
+      started_at=pass_date_started,
+      actual_end_at=pass_date_completed,
+      expected_egress_ips=pass_window_egress_ips,
+      report_refs=pass_window_report_refs,
+    )
+    if redmesh_test_attestation is not None:
+      owner._emit_timeline_event(
+        job_specs, "blockchain_submit",
+        f"Test attestation submitted (pass {job_pass})",
+        actor_type="system",
+        meta={**redmesh_test_attestation, "network": owner.REDMESH_ATTESTATION_NETWORK}
+      )
+    owner.P(f"[CONTINUOUS] Pass {job_pass} complete for job {job_id}. Status set to STOPPED (soft stop was scheduled)")
+    owner._emit_timeline_event(job_specs, "stopped", "Job stopped")
+    # End state first: a failed archive build leaves it, not FINALIZING, so the terminal archive
+    # retry takes over and this tail (and its stop events) does not run again (I-268).
+    _write_job_record(owner, job_key, job_specs, context="finalize_terminal")
+    owner._build_job_archive(job_key, job_specs)
+    _enqueue_misp_auto_push(owner, job_specs, job_pass)
+    owner._clear_live_progress(job_id, list(workers.keys()))
+    return
+
+  if job_pass >= MAX_CONTINUOUS_PASSES:
+    set_job_status(job_specs, JOB_STATUS_STOPPED)
+    owner._emit_timeline_event(job_specs, "scan_completed", f"Scan completed (pass {job_pass})")
+    emit_lifecycle_event(
+      owner,
+      job_specs,
+      event_type="redmesh.job.stopped",
+      event_action="stopped",
+      event_outcome="success",
+      pass_nr=job_pass,
+      started_at=pass_date_started,
+      actual_end_at=pass_date_completed,
+      expected_egress_ips=pass_window_egress_ips,
+      report_refs=pass_window_report_refs,
+    )
+    owner._emit_timeline_event(
+      job_specs,
+      "pass_cap_reached",
+      f"Maximum continuous passes reached ({MAX_CONTINUOUS_PASSES})",
+      meta={"pass_nr": job_pass, "max_continuous_passes": MAX_CONTINUOUS_PASSES},
+    )
+    owner._log_audit_event("continuous_pass_cap_reached", {
+      "job_id": job_id,
+      "pass_nr": job_pass,
+      "max_continuous_passes": MAX_CONTINUOUS_PASSES,
+    })
+    if redmesh_test_attestation is not None:
+      owner._emit_timeline_event(
+        job_specs, "blockchain_submit",
+        f"Test attestation submitted (pass {job_pass})",
+        actor_type="system",
+        meta={**redmesh_test_attestation, "network": owner.REDMESH_ATTESTATION_NETWORK}
+      )
+    owner.P(
+      f"[CONTINUOUS] Pass {job_pass} complete for job {job_id}. "
+      f"Status set to STOPPED (max {MAX_CONTINUOUS_PASSES} passes reached)"
+    )
+    owner._emit_timeline_event(job_specs, "stopped", "Job stopped")
+    # End state first: a failed archive build leaves it, not FINALIZING, so the terminal archive
+    # retry takes over and this tail (and its stop events) does not run again (I-268).
+    _write_job_record(owner, job_key, job_specs, context="finalize_terminal")
+    owner._build_job_archive(job_key, job_specs)
+    _enqueue_misp_auto_push(owner, job_specs, job_pass)
+    owner._clear_live_progress(job_id, list(workers.keys()))
+    return
+
+  if redmesh_test_attestation is not None:
+    owner._emit_timeline_event(
+      job_specs, "blockchain_submit",
+      f"Test attestation submitted (pass {job_pass})",
+      actor_type="system",
+      meta={**redmesh_test_attestation, "network": owner.REDMESH_ATTESTATION_NETWORK}
+    )
+  set_job_status(job_specs, JOB_STATUS_RUNNING)
+  interval = job_config.get("monitor_interval", owner.cfg_monitor_interval)
+  jitter = random.uniform(0, owner.cfg_monitor_jitter)
+  job_specs["next_pass_at"] = owner.time() + interval + jitter
+  owner._emit_timeline_event(job_specs, "pass_completed", f"Pass {job_pass} completed")
+
+  owner.P(f"[CONTINUOUS] Pass {job_pass} complete for job {job_id}. Next pass in {interval}s (+{jitter:.1f}s jitter)")
+  _write_job_record(owner, job_key, job_specs, context="continuous_next_pass")
+  enqueue_misp_auto_push(owner, job_specs, job_pass)
+  owner._clear_live_progress(job_id, list(workers.keys()))
+
+  owner.completed_jobs_reports.pop(job_id, None)
+  if job_id in owner.lst_completed_jobs:
+    owner.lst_completed_jobs.remove(job_id)
 
 
 def maybe_finalize_pass(owner):
@@ -490,6 +841,11 @@ def maybe_finalize_pass(owner):
         owner._build_job_archive(job_id, job_specs)
       continue
     if is_intermediate_job_status(job_status) and not resumed_automatic_analysis:
+      ref = _current_pass_ref(job_specs)
+      if (job_status == JOB_STATUS_FINALIZING and ref is not None and not job_specs.get("job_cid")
+          and next_pass_at is None and _all_workers_finished_with_reports(workers)):
+        _resume_finalizing_tail(owner, job_key, job_specs, workers, ref)
+        continue
       if not _is_stale_intermediate_recovery_candidate(job_specs, workers, job_status, next_pass_at):
         continue
       _record_stale_intermediate_recovery(owner, job_specs, job_status, len(workers))
@@ -498,7 +854,9 @@ def maybe_finalize_pass(owner):
 
     new_pass_due = bool(all_finished and next_pass_at and owner.time() >= next_pass_at)
     if (run_mode == RUN_MODE_CONTINUOUS_MONITORING and not (all_finished and next_pass_at is None)
-        and _stop_if_engagement_ended(owner, job_specs, due=new_pass_due)):
+        # RM-248: a held pass is checked on the running-pass cadence, not on every tick.
+        and _stop_if_engagement_ended(owner, job_specs, due=new_pass_due and job_id not in (
+          getattr(owner, "_pass_holds", None) or {}))):
       continue
 
     if all_finished and next_pass_at is None:
@@ -531,7 +889,7 @@ def maybe_finalize_pass(owner):
       except Exception:
         worker_cls = None
       aggregated = (
-        owner._get_aggregated_report(node_reports, worker_cls=worker_cls)
+        get_host_aggregated_report(owner, node_reports, worker_cls=worker_cls)
         if node_reports else {}
       )
       if node_reports:
@@ -541,14 +899,31 @@ def maybe_finalize_pass(owner):
           f"{worker_cls.__name__ if worker_cls else 'default'} "
           f"({len(node_reports)} worker reports)"
         )
+        if not aggregated:
+          _record_skipped_ledger_pass(
+            owner, job_specs, job_id=job_id, pass_nr=job_pass, date_completed=pass_date_completed)
+          _mark_job_failed(
+            owner, job_key, job_specs, job_id=job_id, pass_nr=job_pass,
+            failure_class="report_aggregation_failed",
+            message="Worker reports could not be merged into a pass report",
+          )
+          continue
 
       risk_score = 0
       flat_findings = []
+      host_triage = {}
       risk_result = None
       abort_state = _pass_abort_state(aggregated, node_reports)
       empty_abort = bool(abort_state and abort_state["empty"])
       if aggregated:
-        risk_result, flat_findings = owner._compute_risk_and_findings(aggregated)
+        # The host triage map (report-findings.md §Triage): a closed finding leaves this pass's score and a
+        # confirmed possible one is scored certain. A failed read scores as if nothing were triaged.
+        try:
+          host_triage = _job_repo(owner).list_triage_for_record(job_specs)
+        except Exception as exc:
+          owner.P(f"[FINALIZE] {job_id} host triage unavailable: {type(exc).__name__}", color='y')
+          host_triage = {}
+        risk_result, flat_findings = owner._compute_risk_and_findings(aggregated, host_triage)
         risk_score = risk_result["score"]
         if empty_abort:
           # Nothing was tested, so there is nothing to score. The flat findings
@@ -573,21 +948,28 @@ def maybe_finalize_pass(owner):
       summary_text = None
       llm_report_sections = None
       structured_llm_failed = None
-      analysis_allowed = _execution_operation_allowed(owner, job_specs, config=job_config)
+      llm_failure_reason = None
+      analysis_denial = _execution_denial_reason(owner, job_specs, config=job_config)
       if empty_abort:
         pass  # no analysis of a scan that tested nothing
-      elif llm_cfg["ENABLED"] and aggregated and not analysis_allowed:
+      elif llm_cfg["ENABLED"] and aggregated and analysis_denial is not None:
         structured_llm_failed = True
+        llm_failure_reason = "execution_authority_denied"
+        _record_execution_denied(
+          owner, job_specs, operation="llm_analysis", reason=analysis_denial, pass_nr=job_pass)
       elif llm_cfg["ENABLED"] and aggregated:
         if resumed_automatic_analysis:
           llm_report_sections = automatic_completion["sections"]
           structured_llm_failed = automatic_completion["failed"]
+          llm_failure_reason = automatic_completion.get("reason") or "provider_error"
         else:
           set_job_status(job_specs, JOB_STATUS_ANALYZING)
           job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_analyzing")
           try:
-            if not _execution_operation_allowed(owner, job_specs, config=job_config):
-              raise RuntimeError("Automatic analysis execution unavailable")
+            if _check_execution(
+              owner, job_specs, operation="llm_analysis", pass_nr=job_pass, config=job_config,
+            ) is not None:
+              raise _AnalysisDenied(_ANALYSIS_DENIED_MESSAGE)
             executor = owner._get_manual_analysis_executor()
             # RM-108 phase 5: _execution_operation_allowed above already required a binding.
             provider_options = {
@@ -602,6 +984,7 @@ def maybe_finalize_pass(owner):
               owner._run_structured_report_sections,
               job_id=job_id,
               findings=flat_findings,
+              triage=host_triage,  # the live host map: closes and confirms findings for the analysis only
               aggregated_report=aggregated,
               engagement=(
                 job_config.get("engagement")
@@ -627,6 +1010,8 @@ def maybe_finalize_pass(owner):
               color='y',
             )
             structured_llm_failed = True
+            llm_failure_reason = (
+              "execution_authority_denied" if isinstance(exc, _AnalysisDenied) else "provider_error")
 
         if llm_report_sections and not structured_llm_failed:
           llm_text, summary_text = render_legacy_llm_fields(llm_report_sections)
@@ -636,7 +1021,7 @@ def maybe_finalize_pass(owner):
         owner._emit_timeline_event(
           job_specs, "llm_failed",
           f"LLM analysis unavailable for pass {job_pass}",
-          meta={"pass_nr": job_pass}
+          meta={"pass_nr": job_pass, "reason": llm_failure_reason or "provider_error"}
         )
 
       worker_metas = {}
@@ -662,14 +1047,16 @@ def maybe_finalize_pass(owner):
         aggregated_report_cid = artifacts.put_json(aggregated_data, show_logs=False)
         if not aggregated_report_cid:
           owner.P(f"Failed to store aggregated report for pass {job_pass} in R1FS", color='r')
+          _record_skipped_ledger_pass(
+            owner, job_specs, job_id=job_id, pass_nr=job_pass, date_completed=pass_date_completed)
           continue
 
       redmesh_test_attestation = None
       required_attestation = _attestation_required(job_specs, job_config)
-      required_attestation_failed = False
+      stop_scheduled = _stop_scheduled(job_specs, job_status)
       terminal_after_pass = (
         run_mode == RUN_MODE_SINGLEPASS
-        or job_status == JOB_STATUS_SCHEDULED_FOR_STOP
+        or stop_scheduled
         or job_pass >= MAX_CONTINUOUS_PASSES
       )
       # A scan that tested nothing gets no on-chain "0 vulnerabilities" record;
@@ -689,7 +1076,11 @@ def maybe_finalize_pass(owner):
           )
           should_submit_attestation = False
 
-      if should_submit_attestation and _execution_operation_allowed(owner, job_specs):
+      attestation_failure_reason = None
+      if should_submit_attestation:
+        attestation_failure_reason = _check_execution(
+          owner, job_specs, operation="attestation", pass_nr=job_pass)
+      if should_submit_attestation and attestation_failure_reason is None:
         try:
           attestation_node_ips = [
             r.get("node_ip") for r in node_reports.values()
@@ -722,6 +1113,7 @@ def maybe_finalize_pass(owner):
               pass_nr=job_pass,
             )
         except Exception as exc:
+          attestation_failure_reason = "submit_failed"
           import traceback
           owner.P(
             f"[ATTESTATION] Failed to submit test attestation for job {job_id}: {exc}\n"
@@ -740,7 +1132,6 @@ def maybe_finalize_pass(owner):
       if required_attestation and terminal_after_pass and not empty_abort and not (
         isinstance(redmesh_test_attestation, dict) and redmesh_test_attestation.get("tx_hash")
       ):
-        required_attestation_failed = True
         emit_attestation_status_event(
           owner,
           job_specs,
@@ -748,6 +1139,17 @@ def maybe_finalize_pass(owner):
           network=owner.REDMESH_ATTESTATION_NETWORK,
           pass_nr=job_pass,
         )
+        # RM-221: the scan finished, so the job keeps its normal terminal status and its results;
+        # only the attestation is marked failed (retry_job_attestation can submit it later).
+        attestation_failure_reason = attestation_failure_reason or attestation_unsubmitted_reason(owner)
+        job_specs["attestation_status"] = "failed"
+        job_specs["attestation_failure_reason"] = attestation_failure_reason
+        owner._emit_timeline_event(
+          job_specs, "attestation_failed", "End attestation was not submitted",
+          actor_type="system", meta={"pass_nr": job_pass, "reason": attestation_failure_reason},
+        )
+      elif required_attestation and terminal_after_pass and not empty_abort:
+        job_specs["attestation_status"] = "submitted"
 
       worker_scan_metrics = {}
       for addr, report in node_reports.items():
@@ -761,9 +1163,12 @@ def maybe_finalize_pass(owner):
       if node_metrics:
         pass_metrics = node_metrics[0] if len(node_metrics) == 1 else owner._merge_worker_metrics(node_metrics)
 
-      if llm_report_sections is not None and not _execution_operation_allowed(owner, job_specs, config=job_config):
+      if llm_report_sections is not None and _check_execution(
+        owner, job_specs, operation="llm_analysis", pass_nr=job_pass, config=job_config,
+      ) is not None:
         llm_report_sections = llm_text = summary_text = None
         llm_failed = True
+        llm_failure_reason = "execution_authority_denied"
 
       pass_report = PassReport(
         pass_nr=job_pass,
@@ -777,6 +1182,7 @@ def maybe_finalize_pass(owner):
         llm_analysis=llm_text,
         quick_summary=summary_text,
         llm_failed=llm_failed,
+        llm_failure_reason=llm_failure_reason if llm_failed else None,
         llm_report_sections=llm_report_sections,
         findings=flat_findings if flat_findings else None,
         scan_metrics=pass_metrics,
@@ -789,6 +1195,8 @@ def maybe_finalize_pass(owner):
       pass_report_cid = artifacts.put_pass_report(pass_report, show_logs=False)
       if not pass_report_cid:
         owner.P(f"Failed to store pass report for pass {job_pass} in R1FS", color='r')
+        _record_skipped_ledger_pass(
+          owner, job_specs, job_id=job_id, pass_nr=job_pass, date_completed=pass_date_completed)
         continue
 
       job_specs.setdefault("pass_reports", []).append(
@@ -825,153 +1233,40 @@ def maybe_finalize_pass(owner):
       set_job_status(job_specs, JOB_STATUS_FINALIZING)
       job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_finalizing")
       job_specs = _ensure_rulebook_assessment_after_pass(owner, job_specs, job_id=job_id, pass_nr=job_pass)
+      job_specs = _record_engagement_ledger_after_pass(
+        owner, job_key, job_specs, artifacts, job_id=job_id, pass_nr=job_pass,
+        pass_report_cid=pass_report_cid, node_reports=node_reports, workers=workers,
+        date_completed=pass_date_completed,
+        flat_findings=flat_findings, aggregated=aggregated, pass_metrics=pass_metrics,
+        abort_state=abort_state, job_config=job_config,
+      )
 
-      if required_attestation_failed:
-        _mark_attestation_failed(
-          owner,
-          job_key,
-          job_specs,
-          job_id=job_id,
-          pass_nr=job_pass,
-          message="Required terminal blockchain attestation was not submitted",
-        )
-        continue
-
-      if empty_abort and job_pass <= 1:
-        _mark_scan_aborted(
-          owner, job_key, job_specs, job_id=job_id, pass_nr=job_pass, abort_state=abort_state,
-        )
-        continue
-      if empty_abort:
-        # A monitor whose target was unreachable for one pass is not a failed
-        # job; the pass says so and the schedule continues.
-        owner._emit_timeline_event(
-          job_specs,
-          "pass_aborted",
-          f"Pass {job_pass} aborted during {abort_state['abort_phase'] or 'unknown'}: "
-          f"{_abort_reason_text(abort_state['abort_reason'])}",
-          actor_type="system",
-          meta={
-            "pass_nr": job_pass,
-            "abort_phase": abort_state["abort_phase"],
-            "abort_reason_class": abort_state["abort_reason_class"],
-          },
-        )
-
-      if run_mode == RUN_MODE_SINGLEPASS:
-        set_job_status(job_specs, JOB_STATUS_FINALIZED)
-        owner._emit_timeline_event(job_specs, "scan_completed", "Scan completed")
-        if redmesh_test_attestation is not None:
-          owner._emit_timeline_event(
-            job_specs, "blockchain_submit",
-            "Job-finished attestation submitted",
-            actor_type="system",
-            meta={**redmesh_test_attestation, "network": owner.REDMESH_ATTESTATION_NETWORK}
-          )
-        owner.P(f"[SINGLEPASS] Job {job_id} complete. Status set to FINALIZED.")
-        owner._emit_timeline_event(job_specs, "finalized", "Job finalized")
-        owner._build_job_archive(job_key, job_specs)
-        enqueue_misp_auto_push(owner, job_specs, job_pass)
-        owner._clear_live_progress(job_id, list(workers.keys()))
-        continue
-
-      if job_status == JOB_STATUS_SCHEDULED_FOR_STOP:
-        set_job_status(job_specs, JOB_STATUS_STOPPED)
-        owner._emit_timeline_event(job_specs, "scan_completed", f"Scan completed (pass {job_pass})")
-        emit_lifecycle_event(
-          owner,
-          job_specs,
-          event_type="redmesh.job.stopped",
-          event_action="stopped",
-          event_outcome="success",
-          pass_nr=job_pass,
-          started_at=pass_date_started,
-          actual_end_at=pass_date_completed,
-          expected_egress_ips=pass_window_egress_ips,
-          report_refs=pass_window_report_refs,
-        )
-        if redmesh_test_attestation is not None:
-          owner._emit_timeline_event(
-            job_specs, "blockchain_submit",
-            f"Test attestation submitted (pass {job_pass})",
-            actor_type="system",
-            meta={**redmesh_test_attestation, "network": owner.REDMESH_ATTESTATION_NETWORK}
-          )
-        owner.P(f"[CONTINUOUS] Pass {job_pass} complete for job {job_id}. Status set to STOPPED (soft stop was scheduled)")
-        owner._emit_timeline_event(job_specs, "stopped", "Job stopped")
-        owner._build_job_archive(job_key, job_specs)
-        enqueue_misp_auto_push(owner, job_specs, job_pass)
-        owner._clear_live_progress(job_id, list(workers.keys()))
-        continue
-
-      if job_pass >= MAX_CONTINUOUS_PASSES:
-        set_job_status(job_specs, JOB_STATUS_STOPPED)
-        owner._emit_timeline_event(job_specs, "scan_completed", f"Scan completed (pass {job_pass})")
-        emit_lifecycle_event(
-          owner,
-          job_specs,
-          event_type="redmesh.job.stopped",
-          event_action="stopped",
-          event_outcome="success",
-          pass_nr=job_pass,
-          started_at=pass_date_started,
-          actual_end_at=pass_date_completed,
-          expected_egress_ips=pass_window_egress_ips,
-          report_refs=pass_window_report_refs,
-        )
-        owner._emit_timeline_event(
-          job_specs,
-          "pass_cap_reached",
-          f"Maximum continuous passes reached ({MAX_CONTINUOUS_PASSES})",
-          meta={"pass_nr": job_pass, "max_continuous_passes": MAX_CONTINUOUS_PASSES},
-        )
-        owner._log_audit_event("continuous_pass_cap_reached", {
-          "job_id": job_id,
-          "pass_nr": job_pass,
-          "max_continuous_passes": MAX_CONTINUOUS_PASSES,
-        })
-        if redmesh_test_attestation is not None:
-          owner._emit_timeline_event(
-            job_specs, "blockchain_submit",
-            f"Test attestation submitted (pass {job_pass})",
-            actor_type="system",
-            meta={**redmesh_test_attestation, "network": owner.REDMESH_ATTESTATION_NETWORK}
-          )
-        owner.P(
-          f"[CONTINUOUS] Pass {job_pass} complete for job {job_id}. "
-          f"Status set to STOPPED (max {MAX_CONTINUOUS_PASSES} passes reached)"
-        )
-        owner._emit_timeline_event(job_specs, "stopped", "Job stopped")
-        owner._build_job_archive(job_key, job_specs)
-        enqueue_misp_auto_push(owner, job_specs, job_pass)
-        owner._clear_live_progress(job_id, list(workers.keys()))
-        continue
-
-      if redmesh_test_attestation is not None:
-        owner._emit_timeline_event(
-          job_specs, "blockchain_submit",
-          f"Test attestation submitted (pass {job_pass})",
-          actor_type="system",
-          meta={**redmesh_test_attestation, "network": owner.REDMESH_ATTESTATION_NETWORK}
-        )
-      set_job_status(job_specs, JOB_STATUS_RUNNING)
-      interval = job_config.get("monitor_interval", owner.cfg_monitor_interval)
-      jitter = random.uniform(0, owner.cfg_monitor_jitter)
-      job_specs["next_pass_at"] = owner.time() + interval + jitter
-      owner._emit_timeline_event(job_specs, "pass_completed", f"Pass {job_pass} completed")
-
-      owner.P(f"[CONTINUOUS] Pass {job_pass} complete for job {job_id}. Next pass in {interval}s (+{jitter:.1f}s jitter)")
-      _write_job_record(owner, job_key, job_specs, context="continuous_next_pass")
-      enqueue_misp_auto_push(owner, job_specs, job_pass)
-      owner._clear_live_progress(job_id, list(workers.keys()))
-
-      owner.completed_jobs_reports.pop(job_id, None)
-      if job_id in owner.lst_completed_jobs:
-        owner.lst_completed_jobs.remove(job_id)
+      _finish_pass(
+        owner, job_key, job_specs, workers=workers, job_config=job_config, abort_state=abort_state,
+        redmesh_test_attestation=redmesh_test_attestation, pass_date_started=pass_date_started,
+        pass_date_completed=pass_date_completed, pass_window_egress_ips=pass_window_egress_ips,
+        pass_window_report_refs=pass_window_report_refs, stop_scheduled=stop_scheduled,
+      )
 
     elif run_mode == RUN_MODE_CONTINUOUS_MONITORING and all_finished and next_pass_at and owner.time() >= next_pass_at:
       job_config = owner._get_job_config(job_specs, resolve_secrets=False)
-      if not _execution_operation_allowed(owner, job_specs, operation="new_pass", config=job_config):
+      # RM-248: a pass held for a suspension is re-checked at most once a minute, like a running pass.
+      holds = getattr(owner, "_pass_holds", None)
+      if not isinstance(holds, dict):
+        holds = owner._pass_holds = {}
+      if owner.time() - holds.get(job_id, float("-inf")) < ENGAGEMENT_RECHECK_SECONDS:
+        continue
+      denial = _execution_denial_reason(owner, job_specs, operation="new_pass", config=job_config)
+      holds.pop(job_id, None)
+      if denial is not None:
+        # RM-248: a suspended engagement holds the next pass (the job is neither stopped nor failed);
+        # the first held tick leaves one timeline entry, and the pass starts after the resume.
+        if denial == "engagement_suspended":
+          holds[job_id] = owner.time()
+          held = len(job_specs.get("timeline") or [])
+          _record_execution_denied(owner, job_specs, operation="new_pass", reason=denial, pass_nr=job_pass)
+          if len(job_specs["timeline"]) > held:
+            _write_job_record(owner, job_key, job_specs, context="continuous_hold")
         continue
       job_specs["job_pass"] = job_pass + 1
       job_specs["next_pass_at"] = None

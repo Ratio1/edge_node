@@ -75,32 +75,26 @@ runner/coordinator. A timeout cannot be upgraded to readiness by a generic healt
 
 ## Verification and limits
 
-Restoration also pins runtime content. A mutable image tag such as `:stable` is not an
-immutable revision. A container app runner records the resolved Docker image ID in its existing
-local persistent state before launching a tracked attempt and starts that exact image thereafter.
+Catalogue services retain their runtime content binding during restoration. Generic apps use an exact binding when the owner enables “Use pinned version”. An image tag such as `:stable` can change between starts. A container app runner records the resolved Docker image ID in its existing
+local persistent state before launching a bound attempt and starts that exact ID thereafter.
 With the ID it records the registry reference of that image (`repository@sha256:...`) when the
 image came from the repository the app is configured with: if the local image is lost it is
-pulled again by that reference and accepted when its ID equals the recorded one or when the local
-Docker store lists it under that reference (another type of image store gives the same image
-another ID).
-A worker's base image is not pinned; it follows `IMAGE_PULL_POLICY` and only its Git commit is.
+pulled again and accepted by its recorded ID or exact registry digest.
+A worker's base image follows `IMAGE_PULL_POLICY`. A worker pin selects its Git commit.
 Node-owned observations capture the actual running image ID; worker runners additionally
 capture and verify the actual Git HEAD before publishing readiness. Retirement preserves
-these safe identifiers in the node journal/report, and restoration supplies them through
-the server-owned `DEEPLOY_RUNTIME_ARTIFACTS` instance field. The report getter reads cached
+these safe identifiers in the node journal/report. Restoration of a bound instance supplies them
+through the server-owned `DEEPLOY_RUNTIME_ARTIFACTS` instance field. The report getter reads cached
 identifiers and performs no Docker, disk, or Git I/O on the reporter thread.
 
-A container app runs only its recorded image: the image with the recorded ID, or the image the
-local Docker store lists under the recorded registry reference, which is then started by the ID
-that store gives it; the recorded binding is not rewritten. When that image is no longer in the
-node's Docker store (the node's own container was replaced, or the image was removed) it is
-pulled again: by the recorded registry reference, then by the configured reference. What the
-recorded reference brings back is used when it is that image by either test; what the configured
-tag brings back in that attempt is used only if its ID equals the recorded one, so the configured
-tag is consulted to find that image and never to replace it. Until the registry serves it the app
-stays stopped and the pull is tried again, at most an hour apart. Worker restoration checks out
-the exact prior commit and does not consult the branch's current head. Tracked attempts disable autonomous
-image/Git updates; a change requires a new deployment operation. Database volume names,
+A bound container app runs its recorded image ID. When that image is no longer in the node's
+Docker store (the node's own container was replaced, or the image was removed) it is pulled
+again: by the recorded registry reference, then by the configured reference. What comes back is
+used when its ID or exact registry digest identifies the saved content. A pull by the
+configured tag must match the recorded ID. Until the registry serves it the app stays stopped and the pull
+is tried again, at most an hour apart. Pinned worker restoration checks out the exact prior
+commit. Pinned apps and catalogue services disable autonomous source updates. Generic apps
+following a source restore from the current branch head or image tag. Database volume names,
 paths, and contents remain untouched. These content bindings do not make arbitrary build
 commands deterministic: a project installing unpinned external dependencies can still
 produce different build outputs from the same source and base image.

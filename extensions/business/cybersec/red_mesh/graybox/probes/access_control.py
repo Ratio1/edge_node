@@ -9,6 +9,66 @@ from ... import cvss_vectors as V
 from ..findings import GrayboxFinding
 
 
+MAX_PARSE_CHARS = 1_000_000  # page text handed to the form-field regexes
+MAX_EVIDENCE_VALUE = 64      # stored values quoted in evidence
+
+
+def _is_checked(attrs):
+  """True for the bare ``checked`` attribute (not ``data-checked`` or a value)."""
+  bare = re.sub(r'"[^"]*"|\'[^\']*\'', '""', attrs)
+  return bool(re.search(r'(?<![\w-])checked(?![\w-])', bare, re.I))
+
+
+def checked_names(page_text):
+  """Names of the checked checkbox and radio inputs, whatever their value."""
+  names = set()
+  for tag in re.finditer(r'<input\b([^>]*)>', (page_text or "")[:MAX_PARSE_CHARS], re.I):
+    attrs = tag.group(1)
+    type_m = re.search(r'type=["\']?(\w+)', attrs, re.I)
+    name_m = re.search(r'name=["\']([^"\']+)', attrs)
+    if (name_m and type_m and type_m.group(1).lower() in ("checkbox", "radio")
+        and _is_checked(attrs)):
+      names.add(name_m.group(1))
+  return names
+
+
+def parse_form_fields(page_text, exclude=None):
+  """Current value of every <input>, <textarea> and selected <select> option.
+
+  A checkbox or radio counts only when ``checked``. ``exclude`` names one
+  field (the CSRF token) to leave out. Shared by the access-control and
+  business-logic probes.
+  """
+  page_text = (page_text or "")[:MAX_PARSE_CHARS]
+  form_fields = {}
+  for tag in re.finditer(r'<input\b([^>]*)>', page_text, re.I):
+    attrs = tag.group(1)
+    name_m = re.search(r'name=["\']([^"\']+)', attrs)
+    val_m = re.search(r'value=["\']([^"\']*)', attrs)
+    type_m = re.search(r'type=["\']?(\w+)', attrs, re.I)
+    if type_m and type_m.group(1).lower() in ("checkbox", "radio"):
+      if not _is_checked(attrs):
+        continue
+    if name_m and name_m.group(1) != exclude:
+      form_fields[name_m.group(1)] = val_m.group(1) if val_m else ""
+  for m in re.finditer(
+    r'<textarea[^>]+name=["\']([^"\']+)["\'][^>]*>(.*?)</textarea>',
+    page_text, re.I | re.DOTALL,
+  ):
+    form_fields[m.group(1)] = m.group(2).strip()
+  for sel in re.finditer(
+    r'<select[^>]+name=["\']([^"\']+)["\'][^>]*>(.*?)</select>',
+    page_text, re.I | re.DOTALL,
+  ):
+    sel_body = sel.group(2)
+    opt = re.search(r'<option[^>]*selected[^>]*value=["\']([^"\']+)', sel_body, re.I)
+    if not opt:
+      opt = re.search(r'<option[^>]*value=["\']([^"\']+)["\'][^>]*selected', sel_body, re.I)
+    if opt:
+      form_fields[sel.group(1)] = opt.group(1)
+  return form_fields
+
+
 class AccessControlProbes(ProbeBase):
   """
   PT-A01-01 IDOR/BOLA, PT-A01-02 function-level authorization bypass,
@@ -78,8 +138,8 @@ class AccessControlProbes(ProbeBase):
     """
     Test IDOR on configured or auto-detected endpoints.
 
-    Emits exactly ONE finding per scenario. Accumulates results across
-    all endpoints, then emits vulnerable (worst-case wins) or not_vulnerable.
+    Read-only, so every endpoint is tested: one vulnerable finding per
+    endpoint, or one not_vulnerable row when none is vulnerable.
     """
     endpoints = self.target_config.access_control.idor_endpoints
     if not endpoints:
@@ -90,19 +150,19 @@ class AccessControlProbes(ProbeBase):
     if not self.regular_username:
       return
 
-    vulnerable_evidence = None
+    vulnerable_hits = []
     endpoints_tested = 0
 
     for ep in endpoints:
-      self.safety.throttle()
-      result = self._test_single_idor(ep)
-      endpoints_tested += 1
+      outcome = {}
+      result = self._test_single_idor(ep, outcome)
+      # A bare 404 is skipped (mistyped path), a denial counts as tested.
+      if outcome.get("evaluated"):
+        endpoints_tested += 1
       if result:
-        vulnerable_evidence = result
-        break
+        vulnerable_hits.append((result, outcome.get("hit_response")))
 
-    if vulnerable_evidence:
-      owner, url, path = vulnerable_evidence
+    for (owner, url, path), hit_response in vulnerable_hits:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-01",
         title="Object-level authorization bypass",
@@ -123,8 +183,9 @@ class AccessControlProbes(ProbeBase):
           "Observe owner field not matching logged-in user.",
         ],
         remediation="Authorize object access using both role and ownership checks server-side.",
+        evidence_artifacts=self.evidence_from(hit_response),
       ))
-    else:
+    if not vulnerable_hits and endpoints_tested:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-01",
         title="Object-level authorization — no bypass detected",
@@ -134,13 +195,19 @@ class AccessControlProbes(ProbeBase):
         evidence=[f"endpoints_tested={endpoints_tested}"],
       ))
 
-  def _test_single_idor(self, ep):
-    """Test one IDOR endpoint. Returns (owner, url, path) on hit, None on miss."""
+  def _test_single_idor(self, ep, outcome=None):
+    """Test one IDOR endpoint. Returns (owner, url, path) on hit, None on miss.
+
+    ``outcome["evaluated"]`` is set when some id got a response that is not a
+    bare 404.
+    """
     path_tpl = ep.path
     for test_id in ep.test_ids:
       path = path_tpl.replace("{id}", str(test_id))
       url = self.target_url + path
       resp = self.auth.regular_session.get(url, timeout=10)
+      if outcome is not None and not self.bare_not_found(resp, url):
+        outcome["evaluated"] = True
       if resp.status_code != 200:
         continue
       ct = resp.headers.get("content-type", "")
@@ -152,6 +219,8 @@ class AccessControlProbes(ProbeBase):
         continue
       owner = body.get(ep.owner_field, "")
       if owner and owner != self.regular_username:
+        if outcome is not None:
+          outcome["hit_response"] = resp
         return (owner, url, path)
     return None
 
@@ -176,7 +245,6 @@ class AccessControlProbes(ProbeBase):
     if not endpoints:
       return
     for ep in endpoints:
-      self.safety.throttle()
       method = ep.method.upper()
       url = self.target_url + ep.path
       if method == "GET":
@@ -184,6 +252,8 @@ class AccessControlProbes(ProbeBase):
       else:
         continue  # only GET for read-only probes
 
+      if self.exempt_denial(resp, url):
+        continue  # login redirect or a denial: the secure result
       if resp.status_code == 200:
         body_lower = resp.text.lower()
         denial_markers = ["access denied", "permission denied", "forbidden",
@@ -222,6 +292,7 @@ class AccessControlProbes(ProbeBase):
             "Confirm privileged data is returned.",
           ],
           remediation="Require admin role and deny by default for all privileged functions.",
+          evidence_artifacts=self.evidence_from(resp),
         ))
 
   def _test_verb_tampering(self):
@@ -242,11 +313,11 @@ class AccessControlProbes(ProbeBase):
 
     tested = 0
     bypass_evidence = []
+    bypass_response = None
     baseline_reachable = 0
 
     for ep in endpoints:
       # First, confirm the endpoint denies regular user via its normal method.
-      self.safety.throttle()
       url = self.target_url + ep.path
       try:
         baseline = self.auth.regular_session.request(
@@ -258,6 +329,8 @@ class AccessControlProbes(ProbeBase):
 
       # Only test verb tampering if the baseline is denied (403/401/302-to-login)
       baseline_denied = baseline.status_code in (401, 403)
+      if not baseline_denied:
+        baseline_denied = bool(self.exempt_denial(baseline, url))
       if not baseline_denied and baseline.status_code == 200:
         body_lower = baseline.text.lower()
         baseline_denied = any(m in body_lower for m in denial_markers)
@@ -269,20 +342,22 @@ class AccessControlProbes(ProbeBase):
 
       # Try alternative methods
       for method in alternative_methods:
-        self.safety.throttle()
         try:
           resp = self.auth.regular_session.request(method, url, timeout=10)
         except Exception:
           continue
         tested += 1
 
-        if resp.status_code < 400 and resp.status_code not in (301, 302):
+        if (resp.status_code < 400 and resp.status_code not in (301, 302)
+            and self.response_reached(resp)):
           body_lower = resp.text.lower()
           if not any(m in body_lower for m in denial_markers):
             bypass_evidence.append(
               f"endpoint={ep.path}; denied_method={ep.method}; "
               f"accepted_method={method}; status={resp.status_code}"
             )
+            if bypass_response is None:
+              bypass_response = resp
             break  # one bypass per endpoint is enough
 
     if bypass_evidence:
@@ -302,6 +377,7 @@ class AccessControlProbes(ProbeBase):
         ],
         remediation="Enforce authorization checks regardless of HTTP method. "
                     "Deny all methods by default and explicitly allow required ones.",
+        evidence_artifacts=self.evidence_from(bypass_response),
       ))
     elif tested > 0:
       self.findings.append(GrayboxFinding(
@@ -369,10 +445,12 @@ class AccessControlProbes(ProbeBase):
     }
 
     tested = 0
+    denied = 0
     accepted_evidence = []
+    accepted_response = None
+    unobservable = []
 
     for form_path in form_paths[:5]:  # cap at 5 forms
-      self.safety.throttle()
       url = self.target_url + form_path
 
       # GET the form to extract existing fields + CSRF token
@@ -380,33 +458,11 @@ class AccessControlProbes(ProbeBase):
         page = self.auth.regular_session.get(url, timeout=10)
       except Exception:
         continue
-      if page.status_code != 200:
+      if not self.response_reached(page):
+        denied += 1
         continue
 
-      # Extract form fields
-      form_fields = {}
-      for tag in re.finditer(r'<input\b([^>]*)>', page.text, re.I):
-        attrs = tag.group(1)
-        name_m = re.search(r'name=["\']([^"\']+)', attrs)
-        val_m = re.search(r'value=["\']([^"\']*)', attrs)
-        if name_m:
-          form_fields[name_m.group(1)] = val_m.group(1) if val_m else ""
-      for m in re.finditer(
-        r'<textarea[^>]+name=["\']([^"\']+)["\'][^>]*>(.*?)</textarea>',
-        page.text, re.I | re.DOTALL,
-      ):
-        form_fields[m.group(1)] = m.group(2).strip()
-      for sel in re.finditer(
-        r'<select[^>]+name=["\']([^"\']+)["\'][^>]*>(.*?)</select>',
-        page.text, re.I | re.DOTALL,
-      ):
-        sel_name = sel.group(1)
-        sel_body = sel.group(2)
-        opt = re.search(r'<option[^>]*selected[^>]*value=["\']([^"\']+)', sel_body, re.I)
-        if not opt:
-          opt = re.search(r'<option[^>]*value=["\']([^"\']+)["\'][^>]*selected', sel_body, re.I)
-        if opt:
-          form_fields[sel_name] = opt.group(1)
+      form_fields = parse_form_fields(page.text)
 
       if not form_fields:
         continue
@@ -429,13 +485,17 @@ class AccessControlProbes(ProbeBase):
       if csrf_token:
         headers["X-CSRFToken"] = csrf_token
 
-      self.safety.throttle()
       try:
         resp = self.auth.regular_session.post(
           url, data=payload, headers=headers,
           timeout=10, allow_redirects=False,
         )
       except Exception:
+        continue
+      # A redirect to login or a 401/403 is a denial, not an accepted
+      # submission; a 400/422 is the handler rejecting the fields.
+      if not self.response_reached(resp, validation_ok=True):
+        denied += 1
         continue
       tested += 1
 
@@ -452,26 +512,53 @@ class AccessControlProbes(ProbeBase):
         continue
 
       # Verify: GET the page again and check if privilege fields are reflected
-      self.safety.throttle()
       try:
         verify = self.auth.regular_session.get(url, timeout=10)
       except Exception:
         continue
+      if verify.status_code != 200:
+        unobservable.append((form_path, "verify_not_readable"))
+        continue
 
+      # Only a field that holds the submitted value now and did not before
+      # counts: an <option value="admin"> or a field already set is not
+      # evidence. `form_fields` and `page.text` are the pre-POST snapshot.
       persisted_fields = []
       verify_lower = verify.text.lower()
+      before_lower = page.text.lower()
+      after_fields = parse_form_fields(verify.text)
+      checked_before = checked_names(page.text)
+      checked_after = checked_names(verify.text)
       for field_name, field_value in priv_fields.items():
-        # Check for field=value in response (JSON or HTML attribute)
-        if (f'"{field_name}": "{field_value}"' in verify_lower or
-            f'"{field_name}":"{field_value}"' in verify_lower or
-            f"value=\"{field_value}\"" in verify.text and field_name in verify.text or
-            f'name="{field_name}"' in verify.text and f'value="{field_value}"' in verify.text):
+        json_after = (f'"{field_name}": "{field_value}"' in verify_lower or
+                      f'"{field_name}":"{field_value}"' in verify_lower)
+        json_before = (f'"{field_name}": "{field_value}"' in before_lower or
+                       f'"{field_name}":"{field_value}"' in before_lower)
+        if json_after and not json_before:
           persisted_fields.append(field_name)
+        elif field_name in checked_after:
+          # A checkbox/radio is judged by its checked state, not its value.
+          if field_name not in checked_before:
+            persisted_fields.append(field_name)
+        elif (after_fields.get(field_name) == field_value
+              and form_fields.get(field_name) != field_value):
+          persisted_fields.append(field_name)
+
+      # Accepted, but the page never shows any privilege field: the absence
+      # of the value proves nothing, so this form is not a clean result.
+      # Observable = a form field name or a JSON key; `role="group"` or
+      # `class="admin"` is not.
+      names = "|".join(priv_fields)
+      if not persisted_fields and not re.search(
+          rf"""name=["']({names})["']|"({names})"\s*:""", verify.text):
+        unobservable.append((form_path, "privilege_field_not_observable"))
 
       if persisted_fields:
         accepted_evidence.append(
           f"endpoint={form_path}; persisted_fields={','.join(persisted_fields)}"
         )
+        if accepted_response is None:
+          accepted_response = verify
 
     if accepted_evidence:
       self.findings.append(GrayboxFinding(
@@ -491,7 +578,14 @@ class AccessControlProbes(ProbeBase):
         remediation="Use explicit field allowlists in form/API binding. "
                     "Never bind user input directly to model attributes. "
                     "Django: use ModelForm.Meta.fields. Rails: use strong_parameters.",
+        evidence_artifacts=self.evidence_from(accepted_response),
       ))
+    elif unobservable:
+      path, reason = unobservable[0]
+      self.emit_inconclusive(
+        "PT-A04-01", "Mass assignment — result not observable", "A04:2021", reason,
+      )
+      self.findings[-1].evidence.append(f"endpoint={path}")
     elif tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A04-01",
@@ -501,6 +595,8 @@ class AccessControlProbes(ProbeBase):
         owasp="A04:2021",
         evidence=[f"forms_tested={tested}"],
       ))
+    elif denied > 0:
+      self.emit_endpoint_denied("PT-A04-01")
 
   def _test_mass_assignment_ownership(self):
     """
@@ -535,6 +631,7 @@ class AccessControlProbes(ProbeBase):
     candidate_owner_ids = [1, 2, 3, 1000]
 
     transferred_evidence = []
+    restore_failed = False
     tested = 0
 
     import json as _json
@@ -543,7 +640,6 @@ class AccessControlProbes(ProbeBase):
       for record_id in (ep.test_ids or [1, 2]):
         path = ep.path.replace("{id}", str(record_id))
         url = self.target_url + path
-        self.safety.throttle()
 
         try:
           before = self.auth.regular_session.get(url, timeout=10)
@@ -567,47 +663,48 @@ class AccessControlProbes(ProbeBase):
         success = False
         for owner_id in candidate_owner_ids:
           patch_body = {field: owner_id for field in transfer_targets}
-          self.safety.throttle()
           try:
             patch_resp = self.auth.regular_session.patch(
               url, data=_json.dumps(patch_body), headers=headers, timeout=10,
             )
           except Exception:
             continue
+          if self.bare_not_found(patch_resp, url):
+            continue
           tested += 1
           if patch_resp.status_code >= 400:
             continue
 
-          self.safety.throttle()
           try:
-            after = self.auth.regular_session.get(url, timeout=10)
+            # Reads back a write that already landed; its answer decides the restore.
+            after = self.auth.regular_session.get(url, timeout=10, budget_exempt=True)
             after_owner = after.json().get(ep.owner_field)
           except Exception:
             continue
           if after_owner != before_owner:
-            transferred_evidence.append(
+            # Restore — PATCH owner back to original by name, then re-read.
+            restored = self._restore_verified(
+              url, {field: before_owner for field in transfer_targets},
+              headers, ep.owner_field, before_owner,
+            )
+            transferred_evidence.append((
               f"endpoint={path}; field={ep.owner_field}; "
               f"injected_id={owner_id}; "
-              f"before={before_owner!r}; after={after_owner!r}"
-            )
-            # Best-effort restore — PATCH owner back to original by name.
-            try:
-              restore_body = {field: before_owner for field in transfer_targets}
-              self.auth.regular_session.patch(
-                url, data=_json.dumps(restore_body), headers=headers, timeout=10,
-              )
-            except Exception:
-              pass
+              f"before={before_owner!r}; after={after_owner!r}",
+              "reverted" if restored else "revert_failed",
+              after,
+            ))
+            restore_failed = not restored
             success = True
             break
 
         if success:
-          break
+          break  # one finding per endpoint
 
-      if transferred_evidence:
-        break
+      if restore_failed:
+        break  # no further writes once a transfer could not be undone
 
-    if transferred_evidence:
+    for item, rollback, proof in transferred_evidence:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A04-02",
         title="Mass assignment — ownership field transferable",
@@ -616,7 +713,8 @@ class AccessControlProbes(ProbeBase):
         owasp="A04:2021",
         cwe=["CWE-915", "CWE-639"],
         attack=["T1078"],
-        evidence=transferred_evidence,
+        evidence=[item],
+        rollback_status=rollback,
         replay_steps=[
           "Log in as regular user.",
           "PATCH a record with body {\"owner_user_id\": <other-id>}.",
@@ -627,8 +725,9 @@ class AccessControlProbes(ProbeBase):
                     "Reject or strip ``owner_user_id`` (and aliases) on "
                     "every write boundary. Use explicit field allowlists "
                     "in serializers / form binding.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
-    elif tested > 0:
+    if not transferred_evidence and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A04-02",
         title="Mass-assignment ownership — guard held",
@@ -639,6 +738,25 @@ class AccessControlProbes(ProbeBase):
       ))
 
   # ── Batch 3 — A01 access-control variants ──────────────────────────────
+
+  def _restore_verified(self, url, body, headers, field, expected):
+    """PATCH ``body`` back, then re-GET and confirm ``field`` equals ``expected``.
+
+    A 2xx on the restore PATCH is not proof: the server may ignore it. Only a
+    re-read that shows the original value counts as restored.
+    """
+    import json as _json
+    try:
+      resp = self.auth.regular_session.patch(
+        url, data=_json.dumps(body), headers=headers, timeout=10,
+        budget_exempt=True,
+      )
+      if resp.status_code >= 400:
+        return False
+      check = self.auth.regular_session.get(url, timeout=10, budget_exempt=True)
+      return check.json().get(field) == expected
+    except Exception:
+      return False
 
   def _test_ownership_update(self):
     """PT-A01-05: regular user updates a record they don't own.
@@ -655,13 +773,13 @@ class AccessControlProbes(ProbeBase):
     import json as _json
     sentinel_title = "redmesh-pt-a01-05-probe-marker"
     transferred_evidence = []
+    restore_failed = False
     tested = 0
 
     for ep in endpoints:
       for record_id in (ep.test_ids or [1, 2]):
         path = ep.path.replace("{id}", str(record_id))
         url = self.target_url + path
-        self.safety.throttle()
         try:
           before = self.auth.regular_session.get(url, timeout=10)
         except Exception:
@@ -671,6 +789,7 @@ class AccessControlProbes(ProbeBase):
         try:
           before_owner = before.json().get(ep.owner_field)
           before_title = before.json().get("title")
+          had_title = "title" in before.json()
         except Exception:
           continue
         # Only attempt cross-tenant write — skip records this user owns.
@@ -681,7 +800,6 @@ class AccessControlProbes(ProbeBase):
         headers = {"Content-Type": "application/json", "Referer": url}
         if csrf_token:
           headers["X-CSRFToken"] = csrf_token
-        self.safety.throttle()
         try:
           patch_resp = self.auth.regular_session.patch(
             url, data=_json.dumps({"title": sentinel_title}),
@@ -689,35 +807,36 @@ class AccessControlProbes(ProbeBase):
           )
         except Exception:
           continue
+        if self.bare_not_found(patch_resp, url):
+          continue
         tested += 1
         if patch_resp.status_code >= 400:
           continue
 
-        self.safety.throttle()
         try:
-          after = self.auth.regular_session.get(url, timeout=10)
+          # Reads back a write that already landed; its answer decides the restore.
+          after = self.auth.regular_session.get(url, timeout=10, budget_exempt=True)
           after_title = after.json().get("title")
         except Exception:
           continue
 
         if after_title == sentinel_title:
-          transferred_evidence.append(
-            f"endpoint={path}; before_owner={before_owner!r}; "
-            f"sentinel_title_persisted=True"
+          # Restore only a field the record had; never send title=null.
+          restored = had_title and self._restore_verified(
+            url, {"title": before_title}, headers, "title", before_title,
           )
-          # Best-effort restore.
-          try:
-            self.auth.regular_session.patch(
-              url, data=_json.dumps({"title": before_title}),
-              headers=headers, timeout=10,
-            )
-          except Exception:
-            pass
-          break
-      if transferred_evidence:
-        break
+          transferred_evidence.append((
+            f"endpoint={path}; before_owner={before_owner!r}; "
+            f"sentinel_title_persisted=True",
+            "reverted" if restored else "revert_failed",
+            after,
+          ))
+          restore_failed = not restored
+          break  # one finding per endpoint
+      if restore_failed:
+        break  # no further writes once a write could not be undone
 
-    if transferred_evidence:
+    for item, rollback, proof in transferred_evidence:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-05",
         title="Ownership update bypass — regular user wrote to non-owned record",
@@ -726,7 +845,8 @@ class AccessControlProbes(ProbeBase):
         owasp="A01:2021",
         cwe=["CWE-639", "CWE-862"],
         attack=["T1078"],
-        evidence=transferred_evidence,
+        evidence=[item],
+        rollback_status=rollback,
         replay_steps=[
           "Log in as the regular user.",
           "PATCH a record whose owner is a different user with a "
@@ -737,8 +857,9 @@ class AccessControlProbes(ProbeBase):
                     "endpoints. Reject mutating requests where the "
                     "record's owner does not match the authenticated "
                     "principal (or an explicit admin role).",
+        evidence_artifacts=self.evidence_from(proof),
       ))
-    elif tested > 0:
+    if not transferred_evidence and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-05",
         title="Ownership update — guard held",
@@ -763,12 +884,12 @@ class AccessControlProbes(ProbeBase):
       return
 
     deleted_evidence = []
+    deleted_response = None
     tested = 0
     for ep in endpoints:
       for record_id in (ep.test_ids or [1, 2]):
         path = ep.path.replace("{id}", str(record_id))
         url = self.target_url + path
-        self.safety.throttle()
         try:
           before = self.auth.regular_session.get(url, timeout=10)
         except Exception:
@@ -786,19 +907,19 @@ class AccessControlProbes(ProbeBase):
         headers = {"Referer": url}
         if csrf_token:
           headers["X-CSRFToken"] = csrf_token
-        self.safety.throttle()
         try:
           del_resp = self.auth.regular_session.delete(
             url, headers=headers, timeout=10,
           )
         except Exception:
           continue
+        if self.bare_not_found(del_resp, url):
+          continue
         tested += 1
         if del_resp.status_code >= 400:
           continue
         # Confirm the record is actually gone — defends against a server
         # that returns 200 but ignores the verb.
-        self.safety.throttle()
         try:
           after = self.auth.regular_session.get(url, timeout=10)
         except Exception:
@@ -811,8 +932,10 @@ class AccessControlProbes(ProbeBase):
             f"delete_status={del_resp.status_code}; "
             f"followup_status={after.status_code}"
           )
+          deleted_response = after
           break
       if deleted_evidence:
+        # A delete cannot be undone: stop after the first confirmed one.
         break
 
     if deleted_evidence:
@@ -833,6 +956,7 @@ class AccessControlProbes(ProbeBase):
         remediation="Apply ownership / role checks on all DELETE "
                     "endpoints. Soft-delete with audit trail is "
                     "preferable when destructive behavior is expected.",
+        evidence_artifacts=self.evidence_from(deleted_response),
       ))
     elif tested > 0:
       self.findings.append(GrayboxFinding(
@@ -874,10 +998,10 @@ class AccessControlProbes(ProbeBase):
     denial_markers = ["access denied", "permission denied", "forbidden",
                       "not authorized", "unauthorized", "403"]
     reachable = []
+    reachable_response = None
     tested = 0
     for path in candidates:
       url = self.target_url + path
-      self.safety.throttle()
       try:
         resp = self.auth.regular_session.get(url, timeout=10)
       except Exception:
@@ -889,6 +1013,8 @@ class AccessControlProbes(ProbeBase):
       if any(m in body_lower for m in denial_markers):
         continue
       reachable.append(f"path={path}; status={resp.status_code}")
+      if reachable_response is None:
+        reachable_response = resp
 
     if reachable:
       self.findings.append(GrayboxFinding(
@@ -908,6 +1034,7 @@ class AccessControlProbes(ProbeBase):
         remediation="Apply role-gated middleware to every administrative "
                     "URL prefix. Default-deny on path-based admin "
                     "namespaces (``/admin/``, ``/manage/``, etc.).",
+        evidence_artifacts=self.evidence_from(reachable_response),
       ))
     elif tested > 0:
       self.findings.append(GrayboxFinding(
@@ -945,28 +1072,29 @@ class AccessControlProbes(ProbeBase):
 
     delta_evidence = []
     tested = 0
+    denied = 0
     for path in targets:
       url = self.target_url + path
-      self.safety.throttle()
       try:
         baseline = self.auth.regular_session.get(url, timeout=10)
       except Exception:
         continue
-      if baseline.status_code != 200:
+      if not self.response_reached(baseline):
+        denied += 1
         continue
       base_body = baseline.text
       base_len = len(base_body)
       for key, value in overrides:
-        self.safety.throttle()
         try:
           probed = self.auth.regular_session.get(
             url, params={key: value}, timeout=10,
           )
         except Exception:
           continue
-        tested += 1
-        if probed.status_code != 200:
+        if not self.response_reached(probed):
+          denied += 1
           continue
+        tested += 1
         # Detect the appearance of admin-only markers that weren't in
         # the baseline. Length-only deltas are too noisy to flag alone.
         admin_markers = ["admin panel", "/admin-panel", "manage users",
@@ -977,16 +1105,15 @@ class AccessControlProbes(ProbeBase):
           and m.lower() not in base_body.lower()
         ]
         if new_markers:
-          delta_evidence.append(
+          delta_evidence.append((
             f"path={path}; param={key}={value}; "
             f"new_markers={new_markers}; "
-            f"baseline_len={base_len}; probed_len={len(probed.text)}"
-          )
+            f"baseline_len={base_len}; probed_len={len(probed.text)}",
+            probed,
+          ))
           break
-      if delta_evidence:
-        break
 
-    if delta_evidence:
+    for item, proof in delta_evidence:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-10",
         title="Query parameter role override — server honors URL-controlled role",
@@ -995,7 +1122,7 @@ class AccessControlProbes(ProbeBase):
         owasp="A01:2021",
         cwe=["CWE-639", "CWE-285"],
         attack=["T1078"],
-        evidence=delta_evidence,
+        evidence=[item],
         replay_steps=[
           "GET a route as a regular user; record body.",
           "GET the same route with ``?role=admin`` (and other "
@@ -1005,8 +1132,9 @@ class AccessControlProbes(ProbeBase):
         remediation="Read role state from the authenticated session "
                     "ONLY. Strip / ignore role-related query parameters "
                     "before authorization decisions.",
+        evidence_artifacts=self.evidence_from(proof),
       ))
-    elif tested > 0:
+    if not delta_evidence and tested > 0:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A01-10",
         title="Query parameter role override — no privilege escalation observed",
@@ -1015,6 +1143,8 @@ class AccessControlProbes(ProbeBase):
         owasp="A01:2021",
         evidence=[f"paths_tested={len(targets)}", f"requests={tested}"],
       ))
+    elif not delta_evidence and denied > 0:
+      self.emit_endpoint_denied("PT-A01-10")
 
   def _test_hidden_field_tampering(self):
     """PT-A01-12: scan discovered forms for hidden inputs and try
@@ -1052,22 +1182,29 @@ class AccessControlProbes(ProbeBase):
       re.IGNORECASE,
     )
     tampered_evidence = []
+    tampered_response = None
     tested = 0
+    denied = 0
 
     for form_path in forms[:5]:
       url = self.target_url + form_path
-      self.safety.throttle()
       try:
         page = self.auth.regular_session.get(url, timeout=10)
       except Exception:
         continue
+      if page.status_code == 405:
+        continue  # POST-only action: no form to read, so no hidden field to tamper with
+      if not self.response_reached(page):
+        denied += 1
+        continue
       if page.status_code != 200:
         continue
+      page_text = page.text
 
       # Extract hidden inputs and detect any auth-related field.
       hidden_fields = {}
       for tag in re.finditer(
-        r'<input\b[^>]*type=["\']hidden["\'][^>]*>', page.text, re.I,
+        r'<input\b[^>]*type=["\']hidden["\'][^>]*>', page_text, re.I,
       ):
         attrs = tag.group(0)
         name_m = re.search(r'name=["\']([^"\']+)', attrs)
@@ -1081,11 +1218,11 @@ class AccessControlProbes(ProbeBase):
 
       # Also extract a CSRF token if needed.
       csrf_field = self.auth.detected_csrf_field or "csrfmiddlewaretoken"
-      csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
+      csrf_token = self.auth.extract_csrf_value(page_text, csrf_field)
 
       # Build payload: copy all visible fields, override auth fields.
       visible_inputs = {}
-      for tag in re.finditer(r'<input\b([^>]*)>', page.text, re.I):
+      for tag in re.finditer(r'<input\b([^>]*)>', page_text, re.I):
         attrs = tag.group(1)
         if 'type="hidden"' in attrs.lower() or "type='hidden'" in attrs.lower():
           continue
@@ -1105,13 +1242,16 @@ class AccessControlProbes(ProbeBase):
       if csrf_token:
         headers["X-CSRFToken"] = csrf_token
 
-      self.safety.throttle()
       try:
         resp = self.auth.regular_session.post(
           url, data=payload, headers=headers,
           timeout=10, allow_redirects=False,
         )
       except Exception:
+        continue
+      if not self.response_reached(resp):
+        # Payload denied or redirected to login: the handler never saw it.
+        denied += 1
         continue
       tested += 1
 
@@ -1125,6 +1265,9 @@ class AccessControlProbes(ProbeBase):
             f"form={form_path}; hidden_auth_fields="
             f"{sorted(auth_fields.keys())}; submit_status={resp.status_code}"
           )
+          tampered_response = resp
+          # The tampered POST is a write that cannot be undone here: stop
+          # after the first accepted one (same exclusion as PT-A01-06).
           break
 
     if tampered_evidence:
@@ -1147,6 +1290,7 @@ class AccessControlProbes(ProbeBase):
                     "Strip hidden auth-like fields server-side or use a "
                     "session-bound state token. ModelForms should not "
                     "include role / is_staff in their bound fields.",
+        evidence_artifacts=self.evidence_from(tampered_response),
       ))
     elif tested > 0:
       self.findings.append(GrayboxFinding(
@@ -1157,3 +1301,5 @@ class AccessControlProbes(ProbeBase):
         owasp="A01:2021",
         evidence=[f"forms_with_hidden_auth_fields={tested}"],
       ))
+    elif denied > 0:
+      self.emit_endpoint_denied("PT-A01-12")

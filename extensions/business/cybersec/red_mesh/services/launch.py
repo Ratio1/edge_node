@@ -23,6 +23,8 @@ def _launch_network_jobs(
   nr_local_workers_override=None,
   target_ports=None,
   execution_identity=None,
+  checkpoint_context=None,
+  restored=None,
 ):
   exceptions = job_config.get("exceptions", [])
   if not isinstance(exceptions, list):
@@ -82,8 +84,17 @@ def _launch_network_jobs(
   if not batches:
     raise ValueError("Unable to allocate port batches to workers.")
 
+  if restored:
+    # Resume (RM-201): one worker per saved payload, with its own id prefix and ports. The batches
+    # computed above are discarded: no reshuffle and no current worker count.
+    batches = [list(payload["initial_ports"]) for payload in restored]
+
+  # This node's whole port set (after a resume: the saved batches), without exceptions. A probe
+  # that follows a port the target names stays inside it, whichever worker's batch holds the port.
+  job_ports = sorted({p for batch in batches for p in batch} - set(exceptions))
   local_jobs = {}
   for index, batch in enumerate(batches):
+    local_id_prefix = str(restored[index]["local_id_prefix"]) if restored else str(index + 1)
     try:
       owner._require_worker_execution(job_id, job_config, execution_identity=execution_identity)
     except ValueError:
@@ -94,14 +105,15 @@ def _launch_network_jobs(
       owner.P("Launching {} requested by {} for target {} - {} ports. Port order {}".format(
         job_id, launcher, target, len(batch), port_order
       ))
-      batch_job = strategy.worker_cls(
+      worker_kwargs = dict(
         owner=owner,
-        local_id_prefix=str(index + 1),
+        local_id_prefix=local_id_prefix,
         target=target,
         job_id=job_id,
         initiator=launcher,
         exceptions=exceptions,
         worker_target_ports=batch,
+        job_ports=job_ports,
         excluded_features=excluded_features,
         enabled_features=enabled_features,
         scan_min_delay=scan_min_delay,
@@ -111,10 +123,19 @@ def _launch_network_jobs(
         scanner_identity=scanner_identity,
         scanner_user_agent=scanner_user_agent,
         timeout_profile=timeout_profile,
-        comparison_ports=comparison_ports if index == 0 else None,
+        comparison_ports=comparison_ports if local_id_prefix == "1" else None,
         execution_config=job_config,
         execution_identity=execution_identity,
+        **({"checkpoint_context": checkpoint_context} if checkpoint_context else {}),
       )
+      batch_job = strategy.worker_cls(**worker_kwargs)
+      if restored:
+        try:
+          batch_job.restore_from_checkpoint(restored[index])
+        except Exception as exc:
+          owner.P("Checkpoint restore failed for worker {} of {}: {}; launching it fresh".format(
+            local_id_prefix, job_id, exc), color='y')
+          batch_job = strategy.worker_cls(**worker_kwargs)
       batch_job.start()
       local_jobs[batch_job.local_worker_id] = batch_job
     except Exception as exc:
@@ -168,6 +189,8 @@ def launch_local_jobs(
   nr_local_workers_override=None,
   target_ports=None,
   execution_identity=None,
+  checkpoint_context=None,
+  restored=None,
 ):
   validate_effective_config(job_config, target=target)
   require_execution = getattr(owner, "_require_worker_execution", None)
@@ -201,4 +224,6 @@ def launch_local_jobs(
     nr_local_workers_override=nr_local_workers_override,
     target_ports=target_ports,
     execution_identity=execution_identity,
+    checkpoint_context=checkpoint_context,
+    restored=restored,
   )

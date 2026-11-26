@@ -34,10 +34,10 @@ TENANT_EXPORT_STATUS_ROUTES = (
 TENANT_REVIEW_READ_ROUTES = ("get_detection_correlation", "get_rulebook_assessment_status", "get_rulebook_review")
 # The typed rulebook artifact read: a job-recorded CID, never through get_report.
 TENANT_ARTIFACT_READ_ROUTES = ("get_rulebook_artifact",)
-ACTOR_ONLY_READ_ROUTES = ("llm_health", "update_finding_triage")
+ACTOR_ONLY_READ_ROUTES = ("llm_health",)
 # Job-less reads with a required tenant (RM-081 Phase 3c added the selector; RM-084 P1 removed the
 # unscoped half). The selector is appended last, as stop_monitoring's is.
-TENANT_JOBLESS_READ_ROUTES = ("get_misp_export_config_status", "get_integration_status")
+TENANT_JOBLESS_READ_ROUTES = ("get_misp_export_config_status", "get_integration_status", "get_triage_rates")
 TENANT_JSON_EXPORT_ROUTES = ("export_misp_json", "export_stix_json", "export_siem_events_json")
 # RM-026 I1b B1: effect endpoints sharing the strict read transport.
 EFFECT_ROUTES = ("dry_run_opencti_export", "dry_run_taxii_export", "export_stix_bundle",
@@ -45,7 +45,7 @@ EFFECT_ROUTES = ("dry_run_opencti_export", "dry_run_taxii_export", "export_stix_
                  "correlate_suricata_eve", "upload_authorization",
                  "save_rulebook_review_draft", "submit_rulebook_review",
                  "reopen_rulebook_review", "update_rulebook_review",
-                 "generate_rulebook_assessment", "stop_monitoring")
+                 "generate_rulebook_assessment", "stop_monitoring", "update_finding_triage")
 # RM-026 I1b B6/B7: admitted endpoints deliberately NOT on the strict read transport, because each
 # returns typed codes the guard would destroy -- `_read_error_response` allowlists only
 # {400,401,403,404,405,503} and rebuilds the body from scratch.
@@ -122,7 +122,11 @@ def _render_native(default_route=None):
     elif method.name in ACTOR_ONLY_READ_ROUTES:
       assert tuple(arg.arg for arg in method.args.args) == ("self", "request_actor")
     elif method.name in TENANT_JOBLESS_READ_ROUTES:
-      assert tuple(arg.arg for arg in method.args.args) == ("self", "request_actor", "tenant_id")
+      assert tuple(arg.arg for arg in method.args.args) == {
+        "get_misp_export_config_status": ("self", "request_actor", "tenant_id"),
+        "get_integration_status": ("self", "request_actor", "tenant_id"),
+        "get_triage_rates": ("self", "request_actor", "tenant_id", "engagement_id"),
+      }[method.name]
     elif method.name in TENANT_JSON_EXPORT_ROUTES:
       assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "pass_nr", "request_actor", "tenant_id")
     elif method.name in UNGUARDED_ROUTES:
@@ -162,6 +166,9 @@ def _render_native(default_route=None):
                                          "force", "request_actor", "tenant_id"),
         # RM-026 MVP: stop_monitoring opted into the tenant seam; the selector is appended last.
         "stop_monitoring": ("self", "job_id", "stop_type", "request_actor", "tenant_id"),
+        # RM-169 step 4a: the triage write, through the effect seam (it was a 503 actor-only route).
+        "update_finding_triage": ("self", "job_id", "finding_ids", "status", "note", "review_at",
+                                  "confirm", "request_actor", "tenant_id"),
       }[method.name]
       assert tuple(arg.arg for arg in method.args.args) == expected
     else:

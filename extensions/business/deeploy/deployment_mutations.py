@@ -6,7 +6,8 @@ import uuid
 from .deeploy_const import DEEPLOY_KEYS
 from .deeploy_mixin import COCKROACHDB_CERT_ENV_KEYS, COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS
 from .deeploy_job_mixin import DEEPLOY_JOBS_CSTORE_HKEY
-from .deployment_operations import request_digest, replace_nodes, required_instances
+from .deployment_operations import request_digest, required_instances
+from .relink_placement import relink_configs
 
 # ChainDist publishes {job_id: (old_node, new_node)} here for jobs whose stored placement
 # still names a node whose license its owner relinked to another node.
@@ -196,9 +197,12 @@ class _DeploymentMutationsMixin:
 
     Notes
     -----
-    The new node keeps the old node's settings, taken from the stored job, so it
-    may be the same machine with a new key or new hardware. dAuth moves per-node
-    secrets with the same aliases. The old node is never contacted.
+    The current address must already report the previous workload, as on a host
+    that kept its local deployment during a key change. The oracle also needs
+    an observation from every retained worker before it may start retirement.
+    A license relink alone gives no evidence that a workload on a different
+    machine stopped or that the new machine can restore it. dAuth moves the
+    per-node settings only after admission; the old address is never contacted.
     """
     pipeline = self.get_job_pipeline_from_cstore(job_id, timeout=30, pin=False,
                                                 raise_on_error=False, show_logs=False)
@@ -227,7 +231,7 @@ class _DeploymentMutationsMixin:
     self._assert_no_active_deployment(job_id=job_id)
     node_aliases = {old_node: new_node}
     prior, configs = self._mutation_baseline(request, owner)
-    configs = replace_nodes(configs, node_aliases)
+    configs = relink_configs(configs, node_aliases)
     for config in configs.values():
       config["DEEPLOY_SPECS"]["date_updated"] = self.time()
       config.pop("DEEPLOY_OPERATION", None)

@@ -11,8 +11,11 @@ import math as _math
 import struct as _struct
 
 from ..worker import PentestLocalWorker
+from ..connection_metrics import RESPONSIVE_CONNECTION_OUTCOMES
+from ..worker.correlation import apply_host_honeypot_verdict, http_without_https_redirect_findings
 from .live_progress import _LiveProgressMixin
 from ..models import UiAggregate
+from ..cve_view import apply_triage, drop_closed, filter_listed
 from ..models.finding_identity import (
   worker_attribution_fields as _worker_attribution_fields,
   volatile_non_content_fields as _volatile_non_content_fields,
@@ -40,6 +43,9 @@ _DEDUP_EXCLUDE_FIELDS = frozenset(
   {"_source_worker_id", "_source_node_addr"}
   | set(_worker_attribution_fields())
   | set(_volatile_non_content_fields())
+  # RM-169: per database build, so one finding seen by two workers on different pins still collapses;
+  # `_reconcile_volatile_fields` gives the survivor the build of the newer freshness.
+  | {"vulndb_build_id"}
 )
 
 
@@ -196,6 +202,8 @@ def _reconcile_volatile_fields(survivor, dropped):
     # comparison for the same reason `finding_rank` demotes one.
     if current is None or str(incoming) > str(current):
       survivor[field] = incoming
+      if field == "cvss_data_freshness" and dropped.get("vulndb_build_id"):
+        survivor["vulndb_build_id"] = dropped["vulndb_build_id"]
 
 
 def _dedup_findings_in_aggregated(aggregated):
@@ -332,6 +340,37 @@ def _compact_finding_signature(finding):
   return "sha256:" + _hashlib.sha256(stable).hexdigest()
 
 
+def get_host_aggregated_report(owner, node_reports, worker_cls=None, log_details=True):
+  """`owner._get_aggregated_report` over the node reports of a whole job, with the host honeypot fold applied once (D54).
+
+  Every merge that feeds risk scoring or LLM input goes through here (finalization, manual analysis). A failed
+  fold is logged by exception type and leaves the merged report as it was.
+  """
+  kwargs = {}
+  if worker_cls is not None:
+    kwargs["worker_cls"] = worker_cls
+  if not log_details:
+    kwargs["log_details"] = False
+  aggregated = owner._get_aggregated_report(node_reports, **kwargs)
+  if isinstance(aggregated, dict) and aggregated:
+    try:
+      verdict = apply_host_honeypot_verdict(aggregated)
+      if verdict:
+        owner.P(f"Host honeypot verdict {verdict}: CVE rows folded")
+    except Exception as exc:
+      owner.P(f"Host honeypot fold failed: {type(exc).__name__}", color='y')
+    try:
+      # RM-265: needs the whole host (the HTTP and TLS ports sit on different workers); idempotent on a re-merge.
+      new_rows = http_without_https_redirect_findings(aggregated)
+      if new_rows:
+        rows = aggregated.setdefault("correlation_findings", [])
+        seen = {r.get("finding_id") for r in rows if isinstance(r, dict)}
+        rows.extend(r for r in new_rows if r.get("finding_id") not in seen)
+    except Exception as exc:
+      owner.P(f"HTTP-without-HTTPS correlation failed: {type(exc).__name__}", color='y')
+  return aggregated
+
+
 class _ReportMixin:
   """Report aggregation and UI view methods for PentesterApi01Plugin."""
 
@@ -403,14 +442,24 @@ class _ReportMixin:
 
     routes = []
     forms = []
+    coverage_notes = []
+    admin_context = ""
+    primary_principal = ""
     for methods in service_info.values():
       if not isinstance(methods, dict):
         continue
+      auth_info = methods.get("_graybox_auth")
+      if isinstance(auth_info, dict):
+        admin_context = admin_context or str(auth_info.get("admin_context") or "")
+        primary_principal = primary_principal or str(auth_info.get("primary_principal") or "")
       discovery = methods.get("_graybox_discovery")
       if not isinstance(discovery, dict):
         continue
       routes.extend(discovery.get("routes") or [])
       forms.extend(discovery.get("forms") or [])
+      note = discovery.get("coverage_note")
+      if isinstance(note, str) and note and note not in coverage_notes:
+        coverage_notes.append(note)
 
     scenario_total = 0
     scenario_vulnerable = 0
@@ -442,6 +491,9 @@ class _ReportMixin:
       "total_forms_discovered": len(self._dedupe_items(forms)),
       "total_scenarios": scenario_total,
       "total_scenarios_vulnerable": scenario_vulnerable,
+      "graybox_coverage_note": " ".join(coverage_notes),
+      "graybox_admin_context": admin_context,
+      "graybox_primary_principal": primary_principal,
     }
 
   def _local_node_address(self):
@@ -579,25 +631,19 @@ class _ReportMixin:
               dct_aggregated_report[field] = local_job_status[field]
             elif field in aggregation_fields:
               type_or_func = aggregation_fields[field]
-              if field not in dct_aggregated_report:
-                field_type = type(local_job_status[field])
-                dct_aggregated_report[field] = field_type()
-              #endif
-              if isinstance(dct_aggregated_report[field], list):
-                existing = set(dct_aggregated_report[field])
-                merged = existing.union(local_job_status[field])
-                try:
-                  dct_aggregated_report[field] = sorted(merged)
-                except TypeError:
-                  dct_aggregated_report[field] = list(merged)
-              elif isinstance(dct_aggregated_report[field], dict):
-                dct_aggregated_report[field] = self.merge_objects_deep(
-                  dct_aggregated_report[field],
-                  local_job_status[field])
+              existing, new = dct_aggregated_report[field], local_job_status[field]
+              if existing is None or new is None:  # null is "no data", as in merge_objects_deep
+                dct_aggregated_report[field] = new if existing is None else existing
+              elif isinstance(existing, (list, dict)) or isinstance(new, (list, dict)):
+                merged = self.merge_objects_deep(existing, new)  # raises on a container/scalar mismatch, either order
+                if isinstance(merged, list):
+                  try:
+                    merged = sorted(merged)  # scalar lists (open_ports, completed_tests) stay sorted
+                  except TypeError:
+                    pass  # dict items keep merge order
+                dct_aggregated_report[field] = merged
               else:
-                _existing = dct_aggregated_report[field]
-                _new = local_job_status[field]
-                dct_aggregated_report[field] = type_or_func([_existing, _new])
+                dct_aggregated_report[field] = type_or_func([existing, new])
               # end if aggregation type
             # end if standard (one time) or aggregated fields
           # for each field in this local job
@@ -623,13 +669,13 @@ class _ReportMixin:
       # endif we have local jobs
     except Exception as exc:
       if log_details:
-        self.P("Error during report aggregation: {}:\n{}\n{}\ntype_or_func={}, field={}".format(
-          exc, self.trace_info(),
-          self.json_dumps(dct_aggregated_report, indent=2),
-          type_or_func, field
+        # No report bodies: thread reports are not credential-redacted yet.
+        self.P("Error during report aggregation: {}:\n{}\ntype_or_func={}, field={}".format(
+          exc, self.trace_info(), type_or_func, field
         ))
       else:
         self.P("Manual report aggregation failed", color='y')
+      dct_aggregated_report = {}  # all-or-nothing: never return a partial merge
     # Phase 0 dedup pass: collapse findings duplicated across workers
     # because each worker stamps its own _source_worker_id /
     # _source_node_addr before merge. The JSON-key fallback in
@@ -679,8 +725,13 @@ class _ReportMixin:
         return merged
     elif isinstance(obj_a, set) and isinstance(obj_b, set):
       return obj_a.union(obj_b)
+    elif obj_b is None or obj_a is None:
+      return obj_a if obj_b is None else obj_b  # null is "no data": never erases the other side
+    elif isinstance(obj_a, (dict, list, set)) or isinstance(obj_b, (dict, list, set)):
+      # A container against another type would erase one side: fail the merge.
+      raise TypeError(f"cannot merge {type(obj_b).__name__} into {type(obj_a).__name__}")
     else:
-      return obj_b  # Prefer obj_b in case of conflict
+      return obj_b  # Prefer obj_b in case of a scalar conflict
 
   def _redact_report(self, report):
     """
@@ -1009,7 +1060,11 @@ class _ReportMixin:
       # so they must not override "reached" when the node returned results.
       if not has_report and addr not in worker_scan_metrics:
         status = "failed"
-      elif outcomes and outcomes.get("connected", 0) == 0 and outcomes.get("timeout", 0) > 0:
+      elif (
+        outcomes
+        and outcomes.get("timeout", 0) > 0
+        and not any(outcomes.get(k, 0) for k in RESPONSIVE_CONNECTION_OUTCOMES)
+      ):
         status = "timeout"
       else:
         status = "reached"
@@ -1047,7 +1102,7 @@ class _ReportMixin:
       })
     return comparison
 
-  def _compute_ui_aggregate(self, passes, latest_aggregated, job_config=None):
+  def _compute_ui_aggregate(self, passes, latest_aggregated, job_config=None, triage=None):
     """Compute pre-aggregated view for frontend from pass reports.
 
     Parameters
@@ -1056,6 +1111,9 @@ class _ReportMixin:
       List of pass report dicts (PassReport.to_dict()).
     latest_aggregated : dict
       AggregatedScanData dict for the latest pass.
+    triage : dict or None
+      The live host triage map. `top_findings` is built over stamped copies, so a confirmed possible CVE can
+      reach it and a closed finding takes no slot; stored findings stay unstamped. Empty: unchanged.
 
     Returns
     -------
@@ -1072,10 +1130,16 @@ class _ReportMixin:
       "total_forms_discovered": 0,
       "total_scenarios": 0,
       "total_scenarios_vulnerable": 0,
+      "graybox_coverage_note": "",
+      "graybox_admin_context": "",
+      "graybox_primary_principal": "",
     }
     if scan_type == "webapp":
       graybox_stats = self._extract_graybox_ui_stats(agg, latest)
 
+    # RM-200: `total_findings` and `findings_count` below exclude tentative CVE findings (an unconfirmed version
+    # match); they are counted once in `unconfirmed_version_matches`. The raw findings stay in the archive.
+    # `latest_risk_breakdown.finding_counts` is the scored view (RM-169: rollups once, possible and closed out).
     # Every counter in this object uses the same predicate, or the object
     # contradicts itself: `total_findings` excluding coverage while the severity
     # chart counted it produced a header saying one finding above a chart
@@ -1083,13 +1147,27 @@ class _ReportMixin:
     real_findings = [f for f in findings if not _is_coverage_result(f)]
 
     # Severity breakdown
-    findings_count = dict(Counter(f.get("severity", "INFO") for f in real_findings))
+    # One predicate for every counter, over the triage-stamped copies: a triage-confirmed CVE row reads certain.
+    stamped = apply_triage(real_findings, triage)
+
+    def _unconfirmed(f):
+      return bool(f.get("cve")) and f.get("confidence") == "tentative"
+
+    unconfirmed = [f for f in stamped if _unconfirmed(f)]
+    confirmed = [f for f in stamped if not _unconfirmed(f)]
+    findings_count = dict(Counter(f.get("severity", "INFO") for f in confirmed))
 
     # Top findings: CRITICAL + HIGH, sorted by severity then confidence, capped
     # at 10. An `inconclusive` scenario keeps its *declared* severity, so
     # without the filter a scenario that concluded nothing was ranked into the
     # customer-facing top-findings list as a HIGH.
-    crit_high = [f for f in real_findings if f.get("severity") in ("CRITICAL", "HIGH")]
+    # Generated CVE findings: listed ones only (the rest are in a rollup or the possible section).
+    # The stamped copies only rank; the triage record is not kept on what is stored in the archive.
+    crit_high = [
+      {k: v for k, v in f.items() if k != "triage"} if triage and "triage" in f else f
+      for f in drop_closed(filter_listed(stamped, triage=triage), triage)
+      if f.get("severity") in ("CRITICAL", "HIGH") and not _unconfirmed(f)  # RM-200, static rows too
+    ]
     crit_high.sort(key=lambda f: (
       self.SEVERITY_ORDER.get(f.get("severity"), 9),
       self.CONFIDENCE_ORDER.get(f.get("confidence"), 9),
@@ -1139,7 +1217,8 @@ class _ReportMixin:
       total_services=self._count_services(agg.get("service_info", {})),
       # Findings, not scenario results: a graybox scan emits one entry per
       # scenario whatever the outcome, so `len(findings)` counted the tests run.
-      total_findings=len(real_findings),
+      total_findings=len(confirmed),
+      unconfirmed_version_matches=len(unconfirmed),
       findings_count=findings_count if findings_count else None,
       top_findings=top_findings if top_findings else None,
       finding_timeline=finding_timeline if finding_timeline else None,
@@ -1163,4 +1242,7 @@ class _ReportMixin:
       total_forms_discovered=graybox_stats["total_forms_discovered"],
       total_scenarios=graybox_stats["total_scenarios"],
       total_scenarios_vulnerable=graybox_stats["total_scenarios_vulnerable"],
+      graybox_coverage_note=graybox_stats["graybox_coverage_note"],
+      graybox_admin_context=graybox_stats["graybox_admin_context"],
+      graybox_primary_principal=graybox_stats["graybox_primary_principal"],
     )

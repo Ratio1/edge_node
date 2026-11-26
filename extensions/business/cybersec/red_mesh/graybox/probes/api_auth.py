@@ -63,27 +63,26 @@ class ApiAuthProbes(ProbeBase):
 
   # ── helpers ────────────────────────────────────────────────────────
 
-  def _obtain_token(self, *, consume_budget: bool = True):
+  def _obtain_token(self, *, rollback: bool = False):
     """Return (token, raw_payload) from token_path or configured bearer session."""
     tok = self.target_config.api_security.token_endpoints
-    session = self.auth.official_session or self.auth.regular_session
+    session = self.auth.primary_session
     if session is None:
       return None, None
     if not tok.token_path:
       token = self._configured_session_bearer_token(session)
       return (token, {"source": "configured_bearer_token"}) if token else (None, None)
-    if consume_budget and not self.budget():
-      return None, None
     url = self.target_url + tok.token_path
     method = (getattr(tok, "token_request_method", "POST") or "POST").upper()
     body = dict(getattr(tok, "token_request_body", {}) or {})
-    self.safety.throttle()
     try:
       req = getattr(session, method.lower(), session.post)
+      # A rollback re-issues the token even on an exhausted budget.
+      extra = {"budget_exempt": True} if rollback else {}
       if method in ("GET", "DELETE"):
-        resp = req(url, params=body, timeout=10)
+        resp = req(url, params=body, timeout=10, **extra)
       else:
-        resp = req(url, json=body if body else None, timeout=10)
+        resp = req(url, json=body if body else None, timeout=10, **extra)
     except requests.RequestException:
       return None, None
     if resp.status_code >= 400:
@@ -150,11 +149,21 @@ class ApiAuthProbes(ProbeBase):
     forged = _forge_jwt({"alg": "none", "typ": "JWT"}, forged_payload)
 
     url = self.target_url + tok.protected_path
-    if not self.budget():
+    if not self.budget_available(2):
+      self.emit_inconclusive("PT-OAPI2-01", title, owasp, "budget_exhausted")
       return
-    self.safety.throttle()
     session = self.auth.make_anonymous_session()
     try:
+      # Baseline: the real token must reach the protected path first, else a
+      # denial of the forged token proves nothing.
+      baseline = session.get(
+        url, headers=self._auth_headers_for_token(real_token),
+        timeout=10,
+        allow_redirects=False,
+      )
+      if not self.response_reached(baseline):
+        self.emit_endpoint_denied("PT-OAPI2-01")
+        return
       resp = session.get(
         url, headers=self._auth_headers_for_token(forged),
         timeout=10,
@@ -168,7 +177,7 @@ class ApiAuthProbes(ProbeBase):
     finally:
       session.close()
 
-    if resp.status_code < 400:
+    if self.response_reached(resp):
       self.emit_vulnerable(
         "PT-OAPI2-01", title,
         "CRITICAL", owasp, ["CWE-347", "CWE-327"],
@@ -291,11 +300,10 @@ class ApiAuthProbes(ProbeBase):
       return t
 
     def mutate(base):
-      if not self.budget():
+      if not self.budget_available():
         no_mutation_reason[0] = "budget_exhausted"
         return False
       url = self.target_url + tok.logout_path
-      self.safety.throttle()
       session = self.auth.make_anonymous_session()
       try:
         resp = session.post(
@@ -312,8 +320,6 @@ class ApiAuthProbes(ProbeBase):
       return accepted
 
     def verify(base):
-      if not self.budget():
-        raise RuntimeError("budget_exhausted")
       url = self.target_url + tok.protected_path
       session = self.auth.make_anonymous_session()
       try:
@@ -329,7 +335,7 @@ class ApiAuthProbes(ProbeBase):
       return resp.status_code < 400
 
     def revert(base):
-      fresh_token, _ = self._obtain_token(consume_budget=False)
+      fresh_token, _ = self._obtain_token(rollback=True)
       return bool(fresh_token)
 
     self.run_stateful(

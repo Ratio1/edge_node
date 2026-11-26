@@ -27,28 +27,24 @@ Arithmetic is exact (`Fraction`); the verdict is taken from the exact values; `c
 from __future__ import annotations
 
 from fractions import Fraction
+from types import SimpleNamespace
 
 from extensions.business.cybersec.red_mesh.references.framework_packs import (
-  FRAMEWORK_LEVELS,
+  FrameworkPackError,
   controls_for_level,
-  level_index,
+  pack_levels,
+)
+
+from .framework_entry_validation import (
+  CAPS, JOB_REF, _EVIDENCE_REF, AssessmentInvalid, bounded_text, normalize_evidence_refs,
 )
 
 SCORING_ID = "maturity_two_axis.v1"
 AXES = ("documentation", "implementation")
 NA = "N/A"
 SCORE_VALUES = (1, 2, 3, 4, 5)
-
-# Caps from the contract. Validation uses them; the Navigator mirrors them.
-CAPS = {
-  "justification": 500,
-  "exclusion_justification": 500,
-  "evidence_refs": 5,
-  "sectoral_requirements": 2000,
-  "remediation_items": 50,
-  "remediation_action": 500,
-}
-
+_THRESHOLD_KEYS = ("key_measure_min", "category_min", "total_min", "excluded_value", "max_excluded")
+_CONTROL_KEYS = ("category", "subcategory", "entry_level", "key_measure", "management_aspect")
 
 def _err(code: str, ids=None, **extra) -> dict:
   out = {"code": code}
@@ -56,6 +52,13 @@ def _err(code: str, ids=None, **extra) -> dict:
     out["ids"] = sorted(ids)
   out.update(extra)
   return out
+
+
+def _rule(rules: dict | None, key: str) -> bool:
+  """A manifest rule switch; absent means on, which is how the DNSC pack has always run.
+  Direct callers of `validate_for_submit` / `validate_scores` with no rule block (the scoring unit tests)
+  rely on this default; every pack reached through the registry carries a full manifest rule block."""
+  return bool((rules or {}).get(key, True))
 
 
 def _mean(values: list[Fraction]) -> Fraction | None:
@@ -76,13 +79,13 @@ def _axis_value(entry: dict, axis: str):
   return entry.get(axis) if isinstance(entry, dict) else None
 
 
-def validate_scores(pack: dict, level: str, scores: dict) -> list[dict]:
+def validate_scores(pack: dict, level: str, scores: dict, rules: dict | None = None) -> list[dict]:
   """Shape and exclusion rules (rules 1 and 2). Returns a list of error dicts; empty means valid.
 
   Unscored controls are not an error here (they are at submit, see validate_for_submit).
   """
   errors: list[dict] = []
-  if level not in FRAMEWORK_LEVELS:
+  if level not in pack_levels(pack):
     return [_err("unknown_level", level=level)]
   counted = {c["ref_id"]: c for c in controls_for_level(pack, level)}
   all_ids = {c["ref_id"] for c in pack["controls"]}
@@ -123,7 +126,7 @@ def validate_scores(pack: dict, level: str, scores: dict) -> list[dict]:
       th = pack["thresholds"][level]
       if control["management_aspect"] and th.get("management_aspect_excludable") is False:
         excl_ma.append(ref_id)
-      if not str(entry.get("exclusion_justification") or "").strip():
+      if _rule(rules, "exclusion_reason_required") and not str(entry.get("exclusion_justification") or "").strip():
         excl_no_just.append(ref_id)
   if bad_values:
     errors.append(_err("invalid_score_value", set(bad_values)))
@@ -143,7 +146,7 @@ def validate_scores(pack: dict, level: str, scores: dict) -> list[dict]:
   return errors
 
 
-def score(pack: dict, level: str, scores: dict) -> dict:
+def score(pack: dict, level: str, scores: dict, *, context=None) -> dict:
   """Compute rollups and the verdict (rules 1, 3, 4) for the scored controls of `level`.
 
   Callers run validate_scores first; this function assumes the exclusion rules hold and treats
@@ -260,10 +263,11 @@ def required_remediation_items(computed: dict) -> list[str]:
   return items
 
 
-def validate_for_submit(pack: dict, level: str, draft: dict) -> tuple[list[dict], dict | None]:
-  """Rule 5 plus rules 1 and 2. Returns (errors, computed); computed is None on shape errors."""
+def validate_for_submit(pack: dict, level: str, draft: dict, rules: dict | None = None) -> tuple[list[dict], dict | None]:
+  """Rule 5 plus rules 1 and 2. Returns (errors, computed); computed is None on shape errors.
+  `rules` is the manifest rule block: its switches turn the justification, sign-off and remediation checks off."""
   scores = draft.get("scores") if isinstance(draft, dict) else None
-  errors = validate_scores(pack, level, scores or {})
+  errors = validate_scores(pack, level, scores or {}, rules)
   if errors:
     return errors, None
   computed = score(pack, level, scores or {})
@@ -272,7 +276,7 @@ def validate_for_submit(pack: dict, level: str, draft: dict) -> tuple[list[dict]
   missing_just = []
   for ref_id in {c["ref_id"] for c in controls_for_level(pack, level)}:
     entry = (scores or {}).get(ref_id)
-    if not isinstance(entry, dict) or _is_excluded(entry):
+    if not _rule(rules, "justification_required") or not isinstance(entry, dict) or _is_excluded(entry):
       continue
     just = entry.get("justification") if isinstance(entry.get("justification"), dict) else {}
     for axis in AXES:
@@ -283,12 +287,13 @@ def validate_for_submit(pack: dict, level: str, draft: dict) -> tuple[list[dict]
   if missing_just:
     errors.append(_err("justification_missing", set(missing_just)))
   signoff = draft.get("management_signoff") if isinstance(draft, dict) else None
-  if not (isinstance(signoff, dict) and str(signoff.get("name") or "").strip()
-          and str(signoff.get("role") or "").strip() and str(signoff.get("date") or "").strip()):
+  if _rule(rules, "signoff_required") and not (
+      isinstance(signoff, dict) and str(signoff.get("name") or "").strip()
+      and str(signoff.get("role") or "").strip() and str(signoff.get("date") or "").strip()):
     errors.append(_err("management_signoff_missing"))
   if not str((draft or {}).get("completion_date") or "").strip():
     errors.append(_err("completion_date_missing"))
-  if not computed["verdict"]["passed"] and not computed["unscored"]:
+  if _rule(rules, "remediation_on_fail") and not computed["verdict"]["passed"] and not computed["unscored"]:
     needed = required_remediation_items(computed)
     items = (draft or {}).get("remediation") or []
     present = set()
@@ -300,3 +305,146 @@ def validate_for_submit(pack: dict, level: str, draft: dict) -> tuple[list[dict]
     if missing:
       errors.append(_err("remediation_missing", missing))
   return errors, computed
+
+
+# -- entry hooks: the caller's `scores[ref_id]` in, the stored entry out --------------------------------
+# (moved here from `tenancy/compliance.py`; `compliance` re-exports the names it and the tests use)
+
+_ENTRY_KEYS = frozenset({"documentation", "implementation", "excluded", "justification", "exclusion_justification",
+                         "evidence_refs", "updated_by", "updated_at"})
+
+
+def _axis(value):
+  if value is None or value == NA:
+    return value
+  if type(value) is int and value in SCORE_VALUES:
+    return value
+  raise AssessmentInvalid("invalid_score_value")
+
+
+def normalize_score_entry(entry, *, actor, now):
+  """One control's entry as the caller sends it, with its justifications and references."""
+  if not isinstance(entry, dict):
+    raise AssessmentInvalid("invalid_score_value")
+  excluded = entry.get("excluded", False)
+  if type(excluded) is not bool:
+    raise AssessmentInvalid("invalid_score_value")
+  justification = entry.get("justification") or {}
+  if not isinstance(justification, dict):
+    raise AssessmentInvalid("invalid_request")
+  return {
+    "documentation": _axis(entry.get("documentation")),
+    "implementation": _axis(entry.get("implementation")),
+    "excluded": excluded,
+    "justification": {axis: bounded_text(justification.get(axis), CAPS["justification"]) for axis in AXES},
+    "exclusion_justification": (bounded_text(entry.get("exclusion_justification"), CAPS["exclusion_justification"])
+                                or None),
+    "evidence_refs": normalize_evidence_refs(entry.get("evidence_refs")),
+    "updated_by": actor,
+    "updated_at": now,
+  }
+
+
+def normalise_patch(pack: dict, rules: dict, scores: dict, *, actor: str, now: str) -> dict:
+  """Hook: the `scores` of a save patch (`ref_id -> entry | None`), normalised; None removes the entry.
+  An error names the control; a key of another scorer's entry shape is refused."""
+  out = {}
+  for ref_id, entry in scores.items():
+    if entry is None:
+      out[ref_id] = None
+      continue
+    try:
+      if isinstance(entry, dict) and set(entry) - _ENTRY_KEYS:
+        raise AssessmentInvalid("invalid_score_value")
+      out[ref_id] = normalize_score_entry(entry, actor=actor, now=now)
+    except AssessmentInvalid as exc:
+      raise AssessmentInvalid(exc.code, exc.ids or [ref_id], **exc.extra) from None
+  return out
+
+
+def validate_stored_entry(pack: dict, ref_id: str, entry: dict) -> list[dict]:
+  """Hook: store validator for one stored entry (read path and RM-108 classification)."""
+  if not isinstance(entry, dict) or not isinstance(entry.get("justification"), dict):
+    return [_err("invalid_stored_entry", [ref_id])]
+  return []
+
+
+def entry_schema(pack: dict) -> dict:
+  """Hook: shape and caps of one `scores[ref_id]` entry."""
+  return {"axes": list(AXES), "values": [*SCORE_VALUES, NA], "caps": dict(CAPS)}
+
+
+def verdict_summary(computed: dict) -> dict:
+  """The compact verdict kept in `history[]`."""
+  verdict = computed["verdict"]
+  return {"passed": verdict["passed"], "total": verdict["total"],
+          "failing_key_measures": list(verdict["failing_key_measures"]),
+          "failing_categories": list(verdict["failing_categories"]),
+          "total_failed": verdict["total_failed"]}
+
+
+def pack_view_extras(pack: dict, text: dict | None) -> dict:
+  """Hook: the scorer-specific part of the pack view (the per-level thresholds)."""
+  return {"thresholds": {level: dict(th) for level, th in (pack.get("thresholds") or {}).items()}}
+
+
+def capabilities() -> dict:
+  """Hook: the flags the Navigator reads for a pack on this scorer."""
+  return {"has_levels": True, "has_verdict": True, "has_remediation": True, "axes": list(AXES)}
+
+
+def check_pack(pack: dict, text: dict | None) -> None:
+  """Scorer-owned schema check, called twice per pack: with `text` None when the pack file loads (levels,
+  thresholds, control keys), and with the text dict when a text file loads (only the maturity scale)."""
+  pid = pack["pack_id"]
+  if text is not None:
+    if "maturity_levels" in text and [m.get("value") for m in text["maturity_levels"]] != list(SCORE_VALUES):
+      raise FrameworkPackError(f"{pid}: maturity_levels must be 1..5")
+    return
+  if not pack_levels(pack):
+    raise FrameworkPackError(f"{pid}: {SCORING_ID} needs levels")
+  for level in pack_levels(pack):
+    th = (pack.get("thresholds") or {}).get(level)
+    if not isinstance(th, dict) or any(k not in th for k in _THRESHOLD_KEYS):
+      raise FrameworkPackError(f"{pid}: thresholds for {level} incomplete")
+  for control in pack["controls"]:
+    if any(k not in control for k in _CONTROL_KEYS):
+      raise FrameworkPackError(f"{pid}: control {control.get('ref_id')!r} incomplete")
+  if "counts" in pack and pack["counts"].get("controls") != len(pack["controls"]):
+    raise FrameworkPackError(f"{pid}: counts.controls {pack['counts'].get('controls')} != {len(pack['controls'])}")
+
+
+# Scorer registry (contract `redmesh.framework_scorer.v1`, §Generalisation): keyed by `pack["scoring"]`.
+# Hooks: `check_pack`, `entry_schema`, `normalise_patch`, `validate_stored_entry`, `compute`, `validate_for_submit` (with the manifest `rules`), `verdict_summary`, `pack_view_extras`, `capabilities`.
+SCORERS: dict = {}
+
+
+def register_scorer(scoring_id: str, scorer) -> None:
+  SCORERS[scoring_id] = scorer
+
+
+def scorer_for(pack: dict):
+  try:
+    return SCORERS[pack.get("scoring")]
+  except KeyError:
+    raise FrameworkPackError(f"unknown scoring {pack.get('scoring')!r}") from None
+
+
+register_scorer(SCORING_ID, SimpleNamespace(
+  check_pack=check_pack,
+  entry_schema=entry_schema,
+  normalise_patch=normalise_patch,
+  validate_stored_entry=validate_stored_entry,
+  compute=score,
+  validate_for_submit=lambda pack, rules, level, draft: validate_for_submit(pack, level, draft, rules),
+  verdict_summary=verdict_summary,
+  pack_view_extras=pack_view_extras,
+  capabilities=capabilities,
+))
+
+# Status implementation depends only on shared entry validators, never this registry.
+from . import framework_status_scoring
+register_scorer(framework_status_scoring.SCORING_ID, framework_status_scoring)
+
+from . import framework_csf_scoring
+register_scorer(framework_csf_scoring.SCORING_ID, framework_csf_scoring)

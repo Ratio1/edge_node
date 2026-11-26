@@ -137,6 +137,10 @@ class JobConfig:
   engagement_id: str = None
   engagement_hash: str = None
   contract_sha256: str = None
+  # RM-251: the scope the engagement authorized at launch (`"all"` or ranges / catalogue ids). Named for the
+  # engagement: an archive from before RM-128 may carry its own `authorized_ports` string, which is not this.
+  engagement_authorized_ports: str | list = None
+  engagement_authorized_tests: str | list = None
   execution_binding: ExecutionBinding | None = None
 
   def __post_init__(self):
@@ -240,6 +244,8 @@ class JobConfig:
       engagement_id=d.get("engagement_id"),
       engagement_hash=d.get("engagement_hash"),
       contract_sha256=d.get("contract_sha256"),
+      engagement_authorized_ports=d.get("engagement_authorized_ports"),
+      engagement_authorized_tests=d.get("engagement_authorized_tests"),
     )
 
   # -- Phase 3 PR-3.3: convenience accessors for the typed shape --
@@ -343,6 +349,7 @@ class PassReport:
   llm_analysis: str = None          # markdown — legacy
   quick_summary: str = None         # 2-4 sentences
   llm_failed: bool = None           # True if LLM API was unavailable — absent on success (_strip_none)
+  llm_failure_reason: str = None    # RM-221: why (execution_authority_denied, provider_error, ...); only with llm_failed
 
   # Phase 4 PR-4.1 structured LLM payload — LlmReportSections.to_dict()
   # output. Consumed by the Phase 6/7 PDF Executive Summary, Exploitation
@@ -389,6 +396,7 @@ class PassReport:
       llm_analysis=d.get("llm_analysis"),
       quick_summary=d.get("quick_summary"),
       llm_failed=d.get("llm_failed"),
+      llm_failure_reason=d.get("llm_failure_reason"),
       llm_report_sections=d.get("llm_report_sections"),
       findings=read_archived_findings(d.get("findings")),
       scan_metrics=d.get("scan_metrics"),
@@ -421,12 +429,16 @@ class UiAggregate:
   worker_activity: list = None      # [ { id, start_port, end_port, open_ports, country } ]
   country_breakdown: list = None    # [ { code, count } ] origin countries the pass ran from
   node_comparison: list = None      # per-node vantage-point comparison (comparison_mode only); see report.py
+  unconfirmed_version_matches: int = 0  # RM-200: tentative CVE findings, outside total_findings and findings_count
   # ── graybox-aware ──
   scan_type: str = "network"
   total_routes_discovered: int = 0          # webapp: discovered routes
   total_forms_discovered: int = 0           # webapp: discovered forms
   total_scenarios: int = 0                  # webapp: probe scenarios run
   total_scenarios_vulnerable: int = 0       # webapp: vulnerable count
+  graybox_coverage_note: str = ""           # webapp: discovery coverage (regular-only scan states what it could not reach)
+  graybox_admin_context: str = ""           # webapp: "provided" or "absent"
+  graybox_primary_principal: str = ""       # webapp: "official" or "regular", the principal the scan ran as
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -446,11 +458,15 @@ class UiAggregate:
       worker_activity=d.get("worker_activity"),
       country_breakdown=d.get("country_breakdown"),
       node_comparison=d.get("node_comparison"),
+      unconfirmed_version_matches=d.get("unconfirmed_version_matches", 0),
       scan_type=d.get("scan_type", "network"),
       total_routes_discovered=d.get("total_routes_discovered", 0),
       total_forms_discovered=d.get("total_forms_discovered", 0),
       total_scenarios=d.get("total_scenarios", 0),
       total_scenarios_vulnerable=d.get("total_scenarios_vulnerable", 0),
+      graybox_coverage_note=d.get("graybox_coverage_note", ""),
+      graybox_admin_context=d.get("graybox_admin_context", ""),
+      graybox_primary_principal=d.get("graybox_primary_principal", ""),
     )
 
 
@@ -482,6 +498,8 @@ class JobArchive:
   start_attestation: dict = None
   failure_class: str = ""
   failure_message: str = ""
+  attestation_status: str = None    # RM-221: submitted | failed | submitting; absent without an end attestation
+  attestation_failure_reason: str = None
   soc_event_status: dict = None
   detection_correlation: dict = None
   stix_export: dict = None
@@ -520,6 +538,8 @@ class JobArchive:
       start_attestation=d.get("start_attestation"),
       failure_class=d.get("failure_class", ""),
       failure_message=d.get("failure_message", ""),
+      attestation_status=d.get("attestation_status"),
+      attestation_failure_reason=d.get("attestation_failure_reason"),
       soc_event_status=d.get("soc_event_status"),
       detection_correlation=d.get("detection_correlation"),
       stix_export=d.get("stix_export"),

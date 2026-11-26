@@ -14,11 +14,14 @@ from .findings import (
   FindingRedactionContext,
   GrayboxEvidenceArtifact,
   GrayboxFinding,
+  evidence_blob,
+  evidence_content_sha256,
 )
 from .auth import AuthManager
 from .discovery import DiscoveryModule
+from .budget import RequestRefused
 from .http_client import GrayboxHttpClient
-from .safety import SafetyControls
+from .safety import GrayboxAbort, SafetyControls
 from .rollback import RollbackJournalRepository
 from .scenario_runtime import GrayboxWorkerAssignment
 from .models import (
@@ -30,9 +33,14 @@ from .models import (
   GrayboxTargetConfig,
 )
 
+# The evidence add is synchronous on the scan thread: past this many blobs a
+# worker's findings keep their content hash only.
+MAX_EVIDENCE_BLOBS_PER_WORKER = 200
+
 # Weak auth uses a direct import (not the registry) because it is a
 # distinct pipeline phase, not a generic probe.
 from .probes.business_logic import BusinessLogicProbes
+from .probes.misconfig import MisconfigProbes
 
 
 PROBE_LEVEL_SKIP_OWASP = {
@@ -54,20 +62,7 @@ def _first_non_empty_str(values):
   return ""
 
 
-class GrayboxAbort(Exception):
-  """Signal that the graybox pipeline must stop immediately.
-
-  Raised only from inside phase methods when a fatal safety or policy
-  gate fails (unauthorized target, preflight rejection, unrecoverable
-  auth failure). Caught exclusively by GrayboxLocalWorker.execute_job
-  — do not catch elsewhere. The fatal finding is always recorded via
-  _record_fatal before the exception is raised.
-  """
-
-  def __init__(self, reason: str, reason_class: str = "unknown"):
-    self.reason = reason
-    self.reason_class = reason_class
-    super().__init__(reason)
+# GrayboxAbort lives in graybox.safety (the HTTP gate raises it); re-exported here.
 
 
 class GrayboxLocalWorker(BaseLocalWorker):
@@ -115,6 +110,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
     self._execution_identity = execution_identity
     self._port = parsed.port or (443 if parsed.scheme == "https" else 80)
     self._port_key = str(self._port)
+    self._evidence_blobs_stored = 0
 
     self.initial_ports = [self._port]
 
@@ -137,11 +133,13 @@ class GrayboxLocalWorker(BaseLocalWorker):
     self.request_budget = RequestBudget(
       remaining=budget_total, total=budget_total,
     )
-    # Built before the client so redirect hops are throttled, not just budgeted.
+    # Built before the client: the client charges the budget and paces every request.
     self.safety = SafetyControls(
       request_delay=job_config.scan_min_delay or None,
       request_delay_max=job_config.scan_max_delay or None,
       target_is_local=SafetyControls.is_local_target(target_url),
+      # The stop_event is created in start(), after this client: pass the method.
+      stop_check=self._check_stopped,
     )
     self.http_client = GrayboxHttpClient(
       self.target_url,
@@ -152,11 +150,14 @@ class GrayboxLocalWorker(BaseLocalWorker):
       gateway_bearer_refresh_token=getattr(
         job_config, "gateway_bearer_refresh_token", "",
       ) or "",
-      # So redirect hops are charged where they are actually issued. A probe
-      # consults the budget once per logical call, but the client follows up to
-      # five redirects and those extra requests were counted by nobody.
+      # The client charges and paces every request it sends, redirect hops
+      # included, so `budget_remaining` is the real request count.
       request_budget=self.request_budget,
       safety=self.safety,
+      # RM-273 (D30): the engagement snapshot's flag; absent means private targets are refused.
+      allow_private_targets=(
+        isinstance(getattr(job_config, "engagement", None), dict)
+        and job_config.engagement.get("allow_private_targets") is True),
       execution_binding=getattr(job_config, "execution_binding", None),
     )
 
@@ -314,8 +315,16 @@ class GrayboxLocalWorker(BaseLocalWorker):
         return
 
       self._run_weak_auth_phase(discovery_result)
+      if self._check_stopped():
+        return
+
+      self._run_lockout_checks(discovery_result)
 
     except GrayboxAbort as exc:
+      if exc.reason_class == "stopped":
+        # An operator stop seen at the HTTP gate: canceled, not aborted.
+        self.state["canceled"] = True
+        return
       self.state["aborted"] = True
       self.state["abort_reason"] = exc.reason
       self.state["abort_phase"] = self._phase
@@ -344,7 +353,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
   def _safe_cleanup(self):
     """Run auth.cleanup without letting its errors mask an earlier abort."""
     try:
-      self.auth.cleanup()
+      self.auth.cleanup(final=True)
     except Exception as exc:
       self.P(
         "[GRAYBOX] auth.cleanup raised during shutdown: %s"
@@ -371,6 +380,12 @@ class GrayboxLocalWorker(BaseLocalWorker):
     self._record_fatal(reason)
     raise GrayboxAbort(reason, reason_class=reason_class)
 
+  def _abort_refused(self, exc, where):
+    """Abort the scan because a request was refused (budget spent or target throttling)."""
+    what = ("Request budget exhausted" if exc.reason == "budget_exhausted"
+            else "Target kept throttling requests")
+    self._abort(f"{what} during {where}.", reason_class=exc.reason)
+
   def _run_preflight_phase(self):
     self._set_phase("preflight")
     self.metrics.phase_start("preflight")
@@ -389,7 +404,10 @@ class GrayboxLocalWorker(BaseLocalWorker):
       if target_error:
         self._abort(target_error, reason_class="unauthorized_target")
 
-      preflight_error = self.auth.preflight_check()
+      try:
+        preflight_error = self.auth.preflight_check()
+      except RequestRefused as exc:
+        self._abort_refused(exc, "preflight")
       if preflight_error:
         self._abort(preflight_error, reason_class="preflight_error")
 
@@ -421,9 +439,14 @@ class GrayboxLocalWorker(BaseLocalWorker):
     self.metrics.phase_start("authentication")
     self._phase_open = True
     try:
-      auth_ok = self.auth.authenticate(
-        self._credentials.official, self._credentials.regular,
-      )
+      try:
+        auth_ok = self.auth.authenticate(
+          self._credentials.official, self._credentials.regular,
+        )
+      except RequestRefused as exc:
+        self._abort_refused(exc, "authentication")
+      # Probes read the login page and field names the form search detected.
+      self.target_config = self.auth.target_config
       self._store_auth_results()
       self.state["completed_tests"].append("graybox_auth")
     finally:
@@ -431,8 +454,9 @@ class GrayboxLocalWorker(BaseLocalWorker):
       self._phase_open = False
 
     if not auth_ok:
+      reason = self.auth.failure_reason() or "Authentication failed"
       self._abort(
-        "Official authentication failed. Cannot proceed with graybox scan.",
+        f"Graybox authentication failed: {reason}. Cannot proceed with graybox scan.",
         reason_class="auth_failed",
       )
 
@@ -453,7 +477,8 @@ class GrayboxLocalWorker(BaseLocalWorker):
           known_routes=self.job_config.app_routes,
         )
         result = DiscoveryResult(routes=routes, forms=forms)
-      self._store_discovery_results(result.routes, result.forms)
+      self._store_discovery_results(
+        result.routes, result.forms, fetch_failures=result.fetch_failures)
       self.state["completed_tests"].append("graybox_discovery")
       return result
     finally:
@@ -469,6 +494,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
       safety=self.safety,
       discovered_routes=discovery_result.routes,
       discovered_forms=discovery_result.forms,
+      discovered_candidates=discovery_result.candidates,
       regular_username=self._credentials.regular.username if self._credentials.regular else "",
       allow_stateful=self.job_config.allow_stateful_probes,
       request_budget=self.request_budget,
@@ -528,13 +554,27 @@ class GrayboxLocalWorker(BaseLocalWorker):
         bl_probe = BusinessLogicProbes(
           **dict(probe_context.to_kwargs(), allow_stateful=False),
         )
+        # A wrong password for a configured principal could lock the
+        # account the scan logs in with, so those usernames are skipped.
+        configured = {
+          cred.username.strip().casefold()
+          for cred in (self._credentials.official, self._credentials.regular)
+          if cred is not None and cred.username
+        }
+        candidates = [
+          cand for cand in self._credentials.weak_candidates
+          if cand.split(":", 1)[0].strip().casefold() not in configured
+        ]
         try:
           weak_findings = bl_probe.run_weak_auth(
-            self._credentials.weak_candidates,
+            candidates,
             self._credentials.max_weak_attempts,
           )
           self._store_findings("_graybox_weak_auth", weak_findings)
           self.metrics.record_probe("_graybox_weak_auth", "completed")
+        except GrayboxAbort:
+          self._keep_partial("_graybox_weak_auth", bl_probe)
+          raise
         except Exception as exc:
           self._record_probe_error("_graybox_weak_auth", exc)
           self.metrics.record_probe("_graybox_weak_auth", "failed")
@@ -545,10 +585,41 @@ class GrayboxLocalWorker(BaseLocalWorker):
     elif self._credentials.weak_candidates and "_graybox_weak_auth" in (self.job_config.excluded_features or []):
       self.metrics.record_probe("_graybox_weak_auth", "skipped:disabled")
 
+  def _run_lockout_checks(self, discovery_result: DiscoveryResult):
+    """Run the checks that send wrong passwords for a configured username.
+
+    They run last, after every probe and the weak_auth phase, because a
+    lockout they trigger would make any later session refresh fail.
+    """
+    excluded = set(self.job_config.excluded_features or [])
+    if "graybox" in excluded or "_graybox_misconfig" in excluded:
+      return
+    store_key = "_graybox_lockout_checks"
+    probe = None
+    try:
+      probe = MisconfigProbes(**self._build_probe_kwargs(discovery_result).to_kwargs())
+      self._store_findings(store_key, probe.run_lockout_checks())
+      self.metrics.record_probe(store_key, "completed")
+    except GrayboxAbort:
+      self._keep_partial(store_key, probe)
+      raise
+    except Exception as exc:
+      self._record_probe_error(store_key, exc)
+      self.metrics.record_probe(store_key, "failed")
+
+  def _keep_partial(self, key, probe):
+    """A stop (or abort) interrupted a probe: keep the findings it had collected."""
+    if probe is not None:
+      self._store_findings(key, probe.findings)
+      self.metrics.record_probe(key, "stopped")
+
   def _run_registered_probe(self, entry, probe_context: GrayboxProbeContext):
     """Run one registered probe through a shared capability and error boundary."""
     probe_def = GrayboxProbeDefinition.from_entry(entry)
     store_key = probe_def.key
+    # The breaker window is one registry entry (one probe class, which may run several
+    # scenarios) and one phase: a throttled entry must not starve the next.
+    self.safety.reset_breaker()
     probe_cls = self._import_probe(probe_def.cls_path)
 
     if probe_cls.is_stateful and not probe_context.allow_stateful:
@@ -564,7 +635,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
     if probe_cls.requires_regular_session and not self.auth.regular_session:
       self.metrics.record_probe(store_key, "skipped:missing_regular_session")
       return
-    if probe_cls.requires_auth and not self.auth.official_session:
+    if probe_cls.requires_auth and not self.auth.primary_session:
       self.metrics.record_probe(store_key, "skipped:missing_auth")
       return
 
@@ -574,13 +645,21 @@ class GrayboxLocalWorker(BaseLocalWorker):
     # and continue with subsequent probes. Phase-level session checks
     # (discovery/weak_auth) use _ensure_active_sessions which raises
     # on failure; this call explicitly does not.
-    if not self.auth.ensure_sessions(
-      self._credentials.official,
-      self._credentials.regular if require_regular or self._credentials.regular else None,
-    ):
+    try:
+      refreshed = self.auth.ensure_sessions(
+        self._credentials.official,
+        self._credentials.regular if require_regular or self._credentials.regular else None,
+      )
+    except RequestRefused as exc:
+      # The refresh itself was refused: record this family and go on to the next.
+      self._record_probe_error(store_key, exc)
+      self.metrics.record_probe(store_key, f"failed:{exc.reason}")
+      return
+    if not refreshed:
       self.metrics.record_probe(store_key, "failed:auth_refresh")
       return
 
+    probe = None
     try:
       from_context = getattr(probe_cls, "from_context", None)
       has_explicit_from_context = "from_context" in getattr(probe_cls, "__dict__", {})
@@ -591,6 +670,9 @@ class GrayboxLocalWorker(BaseLocalWorker):
       run_result = self._normalize_probe_run_result(probe.run())
       self._store_findings(store_key, run_result)
       self.metrics.record_probe(store_key, run_result.outcome)
+    except GrayboxAbort:
+      self._keep_partial(store_key, probe)
+      raise
     except Exception as exc:
       self._record_probe_error(store_key, exc)
       self.metrics.record_probe(store_key, "failed")
@@ -602,10 +684,13 @@ class GrayboxLocalWorker(BaseLocalWorker):
     an authenticated session. Callers should NOT swallow the exception;
     it propagates to execute_job's single handler.
     """
-    auth_ok = self.auth.ensure_sessions(
-      self._credentials.official,
-      self._credentials.regular if require_regular or self._credentials.regular else None,
-    )
+    try:
+      auth_ok = self.auth.ensure_sessions(
+        self._credentials.official,
+        self._credentials.regular if require_regular or self._credentials.regular else None,
+      )
+    except RequestRefused as exc:
+      self._abort_refused(exc, scope.replace("_", " "))
     if auth_ok:
       return True
 
@@ -628,7 +713,9 @@ class GrayboxLocalWorker(BaseLocalWorker):
       secret_field_names=self._configured_secret_field_names(),
     ):
       port_results[key] = {
-        "findings": [f.to_dict() for f in run_result.findings],
+        "findings": self._attach_evidence_cids(
+          [f.to_dict() for f in run_result.findings], key,
+        ),
         "artifacts": [
           GrayboxEvidenceArtifact.from_value(artifact).to_dict()
           for artifact in run_result.artifacts
@@ -637,6 +724,84 @@ class GrayboxLocalWorker(BaseLocalWorker):
       }
     for finding in run_result.findings:
       self.metrics.record_finding(getattr(finding, "severity", "INFO"))
+
+  def _attach_evidence_cids(self, flats, key):
+    """Hash and store the redacted snapshots of vulnerable/inconclusive findings.
+
+    The snapshots go through the same `_redact_report` pass the worker report
+    gets (honouring `redact_credentials`) before they are hashed or stored, and
+    the redacted text replaces the one held in the result, so the hash matches
+    what the report shows. A storage failure leaves the cid empty and keeps the
+    hash; it never fails the job. The R1FS add is synchronous on the scan
+    thread, so past `MAX_EVIDENCE_BLOBS_PER_WORKER` a finding keeps only its hash.
+    """
+    targets = [
+      artifact
+      for flat in flats
+      if flat.get("status") in ("vulnerable", "inconclusive")
+      for artifact in (flat.get("evidence_artifacts") or [])
+      if isinstance(artifact, dict)
+      and (artifact.get("request_snapshot") or artifact.get("response_snapshot"))
+    ]
+    if not targets:
+      return flats
+    if getattr(self.job_config, "redact_credentials", True):
+      try:
+        redacted = self.owner._redact_report(
+          {"graybox_results": {self._port_key: {key: {"findings": flats}}}}
+        )
+        redacted_flats = redacted["graybox_results"][self._port_key][key]["findings"]
+        for flat, red in zip(flats, redacted_flats):
+          for artifact, red_artifact in zip(
+            flat.get("evidence_artifacts") or [], red.get("evidence_artifacts") or [],
+          ):
+            if isinstance(artifact, dict) and isinstance(red_artifact, dict):
+              for field_name in ("summary", "request_snapshot", "response_snapshot"):
+                artifact[field_name] = red_artifact.get(field_name, "")
+      except Exception as exc:
+        # Fail closed: nothing unredacted is hashed or stored.
+        self.P(f"Evidence redaction failed: {self._sanitize_error(exc)}", color='y')
+        return flats
+    for artifact in targets:
+      request = artifact.get("request_snapshot") or ""
+      response = artifact.get("response_snapshot") or ""
+      artifact["content_sha256"] = evidence_content_sha256(request, response)
+      if not artifact.get("raw_evidence_cid"):
+        artifact["raw_evidence_cid"] = self._store_evidence_blob(
+          request, response, artifact["content_sha256"],
+        )
+    return flats
+
+  def _store_evidence_blob(self, request, response, digest):
+    if self._evidence_blobs_stored >= MAX_EVIDENCE_BLOBS_PER_WORKER:
+      return ""
+    # Imported here: `services` imports this module, so a top-level import cycles.
+    from ..model_testing.raw_evidence import _retention_until
+    from ..services.config import get_model_testing_config
+    from ..services.secrets import R1fsSecretStore
+    try:
+      secret_key, _ = R1fsSecretStore(self.owner).resolve_secret_store_key()
+      if not secret_key:
+        return ""
+      payload = {
+        "kind": "redmesh_graybox_evidence",
+        "job_id": self.job_id,
+        "retention_until": _retention_until(
+          self.owner, get_model_testing_config(self.owner),
+        ),
+        "content_sha256": digest,
+        **evidence_blob(request, response),
+      }
+      cid = self.owner._get_artifact_repository().put_json(
+        payload, show_logs=False, secret=secret_key,
+      )
+    except Exception as exc:
+      self.P(f"Evidence storage failed: {self._sanitize_error(exc)}", color='y')
+      return ""
+    if not isinstance(cid, str) or not cid:
+      return ""
+    self._evidence_blobs_stored += 1
+    return cid
 
   def _configured_secret_field_names(self):
     api_security = getattr(self.target_config, "api_security", None)
@@ -654,6 +819,15 @@ class GrayboxLocalWorker(BaseLocalWorker):
         value = getattr(descriptor, attr, None)
         if isinstance(value, str) and value and value not in names:
           names.append(value)
+    # The login form's own field names: a captured login request carries the
+    # operator's target password and the CSRF token under them.
+    for value in (
+      getattr(self.target_config, "password_field", None),
+      getattr(self.target_config, "csrf_field", None),
+      getattr(getattr(self, "auth", None), "detected_csrf_field", None),
+    ):
+      if isinstance(value, str) and value and value not in names:
+        names.append(value)
     return tuple(names)
 
   def _sanitize_error(self, value):
@@ -669,16 +843,25 @@ class GrayboxLocalWorker(BaseLocalWorker):
     port_info["_graybox_auth"] = {
       "official_success": self.auth.official_session is not None,
       "regular_success": self.auth.regular_session is not None,
+      "admin_context": self.auth.admin_context,
+      "primary_principal": self.auth.primary_principal,
+      "failure_reason": self.auth.failure_reason(),
       "auth_errors": list(self.auth._auth_errors),
       "auth_diagnostics": list(getattr(self.auth, "_auth_diagnostics", [])),
       "findings": [],
     }
 
-  def _store_discovery_results(self, routes, forms):
+  def _store_discovery_results(self, routes, forms, fetch_failures=0):
     port_info = self.state["service_info"].setdefault(self._port_key, {})
     port_info["_graybox_discovery"] = {
       "routes": routes,
       "forms": forms,
+      "fetch_failures": fetch_failures,
+      "crawled_as": self.auth.primary_principal,
+      "coverage_note": (
+        "Crawled as the regular user; admin-only pages not reached."
+        if self.auth.admin_context == "absent" else ""
+      ),
       "findings": [],
     }
 
@@ -717,6 +900,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
 
   def _set_phase(self, phase):
     self._phase = phase
+    self.safety.reset_breaker()  # breaker window: one phase, or one registry entry (see _run_registered_probe)
 
   def _compute_scenario_stats(self):
     """Compute scenario stats from graybox_results."""

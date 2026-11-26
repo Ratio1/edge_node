@@ -1,3 +1,4 @@
+import json
 from contextlib import ExitStack
 
 from ..constants import (
@@ -13,7 +14,9 @@ from ..model_testing.constants import (
   selected_model_test_worker_addr,
 )
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..tenancy import tenancy_namespace
 from ..tenancy.effects import EffectState
+from . import checkpoint
 from .event_hooks import emit_lifecycle_event
 from .secrets import collect_secret_refs_from_job_config
 from .state_machine import is_terminal_job_status, set_job_status
@@ -66,6 +69,14 @@ def _foreign_launcher_error(owner, job_id, job_specs, action):
   }
 
 
+def _delete_checkpoints(owner, job_id):
+  """RM-201: drop every local worker checkpoint of a stopped job; a failure is logged, never raised."""
+  try:
+    checkpoint.delete_job(owner, job_id)
+  except Exception as exc:
+    owner.P(f"Could not delete checkpoints of job {job_id}: {exc}", color='y')
+
+
 def stop_and_delete_job(owner, job_id: str, *, checked_job=None, snapshot_mode=None, ledger=None):
   """
   Stop a running job, mark it stopped, then delegate to purge_job
@@ -95,6 +106,7 @@ def stop_and_delete_job(owner, job_id: str, *, checked_job=None, snapshot_mode=N
       job.stop()
     owner.P(f"Job {job_id} stopped.")
   owner.scan_jobs.pop(job_id, None)
+  _delete_checkpoints(owner, job_id)
 
   if isinstance(job_specs, dict):
     # Contract 4 before the first irreversible act. Everything below -- worker cancellation, the
@@ -187,6 +199,8 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
       return {"status": "error", "message": "Cannot purge a running job. Stop it first."}
 
   cids = set()
+  evidence_cids = set()
+  unreadable_reports = set()
 
   def _track(cid, source):
     if cid and isinstance(cid, str) and cid not in cids:
@@ -195,11 +209,18 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
 
   _track(job_specs.get("job_config_cid"), "job_specs.job_config_cid")
   artifacts = _artifact_repo(owner)
-  job_config = artifacts.get_job_config(job_specs) if job_specs.get("job_config_cid") else {}
+  unreadable = []
+  try:
+    job_config = artifacts.get_job_config(job_specs) if job_specs.get("job_config_cid") else {}
+  except Exception as e:
+    owner.P(f"[PURGE] Failed to fetch job config: {e}", color='r')
+    job_config = None
   if isinstance(job_config, dict):
     for secret_ref in collect_secret_refs_from_job_config(job_config):
         _track(secret_ref, "job_config.secret_ref")
-
+  else:
+    # Its secret refs are R1FS payloads too; skipping them would orphan them.
+    unreadable.append(("job_config", job_specs.get("job_config_cid")))
   job_cid = job_specs.get("job_cid")
   if job_cid:
     _track(job_cid, "job_specs.job_cid")
@@ -212,13 +233,17 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
           for addr, wr in (pass_data.get("worker_reports") or {}).items():
             if isinstance(wr, dict):
               _track(wr.get("report_cid"), f"archive.passes[{pi}].worker_reports[{addr}].report_cid")
+              evidence_cids.update(_graybox_evidence_cids(artifacts, wr.get("report_cid"), unreadable_reports))
       else:
         owner.P(f"[PURGE] Archive fetch returned non-dict: {type(archive)}", color='y')
+        unreadable.append(("archive", job_cid))
     except Exception as e:
       owner.P(f"[PURGE] Failed to fetch archive {job_cid}: {e}", color='r')
+      unreadable.append(("archive", job_cid))
 
   for addr, w in workers.items():
     _track(w.get("report_cid"), f"workers[{addr}].report_cid")
+    evidence_cids.update(_graybox_evidence_cids(artifacts, w.get("report_cid"), unreadable_reports))
 
   rulebook_assessments = job_specs.get("rulebook_assessments")
   if isinstance(rulebook_assessments, dict):
@@ -284,12 +309,51 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
           for addr, wr in (pass_data.get("worker_reports") or {}).items():
             if isinstance(wr, dict):
               _track(wr.get("report_cid"), f"pass_reports[{ri}]->worker_reports[{addr}].report_cid")
+              evidence_cids.update(_graybox_evidence_cids(artifacts, wr.get("report_cid"), unreadable_reports))
         else:
           owner.P(f"[PURGE] Pass report fetch returned non-dict: {type(pass_data)}", color='y')
+          unreadable.append(("pass_report", report_cid))
       except Exception as e:
         owner.P(f"[PURGE] Failed to fetch pass report {report_cid}: {e}", color='r')
+        unreadable.append(("pass_report", report_cid))
+
+  # A retry after a partial delete (RM-273): the record is written only after this gate passed, so the
+  # stored "cids" hold every child of every parent they list. A parent named there that is unreadable now
+  # was deleted (or the run stopped mid-delete), not lost; its children are already in the set.
+  progress_hkey = f"{owner.cfg_instance_id}:purge_progress"
+  stored = owner.chainstore_hget(hkey=progress_hkey, key=job_id)
+  stored = stored if isinstance(stored, dict) else {}
+  done = {cid for cid in stored.get("deleted") or () if isinstance(cid, str)}
+  known = {cid for cid in stored.get("cids") or () if isinstance(cid, str)}
+  cids.update(known)
+  unreadable = [(kind, cid) for kind, cid in unreadable if cid not in known]
+
+  for evidence_cid in sorted(evidence_cids):
+    _track(evidence_cid, "graybox evidence raw_evidence_cid")
+  # An unreadable own report keeps its CID: its evidence blobs cannot be listed, so deleting it would orphan them.
+  cids -= unreadable_reports
+  if unreadable_reports:
+    owner.P(f"[PURGE] Keeping unreadable report CIDs {sorted(unreadable_reports)}.", color='r')
 
   owner.P(f"[PURGE] Total CIDs collected: {len(cids)}: {sorted(cids)}")
+
+  # An unreadable archive or pass report hides its child CIDs. Deleting the parent would orphan them,
+  # so keep every CID and the job record until the artifacts can be read.
+  if unreadable:
+    owner.P(f"[PURGE] Unreadable artifacts, nothing deleted: {unreadable}", color='r')
+    counts = {}
+    for kind, _ in unreadable:
+      counts[kind] = counts.get(kind, 0) + 1
+    return {
+      "status": "partial",
+      "job_id": job_id,
+      "cids_deleted": 0,
+      "cids_failed": 0,
+      "cids_total": len(cids),
+      # Contract 7: counts by kind only; the CIDs stay in the log above.
+      "unreadable": counts,
+      "message": "Unreadable artifacts; nothing deleted, CStore kept for retry.",
+    }
 
   deleted, failed = 0, 0
   # Contract 4 at the last seam before anything is destroyed: re-admit the requester, so an account
@@ -299,15 +363,25 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
     ledger.checkpoint()
   # R1FS deletion acknowledges local/relay unpin and garbage-collection requests.
   # The relay sweep can take up to 24 hours, and reading here can rehydrate the CID.
-  for cid in cids:
+  def _save_progress():
+    owner.chainstore_hset(hkey=progress_hkey, key=job_id, value={"cids": sorted(cids), "deleted": sorted(done)})
+
+  if cids - done:
+    _save_progress()
+  for cid in cids - done:
     try:
       success = artifacts.delete(cid, show_logs=True, raise_on_error=False, purge=True)
       if success:
         deleted += 1
+        done.add(cid)
         # Irreversible. A later raise must not reach the caller as "nothing happened".
         if ledger is not None:
           ledger.record(EffectState.DELIVERED)
         owner.P(f"[PURGE] Deleted CID {cid}")
+        try:
+          _save_progress()
+        except Exception as e:
+          owner.P(f"[PURGE] Could not record progress after deleting {cid}: {e}", color='r')
       else:
         failed += 1
         owner.P(f"[PURGE] delete_file returned False for CID {cid}", color='r')
@@ -317,6 +391,7 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
 
   if failed > 0:
     owner.P(f"Purge incomplete: {failed}/{len(cids)} CIDs failed. CStore kept.", color='r')
+    _save_progress()
     return {
       "status": "partial",
       "job_id": job_id,
@@ -333,28 +408,77 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
       if key.startswith(prefix):
         _job_repo(owner).delete_live_progress(key)
 
-  _job_repo(owner).delete_job_triage(job_id)
+  # Host-scoped triage outlives any one job (report-findings.md §Triage): only legacy job-keyed rows go.
+  _job_repo(owner).legacy_delete_job_triage(job_id)
   _job_repo(owner).delete_job_rulebook_reviews(job_id)
   _job_repo(owner).delete_job_report_review(job_id)
   _delete_job_record(owner, job_id)
+  owner.chainstore_hset(hkey=progress_hkey, key=job_id, value=None)
 
   owner.P(f"Purged job {job_id}: {deleted}/{len(cids)} CIDs deleted.")
   owner._log_audit_event("job_purged", {"job_id": job_id, "cids_deleted": deleted, "cids_total": len(cids)})
 
-  return {"status": "success", "job_id": job_id, "cids_deleted": deleted, "cids_total": len(cids)}
+  result = {"status": "success", "job_id": job_id, "cids_deleted": deleted, "cids_total": len(cids)}
+  if unreadable_reports:
+    result["kept_unreadable_reports"] = sorted(unreadable_reports)
+  return result
 
 
-def _collect_cids_from_raw(payload):
-  """Walk a raw CStore payload and yield every value stored under a `*_cid` key."""
+def _graybox_evidence_cids(artifacts, report_cid, unreadable=None):
+  """CIDs of the graybox evidence blobs a worker report's findings point at.
+
+  Evidence CIDs are unique per job (the blob embeds the job id and is
+  encrypted), so a job's own report lists everything to delete. A report that
+  cannot be read lists nothing: its CID goes into ``unreadable`` so the caller
+  keeps it rather than orphaning evidence it can no longer enumerate.
+  """
+  found = set()
+  if not report_cid or not isinstance(report_cid, str):
+    return found
+  try:
+    report = artifacts.get_json(report_cid)
+  except Exception:
+    report = None
+  if report is None:
+    if unreadable is not None:
+      unreadable.add(report_cid)
+    return found
+  results = report.get("graybox_results") if isinstance(report, dict) else None
+  for probes in (results or {}).values():
+    for probe_data in (probes.values() if isinstance(probes, dict) else ()):
+      for finding in (probe_data.get("findings") if isinstance(probe_data, dict) else None) or ():
+        for artifact in (finding.get("evidence_artifacts") if isinstance(finding, dict) else None) or ():
+          cid = artifact.get("raw_evidence_cid") if isinstance(artifact, dict) else None
+          if isinstance(cid, str) and cid:
+            found.add(cid)
+  return found
+
+
+def _report_cids_in(payload):
+  """Every value under a `report_cid` key in a raw job record."""
+  if isinstance(payload, dict):
+    for key, value in payload.items():
+      if key == "report_cid" and isinstance(value, str) and value:
+        yield value
+      else:
+        yield from _report_cids_in(value)
+  elif isinstance(payload, (list, tuple)):
+    for item in payload:
+      yield from _report_cids_in(item)
+
+
+def _collect_cids_from_raw(payload, skip=()):
+  """Walk a raw CStore payload and yield every value stored under a `*_cid` key not named in `skip`."""
   if isinstance(payload, dict):
     for key, value in payload.items():
       if isinstance(key, str) and key.endswith("_cid") and isinstance(value, str) and value:
-        yield value
+        if key not in skip:
+          yield value
       else:
-        yield from _collect_cids_from_raw(value)
+        yield from _collect_cids_from_raw(value, skip)
   elif isinstance(payload, (list, tuple)):
     for item in payload:
-      yield from _collect_cids_from_raw(item)
+      yield from _collect_cids_from_raw(item, skip)
 
 
 def _collect_rulebook_submission_cids(payload):
@@ -389,7 +513,9 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
   Formal submission pointers remain retryable unless R1FS acknowledges deletion;
   other legacy artifacts retain the existing best-effort force-wipe behavior.
   """
-  cids = {c for c in _collect_cids_from_raw(raw_payload) if isinstance(c, str)}
+  # RM-121: a pass's engagement-ledger artifact belongs to the engagement asset, not the job: a job
+  # purge never deletes it (tenant delete does, continuous-monitoring.md §2.1).
+  cids = {c for c in _collect_cids_from_raw(raw_payload, skip=("pass_changes_cid",)) if isinstance(c, str)}
   submission_hkey = f"{owner.cfg_instance_id}:rulebook_review:submissions"
   try:
     submission_rows = owner.chainstore_hgetall(hkey=submission_hkey) or {}
@@ -425,7 +551,25 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
       owner.P(f"[PURGE_ALL_FORCE] Could not inspect shared CID references for {job_id}; retaining rows.", color='r')
       return 0, len(job_submission_cids)
   cids.update(job_submission_cids - shared_submission_cids)
+  progress_hkey = f"{owner.cfg_instance_id}:purge_progress"
+  recorded, keep_progress = set(), False
+  try:
+    stored = owner.chainstore_hget(hkey=progress_hkey, key=job_id)
+  except Exception:
+    stored, keep_progress = None, True
+  if isinstance(stored, dict):  # children of parents an earlier purge already deleted (RM-273)
+    gone = set(stored.get("deleted") or ())
+    recorded = {c for c in stored.get("cids") or () if isinstance(c, str) and c not in gone}
+    cids.update(recorded)
   cids.difference_update(shared_submission_cids)
+  force_artifacts = _artifact_repo(owner)
+  unreadable_reports = set()
+  for report_cid in _report_cids_in(raw_payload):
+    cids.update(_graybox_evidence_cids(force_artifacts, report_cid, unreadable_reports))
+  if unreadable_reports:
+    cids -= unreadable_reports
+    errors.append({"job_id": job_id, "scope": "r1fs",
+                   "message": f"kept unreadable reports: {sorted(unreadable_reports)}"})
   cids = sorted(cids)
   cids_deleted = 0
   cids_failed = len(shared_submission_cids)
@@ -445,11 +589,13 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
         owner.P(f"[PURGE_ALL_FORCE] Deleted CID {cid} for {job_id}")
       else:
         cids_failed += 1
+        keep_progress = keep_progress or cid in recorded
         if cid in job_submission_cids:
           failed_submission_cids.add(cid)
         owner.P(f"[PURGE_ALL_FORCE] delete returned False for CID {cid} ({job_id})", color='y')
     except Exception as exc:
       cids_failed += 1
+      keep_progress = keep_progress or cid in recorded
       if cid in job_submission_cids:
         failed_submission_cids.add(cid)
       owner.P(f"[PURGE_ALL_FORCE] Failed to delete CID {cid} ({job_id}): {exc}", color='r')
@@ -487,16 +633,19 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
         except Exception as exc:
           errors.append({"job_id": job_id, "scope": hkey, "message": type(exc).__name__})
 
-  try:
-    owner.chainstore_hset(hkey=cfg_instance_id, key=job_id, value=None)
-  except Exception as exc:
-    errors.append({"job_id": job_id, "scope": cfg_instance_id, "message": type(exc).__name__})
+  # The progress row is the only pointer to a recorded child whose parent is gone: keep it until those
+  # children are deleted, so a later purge-all can retry them.
+  for hkey in (cfg_instance_id,) if keep_progress else (cfg_instance_id, progress_hkey):
+    try:
+      owner.chainstore_hset(hkey=hkey, key=job_id, value=None)
+    except Exception as exc:
+      errors.append({"job_id": job_id, "scope": hkey, "message": type(exc).__name__})
 
   owner.P(f"[PURGE_ALL_FORCE] Force-purged {job_id}: {cids_deleted}/{len(cids)} CIDs deleted.")
   return cids_deleted, cids_failed
 
 
-def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None):
+def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None, tenant_id=None):
   """
   Purge every RedMesh job on this edge node: stop running jobs, delete all
   R1FS artifacts, tombstone CStore records, and sweep orphan rows in the
@@ -510,6 +659,9 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
   Preserves the single-job partial-failure contract for parseable records:
   any job whose purge returned ``partial`` keeps its CStore rows intact so
   the operator can retry artifact deletion later.
+
+  `tenant_id`: the tenant the purge was admitted for. Its host triage is deleted even when it has no job
+  left (a single-job purge keeps host triage, so the last job can be gone while the records stay).
   """
   # The admitted enumeration when one was supplied (RM-026 I1b B9). This is what scopes a
   # Super-Tenant Admin's "purge everything" to their own tenant rather than the whole node.
@@ -537,6 +689,7 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
   jobs_force_purged = 0
   cids_deleted = 0
   cids_failed = 0
+  host_triage_failed = False
   failed_job_ids = set()
   errors = []
   # RM-026 I1b B9, owner decision: a mixed batch reports the partial, and the per-item outcome is
@@ -670,6 +823,69 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
         owner.P(f"[PURGE_ALL] failed to tombstone {hkey}/{key}: {exc}", color='r')
         errors.append({"job_id": job_id_prefix or "", "scope": hkey, "message": type(exc).__name__})
     return rows_deleted
+
+  def _host_triage_tenants():
+    """Tenants whose host triage this call may delete: those of the admitted jobs' bindings and, for a
+    whole-node purge only, every tenant the tenancy store names (their jobs may be gone while the records stay)."""
+    tenants = {tenant_id} if isinstance(tenant_id, str) and tenant_id.strip() else set()
+    for payload in raw_jobs.values():
+      binding = payload.get("execution_binding") if isinstance(payload, dict) else None
+      tenant = binding.get("tenant_id") if isinstance(binding, dict) else None
+      if isinstance(tenant, str) and tenant.strip():
+        tenants.add(tenant)
+    namespace = tenancy_namespace(owner)
+    if swept_ids is None and namespace is not None:
+      tenancy_hkey = json.dumps(["redmesh", "tenancy", 1, namespace], separators=(",", ":"))
+      try:
+        rows = owner.chainstore_hgetall(hkey=tenancy_hkey)
+      except Exception as exc:
+        errors.append({"job_id": "", "scope": tenancy_hkey, "message": type(exc).__name__})
+        rows = None
+      for field, value in (rows.items() if isinstance(rows, dict) else ()):
+        try:
+          decoded = json.loads(field)
+        except (TypeError, ValueError):
+          continue
+        if (value is not None and isinstance(decoded, list) and len(decoded) == 3 and decoded[0] == "tenant"
+            and decoded[1] == namespace and isinstance(decoded[2], str)):
+          tenants.add(decoded[2])
+    return tenants
+
+  def _sweep_host_triage():
+    """Whole-purge only: host-scoped records are no job's, so a purge of jobs keeps them; this is the wipe.
+
+    Skipped while any job failed to purge, as the integration status sweep is, so a retry finds them intact.
+    """
+    nonlocal host_triage_failed
+    if jobs_failed or cids_failed:
+      return
+    from .triage import _unfinished_writes
+
+    repo = _job_repo(owner)
+    unfinished = _unfinished_writes(owner)
+    for tenant in sorted(_host_triage_tenants()):
+      try:
+        hkeys = (repo.host_triage_hkey(tenant), repo.host_triage_audit_hkey(tenant))
+      except ValueError:
+        continue
+      swept = True
+      for hkey in hkeys:
+        try:
+          rows = owner.chainstore_hgetall(hkey=hkey)
+          refused = [key for key, value in list((rows or {}).items())
+                     if value is not None and owner.chainstore_hset(hkey=hkey, key=key, value=None) is not True]
+          if refused:  # the store did not confirm the delete: the rows may still be readable
+            swept = False
+            errors.append({"job_id": "", "scope": hkey, "message": "delete_not_confirmed"})
+        except Exception as exc:
+          swept = False
+          errors.append({"job_id": "", "scope": hkey, "message": type(exc).__name__})
+      if not swept:
+        host_triage_failed = True
+      else:
+        # This launcher's unfinished triage changes of the tenant go too, or a retry would write them back.
+        for key in [key for key in list(unfinished) if key[0] == tenant]:  # a snapshot: other hosts' writes may add
+          unfinished.pop(key, None)
 
   def _sweep_submission_hash():
     nonlocal cids_deleted, cids_failed
@@ -811,8 +1027,10 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
   _sweep_hash(live_hkey, dict)
   _sweep_hash(triage_hkey, dict)
   _sweep_hash(triage_audit_hkey, list)
+  _sweep_host_triage()
   _sweep_hash(rulebook_review_hkey, dict)
   _sweep_hash(rulebook_review_audit_hkey, list)
+  _sweep_hash(f"{cfg_instance_id}:purge_progress", dict)
   _sweep_submission_hash()
   integration_status_rows_deleted = 0
   if jobs_failed == 0 and cids_failed == 0:
@@ -831,7 +1049,7 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
         owner.P(f"[PURGE_ALL] failed to tombstone job record {key}: {exc}", color='r')
         errors.append({"job_id": key, "scope": cfg_instance_id, "message": type(exc).__name__})
 
-  status = "success" if jobs_failed == 0 and cids_failed == 0 else "partial"
+  status = "success" if jobs_failed == 0 and cids_failed == 0 and not host_triage_failed else "partial"
 
   owner._log_audit_event("all_data_purged", {
     "jobs_total": jobs_total,
@@ -929,6 +1147,7 @@ def stop_monitoring(owner, job_id: str, stop_type: str = "SOFT", *, checked_job=
           owner.P(f"Stopping job {job_id} on local worker {local_worker_id}.")
           job.stop()
         owner.scan_jobs.pop(job_id, None)
+      _delete_checkpoints(owner, job_id)
 
       worker_entry = job_specs.setdefault("workers", {}).setdefault(owner.ee_addr, {})
       worker_entry["finished"] = True

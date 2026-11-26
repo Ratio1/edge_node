@@ -10,6 +10,7 @@ from uuid import uuid4
 from extensions.business.cybersec.red_mesh.services import data_maintenance
 from .contract_fixture import install_contract
 from .test_execution_binding_models import binding_payload
+from .test_framework_manifest import static_dir
 from .test_tenant_administration import FakeAdministrationStore
 
 TENANCY = '["redmesh","tenancy",1,"deployment"]'
@@ -69,13 +70,10 @@ class TestDataMaintenance(unittest.TestCase):
     cls.Plugin = PentesterApi01Plugin
 
   def setUp(self):
-    environment = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    environment.start()
-    self.addCleanup(environment.stop)
     self.storage = FakeAdministrationStore()
     self.storage.account("pentester", memberships=[{"role": "super_pentester", "tenant_id": None}])
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenancy_namespace = "deployment"
+    self.plugin._stream_id = "deployment"
     self.plugin.cfg_instance_id = JOBS
     self.plugin.P = lambda *args, **kwargs: None
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hkeys", "chainstore_hset"):
@@ -132,10 +130,60 @@ class TestDataMaintenance(unittest.TestCase):
 
   def assessment_row(self, tenant_id):
     return {"schemaVersion": 1, "namespace": "deployment", "kind": "framework_assessment", "ids": [tenant_id, "ro.dnsc.o1-2026"],
+            "row_format": 2,
             "tenant_id": tenant_id, "pack_id": "ro.dnsc.o1-2026", "pack_acts": [], "assurance_level": None,
             "level_provenance": None, "sectoral_requirements": "", "completion_date": "", "management_signoff": None,
             "remediation": [], "state": "draft", "assessment_revision": 1, "reopened_from": None, "pending": None,
             "scores": {}, "submissions": [], "created_by": "initial", "created_at": "t", "updated_by": "initial", "updated_at": "t"}
+
+  def test_profile_singleton_backup_restore_and_current_old_orphan_classification(self):
+    result = self.plugin.save_tenant_compliance_profile(self.actor, self.tenant, {"country": "DE"}, 0, str(uuid4()))
+    self.assertTrue(result["success"], result)
+    field = json.dumps(["compliance_profile", "deployment", self.tenant], separators=(",", ":"))
+    rows = self.scan()
+    current = rows[(COMPLIANCE, field)]
+    self.assertEqual(current["class"], "current")
+    self.assertEqual(current["cids"], [])
+    row = current["value"]
+    self.storage.data[(COMPLIANCE, field)] = None
+    restored = self.plugin.restore_redmesh_records(self.actor, [{"hkey": COMPLIANCE, "field": field, "value": row}])
+    self.assertTrue(restored["success"], restored)
+    self.assertEqual(restored["data"]["outcomes"][0]["outcome"], "written")
+    self.assertEqual(self.storage.data[(COMPLIANCE, field)], row)
+    tenant_key = json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":"))
+    tenant = self.storage.data[(TENANCY, tenant_key)]
+    tenant["active"] = False
+    self.assertEqual(self.scan()[(COMPLIANCE, field)]["class"], "current")
+    tenant["schemaVersion"] = 0
+    self.assertEqual(self.scan()[(COMPLIANCE, field)]["class"], "old")
+    self.storage.data[(TENANCY, tenant_key)] = None
+    orphan = self.scan()[(COMPLIANCE, field)]
+    self.assertEqual(orphan["class"], "orphan")
+    self.assertEqual(self.clean(orphan)[0]["outcome"], "deleted")
+    # Malformed singleton is recognized as old, rather than accidentally parsed as assessment ids.
+    row["revision"] = 0
+    self.put(COMPLIANCE, field, row)
+    self.assertEqual(self.scan()[(COMPLIANCE, field)]["class"], "old")
+
+  def test_review_rows_classify_current_old_orphan_and_carry_the_stored_value_hash(self):
+    def review(tenant, **extra):
+      return {"schemaVersion": 1, "namespace": "deployment", "kind": "framework_assessment_review",
+        "ids": [tenant, "ro.dnsc.o1-2026", "default", "1"], "tenant_id": tenant,
+        "pack_id": "ro.dnsc.o1-2026", "assessment_id": "default", "submitted_revision": 1,
+        "fingerprint": "a" * 64, "review_revision": 1, "history": [{"actor": "creator", "action": "submit",
+          "time": "2026-11-16T00:00:00Z", "revision": 1, "request_id": str(uuid4()),
+          "control_id": None, "comment": None, "self_approved": False}], **extra}
+    fields = {}
+    for tenant, extra in ((self.tenant, {}), ("tn_gone", {}), ("tn_bad", {"review_revision": 0})):
+      field = json.dumps(["framework_assessment_review", "deployment", tenant, "ro.dnsc.o1-2026", "default", "1"], separators=(",", ":"))
+      fields[tenant] = field
+      self.put(COMPLIANCE, field, review(tenant, **extra))
+    rows = self.scan()
+    for tenant, expected in ((self.tenant, "current"), ("tn_gone", "orphan"), ("tn_bad", "old")):
+      row = rows[(COMPLIANCE, fields[tenant])]
+      self.assertEqual(row["class"], expected)
+      self.assertIn("sha256", row)
+      self.assertEqual(row["sha256"], data_maintenance.row_sha256(self.storage.data[(COMPLIANCE, fields[tenant])]))
 
   def test_assessment_rows_are_registered_and_classified_by_their_tenant(self):
     field = lambda tenant_id: json.dumps(["framework_assessment", "deployment", tenant_id, "ro.dnsc.o1-2026"], separators=(",", ":"))
@@ -168,6 +216,22 @@ class TestDataMaintenance(unittest.TestCase):
     for key in (field("tn_bad", fa), field(self.tenant, "fa_bad"), field(self.tenant, fa, "x")):
       self.assertEqual((rows[(COMPLIANCE, key)]["class"], rows[(COMPLIANCE, key)]["reason"]), ("old", "unrecognized"), key)
 
+  def test_row_format_marker_pack_and_retirement_decide_the_assessment_class(self):
+    """RM-182 phase 4: no marker or an unknown pack is `old` / `unrecognized`; a retired pack stays `current`."""
+    field = lambda pack: json.dumps(["framework_assessment", "deployment", self.tenant, pack], separators=(",", ":"))
+    unmarked = {key: value for key, value in self.assessment_row(self.tenant).items() if key != "row_format"}
+    unknown = {**self.assessment_row(self.tenant), "pack_id": "cyfun.2025", "ids": [self.tenant, "cyfun.2025"]}
+    self.put(COMPLIANCE, field("ro.dnsc.o1-2026"), unmarked)
+    self.put(COMPLIANCE, field("cyfun.2025"), unknown)
+    rows = self.scan()
+    for pack in ("ro.dnsc.o1-2026", "cyfun.2025"):
+      self.assertEqual((rows[(COMPLIANCE, field(pack))]["class"], rows[(COMPLIANCE, field(pack))]["reason"]),
+                       ("old", "unrecognized"), pack)
+    self.put(COMPLIANCE, field("ro.dnsc.o1-2026"), self.assessment_row(self.tenant))
+    static_dir(self, edit=lambda manifest: manifest["packs"][0].__setitem__("status", "retired"))
+    rows = self.scan()
+    self.assertEqual(rows[(COMPLIANCE, field("ro.dnsc.o1-2026"))]["class"], "current")
+
   # -- authorization ----------------------------------------------------------------------------
 
   def test_only_a_full_portfolio_super_tenant_admin_calls_any_of_the_five(self):
@@ -195,7 +259,7 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertEqual((rows[(JOBS, "old1")]["class"], rows[(JOBS, "old1")]["reason"]),
                      ("old", "binding_schema_1"))
     self.assertEqual(rows[(f"{JOBS}:live", "old1:node-a")]["reason"], "old_job")
-    self.assertEqual(rows[("auth", "creator")]["class"], "current")
+    self.assertEqual(rows[("deployment:auth", "creator")]["class"], "current")
     tenancy = [row for (hkey, _), row in rows.items() if hkey == TENANCY]
     self.assertEqual({row["class"] for row in tenancy}, {"current"})
     self.assertEqual({json.loads(row["field"])[0] for row in tenancy}, {"tenant", "receipt", "domain"})
@@ -215,11 +279,76 @@ class TestDataMaintenance(unittest.TestCase):
       text = path.read_text(encoding="utf-8")
       built.update(re.findall(r"""cfg_instance_id[^"'\n]*\}((?::[a-z_]+)+)[:"']""", text))
     self.assertTrue(built)
+    # `:triage:t:{tenant}` is a per-tenant family like `:integrations:{tenant}`: the tenant names are asserted below.
+    self.assertIn(":triage:t", built)
+    built.discard(":triage:t")
     hkeys = self.plugin.export_redmesh_records(self.actor, 0, 0, 1)["data"]["hkeys"]
     names = {item["hkey"] for item in hkeys}
     self.assertEqual({JOBS + suffix for suffix in built} - names, set())
-    self.assertLessEqual({JOBS, TENANCY, COMPLIANCE, "auth", f"{JOBS}:integrations:{self.tenant}"}, names)
-    self.assertEqual([item["hkey"] for item in hkeys if item["account"]], ["auth"])
+    self.assertLessEqual({JOBS, TENANCY, COMPLIANCE, "deployment:auth", f"{JOBS}:integrations:{self.tenant}",
+                          f"{JOBS}:triage:t:{self.tenant}", f"{JOBS}:triage:audit:{self.tenant}"}, names)
+    self.assertEqual([item["hkey"] for item in hkeys if item["account"]], ["deployment:auth"])
+
+  def test_host_triage_rows_are_registered_classified_and_restorable(self):
+    # RM-169 step 4a: one hkey per tenant, field `host\x1ffinding_id`; no job owns a row.
+    gone = "tn_" + str(uuid4())
+    other = "tn_" + str(uuid4())
+    host = "192.0.2.10"
+    field = f"{host}\x1ff1"
+    entry_field = f"{field}\x1f000000000001000-ab12cd34"
+    t_hkey, a_hkey = f"{JOBS}:triage:t:{self.tenant}", f"{JOBS}:triage:audit:{self.tenant}"
+    row = {"job_id": "new1", "finding_id": "f1", "status": "open", "tenant_id": self.tenant, "host": host}
+    self.put(t_hkey, field, row)
+    self.put(t_hkey, "no-separator", {"status": "open"})
+    self.put(a_hkey, entry_field, row)
+    self.put(a_hkey, f"{host}\x1ff2\x1fx", {"not": "an entry"})
+    self.put(a_hkey, field, [row])  # one field per entry now: a list under the two-part field is not one
+    # identity: the value must name the hkey's tenant and the field's host and finding
+    self.put(t_hkey, f"{host}\x1ff3", {**row, "finding_id": "f3", "tenant_id": other})
+    self.put(t_hkey, f"{host}\x1ff4", {**row, "finding_id": "f9"})
+    self.put(t_hkey, f"198.51.100.1\x1ff5", {**row, "finding_id": "f5"})
+    self.put(a_hkey, f"{host}\x1ff6\x1fy", {**row, "finding_id": "f6", "tenant_id": other})
+    rows = self.scan()
+    found = {key: (row["class"], row["reason"]) for key, row in rows.items()
+             if key[0].startswith(f"{JOBS}:triage:") and key[0] not in (f"{JOBS}:triage", f"{JOBS}:triage:audit")}
+    old = ("old", "unrecognized")
+    self.assertEqual(found, {
+      (t_hkey, field): ("current", ""),
+      (t_hkey, "no-separator"): old,
+      (a_hkey, entry_field): ("current", ""),
+      (a_hkey, f"{host}\x1ff2\x1fx"): old,
+      (a_hkey, field): old,
+      (t_hkey, f"{host}\x1ff3"): old,
+      (t_hkey, f"{host}\x1ff4"): old,
+      (t_hkey, "198.51.100.1\x1ff5"): old,
+      (a_hkey, f"{host}\x1ff6\x1fy"): old,
+    })
+    # A backup row of a tenant that no longer exists is still accepted, as an integration status row is; the legacy
+    # audit hkey and a lookalike are not.
+    mine = lambda tenant, **kw: {**row, "tenant_id": tenant, **kw}
+    backup = [{"hkey": f"{JOBS}:triage:t:{gone}", "field": field, "value": mine(gone)},
+              {"hkey": f"{JOBS}:triage:audit:{gone}", "field": entry_field, "value": mine(gone)},
+              {"hkey": f"{JOBS}:triage:t:audit", "field": field, "value": mine("audit")},
+              {"hkey": f"{JOBS}:triage:t:{gone}x", "field": field, "value": mine(gone + "x")},
+              # a row naming another tenant, host or finding than its hkey and field is not restored
+              {"hkey": f"{JOBS}:triage:t:{gone}", "field": f"{host}\x1fg2", "value": mine(other, finding_id="g2")},
+              {"hkey": f"{JOBS}:triage:t:{gone}", "field": f"{host}\x1fg3", "value": mine(gone, finding_id="x")},
+              {"hkey": f"{JOBS}:triage:audit:{gone}", "field": f"{host}\x1fg4\x1fz", "value": mine(gone, host="h")},
+              {"hkey": f"{JOBS}:triage:audit:{gone}", "field": field, "value": [mine(gone)]}]
+    done = self.plugin.restore_redmesh_records(self.actor, backup)
+    self.assertEqual([item["outcome"] for item in done["data"]["outcomes"]],
+                     ["written", "written"] + ["refused"] * 6)
+
+  def test_restore_skips_a_triage_audit_entry_the_prune_tombstoned(self):
+    host = "192.0.2.10"
+    a_hkey = f"{JOBS}:triage:audit:{self.tenant}"
+    row = {"job_id": "new1", "finding_id": "f1", "status": "open", "tenant_id": self.tenant, "host": host}
+    pruned, fresh = f"{host}\x1ff1\x1f000000000001000-aa", f"{host}\x1ff1\x1f000000000002000-bb"
+    self.put(a_hkey, pruned, None)  # listed by hkeys, reads None
+    done = self.plugin.restore_redmesh_records(self.actor, [
+      {"hkey": a_hkey, "field": pruned, "value": row}, {"hkey": a_hkey, "field": fresh, "value": row}])
+    self.assertEqual([item["outcome"] for item in done["data"]["outcomes"]], ["refused", "written"])
+    self.assertIsNone(self.storage.data[(a_hkey, pruned)])
 
   def test_a_job_lists_the_files_its_record_config_and_archive_name(self):
     row = self.scan()[(JOBS, "old1")]
@@ -336,7 +465,7 @@ class TestDataMaintenance(unittest.TestCase):
   # RM-133: a contract draft is keyed by its tenant and takes the related-tenant rule; the tenant
   # row that counts its contracts stays current.
   def test_a_contract_draft_is_current_under_its_tenant_with_its_files_and_old_without(self):
-    created = self.plugin.create_tenant_contract_draft(self.actor, self.tenant, str(uuid4()))
+    created = self.plugin.create_tenant_contract_draft(self.actor, self.tenant, str(uuid4()), supersedes="c_1")
     self.assertTrue(created["success"], created)
     field = json.dumps(["tenant_contract_draft", "deployment", self.tenant, created["data"]["contract_id"]],
                        separators=(",", ":"))
@@ -419,7 +548,8 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertEqual(self.scan()[(TENANCY, under_tenant)]["reason"], "unrecognized")
 
   def test_v2_shaped_engagements_and_drafts_are_old_and_cleanup_removes_them(self):
-    # RM-125 phase 2b: entries without `asset_id` (or with the v2 test picks) predate the asset library.
+    # RM-125 phase 2b: entries without `asset_id` predate the asset library. RM-277: one with an `asset_id` and
+    # a scope that does not read is simply unrecognized.
     tenant = self.tenant
     field = self.engagement_draft_row(tenant, 60)
     entry = {"engagement_asset_id": "ea_1", "display_name": "Edge", "kind": "network",
@@ -435,12 +565,18 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertEqual((rows[(TENANCY, field)]["class"], rows[(TENANCY, field)]["reason"]),
                      ("old", "engagement_draft_v1"))
     self.assertEqual((rows[(TENANCY, with_id)]["class"], rows[(TENANCY, with_id)]["reason"]),
-                     ("old", "engagement_draft_v1"))
+                     ("old", "unrecognized"))
     self.assertEqual((rows[(TENANCY, engagement)]["class"], rows[(TENANCY, engagement)]["reason"]),
                      ("old", "engagement_v2"))
     self.assertEqual(self.clean(rows[(TENANCY, field)])[0]["outcome"], "deleted")
     self.assertEqual(sorted(self.files.deleted), sorted([cid(60), cid(61)]))
     self.assertEqual(self.clean(rows[(TENANCY, engagement)])[0]["outcome"], "deleted")
+
+  def test_an_rm251_draft_with_the_engagement_level_scope_is_current(self):
+    # RM-277: 2.10.810 drafts and engagements hold the pair on the row; they read, so they are never offered for cleanup.
+    field = self.engagement_draft_row(self.tenant, 70)
+    self.storage.data[(TENANCY, field)].update(authorized_ports=[[1, 1024]], authorized_tests=["web_discovery"])
+    self.assertEqual(self.scan()[(TENANCY, field)]["class"], "current")
 
   def tenant_asset_row(self, parent, address):
     """RM-125. A tenant asset written through the real endpoint."""
@@ -830,12 +966,12 @@ class TestDataMaintenance(unittest.TestCase):
     busy = self.scan()[(JOBS, "busy")]
     stale = dict(rows[(JOBS, "old1")])
     self.storage.data[(JOBS, "old1")]["job_status"] = "STOPPED"
-    outcomes = self.clean(stale, busy, rows[(JOBS, "new1")], rows[("auth", "creator")],
+    outcomes = self.clean(stale, busy, rows[(JOBS, "new1")], rows[("deployment:auth", "creator")],
                           {"hkey": JOBS, "field": "never", "sha256": "0" * 64})
     self.assertEqual([item["outcome"] for item in outcomes],
                      ["changed", "running", "not_old", "refused", "absent"])
     self.assertEqual(self.files.deleted, [])
-    self.assertIsNotNone(self.storage.data[("auth", "creator")])
+    self.assertIsNotNone(self.storage.data[("deployment:auth", "creator")])
 
   def test_a_failed_file_delete_keeps_the_row(self):
     self.files.refuse = {REPORT}
@@ -858,7 +994,7 @@ class TestDataMaintenance(unittest.TestCase):
   def test_restore_writes_back_what_is_gone_and_never_overwrites(self):
     rows = self.scan()
     saved = [{"hkey": key[0], "field": key[1], "value": rows[key]["value"]}
-             for key in ((JOBS, "old1"), (JOBS, "new1"), ("auth", "creator"))]
+             for key in ((JOBS, "old1"), (JOBS, "new1"), ("deployment:auth", "creator"))]
     self.clean(rows[(JOBS, "old1")])
     self.storage.data[(JOBS, "new1")]["job_status"] = "STOPPED"
     self.events.clear()

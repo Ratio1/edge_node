@@ -5,6 +5,7 @@ import requests
 from html import unescape as _html_unescape
 from urllib.parse import quote, urlsplit
 
+from ...constants import AUTH_SKIPPED
 from ...findings import AffectedAsset, Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
 from ..probe_registry import register_probe, CATEGORY_WEB_TEST
@@ -587,6 +588,8 @@ class _WebHardeningMixin:
     -------
     dict
     """
+    if not self._login_attempts_allowed():
+      return probe_result(raw_data={"auth_control": dict(AUTH_SKIPPED)})
     findings_list = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
@@ -683,6 +686,8 @@ class _WebHardeningMixin:
     -------
     dict
     """
+    if not self._login_attempts_allowed():
+      return probe_result(raw_data={"auth_control": dict(AUTH_SKIPPED)})
     findings_list = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"

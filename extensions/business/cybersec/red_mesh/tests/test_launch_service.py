@@ -58,6 +58,11 @@ class DummyNetworkWorker:
     self.started = True
 
 
+class DummyRestorableWorker(DummyNetworkWorker):
+  def restore_from_checkpoint(self, payload):
+    self.restored = payload
+
+
 class DummyWebappWorker:
   def __init__(self, *, local_id, target_url, job_config, **kwargs):
     self.local_worker_id = local_id
@@ -93,6 +98,7 @@ class TestLaunchService(unittest.TestCase):
           "scan_type": "network",
           "nr_local_workers": 2,
           "port_order": PORT_ORDER_SEQUENTIAL,
+          "exceptions": [3],
         }),
       )
 
@@ -102,6 +108,71 @@ class TestLaunchService(unittest.TestCase):
       sorted(len(worker.worker_target_ports) for worker in local_jobs.values()),
       [2, 2],
     )
+    # Each worker's probe scope is the node's whole port set minus exceptions, not its own batch.
+    self.assertEqual([w.kwargs["job_ports"] for w in local_jobs.values()], [[1, 2, 4], [1, 2, 4]])
+
+  def _restored_launch(self, restored, **overrides):
+    owner = DummyOwner()
+    owner._worker_assignment = {"start_port": 1, "end_port": 30, "target_ports": None}
+    strategy = ScanStrategy(
+      scan_type=ScanType.NETWORK,
+      worker_cls=DummyRestorableWorker,
+      catalog_categories=("service",),
+    )
+    config = {
+      "scan_type": "network", "nr_local_workers": 5, "port_order": "SHUFFLE",
+      "comparison_ports": [443],
+    }
+    with patch("extensions.business.cybersec.red_mesh.services.launch.get_scan_strategy", return_value=strategy):
+      return launch_local_jobs(
+        owner, job_id="job-1", target="10.0.0.10", launcher="0xlauncher", start_port=1, end_port=30,
+        job_config=_bound_network_config(config), restored=restored,
+        checkpoint_context={"pass_nr": 1}, **overrides,
+      )
+
+  def test_restored_builds_one_worker_per_payload_with_saved_ports(self):
+    restored = [
+      {"local_id_prefix": "3", "local_worker_id": "RM-3-abcd", "initial_ports": [30, 2, 17]},
+      {"local_id_prefix": "1", "local_worker_id": "RM-1-abcd", "initial_ports": [9, 4]},
+    ]
+    jobs = self._restored_launch(restored)
+    # nr_local_workers=5 and SHUFFLE are not applied: ports keep the saved order, prefixes the saved ids.
+    self.assertEqual(sorted(jobs), ["worker-1", "worker-3"])
+    self.assertEqual(jobs["worker-3"].worker_target_ports, [30, 2, 17])
+    self.assertEqual(jobs["worker-1"].worker_target_ports, [9, 4])
+    self.assertIs(jobs["worker-3"].restored, restored[0])
+    self.assertIs(jobs["worker-1"].restored, restored[1])
+    self.assertTrue(all(w.started for w in jobs.values()))
+    self.assertEqual(jobs["worker-1"].kwargs["comparison_ports"], [443])
+    self.assertIsNone(jobs["worker-3"].kwargs["comparison_ports"])
+    self.assertEqual(jobs["worker-3"].kwargs["checkpoint_context"], {"pass_nr": 1})
+    self.assertEqual(jobs["worker-3"].kwargs["job_ports"], [2, 4, 9, 17, 30])  # the saved batches
+
+  def test_without_restored_workers_are_not_restored(self):
+    jobs = self._restored_launch(None)
+    self.assertEqual(len(jobs), 5)
+    self.assertFalse(any(hasattr(w, "restored") for w in jobs.values()))
+    self.assertEqual(jobs["worker-1"].kwargs["comparison_ports"], [443])
+
+  def test_restore_failure_launches_that_worker_fresh(self):
+    restored = [
+      {"local_id_prefix": "1", "local_worker_id": "a", "initial_ports": [1]},
+      {"local_id_prefix": "2", "local_worker_id": "b", "initial_ports": [2, 3]},
+    ]
+    real = DummyRestorableWorker.restore_from_checkpoint
+
+    def flaky(self, payload):
+      if payload["local_id_prefix"] == "2":
+        raise KeyError("state")
+      real(self, payload)
+
+    with patch.object(DummyRestorableWorker, "restore_from_checkpoint", flaky):
+      jobs = self._restored_launch(restored)
+    self.assertEqual(sorted(jobs), ["worker-1", "worker-2"])
+    self.assertTrue(hasattr(jobs["worker-1"], "restored"))
+    self.assertFalse(hasattr(jobs["worker-2"], "restored"))  # a new, unrestored worker
+    self.assertEqual(jobs["worker-2"].worker_target_ports, [2, 3])
+    self.assertTrue(all(w.started for w in jobs.values()))
 
   def test_launch_local_jobs_uses_webapp_strategy_dispatch(self):
     owner = DummyOwner()

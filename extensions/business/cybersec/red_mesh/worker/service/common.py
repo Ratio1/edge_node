@@ -2,16 +2,22 @@ import random
 import re as _re
 import socket
 import struct
+import time
 import ftplib
 import requests
 import ssl
 from datetime import datetime
+from urllib.parse import urlparse
 
 import paramiko
 
+from ...constants import AUTH_SKIPPED
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
-from ...cve_db import check_cves, parse_distro_package
+from ...cve_db import (
+  BANNER_NOT_ASSESSABLE, NOT_APPLICABLE_BEHAVIOUR_CLEARED, check_cves, clear_cve, confirm_cve, parse_distro_package, probe_cve_fields,
+  withdraw_not_applicable,
+)
 from ...models.finding_schema import (
   AUTHENTICATED_ACTION_ATTEMPTED, AUTHENTICATED_ACTION_PERFORMED,
 )
@@ -198,8 +204,210 @@ _HTTP_SERVER_RE = _re.compile(
 _HTTP_PRODUCT_MAP = {'apache': 'apache', 'nginx': 'nginx'}
 
 
+_EHLO_LABEL = _re.compile(r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
+
+
+_DEFAULT_EHLO_DOMAIN = "probe.redmesh.local"
+
+
+def _ehlo_domain(identity):
+  """Return identity when it is a valid hostname (RFC 1123), else the default EHLO domain."""
+  if (isinstance(identity, str) and 0 < len(identity) <= 253
+      and all(_EHLO_LABEL.match(label) for label in identity.split("."))):
+    return identity
+  return _DEFAULT_EHLO_DOMAIN
+
+
+def _server_package(server, version):
+  """The distro package of a Server header, only when it names the version `check_cves` matches (RM-240)."""
+  package = parse_distro_package(server)
+  return package if package is not None and package.upstream == version else None
+
+
+# RM-204: the one positive upstream-build marker: a header that starts `Apache/x (Unix)`, followed only by `Name/version` module tokens.
+# A vendor word, a distro marker or no parenthesised token is not the marker; absence of a distro marker never is.
+_APACHE_UPSTREAM_RE = _re.compile(r'\s*Apache/\d+(?:\.\d+)+ \(Unix\)(?:\s+[\w.-]+/[\w.+~-]+)*\s*$')
+
+
+# --- SSH KEXINIT: the server's own algorithm offer (RM-200) ---------------------------------------
+# paramiko's `get_security_options()` is the client's preference list, so it says nothing about the server.
+# The server's SSH_MSG_KEXINIT (RFC 4253 section 7.1) is sent before any authentication and needs no keys.
+_KEXINIT_FIELDS = ("kex", "host_key", "enc_c2s", "enc_s2c", "mac_c2s", "mac_s2c",
+                   "comp_c2s", "comp_s2c", "lang_c2s", "lang_s2c")
+_KEXINIT_MAX_PACKET = 35000  # RFC 4253 section 6.1: a receiver must accept 35000 bytes
+_KEXINIT_MAX_NAME = 64
+_KEXINIT_MAX_NAMES = 64
+_KEXINIT_DEADLINE_FACTOR = 5   # overall read budget = this many per-recv timeouts ...
+_KEXINIT_DEADLINE_CAP = 15.0   # ... capped, so a server dripping one byte per timeout cannot hold the probe
+_SSH_STRICT_KEX = "kex-strict-s-v00@openssh.com"
+_SSH_CHACHA = "chacha20-poly1305@openssh.com"
+# Real Dropbear always offers the first (since 2013.57) and has never implemented the second.
+_DROPBEAR_KEXGUESS = "kexguess2@matt.ucc.asn.au"
+_DROPBEAR_NO_PREFIX = "diffie-hellman-group-exchange-"
+
+
+def _parse_ssh_kexinit(body):
+  """The 10 name-lists of an unencrypted SSH_MSG_KEXINIT packet body, or None.
+
+  `body` is the binary packet after its length field: padding length, payload, padding.
+  """
+  try:
+    pad = body[0]
+    payload = body[1:len(body) - pad]
+    if not payload or payload[0] != 20:
+      return None
+    pos = 17  # message type + 16-byte cookie
+    lists = {}
+    for field in _KEXINIT_FIELDS:
+      (size,) = struct.unpack(">I", payload[pos:pos + 4])
+      pos += 4
+      if size > len(payload) - pos:
+        return None
+      text = payload[pos:pos + size].decode("latin-1")
+      # RFC 4251 section 6: a name is printable ASCII 0x21-0x7e, 64 characters at most. Others are dropped, not cut.
+      names = [n for n in text.split(",") if 0 < len(n) <= _KEXINIT_MAX_NAME and all("!" <= c <= "~" for c in n)]
+      lists[field] = names[:_KEXINIT_MAX_NAMES]
+      pos += size
+    return lists
+  except (IndexError, struct.error):
+    return None
+
+
+def _ssh_read_kexinit(target, port, timeout):
+  """The server's KEXINIT name-lists as a dict, or None on any error. No authentication, bounded reads."""
+  sock = None
+  deadline = time.monotonic() + min(timeout * _KEXINIT_DEADLINE_FACTOR, _KEXINIT_DEADLINE_CAP)
+  try:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    sock.connect((target, port))
+    sock.sendall(b"SSH-2.0-RedMesh_Probe\r\n")
+    buf = b""
+
+    def take(n):
+      nonlocal buf
+      while len(buf) < n:
+        if time.monotonic() > deadline:
+          raise TimeoutError("KEXINIT read deadline")
+        chunk = sock.recv(4096)
+        if not chunk:
+          raise EOFError
+        buf += chunk
+      out, buf = buf[:n], buf[n:]
+      return out
+
+    for _ in range(20):  # a server may send text lines before its identification line
+      line = b""
+      while not line.endswith(b"\n"):
+        line += take(1)
+        if len(line) > 255:
+          return None
+      if line.startswith(b"SSH-"):
+        break
+    else:
+      return None
+    (length,) = struct.unpack(">I", take(4))
+    if length < 2 or length > _KEXINIT_MAX_PACKET:
+      return None
+    return _parse_ssh_kexinit(take(length))
+  except Exception:
+    return None
+  finally:
+    if sock is not None:
+      try:
+        sock.close()
+      except Exception:
+        pass
+
+
+def _ssh_banner_verdict(product, kexinit):
+  """`(verified, why)`: does the KEXINIT fit the implementation the banner names?
+
+  True: it does, or no rule exists (OpenSSH has no invariant its config cannot change, so it is verified by default).
+  False: it contradicts the banner, so the service is an emulator or a proxy. None: no KEXINIT to judge by.
+  BANNER_NOT_ASSESSABLE: no KEXINIT and the product has no check (only dropbear has one), so its rows keep their confidence.
+  """
+  if kexinit is None:
+    return (None if product == "dropbear" else BANNER_NOT_ASSESSABLE), ""
+  if product == "dropbear":
+    kex = kexinit["kex"]
+    if _DROPBEAR_KEXGUESS not in kex:
+      return False, f"banner names dropbear but the KEXINIT lacks {_DROPBEAR_KEXGUESS}, which every Dropbear offers"
+    group_exchange = sorted(k for k in kex if k.startswith(_DROPBEAR_NO_PREFIX))
+    if group_exchange:
+      return False, f"banner names dropbear but the KEXINIT offers {', '.join(group_exchange)}, which Dropbear never implements"
+  return True, ""
+
+
+def _ssh_terrapin(kexinit):
+  """`(vulnerable, evidence)` for CVE-2023-48795 from the server's KEXINIT; `(None, "")` without one.
+
+  Vulnerable: chacha20-poly1305, or a CBC cipher with an -etm MAC, is offered and strict KEX is not.
+  """
+  if kexinit is None:
+    return None, ""
+  ciphers = set(kexinit["enc_c2s"]) | set(kexinit["enc_s2c"])
+  macs = set(kexinit["mac_c2s"]) | set(kexinit["mac_s2c"])
+  modes = []
+  if _SSH_CHACHA in ciphers:
+    modes.append(_SSH_CHACHA)
+  cbc = sorted(c for c in ciphers if c.endswith("-cbc"))
+  etm = sorted(m for m in macs if m.endswith("-etm@openssh.com"))
+  if cbc and etm:
+    modes.append(f"{cbc[0]} with {etm[0]}")
+  strict = _SSH_STRICT_KEX in kexinit["kex"]
+  if modes and not strict:
+    return True, f"KEXINIT offers {' and '.join(modes)} and no {_SSH_STRICT_KEX}"
+  if strict:
+    return False, f"KEXINIT offers {_SSH_STRICT_KEX}"
+  return False, "KEXINIT offers neither chacha20-poly1305 nor a CBC cipher with an -etm MAC"
+
+
+def _smtp_banner_verdict(mta, ehlo_features):
+  """`(verified, why)` for an SMTP banner from the EHLO reply lines. Only judged when an EHLO 250 reply was read.
+
+  Exim always ends its EHLO reply with HELP; mailoney's reply has none. Other MTAs have no check: not assessable,
+  even when EHLO was refused.
+  """
+  if mta != "exim":
+    return BANNER_NOT_ASSESSABLE, ""
+  if not ehlo_features:
+    return None, ""
+  if not any(f.strip().upper() == "HELP" for f in ehlo_features):
+    return False, "banner names Exim but the EHLO reply has no HELP line, which Exim always sends"
+  return True, ""
+
+
 class _ServiceCommonMixin(_ServiceProbeBase):
   """HTTP, FTP, SSH, SMTP, Telnet and Rsync service probes."""
+
+  def _record_web_root(self, port, url, resp):
+    """RM-265: facts for the host-level "HTTP without redirect to HTTPS" rule, from a GET already sent.
+
+    `location_scheme` is read only from a 3xx first answer (a Location on a 200 redirects nothing);
+    `same_host` is False when the redirect chain ended on another host. Never raises: a bad
+    response leaves the probe as it was.
+    """
+    try:
+      meta = (getattr(self, "state", None) or {}).get("scan_metadata")
+      if meta is None:
+        return
+      history = resp.history if isinstance(resp.history, (list, tuple)) else ()
+      first = history[0] if history else resp
+      location = str(first.headers.get("Location") or "") if 300 <= first.status_code < 400 else ""
+      final_url = urlparse(str(resp.url))
+      meta.setdefault("web_root", {})[port] = {
+        "url": url,
+        "status": first.status_code,
+        "location_scheme": (urlparse(location).scheme.lower() or None) if location else None,
+        "final_status": resp.status_code,
+        "final_scheme": final_url.scheme.lower() or None,
+        "same_host": final_url.hostname == urlparse(url).hostname,
+        "empty": not bytes(resp.content or b"").strip(),
+        "catch_all": None,
+      }
+    except Exception as exc:
+      self.P(f"web_root facts not recorded for port {port}: {type(exc).__name__}", color='y')
 
   @register_probe(
     display_name="HTTP service detection",
@@ -250,6 +458,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       headers = {'User-Agent': ua} if ua else {}
       resp = requests.get(url, timeout=self._target_timeout(5), verify=False, allow_redirects=True, headers=headers)
 
+      if scheme == "http":
+        self._record_web_root(port, url, resp)
+
       result["banner"] = f"HTTP {resp.status_code} {resp.reason}"
       result["server"] = resp.headers.get("Server")
       if result["server"]:
@@ -259,7 +470,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         if _m:
           _cve_product = _HTTP_PRODUCT_MAP.get(_m.group(1).lower())
           if _cve_product:
-            findings += check_cves(_cve_product, _m.group(2))
+            findings += check_cves(_cve_product, _m.group(2),
+                                   package=_server_package(result["server"], _m.group(2)),
+                                   upstream_build=bool(_APACHE_UPSTREAM_RE.match(result["server"])))
         # Apache `ServerTokens Full` and some nginx builds disclose the
         # bundled OpenSSL package version in the Server header (e.g.
         # `Apache/2.4.50 (Unix) OpenSSL/1.0.2k`). Extract it as a separate
@@ -385,7 +598,11 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     dangerous = []
     statuses = {}
     host_is_catch_all = getattr(self, "_host_is_catch_all", None)
-    if host_is_catch_all is not None and host_is_catch_all(url):
+    catch_all = host_is_catch_all(url) if host_is_catch_all is not None else None
+    _root = (((getattr(self, "state", None) or {}).get("scan_metadata") or {}).get("web_root") or {}).get(port)
+    if _root is not None:
+      _root["catch_all"] = None if catch_all is None else bool(catch_all)
+    if catch_all:
       for method in methods:
         self._withhold_on_catch_all(url, "_service_info_http", f"{method} /")
       result["dangerous_methods_withheld"] = "catch_all"
@@ -545,7 +762,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         if _m:
           _cve_product = _HTTP_PRODUCT_MAP.get(_m.group(1).lower())
           if _cve_product:
-            findings += check_cves(_cve_product, _m.group(2))
+            findings += check_cves(_cve_product, _m.group(2),
+                                   package=_server_package(raw["server"], _m.group(2)),
+                                   upstream_build=bool(_APACHE_UPSTREAM_RE.match(raw["server"])))
         # Co-disclosed OpenSSL package version in the HTTPS Server header
         # (e.g. ``Apache/2.4.50 (Unix) OpenSSL/1.0.2k``) — common with
         # ``ServerTokens Full`` and some nginx builds.
@@ -687,8 +906,8 @@ class _ServiceCommonMixin(_ServiceProbeBase):
   @register_probe(
     display_name="FTP service detection",
     description=(
-      "FTP banner / features / anonymous-login / write-access probes. "
-      "Detects exposed FTP, anonymous read/write, missing FTPS."
+      "FTP banner / features / anonymous-login probes. "
+      "Detects exposed FTP, anonymous login, missing FTPS."
     ),
     category=CATEGORY_SERVICE_INFO,
     default_cwe=(287, 319),
@@ -698,17 +917,16 @@ class _ServiceCommonMixin(_ServiceProbeBase):
   def _service_info_ftp(self, target, port):  # default port: 21
     """
     Assess FTP service security: banner, anonymous access, default creds,
-    server fingerprint, TLS support, write access, and credential validation.
+    server fingerprint, TLS support, and credential validation.
 
     Checks performed (in order):
 
     1. Banner grab and SYST/FEAT fingerprint.
     2. Anonymous login attempt.
-    3. Write access test (STOR) after anonymous login.
-    4. Directory listing and traversal.
-    5. TLS support check (AUTH TLS).
-    6. Default credential check.
-    7. Arbitrary credential acceptance test.
+    3. Directory listing and traversal.
+    4. TLS support check (AUTH TLS).
+    5. Default credential check.
+    6. Arbitrary credential acceptance test.
 
     Parameters
     ----------
@@ -728,7 +946,6 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       "server_type": None,
       "features": [],
       "anonymous_access": False,
-      "write_access": False,
       "tls_supported": False,
       "accepted_credentials": [],
       "directory_listing": None,
@@ -751,7 +968,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
 
     # FTP server version CVE check
     _ftp_m = _re.search(
-      r'(ProFTPD|vsftpd)[/ ]+(\d+(?:\.\d+)+)',
+      r'(ProFTPD|vsftpd)[/ ]+(\d+(?:\.\d+)+(?:[a-z](?![a-z]))?)',
       result["banner"], _re.IGNORECASE,
     )
     if _ftp_m:
@@ -773,8 +990,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         owasp_id="A07:2021",
         cwe_id="CWE-287",
         confidence="certain",
-        # The upload test below always runs (RM-128); when it succeeds its own
-        # finding says `performed`, and "any performed" wins in the report.
+        # Anonymous login only; write access is never tested (RM-256).
         authenticated_action=AUTHENTICATED_ACTION_ATTEMPTED,
       ))
     except Exception:
@@ -831,35 +1047,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       except Exception:
         pass
 
-    # --- 3. Write access test (only if anonymous login succeeded) ---
-    if ftp and result["anonymous_access"]:
-      import io
-      try:
-        ftp.set_pasv(True)
-        test_data = io.BytesIO(b"RedMesh write access probe")
-        resp = ftp.storbinary("STOR __redmesh_probe.txt", test_data)
-        if resp and resp.startswith("226"):
-          result["write_access"] = True
-          findings.append(Finding(
-            severity=Severity.CRITICAL,
-            cvss_vector=V.UNAUTHENTICATED_READ_WRITE,
-            title="FTP anonymous write access enabled (file upload possible).",
-            description="Anonymous users can upload files to the FTP server.",
-            evidence="STOR command succeeded with anonymous session.",
-            remediation="Remove write permissions for anonymous FTP users.",
-            owasp_id="A01:2021",
-            cwe_id="CWE-434",
-            confidence="certain",
-            authenticated_action=AUTHENTICATED_ACTION_PERFORMED,
-          ))
-          try:
-            ftp.delete("__redmesh_probe.txt")
-          except Exception:
-            pass
-      except Exception:
-        pass
-
-    # --- 4. Directory listing and traversal ---
+    # --- 3. Directory listing and traversal ---
     if ftp:
       try:
         pwd = ftp.pwd()
@@ -903,7 +1091,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       except Exception:
         pass
 
-    # --- 5. TLS support check ---
+    # --- 4. TLS support check ---
     try:
       ftp_tls = _ftp_connect()
       resp = ftp_tls.sendcmd("AUTH TLS")
@@ -926,7 +1114,10 @@ class _ServiceCommonMixin(_ServiceProbeBase):
           confidence="certain",
         ))
 
-    # --- 6. Default credential check ---
+    # --- 5. Default credential check ---
+    if not self._login_attempts_allowed():
+      result["auth_control"] = dict(AUTH_SKIPPED)
+      return probe_result(raw_data=result, findings=findings)
     accepted_creds = []
     proofs = {}
     for user, passwd in _FTP_DEFAULT_CREDS:
@@ -945,8 +1136,8 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       except Exception:
         pass
 
-    # --- 7. Arbitrary credential acceptance test ---
-    # Doubles as the negative control for step 6 (RM-069); the default-credential
+    # --- 6. Arbitrary credential acceptance test ---
+    # Doubles as the negative control for step 5 (RM-069); the default-credential
     # findings are built after it so they can be gated on its outcome.
     control = CONTROL_NOT_RUN
     import string as _string
@@ -1071,66 +1262,70 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     # --- 3. Default credential check ---
     accepted_creds = []
     proofs = {}
+    login_attempts = self._login_attempts_allowed()
+    control = CONTROL_NOT_RUN
 
-    for username, password in _SSH_DEFAULT_CREDS:
+    if not login_attempts:
+      result["auth_control"] = dict(AUTH_SKIPPED)
+    else:
+      for username, password in _SSH_DEFAULT_CREDS:
+        try:
+          client = paramiko.SSHClient()
+          client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+          client.connect(
+            target, port=port,
+            username=username, password=password,
+            timeout=self._target_timeout(3), auth_timeout=self._target_timeout(3),
+            look_for_keys=False, allow_agent=False,
+          )
+          cred = f"{username}:{password}"
+          accepted_creds.append(cred)
+          proofs[cred] = _ssh_authenticated_action(client, self._target_timeout(3))
+          client.close()
+        except paramiko.AuthenticationException:
+          continue
+        except Exception:
+          break  # connection issue, stop trying
+
+      # --- 4. Arbitrary credential acceptance test ---
+      # Doubles as the negative control for step 3: a service that accepts a
+      # random pair has not demonstrated a default credential in use, whatever
+      # it said to the defaults (RM-069).
+      random_user = f"probe_{random.randint(10000, 99999)}"
+      random_pass = f"rnd_{random.randint(10000, 99999)}"
       try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(
           target, port=port,
-          username=username, password=password,
+          username=random_user, password=random_pass,
           timeout=self._target_timeout(3), auth_timeout=self._target_timeout(3),
           look_for_keys=False, allow_agent=False,
         )
-        cred = f"{username}:{password}"
-        accepted_creds.append(cred)
-        proofs[cred] = _ssh_authenticated_action(client, self._target_timeout(3))
+        # The generated pair goes to raw_data, not into the finding. `evidence` is
+        # a content-hash field (models/finding_identity._CONTENT_FIELDS), so a
+        # value that differs every run gave this finding a new finding_signature
+        # on every scan and on every worker: change detection reported a change
+        # each pass and the aggregate carried one copy per worker.
+        result["arbitrary_credentials_accepted"] = f"{random_user}:{random_pass}"
+        control = CONTROL_ACCEPTED
+        findings.append(Finding(
+          severity=Severity.CRITICAL,
+          cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
+          title="SSH accepts arbitrary credentials",
+          description="Random credentials were accepted, indicating a dangerous misconfiguration or deceptive service.",
+          evidence="Randomly generated credentials were accepted by the SSH service.",
+          remediation="Investigate immediately — authentication is non-functional.",
+          owasp_id="A07:2021",
+          cwe_id="CWE-287",
+          confidence="certain",
+        ))
         client.close()
       except paramiko.AuthenticationException:
-        continue
+        control = CONTROL_REJECTED
       except Exception:
-        break  # connection issue, stop trying
-
-    # --- 4. Arbitrary credential acceptance test ---
-    # Doubles as the negative control for step 3: a service that accepts a
-    # random pair has not demonstrated a default credential in use, whatever
-    # it said to the defaults (RM-069).
-    control = CONTROL_NOT_RUN
-    random_user = f"probe_{random.randint(10000, 99999)}"
-    random_pass = f"rnd_{random.randint(10000, 99999)}"
-    try:
-      client = paramiko.SSHClient()
-      client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-      client.connect(
-        target, port=port,
-        username=random_user, password=random_pass,
-        timeout=self._target_timeout(3), auth_timeout=self._target_timeout(3),
-        look_for_keys=False, allow_agent=False,
-      )
-      # The generated pair goes to raw_data, not into the finding. `evidence` is
-      # a content-hash field (models/finding_identity._CONTENT_FIELDS), so a
-      # value that differs every run gave this finding a new finding_signature
-      # on every scan and on every worker: change detection reported a change
-      # each pass and the aggregate carried one copy per worker.
-      result["arbitrary_credentials_accepted"] = f"{random_user}:{random_pass}"
-      control = CONTROL_ACCEPTED
-      findings.append(Finding(
-        severity=Severity.CRITICAL,
-        cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
-        title="SSH accepts arbitrary credentials",
-        description="Random credentials were accepted, indicating a dangerous misconfiguration or deceptive service.",
-        evidence="Randomly generated credentials were accepted by the SSH service.",
-        remediation="Investigate immediately — authentication is non-functional.",
-        owasp_id="A07:2021",
-        cwe_id="CWE-287",
-        confidence="certain",
-      ))
-      client.close()
-    except paramiko.AuthenticationException:
-      control = CONTROL_REJECTED
-    except Exception:
-      pass  # the control did not run; stays CONTROL_NOT_RUN
-    result["auth_control"] = {"random_credentials": control}
+        pass  # the control did not run; stays CONTROL_NOT_RUN
+      result["auth_control"] = {"random_credentials": control}
 
     if accepted_creds:
       result["accepted_credentials"] = accepted_creds
@@ -1138,12 +1333,14 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         "SSH", accepted_creds, control=control, proofs=proofs,
       )
 
-    # --- 5. Cipher/KEX audit ---
-    cipher_findings, weak_labels = self._ssh_check_ciphers(target, port)
+    # --- 5. Cipher/KEX audit, from the server's own KEXINIT ---
+    kexinit = _ssh_read_kexinit(target, port, self._target_timeout(3))
+    cipher_findings, weak_labels = self._ssh_check_ciphers(target, port, kexinit)
     findings += cipher_findings
     result["weak_algorithms"] = weak_labels
 
     # --- 6. CVE check on banner version ---
+    ssh_lib = ssh_version = package = verified = None
     if result["banner"]:
       ssh_lib, ssh_version = self._ssh_identify_library(result["banner"])
       if ssh_lib and ssh_version:
@@ -1154,17 +1351,75 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         # returning the bare upstream version the matcher compares; the
         # package is what decides whether a matched CVE was backported (RM-070).
         package = parse_distro_package(result["banner"])
+        if package is not None and not package.revision:
+          # `OpenSSH_8.9p1 (Ubuntu)` names no revision: behave as if no package was parsed.
+          package = None
         if package is not None:
           result["ssh_package"] = f"{package.upstream} {package.distro}-{package.revision}"
-        findings += check_cves(ssh_lib, ssh_version, package=package)
+        # Does the KEXINIT fit the implementation the banner names? An emulator announces a real
+        # version and offers its own algorithms (RM-200).
+        verified, why = _ssh_banner_verdict(ssh_lib, kexinit)
+        self._record_banner_verdict(result, f"ssh:{port}", verified, why)
+        findings += check_cves(ssh_lib, ssh_version, package=package, banner_verified=verified)
 
         # --- 7. libssh auth bypass (CVE-2018-10933) ---
-        if ssh_lib == "libssh":
+        if ssh_lib == "libssh" and login_attempts:
           bypass = self._ssh_check_libssh_bypass(target, port)
           if bypass:
             findings.append(bypass)
 
+    # --- 8. Terrapin (CVE-2023-48795), from the KEXINIT and not the banner ---
+    findings = self._ssh_apply_terrapin(findings, kexinit, ssh_lib or "", ssh_version or "", package, verified)
+
     return probe_result(raw_data=result, findings=findings)
+
+  def _record_banner_verdict(self, result, source, verified, why):
+    """Put a banner verdict in the probe result and hand an unverified one to the honeypot correlation."""
+    if verified is None or verified == BANNER_NOT_ASSESSABLE:
+      return
+    result["banner_verified"] = verified
+    if verified is False:
+      result["banner_unverified_reason"] = why
+      meta = self.state.get("scan_metadata")
+      if meta is not None:
+        # `pentest_worker.py` declares the other buckets; this one is added here, outside that file's reach.
+        meta.setdefault("banner_unverified", {})
+      self._emit_metadata("banner_unverified", source, why)
+
+  def _ssh_apply_terrapin(self, findings, kexinit, product, version, package, banner_verified=None):
+    """Confirm or clear CVE-2023-48795 from the KEXINIT, whatever the banner row says.
+
+    Not vulnerable: the banner row, if any, leaves the list and is recorded as not applicable.
+    Vulnerable: the banner row becomes certain with the KEXINIT evidence; with no row, a certain finding is added.
+    On a banner proven false (`banner_verified is False`) the finding keeps the evidence but stays tentative
+    `banner_unverified`: the service is an emulator, so its KEXINIT says nothing about a real server.
+    If the row had been dropped as `backport_fixed`, the behaviour wins and that record is withdrawn.
+    """
+    vulnerable, evidence = _ssh_terrapin(kexinit)
+    if vulnerable is None:
+      return findings
+    cve_id = "CVE-2023-48795"
+    if not vulnerable:
+      return clear_cve(findings, cve_id, product, version, package, NOT_APPLICABLE_BEHAVIOUR_CLEARED)
+    withdraw_not_applicable(cve_id)
+    unverified = banner_verified is False
+    if any(cve_id in (f.cve or ()) for f in findings):
+      return [confirm_cve(f, product, version, evidence, unverified=unverified) if cve_id in (f.cve or ()) else f
+              for f in findings]
+    return findings + [Finding(
+      severity=Severity.MEDIUM,
+      cvss_vector=V.WEAK_TRANSPORT,
+      title=f"{cve_id}: SSH Terrapin prefix truncation attack",
+      description="The SSH server offers an encryption mode affected by the Terrapin attack and does not offer strict key exchange.",
+      evidence=evidence,
+      remediation="Upgrade the SSH server to a release with strict key exchange, or disable chacha20-poly1305 and CBC-with-ETM modes.",
+      owasp_id="A02:2021",
+      cwe_id="CWE-354",
+      confidence="tentative" if unverified else "certain",
+      confidence_reason="banner_unverified" if unverified else "behaviour_confirmed",
+      cve=(cve_id,),
+      **probe_cve_fields(cve_id),
+    )]
 
   # Patterns: (regex, product_name_for_cve_db)
   _SSH_LIBRARY_PATTERNS = [
@@ -1189,8 +1444,11 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         return product, m.group(1)
     return None, None
 
-  def _ssh_check_ciphers(self, target, port):
-    """Audit SSH ciphers, KEX, and MACs via paramiko Transport.
+  def _ssh_check_ciphers(self, target, port, kexinit=None):
+    """Audit SSH ciphers, KEX and host-key types from the server's KEXINIT; the RSA key size via paramiko.
+
+    ``kexinit`` is `_ssh_read_kexinit`'s result. None: no cipher, KEX or DSA finding (paramiko's own preference
+    list is never a fallback: it describes the client).
 
     Returns
     -------
@@ -1205,18 +1463,23 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     _WEAK_KEX = {"diffie-hellman-group1-sha1", "diffie-hellman-group14-sha1",
                  "diffie-hellman-group-exchange-sha1"}
 
-    try:
-      transport = paramiko.Transport((target, port))
-      transport.connect()
-      sec_opts = transport.get_security_options()
+    ciphers = set(kexinit["enc_s2c"]) if kexinit else set()
+    kex = set(kexinit["kex"]) if kexinit else set()
+    key_types = set(kexinit["host_key"]) if kexinit else set()
 
-      ciphers = set(sec_opts.ciphers) if sec_opts.ciphers else set()
-      kex = set(sec_opts.kex) if sec_opts.kex else set()
-      key_types = set(sec_opts.key_types) if sec_opts.key_types else set()
+    try:
+      # The paramiko session only supplies the RSA host key; the algorithm lists above do not need it.
+      transport = None
+      try:
+        transport = paramiko.Transport((target, port))
+        transport.connect()
+      except Exception as e:
+        self.P(f"SSH host key read failed on {target}:{port}: {e}", color='y')
+        transport = None
 
       # RSA key size check — must be done before transport.close()
       try:
-        remote_key = transport.get_remote_server_key()
+        remote_key = transport.get_remote_server_key() if transport is not None else None
         if remote_key is not None and remote_key.get_name() == "ssh-rsa":
           key_bits = remote_key.get_bits()
           if key_bits < 2048:
@@ -1248,7 +1511,8 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       except Exception:
         pass
 
-      transport.close()
+      if transport is not None:
+        transport.close()
 
       # DSA key detection
       if "ssh-dss" in key_types:
@@ -1330,6 +1594,8 @@ class _ServiceCommonMixin(_ServiceProbeBase):
             severity=Severity.CRITICAL,
             cvss_vector=V.UNAUTHENTICATED_READ_WRITE,
             title="libssh auth bypass (CVE-2018-10933)",
+            cve=("CVE-2018-10933",),
+            **probe_cve_fields("CVE-2018-10933"),
             description="Server accepted SSH2_MSG_USERAUTH_SUCCESS from client, "
                         "bypassing authentication entirely. Full shell access possible.",
             evidence="Session channel opened after sending USERAUTH_SUCCESS.",
@@ -1401,7 +1667,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       return probe_error(target, port, "SMTP", e)
 
     # --- 2. EHLO — server capabilities ---
-    identity = getattr(self, 'scanner_identity', 'probe.redmesh.local')
+    identity = _ehlo_domain(getattr(self, 'scanner_identity', _DEFAULT_EHLO_DOMAIN))
     ehlo_features = []
     try:
       code, msg = smtp.ehlo(identity)
@@ -1478,7 +1744,10 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     if _mta_name and _mta_version:
       _cve_product = _smtp_product_map.get(_mta_name)
       if _cve_product:
-        findings += check_cves(_cve_product, _mta_version)
+        # Mailoney announces Exim and answers EHLO like nothing Exim sends (RM-200).
+        verified, why = _smtp_banner_verdict(_mta_name, ehlo_features)
+        self._record_banner_verdict(result, f"smtp:{port}", verified, why)
+        findings += check_cves(_cve_product, _mta_version, banner_verified=verified)
 
     if result["server_hostname"]:
       # Check if hostname reveals container/internal info
@@ -1672,18 +1941,6 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       "system_info": None,
     }
 
-    findings.append(Finding(
-      severity=Severity.MEDIUM,
-      cvss_vector=V.WEAK_TRANSPORT,
-      title="Telnet service is running (unencrypted remote access).",
-      description="Telnet transmits all data including credentials in cleartext.",
-      evidence=f"Telnet port {port} is open on {target}.",
-      remediation="Replace Telnet with SSH for encrypted remote access.",
-      owasp_id="A02:2021",
-      cwe_id="CWE-319",
-      confidence="certain",
-    ))
-
     # --- 1. Banner grab + IAC negotiation parsing ---
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1705,7 +1962,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     i = 0
     text_parts = []
     while i < len(raw):
-      if raw[i] == 0xFF and i + 2 < len(raw):
+      if raw[i] == 0xFF and i + 2 < len(raw) and 250 <= raw[i + 1] <= 254:  # IAC SB/WILL/WONT/DO/DONT <option>
         cmd = cmd_names.get(raw[i + 1], f"CMD_{raw[i+1]}")
         opt = opt_names.get(raw[i + 2], f"OPT_{raw[i+2]}")
         iac_options.append(f"{cmd} {opt}")
@@ -1723,6 +1980,29 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     else:
       result["banner"] = "(no banner)"
     result["negotiation_options"] = iac_options
+
+    if banner_text or iac_options:
+      findings.append(Finding(
+        severity=Severity.MEDIUM,
+        cvss_vector=V.WEAK_TRANSPORT,
+        title="Telnet service is running (unencrypted remote access).",
+        description="Telnet transmits all data including credentials in cleartext.",
+        evidence=f"Telnet port {port} is open on {target}.",
+        remediation="Replace Telnet with SSH for encrypted remote access.",
+        owasp_id="A02:2021",
+        cwe_id="CWE-319",
+        confidence="certain",
+      ))
+    else:
+      findings.append(Finding(
+        severity=Severity.INFO,
+        title="Telnet port accepted a connection, no banner or negotiation",
+        description="The port accepted a TCP connection but sent no Telnet negotiation or banner.",
+        evidence=(f"Telnet port {port} on {target} sent {len(raw)} byte(s), no Telnet negotiation or text banner."
+                  if raw else f"Telnet port {port} on {target} sent no bytes."),
+        remediation="Verify the service on this port manually.",
+        confidence="tentative",
+      ))
 
     # --- 2–4. Default credential check with system fingerprint ---
     def _try_telnet_login(user, passwd, act=False):
@@ -1837,6 +2117,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       except Exception:
         return False, None, None
 
+    if not self._login_attempts_allowed():
+      result["auth_control"] = dict(AUTH_SKIPPED)
+      return probe_result(raw_data=result, findings=findings)
     system_info_captured = False
     accepted_creds = []
     proofs = {}

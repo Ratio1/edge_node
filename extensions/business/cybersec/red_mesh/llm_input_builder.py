@@ -46,7 +46,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .cvss_entries import cvss_entries, is_cvss_vector
 from .credential_redaction import redact_credential_text
+from .cve_view import apply_triage, build_cve_view, drop_closed, effective_kev, filter_listed, summarize_view
 from .models.finding_schema import is_coverage_result as _is_coverage_result
 
 
@@ -178,6 +180,7 @@ def build_llm_input(
   aggregated_report: dict | None = None,
   engagement: dict | None = None,
   max_findings: int = MAX_FINDINGS_INCLUDED,
+  triage: dict | None = None,
 ) -> LlmInput:
   """Construct the LLM context payload.
 
@@ -200,6 +203,9 @@ def build_llm_input(
       Cap on findings included; defaults to MAX_FINDINGS_INCLUDED.
       Findings are sorted by severity descending, then by confidence,
       so the most important make it past the cap.
+  triage : dict | None
+      The live host triage map (finding_id -> record): closed findings are left out,
+      confirmed tentative ones read certain. None or {} closes nothing.
   """
   finding_dicts = list(findings or [])
 
@@ -221,21 +227,32 @@ def build_llm_input(
   # real findings, on a declared severity it kept because only `not_vulnerable`
   # is downgraded to INFO.
   real_findings = [f for f in finding_dicts if not _is_coverage_result(f)]
+  # RM-169, generated CVE findings: the listed ones go in `findings`; the view's counts, rollups, possible
+  # summary and folded groups (with their per-reason counts) go in `scan_summary`. None under `static`.
+  not_applicable = ((aggregated_report or {}).get("cves_not_applicable") or {}).values()
+  # `triage` is the live host triage map, passed by the caller. A `triage` field embedded on a finding is never
+  # read: it may come from a worker, and only the live map closes or confirms a finding.
+  real_findings = apply_triage(real_findings, triage)
+  cve_view = build_cve_view(real_findings, not_applicable, triage)
+  real_findings = drop_closed(filter_listed(real_findings, view=cve_view), triage)
   real_findings.sort(key=_key)
   truncated = real_findings[:max_findings]
 
   out_findings = [_sanitize_finding(f) for f in truncated]
 
+  scan_summary = _summarize_scan(
+    aggregated_report,
+    # All three from one list, so they cannot disagree. Fixing only
+    # `total_findings` told the model there was one finding and handed it ten.
+    total_findings=len(real_findings),
+    included_findings=len(out_findings),
+    truncated_findings=len(real_findings) - len(out_findings),
+  )
+  if cve_view:
+    scan_summary["cve_view"] = summarize_view(cve_view)
   return LlmInput(
     engagement_summary=_summarize_engagement(engagement),
-    scan_summary=_summarize_scan(
-      aggregated_report,
-      # All three from one list, so they cannot disagree. Fixing only
-      # `total_findings` told the model there was one finding and handed it ten.
-      total_findings=len(real_findings),
-      included_findings=len(out_findings),
-      truncated_findings=len(real_findings) - len(out_findings),
-    ),
+    scan_summary=scan_summary,
     findings=out_findings,
   )
 
@@ -286,6 +303,8 @@ def _summarize_scan(
     "routes_discovered": 0,
     "scenarios_tested": 0,
     "scan_type": "",
+    "discovery_coverage_note": "",
+    "admin_context": "",
   }
   if not isinstance(aggregated, dict):
     return out
@@ -297,6 +316,17 @@ def _summarize_scan(
   service_info = aggregated.get("service_info") or {}
   if isinstance(service_info, dict):
     out["services_count"] = len(service_info)
+    # A regular-only graybox scan states what its crawl could not reach, so the
+    # narrative does not claim admin coverage.
+    for methods in service_info.values():
+      if not isinstance(methods, dict):
+        continue
+      auth_info = methods.get("_graybox_auth")
+      if isinstance(auth_info, dict) and not out["admin_context"]:
+        out["admin_context"] = _sanitize(auth_info.get("admin_context", ""), 32)
+      discovery = methods.get("_graybox_discovery")
+      if isinstance(discovery, dict) and not out["discovery_coverage_note"]:
+        out["discovery_coverage_note"] = _sanitize(discovery.get("coverage_note", ""), 200)
 
   out["scan_type"] = _sanitize(aggregated.get("scan_type", ""), 32)
 
@@ -357,13 +387,18 @@ def _sanitize_finding(f: dict) -> dict:
     "confidence": _sanitize(f.get("confidence", ""), 32),
     "owasp_id": _sanitize(f.get("owasp_id", ""), 32),
     "cwe_id": _sanitize(f.get("cwe_id", ""), 32),
-    "cvss_vector": _sanitize(f.get("cvss_vector", ""), 120),
+    "cvss_vector": _sanitize(_cvss_vector_or_empty(f.get("cvss_vector")), 256),
+    "cvss_v4_vector": _sanitize(_cvss_vector_or_empty((_v4_entry(f) or {}).get("vector")), 256),
+    "cvss_v4_score": _safe_float((_v4_entry(f) or {}).get("score")),
     "cvss_score": _safe_float(f.get("cvss_score")),
     # KEV is a fact only when the dynamic reference cache consulted it; its
     # fetch timestamp is `cvss_data_freshness`. Otherwise it is unknown, not
     # "not listed" (RM-090: the cache is not wired in production yet).
-    "kev": bool(f.get("kev", False)) if f.get("cvss_data_freshness") else None,
-    "kev_evaluated": bool(f.get("cvss_data_freshness")),
+    # A generated finding carries its own tri-state (a local build has no freshness but did evaluate KEV).
+    # RM-200: a tentative row that is platform-only, unverified or local-only is not shown as KEV (`effective_kev`).
+    "kev": (None if f.get("kev") is None else effective_kev(f)) if f.get("vulndb_build_id")
+           else (effective_kev(f) if f.get("cvss_data_freshness") else None),
+    "kev_evaluated": f.get("kev") is not None if f.get("vulndb_build_id") else bool(f.get("cvss_data_freshness")),
     "epss_score": _safe_float(f.get("epss_score")),
     "cve": _sanitize_list(f.get("cve"), MAX_REFERENCES_PER_FINDING, 32),
     "cwe": [int(x) for x in (f.get("cwe") or []) if isinstance(x, int) and x > 0][:8],
@@ -380,6 +415,14 @@ def _sanitize_finding(f: dict) -> dict:
     # evidence at all, because nothing populated `evidence_items` for them.
   }
   return out
+
+
+def _cvss_vector_or_empty(v: Any) -> str:
+  return v if is_cvss_vector(v) else ""
+
+
+def _v4_entry(f: dict) -> dict | None:
+  return next((e for e in cvss_entries(f) if e["version"] == "4.0"), None)
 
 
 def _safe_float(v: Any) -> float | None:

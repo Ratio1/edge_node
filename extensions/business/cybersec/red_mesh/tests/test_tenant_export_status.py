@@ -98,13 +98,13 @@ def test_checked_model_error_is_typed_and_unchecked_compatibility_remains(reader
 @pytest.mark.parametrize("role", ("tenant_admin", "tenant_pentester", "tenant_user", "super_tenant_admin"))
 def test_endpoint_admits_every_tenant_reader(reader, key, published, role):
   with read_endpoint_fixture(bound=True) as fixture:
-    fixture.store.data[("auth", "reader")]["memberships"] = [
+    fixture.store.data[("deployment:auth", "reader")]["memberships"] = [
       {"role": role, "tenant_id": None if role == "super_tenant_admin" else fixture.tenant_id}]
     writes = list(fixture.store.writes)
     result = getattr(fixture.Plugin, reader.__name__)(fixture.owner, "job-1", request_actor=fixture.actor,
                                                       tenant_id=fixture.tenant_id)
     assert result == {"job_id": "job-1", "found": True, "exported": False}
-    assert fixture.store.reads[0] == ("get", "auth", "reader")
+    assert fixture.store.reads[0] == ("get", "deployment:auth", "reader")
     # The tenant reader point-reads the job; it never enumerates the shared job hash.
     assert fixture.store.reads[-1] == ("get", fixture.store.cfg_instance_id, "job-1")
     assert not any(row[0] == "list" and row[1] == fixture.store.cfg_instance_id for row in fixture.store.reads)
@@ -138,7 +138,7 @@ def test_real_account_and_stored_job_denials_have_no_effects(reader, key, publis
     if fault == "actorless":
       actor = None
     elif fault.endswith("memberships"):
-      fixture.store.data[("auth", "reader")]["memberships"] = {
+      fixture.store.data[("deployment:auth", "reader")]["memberships"] = {
         "empty_memberships": [], "null_memberships": None, "malformed_memberships": "private",
       }[fault]
     elif fault == "inactive":
@@ -266,7 +266,7 @@ def test_actual_native_denials_are_sanitized_and_no_store(read_native, reader, k
     if outcome == "model":
       fixture.job["job_type"] = "model_test"
     elif outcome == "member":
-      fixture.store.data[("auth", "reader")]["memberships"] = []
+      fixture.store.data[("deployment:auth", "reader")]["memberships"] = []
     elif outcome == "missing":
       fixture.store.jobs.clear()
     elif outcome == "actorless":
@@ -274,7 +274,7 @@ def test_actual_native_denials_are_sanitized_and_no_store(read_native, reader, k
     elif outcome == "malformed":
       fixture.job[key] = {"result": {"private": "hidden"}}
     elif outcome == "tenant_user":
-      fixture.store.data[("auth", "reader")]["memberships"] = [
+      fixture.store.data[("deployment:auth", "reader")]["memberships"] = [
         {"role": "tenant_user", "tenant_id": fixture.tenant_id}]
     elif outcome == "no_tenant":
       payload.pop("tenant_id")

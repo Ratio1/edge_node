@@ -11,6 +11,7 @@ from extensions.business.cybersec.red_mesh.constants import NETWORK_FEATURE_METH
 from extensions.business.cybersec.red_mesh.cve_db import check_cves
 from extensions.business.cybersec.red_mesh.detection_inventory import build_detection_inventory
 from extensions.business.cybersec.red_mesh.graybox.scenario_catalog import (
+  GRAYBOX_NOT_IMPLEMENTED,
   GRAYBOX_SCENARIO_CATALOG,
   attack_for_scenario,
 )
@@ -30,6 +31,15 @@ class TestDetectionInventory(unittest.TestCase):
     # (continued OWASP Web Top 10 closing).
     self.assertGreaterEqual(counts["graybox"], 103)
     self.assertGreaterEqual(counts["cves"], 200)
+
+  def test_cves_without_a_probe_are_counted_apart(self):
+    """Dead product keys keep their rows and their count, and are reported as not probe-reachable."""
+    inventory = build_detection_inventory()
+    self.assertEqual(inventory.counts()["cves_not_probe_reachable"], len(inventory.not_probe_reachable))
+    self.assertGreater(len(inventory.not_probe_reachable), 0)
+    self.assertLessEqual(inventory.not_probe_reachable, inventory.cves)
+    self.assertIn("CVE:CVE-2017-5638", inventory.not_probe_reachable)  # struts2
+    self.assertNotIn("CVE:CVE-2021-41773", inventory.not_probe_reachable)  # apache
 
   def test_detection_ids_are_unique(self):
     inventory = build_detection_inventory()
@@ -105,14 +115,29 @@ class TestDetectionInventory(unittest.TestCase):
               source_ids.add(candidate.value)
     return source_ids
 
-  def test_existing_graybox_emitted_scenarios_are_registered(self):
+  @classmethod
+  def _collect_source_ids(cls):
+    """Scenario ids the graybox source emits: the AST scan plus the `scenario_id=` regex over graybox/."""
     redmesh_root = Path(__file__).resolve().parents[1]
-    source_ids = self._collect_ast_scenario_ids(redmesh_root)
+    source_ids = cls._collect_ast_scenario_ids(redmesh_root)
     for path in (redmesh_root / "graybox").rglob("*.py"):
-      source_ids.update(self._SCENARIO_ID_RE.findall(path.read_text()))
+      source_ids.update(cls._SCENARIO_ID_RE.findall(path.read_text()))
+    return source_ids
+
+  def test_existing_graybox_emitted_scenarios_are_registered(self):
+    source_ids = self._collect_source_ids()
     catalog_ids = {entry["id"] for entry in GRAYBOX_SCENARIO_CATALOG}
     self.assertTrue(source_ids)
     self.assertEqual(source_ids - catalog_ids, set())
+
+  def test_catalog_partitions_into_runner_emitted_and_not_implemented(self):
+    """Every catalog id is emitted by a runner or listed not-implemented, never both."""
+    source_ids = self._collect_source_ids()
+    catalog_ids = {entry["id"] for entry in GRAYBOX_SCENARIO_CATALOG}
+    self.assertEqual(GRAYBOX_NOT_IMPLEMENTED - catalog_ids, set())
+    self.assertEqual(catalog_ids - source_ids - GRAYBOX_NOT_IMPLEMENTED, set())
+    self.assertEqual(GRAYBOX_NOT_IMPLEMENTED & source_ids, set())
+    self.assertEqual(len(GRAYBOX_NOT_IMPLEMENTED), 42)
 
   def test_api_probe_modules_use_emit_helpers_for_findings(self):
     """New API probe families should not bypass central emission helpers."""

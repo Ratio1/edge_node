@@ -37,9 +37,6 @@ class PurgeAdmissionCase(unittest.TestCase):
     TestPhase1ConfigCID._mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
 
-    env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
-    env.start()
-    self.addCleanup(env.stop)
     self.Plugin = PentesterApi01Plugin
     self.store = ReadStore()
     self.tenants = CstoreTenantAdministrationStore(self.store, "deployment")
@@ -55,7 +52,7 @@ class PurgeAdmissionCase(unittest.TestCase):
       "execution_binding": {**binding_payload(), "tenant_id": self.tenant_id}}
     self.actor = {"account_id": "reader"}
     self.owner = SimpleNamespace(
-      cfg_instance_id=self.store.cfg_instance_id, cfg_tenancy_namespace="deployment",
+      cfg_instance_id=self.store.cfg_instance_id, _stream_id="deployment",
       cfg_tenant_execution_enabled=False, cfg_tenant_execution_stage="compatibility",
       chainstore_hget=self.store.chainstore_hget, chainstore_hgetall=self.store.chainstore_hgetall,
       chainstore_hset=self.store.chainstore_hset, P=lambda *a, **k: None)
@@ -113,6 +110,14 @@ class TestPurgeAdmission(PurgeAdmissionCase):
         # Admission passed, so the canary raised inside the effect.
         self.assertNotEqual(result.get("status_code"), 403, result)
         self.assertNotIn(SECRET, repr(result))
+
+  def test_purge_all_names_the_admitted_tenant_so_a_tenant_without_jobs_is_still_purged(self):
+    self.as_role("super_tenant_admin")
+    import sys
+    module = sys.modules[self.Plugin.__module__]
+    with patch.object(module, "purge_all_jobs", return_value={"status": "success"}) as purge:
+      self.call("purge_all_redmesh_data")
+    self.assertEqual(purge.call_args.kwargs["tenant_id"], self.tenant_id)
 
   def test_every_other_tenant_role_is_refused(self):
     for role in ("super_pentester", "tenant_admin", "tenant_pentester", "tenant_user"):
@@ -404,6 +409,7 @@ class TestTheLedgerIsLiveOnThePurgePath(unittest.TestCase):
     owner.chainstore_hgetall.side_effect = lambda *, hkey: {}
     owner._normalize_job_record.side_effect = lambda k, r, **kw: (k, r)
     owner.r1fs.delete_file.return_value = delete_ok
+    owner.r1fs.get_json.return_value = {"passes": []}
     return owner
 
   def _job(self):
@@ -429,6 +435,124 @@ class TestTheLedgerIsLiveOnThePurgePath(unittest.TestCase):
     owner = self._owner(delete_ok=False)
     self.control.purge_job(owner, "job-1", checked_job=self._job(), ledger=ledger)
     self.assertIs(ledger.state, self.EffectState.NONE)
+
+
+class TestPurgeKeepsEverythingWhenAChildIsUnreadable(unittest.TestCase):
+  """RM-273 Phase B. An archive or pass report that cannot be fetched hides its child CIDs; deleting
+  the parent would orphan them. The purge answers `partial` and deletes nothing."""
+
+  def setUp(self):
+    from .conftest import mock_plugin_modules
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.services import control
+    self.control = control
+
+  def _run(self, archive=None, pass_report=None, with_pass_report=False, job_config=None, store=None,
+           failing=()):
+    from unittest.mock import MagicMock
+    owner = MagicMock()
+    owner.cfg_instance_id = "test-instance"
+    owner.ee_addr = "node-a"
+    owner.P = lambda *a, **k: None
+    owner._log_audit_event = lambda *a, **k: None
+    owner.chainstore_hgetall.side_effect = lambda *, hkey: {}
+    owner._normalize_job_record.side_effect = lambda k, r, **kw: (k, r)
+    owner.r1fs.delete_file.return_value = True
+    store = {} if store is None else store
+    owner.chainstore_hget.side_effect = lambda *, hkey, key: store.get((hkey, key))
+    owner.chainstore_hset.side_effect = lambda *, hkey, key, value: (
+      store.pop((hkey, key), None) if value is None else store.__setitem__((hkey, key), value))
+    job = {"job_id": "job-1", "job_status": "FINALIZED", "launcher": "node-a",
+           "job_cid": "cid-archive", "workers": {}}
+    if with_pass_report:
+      job["pass_reports"] = [{"report_cid": "cid-pass"}]
+    artifacts = MagicMock()
+    artifacts.delete.side_effect = lambda cid, **kw: cid not in failing
+    if job_config is not None:
+      job["job_config_cid"] = "cid-config"
+      if isinstance(job_config, Exception):
+        artifacts.get_job_config.side_effect = job_config
+      else:
+        artifacts.get_job_config.return_value = job_config
+    for target, value in ((artifacts.get_json, archive), (artifacts.get_pass_report, pass_report)):
+      if isinstance(value, Exception):
+        target.side_effect = value
+      else:
+        target.return_value = value
+    with patch.object(self.control, "_artifact_repo", return_value=artifacts), \
+         patch.object(self.control, "_delete_job_record") as delete_record:
+      result = self.control.purge_job(owner, "job-1", checked_job=job)
+    return result, artifacts, delete_record
+
+  def test_an_unreadable_archive_deletes_nothing(self):
+    result, artifacts, delete_record = self._run(archive=RuntimeError("gone"))
+    self.assertEqual(result["status"], "partial")
+    self.assertEqual(result["unreadable"], {"archive": 1})
+    artifacts.delete.assert_not_called()
+    delete_record.assert_not_called()
+
+  def test_an_unreadable_pass_report_deletes_nothing(self):
+    result, artifacts, delete_record = self._run(
+      archive={"passes": []}, pass_report=None, with_pass_report=True)
+    self.assertEqual(result["status"], "partial")
+    self.assertEqual(result["unreadable"], {"pass_report": 1})
+    artifacts.delete.assert_not_called()
+    delete_record.assert_not_called()
+
+  def test_an_unreadable_job_config_deletes_nothing(self):
+    result, artifacts, delete_record = self._run(archive={"passes": []}, job_config="not-a-dict")
+    self.assertEqual(result["status"], "partial")
+    self.assertEqual(result["unreadable"], {"job_config": 1})
+    artifacts.delete.assert_not_called()
+    delete_record.assert_not_called()
+
+  def test_the_partial_reply_carries_no_cid(self):
+    result, _, _ = self._run(archive=RuntimeError("gone"), pass_report=None, with_pass_report=True)
+    self.assertEqual(result["unreadable"], {"archive": 1, "pass_report": 1})
+    self.assertNotIn("cid-", repr(result))
+
+  def test_a_job_config_fetch_error_deletes_nothing(self):
+    result, artifacts, delete_record = self._run(archive={"passes": []}, job_config=RuntimeError("r1fs down"))
+    self.assertEqual((result["status"], result["unreadable"]), ("partial", {"job_config": 1}))
+    artifacts.delete.assert_not_called()
+    delete_record.assert_not_called()
+
+  def test_a_retry_after_a_partial_delete_completes(self):
+    # Round 1 deletes the archive and fails on its child; round 2 cannot read the archive any more,
+    # but the stored progress names the child, so the retry deletes it and completes.
+    store = {}
+    first, _, _ = self._run(archive={"passes": [{"aggregated_report_cid": "cid-agg"}]}, store=store,
+                            failing={"cid-agg"})
+    self.assertEqual((first["status"], first["cids_deleted"], first["cids_failed"]), ("partial", 1, 1))
+    second, artifacts, delete_record = self._run(archive=RuntimeError("deleted"), store=store)
+    self.assertEqual(second["status"], "success")
+    self.assertEqual([c.args[0] for c in artifacts.delete.call_args_list], ["cid-agg"])
+    delete_record.assert_called_once()
+    self.assertEqual(store, {})
+
+  def test_a_retry_after_a_stop_mid_delete_completes(self):
+    # Round 1 saved its progress and stopped (crash, raise) before recording any delete; the archive is
+    # gone. The stored "cids" still name it, so the retry deletes the rest and completes.
+    store = {("test-instance:purge_progress", "job-1"): {"cids": ["cid-agg", "cid-archive"], "deleted": []}}
+    result, artifacts, delete_record = self._run(archive=RuntimeError("deleted"), store=store)
+    self.assertEqual(result["status"], "success")
+    self.assertEqual(sorted(c.args[0] for c in artifacts.delete.call_args_list), ["cid-agg", "cid-archive"])
+    delete_record.assert_called_once()
+    self.assertEqual(store, {})
+
+  def test_a_successful_purge_leaves_no_progress_entry(self):
+    store = {}
+    result, _, _ = self._run(archive={"passes": []}, store=store)
+    self.assertEqual(result["status"], "success")
+    self.assertEqual(store, {})
+
+  def test_readable_archive_and_pass_report_purge_fully(self):
+    result, artifacts, delete_record = self._run(
+      archive={"passes": [{"aggregated_report_cid": "cid-agg"}]},
+      pass_report={"aggregated_report_cid": "cid-agg2"}, with_pass_report=True)
+    self.assertEqual(result["status"], "success")
+    self.assertEqual(result["cids_deleted"], 4)
+    delete_record.assert_called_once()
 
 
 class TestPurgeErrorsCarryNoExceptionProse(unittest.TestCase):

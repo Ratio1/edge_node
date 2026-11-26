@@ -52,7 +52,9 @@ PYTHONPATH=/home/vitalii/remote-dev/repos/edge_node pytest -q extensions/busines
 
 The native FastAPI tests need `naeural_core` importable from the repo root (a checkout or a symlink
 named `naeural_core` next to `extensions/`) and `aiofiles` and `uvicorn`; without them those tests
-skip or error and the failure count is misleading. From the edge_node repo root:
+skip or error and the failure count is misleading. Run it with pytest: `python -m unittest
+discover` collects only the unittest classes and skips the plain pytest test functions (about 3,000
+tests). From the edge_node repo root:
 
 ```bash
 uv run --no-project --with pytest --with pymisp --with requests --with numpy --with paramiko \

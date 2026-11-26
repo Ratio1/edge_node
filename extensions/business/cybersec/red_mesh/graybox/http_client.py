@@ -6,11 +6,43 @@ keeping the existing probe-facing ``requests.Session`` shape.
 
 from __future__ import annotations
 
+import contextlib
 import posixpath
+import time
 from collections.abc import Mapping
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import parse_qsl, urlencode, unquote, urljoin, urlsplit, urlunsplit
 
 import requests
+
+from ..constants import (
+  GRAYBOX_BACKOFF_DEADLINE,
+  GRAYBOX_HTTP_TIMEOUT,
+  GRAYBOX_RETRY_AFTER_MAX,
+  GRAYBOX_RETRY_MAX,
+)
+from .budget import RequestBudgetExhausted
+
+_RETRYABLE_METHODS = ("GET", "HEAD", "OPTIONS")
+
+
+def _retry_after_seconds(value):
+  """Seconds from a Retry-After header (delta-seconds or HTTP-date); None when absent or invalid."""
+  text = str(value or "").strip()
+  if not text:
+    return None
+  try:
+    seconds = float(text)
+  except ValueError:
+    try:
+      date = parsedate_to_datetime(text)
+      if date.tzinfo is None:  # "-0000" means UTC, not local time
+        date = date.replace(tzinfo=timezone.utc)
+      seconds = date.timestamp() - time.time()
+    except (TypeError, ValueError, IndexError, OverflowError):
+      return None
+  return seconds if seconds >= 0 else None  # negative or NaN: invalid
 
 
 class GrayboxScopeError(requests.RequestException):
@@ -260,6 +292,8 @@ class _ScopedAdapter(requests.adapters.BaseAdapter):
     self._client._validate_bound_url(request.url)
     self._client._validate_bound_headers(request.headers)
     self._client.validate_url(request.url)
+    # Not charged: an auth object or hook that resends here bypasses `_admit`. No caller
+    # supplies one today; RM-273 P4.4 (Digest/NTLM) must charge here.
     response = self._adapter.send(request, **kwargs)
     # Requests auth hooks can retry through response.connection.send directly.
     response.connection = self
@@ -344,6 +378,7 @@ class GrayboxHttpClient:
     request_budget=None,
     safety=None,
     execution_binding=None,
+    allow_private_targets=False,
   ):
     # Imported lazily: asset validation itself uses this module's path helper.
     from ..tenancy.execution import binding_value
@@ -354,11 +389,17 @@ class GrayboxHttpClient:
       if target["kind"] != "webapp":
         raise GrayboxScopeError("graybox requires a webapp execution target")
       self._bound_target = (target["url"], target["allowedPathPrefix"])
-    # The shared per-scan RequestBudget, so redirect hops can be charged where
-    # they are actually issued. Optional: legacy callers and tests construct the
+    # The shared per-scan RequestBudget, charged here for every hop actually
+    # issued (see `_admit`). Optional: legacy callers and tests construct the
     # client without one and are unaffected.
     self._request_budget = request_budget
     self._safety = safety
+    # RM-273 P2: session recovery hook (see `set_session_recovery`); `_recovering` keeps the
+    # liveness and login requests the hook itself sends from recursing into it.
+    self._recover = None
+    self._recovering = False
+    # RM-273 (D30): the worker passes the engagement's flag; without it private targets are refused.
+    self._allow_private_targets = allow_private_targets
     self.target_url = target_url.rstrip("/")
     self.scopes = path_scopes_from_allowlist(target_url, allowlist)
     discovery = getattr(target_config, "discovery", None)
@@ -497,6 +538,13 @@ class GrayboxHttpClient:
   def validate_url(self, url_or_path: str) -> str:
     url = normalize_request_url(self.target_url, url_or_path)
     self._validate_bound_url(url)
+    if not self._allow_private_targets:
+      from .safety import SafetyControls
+      # Re-checked on every request and fail-closed on a resolve error; connect-time pinning
+      # (closing the check-to-connect gap) is RM-273 Phase G.
+      reason = SafetyControls.private_target_reason(urlsplit(url).hostname, fail_closed=True)
+      if reason:
+        raise GrayboxScopeError(reason)
     path = urlsplit(url).path
     if self.scopes and not any(path_in_scope(path, scope) for scope in self.scopes):
       raise GrayboxScopeError(f"out-of-scope graybox request blocked: {path}")
@@ -541,11 +589,74 @@ class GrayboxHttpClient:
     except (AttributeError, TypeError, ValueError, UnicodeError) as exc:
       raise GrayboxScopeError("Host header is outside the bound graybox target") from exc
 
+  def _admit(self, budget_exempt=False, min_delay=None):
+    """Gate every hop before it is sent: stop check, breaker, charge, pace.
+
+    The one admission point for outbound traffic. A refused hop raises and
+    sends nothing; callers never receive a stand-in response. A stop seen during
+    pacing leaves that one hop charged and unsent. The stop check runs again
+    after pacing: no request leaves once a stop is seen.
+    """
+    if self._safety is not None:
+      self._safety.check_admission(budget_exempt)
+    if self._request_budget is not None:
+      if not self._request_budget.consume(1, exempt=budget_exempt):
+        raise RequestBudgetExhausted()
+    if self._safety is not None:
+      if budget_exempt:
+        self._safety.throttle(min_delay, interruptible=False)
+      else:
+        self._safety.throttle(min_delay)
+      self._safety.check_admission(budget_exempt)
+
+  def set_session_recovery(self, fn):
+    """Register `fn(raw_session, response) -> "reauthenticated" | "lost" | None`.
+
+    Called after a 401/403/3xx on a non-exempt hop; the manager decides whether the session
+    is really dead (a 403 is usually an authorization denial) and re-authenticates it in place.
+    """
+    self._recover = fn
+
+  @contextlib.contextmanager
+  def recovery_paused(self):
+    """No recovery hook for requests sent inside (the manager's own checks and logins)."""
+    self._recovering = True
+    try:
+      yield
+    finally:
+      self._recovering = False
+
+  def _recover_session(self, session, response):
+    with self.recovery_paused():
+      return self._recover(session, response)
+
+  def _backoff_wait(self, method, response, retries, deadline, allowed):
+    """Seconds to wait before retrying a throttled safe request, or None for no retry."""
+    if (not allowed or self._safety is None or self._safety.breaker_open
+        or method.upper() not in _RETRYABLE_METHODS
+        or response.status_code not in (429, 503) or retries >= GRAYBOX_RETRY_MAX
+        or self._safety.prepaid_active):
+      return None
+    wait = _retry_after_seconds(response.headers.get("Retry-After"))
+    if wait is None:
+      wait = float(2 ** retries)
+    # Never retry earlier than the target asked; when it asks for too long, do not retry.
+    if wait > GRAYBOX_RETRY_AFTER_MAX or time.time() + wait > deadline:
+      return None
+    return wait
+
   def request(self, session, method, url, **kwargs):
     allow_redirects = bool(kwargs.pop("allow_redirects", False))
-    # Cleanup and revert traffic is exempt: budget exhaustion must never prevent
-    # a rollback, which is the existing contract of ProbeBase.cleanup_budget.
+    # Rollback traffic is exempt from the refusal (still charged): budget
+    # exhaustion must never prevent an undo from completing.
     budget_exempt = bool(kwargs.pop("budget_exempt", False))
+    # Per-request pacing override (e.g. a rate-limit burst's tighter spacing).
+    throttle_min_delay = kwargs.pop("throttle_min_delay", None)
+    # A caller whose verdict reads the 429 itself opts out of the backoff retry.
+    throttle_retry = bool(kwargs.pop("throttle_retry", True))
+    deadline = time.time() + GRAYBOX_BACKOFF_DEADLINE
+    if kwargs.get("timeout") is None:
+      kwargs["timeout"] = GRAYBOX_HTTP_TIMEOUT
     safe_url = self.validate_url(url)
     self._guard_transport(session)
     if self._bound_target is not None:
@@ -554,8 +665,6 @@ class GrayboxHttpClient:
     kwargs = self._with_protected_gateway_auth(kwargs)
     if self._protected_params:
       safe_url = self._without_protected_query_values(safe_url, self._protected_params)
-    if not allow_redirects:
-      return session.request(method, safe_url, allow_redirects=False, **kwargs)
     current_url = safe_url
     response = None
     # We resolve redirects ourselves so every hop re-enters `validate_url`, which
@@ -569,25 +678,56 @@ class GrayboxHttpClient:
     # reported "not vulnerable". Record the chain we consumed so the attribute
     # means what the `requests` contract says it means.
     history = []
-    for hop in range(5):
-      # Charge every hop *after* the first. A probe consults the shared budget
-      # once per logical call, so the first request is already paid for;
-      # charging it again would double-count every ordinary request. The hops
-      # were charged to nobody at all — measured, one redirecting call issued
-      # five real requests against a single consume, which let a target that
-      # simply redirects push actual traffic to five times the configured cap
-      # while `budget_remaining` reported the cap was being respected.
-      if hop and not budget_exempt and self._request_budget is not None:
-        if not self._request_budget.consume(1):
-          return _with_history(response, history)
-        if self._safety is not None:
-          self._safety.throttle()
-      if response is not None:
+    # One loop issues every request: a call without redirects or retries is one hop.
+    max_hops = 5 if allow_redirects else 1
+    hop = 0
+    retries = 0
+    retrying = False
+    recovered = False
+    while hop < max_hops:
+      # Every hop, the first included, is charged and paced here, so the budget
+      # equals the requests really sent whichever probe (or discovery, or auth)
+      # sent them. Redirect hops were once charged to nobody: one redirecting
+      # call issued five real requests against a single consume. A backoff retry
+      # is a hop like any other.
+      if response is not None and not retrying:
         history.append(response)
+      retrying = False
       if hop and self._bound_target is not None:
         self._validate_bound_headers(session.headers)
         self._validate_bound_headers(kwargs.get("headers"))
+      # Last gate before the wire, after every validation: a charged hop is a sent hop.
+      self._admit(budget_exempt, throttle_min_delay)
       response = session.request(method, current_url, allow_redirects=False, **kwargs)
+      if self._safety is not None:
+        self._safety.record_response(response.status_code)
+      status = response.status_code
+      if (self._recover is not None and not budget_exempt and not self._recovering
+          and not recovered and (status in (401, 403) or 300 <= status < 400)):
+        outcome = self._recover_session(session, response)
+        if outcome in ("lost", "reauthenticated"):
+          recovered = True
+          # Any renewal degrades the run: CSRF tokens and flow cookies a probe read before it no
+          # longer match, so a later denial is not evidence of a guard.
+          if self._safety is not None:
+            self._safety.note_degraded(
+              "session_lost" if outcome == "lost" else "session_reauthenticated")
+          # Only GET/HEAD/OPTIONS are replayed; a POST returns its original response.
+          if outcome == "reauthenticated" and method.upper() in _RETRYABLE_METHODS:
+            response.close()
+            retrying = True
+            continue
+      # An exempt hop (rollback, cleanup logout) is never backoff-retried: no sleep outlives a stop.
+      wait = self._backoff_wait(method, response, retries, deadline,
+                                throttle_retry and not budget_exempt)
+      if wait is not None:
+        response.close()
+        self._safety.sleep(wait)
+        retries += 1
+        retrying = True
+        continue
+      if not allow_redirects:
+        return response
       if response.status_code not in (301, 302, 303, 307, 308):
         return _with_history(response, history)
       location = response.headers.get("Location", "")
@@ -597,6 +737,7 @@ class GrayboxHttpClient:
       if not isinstance(previous_url, str) or not previous_url:
         previous_url = current_url
       current_url = self.validate_url(urljoin(previous_url, location))
+      hop += 1
       if response.status_code in (301, 302, 303) and method != "HEAD":
         method = "GET"
         kwargs.pop("data", None)

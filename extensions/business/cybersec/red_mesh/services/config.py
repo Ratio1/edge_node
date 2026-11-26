@@ -103,6 +103,10 @@ def resolve_config_block(owner, block_name, defaults, normalizer=None, override=
 DEFAULT_LLM_AGENT_CONFIG = {
   "ENABLED": False,
   "TIMEOUT": 120.0,
+  # RM-217: per-chunk HTTP timeout for local structured narrative calls. A 768-token chunk takes
+  # ~200 s on a 4-vCPU node. Keep it below both LLM Agent API timeouts: REQUEST_TIMEOUT (HTTP front)
+  # and REQUEST_TIMEOUT_SECONDS (model call).
+  "LOCAL_STRUCTURED_CHUNK_TIMEOUT": 270.0,
   "AUTO_ANALYSIS_TYPE": "security_assessment",
   "PROVIDER": "local",
   "MODEL": "CyberSecQwen-4B.Q4_K_M.gguf",
@@ -338,6 +342,16 @@ def get_llm_agent_config(owner):
     if timeout <= 0:
       timeout = defaults["TIMEOUT"]
 
+    try:
+      chunk_timeout = float(
+        merged.get("LOCAL_STRUCTURED_CHUNK_TIMEOUT", defaults["LOCAL_STRUCTURED_CHUNK_TIMEOUT"])
+      )
+    except (TypeError, ValueError):
+      chunk_timeout = defaults["LOCAL_STRUCTURED_CHUNK_TIMEOUT"]
+    if not isfinite(chunk_timeout) or chunk_timeout <= 0:
+      chunk_timeout = defaults["LOCAL_STRUCTURED_CHUNK_TIMEOUT"]
+    chunk_timeout = min(chunk_timeout, 1800.0)
+
     analysis_type = str(
       merged.get("AUTO_ANALYSIS_TYPE") or defaults["AUTO_ANALYSIS_TYPE"]
     ).strip() or defaults["AUTO_ANALYSIS_TYPE"]
@@ -395,6 +409,7 @@ def get_llm_agent_config(owner):
     return {
       "ENABLED": enabled,
       "TIMEOUT": timeout,
+      "LOCAL_STRUCTURED_CHUNK_TIMEOUT": chunk_timeout,
       "AUTO_ANALYSIS_TYPE": analysis_type,
       "PROVIDER": provider,
       "MODEL": model,

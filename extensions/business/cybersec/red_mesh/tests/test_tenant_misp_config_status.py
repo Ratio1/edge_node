@@ -90,13 +90,13 @@ def test_actual_native_preserves_integration_view_for_every_export_role(read_nat
   module, _ = read_native
   install(module)
   with read_endpoint_fixture(bound=True) as fixture:
-    fixture.store.data[("auth", "reader")]["memberships"] = [
+    fixture.store.data[("deployment:auth", "reader")]["memberships"] = [
       {"role": role, "tenant_id": None if role == "super_tenant_admin" else fixture.tenant_id}]
     install_config_producer(fixture)
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 200)
     assert (result["result"] if response_format == "WRAPPED" else result) == DEFAULT and calls == 1
-    assert fixture.store.reads[0] == ("get", "auth", "reader")
+    assert fixture.store.reads[0] == ("get", "deployment:auth", "reader")
 
 
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
@@ -171,12 +171,12 @@ def test_native_denials_precede_configuration_and_other_effects(read_native, res
     elif fault == "inactive":
       fixture.store.account("reader", active=False)
     elif fault == "identity_store":
-      fixture.store.fail_hkey = "auth"
+      fixture.store.fail_hkey = "deployment:auth"
     elif fault.endswith("memberships"):
-      fixture.store.data[("auth", "reader")]["memberships"] = {
+      fixture.store.data[("deployment:auth", "reader")]["memberships"] = {
         "empty_memberships": [], "null_memberships": None, "malformed_memberships": "private"}[fault]
     elif fault == "tenant_user":
-      fixture.store.data[("auth", "reader")]["memberships"] = [
+      fixture.store.data[("deployment:auth", "reader")]["memberships"] = [
         {"role": "tenant_user", "tenant_id": fixture.tenant_id}]
     elif fault == "other_tenant":
       body["tenant_id"] = "tn_00000000-0000-4000-8000-000000000000"
@@ -316,7 +316,7 @@ def test_without_a_tenant_any_other_caller_is_refused_before_the_producer(member
 def test_the_sta_read_without_a_tenant_fails_closed_when_identity_is_unreadable():
   with read_endpoint_fixture(bound=True) as fixture:
     install_config_producer(fixture, {"ENABLED": True, "MISP_URL": URL, "MISP_API_KEY": SECRET})
-    fixture.store.fail_hkey = "auth"
+    fixture.store.fail_hkey = "deployment:auth"
     assert getattr(fixture.Plugin, ENDPOINT)(fixture.owner, request_actor={"account_id": "creator"}) == {
       "success": False, "error": "unavailable", "status_code": 503}
     fixture.owner._get_misp_export_config.assert_not_called()

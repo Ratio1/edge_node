@@ -1,0 +1,626 @@
+{
+ "computed": {
+  "categories": {
+   "DE.AE": {
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "maturity": 1.0
+   },
+   "DE.CM": {
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "maturity": 1.0
+   },
+   "GV.OC": {
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "maturity": 1.0
+   },
+   "GV.PO": {
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "maturity": 1.0
+   },
+   "GV.RM": {
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "maturity": 1.0
+   },
+   "GV.RR": {
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "maturity": 1.0
+   },
+   "ID.AM": {
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "maturity": 1.0
+   },
+   "ID.IM": {
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "maturity": 1.0
+   },
+   "ID.RA": {
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "maturity": 1.0
+   },
+   "PR.AA": {
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "maturity": 1.0
+   },
+   "PR.AT": {
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "maturity": 1.0
+   },
+   "PR.DS": {
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "maturity": 1.0
+   },
+   "PR.IR": {
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "maturity": 1.0
+   },
+   "PR.PS": {
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "maturity": 1.0
+   },
+   "RC.RP": {
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "maturity": 1.0
+   },
+   "RS.CO": {
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "maturity": 1.0
+   },
+   "RS.MA": {
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "maturity": 1.0
+   }
+  },
+  "complete": true,
+  "exclusions": {
+   "count": 0,
+   "excluded_value": 2.5,
+   "ids": [],
+   "max": 1
+  },
+  "key_measures": {
+   "DE.AE-03.1": {
+    "below_target_axes": [
+     "documentation",
+     "implementation"
+    ],
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "score": 1.0,
+    "target": 2.5
+   },
+   "DE.CM-01.2": {
+    "below_target_axes": [
+     "documentation",
+     "implementation"
+    ],
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "score": 1.0,
+    "target": 2.5
+   },
+   "ID.AM-08.2": {
+    "below_target_axes": [
+     "documentation",
+     "implementation"
+    ],
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "score": 1.0,
+    "target": 2.5
+   },
+   "PR.AA-01.1": {
+    "below_target_axes": [
+     "documentation",
+     "implementation"
+    ],
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "score": 1.0,
+    "target": 2.5
+   },
+   "PR.AA-03.2": {
+    "below_target_axes": [
+     "documentation",
+     "implementation"
+    ],
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "score": 1.0,
+    "target": 2.5
+   },
+   "PR.AA-05.1": {
+    "below_target_axes": [
+     "documentation",
+     "implementation"
+    ],
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "score": 1.0,
+    "target": 2.5
+   },
+   "PR.AA-05.2": {
+    "below_target_axes": [
+     "documentation",
+     "implementation"
+    ],
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "score": 1.0,
+    "target": 2.5
+   },
+   "PR.AA-05.3": {
+    "below_target_axes": [
+     "documentation",
+     "implementation"
+    ],
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "score": 1.0,
+    "target": 2.5
+   },
+   "PR.AA-05.4": {
+    "below_target_axes": [
+     "documentation",
+     "implementation"
+    ],
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "score": 1.0,
+    "target": 2.5
+   },
+   "PR.DS-11.1": {
+    "below_target_axes": [
+     "documentation",
+     "implementation"
+    ],
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "score": 1.0,
+    "target": 2.5
+   },
+   "PR.IR-01.1": {
+    "below_target_axes": [
+     "documentation",
+     "implementation"
+    ],
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "score": 1.0,
+    "target": 2.5
+   },
+   "PR.IR-01.2": {
+    "below_target_axes": [
+     "documentation",
+     "implementation"
+    ],
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "score": 1.0,
+    "target": 2.5
+   },
+   "PR.PS-04.1": {
+    "below_target_axes": [
+     "documentation",
+     "implementation"
+    ],
+    "documentation": 1.0,
+    "implementation": 1.0,
+    "score": 1.0,
+    "target": 2.5
+   }
+  },
+  "level": "basic",
+  "scoring": "maturity_two_axis.v1",
+  "subcategories": {
+   "DE.AE-03": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "DE.CM-01": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "DE.CM-03": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "GV.OC-03": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "GV.PO-01": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "GV.RM-03": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "GV.RR-04": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "ID.AM-01": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "ID.AM-02": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "ID.AM-05": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "ID.AM-07": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "ID.AM-08": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "ID.IM-03": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "ID.RA-01": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "ID.RA-05": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "PR.AA-01": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "PR.AA-03": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "PR.AA-05": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "PR.AA-06": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "PR.AT-01": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "PR.DS-01": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "PR.DS-11": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "PR.IR-01": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "PR.PS-04": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "PR.PS-05": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "RC.RP-01": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "RS.CO-02": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   },
+   "RS.MA-01": {
+    "documentation": 1.0,
+    "implementation": 1.0
+   }
+  },
+  "total": 1.0,
+  "totals_per_axis": {
+   "documentation": 1.0,
+   "implementation": 1.0
+  },
+  "unscored": [],
+  "verdict": {
+   "category_min": null,
+   "failing_categories": [],
+   "failing_key_measures": [
+    "ID.AM-08.2",
+    "PR.AA-01.1",
+    "PR.AA-03.2",
+    "PR.AA-05.1",
+    "PR.AA-05.2",
+    "PR.AA-05.3",
+    "PR.AA-05.4",
+    "PR.DS-11.1",
+    "PR.IR-01.1",
+    "PR.IR-01.2",
+    "PR.PS-04.1",
+    "DE.AE-03.1",
+    "DE.CM-01.2"
+   ],
+   "key_measure_min": 2.5,
+   "passed": false,
+   "total": 1.0,
+   "total_failed": true,
+   "total_min": 2.5
+  }
+ },
+ "intent_digest": "4eced46e4d146431a11795020b13fe85965581dc3db06c9e1c688257f83678fc",
+ "pack_view_sha256": "05300ce811ff9ece7160b94dfaeb21a905f50848765327052bf05665f9904c65",
+ "snapshot_envelope": {
+  "kind": "redmesh_framework_assessment",
+  "pack_id": "ro.dnsc.o1-2026",
+  "revision": 1,
+  "schema": "redmesh.framework_assessment.v1",
+  "schema_version": "1.0",
+  "snapshot": {
+   "artifact_kind": "self_assessment",
+   "assurance_level": "basic",
+   "claimant": {
+    "legal_name": "Example SRL",
+    "registration_id": "RO123",
+    "signer_name": "Ana Pop",
+    "signer_role": "Director"
+   },
+   "completion_date": "2026-10-06",
+   "country": "RO",
+   "dnsc_unique_id": "",
+   "external_supplier": "",
+   "level_provenance": {
+    "declared_by": "initial",
+    "kind": "risk_score",
+    "score": 42
+   },
+   "management_signoff": {
+    "date": "2026-10-06",
+    "name": "Ana Pop",
+    "role": "Director"
+   },
+   "manifest_version": null,
+   "missing_historical_provenance": true,
+   "pack_acts": [
+    "MO 712 bis/2026-08-27",
+    "MO 792/2026-09-18 (Ordin 2/2026)"
+   ],
+   "pack_hash": null,
+   "pack_id": "ro.dnsc.o1-2026",
+   "remediation": [
+    {
+     "action": "fix",
+     "deadline": "2026-12-31",
+     "item": "ID.AM-08.2"
+    },
+    {
+     "action": "fix",
+     "deadline": "2026-12-31",
+     "item": "PR.AA-01.1"
+    },
+    {
+     "action": "fix",
+     "deadline": "2026-12-31",
+     "item": "PR.AA-03.2"
+    },
+    {
+     "action": "fix",
+     "deadline": "2026-12-31",
+     "item": "PR.AA-05.1"
+    },
+    {
+     "action": "fix",
+     "deadline": "2026-12-31",
+     "item": "PR.AA-05.2"
+    },
+    {
+     "action": "fix",
+     "deadline": "2026-12-31",
+     "item": "PR.AA-05.3"
+    },
+    {
+     "action": "fix",
+     "deadline": "2026-12-31",
+     "item": "PR.AA-05.4"
+    },
+    {
+     "action": "fix",
+     "deadline": "2026-12-31",
+     "item": "PR.DS-11.1"
+    },
+    {
+     "action": "fix",
+     "deadline": "2026-12-31",
+     "item": "PR.IR-01.1"
+    },
+    {
+     "action": "fix",
+     "deadline": "2026-12-31",
+     "item": "PR.IR-01.2"
+    },
+    {
+     "action": "fix",
+     "deadline": "2026-12-31",
+     "item": "PR.PS-04.1"
+    },
+    {
+     "action": "fix",
+     "deadline": "2026-12-31",
+     "item": "DE.AE-03.1"
+    },
+    {
+     "action": "fix",
+     "deadline": "2026-12-31",
+     "item": "DE.CM-01.2"
+    },
+    {
+     "action": "fix",
+     "deadline": "2026-12-31",
+     "item": "total"
+    }
+   ],
+   "schema": "redmesh.framework_assessment.v1",
+   "sectoral_requirements": "",
+   "submission": {
+    "actor": "initial",
+    "fingerprint": "4eced46e4d146431a11795020b13fe85965581dc3db06c9e1c688257f83678fc",
+    "pack_acts": [
+     "MO 712 bis/2026-08-27",
+     "MO 792/2026-09-18 (Ordin 2/2026)"
+    ],
+    "request_id": "11111111-1111-4111-8111-111111111111",
+    "revision": 1,
+    "submitted_at": "2026-11-14T10:00:00Z"
+   },
+   "tenant_id": "tn_golden"
+  },
+  "tenant_id": "tn_golden"
+ },
+ "view": {
+  "archived": false,
+  "assessmentId": "default",
+  "assessmentRevision": 1,
+  "assuranceLevel": "basic",
+  "canManage": true,
+  "claimant": {
+   "legal_name": "Example SRL",
+   "registration_id": "RO123"
+  },
+  "completionDate": "2026-10-06",
+  "currentPackActs": [
+   "MO 712 bis/2026-08-27",
+   "MO 792/2026-09-18 (Ordin 2/2026)"
+  ],
+  "dnscUniqueId": "",
+  "externalSupplier": "",
+  "history": [],
+  "latestRevision": 0,
+  "levelProvenance": {
+   "declared_by": "initial",
+   "kind": "risk_score",
+   "score": 42
+  },
+  "managementSignoff": {
+   "date": "2026-10-06",
+   "name": "Ana Pop",
+   "role": "Director"
+  },
+  "name": "",
+  "pack": null,
+  "packActs": [
+   "MO 712 bis/2026-08-27",
+   "MO 792/2026-09-18 (Ordin 2/2026)"
+  ],
+  "packId": "ro.dnsc.o1-2026",
+  "pending": null,
+  "persisted": true,
+  "remediation": [
+   {
+    "action": "fix",
+    "deadline": "2026-12-31",
+    "item": "ID.AM-08.2"
+   },
+   {
+    "action": "fix",
+    "deadline": "2026-12-31",
+    "item": "PR.AA-01.1"
+   },
+   {
+    "action": "fix",
+    "deadline": "2026-12-31",
+    "item": "PR.AA-03.2"
+   },
+   {
+    "action": "fix",
+    "deadline": "2026-12-31",
+    "item": "PR.AA-05.1"
+   },
+   {
+    "action": "fix",
+    "deadline": "2026-12-31",
+    "item": "PR.AA-05.2"
+   },
+   {
+    "action": "fix",
+    "deadline": "2026-12-31",
+    "item": "PR.AA-05.3"
+   },
+   {
+    "action": "fix",
+    "deadline": "2026-12-31",
+    "item": "PR.AA-05.4"
+   },
+   {
+    "action": "fix",
+    "deadline": "2026-12-31",
+    "item": "PR.DS-11.1"
+   },
+   {
+    "action": "fix",
+    "deadline": "2026-12-31",
+    "item": "PR.IR-01.1"
+   },
+   {
+    "action": "fix",
+    "deadline": "2026-12-31",
+    "item": "PR.IR-01.2"
+   },
+   {
+    "action": "fix",
+    "deadline": "2026-12-31",
+    "item": "PR.PS-04.1"
+   },
+   {
+    "action": "fix",
+    "deadline": "2026-12-31",
+    "item": "DE.AE-03.1"
+   },
+   {
+    "action": "fix",
+    "deadline": "2026-12-31",
+    "item": "DE.CM-01.2"
+   },
+   {
+    "action": "fix",
+    "deadline": "2026-12-31",
+    "item": "total"
+   }
+  ],
+  "reopenedFrom": null,
+  "sectoralRequirements": "",
+  "stale": {
+   "newerPackActs": false
+  },
+  "state": "draft",
+  "submitErrors": [],
+  "tenantId": "tn_golden",
+  "updatedAt": "2026-11-14T10:00:00Z",
+  "updatedBy": "initial",
+  "updatedByName": null
+ }
+}

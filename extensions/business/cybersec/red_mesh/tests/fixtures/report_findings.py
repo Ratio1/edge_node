@@ -33,6 +33,9 @@ FIXTURE_PATH = pathlib.Path(__file__).resolve().parent / "report-findings.v1.jso
 TARGET = "198.51.100.20"  # RFC 5737 documentation address
 SCHEMA_VERSION = 1
 
+# CVSS:4.0 base vector for the CVE finding; 7.3 is its score by the vulndb builder's recompute (`cvss==3.6`).
+_CVSS_V4_VECTOR = "CVSS:4.0/AV:L/AC:H/AT:N/PR:L/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"
+
 _SSH_PROOF = "exec id -> uid=0(root) gid=0(root)"
 
 
@@ -119,7 +122,7 @@ def _ssh(port, banner, accept, outputs, *, cves=True):
 
 
 class _FixtureFtp:
-  """Accepts anonymous and `ftp:ftp`; uploads succeed; directory changes are
+  """Accepts anonymous and `ftp:ftp`; directory changes are
   refused, so no MagicMock repr reaches a finding's evidence."""
 
   def __init__(self, *a, **k): pass
@@ -132,8 +135,6 @@ class _FixtureFtp:
   def pwd(self): return "/home/ftp"
   def sendcmd(self, cmd): raise ftplib.error_perm("502 not implemented")
   def cwd(self, _path): raise ftplib.error_perm("550 Permission denied")
-  def storbinary(self, cmd, fp, *a, **k): return "226 Transfer complete"
-  def delete(self, name): return "250 ok"
   def __getattr__(self, name): return MagicMock(return_value="")
 
 
@@ -204,6 +205,15 @@ def build():
   host = _Host()
   redacted = host._redact_report(report)
   _risk, flat = host._compute_risk_and_findings(redacted)
+  # The static CVE catalog carries no v4.0 entry, so the one CVE finding gets the list a vulndb-built
+  # finding carries (RM-170): its v3.1 label entry and a v4.0 entry, score as the builder recomputes it.
+  for finding in flat:
+    if finding.get("cve") and finding.get("cvss_vector"):
+      finding["cvss"] = [
+        {"version": finding["cvss_version"], "vector": finding["cvss_vector"],
+         "score": finding["cvss_score"], "source": finding["cvss_source"]},
+        {"version": "4.0", "vector": _CVSS_V4_VECTOR, "score": 7.3, "source": "nvd", "nomenclature": "CVSS-B"},
+      ]
   flat = sorted(flat, key=lambda f: (f["probe"], f["port"], f["title"], f["finding_id"]))
   return {
     "schemaVersion": SCHEMA_VERSION,
