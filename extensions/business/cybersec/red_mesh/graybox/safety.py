@@ -6,6 +6,7 @@ Rate limiting, attempt budgeting, and target validation.
 
 import contextlib
 import ipaddress
+import math
 import random
 import socket
 import time
@@ -144,7 +145,8 @@ class SafetyControls:
       time.sleep(seconds)
       return
     end = time.time() + seconds
-    while True:
+    # Bounded by poll count too, so a stubbed time.sleep (tests) cannot spin until the real deadline.
+    for _ in range(math.ceil(seconds / _STOP_POLL) + 1):
       self._check_stop()
       left = end - time.time()
       if left <= 0:

@@ -39,6 +39,9 @@ GRAYBOX_BREAKER_THRESHOLD = 5
 GRAYBOX_WEAK_AUTH_DELAY = 1.0
 GRAYBOX_MAX_WEAK_ATTEMPTS = 20
 GRAYBOX_SESSION_MAX_AGE = 1800
+# RM-273 Phase 2b: (connect, read) seconds for a graybox request whose caller passes no timeout;
+# requests would otherwise wait forever on a target that accepts and never answers.
+GRAYBOX_HTTP_TIMEOUT = (10, 30)
 GRAYBOX_REAUTH_MAX = 3  # mid-family re-logins per principal; every login counts toward lockout
 
 

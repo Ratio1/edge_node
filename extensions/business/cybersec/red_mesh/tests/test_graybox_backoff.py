@@ -181,6 +181,12 @@ class TestKillSwitch(unittest.TestCase):
     self.assertLessEqual(clock.now - 1001.0, 0.25)
     self.assertEqual(session.request.call_count, 1)
 
+  def test_interruptible_sleep_with_a_stubbed_sleep_ends_after_its_polls(self):
+    safety = SafetyControls(stop_check=lambda: False)
+    with patch.object(safety_mod.time, "sleep") as stub:
+      safety.sleep(1.0)
+    self.assertEqual(stub.call_count, 5)  # ceil(1.0 / 0.25) + 1, not a spin to the real deadline
+
   def test_stop_seen_while_pacing_sends_nothing(self):
     state = {"stop": False}
     clock, safety, budget, client, session = _setup([_resp(200)], stop=lambda: state["stop"])

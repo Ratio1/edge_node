@@ -17,6 +17,7 @@ import requests
 
 from ..constants import (
   GRAYBOX_BACKOFF_DEADLINE,
+  GRAYBOX_HTTP_TIMEOUT,
   GRAYBOX_RETRY_AFTER_MAX,
   GRAYBOX_RETRY_MAX,
 )
@@ -647,6 +648,8 @@ class GrayboxHttpClient:
     # A caller whose verdict reads the 429 itself opts out of the backoff retry.
     throttle_retry = bool(kwargs.pop("throttle_retry", True))
     deadline = time.time() + GRAYBOX_BACKOFF_DEADLINE
+    if kwargs.get("timeout") is None:
+      kwargs["timeout"] = GRAYBOX_HTTP_TIMEOUT
     safe_url = self.validate_url(url)
     self._guard_transport(session)
     if self._bound_target is not None:
