@@ -50,6 +50,9 @@ REPAIR_AGES = (600, 1200, 2400) + tuple(range(4800, 86400, 3600))
 # (a blocked one) keeps the same snapshot for as long as it waits, and every oracle received and answered that
 # snapshot about 115 times an hour.
 OPEN_REPAIR_SECONDS = 600
+# Extra phase deadlines an ordinary blocked operation may spend waiting for signed evidence.
+BLOCKED_RECOVERY_GRACE_PERIODS = 24
+BLOCKED_OPERATION_ENDED = "BLOCKED_OPERATION_ENDED"
 class DeploymentAuthenticationError(ValueError):
   """The reusable read authorization is invalid or expired."""
 
@@ -964,7 +967,9 @@ class _DeploymentOperationsMixin:
     >>> plugin.now += 600
     >>> plugin._replicate_operation(operation)  # open, unchanged for 600 s: sent, and then once per 600 s
     """
-    if operation["phase"] != "completed" and self.time() - operation["updated_at"] >= OPEN_REPAIR_SECONDS:
+    if operation["phase"] != "completed" and (
+      operation.get("recovery") == "blocked" or self.time() - operation["updated_at"] >= OPEN_REPAIR_SECONDS
+    ):
       # An open operation whose snapshot has not changed for 600 s is repaired once per 600 s, not per 30 s:
       # a blocked operation was re-sent about 115 times an hour to every oracle with nothing new in it.
       every = OPEN_REPAIR_SECONDS
@@ -1008,6 +1013,11 @@ class _DeploymentOperationsMixin:
         if record["request_hash"] != digest:
           raise DeploymentConflictError("request_id was already used for different deployment input.")
         return record
+    # Terminal execution never permits an overlapping paid create while its earlier workers may still run.
+    if kind == "create" and any(record["kind"] == "create" and record.get("unconfirmed_nodes")
+                                and record["phase"] == "completed" and record.get("recovery") == "blocked"
+                                for record in records):
+      raise DeploymentConflictError("A previous deployment still has unconfirmed cleanup for this paid job.")
     if any(record["phase"] != "completed" and (not repair_parent or record["operation_id"] != repair_parent) for record in records):
       raise DeploymentConflictError("A deployment operation or recovery is already active for this job.")
     return None
@@ -1705,6 +1715,8 @@ class _DeploymentOperationsMixin:
     check_placement = action == "start" and operation.get("mutation") == "same_host_repair_v1"
     check_replacement = action == "start" and operation.get("mutation") == STATELESS_REPLACEMENT
     repair_restore = check_placement and attempt == "restore"
+    # Normal delivery remains responsive. Repeated commands for a blocked phase use the replica repair cadence.
+    interval = OPEN_REPAIR_SECONDS if operation.get("recovery") == "blocked" else 10
     for node, config in configs.items():
       report = reports.get(node, {})
       if action in ("stop", "retire") and report.get("status") == "stopped":
@@ -1717,7 +1729,8 @@ class _DeploymentOperationsMixin:
       # The map is shared by all operations, so the key starts with the operation id; the old in-snapshot
       # key needed only attempt|action|node.
       key = "{}|{}|{}|{}".format(operation["operation_id"], attempt, action, node)
-      if 0 <= self.time() - sent_at.get(key, 0) < 10:
+      # Missing send history permits the first attempt even immediately after a coordinator starts.
+      if key in sent_at and 0 <= self.time() - sent_at[key] < interval:
         continue
       if check_placement:
         # One fresh read covers this batch, including starts retried after a coordinator restart.
@@ -1790,6 +1803,8 @@ class _DeploymentOperationsMixin:
       return self._advance_delete_operation(operation)
     repair = operation.get("mutation") == "same_host_repair_v1"
     replacing = operation.get("mutation") == STATELESS_REPLACEMENT
+    # Signed repair and replacement retain their own durable handoff and publication barriers.
+    recovery_grace = self.cfg_deployment_readiness_timeout * BLOCKED_RECOVERY_GRACE_PERIODS
     if (repair or (replacing and operation.get("repair_parent"))) and not self._repair_parent_is_held(operation):
       return  # A crash between reservation writes is repaired from the parent pass.
     phase = deployment_operation_phase(operation)
@@ -1821,7 +1836,9 @@ class _DeploymentOperationsMixin:
       return self._retire_repair_workers(operation, plan)
     if phase == "retiring_previous":
       retired = self._node_operation_reports(operation, "retire")
-      if all(retired.get(node, {}).get("status") == "stopped" for node in plan["previous_configs"]):
+      # Only the workers in the previous placement can satisfy its retirement barrier.
+      missing = [node for node in plan["previous_configs"] if retired.get(node, {}).get("status") != "stopped"]
+      if not missing:
         operation["retired_runtime"] = {
           node: {item["signature"] + "|" + item["instance_id"]: copy.deepcopy(item["runtime_artifacts"])
                  for item in report.get("instances", []) if item.get("runtime_artifacts")}
@@ -1829,15 +1846,23 @@ class _DeploymentOperationsMixin:
         }
         if operation.get("error"):
           operation["restore_deadline"] = self.time() + self.cfg_deployment_readiness_timeout
+          # The restoration phase has its own readiness deadline and responsive initial sends.
+          operation["recovery"] = "in_progress"
           self._save_operation(operation, "restoring_previous", "Restoring the previous revision.")
         else:
           operation["deadline"] = self.time() + self.cfg_deployment_readiness_timeout
           self._save_operation(operation, "waiting_for_readiness", "Previous instances stopped; starting target nodes.")
       else:
-        if self.time() >= operation["deadline"] or any(r.get("status") == "failed" for r in retired.values()):
+        if self.time() >= operation["deadline"] + recovery_grace:
+          return self._end_blocked_operation(operation, missing)
+        if operation.get("recovery") != "blocked" and (
+          self.time() >= operation["deadline"] or any(r.get("status") == "failed" for r in retired.values())
+        ):
           operation["error"] = dict(code="PREVIOUS_STOP_UNCONFIRMED",
                                     message="Waiting for confirmed stop of the previous revision.", retryable=True)
           operation["recovery"] = "blocked"
+          # Publish the blocked state even when the next command is still throttled.
+          self._save_operation(operation)
         self._send_operation_commands(operation, plan["previous_configs"], "retire", "retire", retired)
       return
     if phase in ("finalizing", "finalizing_recovery"):
@@ -1896,17 +1921,27 @@ class _DeploymentOperationsMixin:
       if replacing:
         # Dispatch intent survives a crash. Targets that never got an intent must not receive a STOP.
         configs = {node: configs[node] for node in operation["dispatched_nodes"]}
-      if all(reports.get(node, {}).get("status") == "stopped" for node in configs):
+      # Stop evidence remains mandatory for restoration, including after the grace period expires.
+      missing = [node for node in configs if reports.get(node, {}).get("status") != "stopped"]
+      if not missing:
         if operation["kind"] == "update" and operation["previous_nodes"]:
           operation["restore_deadline"] = self.time() + self.cfg_deployment_readiness_timeout
+          # Confirmed stops clear the prior blockage while restoration begins.
+          operation["recovery"] = "in_progress"
           self._save_operation(operation, "restoring_previous", "Restoring the previous revision.")
         else:
           self._release_unused_secret_revisions(operation, plan, active_attempt=None)
           operation.update(outcome="failed", recovery="completed")
           self._save_operation(operation, "completed", "Failed deployment stopped on all target nodes.")
       else:
-        if self.time() - operation["recovery_started_at"] > self.cfg_deployment_readiness_timeout:
+        # Earlier snapshots already provide the durable start of cleanup.
+        deadline = operation["recovery_started_at"] + self.cfg_deployment_readiness_timeout
+        if not (repair or replacing) and self.time() >= deadline + recovery_grace:
+          return self._end_blocked_operation(operation, missing)
+        if operation.get("recovery") != "blocked" and self.time() >= deadline:
           operation["recovery"] = "blocked"
+          # The failure remains visible while waiting for the next permitted send.
+          self._save_operation(operation)
         self._send_operation_commands(operation, configs, "deploy", "stop", reports)
       return
     if phase == "restoring_previous":
@@ -1921,9 +1956,16 @@ class _DeploymentOperationsMixin:
         message = "Previous revision restored and waiting for source." if "kept" in states.values() else "Previous revision is ready on all required nodes."
         self._save_operation(operation, "finalizing_recovery", message)
       else:
-        if expired or any(state in ("failed", "legacy_failed") for state in states.values()):
-          operation["recovery"] = "blocked"
+        # Keep the already running restoration candidates and name the ones without positive readiness.
         unresolved = {node: previous_configs[node] for node, state in states.items() if state not in ("ready", "kept")}
+        if not (repair or replacing) and self.time() >= operation["restore_deadline"] + recovery_grace:
+          return self._end_blocked_operation(operation, unresolved)
+        if operation.get("recovery") != "blocked" and (
+          expired or any(state in ("failed", "legacy_failed") for state in states.values())
+        ):
+          operation["recovery"] = "blocked"
+          # A pending throttle must not hide newly blocked restoration from the caller.
+          self._save_operation(operation)
         self._send_operation_commands(operation, unresolved, "restore", "start", previous_reports)
       return
     if phase in ("finalizing", "finalizing_recovery"):
@@ -1974,6 +2016,42 @@ class _DeploymentOperationsMixin:
                        recovery="completed" if restored else None)
       self._save_operation(operation, "completed",
                            "Previous revision restored." if restored else "Deployment completed.")
+
+  def _end_blocked_operation(self, operation, missing):
+    """End a phase whose workers did not supply the required evidence.
+
+    Save the terminal result before contacting custody so a transient custody
+    outage cannot keep sending workload commands or delay the failure result.
+
+    Parameters
+    ----------
+    operation : dict
+      Coordinator-owned operation still waiting for worker reports.
+    missing : iterable of str
+      Addresses without the expected signed stop or readiness report.
+
+    Returns
+    -------
+    None
+      The signed terminal snapshot records the outstanding workers.
+
+    Examples
+    --------
+    >>> plugin._end_blocked_operation(operation, ["worker-b"])  # doctest: +SKIP
+    """
+    # Preserve the last work phase so readers can distinguish restore readiness from stop evidence.
+    phase = deployment_operation_phase(operation)
+    # Keep every affected worker in the signed snapshot so lagging replicas can report the same result.
+    missing = sorted(missing)
+    # This terminal event describes the unconfirmed evidence, without claiming a workload stopped.
+    evidence = "readiness" if phase == "restoring_previous" else "shutdown"
+    message = "The operation ended before confirming {} on every required worker.".format(evidence)
+    operation.update(outcome="failed", recovery="blocked", blocked_phase=phase, unconfirmed_nodes=missing,
+                     error=dict(code=BLOCKED_OPERATION_ENDED, message=message, retryable=False))
+    if operation["kind"] != "delete":
+      # A delete stages no revision. Its published credentials still belong to the existing job.
+      operation["abandoned_deploy_revocation_pending"] = True
+    self._save_operation(operation, "completed", message)
 
   def _fail_deployment_rollout(self, operation, code, message):
     """Schedule cleanup of a deployment that cannot finish.
@@ -2203,6 +2281,11 @@ class _DeploymentOperationsMixin:
             self._advance_serialized_operation(operation)
           else:
             self._advance_deployment_operation(operation)
+        elif operation.get("abandoned_deploy_revocation_pending"):
+          # Retry only custody after a terminal failure. Workload commands never resume for the ended operation.
+          self._deployment_secret_request("revoke", operation, active_attempt=None)
+          operation.pop("abandoned_deploy_revocation_pending")
+          self._save_operation(operation)
         # For 600 s after completion, oracles that missed the final snapshot get it too, as before.
         elif age < 600:
           # No age of REPAIR_AGES is served yet, also when this is the first pass after a restart: 600 s is sent.
@@ -2405,12 +2488,14 @@ class _DeploymentOperationsMixin:
               "revision": 0, "observation_stale": True, "poll_after_ms": 2000}
     operation = max(matches, key=lambda record: (record["target_revision"], record["created_at"], record["sequence"]))
     phase = deployment_operation_phase(operation)
-    restoring = phase in ("restoring_previous", "finalizing_recovery") or (
-      operation["outcome"] == "failed" and operation["kind"] == "update"
+    # An ended phase keeps the report attempt that was relevant at the timeout, even on another oracle.
+    observed_phase = operation.get("blocked_phase", phase)
+    restoring = observed_phase in ("restoring_previous", "finalizing_recovery") or (
+      "blocked_phase" not in operation and operation["outcome"] == "failed" and operation["kind"] == "update"
       and operation.get("mutation") != STATELESS_REPLACEMENT
       and (operation.get("error") or {}).get("code") != "ADMISSION_PREPARATION_FAILED"
     )
-    attempt = "retire" if operation["kind"] == "delete" or phase == "retiring_previous" else "restore" if restoring else "deploy"
+    attempt = "retire" if operation["kind"] == "delete" or observed_phase == "retiring_previous" else "restore" if restoring else "deploy"
     reports = self._node_operation_reports(operation, attempt)
     if attempt == "retire" and operation.get("mutation") == "same_host_repair_v1":
       # An already stopped worker owes no second STOP. Display the original signed receipt at its actual signer.
@@ -2468,6 +2553,9 @@ class _DeploymentOperationsMixin:
               "target_revision", "previous_revision", "phase", "outcome", "recovery",
               "coordinator", "created_at", "updated_at", "error")
     result = {key: copy.deepcopy(operation.get(key)) for key in fields}
+    if "unconfirmed_nodes" in operation:
+      # The coordinator's terminal snapshot names the exact missing workers independently of replica report lag.
+      result.update(unconfirmed_nodes=list(operation["unconfirmed_nodes"]), blocked_phase=operation["blocked_phase"])
     if operation.get("mutation") == "same_host_repair_v1":
       # The prior address remains available for audit; its successor alone occupies the paid slot.
       result["relinked_nodes"] = [{"previous": old, "current": current} for old, current in operation["repair_aliases"]]

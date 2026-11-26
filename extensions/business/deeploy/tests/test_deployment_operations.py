@@ -661,6 +661,60 @@ class DeploymentOperationTests(unittest.TestCase):
     self.assertEqual(operation["error"]["code"], "READINESS_DEADLINE_EXCEEDED")
     self.assertIsNone(operation["outcome"])
 
+  def test_unconfirmed_create_stop_blocks_a_new_paid_request_after_expiry(self):
+    """Prevent a new create from starting while a previous workload may run.
+
+    Parameters
+    ----------
+    None
+    Returns
+    -------
+    None
+    Examples
+    --------
+    >>> DeploymentOperationTests('test_unconfirmed_create_stop_blocks_a_new_paid_request_after_expiry').run()
+    """
+    # Persist a failed paid create with two acknowledged stops and a third worker that never replies.
+    plugin = Coordinator()
+    operation = plugin.operation()
+    operation.update(phase="stopping_failed_rollout", recovery_started_at=plugin.now, recovery="in_progress")
+    plugin._save_operation(operation)
+    for worker in ("A", "B"):
+      plugin.report(operation, worker, "stopped")
+    # An expired operation is terminal, but the job remains ineligible for another create without shutdown evidence.
+    plugin.now += 25 * plugin.cfg_deployment_readiness_timeout
+    plugin._reconcile_coordinator_operations()
+    ended = plugin._operation_records()[operation["operation_id"]]
+    self.assertEqual((ended["outcome"], ended["unconfirmed_nodes"]), ("failed", ["C"]))
+    with self.assertRaisesRegex(DeploymentConflictError, "unconfirmed cleanup"):
+      plugin._find_request_operation(dict(request_id="new-request", job_id=1), "owner", "create")
+
+  def test_restore_expiry_names_only_workers_without_ready_evidence(self):
+    """Keep restore readiness separate from shutdown evidence at expiry.
+
+    Parameters
+    ----------
+    None
+    Returns
+    -------
+    None
+    Examples
+    --------
+    >>> DeploymentOperationTests('test_restore_expiry_names_only_workers_without_ready_evidence').run()
+    """
+    # A prior worker has returned; the second reports no readiness.
+    plugin = Coordinator()
+    operation = plugin.operation("update")
+    operation.update(phase="restoring_previous", restore_deadline=160, recovery="in_progress")
+    plugin._save_operation(operation)
+    plugin.report(operation, "A", "ready", attempt="restore")
+    plugin.now = operation["restore_deadline"] + 24 * plugin.cfg_deployment_readiness_timeout
+    plugin._reconcile_coordinator_operations()
+    ended = plugin._operation_records()[operation["operation_id"]]
+    self.assertEqual((ended["blocked_phase"], ended["unconfirmed_nodes"]), ("restoring_previous", ["B"]))
+    self.assertFalse(plugin.commands)
+    plugin._commit_operation_revision.assert_not_called()
+
   def test_restart_with_one_previous_stop_keeps_the_relink_blocked(self):
     # A coordinator can restart after one worker confirmed retirement and the other never answered.
     before = Coordinator()

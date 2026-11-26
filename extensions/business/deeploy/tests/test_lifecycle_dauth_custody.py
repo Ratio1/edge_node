@@ -192,6 +192,55 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     restored_ref = '7|' + operation['operation_id'] + ':restore'
     self.assertNotIn('revoked', self.state.secrets['DAUTH_JOB_SECRET_REVISIONS', restored_ref])
 
+  def test_blocked_update_ends_without_restoring_and_revokes_only_the_deploy_revision(self):
+    """Verify a failed rollout across the real SDK and dAuth custody boundary.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> LifecycleDauthCustodyTests('test_blocked_update_ends_without_restoring_and_revokes_only_the_deploy_revision').run()
+    """
+    # Prepare two scoped revisions over the signed custody endpoint.
+    previous, cid = self.legacy()
+    self.admit(previous)
+    operation = self.operation()
+    self.coordinator._advance_deployment_operation(operation)
+    report(self.state, operation, 'retire', 'stopped')
+    self.coordinator._advance_deployment_operation(operation)
+    report(self.state, operation, 'deploy', 'failed')
+    self.coordinator._advance_deployment_operation(operation)
+    # No signed stop arrives after failure. The operation is still open one second before grace expires.
+    readiness = self.coordinator.cfg_deployment_readiness_timeout
+    self.state.now = operation['recovery_started_at'] + 25 * readiness - 1
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual((operation['phase'], operation['recovery']), ('stopping_failed_rollout', 'blocked'))
+    # At the deadline execution ends independently of secret-store availability.
+    self.state.now += 1
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual((operation['phase'], operation['outcome'], operation['unconfirmed_nodes']), ('completed', 'failed', ['A']))
+    key = '7|' + operation['operation_id']
+    deploy = key + ':deploy'
+    restore = key + ':restore'
+    self.state.fail_write = lambda namespace, field: 'before' if field == deploy + '|revoked' else None
+    self.coordinator._reconcile_coordinator_operations()
+    self.assertTrue(self.operation()['abandoned_deploy_revocation_pending'])
+    # The next successful custody call revokes the attempted revision and keeps the previous plan available.
+    self.state.fail_write = None
+    self.state.now += 10
+    self.coordinator._reconcile_coordinator_operations()
+    self.assertTrue(self.state.secrets['DAUTH_JOB_SECRET_REVISIONS', deploy]['revoked'])
+    self.assertNotIn('revoked', self.state.secrets['DAUTH_JOB_SECRET_REVISIONS', restore])
+    self.assertNotIn('abandoned_deploy_revocation_pending', self.operation())
+    self.assertEqual(self.state.public['DEEPLOY_DEPLOYED_JOBS', '7'], cid)
+    self.assertNotIn('restore', [cmd['DEEPLOY_OPERATION']['attempt'] for _, cmd in self.coordinator.commands])
+
   def test_first_update_without_bundle_preserves_plaintext_values(self):
     previous, cid = self.legacy('old-token', with_bundle=False)
     self.admit(previous, secret=dAuth.DAUTH_SECRET_PLACEHOLDER)

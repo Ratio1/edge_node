@@ -195,6 +195,7 @@ A response must contain:
 - Last known workload health separately from operation outcome.
 - Observation timestamps, stale flags, source/authority version, and a suggested poll interval.
 - Structured errors with code, safe message, scope, failed phase, retryability, attempt count, and next retry time where applicable.
+- An ended blocked operation reports `phase: completed`, `outcome: failed`, `recovery: blocked`, and the non-retryable error `BLOCKED_OPERATION_ENDED`. `blocked_phase` identifies the expired retirement, failed-rollout stop, or restoration phase. `unconfirmed_nodes` lists every worker address whose stop or readiness made that phase incomplete.
 - Cleanup/restoration state for each affected node; metadata state.
 - Bounded recent events and continuation information.
 
@@ -268,7 +269,7 @@ Keep execution phase, outcome, recovery state, and current workload health separ
 | Kept create/update | Every planned instance is ready or kept. Commit the target revision and complete with outcome `waiting_for_source` and no recovery. |
 | Terminal create failure | failure detected → aborting → stopping_failed_rollout → finalizing_cleanup → completed; outcome `failed`, recovery `completed`, workloads confirmed stopped. |
 | Terminal update failure | failure detected → aborting → stopping_failed_rollout → restoring_previous → verifying_previous → finalizing_recovery → completed; outcome `failed`, recovery `completed`, previous configuration in effect. |
-| Incomplete cleanup/restoration | Remain in the applicable recovery phase with `recovery=blocked` or `in_progress`; preserve unresolved nodes, errors, retained secrets, and retry schedule. Do not claim completion. |
+| Incomplete cleanup/restoration | While recovery is active, report `recovery=blocked` or `in_progress`. On expiry, stop sending workload commands and finish with `BLOCKED_OPERATION_ENDED`, preserving unresolved nodes. |
 
 An operation can have an explicit failure reason while recovery is still active. Restoring the old revision does not turn the requested update into a success. A later runtime crash after an already completed successful operation changes current health; it does not rewrite historical rollout success or automatically trigger a new rollout policy.
 
@@ -281,9 +282,10 @@ Distinguish HTTP request timeout, node observation freshness, rollout readiness 
 - A source-following instance that reports a workload start, health, image pull or source-access failure stays deployed. At the deadline a reporting source-following instance can also be kept while it is starting. Use the stored plan to determine eligibility and require a matching mode from the node. Infrastructure and bound-instance failures abort the whole operation.
 - If a required node never reports before the rollout deadline, abort with a reason such as `READINESS_DEADLINE_EXCEEDED`. This proves policy failure, not that the node never started.
 - Once aborted, no further forward-deployment retries are allowed for that attempt. Recovery commands take precedence over delayed readiness success.
-- If recovery exceeds its budget, expose the unresolved state and required action. Continue scheduled reconciliation where safe; do not discard the operation or declare unreachable workloads stopped.
+- After the ordinary phase deadline, allow 24 readiness timeouts for missing previous-retirement stops, failed-rollout stops, or restored readiness. This is six additional hours at the default timeout. During a blocked phase a coordinator resends the same command or snapshot at most every 600 seconds. A restart may resend once before the next interval. An ended automatic relink does not retry the same move. An already-authorized repair or replacement follows its own signed handoff and publication rules.
+- Whole-job delete allows one additional hour after its retirement deadline, or 75 minutes from phase start at defaults. Admission returns `202`. A conflicting mutation to the same job returns `409` while the operation is active. Every planned worker must confirm shutdown for deletion to succeed. On failure the coordinator preserves the job metadata and published credentials, and names the workers whose shutdown remained unconfirmed.
 
-Implemented defaults: preparation deadline 120 seconds; deployment/restoration readiness deadline 900 seconds (15 minutes; `DEPLOYMENT_READINESS_TIMEOUT`); worker wake-up 2 seconds using local operation/report replicas without namespace repair; CStore write timeout 5 seconds with one retry; nodes publish signed reports only on state change (15-second confirmation wait, retried until confirmed) and continue to report source-following status and version changes after readiness. The node replays its latest signed current field to an intended oracle that missed the observation or whose restart NetMon detected, preserving its sequence and timestamp. Bound instances stop reporting after confirmed readiness. Readiness pairs the latest ready report with NetMon command/control liveness instead of report age. Cleanup deadlines expose blocked recovery and keep reconciliation running; they never substitute for stop evidence. Operation events retain 128 entries and each signed record uses eight sequence slots. Abort/history identities have no automatic expiry.
+Implemented defaults: preparation deadline 120 seconds; deployment/restoration readiness deadline 900 seconds (15 minutes; `DEPLOYMENT_READINESS_TIMEOUT`); worker wake-up 2 seconds using local operation/report replicas without namespace repair; CStore write timeout 5 seconds with one retry; nodes publish signed reports only on state change (15-second confirmation wait, retried until confirmed) and continue to report source-following status and version changes after readiness. The node replays its latest signed current field to an intended oracle that missed the observation or whose restart NetMon detected, preserving its sequence and timestamp. Bound instances stop reporting after confirmed readiness. Readiness pairs the latest ready report with NetMon command/control liveness instead of report age. Operation events retain 128 entries and each signed record uses eight sequence slots. Abort/history identities have no automatic expiry.
 
 ### Terminal create failure cleanup
 
@@ -319,8 +321,8 @@ The existing per-job mutable dAuth bundle is insufficient if both previous and a
 - Keep secrets protected and bind each bundle to its configuration revision and authorization scope.
 - Stage a new immutable revision without prematurely replacing the authoritative current revision or deleting the previous bundle.
 - During a successful update, retain the previous version until the rollback obligation and active-use conditions permit cleanup.
-- During a failed update, retain both versions until all affected nodes are confirmed restored/stopped and neither needs the attempted bundle.
-- During failed-create cleanup, retain the attempt's secrets while any dispatched instance could still be running or stopping.
+- During active recovery, retain the credentials needed for cleanup or restoration.
+- When a blocked ordinary operation ends, revoke its abandoned deploy revision. Preserve the previous and restore credentials that a workload can still need. An update whose failed targets have not all stopped ends without starting restoration.
 - Cleanup must be retryable and reference-aware. A deadline alone never establishes that secrets are unused.
 - Existing secret-path selection, redaction, owner checks, and reveal rules remain security requirements. No plaintext secrets in operation events, errors, polling responses, logs, or ordinary R1FS definitions.
 
@@ -349,6 +351,7 @@ The existing ChainDistMonitor continues its independent pending-job confirmation
 - On a lost acceptance response, look up by request ID or resubmit the same signed semantic request/key. Do not generate a fresh request ID automatically.
 - Reopen active/latest tracking by job ID after refresh, navigation, logout/login where authorized, or oracle change.
 - A paid draft becomes a tracked deployment after acceptance. Keep enough identifiers to resume it; do not leave a second actionable create draft for the same accepted operation.
+- The dashboard lists failed creates tracked by a paid draft in the browser. Show `Deployment failed · Paid` with cleanup progress and a link to the operation. A failed delete shows `Delete failed` and identifies every worker whose shutdown remained unconfirmed. A create retry requires confirmed cleanup, reopens the saved configuration, and signs a new create under the same paid job ID. A successful retry supersedes the failed draft on the dashboard.
 - UI polling failures affect a connection/freshness indicator only. Keep the last observed result and avoid repeated failure toasts.
 
 ### Progress presentation

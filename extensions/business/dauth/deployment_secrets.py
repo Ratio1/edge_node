@@ -5,7 +5,7 @@ import hashlib
 from .dauth_registry import dauth_registry_write_kwargs
 from .repair_tunnel import reconcile_restore_tunnel
 from extensions.business.deeploy.deployment_operations import (
-  check_replacement_placement, deployment_operation_phase, required_instances, ReplacementPlacementMismatch,
+  BLOCKED_OPERATION_ENDED, check_replacement_placement, deployment_operation_phase, required_instances, ReplacementPlacementMismatch,
   SIGNATURE_KEYS, STATELESS_REPLACEMENT,
 )
 from extensions.business.deeploy.relink_placement import relink_configs, relink_pipeline
@@ -150,6 +150,10 @@ class _DauthDeploymentSecretsMixin:
     }
     if operation.get("mutation") == STATELESS_REPLACEMENT:
       phases["status"].add("finalizing")  # Reconcile the exact published attempt if the original reply was lost.
+    if (operation.get("abandoned_deploy_revocation_pending") is True and operation.get("outcome") == "failed"
+        and (operation.get("error") or {}).get("code") == BLOCKED_OPERATION_ENDED):
+      # The coordinator persisted the terminal result before revoking its abandoned deployment revision.
+      phases["revoke"].add("completed")
     if action not in phases or phase not in phases[action]:
       raise ValueError("Secret action does not match the deployment phase.")
     if (operation.get("kind") == "delete") != (action == "delete" or (action == "revoke" and phase == "retiring_previous")):
@@ -782,6 +786,8 @@ class _DauthDeploymentSecretsMixin:
     {'job_id': '42', 'revision': '<operation_id>:restore', 'revoked': True}
     """
     phase = operation["phase"]
+    # The custody context grants completed-phase access only to a signed abandonment needing revocation.
+    abandoned_deploy = phase == "completed"
     expected_active = {"finalizing": "deploy", "finalizing_recovery": "restore"}.get(phase)
     if active_attempt != expected_active or (
       phase in ("preparing", "cleaning_up_preparation") and self.time() < operation["preparation_deadline"]
@@ -815,6 +821,8 @@ class _DauthDeploymentSecretsMixin:
       references.append(operation["previous_secret_revision"])
     if operation["kind"] != "delete":
       for attempt, key in (("deploy", "configs"), ("restore", "previous_configs")):
+        if abandoned_deploy and attempt == "restore":
+          continue  # A previous runtime that partly restored may already use its restoration credentials.
         if attempt != active_attempt and plan[key]:
           references.append(_revision_ref(operation, attempt))
     repair_parent = (operation.get("repair_parent") if operation.get("mutation")
