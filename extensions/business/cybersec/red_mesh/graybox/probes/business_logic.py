@@ -255,13 +255,17 @@ class BusinessLogicProbes(ProbeBase):
       ))
 
   def _read_back_field(self, url, field, csrf_field):
-    """GET the record again and return the stored value of ``field``, or None."""
+    """GET the record again and return the stored value of ``field``, or None.
+    The page read is kept in ``_read_back_page``: it, not the POST answer (often
+    a bodiless redirect), shows the stored value, so it is the evidence."""
+    self._read_back_page = None
     try:
       page = self.auth.primary_session.get(url, timeout=10)
     except Exception:
       return None
     if page.status_code != 200 or not self.response_reached(page):
       return None
+    self._read_back_page = page
     return parse_form_fields(page.text, csrf_field).get(field)
 
   @staticmethod
@@ -379,9 +383,9 @@ class BusinessLogicProbes(ProbeBase):
           elif self._same_amount(stored, "-9999.99"):
             bypass_evidence.append(f"negative_amount_accepted=True; endpoint={path}")
             if bypass_response is None:
-              bypass_response = resp
+              bypass_response = self._read_back_page
             if negative_amount_response is None:
-              negative_amount_response = resp
+              negative_amount_response = self._read_back_page
             negative_amount_evidence.append(
               f"endpoint={path}; submitted_amount=-9999.99; "
               f"stored_amount={stored[:MAX_EVIDENCE_VALUE]}; status={resp.status_code}"
@@ -441,7 +445,7 @@ class BusinessLogicProbes(ProbeBase):
                 f"stored_status={stored2[:MAX_EVIDENCE_VALUE]}; endpoint={path}"
               )
               if bypass_response is None:
-                bypass_response = resp2
+                bypass_response = self._read_back_page
 
     if bypass_evidence:
       self.findings.append(GrayboxFinding(

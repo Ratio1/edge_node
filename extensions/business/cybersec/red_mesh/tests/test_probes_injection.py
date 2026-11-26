@@ -1491,6 +1491,16 @@ class TestRealSqli(unittest.TestCase):
     self.assertEqual(len(probe.findings), 1)
     self.assertIn("reason=sqli_budget_exhausted", probe.findings[0].evidence)
 
+  def test_open_throttle_breaker_stops_the_sqli_loop(self):
+    """A TargetThrottled refusal ends the family like a 429, not one swallowed request at a time."""
+    from extensions.business.cybersec.red_mesh.graybox.budget import TargetThrottled
+    probe = _make_probe(
+      xss_endpoints=[ReflectiveEndpoint(path="/a/", param="q"),
+                     ReflectiveEndpoint(path="/b/", param="q")])
+    probe.auth.primary_session.get = MagicMock(side_effect=TargetThrottled())
+    probe._test_sqli_get()
+    self.assertEqual(probe.auth.primary_session.get.call_count, 1)
+
   def test_scan_wide_time_allowance_skips_time_technique(self):
     from types import SimpleNamespace
     from extensions.business.cybersec.red_mesh.graybox.probes import sqli

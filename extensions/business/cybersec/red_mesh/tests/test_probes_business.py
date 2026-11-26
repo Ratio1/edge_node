@@ -317,6 +317,18 @@ class TestNegativeAmountScenarioPTA0604(unittest.TestCase):
     self.assertTrue(any("submitted_amount=-9999.99" in e for e in a06_04[0].evidence))
     self.assertTrue(any("stored_amount=-9999.99" in e for e in a06_04[0].evidence))
 
+  def test_pt_a06_04_evidence_is_the_read_back_page(self):
+    """The read-back shows the stored value; the POST answer (a bodiless 302) does not."""
+    probe = _make_probe(record_endpoints=[RecordEndpoint(path="/records/1/")], allow_stateful=True)
+    _stored_record(probe.auth.primary_session)
+    probe.evidence_from = MagicMock(return_value=[])
+
+    probe._test_validation_bypass()
+
+    shown = [c.args[0] for c in probe.evidence_from.call_args_list if c.args and c.args[0] is not None]
+    self.assertTrue(shown)
+    self.assertTrue(all(getattr(r, "status_code", None) == 200 for r in shown))
+
   def test_pt_a06_04_read_back_decides_whatever_the_post_says(self):
     """Error words in a 200 POST answer do not skip the read-back."""
     for store, verdict in ((True, "vulnerable"), (False, "not_vulnerable")):

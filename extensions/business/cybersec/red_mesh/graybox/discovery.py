@@ -82,6 +82,7 @@ class DiscoveryModule:
     self.auth = auth_manager
     self.safety = safety
     self._target_host = urlparse(target_url).netloc
+    self._target_scheme = urlparse(target_url).scheme
     # Paths in the crawl queue are origin-absolute — `_normalize` resolves every
     # link against the target's base and returns the whole path — so requests
     # are built on the origin. Building them on `target_url` instead appended a
@@ -330,7 +331,9 @@ class DiscoveryModule:
         resp.close()
         hop = urlparse(url)
         hop_path = hop.path or "/"
-        if (hop.netloc != self._target_host or self._is_logout(hop_path)
+        # Scheme too: http://h/ -> https://h/ is port 443, outside the job's port list.
+        if (hop.netloc != self._target_host or hop.scheme != self._target_scheme
+            or self._is_logout(hop_path)
             or not self._in_scope(hop_path)):
           return None
         continue

@@ -368,13 +368,6 @@ def _resume_finalizing_tail(owner, job_key, job_specs, workers, ref):
     pass_window_report_refs={"pass_report_cid": ref.get("report_cid"), "aggregated_report_cid": aggregated_cid},
     stop_scheduled=_stop_scheduled(job_specs, job_specs.get("job_status")),
   )
-  if is_terminal_job_status(job_specs.get("job_status")):
-    current = _job_repo(owner).get_job(job_key)
-    if (isinstance(current, dict) and current.get("job_status") == JOB_STATUS_FINALIZING
-        and not current.get("job_cid")):
-      # The archive did not land. Keep the end state, so the terminal archive retry takes over and the
-      # stop and cap events of this tail are not sent again on the next attempt.
-      _write_job_record(owner, job_key, job_specs, context="finalizing_recovery_terminal")
 
 
 def _automatic_analysis_report_identity(workers):
@@ -684,6 +677,9 @@ def _finish_pass(owner, job_key, job_specs, *, workers, job_config, abort_state,
       )
     owner.P(f"[SINGLEPASS] Job {job_id} complete. Status set to FINALIZED.")
     owner._emit_timeline_event(job_specs, "finalized", "Job finalized")
+    # End state first: a failed archive build leaves it, not FINALIZING, so the terminal archive
+    # retry takes over and this tail (and its stop events) does not run again (I-268).
+    _write_job_record(owner, job_key, job_specs, context="finalize_terminal")
     owner._build_job_archive(job_key, job_specs)
     _enqueue_misp_auto_push(owner, job_specs, job_pass)
     owner._clear_live_progress(job_id, list(workers.keys()))
@@ -713,6 +709,9 @@ def _finish_pass(owner, job_key, job_specs, *, workers, job_config, abort_state,
       )
     owner.P(f"[CONTINUOUS] Pass {job_pass} complete for job {job_id}. Status set to STOPPED (soft stop was scheduled)")
     owner._emit_timeline_event(job_specs, "stopped", "Job stopped")
+    # End state first: a failed archive build leaves it, not FINALIZING, so the terminal archive
+    # retry takes over and this tail (and its stop events) does not run again (I-268).
+    _write_job_record(owner, job_key, job_specs, context="finalize_terminal")
     owner._build_job_archive(job_key, job_specs)
     _enqueue_misp_auto_push(owner, job_specs, job_pass)
     owner._clear_live_progress(job_id, list(workers.keys()))
@@ -756,6 +755,9 @@ def _finish_pass(owner, job_key, job_specs, *, workers, job_config, abort_state,
       f"Status set to STOPPED (max {MAX_CONTINUOUS_PASSES} passes reached)"
     )
     owner._emit_timeline_event(job_specs, "stopped", "Job stopped")
+    # End state first: a failed archive build leaves it, not FINALIZING, so the terminal archive
+    # retry takes over and this tail (and its stop events) does not run again (I-268).
+    _write_job_record(owner, job_key, job_specs, context="finalize_terminal")
     owner._build_job_archive(job_key, job_specs)
     _enqueue_misp_auto_push(owner, job_specs, job_pass)
     owner._clear_live_progress(job_id, list(workers.keys()))

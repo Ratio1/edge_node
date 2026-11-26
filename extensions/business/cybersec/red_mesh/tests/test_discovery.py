@@ -547,6 +547,15 @@ class TestSeedHardening(unittest.TestCase):
     self.assertFalse([u for u in disc.requested if "evil.example.com" in u])
     self.assertGreaterEqual(result.fetch_failures, 1)
 
+  def test_redirect_to_another_scheme_is_not_followed(self):
+    """http -> https on the same host is port 443, outside the job's port list."""
+    disc = _spec_discovery({
+      "/": (200, "<html></html>", "text/html"),
+      "/robots.txt": (302, "", "text/plain", "https://testapp.local:8000/r"),
+    })
+    disc.discover_result()
+    self.assertFalse([u for u in disc.requested if u.startswith("https://")])
+
   def test_same_origin_redirect_to_logout_is_not_followed(self):
     disc = _spec_discovery({
       "/": (200, "<html></html>", "text/html"),

@@ -3429,7 +3429,8 @@ class TestPhase2PassFinalization(unittest.TestCase):
     plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
 
   def test_resume_whose_archive_fails_keeps_the_end_state_for_the_archive_retry(self):
-    """I-268: a failed archive leaves the record STOPPED, not FINALIZING, so the stop is not re-sent."""
+    """I-268: the end state is written before the archive, so a failed archive leaves STOPPED, not
+    FINALIZING, and the stop is not re-sent."""
     PentesterApi01Plugin = self._get_plugin_class()
     plugin, job_specs = self._build_finalize_plugin(run_mode="CONTINUOUS_MONITORING")
     self._configure_successful_pass_finalization(plugin, job_specs)
@@ -3444,8 +3445,27 @@ class TestPhase2PassFinalization(unittest.TestCase):
       PentesterApi01Plugin._maybe_finalize_pass(plugin)
 
     kept = [c.args[2]["job_status"] for c in write.call_args_list
-            if c.kwargs.get("context") == "finalizing_recovery_terminal"]
+            if c.kwargs.get("context") == "finalize_terminal"]
     self.assertEqual(kept, ["STOPPED"])
+
+  def test_soft_stop_writes_the_end_state_before_the_archive(self):
+    """I-268: on the uninterrupted path too, a failed archive leaves STOPPED for the archive retry,
+    so the next tick does not resume the tail and send the stop event again."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    job_specs["job_status"] = "SCHEDULED_FOR_STOP"
+    order = []
+    plugin._build_job_archive.side_effect = lambda *a, **kw: order.append("archive")
+
+    target = "extensions.business.cybersec.red_mesh.services.finalization._write_job_record"
+    def write(owner, key, specs, context):
+      order.append((context, specs["job_status"]))
+      return specs
+    with patch(target, side_effect=write):
+      PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertLess(order.index(("finalize_terminal", "STOPPED")), order.index("archive"))
 
   def test_continuous_finalizing_wedge_at_the_pass_cap_stops_with_its_events(self):
     """I-268: the resumed pass-cap tail is the uninterrupted one, events included."""

@@ -20,7 +20,7 @@ import html
 import re
 import time
 
-from ..budget import RequestBudgetExhausted
+from ..budget import RequestRefused, TargetThrottled
 
 TIME_DELAY = 3                 # seconds asked of the database
 TIME_MARGIN = 0.8              # elapsed must exceed baseline + delay * margin
@@ -104,8 +104,9 @@ def status_reached(resp):
   return isinstance(status, int) and 200 <= status < 400
 
 
-# The client's refusal, raised by a ``prepare`` step or by ``send``.
-BudgetRefused = RequestBudgetExhausted
+# The client's refusal (spent budget or open throttle breaker), raised by a
+# ``prepare`` step or by ``send``.
+BudgetRefused = RequestRefused
 
 
 class CsrfUnavailable(Exception):
@@ -151,6 +152,8 @@ def detect_sqli(send, throttle=None, reached=None, budget=None,
       cap["left"] -= 1
     try:
       ctx = prepare() if prepare else None
+    except TargetThrottled:
+      raise _Stop("rate_limited")
     except BudgetRefused:
       raise _Stop("budget")
     except CsrfUnavailable:
@@ -164,6 +167,8 @@ def detect_sqli(send, throttle=None, reached=None, budget=None,
     started = time.monotonic()
     try:
       resp = send(value, ctx) if prepare else send(value)
+    except TargetThrottled:
+      raise _Stop("rate_limited")
     except BudgetRefused:
       raise _Stop("budget")
     except Exception:
