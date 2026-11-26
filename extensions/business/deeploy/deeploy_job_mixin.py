@@ -5,7 +5,9 @@ from extensions.business.dauth.dauth_registry import (
   pipeline_registry_write_kwargs,
 )
 
-NONCE = 42
+# Share the gated writer and compatible reader with the deployment and dAuth paths.
+from . import r1fs_documents
+
 R1FS_FILENAME = 'data.json'
 DEEPLOY_JOBS_CSTORE_HKEY = "DEEPLOY_DEPLOYED_JOBS"
 DAUTH_JOB_SECRETS_CSTORE_HKEY = "DAUTH_JOB_SECRETS"
@@ -140,6 +142,8 @@ class _DeeployJobMixin:
 
     Replacement persists the exact pointer after metadata upload and before
     making the first custody call. A resume-only call can finish a prior write.
+    A signed pointer records when the uploaded copy replaces a legacy copy, so
+    a restart after publication can still produce the owner notice.
 
     Parameters
     ----------
@@ -162,39 +166,66 @@ class _DeeployJobMixin:
     from .deployment_operations import ReplacementPublicationRefused, STATELESS_REPLACEMENT
 
     replacing = operation.get("mutation") == STATELESS_REPLACEMENT
-    first_send = replacing and not operation.get("replacement_publication_started")
     pointer = operation.get("replacement_publication") if replacing else None
-    if pointer is not None:
-      # Reuse the signed CID even when the original reply or pointer replication was lost.
-      return self._deployment_secret_request("status" if resume_only else "commit", operation, pointer=pointer)
-    if resume_only:
+    # Only the first send can report a pre-write refusal that proves no prior request was in flight.
+    first_send = replacing and pointer is None and not operation.get("replacement_publication_started")
+    if resume_only and pointer is None:
       raise RuntimeError("The exact replacement publication pointer is unavailable.")
-    # The plan holds every node's exact config of this revision; later updates
-    # rebuild from it, since configs can differ per node (scale-up instance IDs).
-    expected = dict(job_id=str(operation["job_id"]), revision=operation["target_revision"],
-                    operation_id=operation["operation_id"], coordinator=operation["coordinator"],
-                    deleted=False, plan_cid=operation["plan_cid"])
-    pointer = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=expected["job_id"])
-    # R1FS wraps each upload in a new folder CID. Reuse a published pointer
-    # after partial finalization; dAuth still verifies its signature and content.
-    if not isinstance(pointer, dict) or any(pointer.get(key) != value for key, value in expected.items()):
-      pipeline = self.deepcopy(self.extract_invariable_data_from_pipeline(pipeline))
-      pipeline.pop("DEEPLOY_OPERATION", None)
-      cid = self._save_pipeline_to_r1fs(self._recursively_sort_pipeline_data(pipeline))
-      if not cid:
-        raise RuntimeError("Deployment metadata persistence is pending.")
-      pointer = dict(expected, pipeline_cid=cid)
-      self.bc.sign(pointer, add_data=True, use_digest=True)
-    if replacing:
-      operation.update(replacement_publication=pointer, replacement_publication_started=True)
-      self._save_operation(operation)  # A failed R1FS upload never records a custody intent.
+    if pointer is None:
+      # The plan preserves each node's exact configuration for later updates and restore.
+      expected = dict(job_id=str(operation["job_id"]), revision=operation["target_revision"],
+                      operation_id=operation["operation_id"], coordinator=operation["coordinator"],
+                      deleted=False, plan_cid=operation["plan_cid"])
+      # Prefer the published pointer after a partial finalization or a lost custody reply.
+      prior = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=expected["job_id"])
+      if isinstance(prior, dict) and all(prior.get(key) == value for key, value in expected.items()):
+        # dAuth still verifies this signature and the publication's contents.
+        pointer = prior
+      else:
+        # Strip deployment commands before persisting the canonical copy.
+        pipeline = self.deepcopy(self.extract_invariable_data_from_pipeline(pipeline))
+        # Never store runtime command metadata in the published copy.
+        pipeline.pop("DEEPLOY_OPERATION", None)
+        # Only the active passphrase and a fresh nonce are used to write the copy.
+        cid = self._save_pipeline_to_r1fs(self._recursively_sort_pipeline_data(pipeline))
+        if not cid:
+          raise RuntimeError("Deployment metadata persistence is pending.")
+        # The marker and notice describe this exact ciphertext and are signed with its CID.
+        pointer = dict(expected, pipeline_cid=cid)
+        if r1fs_documents.ORACLE_R1FS_WRITES:
+          # Existing copies are represented by a bare CID or by a pointer without a protection marker.
+          prior_cid = prior.get("pipeline_cid") if isinstance(prior, dict) else prior
+          # Check the marker before deciding whether this update rewrites a legacy copy.
+          prior_mode = prior.get(r1fs_documents.R1FS_ENCRYPTION) if isinstance(prior, dict) else None
+          # Skip creates, subsequent edits, and snapshots whose prior CID has already moved.
+          rewritten = (operation.get("kind") == "update" and prior_cid
+                       and prior_cid == operation.get("previous_pipeline_cid")
+                       and prior_mode not in r1fs_documents.PROTECTED_R1FS_MODES)
+          # A retried finalization can recover the original notice from its signed pointer.
+          pointer[r1fs_documents.R1FS_ENCRYPTION] = (
+            r1fs_documents.ORACLE_REWROTE_LEGACY if rewritten else r1fs_documents.ORACLE_ENCRYPTED
+          )
+        # The custodian authenticates the whole pointer before publication.
+        self.bc.sign(pointer, add_data=True, use_digest=True)
+      if replacing:
+        # Preserve the exact signed CID before making the first custody request.
+        operation.update(replacement_publication=pointer, replacement_publication_started=True)
+        # A failed upload never records a custody intent.
+        self._save_operation(operation)
     if first_send:
       # Only the first dispatch can prove that a signed pre-write refusal leaves no earlier send in doubt.
       result = self._deployment_secret_request("commit", operation, pointer=pointer, report_prewrite_refusal=True)
       if result.get("publication_refused_before_write") is True:
         raise ReplacementPublicationRefused("dAuth refused publication before writing because the reviewed placement changed.")
-      return result
-    return self._deployment_secret_request("commit", operation, pointer=pointer)
+    else:
+      # Retrying publication reuses the original signed CID and asks status only in resume-only mode.
+      result = self._deployment_secret_request("status" if resume_only else "commit", operation, pointer=pointer)
+    if (pointer.get(r1fs_documents.R1FS_ENCRYPTION) == r1fs_documents.ORACLE_REWROTE_LEGACY
+        and result.get("pipeline_cid") == pointer["pipeline_cid"]
+        and (not resume_only or result.get("publication_committed") is True)):
+      # Pass proof to finalization without changing the still-signed operation used for revocation.
+      return dict(result, credential_rotation_required=True)
+    return result
 
   def _load_dauth_job_secret_bundle(self, job_id):
     return self.chainstore_hget(
@@ -413,8 +444,9 @@ class _DeeployJobMixin:
     """
     Get the pipeline from R1FS.
     """
-    return self.r1fs.get_json(
-      cid,
+    # All callers read the pending and legacy formats from the same local download.
+    return r1fs_documents.read_r1fs_document(
+      self.r1fs, cid,
       timeout=timeout,
       pin=pin,
       raise_on_error=raise_on_error,
@@ -422,8 +454,21 @@ class _DeeployJobMixin:
     )
 
   def _save_pipeline_to_r1fs(self, pipeline: dict):
-    """
-    Save the pipeline to R1FS.
+    """Write a job copy with an independent nonce and the active passphrase.
+
+    Parameters
+    ----------
+    pipeline : dict
+      Job configuration destined for the oracle readers.
+
+    Returns
+    -------
+    str or None
+      Uploaded CID, or None if a write could not complete.
+
+    Examples
+    --------
+    >>> plugin._save_pipeline_to_r1fs(pipeline)  # doctest: +SKIP
     """
 
     try:
@@ -432,10 +477,9 @@ class _DeeployJobMixin:
           self.json_dumps(self._redact_per_node_config_for_log(pipeline))
         )
       )
-      cid = self.r1fs.add_json(pipeline, nonce=NONCE, fn=R1FS_FILENAME, show_logs=False)
+      # Use the SDK's fresh nonce and the current writer mode.
+      cid = r1fs_documents.write_r1fs_document(self.r1fs, pipeline, R1FS_FILENAME)
       self.Pd(f"Pipeline saved to R1FS with CID: {cid}")
-      calc_cid = self.r1fs.calculate_json_cid(pipeline, nonce=NONCE, fn=R1FS_FILENAME, show_logs=False)
-      self.Pd(f"Calculated CID: {calc_cid}")
     except Exception as e:
       self.Pd(f"Error saving pipeline to R1FS: {e}")
       return None

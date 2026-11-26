@@ -189,6 +189,34 @@ class DeploymentStatusTests(unittest.TestCase):
     plugin.bc.get_job_details.return_value = {"escrowOwner": "different-owner"}
     self.assertEqual(plugin._deployment_status({"job_id": 1})["status"], "synchronizing")
 
+  def test_legacy_copy_notice_is_projected_only_after_confirmed_completion(self):
+    """Expose only a confirmed credential rotation notice in owner status.
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> DeploymentStatusTests("test_legacy_copy_notice_is_projected_only_after_confirmed_completion").run()
+    """
+    # Check a pending finalization and its subsequent terminal projection.
+    plugin = self.prepare()
+    # Build an update operation with a durable signed snapshot.
+    operation = plugin.operation("update")
+    # Custody may succeed before completion of the operation is confirmed.
+    operation.update(phase="finalizing", credential_rotation_required=True)
+    # Replicate the in-progress snapshot to the status reader.
+    plugin._save_operation(operation)
+    # A polling owner does not yet receive a rotation notice.
+    self.assertNotIn("credential_rotation_required", plugin._deployment_status({"job_id": 1}))
+    # The terminal snapshot proves publication and makes the notice available.
+    operation["outcome"] = "succeeded"
+    # Save completion using the ordinary operation path.
+    plugin._save_operation(operation, "completed")
+    # This additive response field is the only input the dashboard needs.
+    self.assertIs(plugin._deployment_status({"job_id": 1})["credential_rotation_required"], True)
+
   def test_other_oracle_polling_is_read_only(self):
     plugin = self.prepare()
     operation = plugin.operation()

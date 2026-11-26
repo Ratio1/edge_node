@@ -346,8 +346,8 @@ class RealKeysTests(unittest.TestCase):
     Start-up dAuth: run the oracle's own client once against the server, on a debug network.
 
     The client is the SDK's ``dauth_autocomplete`` of the oracle engine; its one HTTP request goes to
-    ``_serve``. The versions it declares are above every minimum, no VPN is assumed, and the keys it
-    writes to the environment are removed afterwards.
+    ``_serve``. The signer is a registered dAuth oracle in the isolated registry. The declared
+    versions are above every minimum, no VPN is assumed, and environment writes are temporary.
 
     Returns
     -------
@@ -362,9 +362,12 @@ class RealKeysTests(unittest.TestCase):
     # The HTTP call, the VPN flag, the declared versions and the environment, for this run only.
     with patch("ratio1.bc.base.requests.post", side_effect=self._serve) as post, \
          patch.object(bc_base, "EE_VPN_IMPL", False), patch.object(bc_base, "app_version", "2.10.730"), \
-         patch.object(bc_base, "core_version", "7.7.360"), patch.dict(os.environ):
+         patch.object(bc_base, "core_version", "7.7.360"), patch.dict(os.environ), \
+         patch.object(self.oracle, "web3_is_dauth_oracle", return_value=True) as registry:
       # The start-up dAuth on devnet, where debug logging is forced on.
       self.oracle.dauth_autocomplete(dauth_endp=DAUTH_URL, network="devnet", max_tries=1, sender_alias="oracle")
+    # Use the real signature and address, with no live RPC calls in the fixture.
+    registry.assert_called_once_with(self.server.eth_address, network="devnet")
     # The signed request of that one call.
     return post.call_args.kwargs["json"]["body"]
 

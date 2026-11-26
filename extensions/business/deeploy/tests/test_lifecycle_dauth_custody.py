@@ -1,14 +1,97 @@
 """Lifecycle preparation and finalization through real SDK and Core wrapper APIs."""
 import copy
+# Store encrypted files by their checksum in the offline transport.
+import hashlib
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+from ratio1.bc.base import BaseBlockEngine
 from ratio1.const.base import dAuth
+from ratio1.ipfs.r1fs import R1FSEngine
 # The error type of a secret record the chain store refused for its size.
 from extensions.business.dauth.deployment_secrets import DeploymentSecretRecordTooLarge
 from extensions.business.deeploy.tests.lifecycle_custody_support import (
   Coordinator, Custodian, State, pipeline, connect, report,
 )
+
+
+def ciphertext_transport(folder):
+  """Keep the SDK encryption and replace only its IPFS command boundary.
+
+  Parameters
+  ----------
+  folder : str
+    Private SDK download root for this test.
+
+  Returns
+  -------
+  tuple[R1FSEngine, dict]
+    The SDK engine and the immutable bytes captured from uploads.
+
+  Examples
+  --------
+  >>> sdk, blobs = ciphertext_transport(folder)  # doctest: +SKIP
+  """
+  # Skip daemon startup and configure only the fields used by these file operations.
+  sdk = object.__new__(R1FSEngine)
+  # Preserve each synthetic CID even when the application stops pinning it.
+  blobs = {}
+  # No external relay, storage daemon or network configuration is needed.
+  sdk._R1FSEngine__ipfs_started = True
+  sdk._R1FSEngine__downloads_dir = folder
+  sdk._R1FSEngine__downloaded_files = {}
+  sdk._R1FSEngine__uploaded_files = {}
+  sdk._R1FSEngine__relay_publication_status = {}
+  sdk._R1FSEngine__DEFAULT_SECRET = "ratio1"
+  # Record execution without side effects from the logger, relay or in-memory upload bookkeeping.
+  sdk.P = sdk.Pd = Mock()
+  sdk._R1FSEngine__set_upload_status = Mock()
+  sdk._R1FSEngine__publish_cid_to_relay = Mock()
+  sdk._R1FSEngine__relay_in_background = Mock()
+  sdk.delete_file = Mock(return_value=True)
+
+  def run(command, **kwargs):
+    """Save and restore the SDK's real ciphertext at the IPFS command boundary.
+
+    Parameters
+    ----------
+    command : list
+      Command passed by the SDK to IPFS.
+    **kwargs : dict
+      SDK command options.
+
+    Returns
+    -------
+    str
+      A synthetic CID or the expected command result.
+
+    Examples
+    --------
+    >>> run(["ipfs", "pin", "add", "FixtureCid"])
+    'ok'
+    """
+    if command[1] == "add":
+      # Capture actual SDK AES-GCM output before its temporary file is cleaned up.
+      contents = Path(command[-1]).read_bytes()
+      # Pick a valid bare CID in the SDK's input contract.
+      cid = hashlib.sha256(contents).hexdigest()
+      # Retain old ciphertext to test whether it remains decryptable after rewrite.
+      blobs[cid] = contents
+      return cid
+    if command[1] == "get":
+      # Replicate the wrapped one-file directory created by Kubo.
+      output = Path(command[-1])
+      # The SDK has removed any older downloads of this CID.
+      output.mkdir()
+      # Restore the same bytes that were uploaded.
+      (output / "ciphertext").write_bytes(blobs[command[2]])
+    return "ok"
+
+  # Record exactly how many network-bound commands a request would have executed.
+  sdk._R1FSEngine__run_command = Mock(side_effect=run)
+  return sdk, blobs
 
 
 class LifecycleDauthCustodyTests(unittest.TestCase):
@@ -251,6 +334,87 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.finalize(operation)
     self.assertEqual(operation['outcome'], 'succeeded')
     self.assertEqual(self.token(self.state.secrets['DAUTH_JOB_SECRETS', '7']), 'old-token')
+
+  def test_first_successful_edit_publishes_protected_bytes_and_owner_notice(self):
+    """Keep historical ciphertext readable but publish an oracle-only copy on first edit.
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> LifecycleDauthCustodyTests("test_first_successful_edit_publishes_protected_bytes_and_owner_notice").run()
+    """
+    # Give the coordinator and custodian the same synthetic ciphertext transport.
+    with TemporaryDirectory() as folder:
+      # Run both writers and readers through the real SDK encryption code.
+      sdk, blobs = ciphertext_transport(folder)
+      # Replace the plaintext fixture store at both sides of custody.
+      self.state.blobs = self.coordinator.r1fs = self.dauth.r1fs = sdk
+      # The old copy and its selected credentials were stored before this switch.
+      prior, old_cid = self.legacy()
+      # A reader with only the default key can still read the old bytes.
+      self.assertEqual(sdk.get_json(old_cid, pin=False, show_logs=False), prior)
+      # Activate the new default against a synthetic locally provisioned secret.
+      secret = "synthetic-shared-oracle-passphrase-only"
+      with patch.object(BaseBlockEngine, "oracle_secret", return_value=secret), \
+           patch("extensions.business.deeploy.r1fs_documents.ORACLE_R1FS_WRITES", True):
+        # Admission publishes the new operation plan without claiming the canonical rewrite happened.
+        self.admit(prior)
+        # The status snapshot before readiness carries no credential notice.
+        operation = self.operation()
+        self.assertNotIn("credential_rotation_required", operation)
+        # The custodian will read the plan with the local key, while a default reader cannot.
+        self.assertIsNone(sdk.get_json(operation["plan_cid"], pin=False, show_logs=False))
+        # Process the signed worker confirmations and commit the protected pointer through dAuth.
+        self.finalize(operation)
+        # The successful completion is bound to the replacement ciphertext, not the old pointer.
+        current = self.state.public["DEEPLOY_DEPLOYED_JOBS", "7"]
+        # This stable signed marker supports notice recovery after an interrupted finalization.
+        self.assertEqual(current["r1fs_encryption"], "oracle_rewrote_legacy")
+        # The user is notified only after custody confirmed the rewrite.
+        self.assertIs(operation["credential_rotation_required"], True)
+        # The replacement and its plan each use a different random 96-bit nonce.
+        ids = (old_cid, operation["plan_cid"], current["pipeline_cid"])
+        # Use exact captured ciphertext headers to exclude fixed or reused nonces.
+        self.assertEqual(len({blobs[cid][:12] for cid in ids}), 3)
+        # A default reader cannot decrypt the new canonical copy.
+        self.assertIsNone(sdk.get_json(current["pipeline_cid"], pin=False, show_logs=False))
+        # A reader with the correct key can decrypt it using the unchanged public file format.
+        protected = sdk.get_json(current["pipeline_cid"], secret=secret, pin=False, show_logs=False)
+        # The protected copy contains the new deployment revision.
+        self.assertEqual(protected["DEEPLOY_SPECS"]["revision"], 1)
+        # Edit the protected revision. A new upload is required but no legacy migration remains.
+        self.coordinator._admit_prepared_deployment(
+          request={"job_id": 7, "request_id": "second-request", "expected_revision": 1},
+          auth_result={"escrow_owner": "owner"}, app_id="app", configs={"A": pipeline("new-synthetic-value")},
+          prior_pipeline=protected, is_create=False,
+        )
+        # Identify the new operation by request ID so older completion snapshots can remain visible.
+        second = next(record for record in self.coordinator._operation_records().values()
+                      if record["request_id"] == "second-request")
+        # Drive it through real custody again.
+        self.finalize(second)
+        # The next signed pointer remains protected without a repeated migration notice.
+        self.assertEqual(self.state.public["DEEPLOY_DEPLOYED_JOBS", "7"]["r1fs_encryption"], "oracle")
+        self.assertNotIn("credential_rotation_required", second)
+        # Whole-job delete uses the third protected writer, for the plan holding the previous configuration.
+        deletion = self.coordinator._admit_delete_operation(
+          {"job_id": 7, "request_id": "delete", "expected_revision": 2}, {"escrow_owner": "owner"},
+        )
+        # Read its immutable plan reference from the signed operation.
+        delete_cid = self.coordinator._operation_records()[deletion["operation_id"]]["plan_cid"]
+        # The default passphrase cannot open the delete plan either.
+        self.assertIsNone(sdk.get_json(delete_cid, pin=False, show_logs=False))
+        # The oracle can restore the exact previous placement it needs for retirement.
+        delete_plan = sdk.get_json(delete_cid, secret=secret, pin=False, show_logs=False)
+        # The signed plan keeps the prior revision intact.
+        self.assertEqual(delete_plan["previous_configs"]["A"]["DEEPLOY_SPECS"]["revision"], 2)
+        # All three writer paths used independent nonces across the captured uploads.
+        self.assertEqual(len({contents[:12] for contents in blobs.values()}), len(blobs))
+      # The old record remains readable if it was previously retained elsewhere.
+      self.assertEqual(sdk.get_json(old_cid, pin=False, show_logs=False), prior)
 
   def test_failed_first_update_without_bundle_restores_plaintext_values(self):
     previous, _ = self.legacy('old-token', with_bundle=False)
