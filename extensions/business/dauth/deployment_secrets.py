@@ -81,8 +81,8 @@ class _DauthDeploymentSecretsMixin:
     It then reads the operation's plan from R1FS and checks that every planned
     configuration matches the operation's placement and identity and carries no
     plaintext secret. Every lifecycle custody action starts here, on the single
-    dAuth request thread, so the plan read is bounded: ``pin=False`` keeps
-    ``ipfs pin add`` out and makes the 10 s ``timeout`` the real bound.
+    dAuth request thread. The plan fetch has a 10-second timeout and skips
+    pinning.
 
     Parameters
     ----------
@@ -110,6 +110,12 @@ class _DauthDeploymentSecretsMixin:
     RuntimeError
       When the plan cannot be read from R1FS, or a newer signed snapshot of the
       same operation is already held on this node (both retryable).
+
+    Notes
+    -----
+    A completed non-delete operation can request revocation only when its
+    signed snapshot records a failed grace expiry and an abandoned deploy
+    revision pending revocation. The normal identity and plan checks apply.
 
     Examples
     --------
@@ -604,8 +610,8 @@ class _DauthDeploymentSecretsMixin:
     secret bundle; for a delete it revokes the job's previous secret revision and
     publishes an empty bundle. It then writes the bundle, writes the pointer and removes the
     previous pipeline CID from R1FS. The published-configuration read runs on the
-    single dAuth request thread, so it is bounded: ``pin=False`` keeps
-    ``ipfs pin add`` out and makes the 10 s ``timeout`` the real bound.
+    single dAuth request thread with a 10-second fetch timeout and pinning
+    disabled.
 
     Parameters
     ----------
@@ -645,6 +651,13 @@ class _DauthDeploymentSecretsMixin:
     RuntimeError
       When the published configuration or the prepared secrets are not available, or
       a chain-store write was not confirmed (all retryable).
+
+    Notes
+    -----
+    A recognized protection marker is part of the signed pointer. It
+    requires the exact published CID to authenticate with the oracle key
+    and disables passphrase fallback. Unmarked pointers still support
+    legacy reads. A missing key for protected verification is retryable.
 
     Examples
     --------
@@ -758,8 +771,8 @@ class _DauthDeploymentSecretsMixin:
     published configuration, read from R1FS, must match the plan. Then each unused
     secret revision gets a "revoked" marker and its record is overwritten with a
     revoked copy that keeps no secrets. The published-configuration read runs on the
-    single dAuth request thread, so it is bounded: ``pin=False`` keeps
-    ``ipfs pin add`` out and makes the 10 s ``timeout`` the real bound.
+    single dAuth request thread with a 10-second fetch timeout and pinning
+    disabled.
 
     Parameters
     ----------
@@ -790,6 +803,13 @@ class _DauthDeploymentSecretsMixin:
     RuntimeError
       When the publication is still pending, the published configuration cannot be
       read, or a chain-store write was not confirmed (all retryable).
+
+    Notes
+    -----
+    For completed abandonment authorized by the custody context, revoke
+    only the unused deploy revision. Preserve the previous and restoration
+    credentials. Active-attempt verification can still read either legacy
+    or protected job copies.
 
     Examples
     --------

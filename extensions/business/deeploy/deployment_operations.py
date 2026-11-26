@@ -551,7 +551,30 @@ def with_observed_legacy_metadata_order(pipeline, observed):
 
 
 class _DeploymentOperationsMixin:
-  """Persist, execute, recover, and present asynchronous deployment operations."""
+  """Persist and reconcile asynchronous deployment operations.
+
+  The hosting plugin runs a coordinator worker and serves owner-scoped status
+  from verified snapshots.
+
+  Parameters
+  ----------
+  None
+
+  Returns
+  -------
+  _DeploymentOperationsMixin
+    Operation helpers for the hosting plugin.
+
+  Notes
+  -----
+  The worker's in-memory cleanup clock permits an immediate receipt check
+  after startup, then paces checks for ended paid creates every 60 seconds.
+  The signed operation, rather than the clock, preserves the outcome.
+
+  Examples
+  --------
+  >>> plugin._reconcile_coordinator_operations()  # doctest: +SKIP
+  """
 
   # The worker owns the cadence. Restarting permits one immediate read of the local receipts.
   _last_ended_create_cleanup_check = None
@@ -1006,7 +1029,46 @@ class _DeploymentOperationsMixin:
       raise DeploymentConflictError("Deployment or recovery is active; wait before changing this job.")
 
   def _find_request_operation(self, request, owner, kind, repair_parent=None):
-    """Resolve already observed idempotent requests and known job conflicts."""
+    """Find an identical request or check whether another operation blocks it.
+
+    Check the verified operation records for this owner and job before
+    deciding whether a new request can proceed.
+
+    Parameters
+    ----------
+    request : dict
+      Deployment input including the job and stable request ID.
+    owner : str
+      Authenticated escrow owner.
+    kind : str
+      Kind of deployment operation being admitted.
+    repair_parent : str or None, optional
+      Active parent operation that may coexist with its own repair request.
+
+    Returns
+    -------
+    dict or None
+      The matching operation on an identical replay, or None for new input
+      that does not conflict with observed operations.
+
+    Raises
+    ------
+    ValueError
+      The request ID is missing or is outside the allowed length.
+    DeploymentConflictError
+      The request ID matches different input, unrelated work is still active,
+      or a new paid create would overlap an ended create's unconfirmed cleanup.
+
+    Notes
+    -----
+    An exact replay returns the existing record before checking conflicts
+    for new input. A completed phase can still block a new paid create until
+    its recovery state confirms cleanup.
+
+    Examples
+    --------
+    >>> plugin._find_request_operation(request, owner, "create")  # doctest: +SKIP
+    """
     request_id = request.get("request_id")
     if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
       raise ValueError("A stable request_id of 1 to 128 characters is required.")
@@ -1261,6 +1323,27 @@ class _DeploymentOperationsMixin:
       The job's stored copy in R1FS, with its original node names.
     reports : dict, optional
       Job reports already observed for this admission. An empty observation is valid.
+
+    Returns
+    -------
+    dict
+      Copies of the saved configurations keyed by the exact prior node set,
+      with per-instance response keys removed.
+
+    Raises
+    ------
+    ValueError
+      The saved plan is unavailable or does not cover the prior placement,
+      or legacy observations disagree with the saved configuration.
+
+    Notes
+    -----
+    A signed pointer may reference either protected or legacy plan storage.
+    For a restored revision, read the plan's previous configurations.
+
+    Examples
+    --------
+    >>> config_by_node = plugin._previous_deployment_configs(pipeline)  # doctest: +SKIP
     """
     specs = pipeline["DEEPLOY_SPECS"]
     nodes = specs.get("current_target_nodes", [])
@@ -1578,7 +1661,34 @@ class _DeploymentOperationsMixin:
     return self._accepted_operation_response(operation)
 
   def _load_operation_plan(self, operation):
-    """Load immutable redacted execution data without exposing it in polling."""
+    """Load the immutable, redacted plan for executing an operation.
+
+    Reuse a cached plan or download it once before returning a private copy.
+
+    Parameters
+    ----------
+    operation : dict
+      Signed operation containing the plan's CID.
+
+    Returns
+    -------
+    dict
+      Independent copy of the validated plan, including its config mapping.
+
+    Raises
+    ------
+    RuntimeError
+      The plan is unavailable or its configs field is invalid.
+
+    Notes
+    -----
+    A cache miss supports legacy and protected documents through one download.
+    The cache lock covers bookkeeping only. Status polling does not load plans.
+
+    Examples
+    --------
+    >>> configs = plugin._load_operation_plan(operation)["configs"]  # doctest: +SKIP
+    """
     cid = operation["plan_cid"]
     with self._deployment_plan_cache_lock:
       plan = self._deployment_plans.get(cid)
@@ -1806,7 +1916,38 @@ class _DeploymentOperationsMixin:
     return self._advance_deployment_operation(operation)
 
   def _advance_deployment_operation(self, operation):
-    """Run the existing state machine for the latest eligible operation."""
+    """Advance the eligible operation by one coordinator pass.
+
+    Process preparation, worker confirmation and publication or recovery
+    for the saved phase. Dispatch commands after the applicable guards pass.
+
+    Parameters
+    ----------
+    operation : dict
+      Coordinator snapshot with the current phase, deadlines and plan.
+
+    Returns
+    -------
+    None
+      Persists progress or waits for the next eligible pass.
+
+    Raises
+    ------
+    RuntimeError
+      Required plan, custody or operation replication is unavailable.
+
+    Notes
+    -----
+    Foreign and completed operations are ignored. Delete uses its own
+    retirement path. Ordinary blocked retirement, failed-rollout cleanup
+    and restoration can end after their deadline plus 24 readiness
+    timeouts. Same-host repair and stateless replacement retain their
+    applicable reservation, stop and publication barriers.
+
+    Examples
+    --------
+    >>> plugin._advance_deployment_operation(operation)  # doctest: +SKIP
+    """
     if operation["coordinator"] != self.bc.address or operation["phase"] == "completed":
       return
     if operation["kind"] == "delete":
@@ -2102,7 +2243,21 @@ class _DeploymentOperationsMixin:
     Returns
     -------
     bool
-      Whether a new snapshot confirming cleanup was persisted.
+      True after saving confirmed cleanup, or False if the operation is
+      ineligible or still lacks an exact signed stop.
+
+    Raises
+    ------
+    RuntimeError
+      Replication of the updated snapshot is unconfirmed.
+    ValueError
+      The caller is not the operation's coordinator.
+
+    Notes
+    -----
+    Every planned worker must have a verified stop for the exact attempt.
+    An empty signed instance list fences an absent attempt. Otherwise the
+    report must confirm retirement of the full planned instance set.
 
     Examples
     --------
@@ -2209,6 +2364,9 @@ class _DeploymentOperationsMixin:
   def _commit_operation_revision(self, operation, configs):
     """Commit canonical metadata after readiness or restoration evidence.
 
+    Use one representative configuration for the canonical copy while
+    retaining the operation's exact per-worker plan.
+
     Parameters
     ----------
     operation : dict
@@ -2220,6 +2378,12 @@ class _DeploymentOperationsMixin:
     -------
     dict
       Authenticated custody result and any confirmed legacy rewrite notice.
+
+    Notes
+    -----
+    Finalization records an affirmative rewrite notice on the completed
+    operation after releasing unused secret revisions. This call leaves
+    the notice in the returned custody result until that save is due.
 
     Examples
     --------
@@ -2276,6 +2440,10 @@ class _DeploymentOperationsMixin:
     tried again at the next age of its repair schedule. A pass of the
     operation without an error drops its wait.
 
+    Parameters
+    ----------
+    None
+
     Returns
     -------
     None
@@ -2291,6 +2459,10 @@ class _DeploymentOperationsMixin:
     Runs on the `deeploy-operations` thread every 2 s, or sooner when the
     wake-up event is set. Each operation is deep-copied before it is
     advanced, so the replica's records are not mutated in place.
+
+    Ended paid creates can finish cleanup without resuming workload command
+    dispatch. The worker checks verified stop receipts every 60 seconds
+    and checks immediately after a pending custody revocation succeeds.
 
     The waits live in `_custody_retry`, which only this thread reads and
     writes. A waiting operation is skipped without any call, so the others are

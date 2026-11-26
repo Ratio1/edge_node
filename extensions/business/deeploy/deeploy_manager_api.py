@@ -1330,6 +1330,9 @@ class DeeployManagerApiPlugin(
       job_id : int
           The job ID from blockchain
 
+      request_id : str
+          Stable request identifier included in the signature.
+
       target_nodes : list[str] or target_nodes_count : int
           Either specific nodes or count of nodes to deploy on
 
@@ -1401,15 +1404,15 @@ class DeeployManagerApiPlugin(
     Returns
     -------
     dict
-        Response containing:
-        - status : str
-        - app_id : str
-        - status_details : dict
-        - request : dict
-        - auth : dict
+        Signed HTTP 202 acceptance with operation, request, job, app and
+        target revision identifiers. Invalid requests, conflicts and
+        uncertain acceptance use HTTP 400, 409 and 503 respectively.
 
     Notes
     -----
+    Poll get_deployment_status for execution and recovery. For uncertain
+    acceptance, retry with the same request ID and input.
+
     - Multi-plugin pipelines are automatically classified as JOB_APP_TYPE.NATIVE
     - Single CONTAINER_APP_RUNNER is classified as GENERIC or SERVICE
     - Resource requirements are aggregated across all container plugins
@@ -1417,10 +1420,9 @@ class DeeployManagerApiPlugin(
     - Example: [{"plugin_signature": "PLUGIN_A", ...}, {"plugin_signature": "PLUGIN_A", ...}] creates 2 instances
     - For multi-plugin templates, see DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN in deeploy_const.py
 
-    TODO: (Vitalii)
-      - Add support to get the ngrok url if NO edge/endpoint is provided but ngrok is STILL used
-    Requires a signed stable request_id. Returns HTTP 202 after durable
-    acceptance; get_deployment_status reports execution and recovery.
+    Examples
+    --------
+    >>> operation_id = oracle.create_pipeline(signed_request)["operation_id"]  # doctest: +SKIP
     """
     self.Pd(f"Called Deeploy create_pipeline endpoint")
     return self._process_pipeline_request(request, is_create=True)
@@ -1503,7 +1505,9 @@ class DeeployManagerApiPlugin(
     Returns
     -------
     dict
-        Response containing update status and details
+        Signed HTTP 202 acceptance with operation, request, job, app and
+        target revision identifiers. Invalid requests, conflicts and
+        uncertain acceptance use HTTP 400, 409 and 503 respectively.
 
     Notes
     -----
@@ -1515,6 +1519,9 @@ class DeeployManagerApiPlugin(
     - New plugin instances can be introduced by omitting `instance_id` (native job type only)
     - See create_pipeline endpoint for detailed parameter documentation and examples
 
+    Examples
+    --------
+    >>> operation_id = oracle.update_pipeline(signed_request)["operation_id"]  # doctest: +SKIP
     """
     self.P(
       "Received an update_pipeline request with body: {}".format(
@@ -1577,6 +1584,9 @@ class DeeployManagerApiPlugin(
   def repair_update_pipeline(self, request: dict):
     """Accept a CSP-signed legacy correction and update on its original coordinator.
 
+    Use the reviewed proposal to admit a same-host repair or
+    replace a stateless workload through the original coordinator.
+
     Parameters
     ----------
     request : dict
@@ -1585,7 +1595,13 @@ class DeeployManagerApiPlugin(
     Returns
     -------
     dict
-      Existing deployment acceptance or structured admission error.
+      Signed HTTP 202 acceptance with an operation ID, or a structured
+      admission error. A stale replacement review returns HTTP 409.
+
+    Notes
+    -----
+    Acceptance is separate from worker readiness and recovery. Poll
+    get_deployment_status for the accepted operation's outcome.
 
     Examples
     --------
@@ -1626,11 +1642,31 @@ class DeeployManagerApiPlugin(
 
   @BasePlugin.endpoint(method="post", forward_accepted_status=True)
   def scale_up_job_workers(self, request: dict = DEEPLOY_SCALE_UP_JOB_WORKERS_REQUEST):
-    """Accept a full revision rollout to a larger placement with automatic rollback.
+    """Accept a full revision rollout to a larger job placement.
 
-    The signed request requires job_id, request_id, expected_revision, and the
-    existing node-selection/resource fields. Poll get_deployment_status for the
-    accepted operation; HTTP202 does not assert readiness.
+    Validate the paid placement change and keep the prior configuration
+    available for restoration if the rollout fails.
+
+    Parameters
+    ----------
+    request : dict
+      Signed request with job_id, request_id, expected_revision and the
+      existing node-selection and resource fields for the additional nodes.
+
+    Returns
+    -------
+    dict
+      Signed HTTP 202 acceptance with an operation ID. Invalid requests,
+      conflicts and uncertain acceptance use HTTP 400, 409 and 503 respectively.
+
+    Notes
+    -----
+    Poll get_deployment_status for rollout and recovery. Retry uncertain
+    acceptance with the same request ID and input.
+
+    Examples
+    --------
+    >>> operation_id = oracle.scale_up_job_workers(signed_request)["operation_id"]  # doctest: +SKIP
     """
     try:
       self.__ensure_eth_balance()

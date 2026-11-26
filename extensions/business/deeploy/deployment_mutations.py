@@ -186,6 +186,10 @@ class _DeploymentMutationsMixin:
   def _admit_node_relink_operation(self, job_id, old_node, new_node):
     """Move a job from a relinked node to its owner's new node through a revision rollout.
 
+    Resolve the existing placement before preparing the update. A move with
+    the same prior revision and destination stays suppressed after grace
+    expires. A new prior revision or destination can qualify after backoff.
+
     Parameters
     ----------
     job_id : int
@@ -197,7 +201,14 @@ class _DeploymentMutationsMixin:
     Returns
     -------
     dict or None
-      Acceptance response, or None while waiting after a failed attempt.
+      Acceptance response, or None while a failed move is suppressed.
+
+    Raises
+    ------
+    ValueError
+      The saved configuration or placement cannot support the move.
+    DeploymentConflictError
+      Another operation already holds the job.
 
     Notes
     -----
@@ -207,6 +218,10 @@ class _DeploymentMutationsMixin:
     A license relink alone gives no evidence that a workload on a different
     machine stopped or that the new machine can restore it. dAuth moves the
     per-node settings only after admission; the old address is never contacted.
+
+    Examples
+    --------
+    >>> plugin._admit_node_relink_operation(job_id, old_node, new_node)  # doctest: +SKIP
     """
     pipeline = self.get_job_pipeline_from_cstore(job_id, timeout=30, pin=False,
                                                 raise_on_error=False, show_logs=False)

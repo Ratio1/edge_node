@@ -157,7 +157,24 @@ class _DeeployJobMixin:
     Returns
     -------
     dict
-      Authenticated result from the custodian.
+      Authenticated custody result. Adds credential_rotation_required=True
+      when the result confirms the exact CID of a signed legacy rewrite.
+
+    Raises
+    ------
+    RuntimeError
+      The canonical copy could not be saved or the exact replacement
+      pointer is unavailable for resume. Custody failures also propagate.
+    ReplacementPublicationRefused
+      The first replacement send was refused before publication.
+
+    Notes
+    -----
+    With protected writes enabled, an update marks a rewrite only when its
+    expected prior CID still points to an unprotected copy. A retry reuses
+    a matching published pointer or the saved replacement intent. A
+    resume-only result must also confirm publication before it enables the
+    rotation notice.
 
     Examples
     --------
@@ -441,8 +458,42 @@ class _DeeployJobMixin:
     raise_on_error: bool = False,
     show_logs: bool = False,
   ):
-    """
-    Get the pipeline from R1FS.
+    """Load a stored pipeline document by its content identifier.
+
+    Read legacy and protected copies through the same SDK JSON reader.
+
+    Parameters
+    ----------
+    cid : str
+      Content identifier of the stored pipeline copy.
+    timeout : int or None, optional
+      Fetch timeout in seconds, or None to use the SDK default.
+    pin : bool, optional
+      Attempt to pin the document after fetching it.
+    raise_on_error : bool, optional
+      Ask the SDK to raise for an unsuccessful read, restore or parse.
+    show_logs : bool, optional
+      Enable SDK read diagnostics.
+
+    Returns
+    -------
+    object or None
+      Decoded JSON, normally a pipeline dictionary. None also represents
+      an unsuccessful read when the SDK suppresses that error.
+
+    Raises
+    ------
+    RuntimeError
+      R1FS is unavailable, or the SDK cannot complete the read with
+      raise_on_error enabled. Other SDK validation and I/O errors propagate.
+
+    Notes
+    -----
+    Fallback passphrases are tried on the local copy after one download.
+
+    Examples
+    --------
+    >>> pipeline = plugin.get_pipeline_from_r1fs(cid, pin=False)  # doctest: +SKIP
     """
     # All callers read the pending and legacy formats from the same local download.
     return r1fs_documents.read_r1fs_document(
@@ -456,6 +507,8 @@ class _DeeployJobMixin:
   def _save_pipeline_to_r1fs(self, pipeline: dict):
     """Write a job copy with an independent nonce and the active passphrase.
 
+    Log a redacted summary and return the uploaded copy's identifier.
+
     Parameters
     ----------
     pipeline : dict
@@ -465,6 +518,12 @@ class _DeeployJobMixin:
     -------
     str or None
       Uploaded CID, or None if a write could not complete.
+
+    Notes
+    -----
+    The write activation flag selects the SDK default passphrase or the
+    shared oracle key. If protected writes are enabled and the key is
+    missing, the upload is skipped and this method returns None.
 
     Examples
     --------

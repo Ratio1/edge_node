@@ -314,10 +314,20 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     not reported: the next lap checks again, so a worker whose check passes later is reported ready
     and not left "failed".
 
+    Parameters
+    ----------
+    None
+
     Returns
     -------
     bool
       Whether the source check passed.
+
+    Notes
+    -----
+    A following worker with SETUP_REPO disabled may use prebuilt or mounted
+    source. A nonzero Git command exit then passes the check without reporting a
+    commit. A pinned worker still needs a matching Git checkout.
 
     Examples
     --------

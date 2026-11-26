@@ -1049,20 +1049,31 @@ class ContainerAppRunnerPlugin(
     self._save_deployment_artifacts(artifacts)
 
   def _get_full_image_ref(self):
-    """
-    Return the image to look up, pull or run.
+    """Return the image reference for the current operation.
 
-    A runner bound to its image uses the saved image id once it has one, so a restart never resolves
-    the configured tag again. When `_ensure_bound_image` found the bound image under another id (the
-    Docker store is of another type than the one that made the binding, and the image is listed under
-    the saved registry reference), it uses that id: the saved one names nothing in this store. Every
-    other runner, a tracked worker included, uses the configured image reference: an id saved earlier
-    exists only in the Docker store that produced it and cannot be pulled.
+    A following container uses the local ID of the selected launch image.
+    A bound container uses the image ID in this Docker store when known,
+    or its saved binding. Worker base images use the configured reference.
+
+    Parameters
+    ----------
+    None
 
     Returns
     -------
     str
-      The `sha256:...` id of the bound image in this Docker store, or the configured image reference.
+      Resolved local image ID or the configured reference.
+
+    Raises
+    ------
+    ValueError
+      An explicit image binding is invalid.
+
+    Notes
+    -----
+    Fixed-volume metadata inspects the resolved launch ID because pulling
+    a digest need not update the local tag. A newer store can also list
+    the bound digest under a different local ID.
 
     Examples
     --------
@@ -1961,7 +1972,12 @@ class ContainerAppRunnerPlugin(
     Returns
     -------
     subprocess.Popen or None
-      Running connector, or None if launching it failed.
+      Started connector, or None for an empty or invalid command or a launch failure.
+
+    Notes
+    -----
+    The command log redacts credentials. For a managed connection the
+    process receives its token through a fresh, one-use pipe.
 
     Examples
     --------
@@ -2030,6 +2046,11 @@ class ContainerAppRunnerPlugin(
     -------
     subprocess.Popen or None
       Started connector process, when configured.
+
+    Notes
+    -----
+    Cloudflare requires a normalized main port and token. Other engines
+    use their inherited launcher.
 
     Examples
     --------
@@ -2447,6 +2468,9 @@ class ContainerAppRunnerPlugin(
     """
     Build Cloudflare tunnel command for a specific port.
 
+    Use the host port mapped to the requested container port as the
+    connector's origin.
+
     Parameters
     ----------
     container_port : int
@@ -2461,7 +2485,12 @@ class ContainerAppRunnerPlugin(
     Returns
     -------
     list or None
-        Command list to execute, or None if error
+        Argument list, or None if the port has no mapping or token is absent.
+
+    Notes
+    -----
+    The credential selects the stdin token-file argument. The caller
+    supplies its value when starting the process.
 
     Examples
     --------
@@ -2522,6 +2551,9 @@ class ContainerAppRunnerPlugin(
     """
     Start a single extra tunnel for a specific container port.
 
+    Resolve the normalized config or legacy token and start the connector
+    against the mapped origin.
+
     Parameters
     ----------
     container_port : int
@@ -2532,7 +2564,13 @@ class ContainerAppRunnerPlugin(
     Returns
     -------
     bool
-        True if tunnel started successfully, False otherwise
+        True once the process and its readers are registered. False if
+        the token or port mapping is missing, or starting the process fails.
+
+    Notes
+    -----
+    Each launch or restart passes the token through a new pipe. Diagnostic
+    commands are redacted, and launch exceptions update restart backoff.
 
     Examples
     --------
@@ -4832,25 +4870,32 @@ class ContainerAppRunnerPlugin(
     return True
 
   def _ensure_image_available(self):
-    """
-    Ensure the container image is available before starting container.
+    """Find or obtain the image selected for the next container launch.
 
-    This method uses a strategy pattern based on configuration:
-    - AUTOUPDATE enabled: Ensure image exists locally (update detection handled separately)
-    - IMAGE_PULL_POLICY='always': Always pull (no tracking)
-    - IMAGE_PULL_POLICY='if-not-present' or default: Pull only if missing locally
+    A following container uses a prepared replacement once, or resolves
+    and pulls the current tag by digest. A pinned container pulls the
+    requested digest on first binding and reuses a matching binding.
 
-    A catalogue deployment resolves its tag once, saves the image id
-    and from then on accepts only that image. When that image is not in the local Docker store it is
-    fetched again from the registry and accepted only when it is that image: the same id, or listed
-    under the saved registry reference (see `_ensure_bound_image`).
-    A tracked worker is not bound to its image and takes the strategies above, so a base image that
-    was lost with the Docker store is simply pulled again.
+    Parameters
+    ----------
+    None
 
     Returns
     -------
     bool
-        True if image is available, False otherwise
+        True if the selected image is available, False if it could not be prepared.
+
+    Raises
+    ------
+    ValueError
+        An explicit binding is invalid or differs from the requested digest.
+
+    Notes
+    -----
+    Other tracked container apps save the first resolved image ID and
+    subsequently recover that exact image. Worker base images and untracked
+    apps use the ordinary pull policy. For those apps, AUTOUPDATE uses a
+    local-first startup. Otherwise an explicit always policy tries to pull.
 
     Examples
     --------

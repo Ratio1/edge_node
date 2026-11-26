@@ -594,11 +594,20 @@ class _DauthMixin(object):
         reader on the node. Any read error, or a result that is not a dict, is recorded as
         unavailable; either way the next read is allowed 30 s after this one ended.
 
+        Parameters
+        ----------
+        None
+
         Returns
         -------
         None
           The result is stored in ``cache[cid]`` as ``(retry_at, document)``, where
           ``document`` is the dict that was read or None.
+
+        Notes
+        -----
+        The private download supports both legacy and protected copies by
+        trying the applicable passphrases locally. Pinning is disabled.
 
         Examples
         --------
