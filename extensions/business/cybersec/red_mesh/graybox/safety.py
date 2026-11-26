@@ -6,6 +6,7 @@ Rate limiting, attempt budgeting, and target validation.
 
 import contextlib
 import ipaddress
+import math
 import random
 import socket
 import time
@@ -105,6 +106,11 @@ class SafetyControls:
     self.last_refusal = reason
     raise exc
 
+  def note_degraded(self, reason):
+    """Count a non-raising degradation so `_run_guarded` downgrades the run's clean verdicts."""
+    self.refusals += 1
+    self.last_refusal = reason
+
   def _check_stop(self):
     if self._stop_check is not None and self._stop_check():
       self._refuse("stopped", GrayboxAbort("stop requested", reason_class="stopped"))
@@ -139,7 +145,8 @@ class SafetyControls:
       time.sleep(seconds)
       return
     end = time.time() + seconds
-    while True:
+    # Bounded by poll count too, so a stubbed time.sleep (tests) cannot spin until the real deadline.
+    for _ in range(math.ceil(seconds / _STOP_POLL) + 1):
       self._check_stop()
       left = end - time.time()
       if left <= 0:

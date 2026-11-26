@@ -805,7 +805,7 @@ class TestExecution(unittest.TestCase):
 
     worker.execute_job()
 
-    worker.auth.cleanup.assert_called_once()
+    worker.auth.cleanup.assert_called_once_with(final=True)
     self.assertTrue(worker.state["done"])
 
 

@@ -21,10 +21,12 @@ class RecordingAdapter(requests.adapters.BaseAdapter):
 
   def __init__(self, replies=()):
     self.sent = []
+    self.timeouts = []
     self.replies = list(replies)
 
   def send(self, request, **kwargs):
     self.sent.append(request)
+    self.timeouts.append(kwargs.get("timeout"))
     response = requests.Response()
     response.status_code, response.headers = (
       self.replies.pop(0) if self.replies else (200, {})
@@ -282,6 +284,15 @@ class TestBoundGrayboxHttpClient(unittest.TestCase):
         with self.assertRaises(GrayboxScopeError):
           effect(scoped)
         self.assertEqual(transport.sent, [])
+
+  def test_missing_timeout_gets_the_default_and_a_caller_timeout_is_kept(self):
+    from extensions.business.cybersec.red_mesh.constants import GRAYBOX_HTTP_TIMEOUT
+    session, transport = self._session()
+    scoped = self._client(allowlist=["/"]).wrap_session(session)
+    scoped.get("/api/public/a")
+    scoped.get("/api/public/b", timeout=None)
+    scoped.get("/api/public/c", timeout=5)
+    self.assertEqual(transport.timeouts, [GRAYBOX_HTTP_TIMEOUT, GRAYBOX_HTTP_TIMEOUT, 5])
 
   def test_relative_redirect_uses_the_preceding_request_url(self):
     session, transport = self._session([

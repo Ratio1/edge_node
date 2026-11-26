@@ -15,6 +15,7 @@ subphases route to `BearerAuth` / `ApiKeyAuth` based on
 `target_config.api_security.auth.auth_type`.
 """
 
+import contextlib
 import dataclasses
 import re
 import time
@@ -22,7 +23,7 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
-from ..constants import GRAYBOX_SESSION_MAX_AGE
+from ..constants import GRAYBOX_REAUTH_MAX, GRAYBOX_SESSION_MAX_AGE
 from .auth_credentials import Credentials
 from .auth_strategies import (
   ApiKeyAuth, BasicAuth, BearerAuth, FormAuth, LOGIN_NOT_FOUND, LoginTarget,
@@ -30,6 +31,17 @@ from .auth_strategies import (
 from .http_client import GrayboxScopeError, normalize_request_url
 from .models.target_config import COMMON_CSRF_FIELDS
 from .models import GrayboxAuthState
+
+
+# Diagnostic stages that mean the authenticated probe path proves the session ended.
+_LOGOUT_STAGES = (
+  "authenticated_probe_redirect", "authenticated_probe_rejected",
+  "authenticated_probe_marker_missing",
+  "authenticated_probe_identity_missing",
+  # Proven at login, public now: a logout that kept the cookie and
+  # redirects the check path to a public page (form one-hop rule).
+  "authenticated_probe_public_control",
+)
 
 
 class AuthManager:
@@ -64,6 +76,16 @@ class AuthManager:
     # Form login found by FormAuth's search: LoginTarget, LOGIN_NOT_FOUND or
     # None (not searched yet). The search runs at most once per manager.
     self._login_target = None
+    # RM-273 P2 mid-family recovery. Per principal: coerced credentials (session lifetime),
+    # rotated bearer tokens (manager lifetime: `to_credentials()` builds a fresh object per
+    # `ensure_sessions`), re-auth count, failed flag, last "session is alive" stamp.
+    self._creds = {}
+    self._token_overlay = {}
+    self._reauth_count = {}
+    self._reauth_failed = set()
+    self._alive_at = {}
+    if http_client is not None:
+      http_client.set_session_recovery(self._recover_session)
 
   @property
   def detected_csrf_field(self) -> str | None:
@@ -127,19 +149,17 @@ class AuthManager:
     if (self._authenticated_probe_path()
         and time.time() - self._liveness_checked_at >= self.LIVENESS_CHECK_SECONDS):
       self._liveness_checked_at = time.time()
-      valid, retryable = self._validate_authenticated_session(self.primary_session)
+      # Paused hook: a dead session here gets the full logout and login, not an in-place renewal.
+      paused = (self.http_client.recovery_paused() if self.http_client is not None
+                else contextlib.nullcontext())
+      with paused:
+        valid, retryable = self._validate_authenticated_session(self.primary_session)
       # Only a redirect, a 401/403, or a 2xx without the configured marker or
       # identity (a 200 login page at the probe path) means the session ended;
       # a 429 or 5xx on the probe path is the target struggling, not a logout.
       last_stage = (self._auth_diagnostics[-1].get("stage", "")
                     if self._auth_diagnostics else "")
-      if not valid and not retryable and last_stage in (
-          "authenticated_probe_redirect", "authenticated_probe_rejected",
-          "authenticated_probe_marker_missing",
-          "authenticated_probe_identity_missing",
-          # Proven at login, public now: a logout that kept the cookie and
-          # redirects the check path to a public page (form one-hop rule).
-          "authenticated_probe_public_control"):
+      if not valid and not retryable and last_stage in _LOGOUT_STAGES:
         return True
     return False
 
@@ -188,6 +208,10 @@ class AuthManager:
     self._auth_errors = []
     self._auth_diagnostics = []
     self._session_cookie_names = {}
+    self._creds = {}
+    self._reauth_count = {}
+    self._reauth_failed = set()
+    self._alive_at = {}
     self._official_configured = self._credentials_configured(official_creds)
     regular_configured = self._credentials_configured(regular_creds)
 
@@ -196,6 +220,9 @@ class AuthManager:
     if not self._official_configured and not regular_configured:
       self._record_auth_error("no_credentials_configured")
       return False
+
+    official_creds = self._remember_creds("official", official_creds)
+    regular_creds = self._remember_creds("regular", regular_creds)
 
     if self._official_configured:
       self.official_session = self._try_login_with_retry(
@@ -220,6 +247,15 @@ class AuthManager:
     self._created_at = time.time()
     self._liveness_checked_at = self._created_at
     return True
+
+  def _remember_creds(self, principal, creds):
+    """Keep a configured principal's creds for re-auth, with any rotated tokens overlaid."""
+    if not self._credentials_configured(creds):
+      return creds
+    if principal in self._token_overlay:
+      creds = dataclasses.replace(creds, **self._token_overlay[principal])
+    self._creds[principal] = creds
+    return creds
 
   @staticmethod
   def _coerce_creds(creds, principal="official"):
@@ -258,7 +294,7 @@ class AuthManager:
       or creds.has_api_key()
     )
 
-  def cleanup(self):
+  def cleanup(self, final=False):
     """
     Explicitly close sessions and attempt logout.
 
@@ -286,6 +322,9 @@ class AuthManager:
     self.regular_session = None
     self.anon_session = None
     self._session_cookie_names = {}
+    self._creds = {}  # references only: the caller owns the Credentials objects
+    if final:
+      self._token_overlay = {}  # rotated tokens outlive per-family cleanups, not the scan
     self._created_at = 0.0
 
   def preflight_check(self) -> str | None:
@@ -417,6 +456,12 @@ class AuthManager:
       if attempt < self.MAX_AUTH_ATTEMPTS:
         time.sleep(self.AUTH_RETRY_DELAY_SECONDS)
 
+    if (not retryable_failure and self._resolve_auth_type() == "bearer"
+        and creds.bearer_refresh_token):
+      # The stamped token was rejected between families: one refresh grant before giving up.
+      session = self._bearer_refreshed_session(principal, creds)
+      if session is not None:
+        return session
     if retryable_failure:
       self._record_auth_error(f"{principal}_login_transport_error")
     else:
@@ -731,12 +776,120 @@ class AuthManager:
         self.target_url, urljoin(probe_url, location.strip()))
     except (GrayboxScopeError, ValueError):
       return ""
-    dest_path = urlparse(dest).path.rstrip("/")
-    for attr in ("login_path", "logout_path"):
-      path = getattr(self.target_config, attr, "") or ""
-      if path and dest_path == urlparse(self.target_url + path).path.rstrip("/"):
-        return ""
+    if any(self._is_config_path(dest, attr) for attr in ("login_path", "logout_path")):
+      return ""
     return dest
+
+  def _is_config_path(self, url: str, attr: str) -> bool:
+    """True when ``url``'s path is the configured ``login_path`` / ``logout_path`` (query ignored)."""
+    path = getattr(self.target_config, attr, "") or ""
+    return bool(path) and (
+      urlparse(url).path.rstrip("/") == urlparse(self.target_url + path).path.rstrip("/"))
+
+  def _redirects_to_login(self, resp) -> bool:
+    location = ((getattr(resp, "headers", None) or {}).get("Location") or "").strip()
+    if not location:
+      return False
+    try:
+      dest = normalize_request_url(
+        self.target_url, urljoin(getattr(resp, "url", "") or self.target_url, location))
+    except (GrayboxScopeError, ValueError):
+      return False
+    return self._is_config_path(dest, "login_path")
+
+  # ── Mid-family session recovery (RM-273 P2) ─────────────────────────────
+
+  def _recover_session(self, raw, response):
+    """Client hook: ``"reauthenticated"``, ``"lost"`` or None (not ours, or alive).
+
+    A 401/403 is usually an authorization denial, so the session is confirmed dead before
+    anything is sent. The wrapper object stays the same: probes hold it.
+    """
+    principal, wrapper = next(
+      ((name, w) for name, w in (("official", self.official_session),
+                                  ("regular", self.regular_session))
+       if w is not None and getattr(w, "_session", w) is raw), (None, None))
+    if principal is None:
+      return None
+    status = response.status_code
+    auth_type = self._resolve_auth_type()
+    if not (status in (401, 403)
+            or (auth_type == "form" and 300 <= status < 400 and self._redirects_to_login(response))):
+      return None
+    dead = auth_type == "form" and not self._session_cookies_alive(wrapper)
+    if not dead:
+      # A bearer 401 has no free cookie signal, so it skips the alive cache; a 403 keeps it.
+      fresh = time.time() - self._alive_at.get(principal, float("-inf")) < self.LIVENESS_CHECK_SECONDS
+      if fresh and not (auth_type == "bearer" and status == 401):
+        return None
+      dead = self._session_dead_on_probe(wrapper, status, auth_type)
+      if not dead:
+        self._alive_at[principal] = time.time()
+        return None
+    # Proven dead. A spent re-auth budget or an earlier failed re-auth means no further login.
+    if (principal in self._reauth_failed
+        or self._reauth_count.get(principal, 0) >= GRAYBOX_REAUTH_MAX):
+      return "lost"
+    if self._reauthenticate(principal, wrapper, response):
+      return "reauthenticated"
+    self._reauth_failed.add(principal)
+    return "lost"
+
+  def _session_dead_on_probe(self, wrapper, status, auth_type) -> bool:
+    if not self._authenticated_probe_path():
+      return auth_type == "bearer" and status == 401
+    seen = len(self._auth_diagnostics)
+    valid, retryable = self._validate_authenticated_session(wrapper)
+    last_stage = (self._auth_diagnostics[-1].get("stage", "")
+                  if len(self._auth_diagnostics) > seen else "")
+    return not valid and not retryable and last_stage in _LOGOUT_STAGES
+
+  def _reauthenticate(self, principal, wrapper, response) -> bool:
+    """One login (or refresh grant) through the strategy; its auth state moves into ``wrapper``.
+
+    Cookies are replaced wholesale, so app or flow cookies and CSRF tokens a probe read before
+    the re-auth stop matching: that probe's result is inconclusive, not wrong.
+    """
+    creds = self._creds.get(principal)
+    auth_type = self._resolve_auth_type()
+    if creds is None or auth_type not in ("form", "bearer"):
+      return False
+    self._reauth_count[principal] = self._reauth_count.get(principal, 0) + 1
+    if auth_type == "form":
+      fresh, _ = self._try_login_attempt(creds)
+    else:
+      fresh = self._bearer_refreshed_session(principal, creds)
+    if fresh is None:
+      return False
+    raw, new_raw = getattr(wrapper, "_session", wrapper), getattr(fresh, "_session", fresh)
+    raw.cookies.clear()
+    raw.cookies.update(new_raw.cookies)
+    raw.headers.update(new_raw.headers)
+    raw.params = new_raw.params
+    fresh.close()
+    self._remember_session_cookies(wrapper)
+    self._alive_at[principal] = self._liveness_checked_at = time.time()
+    self._refresh_count += 1
+    self._record_auth_diagnostic("session_reauthenticated", response)
+    return True
+
+  def _bearer_refreshed_session(self, principal, creds):
+    strategy = self._build_strategy()
+    grant = strategy.refresh_grant(creds)
+    if grant is None:
+      if strategy.last_response is not None or strategy.last_error:
+        self._record_auth_diagnostic(
+          "bearer_refresh_failed", strategy.last_response, strategy.last_error)
+      return None
+    access, rotated = grant
+    self._token_overlay[principal] = {
+      "bearer_token": access, "bearer_refresh_token": rotated or creds.bearer_refresh_token}
+    creds = self._creds[principal] = dataclasses.replace(creds, **self._token_overlay[principal])
+    fresh = strategy.authenticate(creds)
+    if fresh is not None and not self._validate_authenticated_session(fresh)[0]:
+      fresh.close()
+      return None
+    return fresh
 
   @staticmethod
   def _read_response_body(resp) -> str:
