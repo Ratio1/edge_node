@@ -9,6 +9,8 @@ from extensions.business.deeploy.deployment_operations import (
   SIGNATURE_KEYS, STATELESS_REPLACEMENT,
 )
 from extensions.business.deeploy.relink_placement import relink_configs, relink_pipeline
+# Use the same key selection and signed-copy marker as the deployment coordinator.
+from extensions.business.deeploy import r1fs_documents
 
 
 REVISIONS = "DAUTH_JOB_SECRET_REVISIONS"
@@ -160,7 +162,8 @@ class _DauthDeploymentSecretsMixin:
       raise ValueError("Secret action does not match the deployment kind.")
     # Read the plan within the 10 s timeout and without pinning: this node does not need its own
     # pin of the plan, because the writer and the relays keep theirs.
-    plan = self.r1fs.get_json(operation["plan_cid"], timeout=10, pin=False, show_logs=False)
+    # Plans written before activation remain usable by the custodian.
+    plan = r1fs_documents.read_r1fs_document(self.r1fs, operation["plan_cid"], timeout=10, pin=False)
     if not isinstance(plan, dict):
       raise RuntimeError("Deployment plan is unavailable.")
     for attempt, key, node_key, instance_key, revision_key in (
@@ -656,6 +659,11 @@ class _DauthDeploymentSecretsMixin:
                     deleted=deleted, pipeline_cid=None if deleted else pointer.get("pipeline_cid"))
     if not deleted:
       expected["plan_cid"] = operation["plan_cid"]
+      # A protected marker is optional so already-signed publication intents stay valid.
+      mode = pointer.get(r1fs_documents.R1FS_ENCRYPTION)
+      if mode in r1fs_documents.PROTECTED_R1FS_MODES:
+        # The signed CID will be checked with the protected key before this pointer can publish.
+        expected[r1fs_documents.R1FS_ENCRYPTION] = mode
     if ({key: value for key, value in pointer.items() if key not in AUTH_FIELDS} != expected
         or pointer.get("EE_SENDER") != operation["coordinator"]
         or not self.bc.verify(pointer, return_full_info=True, log_hash_sign_fails=False).valid):
@@ -701,7 +709,11 @@ class _DauthDeploymentSecretsMixin:
       canonical = self._recursively_sort_pipeline_data(self.extract_invariable_data_from_pipeline(representative))
       # Read the published configuration within the 10 s timeout and without pinning: this node
       # does not need its own pin of it, because the writer and the relays keep theirs.
-      published = self.r1fs.get_json(pointer["pipeline_cid"], timeout=10, pin=False, show_logs=False)
+      # A protected pointer is accepted only if the copy authenticates under the oracle key.
+      published = r1fs_documents.read_r1fs_document(
+        self.r1fs, pointer["pipeline_cid"], timeout=10, pin=False,
+        protected_only=r1fs_documents.R1FS_ENCRYPTION in expected,
+      )
       if published is None:
         raise RuntimeError("Published deployment configuration is unavailable.")
       if published != canonical:
@@ -807,7 +819,8 @@ class _DauthDeploymentSecretsMixin:
         raise RuntimeError("Active deployment publication is pending.")
       # Read the published configuration within the 10 s timeout and without pinning: this node
       # does not need its own pin of it, because the writer and the relays keep theirs.
-      published = self.r1fs.get_json(pointer["pipeline_cid"], timeout=10, pin=False, show_logs=False)
+      # Revocation checks can still read a job copy written before activation.
+      published = r1fs_documents.read_r1fs_document(self.r1fs, pointer["pipeline_cid"], timeout=10, pin=False)
       if published is None:
         raise RuntimeError("Published deployment configuration is unavailable.")
       if published != canonical:

@@ -30,6 +30,8 @@ from ratio1.const.base import BCctbase, dAuth
 # The SDK engine class holds this process's oracle-only secret in memory; dAuth hands it to oracles.
 from ratio1.bc.base import BaseBlockEngine
 from extensions.business.deeploy.deployment_operations import replacement_license_binding, replacement_paid_slots
+# dAuth reads both deployment-copy formats without multiple downloads.
+from extensions.business.deeploy.r1fs_documents import read_r1fs_document
 
 
 DAUTH_JOB_SECRETS_CSTORE_HKEY = "DAUTH_JOB_SECRETS"
@@ -499,7 +501,8 @@ class _DauthMixin(object):
       return None, None
     # Read within the 10 s timeout and without pinning: this node does not need its own pin of
     # the document, because the writer and the relays keep theirs.
-    return cid, self.r1fs.get_json(cid, timeout=10, pin=False, show_logs=False)
+    # Try the locally held key and the historical default in the same fetch.
+    return cid, read_r1fs_document(self.r1fs, cid, timeout=10, pin=False)
 
   def _load_dauth_job_pipeline(self, job_id):
     _, pipeline = self._load_dauth_job_pipeline_record(job_id)
@@ -610,7 +613,8 @@ class _DauthMixin(object):
           with tempfile.TemporaryDirectory() as folder:
             # Bounded like the other dAuth reads by the 10 s timeout, and without pinning: this node
             # does not need its own pin of the document, because the writer and the relays keep theirs.
-            doc = self.r1fs.get_json(cid, local_folder=folder, timeout=10, pin=False, show_logs=False)
+            # Both formats work with the same private download and local key attempts.
+            doc = read_r1fs_document(self.r1fs, cid, local_folder=folder, timeout=10, pin=False)
         except Exception:
           # Any read error means "not available"; it is retried after the delay below.
           doc = None

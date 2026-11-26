@@ -8,6 +8,8 @@ from .deeploy_mixin import COCKROACHDB_CERT_ENV_KEYS, COCKROACHDB_BOOTSTRAP_CERT
 from .deeploy_job_mixin import DEEPLOY_JOBS_CSTORE_HKEY
 from .deployment_operations import BLOCKED_OPERATION_ENDED, request_digest, required_instances
 from .relink_placement import relink_configs
+# Delete plans hold the same oracle-only configuration as update plans.
+from . import r1fs_documents
 
 # ChainDist publishes {job_id: (old_node, new_node)} here for jobs whose stored placement
 # still names a node whose license its owner relinked to another node.
@@ -304,7 +306,8 @@ class _DeploymentMutationsMixin:
     revision = self._next_deployment_revision(request["job_id"], specs.get("revision", 0))
     plan = dict(configs={}, previous_configs=configs, canonical_record=canonical_record,
                 canonical_cid=self._get_pipeline_from_cstore(request["job_id"]))
-    cid = self.r1fs.add_json(plan, nonce=42, fn="deployment-plan.json", show_logs=False)
+    # The third private writer follows the same activation condition and random nonce policy.
+    cid = r1fs_documents.write_r1fs_document(self.r1fs, plan, "deployment-plan.json")
     if not cid:
       raise RuntimeError("Could not persist deletion execution plan.")
     now = self.time()

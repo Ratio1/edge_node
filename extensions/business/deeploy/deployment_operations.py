@@ -29,6 +29,8 @@ from extensions.business.container_apps.container_utils import configured_image_
 from extensions.utils.per_node_config import iter_overlays, normalize_config, PER_NODE_CONFIG_KEYS
 from .selected_secrets import inherit_selections
 from .relink_placement import relink_configs, relink_pipeline
+# Share the writer activation and local compatibility reader across Oracle API paths.
+from . import r1fs_documents
 
 from extensions.business.dauth.dauth_registry import get_dauth_registry_internal_peers
 # The worker signature tells the restoration gate which runtime binding an instance needs.
@@ -1264,7 +1266,8 @@ class _DeploymentOperationsMixin:
     nodes = specs.get("current_target_nodes", [])
     pointer = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(specs["job_id"]))
     if isinstance(pointer, dict) and pointer.get("plan_cid"):
-      plan = self.r1fs.get_json(pointer["plan_cid"], timeout=10, show_logs=False) or {}
+      # Older plans and protected plans are both valid restoration inputs.
+      plan = r1fs_documents.read_r1fs_document(self.r1fs, pointer["plan_cid"], timeout=10) or {}
       restored = str(specs.get("secret_revision", "")).endswith(":restore")
       configs = plan.get("previous_configs" if restored else "configs")
       if not isinstance(configs, dict) or set(configs) != set(nodes):
@@ -1473,7 +1476,8 @@ class _DeploymentOperationsMixin:
     if repair:
       # Keep signed historic and fresh receipts in the immutable plan under their actual signer.
       plan["repair_evidence"] = dict(stopped=repair["stopped"], inspections=repair["inspections"], seals=repair["seals"])
-    plan_cid = self.r1fs.add_json(plan, nonce=42, fn="deployment-plan.json", show_logs=False)
+    # Execution plans use the same gated writer as the canonical job copy.
+    plan_cid = r1fs_documents.write_r1fs_document(self.r1fs, plan, "deployment-plan.json")
     if not plan_cid:
       raise RuntimeError("Could not persist deployment execution plan.")
     now = self.time()
@@ -1579,7 +1583,8 @@ class _DeploymentOperationsMixin:
     with self._deployment_plan_cache_lock:
       plan = self._deployment_plans.get(cid)
     if plan is None:
-      plan = self.r1fs.get_json(cid, timeout=10, show_logs=False)
+      # Recovery can use either passphrase while fetching the plan only once.
+      plan = r1fs_documents.read_r1fs_document(self.r1fs, cid, timeout=10)
       if not isinstance(plan, dict) or not isinstance(plan.get("configs"), dict):
         raise RuntimeError("Deployment plan is temporarily unavailable.")
       # Only cache bookkeeping is locked; storage reads never hold this lock.
@@ -2002,9 +2007,12 @@ class _DeploymentOperationsMixin:
                                recovery="blocked")
               self._save_operation(operation)
             raise DeploymentCustodyError(message)
+          # A confirmed response can recover the notice from the already-published pointer.
+          publication = result
         else:
           try:
-            self._commit_operation_revision(operation, active_configs)
+            # Keep evidence of any legacy rewrite until the last signed custody request succeeds.
+            publication = self._commit_operation_revision(operation, active_configs)
           except ReplacementPublicationRefused as exc:
             self._fail_deployment_rollout(operation, "REPLACEMENT_PLACEMENT_CHANGED", str(exc))
             return
@@ -2014,8 +2022,12 @@ class _DeploymentOperationsMixin:
           operation.update(error=None, recovery=None)  # The custodian confirmed the exact publication.
           self._save_operation(operation)
       else:
-        self._commit_operation_revision(operation, active_configs)
+        # Standard updates and restores also return their verified publication evidence.
+        publication = self._commit_operation_revision(operation, active_configs)
       self._release_unused_secret_revisions(operation, plan, active_attempt="restore" if restored else "deploy")
+      if publication and publication.get("credential_rotation_required") is True:
+        # The final signed operation records the notice after all custody steps used the prior signature.
+        operation["credential_rotation_required"] = True
       applied_outcome = "waiting_for_source" if operation.get("waiting_for_source") else "succeeded"
       operation.update(outcome="failed" if restored else applied_outcome,
                        recovery="completed" if restored else None)
@@ -2177,9 +2189,28 @@ class _DeploymentOperationsMixin:
     self._save_operation(operation, "accepted", "Deployment preparation recovered.")
 
   def _commit_operation_revision(self, operation, configs):
-    """Commit canonical metadata only after readiness or restoration evidence."""
+    """Commit canonical metadata after readiness or restoration evidence.
+
+    Parameters
+    ----------
+    operation : dict
+      Signed operation entering finalization.
+    configs : dict
+      Ready or restored configuration per node.
+
+    Returns
+    -------
+    dict
+      Authenticated custody result and any confirmed legacy rewrite notice.
+
+    Examples
+    --------
+    >>> plugin._commit_operation_revision(operation, configs)  # doctest: +SKIP
+    """
+    # All active configurations share the canonical pipeline identity.
     representative = next(iter(configs.values()))
-    self.commit_deployment_revision(operation, representative)
+    # Forward the confirmed publication data while preserving the signed operation.
+    return self.commit_deployment_revision(operation, representative)
 
   def _release_unused_secret_revisions(self, operation, plan, active_attempt):
     """Remove plaintext from unused revisions only after positive stop evidence.
@@ -2608,6 +2639,9 @@ class _DeploymentOperationsMixin:
               "target_revision", "previous_revision", "phase", "outcome", "recovery",
               "coordinator", "created_at", "updated_at", "error")
     result = {key: copy.deepcopy(operation.get(key)) for key in fields}
+    if phase == "completed" and operation.get("credential_rotation_required") is True:
+      # Report the first legacy-copy migration only after its custody publication completed.
+      result["credential_rotation_required"] = True
     if "unconfirmed_nodes" in operation:
       # The coordinator's terminal snapshot names the exact missing workers independently of replica report lag.
       result.update(unconfirmed_nodes=list(operation["unconfirmed_nodes"]), blocked_phase=operation["blocked_phase"])
