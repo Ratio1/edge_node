@@ -1303,7 +1303,7 @@ class DeeployManagerApiPlugin(
     })
     return response
 
-  @BasePlugin.endpoint(method="post")
+  @BasePlugin.endpoint(method="post", forward_accepted_status=True)
   # /create_pipeline
   def create_pipeline(
     self,
@@ -1425,7 +1425,7 @@ class DeeployManagerApiPlugin(
     self.Pd(f"Called Deeploy create_pipeline endpoint")
     return self._process_pipeline_request(request, is_create=True)
 
-  @BasePlugin.endpoint(method="post")
+  @BasePlugin.endpoint(method="post", forward_accepted_status=True)
   # /update_pipeline
   def update_pipeline(
     self,
@@ -1573,7 +1573,7 @@ class DeeployManagerApiPlugin(
     except Exception:
       return self._get_response(dict(status="blocked", reason="The current job, license or worker evidence is unavailable."))
 
-  @BasePlugin.endpoint(method="post")
+  @BasePlugin.endpoint(method="post", forward_accepted_status=True)
   def repair_update_pipeline(self, request: dict):
     """Accept a CSP-signed legacy correction and update on its original coordinator.
 
@@ -1624,7 +1624,7 @@ class DeeployManagerApiPlugin(
     return self._get_response(dict(status_code=code, status="error",
                                   error=dict(code=name, message=message, retryable=retryable)))
 
-  @BasePlugin.endpoint(method="post")
+  @BasePlugin.endpoint(method="post", forward_accepted_status=True)
   def scale_up_job_workers(self, request: dict = DEEPLOY_SCALE_UP_JOB_WORKERS_REQUEST):
     """Accept a full revision rollout to a larger placement with automatic rollback.
 
@@ -1647,7 +1647,7 @@ class DeeployManagerApiPlugin(
     except Exception as exc:
       return self._deployment_admission_error(exc)
 
-  @BasePlugin.endpoint(method="post")
+  @BasePlugin.endpoint(method="post", forward_accepted_status=True)
   def delete_pipeline(self, request: dict = DEEPLOY_DELETE_REQUEST):
     """Accept whole-job deletion; retain credentials until all nodes prove stop.
 
