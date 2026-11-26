@@ -484,6 +484,10 @@ class DeploymentMutationTests(unittest.TestCase):
   def test_delete_ends_at_grace_expiry_after_restart_and_names_only_unconfirmed_workers(self):
     """Exercise durable deletion, restart, and the public progress projection.
 
+    Keep one worker unconfirmed, verify the resend boundary at 600 seconds,
+    and restart the coordinator at the grace limit. Check that the failure
+    still names the missing worker and keeps the published job intact.
+
     Parameters
     ----------
     None
@@ -505,12 +509,17 @@ class DeploymentMutationTests(unittest.TestCase):
     before.now = operation["deadline"]
     before._reconcile_coordinator_operations()
     self.assertEqual([command["node_address"] for command in before.commands], ["B"])
+    # Check one second before the ten-minute resend becomes due.
     before.now += 599
     before._reconcile_coordinator_operations()
+    # The unresolved worker has received only the initial command so far.
     self.assertEqual(len(before.commands), 1)
+    # Cross the 600-second boundary, when the unresolved worker can be retried.
     before.now += 1
     before._reconcile_coordinator_operations()
+    # There is exactly one retry and the already confirmed worker is excluded.
     self.assertEqual([command["node_address"] for command in before.commands], ["B", "B"])
+    # One second before grace expiry, the original operation must still hold the job.
     before.now = operation["deadline"] + 3599
     before._reconcile_coordinator_operations()
     # An active operation rejects another deletion of the same job.
@@ -525,8 +534,11 @@ class DeploymentMutationTests(unittest.TestCase):
     after.deeploy_get_auth_result = Mock(return_value={"escrow_owner": "owner"})
     after._reconcile_coordinator_operations()
     result = after._deployment_status(dict(operation_id=operation_id))
+    # Completed ends execution, failed states the outcome, and blocked records unfinished cleanup.
     self.assertEqual((result["phase"], result["outcome"], result["recovery"]), ("completed", "failed", "blocked"))
+    # The public error distinguishes grace expiry from the still-active stop wait.
     self.assertEqual(result["error"]["code"], "BLOCKED_OPERATION_ENDED")
+    # The terminal diagnosis names the worker whose signed stop was missing.
     self.assertEqual(result["unconfirmed_nodes"], ["B"])
     # The expired delete sends no commands and preserves the still-needed metadata and secrets.
     after._reconcile_coordinator_operations()

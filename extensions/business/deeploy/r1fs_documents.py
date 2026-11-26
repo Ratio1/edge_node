@@ -16,6 +16,9 @@ PROTECTED_R1FS_MODES = (ORACLE_ENCRYPTED, ORACLE_REWROTE_LEGACY)
 def read_r1fs_document(r1fs, cid, *, protected_only=False, **kwargs):
   """Read a Deeploy document using local keys on a single download.
 
+  Ordinary reads accept existing documents and documents encrypted with
+  the shared oracle key. A protected-only read verifies the latter mode.
+
   Parameters
   ----------
   r1fs : R1FSEngine
@@ -37,6 +40,14 @@ def read_r1fs_document(r1fs, cid, *, protected_only=False, **kwargs):
   RuntimeError
     A protected read was requested without the shared key.
 
+  Notes
+  -----
+  The write activation flag does not change the read policy. With a key,
+  ordinary reads try that key and then the SDK default passphrase for
+  legacy documents. Without a key, ordinary reads leave the supplied key
+  options in place, including the SDK default when no options are given.
+  Protected-only reads require the oracle key and disable fallback.
+
   Examples
   --------
   >>> read_r1fs_document(plugin.r1fs, cid, timeout=10, pin=False)  # doctest: +SKIP
@@ -44,6 +55,7 @@ def read_r1fs_document(r1fs, cid, *, protected_only=False, **kwargs):
   # Reads remain compatible while protected writes are disabled.
   secret = BaseBlockEngine.oracle_secret()
   if protected_only and not secret:
+    # Without the oracle key this read cannot verify the protection asserted by a pointer.
     raise RuntimeError("The oracle R1FS secret is unavailable.")
   if secret:
     # Try the public passphrase only for compatibility with pre-existing documents.
@@ -56,6 +68,9 @@ def read_r1fs_document(r1fs, cid, *, protected_only=False, **kwargs):
 
 def write_r1fs_document(r1fs, document, filename):
   """Write an oracle document with a random nonce and the active passphrase.
+
+  Use the SDK to upload the JSON document under an immutable content
+  identifier for subsequent reads.
 
   Parameters
   ----------
@@ -76,6 +91,12 @@ def write_r1fs_document(r1fs, document, filename):
   RuntimeError
     Protected writes are enabled and the shared key is unavailable.
 
+  Notes
+  -----
+  The write activation flag selects the passphrase for new writes. While
+  it is disabled, writes use the SDK default passphrase. When it is
+  enabled, every write requires the shared oracle key.
+
   Examples
   --------
   >>> write_r1fs_document(plugin.r1fs, plan, "deployment-plan.json")  # doctest: +SKIP
@@ -83,6 +104,7 @@ def write_r1fs_document(r1fs, document, filename):
   # Ship the reader first. Until the activation gate passes, keep writing with the public default.
   secret = BaseBlockEngine.oracle_secret() if ORACLE_R1FS_WRITES else None
   if ORACLE_R1FS_WRITES and not secret:
+    # A protected write must fail before uploading a copy under the SDK default passphrase.
     raise RuntimeError("The oracle R1FS secret is unavailable.")
   # Omit nonce to use the SDK's random 96-bit AES-GCM nonce for every write.
   return r1fs.add_json(document, secret=secret, fn=filename, show_logs=False)

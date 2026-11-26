@@ -2050,7 +2050,22 @@ class _DeploymentOperationsMixin:
     Returns
     -------
     None
-      The signed terminal snapshot records the outstanding workers.
+
+    Raises
+    ------
+    ValueError
+      This oracle is not the operation coordinator.
+    RuntimeError
+      Replication of the terminal snapshot is unconfirmed.
+
+    Notes
+    -----
+    The signed terminal snapshot keeps the phase and workers outstanding at
+    expiry even if a replica sees newer worker reports later. Deletion leaves
+    the published configuration and credentials available to the existing job.
+    For other operations, the pending flag lets reconciliation retry revocation
+    of the abandoned deployment revision after the terminal save. Workload
+    command dispatch ends with the saved terminal transition.
 
     Examples
     --------
@@ -2062,12 +2077,15 @@ class _DeploymentOperationsMixin:
     missing = sorted(missing)
     # This terminal event describes the unconfirmed evidence, without claiming a workload stopped.
     evidence = "readiness" if phase == "restoring_previous" else "shutdown"
+    # Explain which confirmation the coordinator was missing in the event and the public error.
     message = "The operation ended before confirming {} on every required worker.".format(evidence)
+    # Record failure while distinguishing the unfinished cleanup from the ended execution.
     operation.update(outcome="failed", recovery="blocked", blocked_phase=phase, unconfirmed_nodes=missing,
                      error=dict(code=BLOCKED_OPERATION_ENDED, message=message, retryable=False))
     if operation["kind"] != "delete":
-      # A delete stages no revision. Its published credentials still belong to the existing job.
+      # Only an abandoned deploy revision needs revocation after the terminal save.
       operation["abandoned_deploy_revocation_pending"] = True
+    # Persist the terminal transition and event before the reconciler can contact custody.
     self._save_operation(operation, "completed", message)
 
   def _confirm_ended_create_cleanup(self, operation):
@@ -2466,12 +2484,6 @@ class _DeploymentOperationsMixin:
     events, and the revision that is in effect. Any oracle can answer; only
     the coordinator advances the operation.
 
-    `observation_stale` tells the caller that the snapshot may be outdated.
-    Snapshots now change only when durable state changes and no longer on
-    every retry, so their age alone does not mean that: an unfinished
-    operation's snapshot is stale only when it is older than 30 s and its
-    coordinator is not online for control.
-
     Parameters
     ----------
     request : dict
@@ -2500,7 +2512,16 @@ class _DeploymentOperationsMixin:
       "recovery", "coordinator", "created_at", "updated_at", "error") plus
       "status", "nodes", "target_nodes", "ready_nodes",
       "observation_stale", "poll_after_ms", "events", "next_event_cursor"
-      and "revision". When nothing matches, a short answer with "status"
+      and "revision". If the saved operation records an expired blocked
+      phase, "blocked_phase" identifies that phase and "unconfirmed_nodes"
+      lists the worker addresses missing the required evidence at expiry.
+      Both fields preserve the terminal diagnosis even if later reports
+      confirm a worker stopped or finish cleanup for a failed paid create.
+      "credential_rotation_required" is present only on a completed
+      operation whose saved record explicitly sets the flag to True after
+      a confirmed protected rewrite.
+
+      When nothing matches, a short answer has "status"
       set to "synchronizing" (replicas may not have the record yet), or to
       "not_found" for a job lookup of the owner's job that has no tracked
       operation yet.
@@ -2512,6 +2533,13 @@ class _DeploymentOperationsMixin:
     ValueError
       If both selectors are given, no selector or job_id is given, or
       events_limit or after_event_cursor is out of range.
+
+    Notes
+    -----
+    An unfinished operation reports "observation_stale" only when the
+    snapshot is older than 30 seconds and its coordinator is offline for
+    control. Snapshots change with durable state, so a healthy coordinator
+    may serve the same snapshot throughout a long wait.
 
     Examples
     --------

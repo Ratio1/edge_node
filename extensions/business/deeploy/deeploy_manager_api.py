@@ -1649,11 +1649,37 @@ class DeeployManagerApiPlugin(
 
   @BasePlugin.endpoint(method="post", forward_accepted_status=True)
   def delete_pipeline(self, request: dict = DEEPLOY_DELETE_REQUEST):
-    """Accept whole-job deletion; retain credentials until all nodes prove stop.
+    """Accept an authenticated request to stop and delete one complete job.
 
-    The signed request requires job_id, request_id and expected_revision.
-    Partial placement deletion is unsupported. Completion is reported through
-    the same deployment polling endpoint, independently of the HTTP connection.
+    The coordinator runs retirement independently of the HTTP request.
+    It removes published configuration and credentials only after every
+    worker in the saved placement confirms shutdown.
+
+    Parameters
+    ----------
+    request : dict
+      Signed request with job_id, request_id and expected_revision. An
+      optional app_id must match the job. If supplied, target_nodes must
+      contain the full saved placement.
+
+    Returns
+    -------
+    dict
+      A signed accepted result with HTTP 202 and an operation ID to poll
+      through get_deployment_status. Admission errors include signed status
+      codes 400 for invalid input, 409 for conflicting work or request ID
+      reuse, and 503 if acceptance is uncertain. For a 503, retry with the
+      same request ID and input.
+
+    Notes
+    -----
+    The accepted response describes admission. Terminal success or failure
+    is available through the status lookup.
+
+    Examples
+    --------
+    >>> plugin.delete_pipeline(signed_delete_request)["status"]  # doctest: +SKIP
+    'accepted'
     """
     try:
       _, inputs = self.deeploy_verify_and_get_inputs(request, request_type="delete pipeline")

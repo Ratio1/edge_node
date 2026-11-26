@@ -281,7 +281,51 @@ class _DeploymentMutationsMixin:
     return
 
   def _admit_delete_operation(self, request, auth_result):
-    """Persist a whole-job scoped retirement before dispatching any stop."""
+    """Persist whole-job retirement for the authenticated escrow owner.
+
+    Reuse an accepted operation when the owner's request ID and input
+    match. A new request checks the current escrow owner and the exact
+    persisted revision and placement before saving its execution plan.
+
+    Parameters
+    ----------
+    request : dict
+      Verified delete request with a stable request ID, job ID and expected
+      revision. If supplied, the app ID must match the job and target nodes
+      must cover its entire saved placement.
+    auth_result : dict
+      Authentication result containing the escrow owner.
+
+    Returns
+    -------
+    dict
+      Signed acceptance with status code 202 and the operation, request,
+      job, app and target revision identifiers. Poll the operation for
+      stop confirmations and the final outcome.
+
+    Raises
+    ------
+    DeploymentConflictError
+      Another operation is active for the job or the request ID was used
+      for different delete input.
+    ValueError
+      The request identifiers, current escrow owner, revision or placement
+      are invalid, inconsistent or unavailable.
+    RuntimeError
+      The plan cannot be saved, its required protection key is missing,
+      or operation replication is unconfirmed.
+
+    Notes
+    -----
+    Admission creates no new credential revision. The saved plan retains
+    the original configuration and scope so the coordinator can verify
+    every worker's retirement before clearing the published job.
+
+    Examples
+    --------
+    >>> plugin._admit_delete_operation(request, auth_result)["status"]  # doctest: +SKIP
+    'accepted'
+    """
     owner = auth_result[DEEPLOY_KEYS.ESCROW_OWNER]
     existing = self._find_request_operation(request, owner, "delete")
     if existing:
@@ -306,9 +350,10 @@ class _DeploymentMutationsMixin:
     revision = self._next_deployment_revision(request["job_id"], specs.get("revision", 0))
     plan = dict(configs={}, previous_configs=configs, canonical_record=canonical_record,
                 canonical_cid=self._get_pipeline_from_cstore(request["job_id"]))
-    # The third private writer follows the same activation condition and random nonce policy.
+    # Keep the exact retirement plan under the configured oracle document write policy.
     cid = r1fs_documents.write_r1fs_document(self.r1fs, plan, "deployment-plan.json")
     if not cid:
+      # A later worker pass must be able to reload the plan before it can send stops.
       raise RuntimeError("Could not persist deletion execution plan.")
     now = self.time()
     operation = dict(
@@ -344,6 +389,22 @@ class _DeploymentMutationsMixin:
     None
       Persists confirmed deletion or its current wait or failure state.
 
+    Raises
+    ------
+    DeploymentCustodyError
+      The custody service has yet to confirm deletion.
+    RuntimeError
+      The execution plan is unavailable or operation replication is
+      unconfirmed.
+
+    Notes
+    -----
+    A stop failure can block the operation before the initial deadline.
+    The grace limit still runs from that deadline. If any stop remains
+    unconfirmed at expiry the signed operation ends failed. With all
+    stops confirmed, the coordinator asks custody to publish the signed
+    deletion pointer before saving success.
+
     Examples
     --------
     >>> plugin._advance_delete_operation(operation)  # doctest: +SKIP
@@ -354,6 +415,7 @@ class _DeploymentMutationsMixin:
     # Only planned workers with verified stop receipts can clear the deletion barrier.
     missing = [node for node in plan["previous_configs"] if reports.get(node, {}).get("status") != "stopped"]
     if missing:
+      # Stop dispatch permanently once the additional hour has elapsed and receipts are still missing.
       if self.time() >= operation["deadline"] + DELETE_STOP_GRACE_SECONDS:
         return self._end_blocked_operation(operation, missing)
       if operation.get("recovery") != "blocked" and (
