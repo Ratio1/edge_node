@@ -85,7 +85,7 @@ class TestIdorProbe(unittest.TestCase):
     self.assertEqual(len(clean), 1)
 
   def test_idor_one_finding_per_scenario(self):
-    """Multiple endpoints → exactly one finding."""
+    """Read-only probe: every vulnerable endpoint gets its own finding."""
     eps = [
       IdorEndpoint(path="/api/records/{id}/", test_ids=[1, 2], owner_field="owner"),
       IdorEndpoint(path="/api/users/{id}/", test_ids=[1], owner_field="owner"),
@@ -98,7 +98,7 @@ class TestIdorProbe(unittest.TestCase):
 
     findings = probe.run()
     a01_findings = [f for f in findings if f.scenario_id == "PT-A01-01"]
-    self.assertEqual(len(a01_findings), 1)
+    self.assertEqual(len(a01_findings), 2)
 
   def test_idor_no_regular_username(self):
     """Returns without findings when regular_username is empty."""
@@ -121,8 +121,8 @@ class TestIdorProbe(unittest.TestCase):
 
     findings = probe.run()
     a01 = [f for f in findings if f.scenario_id == "PT-A01-01"]
-    self.assertEqual(len(a01), 1)
-    self.assertEqual(a01[0].status, "vulnerable")
+    self.assertGreaterEqual(len(a01), 1)
+    self.assertEqual({f.status for f in a01}, {"vulnerable"})
 
   def test_idor_no_endpoints(self):
     """No endpoints and no discoverable routes → no findings, no error."""
@@ -553,6 +553,80 @@ class TestMassAssignment(unittest.TestCase):
     self.assertEqual(vuln[0].severity, "HIGH")
     self.assertIn("CWE-915", vuln[0].cwe)
 
+  def test_mass_assignment_preexisting_option_is_not_evidence(self):
+    """`<option value="admin">` is on the page before the POST: nothing changed."""
+    probe = _make_probe(allow_stateful=True)
+    probe.discovered_forms = ["/profile/"]
+    session = probe.auth.regular_session
+
+    html = ('<form><input name="username" value="alice">'
+            '<select name="role"><option value="user" selected>user</option>'
+            '<option value="admin">admin</option></select></form>')
+    session.get = MagicMock(return_value=_mock_response(status=200, text=html))
+    session.post = MagicMock(return_value=_redirect_to("/profile/"))
+    probe.auth.detected_csrf_field = None
+    probe.auth.extract_csrf_value = MagicMock(return_value=None)
+
+    probe._test_mass_assignment()
+    found = [f for f in probe.findings if f.scenario_id == "PT-A04-01"]
+    self.assertEqual([f.status for f in found], ["not_vulnerable"])
+
+  def _accepted_with(self, before_html, after_html, verify_status=200):
+    probe = _make_probe(allow_stateful=True)
+    probe.discovered_forms = ["/profile/"]
+    session = probe.auth.regular_session
+    session.get = MagicMock(side_effect=[
+      _mock_response(status=200, text=before_html),
+      _mock_response(status=verify_status, text=after_html)])
+    session.post = MagicMock(return_value=_redirect_to("/profile/"))
+    probe.auth.detected_csrf_field = None
+    probe.auth.extract_csrf_value = MagicMock(return_value=None)
+    probe._test_mass_assignment()
+    return [f for f in probe.findings if f.scenario_id == "PT-A04-01"]
+
+  def test_mass_assignment_unchecked_checkbox_is_not_persisted(self):
+    html = ('<form><input name="username" value="alice">'
+            '<input type="checkbox" name="is_admin" value="true"></form>')
+    self.assertEqual([f.status for f in self._accepted_with(html, html)],
+                     ["not_vulnerable"])
+
+  def test_mass_assignment_checked_checkbox_is_persisted(self):
+    before = '<form><input name="username" value="alice"></form>'
+    after = ('<form><input name="username" value="alice">'
+             '<input type="checkbox" name="is_admin" value="true" checked></form>')
+    self.assertEqual([f.status for f in self._accepted_with(before, after)],
+                     ["vulnerable"])
+
+  def test_mass_assignment_django_checkbox_without_value_counts_when_checked(self):
+    before = '<form><input name="username" value="alice"><input type="checkbox" name="is_admin"></form>'
+    after = ('<form><input name="username" value="alice">'
+             '<input type="checkbox" name="is_admin" checked></form>')
+    self.assertEqual([f.status for f in self._accepted_with(before, after)],
+                     ["vulnerable"])
+
+  def test_mass_assignment_data_checked_is_not_checked(self):
+    before = '<form><input name="username" value="alice"><input type="checkbox" name="is_admin"></form>'
+    after = ('<form><input name="username" value="alice">'
+             '<input type="checkbox" name="is_admin" data-checked="1"></form>')
+    self.assertEqual([f.status for f in self._accepted_with(before, after)],
+                     ["not_vulnerable"])
+
+  def test_mass_assignment_field_absent_after_accept_is_inconclusive(self):
+    """`role="group"` / `class="admin"` are attributes, not privilege fields."""
+    for html in ('<form><input name="username" value="alice"></form>',
+                 '<div role="group" class="admin"><form>'
+                 '<input name="username" value="alice"></form></div>'):
+      with self.subTest(html=html):
+        found = self._accepted_with(html, html)
+        self.assertEqual([f.status for f in found], ["inconclusive"])
+        self.assertIn("reason=privilege_field_not_observable", found[0].evidence)
+
+  def test_mass_assignment_unreadable_verify_page_is_inconclusive(self):
+    html = '<form><input name="username" value="alice"></form>'
+    found = self._accepted_with(html, "", verify_status=500)
+    self.assertEqual([f.status for f in found], ["inconclusive"])
+    self.assertIn("reason=verify_not_readable", found[0].evidence)
+
   def test_mass_assignment_rejected(self):
     """Server rejects extra fields → not_vulnerable."""
     probe = _make_probe(allow_stateful=True)
@@ -857,3 +931,158 @@ class TestCreateUserPageIsNotALoginPage(unittest.TestCase):
         probe._test_privilege_esc()
         found = [f for f in probe.findings if f.scenario_id == "PT-A01-02"]
         self.assertEqual([f.status for f in found], ["vulnerable"])
+
+
+class TestOwnershipUpdateEveryEndpointAndRestore(unittest.TestCase):
+  """RM-060 P2.5: one finding per endpoint; stop writing once a restore fails."""
+
+  def _probe(self, restore_status):
+    eps = [
+      IdorEndpoint(path="/api/a/{id}/", test_ids=[1], owner_field="owner"),
+      IdorEndpoint(path="/api/b/{id}/", test_ids=[1], owner_field="owner"),
+    ]
+    probe = _make_probe(idor_endpoints=eps, allow_stateful=True, regular_username="alice")
+    sess = probe.auth.regular_session
+    sess.cookies = MagicMock()
+    sess.cookies.get = MagicMock(return_value="csrf123")
+    sentinel = "redmesh-pt-a01-05-probe-marker"
+
+    def get(url, **kw):
+      # Before-GET sees "before"; after-GET (second per endpoint) sees sentinel.
+      get.n[url] = get.n.get(url, 0) + 1
+      title = "before" if get.n[url] % 2 == 1 else sentinel
+      return _mock_response(status=200, json_data={"owner": "bob", "title": title})
+    get.n = {}
+    sess.get = MagicMock(side_effect=get)
+    # Sentinel PATCH ok (200); restore PATCH (body carries the old title) gets restore_status.
+    def patch(url, data=None, **kw):
+      return _mock_response(status=restore_status if '"before"' in data else 200)
+    sess.patch = MagicMock(side_effect=patch)
+    return probe
+
+  def test_each_endpoint_gets_its_own_finding_when_restore_succeeds(self):
+    probe = self._probe(restore_status=200)
+    probe._test_ownership_update()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A01-05" and x.status == "vulnerable"]
+    self.assertEqual(len(f), 2)
+    self.assertEqual({x.rollback_status for x in f}, {"reverted"})
+    self.assertEqual(
+      sorted(x.evidence[0].split(";")[0] for x in f),
+      ["endpoint=/api/a/1/", "endpoint=/api/b/1/"],
+    )
+
+  def test_failed_restore_stops_further_writes_and_is_recorded(self):
+    probe = self._probe(restore_status=500)
+    probe._test_ownership_update()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A01-05" and x.status == "vulnerable"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].rollback_status, "revert_failed")
+    # sentinel PATCH + failed restore PATCH on the first endpoint only
+    self.assertEqual(probe.auth.regular_session.patch.call_count, 2)
+
+
+class TestRestoreIsVerifiedRound1(unittest.TestCase):
+  """RM-060 fix round 1: a restore counts only when a re-read shows the old value."""
+
+  def _update_probe(self, restore_shows):
+    ep = IdorEndpoint(path="/api/records/{id}/", test_ids=[1], owner_field="owner")
+    ep2 = IdorEndpoint(path="/api/other/{id}/", test_ids=[1], owner_field="owner")
+    probe = _make_probe(idor_endpoints=[ep, ep2], allow_stateful=True, regular_username="alice")
+    sess = probe.auth.regular_session
+    sess.cookies = MagicMock()
+    sess.cookies.get = MagicMock(return_value="csrf123")
+    seq = {}
+    def get(url, **kw):
+      n = seq[url] = seq.get(url, 0) + 1
+      title = {1: "before", 2: "redmesh-pt-a01-05-probe-marker"}.get(n, restore_shows)
+      return _mock_response(status=200, json_data={"owner": "bob", "title": title})
+    sess.get = MagicMock(side_effect=get)
+    sess.patch = MagicMock(return_value=_mock_response(status=200))
+    return probe
+
+  def test_a01_05_restore_2xx_but_value_unchanged_is_revert_failed_and_stops(self):
+    probe = self._update_probe(restore_shows="redmesh-pt-a01-05-probe-marker")
+    probe._test_ownership_update()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A01-05" and x.status == "vulnerable"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].rollback_status, "revert_failed")
+    self.assertEqual(probe.auth.regular_session.patch.call_count, 2)
+
+  def test_a01_05_verified_restore_continues_to_next_endpoint(self):
+    probe = self._update_probe(restore_shows="before")
+    probe._test_ownership_update()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A01-05" and x.status == "vulnerable"]
+    self.assertEqual([x.rollback_status for x in f], ["reverted", "reverted"])
+
+  def test_a01_05_record_without_title_is_never_restored_with_null(self):
+    ep = IdorEndpoint(path="/api/records/{id}/", test_ids=[1], owner_field="owner")
+    probe = _make_probe(idor_endpoints=[ep], allow_stateful=True, regular_username="alice")
+    sess = probe.auth.regular_session
+    sess.cookies = MagicMock()
+    sess.cookies.get = MagicMock(return_value="c")
+    gets = iter([
+      _mock_response(json_data={"owner": "bob"}),
+      _mock_response(json_data={"owner": "bob", "title": "redmesh-pt-a01-05-probe-marker"}),
+    ])
+    sess.get = MagicMock(side_effect=lambda *a, **k: next(gets))
+    sess.patch = MagicMock(return_value=_mock_response(status=200))
+    probe._test_ownership_update()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A01-05" and x.status == "vulnerable"]
+    self.assertEqual(f[0].rollback_status, "revert_failed")
+    self.assertEqual(sess.patch.call_count, 1)  # sentinel only, no title=null
+
+  def _mass_probe(self, restore_owner):
+    eps = [IdorEndpoint(path="/api/a/{id}/", test_ids=[2], owner_field="owner"),
+           IdorEndpoint(path="/api/b/{id}/", test_ids=[2], owner_field="owner")]
+    probe = _make_probe(idor_endpoints=eps, allow_stateful=True)
+    sess = probe.auth.regular_session
+    sess.cookies = MagicMock()
+    sess.cookies.get = MagicMock(return_value="c")
+    seq = {}
+    def get(url, **kw):
+      n = seq[url] = seq.get(url, 0) + 1
+      owner = {1: "alice", 2: "1"}.get(n, restore_owner)
+      return _mock_response(status=200, json_data={"owner": owner})
+    sess.get = MagicMock(side_effect=get)
+    sess.patch = MagicMock(return_value=_mock_response(status=200))
+    return probe
+
+  def test_a04_02_verified_restore_continues_to_next_endpoint(self):
+    probe = self._mass_probe(restore_owner="alice")
+    probe._test_mass_assignment_ownership()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A04-02" and x.status == "vulnerable"]
+    self.assertEqual([x.rollback_status for x in f], ["reverted", "reverted"])
+
+  def test_a04_02_unverified_restore_stops_further_writes(self):
+    probe = self._mass_probe(restore_owner="1")
+    probe._test_mass_assignment_ownership()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A04-02" and x.status == "vulnerable"]
+    self.assertEqual([x.rollback_status for x in f], ["revert_failed"])
+    self.assertEqual(probe.auth.regular_session.patch.call_count, 2)
+
+
+class TestReadOnlyProbesReportEveryEndpointRound1(unittest.TestCase):
+
+  def test_idor_one_finding_per_endpoint(self):
+    eps = [IdorEndpoint(path="/api/a/{id}/", test_ids=[9], owner_field="owner"),
+           IdorEndpoint(path="/api/b/{id}/", test_ids=[9], owner_field="owner")]
+    probe = _make_probe(idor_endpoints=eps)
+    resp = _mock_response(json_data={"owner": "bob"})
+    resp.json.return_value = {"owner": "bob"}
+    probe.auth.regular_session.get.return_value = resp
+    probe._test_idor()
+    vuln = [f for f in probe.findings if f.scenario_id == "PT-A01-01" and f.status == "vulnerable"]
+    self.assertEqual(len(vuln), 2)
+    self.assertEqual(len({f.evidence[0] for f in vuln}), 2)
+
+  def test_query_role_override_one_finding_per_path(self):
+    probe = _make_probe(discovered_routes=["/p1/", "/p2/"], regular_username="alice")
+    def get(url, params=None, **kw):
+      if params:
+        return _mock_response(status=200, text="Admin Panel")
+      return _mock_response(status=200, text="hello")
+    probe.auth.regular_session.get = MagicMock(side_effect=get)
+    probe._test_query_role_override()
+    vuln = [f for f in probe.findings if f.scenario_id == "PT-A01-10" and f.status == "vulnerable"]
+    self.assertEqual(sorted(f.evidence[0].split(";")[0] for f in vuln),
+                     ["path=/p1/", "path=/p2/"])

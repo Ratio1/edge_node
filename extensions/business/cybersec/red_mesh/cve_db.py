@@ -751,15 +751,34 @@ def set_vulndb_reader(reader) -> None:
   _VULNDB_READER = reader
 
 
-def probe_cve_fields(cve_id: str) -> dict:
-  """KEV and build for a CVE a probe confirmed itself (Heartbleed), not matched by `check_cves`.
+# Database product keys a probe passes as `product_hint` for a CVE the build lists under several products (RM-263).
+# Kept here, beside the database code: no probe matches these products by version.
+HINT_STRUTS2 = "struts2"
+HINT_SPRING_FRAMEWORK = "spring_framework"
 
-  `static`: KEV not evaluated. `generated`: the build is named; KEV is None when the build has no row for the CVE.
+
+def probe_cve_fields(cve_id: str, product_hint: str = "") -> dict:
+  """Database fields for a CVE a probe confirmed itself (Heartbleed), not matched by `check_cves`.
+
+  `static`: KEV not evaluated, nothing else. `generated`: the build is named; KEV is None when the build has no row
+  for the CVE. With a row, the finding also gets the row's EPSS and `cvss[]` list, and the CVE view's subject
+  `product`: the one product the build's rows name for the CVE; when it names several, the probe's `product_hint` if the
+  build names that product, else none. Never `cvss_score`, vector or severity: those stay the probe's call (RM-263).
   """
   reader = _VULNDB_READER
   if reader is None:
     return {"kev": None}
-  return {"kev": reader.kev(cve_id), "vulndb_build_id": reader.build_id}
+  fields = {"kev": reader.kev(cve_id), "vulndb_build_id": reader.build_id}
+  record = reader.probe_record(cve_id)
+  if record is None:
+    return fields
+  epss, cvss, products = record
+  fields.update(epss_score=epss, cvss=tuple(dict(c) for c in cvss))
+  if len(products) == 1:
+    fields["product"] = products[0]
+  elif product_hint and product_hint in products:
+    fields["product"] = product_hint
+  return fields
 
 
 def set_dynamic_reference_cache(dynamic_cache):

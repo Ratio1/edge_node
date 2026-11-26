@@ -30,9 +30,19 @@ GRAYBOX_PROBE_REGISTRY = [
 
 # Graybox timing and limits
 GRAYBOX_DEFAULT_DELAY = 0.2
+# RM-273 Phase F: bounded 429/503 backoff, circuit breaker, per-call deadline. The breaker
+# resets per phase and per registry entry (one probe class), not per scenario.
+GRAYBOX_RETRY_MAX = 2
+GRAYBOX_RETRY_AFTER_MAX = 30
+GRAYBOX_BACKOFF_DEADLINE = 60
+GRAYBOX_BREAKER_THRESHOLD = 5
 GRAYBOX_WEAK_AUTH_DELAY = 1.0
 GRAYBOX_MAX_WEAK_ATTEMPTS = 20
 GRAYBOX_SESSION_MAX_AGE = 1800
+# RM-273 Phase 2b: (connect, read) seconds for a graybox request whose caller passes no timeout;
+# requests would otherwise wait forever on a target that accepts and never answers.
+GRAYBOX_HTTP_TIMEOUT = (10, 30)
+GRAYBOX_REAUTH_MAX = 3  # mid-family re-logins per principal; every login counts toward lockout
 
 
 FEATURE_CATALOG = [
@@ -245,6 +255,15 @@ FINGERPRINT_TIMEOUT = 2        # seconds — passive banner grab timeout
 FINGERPRINT_MAX_BANNER = 512   # bytes — max banner stored per port
 FINGERPRINT_HTTP_TIMEOUT = 4   # seconds — active HTTP probe timeout (honeypots may be slow)
 FINGERPRINT_NUDGE_TIMEOUT = 3  # seconds — generic \r\n nudge probe timeout
+
+# Blackbox web injection caps (RM-275). Workers may override any key through a
+# `web_injection_caps` dict attribute; the candidate, request, page and time caps are named in the probe's coverage note.
+WEB_INJECTION_CAPS = {
+  "crawl_max_pages": 30,           # routes fetched by the shared crawl, per base URL
+  "crawl_max_depth": 2,            # link depth from the root
+  "candidates_per_probe": 20,      # (path, parameter) pairs tested by one injection probe
+  "sqli_requests_per_port": 240,   # SQLi requests per port (20 candidates x ~12), controls not counted
+}
 
 # Well-known TCP port → protocol (fallback when banner is unrecognized)
 WELL_KNOWN_PORTS = {

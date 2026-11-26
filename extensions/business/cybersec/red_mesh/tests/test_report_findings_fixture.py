@@ -84,6 +84,11 @@ class TestReportFindingsFixture(unittest.TestCase):
     self.assertEqual(len(csrf), 2)
     self.assertEqual({f["affected_assets"][0]["parameter"] for f in csrf}, {"/users/sign_in", "/users"})
     self.assertTrue(any(f.get("backport_status") for f in self.findings))
+    # RM-170: a CVE finding carries the v3.1 label and a v4.0 entry in `cvss`.
+    with_cvss = [f for f in self.findings if f.get("cvss")]
+    self.assertEqual(len(with_cvss), 1)
+    self.assertEqual([c["version"] for c in with_cvss[0]["cvss"]], ["3.1", "4.0"])
+    self.assertEqual(with_cvss[0]["cvss"][0]["vector"], with_cvss[0]["cvss_vector"])
     self.assertTrue(all(f.get("probe_display_name") for f in self.findings))
     self.assertEqual(self.fixture["catch_all_withheld"],
                      {"http://198.51.100.20": [{"path": "/admin", "probe": "_web_test_common"}]})

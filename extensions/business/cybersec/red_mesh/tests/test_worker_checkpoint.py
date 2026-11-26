@@ -142,6 +142,29 @@ class TestWorkerCheckpoint(unittest.TestCase):
     self.assertEqual(mc.call_count, 2)
     self.assertEqual(w.state["ports_scanned"], [1, 2, 3, 4, 5])
 
+  def test_unanswered_ports_count_as_timeout_and_new_errno_logs_once(self):
+    import errno
+    codes = {1: errno.EAGAIN, 2: errno.ETIMEDOUT, 3: errno.EHOSTUNREACH,
+             4: errno.EHOSTUNREACH, 5: errno.ECONNREFUSED}
+
+    class _Sock:
+      def __init__(self): self.port = None
+      def settimeout(self, t): pass
+      def connect_ex(self, addr): return codes[addr[1]]
+      def close(self): pass
+
+    owner = _Owner(self.tmp)
+    logs = []
+    owner.P = lambda msg, **k: logs.append(msg)
+    w = _worker(owner, ports=[1, 2, 3, 4, 5])
+    w._interruptible_sleep = lambda: False
+    with patch("extensions.business.cybersec.red_mesh.worker.pentest_worker.socket.socket",
+               return_value=_Sock()):
+      w._scan_ports_step()
+    outcomes = w.metrics.build().connection_outcomes
+    self.assertEqual((outcomes["timeout"], outcomes["error"], outcomes["refused"]), (2, 2, 1))
+    self.assertEqual(len([m for m in logs if "errno" in m and str(errno.EHOSTUNREACH) in m]), 1)
+
   def _enabled_methods(self, w, category, names):
     w._get_enabled_feature_methods = lambda category=None: list(names)
     for n in names:

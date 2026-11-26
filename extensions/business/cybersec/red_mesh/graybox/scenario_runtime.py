@@ -160,6 +160,20 @@ def runtime_scenario_ids() -> tuple[str, ...]:
   return tuple(item.scenario_id for item in API_RUNTIME_SCENARIOS)
 
 
+def owns_legacy_families(assigned_scenario_ids) -> bool:
+  """True when this worker runs the legacy (non-manifest) graybox families.
+
+  Legacy families are not in the runtime manifest, so SLICE cannot divide
+  them. Under SLICE only the worker holding the first manifest scenario
+  (slice index 0) runs them; under MIRROR every worker holds every id and
+  runs them. ``None`` means no assignment: run everything.
+  """
+  if assigned_scenario_ids is None:
+    return True
+  ids = runtime_scenario_ids()
+  return not ids or ids[0] in set(assigned_scenario_ids)
+
+
 def runtime_scenarios_for_probe(probe_key: str) -> tuple[RuntimeScenario, ...]:
   return tuple(item for item in API_RUNTIME_SCENARIOS if item.probe_key == probe_key)
 

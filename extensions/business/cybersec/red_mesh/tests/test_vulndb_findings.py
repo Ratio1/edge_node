@@ -104,6 +104,7 @@ class FindingFieldTests(unittest.TestCase):
     self.assertEqual((finding.cvss_version, finding.cvss_score, finding.cvss_source, finding.cvss_vector),
                      ("3.1", 8.1, "nvd", V31))
     self.assertEqual([(c["version"], c["source"]) for c in finding.cvss], [("3.1", "cna"), ("3.1", "nvd"), ("4.0", "cna")])
+    self.assertEqual([c.get("nomenclature") for c in finding.cvss], [None, None, "CVSS-B"])  # RM-170: v4.0 only
     self.assertEqual((finding.confidence, finding.confidence_reason), ("tentative", "banner_only"))
     self.assertEqual(finding.cwe_id, "CWE-362")  # frozen to the static row
     self.assertEqual(finding.cwe, (79,))  # display classification from the database
@@ -113,8 +114,13 @@ class FindingFieldTests(unittest.TestCase):
     """A CVE a probe proves itself (Heartbleed) is a CVE finding too: build and KEV come from the database."""
     self.assertEqual(cve_db.probe_cve_fields(CVE), {"kev": None})  # static: KEV not evaluated
     self.use()
-    self.assertEqual(cve_db.probe_cve_fields("CVE-2030-0011"), {"kev": True, "vulndb_build_id": "vulndb-aaaaaaaaaaaa"})
-    self.assertEqual(cve_db.probe_cve_fields(CVE), {"kev": False, "vulndb_build_id": "vulndb-aaaaaaaaaaaa"})
+    # RM-263: a row in the build also gives EPSS, `cvss[]` and the product (see `test_rm263_probe_cve_enrichment`).
+    build_id = "vulndb-aaaaaaaaaaaa"
+    self.assertEqual(cve_db.probe_cve_fields("CVE-2030-0011"),
+                     {"kev": True, "vulndb_build_id": build_id, "epss_score": 0.5, "cvss": (), "product": "oldprod"})
+    fields = cve_db.probe_cve_fields(CVE)
+    self.assertEqual((fields["kev"], fields["vulndb_build_id"], fields["epss_score"], fields["product"]), (False, build_id, 0.5, "openssh"))
+    self.assertEqual(len(fields["cvss"]), 3)
     # No row in this build: the build is named, KEV stays not evaluated.
     self.assertEqual(cve_db.probe_cve_fields("CVE-1999-0001"), {"kev": None, "vulndb_build_id": "vulndb-aaaaaaaaaaaa"})
 

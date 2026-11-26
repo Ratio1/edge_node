@@ -11,6 +11,7 @@ from ..repositories import ArtifactRepository, JobStateRepository
 from ..tenancy.administration import AdministrationDenied
 from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode
 from ..tenancy.ports import TenantStoreError
+from ..cvss_entries import cvss_entries
 from .config import get_stix_export_config, job_tenant_id
 from .tenant_labels import tenant_id_label
 from ..tenancy.effects import EffectState
@@ -286,6 +287,7 @@ def _vulnerability_object(finding, *, job_id, pass_nr, created, marking_id,
     "confidence": finding.get("confidence"),
     "cvss_score": finding.get("cvss_score"),
     "cvss_vector": finding.get("cvss_vector"),
+    "cvss": cvss_entries(finding),
     "port": finding.get("port"),
     "protocol": finding.get("protocol"),
     "probe": finding.get("probe"),

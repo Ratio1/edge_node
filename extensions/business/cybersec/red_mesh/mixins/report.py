@@ -11,6 +11,8 @@ import math as _math
 import struct as _struct
 
 from ..worker import PentestLocalWorker
+from ..connection_metrics import RESPONSIVE_CONNECTION_OUTCOMES
+from ..worker.correlation import apply_host_honeypot_verdict, http_without_https_redirect_findings
 from .live_progress import _LiveProgressMixin
 from ..models import UiAggregate
 from ..cve_view import apply_triage, drop_closed, filter_listed
@@ -336,6 +338,37 @@ def _compact_finding_signature(finding):
     canonical = repr(normalize(finding))
   stable = canonical.encode("utf-8", errors="replace")
   return "sha256:" + _hashlib.sha256(stable).hexdigest()
+
+
+def get_host_aggregated_report(owner, node_reports, worker_cls=None, log_details=True):
+  """`owner._get_aggregated_report` over the node reports of a whole job, with the host honeypot fold applied once (D54).
+
+  Every merge that feeds risk scoring or LLM input goes through here (finalization, manual analysis). A failed
+  fold is logged by exception type and leaves the merged report as it was.
+  """
+  kwargs = {}
+  if worker_cls is not None:
+    kwargs["worker_cls"] = worker_cls
+  if not log_details:
+    kwargs["log_details"] = False
+  aggregated = owner._get_aggregated_report(node_reports, **kwargs)
+  if isinstance(aggregated, dict) and aggregated:
+    try:
+      verdict = apply_host_honeypot_verdict(aggregated)
+      if verdict:
+        owner.P(f"Host honeypot verdict {verdict}: CVE rows folded")
+    except Exception as exc:
+      owner.P(f"Host honeypot fold failed: {type(exc).__name__}", color='y')
+    try:
+      # RM-265: needs the whole host (the HTTP and TLS ports sit on different workers); idempotent on a re-merge.
+      new_rows = http_without_https_redirect_findings(aggregated)
+      if new_rows:
+        rows = aggregated.setdefault("correlation_findings", [])
+        seen = {r.get("finding_id") for r in rows if isinstance(r, dict)}
+        rows.extend(r for r in new_rows if r.get("finding_id") not in seen)
+    except Exception as exc:
+      owner.P(f"HTTP-without-HTTPS correlation failed: {type(exc).__name__}", color='y')
+  return aggregated
 
 
 class _ReportMixin:
@@ -1027,7 +1060,11 @@ class _ReportMixin:
       # so they must not override "reached" when the node returned results.
       if not has_report and addr not in worker_scan_metrics:
         status = "failed"
-      elif outcomes and outcomes.get("connected", 0) == 0 and outcomes.get("timeout", 0) > 0:
+      elif (
+        outcomes
+        and outcomes.get("timeout", 0) > 0
+        and not any(outcomes.get(k, 0) for k in RESPONSIVE_CONNECTION_OUTCOMES)
+      ):
         status = "timeout"
       else:
         status = "reached"

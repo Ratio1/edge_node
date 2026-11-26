@@ -75,14 +75,13 @@ class ApiDataProbes(ProbeBase):
 
     found_any = False
     for ep in endpoints:
-      if not self.budget():
+      if not self.budget_available():
         self.emit_inconclusive(
           "PT-OAPI3-01", "API response leaks sensitive properties",
           "API3:2023", "budget_exhausted",
         )
         return
       url = self._render_url(ep.path, ep.id_param, ep.test_id)
-      self.safety.throttle()
       try:
         resp = session.get(url, timeout=10, allow_redirects=False)
       except requests.RequestException:
@@ -172,9 +171,6 @@ class ApiDataProbes(ProbeBase):
       method = (ep.method_write or "PATCH").upper()
 
       def baseline(_ep=ep, _url=read_url):
-        if not self.budget():
-          raise RuntimeError("budget_exhausted")
-        self.safety.throttle()
         resp = session.get(_url, timeout=10, allow_redirects=False)
         try:
           return resp.json() if resp.status_code < 400 else None
@@ -185,9 +181,8 @@ class ApiDataProbes(ProbeBase):
                   _field=target_field):
         if base is None:
           return False
-        if not self.budget():
+        if not self.budget_available():
           raise RuntimeError("budget_exhausted")
-        self.safety.throttle()
         payload = {_field: True}
         try:
           if _method == "PATCH":
@@ -201,9 +196,6 @@ class ApiDataProbes(ProbeBase):
         return resp.status_code < 400
 
       def verify(base, _ep=ep, _url=read_url, _field=target_field):
-        if not self.budget():
-          raise RuntimeError("budget_exhausted")
-        self.safety.throttle()
         try:
           resp = session.get(_url, timeout=10, allow_redirects=False)
         except requests.RequestException:
@@ -226,16 +218,17 @@ class ApiDataProbes(ProbeBase):
           return False
         if _field not in base:
           return False
-        if not self.cleanup_budget():
-          return False
         before = base.get(_field)
         try:
           if _method == "PATCH":
-            resp = session.patch(_url, json={_field: before}, timeout=10)
+            resp = session.patch(_url, json={_field: before}, timeout=10,
+                                 budget_exempt=True)
           elif _method == "PUT":
-            resp = session.put(_url, json={_field: before}, timeout=10)
+            resp = session.put(_url, json={_field: before}, timeout=10,
+                                 budget_exempt=True)
           else:
-            resp = session.post(_url, json={_field: before}, timeout=10)
+            resp = session.post(_url, json={_field: before}, timeout=10,
+                                 budget_exempt=True)
         except requests.RequestException:
           return False
         return resp.status_code < 400

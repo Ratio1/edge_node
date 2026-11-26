@@ -23,6 +23,13 @@ COMMON_CSRF_FIELDS = [
   "_token",               # Laravel
 ]
 
+# Login pages tried, in order, when the configured login_path answers >= 400.
+# Six entries: the search cap is 8 GETs, minus the configured path and the root.
+# Product paths are data: engine code never branches on a product name.
+LOGIN_DISCOVERY_PATHS = (
+  "/login", "/signin", "/wp-login.php", "/backend", "/user/login", "/users/sign_in",
+)
+
 
 _SECRET_BODY_KEY_PARTS = (
   "password", "passwd", "pwd", "secret", "api_key", "apikey",
@@ -361,6 +368,8 @@ class ReflectiveEndpoint:
   """
   path: str
   param: str = "msg"
+  # "discovered" for candidates the crawler fed in; never read from config.
+  source: str = "configured"
 
   @classmethod
   def from_dict(cls, d: dict) -> ReflectiveEndpoint:
@@ -439,12 +448,19 @@ class BusinessLogicConfig:
     )
 
 
+# Hard ceiling on discovered candidates per family, whatever the config says.
+MAX_CANDIDATES_CEILING = 50
+
+
 @dataclass(frozen=True)
 class DiscoveryConfig:
   """Config for route/form discovery."""
   scope_prefix: str = ""                  # e.g. "/api/" — only crawl under this path
   max_pages: int = 50                     # max pages to crawl
   max_depth: int = 3                      # max link-follow depth
+  # Discovered injection candidates tried per probe family; configured
+  # endpoints are never capped. Clamped to MAX_CANDIDATES_CEILING.
+  max_candidates_per_family: int = 20
 
   @classmethod
   def from_dict(cls, d: dict) -> DiscoveryConfig:
@@ -453,6 +469,8 @@ class DiscoveryConfig:
       scope_prefix=d.get("scope_prefix", ""),
       max_pages=d.get("max_pages", 50),
       max_depth=d.get("max_depth", 3),
+      max_candidates_per_family=max(0, min(
+        int(d.get("max_candidates_per_family", 20)), MAX_CANDIDATES_CEILING)),
     )
 
 
@@ -782,7 +800,7 @@ class AuthDescriptor:
                must resolve to a non-empty value when authenticated and
                not when anonymous (e.g. ``user.id``).
   """
-  auth_type: str = "form"   # "form" | "bearer" | "api_key"
+  auth_type: str = "form"   # "form" | "bearer" | "api_key" | "basic"
   bearer_token_header_name: str = "Authorization"
   bearer_scheme: str = "Bearer"
   bearer_refresh_url: str = ""
@@ -920,10 +938,10 @@ class ApiSecurityConfig:
     "/debug", "/api/debug", "/api/_routes",
     "/actuator", "/actuator/env", "/q/dev", "/__debug__",
   ])
-  # OWASP API Top 10 — Subphase 1.7. Per-scan request budget cap. Each
-  # `ProbeBase.budget()` call decrements a shared `RequestBudget`; once
-  # exhausted, probes emit `inconclusive` with reason `budget_exhausted`
-  # rather than continuing to issue requests.
+  # OWASP API Top 10 — Subphase 1.7. Per-scan request budget cap. Every HTTP
+  # request `GrayboxHttpClient` sends (each redirect hop included) decrements a
+  # shared `RequestBudget`; once exhausted the client refuses further requests
+  # and the affected scenarios end `inconclusive` with reason `budget_exhausted`.
   max_total_requests: int = 1000
 
   @classmethod

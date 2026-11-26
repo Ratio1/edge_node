@@ -2,6 +2,7 @@ import json
 import re as _re
 import sys
 import struct
+import socket
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -112,18 +113,6 @@ class RedMeshOWASPTests(unittest.TestCase):
     self._assert_has_finding(result, "Cookie missing Secure flag")
     self._assert_has_finding(result, "Cookie missing HttpOnly flag")
     self._assert_has_finding(result, "Cookie missing SameSite flag")
-
-  def test_injection_sql_detected(self):
-    owner, worker = self._build_worker()
-    resp = MagicMock()
-    resp.text = "sql syntax error near line"
-    resp.status_code = 200
-    with patch(
-      "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get",
-      return_value=resp,
-    ):
-      result = worker._web_test_sql_injection("example.com", 80)
-    self._assert_has_finding(result, "SQL injection")
 
   def test_insecure_design_path_traversal(self):
     owner, worker = self._build_worker()
@@ -401,19 +390,6 @@ class RedMeshOWASPTests(unittest.TestCase):
     self.assertNotIn(9000, worker.state["ports_to_scan"])
     self.assertIn(9000, worker.exceptions)
 
-  def test_cross_site_scripting_detection(self):
-    owner, worker = self._build_worker()
-    payload = "<script>alert(1)</script>"
-    resp = MagicMock()
-    resp.text = f"Response with {payload} inside"
-    resp.status_code = 200
-    with patch(
-      "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get",
-      return_value=resp,
-    ):
-      result = worker._web_test_xss("example.com", 80)
-    self._assert_has_finding(result, "XSS")
-
   def test_tls_certificate_expiration_reporting(self):
     owner, worker = self._build_worker(ports=[443])
 
@@ -476,6 +452,9 @@ class RedMeshOWASPTests(unittest.TestCase):
       return DummyContextUnverified()
 
     with patch(
+      "socket.getaddrinfo",  # RM-067: the dial resolves first; keep these tests offline
+      return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+    ), patch(
       "extensions.business.cybersec.red_mesh.worker.service.tls.socket.create_connection",
       return_value=DummyConn(),
     ), patch(
@@ -535,6 +514,9 @@ class RedMeshOWASPTests(unittest.TestCase):
     import ssl
 
     with patch(
+      "socket.getaddrinfo",  # RM-067: the dial resolves first; keep these tests offline
+      return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+    ), patch(
       "extensions.business.cybersec.red_mesh.worker.service.tls.socket.create_connection",
       return_value=DummyConn(),
     ), patch(
@@ -1381,6 +1363,30 @@ class RedMeshOWASPTests(unittest.TestCase):
       worker._active_fingerprint_ports()
 
     self.assertEqual(worker.state["port_protocols"][1024], "modbus")
+
+  def test_fingerprint_modbus_exception_reply_halts_in_ics_safe_mode(self):
+    """RM-061 R2: a Modbus exception reply (function 0xAB) also proves Modbus and halts in ICS Safe Mode."""
+    owner, worker = self._build_worker(ports=[1024])
+    worker.state["open_ports"] = [1024]
+    worker.state["port_protocols"] = {1024: "unknown"}
+    worker.state["port_banners"] = {1024: ""}
+    worker.state["port_banner_confirmed"] = {1024: False}
+    worker.target = "10.0.0.1"
+    worker.ics_safe_mode = True
+    exception_reply = b'\x00\x01\x00\x00\x00\x03\x01\xab\x01'
+    call_index = [0]
+
+    def fake_socket_factory(*args, **kwargs):
+      mock_sock = MagicMock()
+      mock_sock.recv.return_value = exception_reply if call_index[0] == 2 else b""
+      call_index[0] += 1
+      return mock_sock
+
+    with patch("extensions.business.cybersec.red_mesh.worker.pentest_worker.socket.socket", side_effect=fake_socket_factory):
+      worker._active_fingerprint_ports()
+
+    self.assertEqual(worker.state["port_protocols"][1024], "modbus")
+    self.assertTrue(worker._ics_detected)
 
   def test_fingerprint_non_modbus_stays_unknown(self):
     """Port with no recognizable response should remain unknown after active probes."""

@@ -6,6 +6,7 @@ from .runtime import (
   GrayboxProbeDefinition,
   GrayboxProbeContext,
   GrayboxProbeRunResult,
+  InjectionCandidate,
 )
 from .target_config import (
   AccessControlConfig,
@@ -23,6 +24,7 @@ from .target_config import (
 )
 
 __all__ = [
+  "InjectionCandidate",
   "AccessControlConfig",
   "AdminEndpoint",
   "BusinessLogicConfig",
