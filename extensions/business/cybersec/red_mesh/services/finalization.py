@@ -266,12 +266,21 @@ def _all_workers_finished_with_reports(workers):
   return True
 
 
+def _current_pass_ref(job_specs):
+  """The stored `PassReportRef` dict of the current pass, or None."""
+  job_pass = job_specs.get("job_pass", 1)
+  return next((ref for ref in job_specs.get("pass_reports") or []
+               if isinstance(ref, dict) and ref.get("pass_nr") == job_pass), None)
+
+
 def _is_stale_intermediate_recovery_candidate(job_specs, workers, job_status, next_pass_at):
   if not is_intermediate_job_status(job_status):
     return False
   if job_specs.get("job_cid"):
     return False
-  if job_specs.get("pass_reports"):
+  # A current pass that already has its report is not re-run (it would store a second report);
+  # an earlier pass's report does not block the current pass (I-268).
+  if _current_pass_ref(job_specs) is not None:
     return False
   if next_pass_at is not None:
     return False
@@ -297,6 +306,51 @@ def _record_stale_intermediate_recovery(owner, job_specs, previous_status, worke
       "pass_nr": pass_nr,
       "worker_count": worker_count,
     })
+
+
+def _resume_finalizing_tail(owner, job_key, job_specs, workers, ref):
+  """I-268: finish a pass whose launcher exited after the FINALIZING write (pass report stored, no
+  archive). Only the steps after that write run; the pass is not collected or scored again."""
+  job_id = job_specs.get("job_id")
+  job_pass = job_specs.get("job_pass", 1)
+  run_mode = job_specs.get("run_mode", RUN_MODE_SINGLEPASS)
+  owner.P(f"[STUCK RECOVERY] {job_id} is FINALIZING with pass {job_pass} stored — resuming finalization",
+          color='y')
+  log_audit_event = getattr(owner, "_log_audit_event", None)
+  if callable(log_audit_event):
+    log_audit_event("stale_finalizing_recovery", {
+      "job_id": job_id, "launcher": job_specs.get("launcher"), "run_mode": run_mode, "pass_nr": job_pass})
+  job_specs = _ensure_rulebook_assessment_after_pass(owner, job_specs, job_id=job_id, pass_nr=job_pass)
+  if not ref.get("pass_changes_cid"):
+    # The ledger step did not finish; its own failure rule leaves a `skipped` entry.
+    _record_skipped_ledger_pass(owner, job_specs, job_id=job_id, pass_nr=job_pass,
+                                date_completed=owner.time())
+  stored = (_artifact_repo(owner).get_pass_report(ref.get("report_cid")) or {}) if job_pass <= 1 else {}
+  if stored.get("aborted") and not sum(
+      int(((entry or {}).get("scan_metrics") or {}).get("probes_attempted") or 0)
+      for entry in (stored.get("worker_scan_metrics") or {}).values()):
+    # The same outcome as the uninterrupted tail: a first pass that tested nothing fails the job.
+    phase = stored.get("abort_phase") or "unknown"
+    _mark_job_failed(
+      owner, job_key, job_specs, job_id=job_id, pass_nr=job_pass, failure_class="scan_aborted",
+      message=f"Scan aborted during {phase}: {_abort_reason_text(stored.get('abort_reason'))}",
+      meta={"abort_phase": phase, "abort_reason_class": stored.get("abort_reason_class") or "unknown"},
+    )
+    return
+  if run_mode == RUN_MODE_SINGLEPASS or job_pass >= MAX_CONTINUOUS_PASSES:
+    set_job_status(job_specs, JOB_STATUS_FINALIZED if run_mode == RUN_MODE_SINGLEPASS else JOB_STATUS_STOPPED)
+    owner._emit_timeline_event(job_specs, "finalized", "Job finalized (recovered after a launcher restart)")
+    owner._build_job_archive(job_key, job_specs)
+    _enqueue_misp_auto_push(owner, job_specs, job_pass)
+  else:
+    job_config = owner._get_job_config(job_specs, resolve_secrets=False) or {}
+    set_job_status(job_specs, JOB_STATUS_RUNNING)
+    job_specs["next_pass_at"] = (owner.time() + job_config.get("monitor_interval", owner.cfg_monitor_interval)
+                                 + random.uniform(0, owner.cfg_monitor_jitter))
+    owner._emit_timeline_event(job_specs, "pass_completed", f"Pass {job_pass} completed (recovered)")
+    _write_job_record(owner, job_key, job_specs, context="finalizing_recovery_next_pass")
+    _enqueue_misp_auto_push(owner, job_specs, job_pass)
+  owner._clear_live_progress(job_id, list(workers.keys()))
 
 
 def _automatic_analysis_report_identity(workers):
@@ -614,6 +668,11 @@ def maybe_finalize_pass(owner):
         owner._build_job_archive(job_id, job_specs)
       continue
     if is_intermediate_job_status(job_status) and not resumed_automatic_analysis:
+      ref = _current_pass_ref(job_specs)
+      if (job_status == JOB_STATUS_FINALIZING and ref is not None and not job_specs.get("job_cid")
+          and next_pass_at is None and _all_workers_finished_with_reports(workers)):
+        _resume_finalizing_tail(owner, job_key, job_specs, workers, ref)
+        continue
       if not _is_stale_intermediate_recovery_candidate(job_specs, workers, job_status, next_pass_at):
         continue
       _record_stale_intermediate_recovery(owner, job_specs, job_status, len(workers))

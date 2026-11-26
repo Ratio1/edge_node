@@ -3273,6 +3273,85 @@ class TestPhase2PassFinalization(unittest.TestCase):
       },
     )
 
+  def test_crash_after_finalizing_write_resumes_the_tail_without_rerunning_the_pass(self):
+    """I-268: a launcher that exits between the FINALIZING write and the archive leaves a job that
+    the next loop finishes from its stored pass report: no second report, no second collection."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    self._configure_successful_pass_finalization(plugin, job_specs)
+
+    class _Exit(BaseException):
+      pass
+
+    target = "extensions.business.cybersec.red_mesh.services.finalization._ensure_rulebook_assessment_after_pass"
+    with patch(target, side_effect=_Exit), self.assertRaises(_Exit):
+      PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    self.assertEqual((job_specs["job_status"], len(job_specs["pass_reports"])), ("FINALIZING", 1))
+    plugin._build_job_archive.assert_not_called()
+
+    skipped = "extensions.business.cybersec.red_mesh.services.finalization._record_skipped_ledger_pass"
+    with patch(skipped) as ledger:
+      PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
+    plugin._collect_node_reports.assert_called_once()
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+    ledger.assert_called_once()  # the ledger step never stored its pass changes
+    plugin._log_audit_event.assert_called_once_with(
+      "stale_finalizing_recovery",
+      {"job_id": job_specs["job_id"], "launcher": "launcher-node", "run_mode": "SINGLEPASS", "pass_nr": 1},
+    )
+
+  def test_finalizing_wedge_after_an_empty_abort_fails_the_job(self):
+    """I-268: the resumed tail keeps the uninterrupted outcome of a first pass that tested nothing."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    job_specs["job_status"] = "FINALIZING"
+    job_specs["pass_reports"] = [{"pass_nr": 1, "report_cid": "QmPass1", "risk_score": 0}]
+    plugin.r1fs.get_json.return_value = {
+      "pass_nr": 1, "aborted": True, "abort_phase": "authentication", "abort_reason": "login failed",
+      "abort_reason_class": "auth_failed", "worker_scan_metrics": {"worker-A": {"scan_metrics": {}}}}
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual((job_specs["job_status"], job_specs["failure_class"]), ("FAILED", "scan_aborted"))
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+
+  def test_continuous_finalizing_wedge_schedules_the_next_pass(self):
+    """I-268: a continuous job stuck in FINALIZING with its pass report goes back to RUNNING."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(job_pass=2, run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    job_specs["job_status"] = "FINALIZING"
+    job_specs["pass_reports"] = [
+      {"pass_nr": 1, "report_cid": "QmPass1", "risk_score": 10, "pass_changes_cid": "QmChanges1"},
+      {"pass_nr": 2, "report_cid": "QmPass2", "risk_score": 20, "pass_changes_cid": "QmChanges2"},
+    ]
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "RUNNING")
+    self.assertEqual(job_specs["next_pass_at"], 1000100.0 + 60)
+    self.assertEqual(len(job_specs["pass_reports"]), 2)
+    plugin._collect_node_reports.assert_not_called()
+    plugin._build_job_archive.assert_not_called()
+
+  def test_continuous_stale_collecting_on_a_later_pass_is_recovered(self):
+    """I-268: an earlier pass's report does not block recovery of the current pass."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(job_pass=2, run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    job_specs["job_status"] = "COLLECTING"
+    job_specs["pass_reports"] = [{"pass_nr": 1, "report_cid": "QmPass1", "risk_score": 10}]
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual([ref["pass_nr"] for ref in job_specs["pass_reports"]], [1, 2])
+    self.assertEqual(job_specs["job_status"], "RUNNING")
+    plugin._collect_node_reports.assert_called_once()
+
   def test_cstore_risk_score_updated(self):
     """After pass, risk_score on CStore matches pass result."""
     PentesterApi01Plugin = self._get_plugin_class()
