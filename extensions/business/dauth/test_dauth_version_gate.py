@@ -76,6 +76,32 @@ def _check(server_version, sender_version):
 
 class DauthVersionGateTests(unittest.TestCase):
 
+  def test_release_preserves_the_previous_admission_boundary(self):
+    """Preserve the Edge 2.10.840 sender boundary on the current release.
+
+    Use explicit sender builds so an unintended change to the computed
+    minimum cannot update the expected outcomes at the same time.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> DauthVersionGateTests().test_release_preserves_the_previous_admission_boundary()
+    """
+    # Exercise both sides of the prior policy and the previous and current release builds.
+    for sender_version, accepted in (("2.10.830", False), ("2.10.831", True),
+                                     ("2.10.840", True), ("2.10.841", True)):
+      # Identify an individual sender's outcome if the boundary moves.
+      with self.subTest(sender_version=sender_version):
+        # Judge every sender against the current Edge release.
+        self.assertEqual(_check(EDGE_VERSION, sender_version).result, accepted)
+
   def test_minimum_release_is_served_by_every_newer_server(self):
     """A node on the minimum release is served by a server 10, 20 or a minor version ahead."""
     # Each server release ahead of the sender.

@@ -41,14 +41,11 @@ DAUTH_SECRET_REQUEST_MAX_AGE_SECONDS = 120
 DAUTH_SECRET_REVEAL_ACTION = "reveal_job_secrets"
 DAUTH_VIEW_SECRETS_PERMISSION = 1 << 4
 DEEPLOY_WALLET_MESSAGE_PREFIX = "Please sign this message for Deeploy: "
-# The oldest node release dAuth serves. The gate used to refuse every sender 10 or more build numbers
-# behind the answering server; releases are 10 or 20 build numbers apart, so a node one release behind
-# was refused whenever it started during a rolling update. A named release does not move when a server
-# is updated. Raise it on purpose, at a release, and keep it below that release: a minimum equal to
-# the release refuses the previous one again (test_dauth_version_gate.py checks the form and that bound).
-# The same tests fail once the minimum is more than 30 build numbers behind the release in ver.py, so
-# that it is raised and does not serve older and older nodes unnoticed.
-DAUTH_MIN_SENDER_APP_VERSION = "2.10.710"
+# Preserve the sender boundary of Edge 2.10.840, whose relative gate refused senders
+# 10 or more builds behind. The named minimum stays fixed when servers are updated.
+# The freshness test in test_dauth_version_gate.py requires a deliberate review
+# before a release moves more than 30 builds beyond the minimum.
+DAUTH_MIN_SENDER_APP_VERSION = "2.10.831"
 
 
 def version_to_int(version):
@@ -206,11 +203,11 @@ class _DauthMixin(object):
 
     Examples
     --------
-    >>> self.ee_ver, self.ee_core_ver, self.ee_sdk_ver = "2.10.730", "7.7.357", "3.5.71"
-    >>> self.version_check("2.10.720", "7.7.357", "3.5.71").result
+    >>> self.ee_ver, self.ee_core_ver, self.ee_sdk_ver = "2.10.841", "7.7.365", "3.5.74"
+    >>> self.version_check("2.10.831", "7.7.365", "3.5.74").result
     True
-    >>> self.version_check("2.10.700", "7.7.357", "3.5.71").message
-    ' FAIL: Sender app version 2.10.700 is too old (minimum: 2.10.710).'
+    >>> self.version_check("2.10.830", "7.7.365", "3.5.74").message
+    ' FAIL: Sender app version 2.10.830 is too old (minimum: 2.10.831).'
     """
     #
     output = VersionCheckData(result=True, message="")
