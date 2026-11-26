@@ -1,12 +1,12 @@
 {
   "schema": 1,
   "repo": "Ratio1/redmesh-vulndb",
-  "build_id": "vulndb-f6f8fe8dd084",
-  "built_at": "2026-11-24T11:35:45Z",
+  "build_id": "vulndb-cad0d0bad0bc",
+  "built_at": "2026-11-26T12:23:49Z",
   "asset": "vulndb.sqlite.zst",
-  "sha256": "2c1585e62c832689fb07cae66934be684ca6287b4db3f27eb14b73f03735cf9d",
-  "size_zst": 575508,
-  "sha256_sqlite": "bd9aa4cf077ddae33a39c20727447349f5de2dd7a94f1571db4d4a050ed53b71",
-  "size": 6225920,
-  "content_hash": "f99ab79df108a7d468c6761ba89f2772c17d84ef64875e60cb797e9f55b3b293"
+  "sha256": "5eb28a9b9eeb640532cfdf9107fd77b13f6400481ab6f3a06803baecc4caf8b3",
+  "size_zst": 573299,
+  "sha256_sqlite": "179501101dfe1998c41a8013060ba1946ddb647f10a21fd988fbf8ccde64b26a",
+  "size": 6234112,
+  "content_hash": "a5d48f871839e7d5ed059e22f1dc5a6dd21242f7233d27bf9ab6cf04aeebacee"
 }
