@@ -20,7 +20,7 @@ Notify app owners before rollout. Upgrade nodes (Core and runners), then coordin
 4. Add exactly one public polling endpoint. It returns progress, per-node and per-plugin state, errors, recent events, and recovery status together. Do not add separate status, history, event-stream, or discovery endpoints.
 5. Show deployment progress across every target node in Deeploy, including errors, cleanup, and restoration progress. Polling is sufficient; SSE and WebSockets are outside this scope.
 6. A create succeeds only when every required instance on every planned target node is ready. If a source-following workload is kept, commit the revision with outcome `waiting_for_source`. On a terminal failure, stop its pipeline on nodes where it started and prevent pending starts from completing afterward.
-7. A terminal update failure stops the rollout and restores the previous configuration. A kept workload failure commits the new revision and releases the previous revision's secrets.
+7. A failed update stops the rollout and restores the previous configuration after every required stop is confirmed. A kept workload failure commits the new revision and releases the previous revision's secrets.
 8. All affected components will be deployed together. No legacy deployment response handling, opt-in asynchronous flags, dual deployment protocols, or migration scripts are required. Decision 14 defines the narrow exception for existing pipelines resolving secrets after restart.
 9. Implementation and pull requests are authorized from current `develop` (Edge/frontend) and `main` (Core). Live deployments, chain writes, remote configuration changes, and production data changes remain outside scope.
 10. **2026-10-14 implementation clarification:** the coordinator is the oracle receiving each create/update request. Do not implement distributed locking, consensus, stable coordinator assignment, or automatic failover. Polling remains available through any oracle. Concurrent submissions through different oracles are not globally serialized; the client must reuse a request ID and discover an existing operation before deliberate retries.
@@ -337,6 +337,8 @@ cleanup uses the existing paid-job reuse validation, even when independent
 monitoring already recorded that job as started. Owner and resource validation
 still apply. Incomplete cleanup, unrelated jobs/owners, and newer successful
 operations do not grant this reuse permission.
+
+After a blocked create ends, the coordinator can still confirm cleanup once it has revoked the abandoned deploy revision and received signed stop evidence for the exact attempt from every planned worker. It checks its local reports once a minute and preserves the final failure and its original `unconfirmed_nodes`. Only the cleanup state changes, and the user can then submit a manual retry. Late reports never trigger more workload commands for an ended operation.
 
 Deployment operations do not prepare, broadcast, reconcile, cancel or track blockchain transactions. Completion and subsequent operation admission depend only on the coordinator's runtime, metadata and recovery state. Polling does not expose settlement fields, and the UI does not show settlement indicators.
 

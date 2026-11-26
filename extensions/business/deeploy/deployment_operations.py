@@ -53,6 +53,8 @@ OPEN_REPAIR_SECONDS = 600
 # Extra phase deadlines an ordinary blocked operation may spend waiting for signed evidence.
 BLOCKED_RECOVERY_GRACE_PERIODS = 24
 BLOCKED_OPERATION_ENDED = "BLOCKED_OPERATION_ENDED"
+# Check for worker receipts that reach an ended paid create after its terminal failure.
+ENDED_CREATE_CLEANUP_CHECK_SECONDS = 60
 class DeploymentAuthenticationError(ValueError):
   """The reusable read authorization is invalid or expired."""
 
@@ -548,6 +550,9 @@ def with_observed_legacy_metadata_order(pipeline, observed):
 
 class _DeploymentOperationsMixin:
   """Persist, execute, recover, and present asynchronous deployment operations."""
+
+  # The worker owns the cadence. Restarting permits one immediate read of the local receipts.
+  _last_ended_create_cleanup_check = None
 
   def _init_deployment_operations(self):
     """Start the independent execution worker and initialize bounded caches.
@@ -2053,6 +2058,45 @@ class _DeploymentOperationsMixin:
       operation["abandoned_deploy_revocation_pending"] = True
     self._save_operation(operation, "completed", message)
 
+  def _confirm_ended_create_cleanup(self, operation):
+    """Confirm late cleanup for an ended paid create using signed receipts.
+
+    A positive result leaves the failure and its recorded shutdown gaps in
+    history, while allowing the user to submit a new paid-job request.
+
+    Parameters
+    ----------
+    operation : dict
+      Coordinator-owned terminal snapshot with revocation already confirmed.
+
+    Returns
+    -------
+    bool
+      Whether a new snapshot confirming cleanup was persisted.
+
+    Examples
+    --------
+    >>> plugin._confirm_ended_create_cleanup(operation)  # doctest: +SKIP
+    True
+    """
+    # Other terminal operation types keep their original recovery state.
+    if (operation["kind"] != "create" or operation.get("blocked_phase") != "stopping_failed_rollout"
+        or operation.get("recovery") != "blocked"):
+      return False
+    # A replica can receive old or foreign receipts. Only the newest verified report for each planned worker counts.
+    reports = self._node_operation_reports(operation, "deploy")
+    for node in operation["nodes"]:
+      report = reports.get(node, {})
+      if report.get("status") != "stopped":
+        return False
+      # An empty signed report proves the worker fenced an absent attempt. Otherwise check its full instance set.
+      if report.get("instances") != [] and not report_confirms_retirement(report, operation["instances"][node]):
+        return False
+    # Only the recovery state changes. The terminal reason, phase, and original unresolved addresses remain recorded.
+    operation["recovery"] = "completed"
+    self._save_operation(operation, message="All attempted workers later confirmed shutdown; cleanup is complete.")
+    return True
+
   def _fail_deployment_rollout(self, operation, code, message):
     """Schedule cleanup of a deployment that cannot finish.
 
@@ -2258,6 +2302,12 @@ class _DeploymentOperationsMixin:
       if finished.is_set():
         self._deployment_preparations.pop(operation_id)
     own = [copy.deepcopy(operation) for operation in self._operation_records(own_only=True).values()]
+    # A single clock drives passive receipt checks, independent of command and custody retries.
+    last = self._last_ended_create_cleanup_check
+    now = self.time()
+    check_ended_create_cleanup = last is None or not 0 <= now - last < ENDED_CREATE_CLEANUP_CHECK_SECONDS
+    if check_ended_create_cleanup:
+      self._last_ended_create_cleanup_check = now
     # Keep a custody wait only for an operation still read here, so one whose records are gone leaves no
     # entry behind and the map never holds more than this oracle's own operations.
     self._custody_retry = {operation["operation_id"]: self._custody_retry[operation["operation_id"]]
@@ -2285,7 +2335,12 @@ class _DeploymentOperationsMixin:
           # Retry only custody after a terminal failure. Workload commands never resume for the ended operation.
           self._deployment_secret_request("revoke", operation, active_attempt=None)
           operation.pop("abandoned_deploy_revocation_pending")
-          self._save_operation(operation)
+          # Authenticated stop receipts can arrive before custody responds. Check them immediately after release.
+          if not self._confirm_ended_create_cleanup(operation):
+            self._save_operation(operation)
+        elif check_ended_create_cleanup and self._confirm_ended_create_cleanup(operation):
+          # The new snapshot was replicated by the save; no further repair is due on this pass.
+          continue
         # For 600 s after completion, oracles that missed the final snapshot get it too, as before.
         elif age < 600:
           # No age of REPAIR_AGES is served yet, also when this is the first pass after a restart: 600 s is sent.

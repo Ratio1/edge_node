@@ -7,7 +7,7 @@ from ratio1.const.base import dAuth
 # The error type of a secret record the chain store refused for its size.
 from extensions.business.dauth.deployment_secrets import DeploymentSecretRecordTooLarge
 from extensions.business.deeploy.tests.lifecycle_custody_support import (
-  Coordinator, Custodian, State, pipeline, connect, report,
+  Coordinator, Custodian, Engine, State, pipeline, connect, report,
 )
 
 
@@ -240,6 +240,80 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.assertNotIn('abandoned_deploy_revocation_pending', self.operation())
     self.assertEqual(self.state.public['DEEPLOY_DEPLOYED_JOBS', '7'], cid)
     self.assertNotIn('restore', [cmd['DEEPLOY_OPERATION']['attempt'] for _, cmd in self.coordinator.commands])
+
+  def test_late_signed_create_stops_unlock_paid_retry_only_after_custody_release(self):
+    """Verify that late receipts can complete cleanup without resuming execution.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> LifecycleDauthCustodyTests('test_late_signed_create_stops_unlock_paid_retry_only_after_custody_release').run()
+    """
+    # Admit a paid create whose worker misses both readiness and cleanup deadlines.
+    self.admit()
+    operation = self.operation()
+    self.coordinator._advance_deployment_operation(operation)
+    self.state.now = operation['deadline']
+    self.coordinator._advance_deployment_operation(operation)
+    self.state.now += 25 * self.coordinator.cfg_deployment_readiness_timeout
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual((operation['phase'], operation['outcome'], operation['recovery']), ('completed', 'failed', 'blocked'))
+    commands = len(self.coordinator.commands)
+    # A signed stop by itself does not release the retry if custody cannot yet revoke the abandoned revision.
+    report(self.state, operation, 'deploy', 'stopped')
+    deploy = '7|' + operation['operation_id'] + ':deploy'
+    self.state.fail_write = lambda namespace, field: 'before' if field == deploy + '|revoked' else None
+    self.coordinator._reconcile_coordinator_operations()
+    self.assertEqual(self.operation()['recovery'], 'blocked')
+    request = {'job_id': 7, 'request_id': 'retry', 'expected_revision': 0}
+    with self.assertRaisesRegex(ValueError, 'unconfirmed cleanup'):
+      self.coordinator._find_request_operation(request, 'owner', 'create')
+    # A valid signature for the wrong revision cannot prove this attempt stopped.
+    receipt = self.state.public['DEEPLOY_NODE_OPERATIONS', 'A|deploy']
+    exact = copy.deepcopy(receipt)
+    receipt['revision'] += 1
+    Engine('A').sign(receipt)
+    self.state.fail_write = None
+    self.state.now += 10
+    self.coordinator._reconcile_coordinator_operations()
+    self.assertTrue(self.state.secrets['DAUTH_JOB_SECRET_REVISIONS', deploy]['revoked'])
+    self.assertEqual(self.operation()['recovery'], 'blocked')
+    # A fresh matching aggregate with an individually running instance also leaves the retry locked.
+    partial = copy.deepcopy(exact)
+    partial['instances'][0]['status'] = 'stopping'
+    Engine('A').sign(partial)
+    self.state.public['DEEPLOY_NODE_OPERATIONS', 'A|deploy'] = partial
+    self.state.now += 60
+    self.coordinator._reconcile_coordinator_operations()
+    self.assertEqual(self.operation()['recovery'], 'blocked')
+    # Matching signed evidence completes cleanup without changing the terminal outcome, or sending any command.
+    self.state.now += 60
+    report(self.state, operation, 'deploy', 'stopped')
+    self.coordinator._reconcile_coordinator_operations()
+    ended = self.operation()
+    self.assertEqual((ended['phase'], ended['outcome'], ended['recovery']), ('completed', 'failed', 'completed'))
+    self.assertEqual(ended['error']['code'], 'BLOCKED_OPERATION_ENDED')
+    self.assertEqual(ended['unconfirmed_nodes'], ['A'])
+    self.assertEqual(len(self.coordinator.commands), commands)
+    self.assertIsNone(self.coordinator._find_request_operation(request, 'owner', 'create'))
+
+    # Reuse the paid job with a fresh request and prove its new revision completes normally.
+    accepted = self.coordinator._admit_prepared_deployment(
+      request=request, auth_result={'escrow_owner': 'owner'}, app_id='app', configs={'A': pipeline('retry-token')},
+      prior_pipeline=None, is_create=True,
+    )
+    self.assertEqual(accepted['status_code'], 202)
+    retry = self.coordinator._operation_records()[accepted['operation_id']]
+    self.assertNotEqual(retry['operation_id'], operation['operation_id'])
+    self.finalize(retry)
+    self.assertEqual((retry['job_id'], retry['outcome']), (operation['job_id'], 'succeeded'))
 
   def test_first_update_without_bundle_preserves_plaintext_values(self):
     previous, cid = self.legacy('old-token', with_bundle=False)
