@@ -6,6 +6,7 @@ keeping the existing probe-facing ``requests.Session`` shape.
 
 from __future__ import annotations
 
+import contextlib
 import posixpath
 import time
 from collections.abc import Mapping
@@ -616,12 +617,18 @@ class GrayboxHttpClient:
     """
     self._recover = fn
 
-  def _recover_session(self, session, response):
+  @contextlib.contextmanager
+  def recovery_paused(self):
+    """No recovery hook for requests sent inside (the manager's own checks and logins)."""
     self._recovering = True
     try:
-      return self._recover(session, response)
+      yield
     finally:
       self._recovering = False
+
+  def _recover_session(self, session, response):
+    with self.recovery_paused():
+      return self._recover(session, response)
 
   def _backoff_wait(self, method, response, retries, deadline, allowed):
     """Seconds to wait before retrying a throttled safe request, or None for no retry."""
@@ -700,14 +707,16 @@ class GrayboxHttpClient:
         outcome = self._recover_session(session, response)
         if outcome in ("lost", "reauthenticated"):
           recovered = True
+          # Any renewal degrades the run: CSRF tokens and flow cookies a probe read before it no
+          # longer match, so a later denial is not evidence of a guard.
+          if self._safety is not None:
+            self._safety.note_degraded(
+              "session_lost" if outcome == "lost" else "session_reauthenticated")
+          # Only GET/HEAD/OPTIONS are replayed; a POST returns its original response.
           if outcome == "reauthenticated" and method.upper() in _RETRYABLE_METHODS:
             response.close()
             retrying = True
             continue
-          # A POST is never replayed: the caller sees the original response, flagged degraded.
-          if self._safety is not None:
-            self._safety.note_degraded(
-              "session_lost" if outcome == "lost" else "session_reauthenticated")
       # An exempt hop (rollback, cleanup logout) is never backoff-retried: no sleep outlives a stop.
       wait = self._backoff_wait(method, response, retries, deadline,
                                 throttle_retry and not budget_exempt)

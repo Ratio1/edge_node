@@ -15,6 +15,7 @@ subphases route to `BearerAuth` / `ApiKeyAuth` based on
 `target_config.api_security.auth.auth_type`.
 """
 
+import contextlib
 import dataclasses
 import re
 import time
@@ -143,7 +144,11 @@ class AuthManager:
     if (self._authenticated_probe_path()
         and time.time() - self._liveness_checked_at >= self.LIVENESS_CHECK_SECONDS):
       self._liveness_checked_at = time.time()
-      valid, retryable = self._validate_authenticated_session(self.primary_session)
+      # Paused hook: a dead session here gets the full logout and login, not an in-place renewal.
+      paused = (self.http_client.recovery_paused() if self.http_client is not None
+                else contextlib.nullcontext())
+      with paused:
+        valid, retryable = self._validate_authenticated_session(self.primary_session)
       # Only a redirect, a 401/403, or a 2xx without the configured marker or
       # identity (a 200 login page at the probe path) means the session ended;
       # a 429 or 5xx on the probe path is the target struggling, not a logout.

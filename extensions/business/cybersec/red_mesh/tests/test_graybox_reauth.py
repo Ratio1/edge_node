@@ -75,7 +75,7 @@ class TestClientRecoveryHook(unittest.TestCase):
     self.assertEqual(budget.remaining, 48)
     self.assertEqual(hook.call_count, 1)  # the replayed 401 does not recover again
     self.assertEqual(response.status_code, 401)
-    self.assertEqual(safety.refusals, 0)
+    self.assertEqual((safety.refusals, safety.last_refusal), (1, "session_reauthenticated"))
 
   def test_post_is_not_replayed_and_is_flagged(self):
     clock, safety, _b, client, session, _hook = self._client(
@@ -243,6 +243,14 @@ class TestFormRecovery(_ManagerCase):
     self.assertEqual(wrapper.get(BASE + "/dash/").status_code, 200)
     self.assertEqual(wrapper.cookies.get("sessionid"), "s2")
 
+  def test_dead_session_between_families_gets_a_full_login_not_a_renewal(self):
+    auth = self.manager(_config(authenticated_probe_path="/api/me"))
+    self.login(auth)
+    self.app.valid_cookies.clear()  # cookie stays, session gone
+    auth._liveness_checked_at = 0.0  # the next family's liveness check is due
+    self.assertTrue(auth.needs_refresh())
+    self.assertEqual((auth._reauth_count, self.app.logins), ({}, 1))
+
   def test_alive_verdict_is_cached_so_denials_cost_one_check(self):
     auth = self.manager(_config(authenticated_probe_path="/api/me"))
     wrapper = self.login(auth)
@@ -399,6 +407,7 @@ class TestBearerRefresh(_ManagerCase):
     self.assertTrue(auth.ensure_sessions(self.creds()))
     self.assertEqual(auth.official_session.headers["Authorization"], "Bearer tok-new-AAA")
     self.assertEqual(self.app.grants, [self.OLD_RT])
+    self.assertEqual(auth._reauth_count, {})  # the login-time refresh, not the mid-family hook
 
   def test_bearer_401_skips_the_alive_cache_but_a_403_keeps_it(self):
     auth = self.bearer()
