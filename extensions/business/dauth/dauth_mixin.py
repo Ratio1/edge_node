@@ -1245,9 +1245,8 @@ class _DauthMixin(object):
 
     Raises
     ------
-    ValueError
-      When the merged auth env keys or predefined keys are None. A configured value of None
-      already fails earlier, with a TypeError, when it is merged with the defaults.
+    TypeError
+      When a configured auth key collection cannot be merged with the defaults, including a null value.
 
     Notes
     -----
