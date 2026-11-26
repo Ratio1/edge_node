@@ -7,6 +7,7 @@ import ftplib
 import requests
 import ssl
 from datetime import datetime
+from urllib.parse import urlparse
 
 import paramiko
 
@@ -380,6 +381,34 @@ def _smtp_banner_verdict(mta, ehlo_features):
 class _ServiceCommonMixin(_ServiceProbeBase):
   """HTTP, FTP, SSH, SMTP, Telnet and Rsync service probes."""
 
+  def _record_web_root(self, port, url, resp):
+    """RM-265: facts for the host-level "HTTP without redirect to HTTPS" rule, from a GET already sent.
+
+    `location_scheme` is read only from a 3xx first answer (a Location on a 200 redirects nothing);
+    `same_host` is False when the redirect chain ended on another host. Never raises: a bad
+    response leaves the probe as it was.
+    """
+    try:
+      meta = (getattr(self, "state", None) or {}).get("scan_metadata")
+      if meta is None:
+        return
+      history = resp.history if isinstance(resp.history, (list, tuple)) else ()
+      first = history[0] if history else resp
+      location = str(first.headers.get("Location") or "") if 300 <= first.status_code < 400 else ""
+      final_url = urlparse(str(resp.url))
+      meta.setdefault("web_root", {})[port] = {
+        "url": url,
+        "status": first.status_code,
+        "location_scheme": (urlparse(location).scheme.lower() or None) if location else None,
+        "final_status": resp.status_code,
+        "final_scheme": final_url.scheme.lower() or None,
+        "same_host": final_url.hostname == urlparse(url).hostname,
+        "empty": not bytes(resp.content or b"").strip(),
+        "catch_all": None,
+      }
+    except Exception as exc:
+      self.P(f"web_root facts not recorded for port {port}: {type(exc).__name__}", color='y')
+
   @register_probe(
     display_name="HTTP service detection",
     description=(
@@ -428,6 +457,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       ua = getattr(self, 'scanner_user_agent', '')
       headers = {'User-Agent': ua} if ua else {}
       resp = requests.get(url, timeout=self._target_timeout(5), verify=False, allow_redirects=True, headers=headers)
+
+      if scheme == "http":
+        self._record_web_root(port, url, resp)
 
       result["banner"] = f"HTTP {resp.status_code} {resp.reason}"
       result["server"] = resp.headers.get("Server")
@@ -566,7 +598,11 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     dangerous = []
     statuses = {}
     host_is_catch_all = getattr(self, "_host_is_catch_all", None)
-    if host_is_catch_all is not None and host_is_catch_all(url):
+    catch_all = host_is_catch_all(url) if host_is_catch_all is not None else None
+    _root = (((getattr(self, "state", None) or {}).get("scan_metadata") or {}).get("web_root") or {}).get(port)
+    if _root is not None:
+      _root["catch_all"] = None if catch_all is None else bool(catch_all)
+    if catch_all:
       for method in methods:
         self._withhold_on_catch_all(url, "_service_info_http", f"{method} /")
       result["dangerous_methods_withheld"] = "catch_all"
@@ -1905,18 +1941,6 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       "system_info": None,
     }
 
-    findings.append(Finding(
-      severity=Severity.MEDIUM,
-      cvss_vector=V.WEAK_TRANSPORT,
-      title="Telnet service is running (unencrypted remote access).",
-      description="Telnet transmits all data including credentials in cleartext.",
-      evidence=f"Telnet port {port} is open on {target}.",
-      remediation="Replace Telnet with SSH for encrypted remote access.",
-      owasp_id="A02:2021",
-      cwe_id="CWE-319",
-      confidence="certain",
-    ))
-
     # --- 1. Banner grab + IAC negotiation parsing ---
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1938,7 +1962,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     i = 0
     text_parts = []
     while i < len(raw):
-      if raw[i] == 0xFF and i + 2 < len(raw):
+      if raw[i] == 0xFF and i + 2 < len(raw) and 250 <= raw[i + 1] <= 254:  # IAC SB/WILL/WONT/DO/DONT <option>
         cmd = cmd_names.get(raw[i + 1], f"CMD_{raw[i+1]}")
         opt = opt_names.get(raw[i + 2], f"OPT_{raw[i+2]}")
         iac_options.append(f"{cmd} {opt}")
@@ -1956,6 +1980,29 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     else:
       result["banner"] = "(no banner)"
     result["negotiation_options"] = iac_options
+
+    if banner_text or iac_options:
+      findings.append(Finding(
+        severity=Severity.MEDIUM,
+        cvss_vector=V.WEAK_TRANSPORT,
+        title="Telnet service is running (unencrypted remote access).",
+        description="Telnet transmits all data including credentials in cleartext.",
+        evidence=f"Telnet port {port} is open on {target}.",
+        remediation="Replace Telnet with SSH for encrypted remote access.",
+        owasp_id="A02:2021",
+        cwe_id="CWE-319",
+        confidence="certain",
+      ))
+    else:
+      findings.append(Finding(
+        severity=Severity.INFO,
+        title="Telnet port accepted a connection, no banner or negotiation",
+        description="The port accepted a TCP connection but sent no Telnet negotiation or banner.",
+        evidence=(f"Telnet port {port} on {target} sent {len(raw)} byte(s), no Telnet negotiation or text banner."
+                  if raw else f"Telnet port {port} on {target} sent no bytes."),
+        remediation="Verify the service on this port manually.",
+        confidence="tentative",
+      ))
 
     # --- 2–4. Default credential check with system fingerprint ---
     def _try_telnet_login(user, passwd, act=False):

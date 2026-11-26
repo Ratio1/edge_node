@@ -16,6 +16,7 @@ from functools import cmp_to_key
 from pathlib import Path
 
 from ..cve_db import _compare_debian_revision, _compare_versions, _parse_version
+from ..cvss_entries import cvss_v4_nomenclature
 from .models import SUPPORTED_MODELS
 
 DB_PATH = Path(__file__).resolve().parent / "vulndb.sqlite"
@@ -131,6 +132,7 @@ class VulndbReader:
     self._vulns = vulns
     self._exact = {}   # (product, normalised numbers, tail) -> [affected row]
     self._ranges = {}  # product -> [(clauses, affected row)]
+    self._products = None  # cve_id -> {product}, built on first `probe_record`
     self._exact_sorted = {}  # product -> [(key, affected row)] sorted by key, built on the first span query
     self._distro = {}  # (distro, product) -> {cve_id: [(release, package, status, fixed_version, source)]}
     self._distro_releases = {}  # (distro, product) -> {upstream: {release}}, from the rows that name a fixed version
@@ -176,6 +178,25 @@ class VulndbReader:
     """KEV flag of `cve_id` in this build; None when the build has no `vuln` row for it."""
     vuln = self._vulns.get(cve_id)
     return None if vuln is None else bool(vuln[Match._fields.index("kev") - Match._fields.index("title")])
+
+  def probe_record(self, cve_id):
+    """`(epss, cvss, products)` of `cve_id` in this build, for a finding a probe confirmed itself; None when the build
+    has no `vuln` row for it. `cvss` is the `{version, vector, score, source}` list; `products` the sorted products
+    the build's affected rows name for the CVE (rows that do not parse are not counted, as in `query`)."""
+    vuln = self._vulns.get(cve_id)
+    if vuln is None:
+      return None
+    if self._products is None:
+      products = {}
+      for rows in self._exact.values():
+        for row in rows:
+          products.setdefault(row[0], set()).add(row[1])
+      for rows in self._ranges.values():
+        for _, row in rows:
+          products.setdefault(row[0], set()).add(row[1])
+      self._products = products  # one assignment: probes run on worker threads
+    return vuln[Match._fields.index("epss") - Match._fields.index("title")], self._cvss.get(cve_id, ()), \
+      tuple(sorted(self._products.get(cve_id, ())))
 
   def _release(self, package, product):
     """The release a node's package belongs to, or None (unknown, or more than one candidate)."""
@@ -389,8 +410,10 @@ def load_reader(db_path=DB_PATH, pin_path=PIN_PATH):
       rows = (row for row in conn.execute(_AFFECTED) if row[0] in vulns)
       cvss = {}
       for cve_id, version, vector, score, source in _optional(conn, _CVSS):
-        cvss.setdefault(cve_id, []).append(
-          {"version": version, "vector": vector, "score": score, "source": source})
+        entry = {"version": version, "vector": vector, "score": score, "source": source}
+        if version == "4.0" and isinstance(vector, str):
+          entry["nomenclature"] = cvss_v4_nomenclature(vector)  # RM-170: findings carry the v4.0 nomenclature
+        cvss.setdefault(cve_id, []).append(entry)
       cvss = {k: tuple(v) for k, v in cvss.items()}
       eol = dict(_optional(conn, _EOL))
       # A file without the snapshot key of a distribution, or without the table (schema 1.0.0), has no data for it.

@@ -20,8 +20,8 @@ def _probe(magic, shares=()):
 class TestSmb2OnlyEnumeration(unittest.TestCase):
   def test_smb2_negotiated_without_shares_records_reason_and_logs(self):
     result, w = _probe(b"\xfeSMB")
-    self.assertEqual(result["shares_error"], "SMB2 negotiated; SMBv1 share enumeration returned no shares")
-    self.assertTrue(any("returned no shares" in str(c) for c in w.P.call_args_list))
+    self.assertEqual(result["shares_error"], "SMB2 negotiated; no shares via SMB1")
+    self.assertTrue(any("no shares via SMB1" in str(c) for c in w.P.call_args_list))
 
   def test_smb1_server_without_shares_records_no_reason(self):
     result, _ = _probe(b"\xffSMB")

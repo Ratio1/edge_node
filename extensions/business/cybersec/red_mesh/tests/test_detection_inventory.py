@@ -11,6 +11,7 @@ from extensions.business.cybersec.red_mesh.constants import NETWORK_FEATURE_METH
 from extensions.business.cybersec.red_mesh.cve_db import check_cves
 from extensions.business.cybersec.red_mesh.detection_inventory import build_detection_inventory
 from extensions.business.cybersec.red_mesh.graybox.scenario_catalog import (
+  GRAYBOX_NOT_IMPLEMENTED,
   GRAYBOX_SCENARIO_CATALOG,
   attack_for_scenario,
 )
@@ -114,14 +115,29 @@ class TestDetectionInventory(unittest.TestCase):
               source_ids.add(candidate.value)
     return source_ids
 
-  def test_existing_graybox_emitted_scenarios_are_registered(self):
+  @classmethod
+  def _collect_source_ids(cls):
+    """Scenario ids the graybox source emits: the AST scan plus the `scenario_id=` regex over graybox/."""
     redmesh_root = Path(__file__).resolve().parents[1]
-    source_ids = self._collect_ast_scenario_ids(redmesh_root)
+    source_ids = cls._collect_ast_scenario_ids(redmesh_root)
     for path in (redmesh_root / "graybox").rglob("*.py"):
-      source_ids.update(self._SCENARIO_ID_RE.findall(path.read_text()))
+      source_ids.update(cls._SCENARIO_ID_RE.findall(path.read_text()))
+    return source_ids
+
+  def test_existing_graybox_emitted_scenarios_are_registered(self):
+    source_ids = self._collect_source_ids()
     catalog_ids = {entry["id"] for entry in GRAYBOX_SCENARIO_CATALOG}
     self.assertTrue(source_ids)
     self.assertEqual(source_ids - catalog_ids, set())
+
+  def test_catalog_partitions_into_runner_emitted_and_not_implemented(self):
+    """Every catalog id is emitted by a runner or listed not-implemented, never both."""
+    source_ids = self._collect_source_ids()
+    catalog_ids = {entry["id"] for entry in GRAYBOX_SCENARIO_CATALOG}
+    self.assertEqual(GRAYBOX_NOT_IMPLEMENTED - catalog_ids, set())
+    self.assertEqual(catalog_ids - source_ids - GRAYBOX_NOT_IMPLEMENTED, set())
+    self.assertEqual(GRAYBOX_NOT_IMPLEMENTED & source_ids, set())
+    self.assertEqual(len(GRAYBOX_NOT_IMPLEMENTED), 42)
 
   def test_api_probe_modules_use_emit_helpers_for_findings(self):
     """New API probe families should not bypass central emission helpers."""

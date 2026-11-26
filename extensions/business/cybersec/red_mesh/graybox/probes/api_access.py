@@ -84,7 +84,7 @@ class ApiAccessProbes(ProbeBase):
     found_any = False
     for ep in endpoints:
       for test_id in ep.test_ids:
-        if not self.budget():
+        if not self.budget_available():
           self.emit_inconclusive(
             "PT-OAPI1-01",
             "API object-level authorization bypass (BOLA)",
@@ -93,7 +93,6 @@ class ApiAccessProbes(ProbeBase):
           )
           return
         url = self._render_object_url(ep, test_id)
-        self.safety.throttle()
         try:
           resp = session.get(url, timeout=10, allow_redirects=False)
         except requests.RequestException as exc:
@@ -216,6 +215,7 @@ class ApiAccessProbes(ProbeBase):
       self.emit_vulnerable(
         "PT-OAPI1-01", title, "MEDIUM", owasp, cwe, evidence,
         replay_steps=replay,
+        response=resp,
         remediation=(
           "Enforce per-object authorization on the endpoint: verify that "
           "the requester owns the object (or shares its tenant) before "
@@ -343,14 +343,13 @@ class ApiAccessProbes(ProbeBase):
       if (ep.method or "GET").upper() not in ("GET", "HEAD"):
         continue
 
-      if not self.budget():
+      if not self.budget_available():
         self.emit_inconclusive(
           scenario_id, title, owasp, "budget_exhausted",
         )
         return found_any
 
       url = self.target_url + ep.path
-      self.safety.throttle()
       try:
         resp = session.get(url, timeout=10, allow_redirects=False)
       except requests.RequestException:
@@ -472,11 +471,12 @@ class ApiAccessProbes(ProbeBase):
 
       def mutate(base, _ep=ep, _url=url, _method_fn=method_fn,
                  _evidence=evidence):
-        if not self.budget():
-          return False
-        self.safety.throttle()
+        # Plain request plus the override request: all or nothing.
+        if not self.budget_available(2):
+          raise RuntimeError("budget_exhausted")
         try:
-          plain_resp = _method_fn(_url, timeout=10, allow_redirects=False)
+          plain_resp = _method_fn(_url, timeout=10, allow_redirects=False,
+                                      throttle_retry=False)
         except requests.RequestException:
           return self.MUTATION_ATTEMPTED_UNKNOWN
         base["plain_status"] = plain_resp.status_code
@@ -488,9 +488,6 @@ class ApiAccessProbes(ProbeBase):
           base["plain_mutating_method_unexpected_status"] = plain_resp.status_code
           return False
 
-        if not self.budget():
-          return False
-        self.safety.throttle()
         try:
           resp = session.post(
             _url, headers={"X-HTTP-Method-Override": "GET"},
@@ -580,11 +577,10 @@ class ApiAccessProbes(ProbeBase):
         return {"method": method, "ep_path": _ep.path}
 
       def mutate(base, _url=url, _method_fn=method_fn):
-        if not self.budget():
-          return False
-        self.safety.throttle()
+        if not self.budget_available():
+          raise RuntimeError("budget_exhausted")
         try:
-          resp = _method_fn(_url, timeout=10)
+          resp = _method_fn(_url, timeout=10, throttle_retry=False)
         except requests.RequestException:
           return self.MUTATION_ATTEMPTED_UNKNOWN
         base["mutate_status"] = resp.status_code
@@ -617,11 +613,9 @@ class ApiAccessProbes(ProbeBase):
       )
 
   def _revert_function_endpoint(self, session, revert_url, ep) -> bool:
-    if not self.cleanup_budget():
-      return False
-    self.safety.throttle()
     try:
-      resp = session.post(revert_url, json=ep.revert_body or {}, timeout=10)
+      resp = session.post(revert_url, json=ep.revert_body or {}, timeout=10,
+                          budget_exempt=True)
     except requests.RequestException:
       return False
     return resp.status_code < 400

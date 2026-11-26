@@ -3,7 +3,7 @@
 import unittest
 from unittest.mock import MagicMock
 
-from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient
+from .conftest import private_ok_client
 from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
   ApiSecurityConfig,
   AuthDescriptor,
@@ -26,7 +26,7 @@ class TestProtectedGatewayLayer(unittest.TestCase):
     return session
 
   def test_gateway_header_overrides_per_request_header(self):
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://api.example.com",
       target_config=_target_config(GatewayAuthDescriptor(
         auth_type="api_key",
@@ -49,7 +49,7 @@ class TestProtectedGatewayLayer(unittest.TestCase):
     self.assertNotIn("PROBE-OVERRIDE", str(headers))
 
   def test_gateway_query_param_overrides_per_request_param(self):
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://api.example.com",
       target_config=_target_config(GatewayAuthDescriptor(
         auth_type="api_key",
@@ -73,7 +73,7 @@ class TestProtectedGatewayLayer(unittest.TestCase):
     self.assertNotIn("PROBE-OVERRIDE", str(params))
 
   def test_gateway_query_param_removes_tampered_url_query_value(self):
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://api.example.com",
       target_config=_target_config(GatewayAuthDescriptor(
         auth_type="api_key",
@@ -98,7 +98,7 @@ class TestProtectedGatewayLayer(unittest.TestCase):
     self.assertNotIn("PROBE-OVERRIDE", str(params))
 
   def test_gateway_header_is_reapplied_on_redirect_follow_up(self):
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://api.example.com",
       allowlist=["/api/", "/login/"],
       target_config=_target_config(GatewayAuthDescriptor(
@@ -145,7 +145,7 @@ class TestLayeredAuthSessionComposition(unittest.TestCase):
         ),
       ),
     )
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://api.example.com",
       target_config=cfg,
       gateway_api_key="GATEWAY-KEY",
@@ -176,7 +176,7 @@ class TestLayeredAuthSessionComposition(unittest.TestCase):
         ),
       ),
     )
-    client = GrayboxHttpClient(
+    client = private_ok_client(
       "https://api.example.com",
       target_config=cfg,
       gateway_api_key="GATEWAY-KEY",

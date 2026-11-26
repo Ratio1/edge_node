@@ -46,6 +46,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .cvss_entries import cvss_entries, is_cvss_vector
 from .credential_redaction import redact_credential_text
 from .cve_view import apply_triage, build_cve_view, drop_closed, effective_kev, filter_listed, summarize_view
 from .models.finding_schema import is_coverage_result as _is_coverage_result
@@ -386,7 +387,9 @@ def _sanitize_finding(f: dict) -> dict:
     "confidence": _sanitize(f.get("confidence", ""), 32),
     "owasp_id": _sanitize(f.get("owasp_id", ""), 32),
     "cwe_id": _sanitize(f.get("cwe_id", ""), 32),
-    "cvss_vector": _sanitize(f.get("cvss_vector", ""), 120),
+    "cvss_vector": _sanitize(_cvss_vector_or_empty(f.get("cvss_vector")), 256),
+    "cvss_v4_vector": _sanitize(_cvss_vector_or_empty((_v4_entry(f) or {}).get("vector")), 256),
+    "cvss_v4_score": _safe_float((_v4_entry(f) or {}).get("score")),
     "cvss_score": _safe_float(f.get("cvss_score")),
     # KEV is a fact only when the dynamic reference cache consulted it; its
     # fetch timestamp is `cvss_data_freshness`. Otherwise it is unknown, not
@@ -412,6 +415,14 @@ def _sanitize_finding(f: dict) -> dict:
     # evidence at all, because nothing populated `evidence_items` for them.
   }
   return out
+
+
+def _cvss_vector_or_empty(v: Any) -> str:
+  return v if is_cvss_vector(v) else ""
+
+
+def _v4_entry(f: dict) -> dict | None:
+  return next((e for e in cvss_entries(f) if e["version"] == "4.0"), None)
 
 
 def _safe_float(v: Any) -> float | None:

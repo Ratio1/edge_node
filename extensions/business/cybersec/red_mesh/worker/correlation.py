@@ -7,9 +7,12 @@ OS mismatches, infrastructure leaks, and timezone drift.
 """
 
 import ipaddress
+from urllib.parse import urlparse
 
-from ..findings import Finding, Severity, probe_result
+from ..cve_view import FOLD_REASON, _subject, is_view_finding
+from ..findings import AffectedAsset, epss_band, Finding, Severity, probe_result
 from .. import cvss_vectors as V
+from ..models.finding_identity import content_hash
 from .probe_registry import register_probe, CATEGORY_CORRELATION
 
 
@@ -45,6 +48,135 @@ def _normalize_os_family(os_string):
     if keyword in lower:
       return family
   return os_string  # unknown — keep as-is for comparison
+
+
+def _port_ratio_fires(n_open, n_scanned):
+  """The port-ratio honeypot rule: more than half of the scanned ports and more than 20 are open."""
+  return bool(n_scanned) and n_open / n_scanned > 0.5 and n_open > 20
+
+
+# The host verdict folds rows, so its ratio rule needs a wide scan: a targeted list of service ports is nearly all
+# open on any real host (RM-268 vulhub regression 1469c783, D66). The per-worker indicator finding keeps the plain rule.
+HOST_RATIO_MIN_SCANNED = 1000
+
+
+def _os_mismatch(os_claims):
+  """True when the OS claims name more than one OS family."""
+  # Only claims the family map knows count: an unmapped string ("Cisco IOS ...") is no evidence of a second OS.
+  known = set(_OS_FAMILY_MAP.values())
+  families = {_normalize_os_family(os_string) for os_string in (os_claims or {}).values()}
+  return len(families & known) > 1
+
+
+def host_honeypot_verdict(report):
+  """`port_ratio`, `os_mismatch` or None for a merged report, over the whole host (D54).
+
+  The same two rules the per-worker checks use, applied to the job's merged `open_ports`, `ports_scanned`
+  (a count after the merge, a list on a worker) and `scan_metadata["os_claims"]`.
+  """
+  scanned = report.get("ports_scanned")
+  scanned = len(scanned) if isinstance(scanned, (list, set, tuple)) else (scanned or 0)
+  if scanned >= HOST_RATIO_MIN_SCANNED and _port_ratio_fires(len(report.get("open_ports") or ()), scanned):
+    return "port_ratio"
+  if _os_mismatch((report.get("scan_metadata") or {}).get("os_claims")):
+    return "os_mismatch"
+  return None
+
+
+def _demotable(row):
+  """A generated CVE row a host verdict may fold: not KEV, not `certain` (confirmed by behaviour), not folded yet."""
+  return (is_view_finding(row) and not row.get("kev") and row.get("confidence") != "certain"
+          and "honeypot_verdict=" not in str(row.get("evidence") or ""))
+
+
+def apply_host_honeypot_verdict(report):
+  """Fold the CVE rows of a merged job report when the host looks like a honeypot (RM-268 D42, D54). Returns the verdict.
+
+  Every copy of a row in `service_info` and `web_tests_info` becomes tentative `banner_unverified`, so no firm
+  copy survives the report's dedup and the RM-205 fold lists the row as folded, never dropped. The prior state
+  is kept as `demoted_from=<confidence>:<reason>` and the `finding_signature` is recomputed (as `confirm_cve`
+  does), so the engagement ledger sees the change; `finding_id` stays. Idempotent.
+  """
+  verdict = host_honeypot_verdict(report)
+  if not verdict:
+    return None
+  for section in ("service_info", "web_tests_info"):
+    for port, methods in (report.get(section) or {}).items():
+      for info in (methods or {}).values():
+        for row in info.get("findings", []) if isinstance(info, dict) else ():
+          if not _demotable(row):
+            continue
+          was = f"{row.get('confidence')}:{row.get('confidence_reason') or ''}"
+          row["confidence"], row["confidence_reason"] = "tentative", FOLD_REASON
+          marks = f"honeypot_verdict={verdict}" if was.endswith(f":{FOLD_REASON}") else f"honeypot_verdict={verdict}; demoted_from={was}"
+          row["evidence"] = f"{row['evidence']}; {marks}" if row.get("evidence") else marks
+          product, version = _subject(row)
+          try:
+            port_nr = int(port)
+          except (TypeError, ValueError):
+            port_nr = None
+          row["finding_signature"] = content_hash(
+            # Same payload `confirm_cve` hashes: `Finding._identity_payload` bands the EPSS score (risk.py does the same).
+            {**row, "probe": f"cve:{product}", "port": port_nr, "epss_score": epss_band(row.get("epss_score"))},
+            asset_canonical=f"{product}:{version}:{row['cve'][0]}",
+          )
+  return verdict
+
+
+HTTP_NO_HTTPS_REDIRECT_TITLE = "Site served over HTTP without redirect to HTTPS"
+
+
+def http_without_https_redirect_findings(report):
+  """Serialised findings, one per HTTP port that serves a page while the same target serves HTTPS (RM-265).
+
+  Runs on the merged host report: the HTTP and the TLS port usually sit on different workers. Input is
+  `scan_metadata["web_root"]`; port keys may be int or str after JSON transport. No finding without a TLS
+  counterpart, for a redirect to https, a non-2xx final answer, an empty page, a catch-all host, a page
+  served by another host the redirect chain reached, or a port that itself completed TLS.
+  """
+  merged = {}
+  for port, facts in ((report.get("scan_metadata") or {}).get("web_root") or {}).items():
+    try:
+      merged.setdefault(int(port), {}).update(facts or {})
+    except (TypeError, ValueError):
+      continue
+  tls_ports = sorted(p for p, f in merged.items() if f.get("tls"))
+  if not tls_ports:
+    return []
+  ports_txt = ", ".join(str(p) for p in tls_ports)
+  findings = []
+  for port in sorted(merged):
+    f = merged[port]
+    status = f.get("final_status")
+    if not f.get("url") or f.get("tls") or not isinstance(status, int) or not 200 <= status < 300:
+      continue
+    # `catch_all` must be a verdict: None means step 2 of the HTTP probe never ran, so the page is unchecked.
+    if "https" in (f.get("location_scheme"), f.get("final_scheme")) or f.get("empty") or f.get("catch_all") is not False:
+      continue
+    if f.get("same_host") is False:  # the page came from another host the redirect chain reached
+      continue
+    host = urlparse(f["url"]).hostname or ""
+    findings.append(Finding(
+      severity=Severity.LOW,
+      cvss_vector=V.MISSING_HEADER_LOW,
+      title=HTTP_NO_HTTPS_REDIRECT_TITLE,
+      description=(
+        f"GET / on HTTP port {port} answered {status} without redirecting to https://, while the same target "
+        f"completes a TLS handshake on port(s) {ports_txt}. Visitors who type or follow an http:// link stay "
+        "on cleartext. The comparison is per target, not per virtual host (vhost pinning is RM-165), so a site "
+        "meant for a hosts-file-only lab may be a false match: the owner decides whether that is intended."
+      ),
+      evidence=(
+        f"HTTP port {port}: first status {f.get('status')}, Location scheme {f.get('location_scheme') or 'none'}, "
+        f"final status {status}, final scheme {f.get('final_scheme') or 'http'}; TLS port(s): {ports_txt}."
+      ),
+      remediation="Redirect HTTP to HTTPS (301) on the server, or close the HTTP port; add HSTS on the HTTPS side.",
+      owasp_id="A02:2021",
+      cwe_id="CWE-319",
+      confidence="firm",
+      affected_assets=(AffectedAsset(host=host, port=port, url=f["url"]),),
+    ))
+  return probe_result(findings=findings, probe_id="_post_scan_correlate")["findings"]
 
 
 def _is_private_ip(ip_str):
@@ -133,7 +265,7 @@ class _CorrelationMixin:
     if not ports_scanned:
       return findings
     ratio = len(open_ports) / len(ports_scanned)
-    if ratio > 0.5 and len(open_ports) > 20:
+    if _port_ratio_fires(len(open_ports), len(ports_scanned)):
       findings.append(Finding(
         severity=Severity.HIGH,
         # The counts belong in the description, not the title: for a finding

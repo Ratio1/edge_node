@@ -86,7 +86,7 @@ class TestEngagementValues(unittest.TestCase):
   def test_context_is_strict_and_never_coerces(self):
     empty = normalize_context({})
     self.assertEqual(empty, normalize_context(None))
-    self.assertEqual(empty["methodology"], "PTES + OWASP WSTG + CVSS v3.1")
+    self.assertEqual(empty["methodology"], "PTES + OWASP WSTG + CVSS v3.1 and v4.0")
     self.assertIsNone(empty["point_of_contact"])
     full = normalize_context({"client_name": " Example ", "asset_exposure": "internal",
                               "point_of_contact": {"name": "Ana", "email": "ana@example.com"}})
@@ -100,6 +100,17 @@ class TestEngagementValues(unittest.TestCase):
       with self.assertRaises(EngagementInvalid) as caught:
         normalize_context(bad)
       self.assertEqual(caught.exception.code, "context_invalid")
+
+  def test_allow_private_targets_is_a_strict_bool_kept_only_when_true(self):
+    # RM-273 (D30): `to_dict` carries the flag only when set, so existing engagement hashes do not move.
+    from extensions.business.cybersec.red_mesh.models.engagement import EngagementContext
+    allowed = normalize_context({"allow_private_targets": True})
+    self.assertIs(allowed["allow_private_targets"], True)
+    self.assertEqual(EngagementContext.from_dict(allowed).to_dict(), allowed)
+    self.assertNotIn("allow_private_targets", normalize_context({"allow_private_targets": False}))
+    for bad in ("true", 1, None):
+      with self.assertRaises(EngagementInvalid):
+        normalize_context({"allow_private_targets": bad})
 
   def test_window_has_one_canonical_form(self):
     self.assertEqual(normalize_instant("2026-10-01T00:00:00Z"), "2026-10-01T00:00:00Z")

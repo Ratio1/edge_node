@@ -781,6 +781,18 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual({workers[node]["budget_scope"] for node in workers}, {"per_scan"})
     self.assertTrue(workers["node-1"]["assignment_hash"])
 
+  def test_launch_webapp_scan_private_target_needs_the_engagement_flag(self):
+    """RM-273 (D30): a private-range webapp target is refused unless the engagement allows it."""
+    plugin = self._build_mock_plugin(job_id="test-job-private")
+    result = self._launch_webapp(plugin, target_url="https://10.0.0.5/app")
+    self.assertEqual(result.get("error"), "validation_error")
+    self.assertIn("allow_private_targets", result.get("message", ""))
+
+    plugin = self._build_mock_plugin(job_id="test-job-private")
+    allowed = {**_engagement("webapp"), "context": {"client_name": "Example", "allow_private_targets": True}}
+    result = self._launch_webapp(plugin, engagement=allowed, target_url="https://10.0.0.5/app")
+    self.assertNotIn("error", result)
+
   def test_launch_webapp_scan_explicit_mirror_divides_budget_without_opt_in(self):
     """Multi-worker MIRROR without per-worker opt-in must divide the budget."""
     plugin = self._build_mock_plugin(job_id="test-job-mirror-div")
@@ -1115,6 +1127,25 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(result["error"], "validation_error")
     self.assertIn("regular_api_key", result["message"])
     self.assertFalse(plugin.r1fs.add_json.called)
+
+  def test_launch_webapp_basic_auth_rules(self):
+    from extensions.business.cybersec.red_mesh.services.launch_api import (
+      _auth_descriptor_carrier, _validate_api_auth_descriptor,
+    )
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import AuthDescriptor
+    basic = AuthDescriptor(auth_type="basic")
+    self.assertIn("authenticated_probe_path", _validate_api_auth_descriptor(basic)["message"])
+    self.assertIsNone(_validate_api_auth_descriptor(
+      AuthDescriptor(auth_type="basic", authenticated_probe_path="/me")))
+    self.assertEqual(_auth_descriptor_carrier(basic)[:2], ("header", "authorization"))
+
+    plugin = self._build_mock_plugin(job_id="test-job-basic-regular-required")
+    result = self._launch_webapp(
+      plugin, regular_username="", regular_password="",
+      target_config={"api_security": {"auth": {
+        "auth_type": "basic", "authenticated_probe_path": "/me"}}})
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("regular credentials", result["message"])
 
   def test_launch_webapp_rejects_unconfirmed_security_downgrades(self):
     plugin = self._build_mock_plugin(job_id="test-job-webapp-unsafe")
@@ -3272,6 +3303,197 @@ class TestPhase2PassFinalization(unittest.TestCase):
         "worker_count": 2,
       },
     )
+
+  @staticmethod
+  def _serve_stored_r1fs(plugin):
+    """R1FS reads return what the run stored (by CID); anything else is the job config."""
+    config = plugin.r1fs.get_json.return_value
+    def stored(cid, *args, **kwargs):
+      cids = {f"QmCID{i + 1}": c.args[0] for i, c in enumerate(plugin.r1fs.add_json.call_args_list)}
+      value = cids.get(cid, config)
+      return json.loads(value) if isinstance(value, str) else value
+    plugin.r1fs.get_json.side_effect = stored
+
+  def _crash_after_finalizing_write(self, plugin):
+    class _Exit(BaseException):
+      pass
+    target = "extensions.business.cybersec.red_mesh.services.finalization._ensure_rulebook_assessment_after_pass"
+    with patch(target, side_effect=_Exit), self.assertRaises(_Exit):
+      self._get_plugin_class()._maybe_finalize_pass(plugin)
+    self._serve_stored_r1fs(plugin)
+
+  def test_crash_after_finalizing_write_resumes_the_tail_without_rerunning_the_pass(self):
+    """I-268: a launcher that exits between the FINALIZING write and the archive leaves a job that
+    the next loop finishes from its stored artifacts: no second report, score or attestation."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    self._crash_after_finalizing_write(plugin)
+    self.assertEqual((job_specs["job_status"], len(job_specs["pass_reports"])), ("FINALIZING", 1))
+    plugin._build_job_archive.assert_not_called()
+    stores = plugin.r1fs.add_json.call_count
+
+    ledger = "extensions.business.cybersec.red_mesh.services.finalization._record_engagement_ledger_after_pass"
+    with patch(ledger, side_effect=lambda owner, key, specs, *a, **kw: specs) as hook:
+      PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
+    self.assertEqual(plugin.r1fs.add_json.call_count, stores)  # nothing stored again
+    plugin._compute_risk_and_findings.assert_called_once()
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+    self.assertEqual(hook.call_args.kwargs["pass_report_cid"], job_specs["pass_reports"][0]["report_cid"])
+    events = [c.args[1] for c in plugin._emit_timeline_event.call_args_list]
+    self.assertEqual(events.count("scan_completed"), 1)  # the crashed run never reached it
+    plugin._log_audit_event.assert_called_once_with(
+      "stale_finalizing_recovery",
+      {"job_id": job_specs["job_id"], "launcher": "launcher-node", "run_mode": "SINGLEPASS", "pass_nr": 1},
+    )
+
+  def test_resume_waits_while_the_stored_artifacts_are_unreadable_and_retries_once_a_minute(self):
+    """I-268: no end state is picked on a guess; the retry is throttled and audited once."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    self._crash_after_finalizing_write(plugin)
+    plugin.r1fs.get_json.side_effect = lambda *a, **kw: None
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)  # same minute: skipped
+
+    self.assertEqual(job_specs["job_status"], "FINALIZING")
+    plugin._build_job_archive.assert_not_called()
+    self.assertEqual(plugin.r1fs.get_json.call_count, 1)
+    self._serve_stored_r1fs(plugin)
+    plugin.time.return_value += 61
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertEqual(plugin._log_audit_event.call_count, 1)
+
+  def test_resume_waits_while_one_worker_report_is_unreadable(self):
+    """I-268: a partial worker-report read is not enough to finish the pass."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    self._crash_after_finalizing_write(plugin)
+    reports = plugin._collect_node_reports.return_value
+    plugin._collect_node_reports.return_value = {"worker-A": reports["worker-A"]}
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FINALIZING")
+    plugin._build_job_archive.assert_not_called()
+
+  def test_finalizing_wedge_after_an_empty_abort_fails_the_job(self):
+    """I-268: the resumed tail keeps the uninterrupted outcome of a first pass that tested nothing."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    plugin._get_aggregated_report.return_value = {
+      **plugin._get_aggregated_report.return_value, "aborted": True, "abort_phase": "authentication",
+      "abort_reason": "login failed", "abort_reason_class": "auth_failed"}
+    self._crash_after_finalizing_write(plugin)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual((job_specs["job_status"], job_specs["failure_class"]), ("FAILED", "scan_aborted"))
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+
+  def test_continuous_finalizing_wedge_schedules_the_next_pass(self):
+    """I-268: a continuous job stuck in FINALIZING with its pass report goes back to RUNNING."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    self._crash_after_finalizing_write(plugin)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "RUNNING")
+    self.assertEqual(job_specs["next_pass_at"], 1000100.0 + 60)
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
+    plugin._build_job_archive.assert_not_called()
+
+  def test_continuous_finalizing_wedge_keeps_a_soft_stop(self):
+    """I-268: a soft stop scheduled before the crash stops the job instead of starting a new pass."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    job_specs["job_status"] = "SCHEDULED_FOR_STOP"
+    job_specs["timeline"].append({"type": "scheduled_for_stop", "label": "Stop scheduled", "date": 1000050.0})
+    self._crash_after_finalizing_write(plugin)
+    self.assertEqual(job_specs["job_status"], "FINALIZING")
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "STOPPED")
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+
+  def test_resume_whose_archive_fails_keeps_the_end_state_for_the_archive_retry(self):
+    """I-268: the end state is written before the archive, so a failed archive leaves STOPPED, not
+    FINALIZING, and the stop is not re-sent."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    job_specs["job_status"] = "SCHEDULED_FOR_STOP"
+    job_specs["timeline"].append({"type": "scheduled_for_stop", "label": "Stop scheduled", "date": 1000050.0})
+    self._crash_after_finalizing_write(plugin)
+    stored = {**job_specs, "job_status": "FINALIZING"}  # CStore; the archive build (a mock) writes nothing
+    plugin.chainstore_hget.side_effect = lambda *a, **kw: dict(stored)
+
+    target = "extensions.business.cybersec.red_mesh.services.finalization._write_job_record"
+    with patch(target, side_effect=lambda owner, key, specs, context: specs) as write:
+      PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    kept = [c.args[2]["job_status"] for c in write.call_args_list
+            if c.kwargs.get("context") == "finalize_terminal"]
+    self.assertEqual(kept, ["STOPPED"])
+
+  def test_soft_stop_writes_the_end_state_before_the_archive(self):
+    """I-268: on the uninterrupted path too, a failed archive leaves STOPPED for the archive retry,
+    so the next tick does not resume the tail and send the stop event again."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    job_specs["job_status"] = "SCHEDULED_FOR_STOP"
+    order = []
+    plugin._build_job_archive.side_effect = lambda *a, **kw: order.append("archive")
+
+    target = "extensions.business.cybersec.red_mesh.services.finalization._write_job_record"
+    def write(owner, key, specs, context):
+      order.append((context, specs["job_status"]))
+      return specs
+    with patch(target, side_effect=write):
+      PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertLess(order.index(("finalize_terminal", "STOPPED")), order.index("archive"))
+
+  def test_continuous_finalizing_wedge_at_the_pass_cap_stops_with_its_events(self):
+    """I-268: the resumed pass-cap tail is the uninterrupted one, events included."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(job_pass=MAX_CONTINUOUS_PASSES, run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    self._crash_after_finalizing_write(plugin)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "STOPPED")
+    events = [c.args[1] for c in plugin._emit_timeline_event.call_args_list]
+    self.assertIn("pass_cap_reached", events)
+    self.assertIn("stopped", events)
+
+  def test_continuous_stale_collecting_on_a_later_pass_is_recovered(self):
+    """I-268: an earlier pass's report does not block recovery of the current pass."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(job_pass=2, run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    job_specs["job_status"] = "COLLECTING"
+    job_specs["pass_reports"] = [{"pass_nr": 1, "report_cid": "QmPass1", "risk_score": 10}]
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual([ref["pass_nr"] for ref in job_specs["pass_reports"]], [1, 2])
+    self.assertEqual(job_specs["job_status"], "RUNNING")
+    plugin._collect_node_reports.assert_called_once()
 
   def test_cstore_risk_score_updated(self):
     """After pass, risk_score on CStore matches pass result."""

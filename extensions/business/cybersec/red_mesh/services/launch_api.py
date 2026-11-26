@@ -30,6 +30,7 @@ from ..graybox.models.target_config import (
   validate_target_config_secret_ref_positions,
 )
 from ..graybox.http_client import validate_target_config_paths
+from ..graybox.safety import SafetyControls
 from ..repositories import JobStateRepository
 from ..tenancy.effective_targets import resolve_launch_target, validate_effective_config
 from ..graybox.scenario_runtime import (
@@ -331,13 +332,13 @@ def _validate_graybox_numeric_fields(canonical: dict | None):
 
 def _validate_api_auth_descriptor(auth_desc):
   auth_type = getattr(auth_desc, "auth_type", "form") or "form"
-  if auth_type not in ("bearer", "api_key"):
+  if auth_type not in ("bearer", "api_key", "basic"):
     return None
   probe_path = (getattr(auth_desc, "authenticated_probe_path", "") or "").strip()
   allow_unverified = bool(getattr(auth_desc, "allow_unverified_auth", False))
   if not probe_path and not allow_unverified:
     return validation_error(
-      "api_security.auth.authenticated_probe_path is required for bearer/api_key "
+      "api_security.auth.authenticated_probe_path is required for bearer/api_key/basic "
       "auth unless allow_unverified_auth=true"
     )
   if not probe_path:
@@ -365,6 +366,8 @@ def _auth_descriptor_carrier(auth_desc, *, default_auth_type="form"):
   if auth_type == "bearer":
     header_name = getattr(auth_desc, "bearer_token_header_name", "Authorization")
     return ("header", _normalize_carrier_name(header_name), header_name or "Authorization")
+  if auth_type == "basic":
+    return ("header", "authorization", "Authorization")
   if auth_type == "api_key":
     location = _normalize_carrier_name(getattr(auth_desc, "api_key_location", "header")) or "header"
     if location == "query":
@@ -1771,7 +1774,7 @@ def launch_webapp_scan(
   # auth mode. Admin/privileged credentials are optional comparison context.
   auth_desc = typed_target_config.api_security.auth
   auth_type = auth_desc.auth_type
-  if auth_type == "form":
+  if auth_type in ("form", "basic"):
     if not regular_username or not regular_password:
       return validation_error("regular credentials required for webapp form auth")
     if bool(official_username) != bool(official_password):
@@ -1822,6 +1825,11 @@ def launch_webapp_scan(
   )
   if auth_error:
     return auth_error
+  # RM-273 (D30): a private-range target needs the engagement's allow_private_targets.
+  allow_private = ((engagement or {}).get("context") or {}).get("allow_private_targets") is True
+  private_reason = None if allow_private else SafetyControls.private_target_reason(target)
+  if private_reason:
+    return validation_error(private_reason)
   path_scope_errors = validate_target_config_paths(
     target_url,
     raw_target_config,
