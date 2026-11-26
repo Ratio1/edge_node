@@ -308,49 +308,64 @@ def _record_stale_intermediate_recovery(owner, job_specs, previous_status, worke
     })
 
 
+def _stop_scheduled(job_specs, job_status):
+  """A soft stop is due: the status says so, or its timeline entry is pending. The entry survives the
+  COLLECTING and FINALIZING writes that replace the status, and a job is stopped once it acts on it."""
+  return job_status == JOB_STATUS_SCHEDULED_FOR_STOP or any(
+    isinstance(event, dict) and event.get("type") == "scheduled_for_stop"
+    for event in job_specs.get("timeline") or [])
+
+
 def _resume_finalizing_tail(owner, job_key, job_specs, workers, ref):
   """I-268: finish a pass whose launcher exited after the FINALIZING write (pass report stored, no
-  archive). Only the steps after that write run; the pass is not collected or scored again."""
+  archive). The steps after that write run from the stored artifacts: the pass is not scored, stored,
+  attested or announced again. Retried at most once a minute; audited once per job."""
   job_id = job_specs.get("job_id")
   job_pass = job_specs.get("job_pass", 1)
-  run_mode = job_specs.get("run_mode", RUN_MODE_SINGLEPASS)
-  owner.P(f"[STUCK RECOVERY] {job_id} is FINALIZING with pass {job_pass} stored — resuming finalization",
-          color='y')
-  log_audit_event = getattr(owner, "_log_audit_event", None)
-  if callable(log_audit_event):
-    log_audit_event("stale_finalizing_recovery", {
-      "job_id": job_id, "launcher": job_specs.get("launcher"), "run_mode": run_mode, "pass_nr": job_pass})
+  retries = getattr(owner, "_finalizing_recovery", None)
+  if not isinstance(retries, dict):
+    retries = owner._finalizing_recovery = {}
+  last = retries.get(job_id)
+  if last is not None and owner.time() - last < ENGAGEMENT_RECHECK_SECONDS:
+    return
+  retries[job_id] = owner.time()
+  if last is None:
+    owner.P(f"[STUCK RECOVERY] {job_id} is FINALIZING with pass {job_pass} stored — resuming finalization",
+            color='y')
+    log_audit_event = getattr(owner, "_log_audit_event", None)
+    if callable(log_audit_event):
+      log_audit_event("stale_finalizing_recovery", {
+        "job_id": job_id, "launcher": job_specs.get("launcher"),
+        "run_mode": job_specs.get("run_mode", RUN_MODE_SINGLEPASS), "pass_nr": job_pass})
+  artifacts = _artifact_repo(owner)
+  stored = artifacts.get_pass_report(ref.get("report_cid"))
+  aggregated_cid = stored.get("aggregated_report_cid") if isinstance(stored, dict) else None
+  aggregated = artifacts.get_json(aggregated_cid) if aggregated_cid else None
+  node_reports = owner._collect_node_reports(workers) if isinstance(aggregated, dict) else None
+  if not isinstance(aggregated, dict) or not node_reports:
+    # Not finished on a guess: an unreadable report could hide an aborted pass. Retried next minute.
+    owner.P(f"[STUCK RECOVERY] {job_id} pass {job_pass} artifacts unreadable — retrying later", color='y')
+    return
+  job_config = owner._get_job_config(job_specs, resolve_secrets=False) or {}
+  abort_state = _pass_abort_state(aggregated, node_reports)
+  date_completed = stored.get("date_completed") or owner.time()
   job_specs = _ensure_rulebook_assessment_after_pass(owner, job_specs, job_id=job_id, pass_nr=job_pass)
   if not ref.get("pass_changes_cid"):
-    # The ledger step did not finish; its own failure rule leaves a `skipped` entry.
-    _record_skipped_ledger_pass(owner, job_specs, job_id=job_id, pass_nr=job_pass,
-                                date_completed=owner.time())
-  stored = (_artifact_repo(owner).get_pass_report(ref.get("report_cid")) or {}) if job_pass <= 1 else {}
-  if stored.get("aborted") and not sum(
-      int(((entry or {}).get("scan_metrics") or {}).get("probes_attempted") or 0)
-      for entry in (stored.get("worker_scan_metrics") or {}).values()):
-    # The same outcome as the uninterrupted tail: a first pass that tested nothing fails the job.
-    phase = stored.get("abort_phase") or "unknown"
-    _mark_job_failed(
-      owner, job_key, job_specs, job_id=job_id, pass_nr=job_pass, failure_class="scan_aborted",
-      message=f"Scan aborted during {phase}: {_abort_reason_text(stored.get('abort_reason'))}",
-      meta={"abort_phase": phase, "abort_reason_class": stored.get("abort_reason_class") or "unknown"},
+    job_specs = _record_engagement_ledger_after_pass(
+      owner, job_key, job_specs, artifacts, job_id=job_id, pass_nr=job_pass,
+      pass_report_cid=ref.get("report_cid"), node_reports=node_reports, workers=workers,
+      date_completed=date_completed, flat_findings=stored.get("findings") or [], aggregated=aggregated,
+      pass_metrics=stored.get("scan_metrics"), abort_state=abort_state, job_config=job_config,
     )
-    return
-  if run_mode == RUN_MODE_SINGLEPASS or job_pass >= MAX_CONTINUOUS_PASSES:
-    set_job_status(job_specs, JOB_STATUS_FINALIZED if run_mode == RUN_MODE_SINGLEPASS else JOB_STATUS_STOPPED)
-    owner._emit_timeline_event(job_specs, "finalized", "Job finalized (recovered after a launcher restart)")
-    owner._build_job_archive(job_key, job_specs)
-    _enqueue_misp_auto_push(owner, job_specs, job_pass)
-  else:
-    job_config = owner._get_job_config(job_specs, resolve_secrets=False) or {}
-    set_job_status(job_specs, JOB_STATUS_RUNNING)
-    job_specs["next_pass_at"] = (owner.time() + job_config.get("monitor_interval", owner.cfg_monitor_interval)
-                                 + random.uniform(0, owner.cfg_monitor_jitter))
-    owner._emit_timeline_event(job_specs, "pass_completed", f"Pass {job_pass} completed (recovered)")
-    _write_job_record(owner, job_key, job_specs, context="finalizing_recovery_next_pass")
-    _enqueue_misp_auto_push(owner, job_specs, job_pass)
-  owner._clear_live_progress(job_id, list(workers.keys()))
+  _finish_pass(
+    owner, job_key, job_specs, workers=workers, job_config=job_config, abort_state=abort_state,
+    redmesh_test_attestation=stored.get("redmesh_test_attestation"),
+    pass_date_started=stored.get("date_started"), pass_date_completed=date_completed,
+    pass_window_egress_ips=[meta.get("node_ip") for meta in (stored.get("worker_reports") or {}).values()
+                            if isinstance(meta, dict) and meta.get("node_ip")],
+    pass_window_report_refs={"pass_report_cid": ref.get("report_cid"), "aggregated_report_cid": aggregated_cid},
+    stop_scheduled=_stop_scheduled(job_specs, job_specs.get("job_status")),
+  )
 
 
 def _automatic_analysis_report_identity(workers):
@@ -611,6 +626,153 @@ def _record_engagement_ledger_after_pass(owner, job_key, job_specs, artifacts, *
       owner.P(f"[LEDGER] Skipped entry for job {job_id} pass {pass_nr} not written ({type(skipped_exc).__name__})",
               color='y')
   return job_specs
+
+
+def _finish_pass(owner, job_key, job_specs, *, workers, job_config, abort_state, redmesh_test_attestation,
+                 pass_date_started, pass_date_completed, pass_window_egress_ips, pass_window_report_refs,
+                 stop_scheduled):
+  """The steps after a pass's FINALIZING write and its ledger hook: the run-mode end state (FINALIZED,
+  STOPPED, FAILED scan_aborted, or RUNNING with the next pass due), its events and the archive. Shared by
+  the uninterrupted pass and the resume of a pass whose launcher exited after that write (I-268)."""
+  job_id = job_specs.get("job_id")
+  job_pass = job_specs.get("job_pass", 1)
+  run_mode = job_specs.get("run_mode", RUN_MODE_SINGLEPASS)
+  empty_abort = bool(abort_state and abort_state["empty"])
+  if empty_abort and job_pass <= 1:
+    phase = abort_state["abort_phase"] or "unknown"
+    _mark_job_failed(
+      owner, job_key, job_specs, job_id=job_id, pass_nr=job_pass,
+      failure_class="scan_aborted",
+      message=f"Scan aborted during {phase}: {_abort_reason_text(abort_state['abort_reason'])}",
+      meta={"abort_phase": phase, "abort_reason_class": abort_state["abort_reason_class"]},
+    )
+    return
+  if empty_abort:
+    # A monitor whose target was unreachable for one pass is not a failed
+    # job; the pass says so and the schedule continues.
+    owner._emit_timeline_event(
+      job_specs,
+      "pass_aborted",
+      f"Pass {job_pass} aborted during {abort_state['abort_phase'] or 'unknown'}: "
+      f"{_abort_reason_text(abort_state['abort_reason'])}",
+      actor_type="system",
+      meta={
+        "pass_nr": job_pass,
+        "abort_phase": abort_state["abort_phase"],
+        "abort_reason_class": abort_state["abort_reason_class"],
+      },
+    )
+
+  if run_mode == RUN_MODE_SINGLEPASS:
+    set_job_status(job_specs, JOB_STATUS_FINALIZED)
+    owner._emit_timeline_event(job_specs, "scan_completed", "Scan completed")
+    if redmesh_test_attestation is not None:
+      owner._emit_timeline_event(
+        job_specs, "blockchain_submit",
+        "Job-finished attestation submitted",
+        actor_type="system",
+        meta={**redmesh_test_attestation, "network": owner.REDMESH_ATTESTATION_NETWORK}
+      )
+    owner.P(f"[SINGLEPASS] Job {job_id} complete. Status set to FINALIZED.")
+    owner._emit_timeline_event(job_specs, "finalized", "Job finalized")
+    owner._build_job_archive(job_key, job_specs)
+    _enqueue_misp_auto_push(owner, job_specs, job_pass)
+    owner._clear_live_progress(job_id, list(workers.keys()))
+    return
+
+  if stop_scheduled:
+    set_job_status(job_specs, JOB_STATUS_STOPPED)
+    owner._emit_timeline_event(job_specs, "scan_completed", f"Scan completed (pass {job_pass})")
+    emit_lifecycle_event(
+      owner,
+      job_specs,
+      event_type="redmesh.job.stopped",
+      event_action="stopped",
+      event_outcome="success",
+      pass_nr=job_pass,
+      started_at=pass_date_started,
+      actual_end_at=pass_date_completed,
+      expected_egress_ips=pass_window_egress_ips,
+      report_refs=pass_window_report_refs,
+    )
+    if redmesh_test_attestation is not None:
+      owner._emit_timeline_event(
+        job_specs, "blockchain_submit",
+        f"Test attestation submitted (pass {job_pass})",
+        actor_type="system",
+        meta={**redmesh_test_attestation, "network": owner.REDMESH_ATTESTATION_NETWORK}
+      )
+    owner.P(f"[CONTINUOUS] Pass {job_pass} complete for job {job_id}. Status set to STOPPED (soft stop was scheduled)")
+    owner._emit_timeline_event(job_specs, "stopped", "Job stopped")
+    owner._build_job_archive(job_key, job_specs)
+    _enqueue_misp_auto_push(owner, job_specs, job_pass)
+    owner._clear_live_progress(job_id, list(workers.keys()))
+    return
+
+  if job_pass >= MAX_CONTINUOUS_PASSES:
+    set_job_status(job_specs, JOB_STATUS_STOPPED)
+    owner._emit_timeline_event(job_specs, "scan_completed", f"Scan completed (pass {job_pass})")
+    emit_lifecycle_event(
+      owner,
+      job_specs,
+      event_type="redmesh.job.stopped",
+      event_action="stopped",
+      event_outcome="success",
+      pass_nr=job_pass,
+      started_at=pass_date_started,
+      actual_end_at=pass_date_completed,
+      expected_egress_ips=pass_window_egress_ips,
+      report_refs=pass_window_report_refs,
+    )
+    owner._emit_timeline_event(
+      job_specs,
+      "pass_cap_reached",
+      f"Maximum continuous passes reached ({MAX_CONTINUOUS_PASSES})",
+      meta={"pass_nr": job_pass, "max_continuous_passes": MAX_CONTINUOUS_PASSES},
+    )
+    owner._log_audit_event("continuous_pass_cap_reached", {
+      "job_id": job_id,
+      "pass_nr": job_pass,
+      "max_continuous_passes": MAX_CONTINUOUS_PASSES,
+    })
+    if redmesh_test_attestation is not None:
+      owner._emit_timeline_event(
+        job_specs, "blockchain_submit",
+        f"Test attestation submitted (pass {job_pass})",
+        actor_type="system",
+        meta={**redmesh_test_attestation, "network": owner.REDMESH_ATTESTATION_NETWORK}
+      )
+    owner.P(
+      f"[CONTINUOUS] Pass {job_pass} complete for job {job_id}. "
+      f"Status set to STOPPED (max {MAX_CONTINUOUS_PASSES} passes reached)"
+    )
+    owner._emit_timeline_event(job_specs, "stopped", "Job stopped")
+    owner._build_job_archive(job_key, job_specs)
+    _enqueue_misp_auto_push(owner, job_specs, job_pass)
+    owner._clear_live_progress(job_id, list(workers.keys()))
+    return
+
+  if redmesh_test_attestation is not None:
+    owner._emit_timeline_event(
+      job_specs, "blockchain_submit",
+      f"Test attestation submitted (pass {job_pass})",
+      actor_type="system",
+      meta={**redmesh_test_attestation, "network": owner.REDMESH_ATTESTATION_NETWORK}
+    )
+  set_job_status(job_specs, JOB_STATUS_RUNNING)
+  interval = job_config.get("monitor_interval", owner.cfg_monitor_interval)
+  jitter = random.uniform(0, owner.cfg_monitor_jitter)
+  job_specs["next_pass_at"] = owner.time() + interval + jitter
+  owner._emit_timeline_event(job_specs, "pass_completed", f"Pass {job_pass} completed")
+
+  owner.P(f"[CONTINUOUS] Pass {job_pass} complete for job {job_id}. Next pass in {interval}s (+{jitter:.1f}s jitter)")
+  _write_job_record(owner, job_key, job_specs, context="continuous_next_pass")
+  enqueue_misp_auto_push(owner, job_specs, job_pass)
+  owner._clear_live_progress(job_id, list(workers.keys()))
+
+  owner.completed_jobs_reports.pop(job_id, None)
+  if job_id in owner.lst_completed_jobs:
+    owner.lst_completed_jobs.remove(job_id)
 
 
 def maybe_finalize_pass(owner):
@@ -880,9 +1042,10 @@ def maybe_finalize_pass(owner):
 
       redmesh_test_attestation = None
       required_attestation = _attestation_required(job_specs, job_config)
+      stop_scheduled = _stop_scheduled(job_specs, job_status)
       terminal_after_pass = (
         run_mode == RUN_MODE_SINGLEPASS
-        or job_status == JOB_STATUS_SCHEDULED_FOR_STOP
+        or stop_scheduled
         or job_pass >= MAX_CONTINUOUS_PASSES
       )
       # A scan that tested nothing gets no on-chain "0 vulnerabilities" record;
@@ -1067,141 +1230,12 @@ def maybe_finalize_pass(owner):
         abort_state=abort_state, job_config=job_config,
       )
 
-      if empty_abort and job_pass <= 1:
-        phase = abort_state["abort_phase"] or "unknown"
-        _mark_job_failed(
-          owner, job_key, job_specs, job_id=job_id, pass_nr=job_pass,
-          failure_class="scan_aborted",
-          message=f"Scan aborted during {phase}: {_abort_reason_text(abort_state['abort_reason'])}",
-          meta={"abort_phase": phase, "abort_reason_class": abort_state["abort_reason_class"]},
-        )
-        continue
-      if empty_abort:
-        # A monitor whose target was unreachable for one pass is not a failed
-        # job; the pass says so and the schedule continues.
-        owner._emit_timeline_event(
-          job_specs,
-          "pass_aborted",
-          f"Pass {job_pass} aborted during {abort_state['abort_phase'] or 'unknown'}: "
-          f"{_abort_reason_text(abort_state['abort_reason'])}",
-          actor_type="system",
-          meta={
-            "pass_nr": job_pass,
-            "abort_phase": abort_state["abort_phase"],
-            "abort_reason_class": abort_state["abort_reason_class"],
-          },
-        )
-
-      if run_mode == RUN_MODE_SINGLEPASS:
-        set_job_status(job_specs, JOB_STATUS_FINALIZED)
-        owner._emit_timeline_event(job_specs, "scan_completed", "Scan completed")
-        if redmesh_test_attestation is not None:
-          owner._emit_timeline_event(
-            job_specs, "blockchain_submit",
-            "Job-finished attestation submitted",
-            actor_type="system",
-            meta={**redmesh_test_attestation, "network": owner.REDMESH_ATTESTATION_NETWORK}
-          )
-        owner.P(f"[SINGLEPASS] Job {job_id} complete. Status set to FINALIZED.")
-        owner._emit_timeline_event(job_specs, "finalized", "Job finalized")
-        owner._build_job_archive(job_key, job_specs)
-        _enqueue_misp_auto_push(owner, job_specs, job_pass)
-        owner._clear_live_progress(job_id, list(workers.keys()))
-        continue
-
-      if job_status == JOB_STATUS_SCHEDULED_FOR_STOP:
-        set_job_status(job_specs, JOB_STATUS_STOPPED)
-        owner._emit_timeline_event(job_specs, "scan_completed", f"Scan completed (pass {job_pass})")
-        emit_lifecycle_event(
-          owner,
-          job_specs,
-          event_type="redmesh.job.stopped",
-          event_action="stopped",
-          event_outcome="success",
-          pass_nr=job_pass,
-          started_at=pass_date_started,
-          actual_end_at=pass_date_completed,
-          expected_egress_ips=pass_window_egress_ips,
-          report_refs=pass_window_report_refs,
-        )
-        if redmesh_test_attestation is not None:
-          owner._emit_timeline_event(
-            job_specs, "blockchain_submit",
-            f"Test attestation submitted (pass {job_pass})",
-            actor_type="system",
-            meta={**redmesh_test_attestation, "network": owner.REDMESH_ATTESTATION_NETWORK}
-          )
-        owner.P(f"[CONTINUOUS] Pass {job_pass} complete for job {job_id}. Status set to STOPPED (soft stop was scheduled)")
-        owner._emit_timeline_event(job_specs, "stopped", "Job stopped")
-        owner._build_job_archive(job_key, job_specs)
-        _enqueue_misp_auto_push(owner, job_specs, job_pass)
-        owner._clear_live_progress(job_id, list(workers.keys()))
-        continue
-
-      if job_pass >= MAX_CONTINUOUS_PASSES:
-        set_job_status(job_specs, JOB_STATUS_STOPPED)
-        owner._emit_timeline_event(job_specs, "scan_completed", f"Scan completed (pass {job_pass})")
-        emit_lifecycle_event(
-          owner,
-          job_specs,
-          event_type="redmesh.job.stopped",
-          event_action="stopped",
-          event_outcome="success",
-          pass_nr=job_pass,
-          started_at=pass_date_started,
-          actual_end_at=pass_date_completed,
-          expected_egress_ips=pass_window_egress_ips,
-          report_refs=pass_window_report_refs,
-        )
-        owner._emit_timeline_event(
-          job_specs,
-          "pass_cap_reached",
-          f"Maximum continuous passes reached ({MAX_CONTINUOUS_PASSES})",
-          meta={"pass_nr": job_pass, "max_continuous_passes": MAX_CONTINUOUS_PASSES},
-        )
-        owner._log_audit_event("continuous_pass_cap_reached", {
-          "job_id": job_id,
-          "pass_nr": job_pass,
-          "max_continuous_passes": MAX_CONTINUOUS_PASSES,
-        })
-        if redmesh_test_attestation is not None:
-          owner._emit_timeline_event(
-            job_specs, "blockchain_submit",
-            f"Test attestation submitted (pass {job_pass})",
-            actor_type="system",
-            meta={**redmesh_test_attestation, "network": owner.REDMESH_ATTESTATION_NETWORK}
-          )
-        owner.P(
-          f"[CONTINUOUS] Pass {job_pass} complete for job {job_id}. "
-          f"Status set to STOPPED (max {MAX_CONTINUOUS_PASSES} passes reached)"
-        )
-        owner._emit_timeline_event(job_specs, "stopped", "Job stopped")
-        owner._build_job_archive(job_key, job_specs)
-        _enqueue_misp_auto_push(owner, job_specs, job_pass)
-        owner._clear_live_progress(job_id, list(workers.keys()))
-        continue
-
-      if redmesh_test_attestation is not None:
-        owner._emit_timeline_event(
-          job_specs, "blockchain_submit",
-          f"Test attestation submitted (pass {job_pass})",
-          actor_type="system",
-          meta={**redmesh_test_attestation, "network": owner.REDMESH_ATTESTATION_NETWORK}
-        )
-      set_job_status(job_specs, JOB_STATUS_RUNNING)
-      interval = job_config.get("monitor_interval", owner.cfg_monitor_interval)
-      jitter = random.uniform(0, owner.cfg_monitor_jitter)
-      job_specs["next_pass_at"] = owner.time() + interval + jitter
-      owner._emit_timeline_event(job_specs, "pass_completed", f"Pass {job_pass} completed")
-
-      owner.P(f"[CONTINUOUS] Pass {job_pass} complete for job {job_id}. Next pass in {interval}s (+{jitter:.1f}s jitter)")
-      _write_job_record(owner, job_key, job_specs, context="continuous_next_pass")
-      enqueue_misp_auto_push(owner, job_specs, job_pass)
-      owner._clear_live_progress(job_id, list(workers.keys()))
-
-      owner.completed_jobs_reports.pop(job_id, None)
-      if job_id in owner.lst_completed_jobs:
-        owner.lst_completed_jobs.remove(job_id)
+      _finish_pass(
+        owner, job_key, job_specs, workers=workers, job_config=job_config, abort_state=abort_state,
+        redmesh_test_attestation=redmesh_test_attestation, pass_date_started=pass_date_started,
+        pass_date_completed=pass_date_completed, pass_window_egress_ips=pass_window_egress_ips,
+        pass_window_report_refs=pass_window_report_refs, stop_scheduled=stop_scheduled,
+      )
 
     elif run_mode == RUN_MODE_CONTINUOUS_MONITORING and all_finished and next_pass_at and owner.time() >= next_pass_at:
       job_config = owner._get_job_config(job_specs, resolve_secrets=False)

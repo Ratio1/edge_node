@@ -3273,46 +3273,81 @@ class TestPhase2PassFinalization(unittest.TestCase):
       },
     )
 
+  @staticmethod
+  def _serve_stored_r1fs(plugin):
+    """R1FS reads return what the run stored (by CID); anything else is the job config."""
+    config = plugin.r1fs.get_json.return_value
+    def stored(cid, *args, **kwargs):
+      cids = {f"QmCID{i + 1}": c.args[0] for i, c in enumerate(plugin.r1fs.add_json.call_args_list)}
+      value = cids.get(cid, config)
+      return json.loads(value) if isinstance(value, str) else value
+    plugin.r1fs.get_json.side_effect = stored
+
+  def _crash_after_finalizing_write(self, plugin):
+    class _Exit(BaseException):
+      pass
+    target = "extensions.business.cybersec.red_mesh.services.finalization._ensure_rulebook_assessment_after_pass"
+    with patch(target, side_effect=_Exit), self.assertRaises(_Exit):
+      self._get_plugin_class()._maybe_finalize_pass(plugin)
+    self._serve_stored_r1fs(plugin)
+
   def test_crash_after_finalizing_write_resumes_the_tail_without_rerunning_the_pass(self):
     """I-268: a launcher that exits between the FINALIZING write and the archive leaves a job that
-    the next loop finishes from its stored pass report: no second report, no second collection."""
+    the next loop finishes from its stored artifacts: no second report, score or attestation."""
     PentesterApi01Plugin = self._get_plugin_class()
     plugin, job_specs = self._build_finalize_plugin()
     self._configure_successful_pass_finalization(plugin, job_specs)
-
-    class _Exit(BaseException):
-      pass
-
-    target = "extensions.business.cybersec.red_mesh.services.finalization._ensure_rulebook_assessment_after_pass"
-    with patch(target, side_effect=_Exit), self.assertRaises(_Exit):
-      PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    self._crash_after_finalizing_write(plugin)
     self.assertEqual((job_specs["job_status"], len(job_specs["pass_reports"])), ("FINALIZING", 1))
     plugin._build_job_archive.assert_not_called()
+    stores = plugin.r1fs.add_json.call_count
 
-    skipped = "extensions.business.cybersec.red_mesh.services.finalization._record_skipped_ledger_pass"
-    with patch(skipped) as ledger:
+    ledger = "extensions.business.cybersec.red_mesh.services.finalization._record_engagement_ledger_after_pass"
+    with patch(ledger, side_effect=lambda owner, key, specs, *a, **kw: specs) as hook:
       PentesterApi01Plugin._maybe_finalize_pass(plugin)
 
     self.assertEqual(job_specs["job_status"], "FINALIZED")
     self.assertEqual(len(job_specs["pass_reports"]), 1)
-    plugin._collect_node_reports.assert_called_once()
+    self.assertEqual(plugin.r1fs.add_json.call_count, stores)  # nothing stored again
+    plugin._compute_risk_and_findings.assert_called_once()
     plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
-    ledger.assert_called_once()  # the ledger step never stored its pass changes
+    self.assertEqual(hook.call_args.kwargs["pass_report_cid"], job_specs["pass_reports"][0]["report_cid"])
+    events = [c.args[1] for c in plugin._emit_timeline_event.call_args_list]
+    self.assertEqual(events.count("scan_completed"), 1)  # the crashed run never reached it
     plugin._log_audit_event.assert_called_once_with(
       "stale_finalizing_recovery",
       {"job_id": job_specs["job_id"], "launcher": "launcher-node", "run_mode": "SINGLEPASS", "pass_nr": 1},
     )
+
+  def test_resume_waits_while_the_stored_artifacts_are_unreadable_and_retries_once_a_minute(self):
+    """I-268: no end state is picked on a guess; the retry is throttled and audited once."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    self._crash_after_finalizing_write(plugin)
+    plugin.r1fs.get_json.side_effect = lambda *a, **kw: None
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)  # same minute: skipped
+
+    self.assertEqual(job_specs["job_status"], "FINALIZING")
+    plugin._build_job_archive.assert_not_called()
+    self.assertEqual(plugin.r1fs.get_json.call_count, 1)
+    self._serve_stored_r1fs(plugin)
+    plugin.time.return_value += 61
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertEqual(plugin._log_audit_event.call_count, 1)
 
   def test_finalizing_wedge_after_an_empty_abort_fails_the_job(self):
     """I-268: the resumed tail keeps the uninterrupted outcome of a first pass that tested nothing."""
     PentesterApi01Plugin = self._get_plugin_class()
     plugin, job_specs = self._build_finalize_plugin()
     self._configure_successful_pass_finalization(plugin, job_specs)
-    job_specs["job_status"] = "FINALIZING"
-    job_specs["pass_reports"] = [{"pass_nr": 1, "report_cid": "QmPass1", "risk_score": 0}]
-    plugin.r1fs.get_json.return_value = {
-      "pass_nr": 1, "aborted": True, "abort_phase": "authentication", "abort_reason": "login failed",
-      "abort_reason_class": "auth_failed", "worker_scan_metrics": {"worker-A": {"scan_metrics": {}}}}
+    plugin._get_aggregated_report.return_value = {
+      **plugin._get_aggregated_report.return_value, "aborted": True, "abort_phase": "authentication",
+      "abort_reason": "login failed", "abort_reason_class": "auth_failed"}
+    self._crash_after_finalizing_write(plugin)
 
     PentesterApi01Plugin._maybe_finalize_pass(plugin)
 
@@ -3322,21 +3357,45 @@ class TestPhase2PassFinalization(unittest.TestCase):
   def test_continuous_finalizing_wedge_schedules_the_next_pass(self):
     """I-268: a continuous job stuck in FINALIZING with its pass report goes back to RUNNING."""
     PentesterApi01Plugin = self._get_plugin_class()
-    plugin, job_specs = self._build_finalize_plugin(job_pass=2, run_mode="CONTINUOUS_MONITORING")
+    plugin, job_specs = self._build_finalize_plugin(run_mode="CONTINUOUS_MONITORING")
     self._configure_successful_pass_finalization(plugin, job_specs)
-    job_specs["job_status"] = "FINALIZING"
-    job_specs["pass_reports"] = [
-      {"pass_nr": 1, "report_cid": "QmPass1", "risk_score": 10, "pass_changes_cid": "QmChanges1"},
-      {"pass_nr": 2, "report_cid": "QmPass2", "risk_score": 20, "pass_changes_cid": "QmChanges2"},
-    ]
+    self._crash_after_finalizing_write(plugin)
 
     PentesterApi01Plugin._maybe_finalize_pass(plugin)
 
     self.assertEqual(job_specs["job_status"], "RUNNING")
     self.assertEqual(job_specs["next_pass_at"], 1000100.0 + 60)
-    self.assertEqual(len(job_specs["pass_reports"]), 2)
-    plugin._collect_node_reports.assert_not_called()
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
     plugin._build_job_archive.assert_not_called()
+
+  def test_continuous_finalizing_wedge_keeps_a_soft_stop(self):
+    """I-268: a soft stop scheduled before the crash stops the job instead of starting a new pass."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    job_specs["job_status"] = "SCHEDULED_FOR_STOP"
+    job_specs["timeline"].append({"type": "scheduled_for_stop", "label": "Stop scheduled", "date": 1000050.0})
+    self._crash_after_finalizing_write(plugin)
+    self.assertEqual(job_specs["job_status"], "FINALIZING")
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "STOPPED")
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+
+  def test_continuous_finalizing_wedge_at_the_pass_cap_stops_with_its_events(self):
+    """I-268: the resumed pass-cap tail is the uninterrupted one, events included."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(job_pass=MAX_CONTINUOUS_PASSES, run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    self._crash_after_finalizing_write(plugin)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "STOPPED")
+    events = [c.args[1] for c in plugin._emit_timeline_event.call_args_list]
+    self.assertIn("pass_cap_reached", events)
+    self.assertIn("stopped", events)
 
   def test_continuous_stale_collecting_on_a_later_pass_is_recovered(self):
     """I-268: an earlier pass's report does not block recovery of the current pass."""
