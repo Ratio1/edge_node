@@ -1385,6 +1385,11 @@ class _DauthMixin(object):
     else:
       dauth_data["EE_SUPERVISOR"] = False
     # end set supervisor flag
+    # Stale configuration, predefined keys or node tags must not restore retired reply settings.
+    for key in tuple(dauth_data):
+      if isinstance(key, str) and (key.startswith("EE_MINIO_") or key in {"EE_GITVER", "EE_NGROK_AUTH_TOKEN"}):
+        # These settings remain available to nodes provisioned through their local environment.
+        del dauth_data[key]
     if self.cfg_dauth_log_response:
       self.P(f"DAuth returning comm server {dauth_data.get(comm_key)}, {str_allocation_log}")
     return dauth_data

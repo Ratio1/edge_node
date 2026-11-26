@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -59,8 +60,8 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
       "tunnel",
       "--no-autoupdate",
       "run",
-      "--token",
-      "cf-token",
+      "--token-file",
+      "/dev/stdin",
       "--url",
       "http://127.0.0.1:20005",
     ])
@@ -83,8 +84,8 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
       "tunnel",
       "--no-autoupdate",
       "run",
-      "--token",
-      "dashboard-token",
+      "--token-file",
+      "/dev/stdin",
       "--url",
       "https://127.0.0.1:20005",
       "--no-tls-verify",
@@ -98,10 +99,12 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
     plugin._record_tunnel_restart_success = lambda _port: None
     plugin.time = lambda: 1.0
     process = MagicMock(pid=123, stdout=object(), stderr=object())
+    # The subprocess stub reads the real descriptor before Popen returns.
+    pipe_reads = []
 
     with patch(
       "extensions.business.container_apps.container_app_runner.subprocess.Popen",
-      return_value=process,
+      side_effect=lambda **kwargs: (pipe_reads.append(os.read(kwargs["stdin"], 4096)) or process),
     ) as popen:
       started = plugin._start_extra_tunnel(8080, {
         "token": "dashboard-secret-token",
@@ -111,9 +114,10 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
       })
 
     self.assertTrue(started)
-    self.assertIn("dashboard-secret-token", popen.call_args.kwargs["args"])
+    self.assertNotIn("dashboard-secret-token", popen.call_args.kwargs["args"])
+    self.assertEqual(pipe_reads, [b"dashboard-secret-token"])
     self.assertNotIn("dashboard-secret-token", "\n".join(plugin.logged_messages))
-    self.assertIn("--token [REDACTED]", "\n".join(plugin.logged_messages))
+    self.assertIn("--token-file /dev/stdin", "\n".join(plugin.logged_messages))
 
   def test_run_main_tunnel_command_redacts_token_from_log(self):
     plugin = make_container_app_runner()
@@ -145,7 +149,7 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
     self.assertNotIn("main-secret-token", "\n".join(plugin.logged_messages))
     self.assertIn("--token [REDACTED]", "\n".join(plugin.logged_messages))
 
-  def test_run_main_cloudflare_tunnel_keeps_token_as_one_opaque_argument(self):
+  def test_run_main_cloudflare_tunnel_keeps_token_in_one_opaque_pipe(self):
     plugin = make_container_app_runner()
     token = "main-token; touch /tmp/must-not-run"
     plugin.cfg_exposed_ports = {
@@ -160,15 +164,18 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
     plugin.LogReader = lambda *_args, **_kwargs: object()
     plugin._remember_process_group = lambda _process: None
     process = MagicMock(pid=321, stdout=object(), stderr=object())
+    # Pull the bytes from the standard-input descriptor without using Cloudflare.
+    pipe_reads = []
 
     with patch(
       "extensions.business.container_apps.container_app_runner.subprocess.Popen",
-      return_value=process,
+      side_effect=lambda **kwargs: (pipe_reads.append(os.read(kwargs["stdin"], 4096)) or process),
     ) as popen:
       started = plugin.run_tunnel_engine()
 
     self.assertIs(started, process)
-    self.assertEqual(popen.call_args.kwargs["args"][5], token)
+    self.assertEqual(popen.call_args.kwargs["args"][4:6], ["--token-file", "/dev/stdin"])
+    self.assertEqual(pipe_reads, [token.encode()])
     self.assertNotIn("shell", popen.call_args.kwargs)
     self.assertNotIn(token, "\n".join(plugin.logged_messages))
 

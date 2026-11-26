@@ -410,6 +410,45 @@ class DauthBrokerAllocationTests(unittest.TestCase):
 
 class DauthRegistrySecretGatingTests(unittest.TestCase):
 
+  def test_retired_settings_are_omitted_from_worker_and_supervisor_replies(self):
+    """Exercise legacy configuration, predefined keys, and node tags.
+
+    MQTT delivery and locally configured credentials remain available.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> DauthRegistrySecretGatingTests().test_retired_settings_are_omitted_from_worker_and_supervisor_replies()
+    """
+    # Set up a node that still has these locally provisioned credentials.
+    plugin = _make_dauth_harness()
+    # Cover MinIO configuration, the removed ngrok credential, and private update access.
+    retired = {"EE_GITVER": "synthetic-git", "EE_NGROK_AUTH_TOKEN": "synthetic-ngrok",
+               "EE_MINIO_SECRET_KEY": "synthetic-minio", "EE_MINIO_ENDPOINT": "example.test"}
+    # A legacy configuration can supply any of these paths on an upgraded sender.
+    plugin.os_environ.update(retired, EE_MQTT="synthetic-mqtt")
+    plugin.cfg_auth_env_keys = ["EE_MQTT", "EE_MINIO_SECRET_KEY"]
+    plugin.cfg_auth_node_env_keys = ["EE_MINIO_ENDPOINT"]
+    plugin.cfg_auth_predefined_keys = {"EE_GITVER": "synthetic-override"}
+    plugin.cfg_supervisor_keys += ["EE_NGROK_AUTH_TOKEN"]
+    plugin.fetch_node_tags = lambda **_kwargs: {"EE_NGROK_AUTH_TOKEN": "synthetic-tag"}
+
+    for address in ("ordinary-node", "node-oracle"):
+      with self.subTest(address=address):
+        # Prepopulated data is filtered too, before the reply leaves the node.
+        data = plugin.fill_dauth_data(dict(retired), address, is_node=True, sender_eth_address="0xDAUTH")
+        self.assertTrue(retired.keys().isdisjoint(data.keys()))
+        self.assertEqual(data["EE_MQTT"], "synthetic-mqtt")
+    # Filtering the reply must preserve the credentials for their existing node-local readers.
+    self.assertEqual({key: plugin.os_environ[key] for key in retired}, retired)
+
   def test_supervisor_keys_are_sent_to_protocol_oracles_registered_for_dauth(self):
     plugin = _make_dauth_harness(dauth_oracle=True)
 

@@ -9,6 +9,9 @@ from unittest.mock import MagicMock
 
 import numpy as _np
 
+# Keep the real process credential helper when the test substitutes the plugin base.
+import naeural_core.utils.process_credentials
+
 
 def install_docker_stub_if_needed():
   """
