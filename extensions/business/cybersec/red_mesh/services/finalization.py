@@ -342,8 +342,9 @@ def _resume_finalizing_tail(owner, job_key, job_specs, workers, ref):
   aggregated_cid = stored.get("aggregated_report_cid") if isinstance(stored, dict) else None
   aggregated = artifacts.get_json(aggregated_cid) if aggregated_cid else None
   node_reports = owner._collect_node_reports(workers) if isinstance(aggregated, dict) else None
-  if not isinstance(aggregated, dict) or not node_reports:
-    # Not finished on a guess: an unreadable report could hide an aborted pass. Retried next minute.
+  if not isinstance(aggregated, dict) or not isinstance(node_reports, dict) or set(node_reports) != set(workers):
+    # Not finished on a guess: an unreadable report (one worker's is enough) could hide an aborted
+    # pass or a ledger range. Retried next minute.
     owner.P(f"[STUCK RECOVERY] {job_id} pass {job_pass} artifacts unreadable — retrying later", color='y')
     return
   job_config = owner._get_job_config(job_specs, resolve_secrets=False) or {}
@@ -366,6 +367,13 @@ def _resume_finalizing_tail(owner, job_key, job_specs, workers, ref):
     pass_window_report_refs={"pass_report_cid": ref.get("report_cid"), "aggregated_report_cid": aggregated_cid},
     stop_scheduled=_stop_scheduled(job_specs, job_specs.get("job_status")),
   )
+  if is_terminal_job_status(job_specs.get("job_status")):
+    current = _job_repo(owner).get_job(job_key)
+    if (isinstance(current, dict) and current.get("job_status") == JOB_STATUS_FINALIZING
+        and not current.get("job_cid")):
+      # The archive did not land. Keep the end state, so the terminal archive retry takes over and the
+      # stop and cap events of this tail are not sent again on the next attempt.
+      _write_job_record(owner, job_key, job_specs, context="finalizing_recovery_terminal")
 
 
 def _automatic_analysis_report_identity(workers):

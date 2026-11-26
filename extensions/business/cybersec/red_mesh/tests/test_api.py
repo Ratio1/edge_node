@@ -3339,6 +3339,20 @@ class TestPhase2PassFinalization(unittest.TestCase):
     self.assertEqual(job_specs["job_status"], "FINALIZED")
     self.assertEqual(plugin._log_audit_event.call_count, 1)
 
+  def test_resume_waits_while_one_worker_report_is_unreadable(self):
+    """I-268: a partial worker-report read is not enough to finish the pass."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    self._crash_after_finalizing_write(plugin)
+    reports = plugin._collect_node_reports.return_value
+    plugin._collect_node_reports.return_value = {"worker-A": reports["worker-A"]}
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FINALIZING")
+    plugin._build_job_archive.assert_not_called()
+
   def test_finalizing_wedge_after_an_empty_abort_fails_the_job(self):
     """I-268: the resumed tail keeps the uninterrupted outcome of a first pass that tested nothing."""
     PentesterApi01Plugin = self._get_plugin_class()
@@ -3382,6 +3396,25 @@ class TestPhase2PassFinalization(unittest.TestCase):
 
     self.assertEqual(job_specs["job_status"], "STOPPED")
     plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+
+  def test_resume_whose_archive_fails_keeps_the_end_state_for_the_archive_retry(self):
+    """I-268: a failed archive leaves the record STOPPED, not FINALIZING, so the stop is not re-sent."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    job_specs["job_status"] = "SCHEDULED_FOR_STOP"
+    job_specs["timeline"].append({"type": "scheduled_for_stop", "label": "Stop scheduled", "date": 1000050.0})
+    self._crash_after_finalizing_write(plugin)
+    stored = {**job_specs, "job_status": "FINALIZING"}  # CStore; the archive build (a mock) writes nothing
+    plugin.chainstore_hget.side_effect = lambda *a, **kw: dict(stored)
+
+    target = "extensions.business.cybersec.red_mesh.services.finalization._write_job_record"
+    with patch(target, side_effect=lambda owner, key, specs, context: specs) as write:
+      PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    kept = [c.args[2]["job_status"] for c in write.call_args_list
+            if c.kwargs.get("context") == "finalizing_recovery_terminal"]
+    self.assertEqual(kept, ["STOPPED"])
 
   def test_continuous_finalizing_wedge_at_the_pass_cap_stops_with_its_events(self):
     """I-268: the resumed pass-cap tail is the uninterrupted one, events included."""
