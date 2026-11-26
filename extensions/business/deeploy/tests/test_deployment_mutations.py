@@ -438,6 +438,24 @@ class DeploymentMutationTests(unittest.TestCase):
     plugin._delete_pipeline_cid_from_r1fs.assert_called_with("canonical-cid")
 
   def test_stuck_delete_writes_no_snapshot_per_pass_and_completes_when_the_node_stops(self):
+    """Keep delete retirement stable while one worker has yet to stop.
+
+    Advance the fake clock through blocking and verify that retries reuse
+    the snapshot and obey the blocked cadence. Supply the missing signed
+    stop receipt inside the grace period and check that deletion completes.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> DeploymentMutationTests().test_stuck_delete_writes_no_snapshot_per_pass_and_completes_when_the_node_stops()
+    """
     plugin = Mutations()
     operation_id = plugin.delete()["operation_id"]
     plugin.stop_report(plugin._operation_records()[operation_id], "A")

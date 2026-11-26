@@ -48,6 +48,23 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
     self.assertFalse(plugin._should_start_main_tunnel())
 
   def test_build_tunnel_command_uses_host_port_mapping(self):
+    """Use the published host port as the Cloudflare tunnel origin.
+
+    Check that a tunnel configured for a container port dials its mapped
+    host port and reads the tunnel token from standard input.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> ContainerAppRunnerTunnelRuntimeTests().test_build_tunnel_command_uses_host_port_mapping()
+    """
     plugin = make_container_app_runner()
     plugin.extra_ports_mapping = {
       20005: 3002
@@ -67,6 +84,23 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
     ])
 
   def test_build_https_tunnel_command_applies_explicit_origin_tls_override(self):
+    """Carry an explicit HTTPS verification override into the generated command.
+
+    Expect an HTTPS URL with the mapped host port and the verification
+    override, with the token supplied through standard input.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> ContainerAppRunnerTunnelRuntimeTests().test_build_https_tunnel_command_applies_explicit_origin_tls_override()
+    """
     plugin = make_container_app_runner()
     plugin.extra_ports_mapping = {
       20005: 8080
@@ -92,6 +126,23 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
     ])
 
   def test_start_extra_tunnel_redacts_token_from_debug_log(self):
+    """Keep the extra tunnel token in its subprocess input stream.
+
+    Read the descriptor at process launch and check that the token reaches
+    the tunnel there while the argument list and debug log stay redacted.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> ContainerAppRunnerTunnelRuntimeTests().test_start_extra_tunnel_redacts_token_from_debug_log()
+    """
     plugin = make_container_app_runner()
     plugin.extra_ports_mapping = {20005: 8080}
     plugin.LogReader = lambda *_args, **_kwargs: object()
@@ -150,6 +201,23 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
     self.assertIn("--token [REDACTED]", "\n".join(plugin.logged_messages))
 
   def test_run_main_cloudflare_tunnel_keeps_token_in_one_opaque_pipe(self):
+    """Pass the main tunnel token as a single value over standard input.
+
+    Use a token with shell metacharacters to verify that the launcher passes
+    the bytes through a pipe without invoking a shell or logging the token.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> ContainerAppRunnerTunnelRuntimeTests().test_run_main_cloudflare_tunnel_keeps_token_in_one_opaque_pipe()
+    """
     plugin = make_container_app_runner()
     token = "main-token; touch /tmp/must-not-run"
     plugin.cfg_exposed_ports = {

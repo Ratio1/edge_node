@@ -47,6 +47,24 @@ class _JobPersistencePlugin(_DeeployJobMixin):
 class DeeployJobPersistenceTests(unittest.TestCase):
 
   def test_save_pipeline_to_r1fs_suppresses_raw_r1fs_logs(self):
+    """Save a deployment configuration without logging its raw contents.
+
+    Verify that the SDK selects the random nonce, that writing protected
+    copies requires the enabled setting, and that the pipeline summary
+    logs a redaction in place of the configured value.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> DeeployJobPersistenceTests().test_save_pipeline_to_r1fs_suppresses_raw_r1fs_logs()
+    """
     plugin = _JobPersistencePlugin()
 
     cid = plugin._save_pipeline_to_r1fs({
