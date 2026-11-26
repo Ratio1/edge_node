@@ -1666,10 +1666,10 @@ class DeeployManagerApiPlugin(
     -------
     dict
       A signed accepted result with HTTP 202 and an operation ID to poll
-      through get_deployment_status. Admission errors include signed status
-      codes 400 for invalid input, 409 for conflicting work or request ID
-      reuse, and 503 if acceptance is uncertain. For a 503, retry with the
-      same request ID and input.
+      through get_deployment_status. The HTTP error path returns 400 for
+      invalid input, 409 for conflicting work or request ID reuse, and 503
+      if acceptance is uncertain. For a 503, retry with the same request ID
+      and input.
 
     Notes
     -----
