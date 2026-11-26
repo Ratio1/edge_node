@@ -833,10 +833,11 @@ class RequestTrackingTests(unittest.TestCase):
     self.assertIn("on_request_monitor_tick", vars(DeeployManagerApiPlugin))
     # What the plugin's two entry points call, in order.
     calls = []
-    # A host with the two trace steps, warmed up and with no relinked node.
+    # A warmed-up host with the repair relay, both trace steps, and no relinked node.
     plugin = SimpleNamespace(
       _maybe_publish_tracked_requests=lambda: calls.append("write"),
       _maybe_log_tracked_requests=lambda: calls.append("log"),
+      _process_job_repair_relay=lambda: calls.append("relay"),
       is_deeploy_warmed_up=lambda: True, _maybe_admit_node_relinks=lambda: None,
     )
     # The monitor's turn.
@@ -845,8 +846,8 @@ class RequestTrackingTests(unittest.TestCase):
     self.assertEqual(calls, ["write"])
     # The end of a plugin lap.
     DeeployManagerApiPlugin.process(plugin)
-    # It only logs.
-    self.assertEqual(calls, ["write", "log"])
+    # The relay still runs, and the lap logs without publishing the trace again.
+    self.assertEqual(calls, ["write", "relay", "log"])
 
   def test_the_trace_state_exists_before_the_base_init_starts_the_monitor_thread(self):
     """The Deeploy API creates the trace state before the base on_init, which starts the request monitor thread:
