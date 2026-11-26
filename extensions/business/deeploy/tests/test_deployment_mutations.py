@@ -29,8 +29,11 @@ class Mutations(_DeploymentMutationsMixin, Admission):
     self.pipeline = copy.deepcopy(self.current["A"])
     self.plans["current-plan"] = dict(configs=self.current, previous_configs={})
     self.reports = self.current
-    self.netmon = SimpleNamespace(network_known_pipelines=lambda: {
-      node: [copy.deepcopy(config)] for node, config in self.reports.items()})
+    # Expose liveness as well as observations so polling can also report an active operation.
+    self.netmon = SimpleNamespace(
+      network_known_pipelines=lambda: {node: [copy.deepcopy(config)] for node, config in self.reports.items()},
+      network_node_is_online_for_control=lambda node: True,
+    )
     self.storage[SECRET_REVISIONS_HKEY, "7|previous:deploy"] = dict(
       job_id="7", revision="previous:deploy", pipelines=copy.deepcopy(self.current), job_secrets={"secret": "protected"},
     )
@@ -39,6 +42,8 @@ class Mutations(_DeploymentMutationsMixin, Admission):
     self._delete_pipeline_cid_from_r1fs = Mock(return_value=True)
     self.r1fs.get_json = lambda cid, **kwargs: copy.deepcopy(self.plans[cid])
     self._deployment_operations_stop = __import__("threading").Event()
+    # Match the coordinator's in-memory snapshot repair state after startup.
+    self._operations_repaired = {}
     self.captured_scale = None
 
   def time(self):
@@ -320,7 +325,8 @@ class DeploymentMutationTests(unittest.TestCase):
     """
     # A durable failure from another coordinator can be older than the normal retry delay.
     plugin = Mutations()
-    failed = dict(job_id=7, mutation="node_relink", outcome="failed", previous_revision=4,
+    failed = dict(job_id=7, mutation="node_relink", kind="update", phase="completed", outcome="failed",
+                  previous_revision=4, target_revision=5, owner="owner", request_id="prior-move",
                   nodes=["N", "B"], updated_at=plugin.now, error={"code": "BLOCKED_OPERATION_ENDED"})
     plugin._operation_records = Mock(return_value={"relink": failed})
     plugin.now += 3600
@@ -495,8 +501,6 @@ class DeploymentMutationTests(unittest.TestCase):
     # Restart at the boundary with only persisted state and the original incomplete receipts.
     after = Mutations()
     after.storage, after.plans = before.storage, before.plans
-    # The restart also clears the coordinator's completed-snapshot repair schedule.
-    after._operations_repaired = {}
     after.now = operation["deadline"] + 3600
     # The status endpoint reuses an authenticated wallet read for its owner scope.
     after.deeploy_verify_and_get_inputs = Mock(return_value=("wallet", {}))
