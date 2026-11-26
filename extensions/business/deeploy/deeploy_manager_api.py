@@ -1582,10 +1582,11 @@ class DeeployManagerApiPlugin(
 
   @BasePlugin.endpoint(method="post", forward_accepted_status=True)
   def repair_update_pipeline(self, request: dict):
-    """Accept a CSP-signed legacy correction and update on its original coordinator.
+    """Accept a signed deployment repair using its reviewed coordinator.
 
     Use the reviewed proposal to admit a same-host repair or
-    replace a stateless workload through the original coordinator.
+    replace a stateless workload through the coordinator named in that
+    proposal.
 
     Parameters
     ----------
