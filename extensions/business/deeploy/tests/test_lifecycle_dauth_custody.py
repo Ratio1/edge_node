@@ -147,6 +147,99 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     pointer = self.state.public['DEEPLOY_DEPLOYED_JOBS', '7']
     return self.state.blobs.get_json(pointer['pipeline_cid'])
 
+  def _admit_resource_removal(self):
+    # Two same-signature rows, with different protected credentials, occupy the initial placement.
+    previous = pipeline()
+    previous["DEEPLOY_SPECS"].update(job_app_type="stack", node_res_req={"cpu": 1, "memory": "2g"})
+    group = previous["PLUGINS"][0]
+    group["SIGNATURE"] = "CONTAINER_APP_RUNNER"
+    kept = group["INSTANCES"][0]
+    kept.update(CONTAINER_RESOURCES={"cpu": ".4", "memory": "512m", "storage": "0g"})
+    removed = copy.deepcopy(kept)
+    removed.update(INSTANCE_ID="removed", ENV={"CF_TUNNEL_TOKEN": "removed-token"})
+    group["INSTANCES"].insert(0, removed)
+    cid = self.state.blobs.add_json(previous)
+    self.state.public["DEEPLOY_DEPLOYED_JOBS", "7"] = cid
+    self.coordinator.known = {"A": [previous]}
+    desired = copy.deepcopy(previous)
+    desired["PLUGINS"][0]["INSTANCES"].pop(0)
+    survivor = desired["PLUGINS"][0]["INSTANCES"][0]
+    survivor.update(CONTAINER_RESOURCES={"cpu": ".8", "memory": "1g", "storage": "0g"},
+                    ENV={"CF_TUNNEL_TOKEN": dAuth.DAUTH_SECRET_PLACEHOLDER})
+    accepted = self.coordinator._admit_prepared_deployment(
+      request={"job_id": 7, "request_id": "split", "expected_revision": 0, "plugins": [{"instance_id": "worker"}]}, auth_result={"escrow_owner": "owner"},
+      app_id="app", configs={"A": desired}, prior_pipeline=previous, is_create=False,
+      resource_tier={"cpu": 1, "memory": "2g"}, deferred_capacity=True)
+    self.assertEqual(accepted["status_code"], 202)
+    return self.operation()
+
+  def test_redistribution_stages_by_identity_and_restores_on_capacity_timeout(self):
+    from datetime import datetime, timezone
+    from naeural_core import constants as ct
+    from extensions.business.deeploy.deployment_operations import deployment_operation_phase
+    operation = self._admit_resource_removal()
+    self.assertEqual(operation["mutation"], "resource_redistribution_v1")
+    self.coordinator._advance_deployment_operation(operation)
+    report(self.state, operation, "retire", "stopped")
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(deployment_operation_phase(operation), "waiting_for_capacity")
+    # The old packet has ample capacity. Its sender timestamp makes it unusable after a stop.
+    sampled = datetime.fromtimestamp(self.state.now - 1, timezone.utc).strftime(ct.HB.TIMESTAMP_FORMAT)
+    sample = {ct.HB.CURRENT_TIME: sampled, ct.PAYLOAD_DATA.EE_TIMEZONE: "UTC+0",
+              ct.HB.CPU_NR_CORES: 4, ct.HB.CPU_USED: 10, ct.HB.AVAILABLE_MEMORY: 16, ct.HB.AVAILABLE_DISK: 3}
+    self.coordinator.netmon.network_node_last_heartbeat = lambda node: sample
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(deployment_operation_phase(operation), "waiting_for_capacity")
+    self.assertFalse(any(command[1]["DEEPLOY_OPERATION"]["action"] == "start" for command in self.coordinator.commands))
+    self.state.now += 2
+    sample[ct.HB.CURRENT_TIME] = datetime.fromtimestamp(self.state.now, timezone.utc).strftime(ct.HB.TIMESTAMP_FORMAT)
+    self.assertEqual(self.coordinator._post_retirement_capacity("A", operation["capacity_after"]["A"],
+                                                              [".8", "1073741824", "0"]), (self.state.now, True))
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(deployment_operation_phase(operation), "waiting_for_capacity")  # First post-stop sample is the fence.
+    self.state.now += 1
+    sample[ct.HB.CURRENT_TIME] = datetime.fromtimestamp(self.state.now, timezone.utc).strftime(ct.HB.TIMESTAMP_FORMAT)
+    sample[ct.HB.AVAILABLE_MEMORY] = 0.01
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(deployment_operation_phase(operation), "waiting_for_capacity")
+    self.state.now = operation["deadline"]
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(deployment_operation_phase(operation), "restoring_previous")
+    self.assertEqual(operation["error"]["code"], "POST_RETIRE_CAPACITY_UNCONFIRMED")
+    report(self.state, operation, "restore", "ready")
+    self.coordinator._advance_deployment_operation(operation)
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(operation["recovery"], "completed")
+    self.assertEqual(len(self.active()["PLUGINS"][0]["INSTANCES"]), 2)
+
+  def test_redistribution_publishes_one_survivor_after_two_fresh_worker_samples(self):
+    from datetime import datetime, timezone
+    from naeural_core import constants as ct
+    from extensions.business.deeploy.deployment_operations import deployment_operation_phase
+    operation = self._admit_resource_removal()
+    self.coordinator._advance_deployment_operation(operation)
+    report(self.state, operation, "retire", "stopped")
+    self.coordinator._advance_deployment_operation(operation)
+    def fresh(node):
+      return {ct.HB.CURRENT_TIME: datetime.fromtimestamp(self.state.now, timezone.utc).strftime(ct.HB.TIMESTAMP_FORMAT),
+              ct.PAYLOAD_DATA.EE_TZ: "UTC", ct.HB.CPU_NR_CORES: 2, ct.HB.CPU_USED: 30,
+              ct.HB.AVAILABLE_MEMORY: 1, ct.HB.AVAILABLE_DISK: 0}
+    self.coordinator.netmon.network_node_last_heartbeat = fresh
+    self.state.now += 1
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(deployment_operation_phase(operation), "waiting_for_capacity")
+    operation = self.operation()  # A coordinator restart reloads the first heartbeat fence.
+    self.state.now += 1
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(deployment_operation_phase(operation), "waiting_for_readiness")
+    self.coordinator._advance_deployment_operation(operation)
+    report(self.state, operation, "deploy", "ready")
+    self.coordinator._advance_deployment_operation(operation)
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(operation["outcome"], "succeeded")
+    self.assertEqual([i["INSTANCE_ID"] for i in self.active()["PLUGINS"][0]["INSTANCES"]], ["worker"])
+    self.assertEqual(self.token(self.state.secrets["DAUTH_JOB_SECRETS", "7"]), "fresh-token")
+
   def test_create_stages_only_on_dauth_and_publishes_after_readiness(self):
     self.assertEqual(self.admit()['status_code'], 202)
     operation = self.operation()

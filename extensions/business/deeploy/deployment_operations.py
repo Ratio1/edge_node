@@ -18,9 +18,14 @@ import threading
 # The call path of an error that stops an operation is logged (function names only).
 import traceback
 import uuid
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo
 # The verified-fingerprint cache keeps insertion order, so its oldest entry can be dropped first.
 from collections import OrderedDict
 
+from naeural_core import constants as ct
+from .container_allocations import redistribution_requirements
 from naeural_core.business.deployment_lifecycle import SOURCE_FAILURES, deployment_source_mode
 from ratio1.const.base import BCct, dAuth
 # The SDK client's error for a secret record a dAuth server refused for its size: it ends a preparation at once.
@@ -62,11 +67,13 @@ class DeploymentAuthenticationError(ValueError):
 
 
 STATELESS_REPLACEMENT = "stateless_replacement_v1"
+RESOURCE_REDISTRIBUTION = "resource_redistribution_v1"
 
 
 _OPERATION_PHASE_PREFIXES = {
   "same_host_repair_v1": "repair_v1_",
   STATELESS_REPLACEMENT: "stateless_v1_",
+  RESOURCE_REDISTRIBUTION: "resources_v1_",
 }
 
 
@@ -1393,7 +1400,8 @@ class _DeploymentOperationsMixin:
 
   def _admit_prepared_deployment(self, request, auth_result, app_id, configs,
                                  prior_pipeline, is_create, mutation=None,
-                                 restore_owner=None, identity_aliases=None, node_aliases=None, repair=None, replacement=None):
+                                 restore_owner=None, identity_aliases=None, node_aliases=None, repair=None, replacement=None,
+                                 resource_tier=None, deferred_capacity=False):
     """Save exact redacted plans and secret revisions before accepting work.
 
     Builds the operation's redacted plan (the target configs and, for an update,
@@ -1428,6 +1436,11 @@ class _DeploymentOperationsMixin:
     node_aliases : dict, optional
       Old node -> new node for a relink. ``prior_pipeline`` still names the old
       node; its previous configs and placement are renamed here.
+
+    resource_tier : dict, optional
+      Chain-confirmed ceiling for ordinary Native and Stack edits.
+    deferred_capacity : bool
+      Require a balanced resource edit before deferring a failed pre-retirement capacity check.
 
     Returns
     -------
@@ -1555,7 +1568,25 @@ class _DeploymentOperationsMixin:
         old_config.setdefault("DEEPLOY_SPECS", {}).update(
           revision=previous_revision, secret_revision=previous_secret_revision,
         )
+    # Compare authenticated materialized configs for the exact signed revision on every worker.
+    budgets = (redistribution_requirements(previous_configs, configs, resource_tier)
+               if resource_tier is not None and mutation is None and not is_create else {})
+    if deferred_capacity and not budgets:
+      raise ValueError("Insufficient free resources for an ordinary update without a balanced redistribution.")
+    if budgets:
+      # Legacy name inference remains available for unrelated edits. A paid redistribution must name every survivor.
+      rows = request.get("plugins") or [request]
+      explicit = {row.get("instance_id") or row.get("INSTANCE_ID") for row in rows}
+      for node, config in configs.items():
+        previous_ids = set(required_instances(previous_configs[node]))
+        survivors = {iid for sig, iid in required_instances(config)
+                     if sig in CONTAINERIZED_APPS_SIGNATURES and (sig, iid) in previous_ids}
+        if not survivors <= explicit:
+          raise ValueError("A container redistribution must explicitly identify every surviving instance_id.")
+      mutation = RESOURCE_REDISTRIBUTION
     plan = dict(configs=configs, previous_configs=previous_configs)
+    if budgets:
+      plan["resource_requirements"] = budgets  # Immutable desired CPU, RAM and persistent disk allocations.
     if repair:
       # Keep signed historic and fresh receipts in the immutable plan under their actual signer.
       plan["repair_evidence"] = dict(stopped=repair["stopped"], inspections=repair["inspections"], seals=repair["seals"])
@@ -1591,6 +1622,8 @@ class _DeploymentOperationsMixin:
     # The recovery owner must exist before any plaintext revision is staged.
     # If admission stops here, the worker either confirms complete preparation
     # or revokes its staged references without touching the running revision.
+    if budgets:
+      operation["phase"] = "resources_v1_preparing"  # Older coordinators cannot bypass the capacity barrier.
     if repair:
       operation.update(phase="repair_v1_preparing", repair_parent=repair["proposal"]["parent"],
                        previous_pipeline_cid=repair["proposal"]["pipeline_cid"],
@@ -1738,7 +1771,7 @@ class _DeploymentOperationsMixin:
         continue
       if node not in reports or reports[node]["sequence"] < sequence:
         reports[node] = report
-    if attempt == "retire" and operation.get("mutation") in ("node_relink", "same_host_repair_v1"):
+    if attempt == "retire" and operation.get("mutation") in ("node_relink", "same_host_repair_v1", RESOURCE_REDISTRIBUTION):
       # Filter after selecting the newest signature so an older stop cannot hide later contradictory evidence.
       reports = {node: report for node, report in reports.items() if report.get("status") != "stopped"
                  or report_confirms_retirement(report, operation["previous_instances"].get(node))}
@@ -1915,6 +1948,52 @@ class _DeploymentOperationsMixin:
         return self._advance_deployment_operation(operation)
     return self._advance_deployment_operation(operation)
 
+  def _post_retirement_capacity(self, node, stopped_at, required):
+    """Check one direct heartbeat sampled after the signed stop receipt.
+
+    Parameters
+    ----------
+    node : str
+      Retained worker identity.
+    stopped_at : float
+      Sender-clock timestamp of its signed complete stop.
+    required : list
+      Desired CPU cores and memory/disk bytes as exact decimal strings.
+
+    Returns
+    -------
+    tuple
+      Fresh sender timestamp and whether the sample covers the desired allocation.
+
+    Examples
+    --------
+    >>> plugin._post_retirement_capacity("worker", 100.0, ["1", "100", "0"])  # doctest: +SKIP
+    (102.0, True)
+    """
+    try:
+      hb = self.netmon.network_node_last_heartbeat(node)  # Read one direct frame, never display-summary fields.
+      if hb.get(ct.PAYLOAD_DATA.EE_TZ):
+        zone = ZoneInfo(hb[ct.PAYLOAD_DATA.EE_TZ])  # A named zone preserves half-hour offsets and DST.
+      else:
+        offset = str(hb[ct.PAYLOAD_DATA.EE_TIMEZONE]).removeprefix("UTC").replace("--", "-") or "0"
+        zone = timezone(timedelta(hours=int(offset)))
+      local = datetime.strptime(hb[ct.HB.CURRENT_TIME], ct.HB.TIMESTAMP_FORMAT)
+      recent = [ts for ts in {local.replace(tzinfo=zone, fold=f).timestamp() for f in (0, 1)}
+                if 0 <= self.time() - ts <= 60]
+      if len(recent) != 1:
+        return None, False  # Only a unique, current sender-clock time can authorize a start.
+      sampled = recent[0]
+      if not sampled > stopped_at:
+        return None, False  # Delayed pre-stop packets and stale or future-dated samples cannot credit capacity.
+      cores, load, ram, disk = (Decimal(str(hb[key])) for key in
+                                (ct.HB.CPU_NR_CORES, ct.HB.CPU_USED, ct.HB.AVAILABLE_MEMORY, ct.HB.AVAILABLE_DISK))
+      if not all(value.is_finite() and value >= 0 for value in (cores, load, ram, disk)) or load > 100:
+        return None, False
+      free = (cores * (100 - load) / 100, ram * 1024 ** 3, disk * 1024 ** 3)
+      return sampled, all(observed >= Decimal(wanted) for observed, wanted in zip(free, required, strict=True))
+    except (KeyError, ValueError, TypeError, OverflowError, InvalidOperation, OSError, RuntimeError):
+      return None, False  # Unknown telemetry leaves the bounded recovery deadline running.
+
   def _advance_deployment_operation(self, operation):
     """Advance the eligible operation by one coordinator pass.
 
@@ -1954,6 +2033,7 @@ class _DeploymentOperationsMixin:
       return self._advance_delete_operation(operation)
     repair = operation.get("mutation") == "same_host_repair_v1"
     replacing = operation.get("mutation") == STATELESS_REPLACEMENT
+    redistributing = operation.get("mutation") == RESOURCE_REDISTRIBUTION
     # Signed repair and replacement retain their own durable handoff and publication barriers.
     recovery_grace = self.cfg_deployment_readiness_timeout * BLOCKED_RECOVERY_GRACE_PERIODS
     if (repair or (replacing and operation.get("repair_parent"))) and not self._repair_parent_is_held(operation):
@@ -2000,6 +2080,11 @@ class _DeploymentOperationsMixin:
           # The restoration phase has its own readiness deadline and responsive initial sends.
           operation["recovery"] = "in_progress"
           self._save_operation(operation, "restoring_previous", "Restoring the previous revision.")
+        elif redistributing:
+          # Each stop receipt and the matching heartbeat are timestamped by the same worker.
+          operation["capacity_after"] = {node: retired[node].get("updated_at") for node in plan["previous_configs"]}
+          operation["deadline"] = self.time() + self.cfg_deployment_readiness_timeout
+          self._save_operation(operation, "waiting_for_capacity", "Previous instances stopped; awaiting fresh worker capacity.")
         else:
           operation["deadline"] = self.time() + self.cfg_deployment_readiness_timeout
           self._save_operation(operation, "waiting_for_readiness", "Previous instances stopped; starting target nodes.")
@@ -2016,6 +2101,31 @@ class _DeploymentOperationsMixin:
           self._save_operation(operation)
         self._send_operation_commands(operation, plan["previous_configs"], "retire", "retire", retired)
       return
+    if phase == "waiting_for_capacity":
+      # Admit the desired start only once every retained worker reports sufficient capacity.
+      first_samples = dict(operation.get("first_capacity_sample", {}))
+      missing = []
+      for node, required in plan["resource_requirements"].items():
+        sampled, sufficient = self._post_retirement_capacity(node, operation["capacity_after"].get(node), required)
+        if sampled is None or not sufficient or sampled <= first_samples.get(node, float("inf")):
+          missing.append(node)
+        if sampled is not None:
+          # CURRENT_TIME is written after resource collection. The next heartbeat starts a new collection.
+          first_samples.setdefault(node, sampled)
+      if first_samples != operation.get("first_capacity_sample", {}):
+        operation["first_capacity_sample"] = first_samples
+        self._save_operation(operation)  # Preserve the first observation across coordinator restart.
+      if self.time() >= operation["deadline"]:
+        operation["error"] = dict(code="POST_RETIRE_CAPACITY_UNCONFIRMED",
+                                  message="Worker capacity was insufficient or unconfirmed after retirement.",
+                                  nodes=missing, retryable=True)
+        operation["restore_deadline"] = self.time() + self.cfg_deployment_readiness_timeout
+        operation["recovery"] = "in_progress"
+        self._save_operation(operation, "restoring_previous", "Restoring the saved allocation and membership.")
+      elif not missing:
+        operation["deadline"] = self.time() + self.cfg_deployment_readiness_timeout
+        self._save_operation(operation, "waiting_for_readiness", "All retained workers confirmed sufficient free capacity.")
+      return
     if phase in ("finalizing", "finalizing_recovery"):
       restoring = phase == "finalizing_recovery"
       active_reports = self._node_operation_reports(operation, "restore") if restoring else reports
@@ -2024,14 +2134,14 @@ class _DeploymentOperationsMixin:
       for node, config in active_configs.items():
         pins = pinned_sources(config)
         # A node may go offline between the readiness barrier and publication of the revision.
-        recheck = repair or replacing or bool(pins) or any(
+        recheck = repair or replacing or redistributing or bool(pins) or any(
           deployment_source_mode(plugin["SIGNATURE"], config, instance) == "following"
           for plugin in config.get("PLUGINS", []) for instance in plugin.get("INSTANCES", [])
         )
         online = self._netmon_node_is_online_for_control(node) if recheck else True
         restore_bindings = operation.get("retired_runtime", {}).get(node, {}) if repair and restoring else None
         state = node_rollout_state(config, active_reports.get(node), online, expired, pins=pins,
-                                   allow_waiting_for_source=not (repair or replacing), restore_bindings=restore_bindings)
+                                   allow_waiting_for_source=not (repair or replacing or redistributing), restore_bindings=restore_bindings)
         if state in ("failed", "legacy_failed") or (recheck and state not in ("ready", "kept")):
           # Once the revision is published, its remaining secret/metadata writes must still finish.
           pointer = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(operation["job_id"]))
@@ -2046,7 +2156,7 @@ class _DeploymentOperationsMixin:
       expired = self.time() >= operation["deadline"]
       # Repair keeps the existing all-workers-ready barrier, including for source-following apps.
       states = {node: node_rollout_state(config, reports.get(node), self._netmon_node_is_online_for_control(node), expired,
-                                         allow_waiting_for_source=not (repair or replacing))
+                                         allow_waiting_for_source=not (repair or replacing or redistributing))
                 for node, config in configs.items()}
       failed = any(state in ("failed", "legacy_failed") for state in states.values())
       if failed or (expired and any(state in ("pending", "legacy_timeout") for state in states.values())):
@@ -2100,7 +2210,7 @@ class _DeploymentOperationsMixin:
       previous_reports = self._node_operation_reports(operation, "restore")
       expired = self.time() >= operation["restore_deadline"]
       states = {node: node_rollout_state(config, previous_reports.get(node), self._netmon_node_is_online_for_control(node), expired,
-                                         allow_waiting_for_source=not repair,
+                                         allow_waiting_for_source=not (repair or redistributing),
                                          restore_bindings=operation.get("retired_runtime", {}).get(node, {}) if repair else None)
                 for node, config in previous_configs.items()}
       if all(state in ("ready", "kept") for state in states.values()):
@@ -2781,7 +2891,7 @@ class _DeploymentOperationsMixin:
       and operation.get("mutation") != STATELESS_REPLACEMENT
       and (operation.get("error") or {}).get("code") != "ADMISSION_PREPARATION_FAILED"
     )
-    attempt = "retire" if operation["kind"] == "delete" or observed_phase == "retiring_previous" else "restore" if restoring else "deploy"
+    attempt = "retire" if operation["kind"] == "delete" or observed_phase in ("retiring_previous", "waiting_for_capacity") else "restore" if restoring else "deploy"
     reports = self._node_operation_reports(operation, attempt)
     if attempt == "retire" and operation.get("mutation") == "same_host_repair_v1":
       # An already stopped worker owes no second STOP. Display the original signed receipt at its actual signer.

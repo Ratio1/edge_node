@@ -6,7 +6,7 @@ from .dauth_registry import dauth_registry_write_kwargs
 from .repair_tunnel import reconcile_restore_tunnel
 from extensions.business.deeploy.deployment_operations import (
   BLOCKED_OPERATION_ENDED, check_replacement_placement, deployment_operation_phase, required_instances, ReplacementPlacementMismatch,
-  SIGNATURE_KEYS, STATELESS_REPLACEMENT,
+  SIGNATURE_KEYS, STATELESS_REPLACEMENT, RESOURCE_REDISTRIBUTION,
 )
 from extensions.business.deeploy.relink_placement import relink_configs, relink_pipeline
 # Use the same key selection and signed-copy marker as the deployment coordinator.
@@ -141,7 +141,7 @@ class _DauthDeploymentSecretsMixin:
           type(operation.get("previous_revision")) is not int
           or not 0 <= operation["previous_revision"] < operation["target_revision"]))):
       raise ValueError("Invalid deployment operation identity.")
-    if operation.get("mutation") in ("same_host_repair_v1", STATELESS_REPLACEMENT):
+    if operation.get("mutation") in ("same_host_repair_v1", STATELESS_REPLACEMENT, RESOURCE_REDISTRIBUTION):
       if not isinstance(operation.get("phase"), str):
         raise ValueError("Invalid repair custody phase.")
       phase = deployment_operation_phase(operation)
@@ -521,6 +521,7 @@ class _DauthDeploymentSecretsMixin:
           job_id, config, fragments,
           prior_bundle=prior_bundle, prior_pipeline=source,
           current_identity_aliases=aliases if attempt == "deploy" else None,
+          match_prior_instance=operation.get("mutation") == RESOURCE_REDISTRIBUTION,
         )
         bundle["job_secrets"] = self._merge_deeploy_dauth_secret_fragments(
           bundle["job_secrets"], node_bundle["job_secrets"], reject_conflicts=True,

@@ -227,3 +227,29 @@ Optional `CONTAINER_RESOURCES.storage` sets a Volume Storage budget that
 includes the container's fixed-size volumes. An omitted Native budget accounts
 for the existing fixed-volume reservations. Explicit zero is valid with no
 reservations. The storage allocation does not resize existing volume files.
+
+### Editing a running Stack or Native container set
+
+Submit a complete signed `update_pipeline` request with the current
+`expected_revision` and a stable `request_id`. Keep the workers and purchased
+tier fixed. Send the stable `instance_id` and signature for every survivor,
+omit the retired rows, and leave the ID absent on a new named container.
+Resolve any dependent plugin references before removal.
+
+The coordinator compares CPU, RAM and Volume Storage on each worker with the
+saved plan for that revision. Both an increase and a decrease in any total
+are refused, including below the paid tier. A historical Native container
+with an omitted CPU or RAM key inherits its actual runner defaults of one
+core and 512 MiB. An explicitly saved full-tier cap stays intact. The saved
+resource dictionary on an identified old container can retain its omitted
+fields. An unknown baseline requires recovery before editing.
+
+Balanced membership and resource changes use whole-placement retirement.
+Every signed receipt must identify all stopped instances. During
+`waiting_for_capacity`, Edge waits for two successive direct heartbeats from every worker
+after its stop. The second sample must have sufficient free CPU, RAM and disk. The
+previous caps and persistent volumes supply no capacity credit. If the
+barrier expires, the existing revision, membership and credentials are
+restored. On a deploy failure all attempted starts must stop before restore.
+Use the original request ID on an uncertain response and poll the returned
+operation. A legacy coordinator cannot advance the versioned capacity gate.
