@@ -1,6 +1,7 @@
 """The oracle API signs full availability for eligible revoked node keys and serves their new keys."""
 import unittest
 from types import SimpleNamespace
+from threading import Event
 from unittest.mock import patch
 
 from ratio1.const.base import dAuth
@@ -48,6 +49,7 @@ class RevokedFloorTests(unittest.TestCase):
 
 
 class _LookupPlugin(OracleApiPlugin):
+  plugins_shmem = {"__chain_storage_set": True}  # Initialized local ChainStore fixture.
   bc = None  # a plain attribute instead of the plugin's blockchain property
 
 
@@ -56,6 +58,8 @@ class NodeKeyRotationLookupTests(unittest.TestCase):
   def setUp(self):
     self.plugin = _LookupPlugin.__new__(_LookupPlugin)
     self.plugin._OracleApiPlugin__revoked_nodes = {REVOKED_ETH.lower(): "internal", OTHER_ETH: "internal-2"}
+    self.plugin._OracleApiPlugin__rotation_stop = Event()
+    self.plugin._OracleApiPlugin__rotation_thread = None
     self.plugin._OracleApiPlugin__last_node_key_rotations_sync = 0
     self.plugin._OracleApiPlugin__get_response = lambda data: data
     self.plugin.bc = SimpleNamespace(address="self", node_address_to_eth_address=lambda node: "eth-" + node)
@@ -71,17 +75,44 @@ class NodeKeyRotationLookupTests(unittest.TestCase):
     }})
 
   def test_rotations_are_synced_from_every_other_dauth_server(self):
+    entered, proceed = Event(), Event()
     calls = []
     def hsync(**kwargs):
       calls.append(kwargs["extra_peers"])
       if kwargs["extra_peers"] == ["down"]:
+        entered.set()  # Keep a real worker in flight while the plugin loop is exercised.
+        if not proceed.wait(timeout=3):
+          raise AssertionError("test did not release peer")
         raise ValueError("timeout")
-    self.plugin.chainstore_hsync = hsync
+      return {"merged_fields": 1}
+    self.plugin.chainstore_hsync_from_peer = lambda hkey, peer, timeout: hsync(extra_peers=[peer])
     self.plugin.time = lambda: 1000
     with patch.object(oracle_api, "get_dauth_registry_internal_peers", return_value=["self", "down", "up"]):
       self.plugin._OracleApiPlugin__maybe_sync_node_key_rotations()
+      self.assertTrue(entered.wait(timeout=2))
+      self.plugin.time = lambda: 2000  # The period expires with an active worker.
       self.plugin._OracleApiPlugin__maybe_sync_node_key_rotations()
+      self.assertEqual(calls, [["down"]])
+      proceed.set()
+      self.plugin._OracleApiPlugin__rotation_thread.join(timeout=2)
+      self.assertFalse(self.plugin._OracleApiPlugin__rotation_thread.is_alive())
     self.assertEqual(calls, [["down"], ["up"]])
+
+  def test_shutdown_during_discovery_starts_no_new_peer_wait(self):
+    entered, proceed = Event(), Event()
+    def discovery(plugin):
+      entered.set()  # A blocked registry simulates the in-flight discovery.
+      proceed.wait(timeout=3)
+      return ["up"]
+    self.plugin.time = lambda: 1000
+    with patch.object(oracle_api, "get_dauth_registry_internal_peers", discovery):
+      with patch.object(self.plugin, "chainstore_hsync_from_peer") as hsync:
+        self.plugin._OracleApiPlugin__maybe_sync_node_key_rotations()
+        self.assertTrue(entered.wait(timeout=2))
+        self.plugin._OracleApiPlugin__rotation_stop.set()
+        proceed.set()
+        self.plugin._OracleApiPlugin__rotation_thread.join(timeout=2)
+        hsync.assert_not_called()
 
 
 # The internal address of the one node the epoch stand-in knows.
@@ -179,7 +210,7 @@ class _Epochs:
     # The override stands for a stored value that differs from the history.
     return self.history[epoch_id] if self.stored is None else self.stored
 
-  def get_stats(self):
+  def get_cached_stats(self, node_addrs=None, online_only=False):
     """
     Return no node statistics.
 
@@ -294,6 +325,28 @@ class EpochEndpointSelfCheckTests(unittest.TestCase):
     self.history = {epoch: 0 for epoch in range(500, 560)}
     # Seen in epoch 527, the last one that makes a revoked key eligible for the floor.
     self.history[527] = 40
+
+  def test_batch_uses_one_metadata_generation_and_keeps_claims_on_cold_cache(self):
+    plugin = _epoch_plugin(REVOKED_ETH, self.history)
+    plugin._OracleApiPlugin__get_response = lambda data, **kw: data
+    plugin.time = lambda: 1
+    cache_results = [{NODE: {'resources': {'cpu': 2}, 'tags': ['x']}}, {'error': 'cold'}]
+    with patch.object(plugin.netmon.epoch_manager, 'get_cached_stats', side_effect=cache_results) as cached:
+      query = {REVOKED_ETH: [528, 530], OTHER_ETH: [528, 530]}
+      warm = plugin.multi_node_epochs_range(query)
+      cold = plugin.multi_node_epochs_range(query)
+    self.assertEqual(cached.call_count, 2)  # One read for each two-row request.
+    for address in query:
+      self.assertEqual(warm[address]['tags'], ['x'])
+      self.assertEqual(cold[address]['resources'], {})
+      self.assertEqual(cold[address]['tags'], [])
+      self.assertEqual(warm[address]['epochs_vals'], cold[address]['epochs_vals'])
+
+  def test_previous_core_uses_its_existing_get_stats_contract(self):
+    plugin = _epoch_plugin(REVOKED_ETH, self.history)
+    previous = SimpleNamespace(get_stats=lambda online_only: {'online_filter': online_only})
+    plugin.netmon.epoch_manager = previous
+    self.assertEqual(plugin._OracleApiPlugin__read_stats(online_only=True), {'online_filter': True})
 
   def test_last_epoch_of_an_eligible_revoked_key_is_answered_with_the_floor(self):
     """`node_last_epoch` answers the floor value for an eligible revoked key instead of failing its self-check."""
