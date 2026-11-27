@@ -20,6 +20,7 @@ from .repair_relay import _RepairRelayMixin
 from .deeploy_mixin import _DeeployMixin
 from .delegate_aliases import _DelegateAliasesMixin  # Optional metadata stays separate from deployment behavior.
 from .selected_secrets import compile_request_selections
+from .container_allocations import prepare_native_omissions, restore_native_omissions
 from .deeploy_chainstore_response_mixin import _DeeployChainstoreResponseMixin
 from .deeploy_target_nodes_mixin import _DeeployTargetNodesMixin
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
@@ -931,7 +932,10 @@ class DeeployManagerApiPlugin(
 
       # Validate plugins array structure and required fields for each plugin
       plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+      omissions = {}
       if plugins_array:
+        if not is_create and not repair_update and not replacing and job_app_type == JOB_APP_TYPES.NATIVE:
+          omissions = prepare_native_omissions(plugins_array)  # Work on normalized input, never the signed request.
         self._validate_plugins_array(plugins_array)
       else:
         # This shouldn't happen after normalization, but handle as fallback
@@ -973,6 +977,7 @@ class DeeployManagerApiPlugin(
       prepared_create_deploy_plan = None
       prepared_pipeline_configs = None
       update_context_from_persisted_pipeline = False
+      deferred_capacity = False
       if is_create:
         canonical = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(job_id))
         reusing_deleted_job = isinstance(canonical, dict) and canonical.get("deleted") is True
@@ -1197,7 +1202,15 @@ class DeeployManagerApiPlugin(
           deployment_targets,
         )
 
-        validated_nodes = self._check_nodes_availability(inputs)
+        try:
+          validated_nodes = self._check_nodes_availability(inputs)
+        except ValueError as exc:
+          # Only resource pressure on the retained placement is eligible for a post-stop check.
+          if (replacing or repair_update or job_app_type not in (JOB_APP_TYPES.STACK, JOB_APP_TYPES.NATIVE)
+              or set(current_nodes) != set(deployment_targets) or DEEPLOY_ERRORS.NODERES1 not in str(exc)):
+            raise
+          deferred_capacity = True
+          validated_nodes = self._check_nodes_availability(inputs, skip_resource_check=True)
         if set(validated_nodes) != set(deployment_targets):
           msg = (
             f"{DEEPLOY_ERRORS.NODES2}: Failed to validate requested target nodes. "
@@ -1255,6 +1268,8 @@ class DeeployManagerApiPlugin(
         owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
         prepared_deploy_plan=prepared_create_deploy_plan,
       )
+      if omissions:
+        restore_native_omissions(prepared_pipeline_configs, omissions)
       prior_pipeline = None if is_create or replacing else self.get_job_pipeline_from_cstore(
         job_id, timeout=30, pin=False, raise_on_error=False, show_logs=False,
       )
@@ -1273,6 +1288,9 @@ class DeeployManagerApiPlugin(
         request=request, auth_result=auth_result, app_id=app_id,
         configs=prepared_pipeline_configs, prior_pipeline=prior_pipeline,
         is_create=is_create, **({"repair": repair, "mutation": SAME_HOST_REPAIR} if repair_update else {}),
+        **({"deferred_capacity": True} if deferred_capacity else {}),
+        **({"resource_tier": inputs.get("_verified_resource_tier", {})}
+           if not is_create and not repair_update and job_app_type in (JOB_APP_TYPES.STACK, JOB_APP_TYPES.NATIVE) else {}),
       )
     except StaleReplacementReviewError:
       try:
@@ -1491,7 +1509,7 @@ class DeeployManagerApiPlugin(
             - instance_id : str (required when updating an existing plugin instance)
               - Required on every submitted service plugin and never inferred by the backend
             - **instance-specific parameters** (payload merged into the instance configuration)
-              - Omit instance_id to attach a brand new plugin instance; supported for native apps only
+              - Omit instance_id to attach a brand new plugin instance; supported for ordinary running Native and Stack container membership edits
             - Omit a live plugin from this array to remove it from the replacement deployment
 
       **Legacy format:**

@@ -99,7 +99,7 @@ from .sync.constants import ARCHIVE_ENCRYPTION, ARCHIVE_ENCRYPTION_SET, HEX64_RE
 
 __VER__ = "0.7.1"
 
-from extensions.utils.memory_formatter import parse_memory_to_mb
+from extensions.utils.memory_formatter import parse_memory_to_mb, size_bytes
 from extensions.utils.per_node_config import (
   CANONICAL_PER_NODE_CONFIG_KEY,
   PER_NODE_TARGET_NODES_KEY,
@@ -2969,7 +2969,12 @@ class ContainerAppRunnerPlugin(
     self.P(log_str)
 
     nano_cpu_limit = int(self._cpu_limit * 1_000_000_000)
-    mem_reservation = f"{parse_memory_to_mb(self._mem_limit, 0.9)}m"
+    try:
+      # Docker treats a bare limit as bytes. Preserve that unit when deriving the soft reservation.
+      mem_reservation = int(size_bytes(self._mem_limit) * 9 / 10)
+    except ValueError:
+      # Existing noncanonical runner configs keep their former Docker SDK validation path.
+      mem_reservation = f"{parse_memory_to_mb(self._mem_limit, 0.9)}m"
 
     # Intentionally NO auto_remove=True: exited containers stay inspectable
     # in `docker ps -a` until the next start cycle, which preserves

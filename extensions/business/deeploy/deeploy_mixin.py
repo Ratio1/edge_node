@@ -42,7 +42,7 @@ from extensions.business.deeploy.selected_secrets import (
   selected_value_paths,
 )
 
-from extensions.business.deeploy.container_allocations import validate_native_limits
+from extensions.business.deeploy.container_allocations import allocated_resources, validate_native_limits
 from extensions.utils.memory_formatter import parse_memory_to_mb
 from extensions.business.container_apps.container_utils import validate_exposed_ports_origin_tls_options
 from extensions.utils.per_node_config import (
@@ -2965,15 +2965,18 @@ class _DeeployMixin:
         container_storage = resources.get(DEEPLOY_RESOURCES.STORAGE)
 
         self.Pd(f"  Container resources: cpu={cpu}, memory={memory}")
-        memory_mb = parse_memory_to_mb(memory)
-        self.Pd(f"  Parsed memory: {memory_mb}MB")
-        storage_mb = 0
-        has_storage_resource = False
-        if DEEPLOY_RESOURCES.STORAGE in resources:
-          has_storage_resource = True
-          storage_mb = self._parse_stack_storage_mb(container_storage, context=f"plugin {idx}")
-          self.Pd(f"  Container storage: {storage_mb}MB")
-        if not is_stack_app and not (is_native_app and has_storage_resource):
+        has_storage_resource = DEEPLOY_RESOURCES.STORAGE in resources
+        if is_native_app:
+          # Use the same exact binary units as Native admission and the Docker memory limit.
+          allocation = allocated_resources(plugin_instance, native=True)
+          cpu = allocation.cpu
+          memory_mb = allocation.memory / 1024 ** 2
+          storage_mb = allocation.storage / 1024 ** 2
+          has_storage_resource = has_storage_resource or storage_mb > 0
+        else:
+          memory_mb = parse_memory_to_mb(memory)
+          storage_mb = self._parse_stack_storage_mb(container_storage, context=f"plugin {idx}") if has_storage_resource else 0
+        if not is_stack_app and not is_native_app:
           fixed_storage_mb = self._aggregate_fixed_size_volumes_storage_mb(plugin_instance)
           if fixed_storage_mb > 0:
             self.Pd(f"  FIXED_SIZE_VOLUMES storage: {fixed_storage_mb}MB")
@@ -3014,11 +3017,11 @@ class _DeeployMixin:
 
     # Return aggregated resources in standard format
     aggregated = {
-      DEEPLOY_RESOURCES.CPU: self._format_cpu_decimal(total_cpu),
-      DEEPLOY_RESOURCES.MEMORY: f"{total_memory_mb}m",
+      DEEPLOY_RESOURCES.CPU: float(total_cpu) if is_native_app else self._format_cpu_decimal(total_cpu),
+      DEEPLOY_RESOURCES.MEMORY: f"{total_memory_mb.normalize():f}m" if isinstance(total_memory_mb, Decimal) else f"{total_memory_mb}m",
     }
     if has_storage_resource:
-      aggregated[DEEPLOY_RESOURCES.STORAGE] = f"{total_storage_mb}m"
+      aggregated[DEEPLOY_RESOURCES.STORAGE] = f"{total_storage_mb.normalize():f}m" if isinstance(total_storage_mb, Decimal) else f"{total_storage_mb}m"
     self.Pd(f"Aggregated resources: {aggregated}")
     return aggregated
 
@@ -3300,6 +3303,7 @@ class _DeeployMixin:
     self.Pd(f"  is_create: {is_create}")
     self.Pd(f"  debug: {debug}")
 
+    inputs["_verified_resource_tier"] = {}  # Clear caller data before writing the server-verified chain ceiling.
     allow_unpaid = inputs.get("allow_unpaid_job", False)
     network = self.bc.get_evm_network()
     self.Pd(f"  allow_unpaid: {allow_unpaid}, network: {network}")
@@ -3383,6 +3387,7 @@ class _DeeployMixin:
           job_app_type = None
 
       if job_app_type == JOB_APP_TYPES.NATIVE:
+        inputs["_verified_resource_tier"] = expected_resources
         # The paid worker limits each new CAR/WAR individually, including legacy full-tier defaults.
         validate_native_limits(inputs, expected_resources, is_create)
         for idx, row in enumerate(inputs.get(DEEPLOY_KEYS.PLUGINS) or []):
@@ -5039,6 +5044,7 @@ class _DeeployMixin:
     prior_bundle=None,
     prior_pipeline=None,
     current_identity_aliases=None,
+    match_prior_instance=False,
   ):
     """Reconstruct the complete current bundle from exact placeholder paths."""
     prior_job_secrets = {}
@@ -5054,12 +5060,26 @@ class _DeeployMixin:
     for path in self._iter_deeploy_dauth_placeholder_paths(redacted_pipeline):
       found, value = self._get_dauth_secret_fragment_value(new_job_secrets, path)
       if not found:
-        found, value = self._get_dauth_secret_fragment_value(prior_job_secrets, path)
+        prior_path = path
+        if match_prior_instance and len(path) >= 4 and path[0] == "PLUGINS" and path[2] == "INSTANCES":
+          # Move only the positional prefix. Every secret still needs the same owning identity and local path.
+          identity = self._dauth_secret_path_identity(redacted_pipeline, path)
+          source = prior_pipeline or {}
+          matches = [(pi, ii) for pi, group in enumerate(source.get("PLUGINS", source.get("plugins", [])))
+                     for ii, instance in enumerate(group.get("INSTANCES", group.get("instances", [])))
+                     if (str(group.get("SIGNATURE", group.get("signature"))).upper(),
+                         instance.get("INSTANCE_ID", instance.get("instance_id"))) == identity]
+          if len(matches) != 1:
+            unresolved.append("/".join(str(part) for part in path))
+            continue
+          pi, ii = matches[0]
+          prior_path = ["PLUGINS", pi, "INSTANCES", ii, *path[4:]]
+        found, value = self._get_dauth_secret_fragment_value(prior_job_secrets, prior_path)
         if found and not self._same_dauth_secret_path_identity(
           path,
           redacted_pipeline,
           prior_pipeline,
-          current_identity_aliases=current_identity_aliases,
+          current_identity_aliases=current_identity_aliases, prior_path=prior_path,
         ):
           found = False
       if (
@@ -5132,9 +5152,10 @@ class _DeeployMixin:
     pipeline,
     prior_pipeline,
     current_identity_aliases=None,
+    prior_path=None,
   ):
     current_identity = self._dauth_secret_path_identity(pipeline, path)
-    prior_identity = self._dauth_secret_path_identity(prior_pipeline, path)
+    prior_identity = self._dauth_secret_path_identity(prior_pipeline, prior_path or path)
     if isinstance(current_identity_aliases, dict):
       current_identity = current_identity_aliases.get(
         current_identity,
@@ -5142,7 +5163,7 @@ class _DeeployMixin:
       )
     return (
       current_identity is not None and current_identity == prior_identity
-      and same_dynamic_structure(path, pipeline, prior_pipeline)
+      and same_dynamic_structure(path, pipeline, prior_pipeline, prior_path=prior_path)
     )
 
   def _store_deeploy_dauth_job_secrets(self, job_id, job_secrets):
