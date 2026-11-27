@@ -321,6 +321,14 @@ class TestLifecycleFirstLaunch(unittest.TestCase):
     plugin._handle_initial_launch()
     client.containers.run.assert_called_once()
 
+  def test_bare_docker_memory_limit_and_reservation_use_bytes(self):
+    plugin, client, _ = make_lifecycle_runner()
+    plugin._mem_limit = 512 * 1024 ** 2
+    plugin._handle_initial_launch()
+    kwargs = client.containers.run.call_args.kwargs
+    self.assertEqual(kwargs["mem_limit"], 512 * 1024 ** 2)
+    self.assertEqual(kwargs["mem_reservation"], (512 * 1024 ** 2) * 9 // 10)
+
   def test_state_transitions_to_running(self):
     plugin, _, _ = make_lifecycle_runner()
     plugin._handle_initial_launch()

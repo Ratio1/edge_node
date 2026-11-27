@@ -42,7 +42,7 @@ from extensions.business.deeploy.selected_secrets import (
   selected_value_paths,
 )
 
-from extensions.business.deeploy.container_allocations import validate_native_limits
+from extensions.business.deeploy.container_allocations import allocated_resources, validate_native_limits
 from extensions.utils.memory_formatter import parse_memory_to_mb
 from extensions.business.container_apps.container_utils import validate_exposed_ports_origin_tls_options
 from extensions.utils.per_node_config import (
@@ -2965,15 +2965,18 @@ class _DeeployMixin:
         container_storage = resources.get(DEEPLOY_RESOURCES.STORAGE)
 
         self.Pd(f"  Container resources: cpu={cpu}, memory={memory}")
-        memory_mb = parse_memory_to_mb(memory)
-        self.Pd(f"  Parsed memory: {memory_mb}MB")
-        storage_mb = 0
-        has_storage_resource = False
-        if DEEPLOY_RESOURCES.STORAGE in resources:
-          has_storage_resource = True
-          storage_mb = self._parse_stack_storage_mb(container_storage, context=f"plugin {idx}")
-          self.Pd(f"  Container storage: {storage_mb}MB")
-        if not is_stack_app and not (is_native_app and has_storage_resource):
+        has_storage_resource = DEEPLOY_RESOURCES.STORAGE in resources
+        if is_native_app:
+          # Use the same exact binary units as Native admission and the Docker memory limit.
+          allocation = allocated_resources(plugin_instance, native=True)
+          cpu = allocation.cpu
+          memory_mb = allocation.memory / 1024 ** 2
+          storage_mb = allocation.storage / 1024 ** 2
+          has_storage_resource = has_storage_resource or storage_mb > 0
+        else:
+          memory_mb = parse_memory_to_mb(memory)
+          storage_mb = self._parse_stack_storage_mb(container_storage, context=f"plugin {idx}") if has_storage_resource else 0
+        if not is_stack_app and not is_native_app:
           fixed_storage_mb = self._aggregate_fixed_size_volumes_storage_mb(plugin_instance)
           if fixed_storage_mb > 0:
             self.Pd(f"  FIXED_SIZE_VOLUMES storage: {fixed_storage_mb}MB")
@@ -3014,11 +3017,11 @@ class _DeeployMixin:
 
     # Return aggregated resources in standard format
     aggregated = {
-      DEEPLOY_RESOURCES.CPU: self._format_cpu_decimal(total_cpu),
-      DEEPLOY_RESOURCES.MEMORY: f"{total_memory_mb}m",
+      DEEPLOY_RESOURCES.CPU: float(total_cpu) if is_native_app else self._format_cpu_decimal(total_cpu),
+      DEEPLOY_RESOURCES.MEMORY: f"{total_memory_mb.normalize():f}m" if isinstance(total_memory_mb, Decimal) else f"{total_memory_mb}m",
     }
     if has_storage_resource:
-      aggregated[DEEPLOY_RESOURCES.STORAGE] = f"{total_storage_mb}m"
+      aggregated[DEEPLOY_RESOURCES.STORAGE] = f"{total_storage_mb.normalize():f}m" if isinstance(total_storage_mb, Decimal) else f"{total_storage_mb}m"
     self.Pd(f"Aggregated resources: {aggregated}")
     return aggregated
 
