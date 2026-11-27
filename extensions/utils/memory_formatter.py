@@ -1,3 +1,39 @@
+import re
+from decimal import Decimal
+
+
+def size_bytes(value, default_unit="b"):
+  """Read a finite capacity in binary units.
+
+  Bare Docker memory values are bytes. Bare Deeploy volume allocations are MiB.
+
+  Parameters
+  ----------
+  value : str or number
+    Stored or signed capacity.
+  default_unit : str
+    Historical interpretation of a unitless value.
+
+  Returns
+  -------
+  Decimal
+    Exact byte-equivalent amount.
+
+  Examples
+  --------
+  >>> size_bytes("512m") == size_bytes("0.5g")
+  True
+  """
+  match = re.fullmatch(r"(\d+(?:\.\d+)?|\.\d+)\s*([kmgt]b?|b)?", str(value).strip(), re.I)
+  if not match:
+    raise ValueError("Invalid container resource size.")
+  unit = (match[2] or default_unit)[0].lower()
+  amount = Decimal(match[1]) * (1024 ** "bkmgt".index(unit))
+  if amount > 2 ** 63 - 1:  # Docker's resource fields are signed 64-bit values.
+    raise ValueError("Container resource size exceeds runtime range.")
+  return amount
+
+
 def format_memory_to_standard(self, memory_value):
   """
   Convert memory value to standard format (string with unit).

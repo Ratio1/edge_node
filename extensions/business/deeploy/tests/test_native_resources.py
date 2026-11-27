@@ -43,3 +43,9 @@ class NativeResourceTests(unittest.TestCase):
     inputs.plugins.append(make_plugin_entry("WORKER_APP_RUNNER", CONTAINER_RESOURCES={"cpu": 3, "memory": "10g"}))
     inputs.plugins.append(make_plugin_entry("IN_PROCESS"))
     self.assertTrue(self.accept(inputs))
+
+  def test_native_placement_counts_docker_units_and_fractional_limits(self):
+    inputs = self.inputs({"cpu": "0.125", "memory": "0.5GB", "storage": "512KB"})
+    self.assertTrue(self.accept(inputs))
+    self.assertEqual(self.plugin._aggregate_container_resources(inputs),
+                     {"cpu": 0.125, "memory": "512m", "storage": "0.5m"})
