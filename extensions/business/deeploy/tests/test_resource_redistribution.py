@@ -58,6 +58,27 @@ class RedistributionTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "Unresolved"):
       plugin._build_complete_dauth_job_secret_bundle(7, new, {}, {"job_secrets": values}, old, match_prior_instance=True)
 
+  def test_redistribution_binds_all_saved_placement_fields_and_their_legacy_defaults(self):
+    old = config([("kept", 1, "1g", "0g")])
+    new = config([("kept", ".5", "512m", "0g"), ("extra", ".5", "512m", "0g")])
+    for item in (old, new):
+      item["DEEPLOY_SPECS"].update(current_target_nodes=["A", "B"], spare_nodes=["C", "D"],
+                                   nr_target_nodes=2, allow_replication_in_the_wild=False)
+    for field, value in (("current_target_nodes", ["B", "A"]), ("spare_nodes", ["D", "C"]),
+                         ("spare_nodes", ["C"]), ("allow_replication_in_the_wild", True), ("nr_target_nodes", 1)):
+      with self.subTest(field=field, value=value):
+        changed = copy.deepcopy(new)
+        changed["DEEPLOY_SPECS"][field] = value
+        with self.assertRaisesRegex(ValueError, "placement"):
+          redistribution_requirements({"A": old, "B": old}, {"A": new, "B": changed}, {})
+    for key in ("spare_nodes", "nr_target_nodes", "allow_replication_in_the_wild"):
+      del old["DEEPLOY_SPECS"][key]  # Historical rows can omit all three optional fields.
+    new["DEEPLOY_SPECS"]["spare_nodes"] = []
+    self.assertEqual(set(redistribution_requirements({"A": old, "B": old}, {"A": new, "B": new}, {})), {"A", "B"})
+    extension = copy.deepcopy(old)  # Ordinary paid scaling retains its independent placement contract.
+    extension["DEEPLOY_SPECS"].update(current_target_nodes=["A", "B", "E"], nr_target_nodes=3)
+    self.assertFalse(redistribution_requirements({"A": old, "B": old}, dict.fromkeys(("A", "B", "E"), extension), {}))
+
   def test_missing_saved_native_caps_use_docker_defaults(self):
     old = config([("one", 1, "512m", "0g")], native=True)
     old["PLUGINS"][0]["INSTANCES"][0].pop("CONTAINER_RESOURCES")

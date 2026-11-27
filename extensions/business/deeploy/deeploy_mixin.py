@@ -43,7 +43,7 @@ from extensions.business.deeploy.selected_secrets import (
 )
 
 from extensions.business.deeploy.container_allocations import allocated_resources, validate_native_limits
-from extensions.utils.memory_formatter import parse_memory_to_mb
+from extensions.utils.memory_formatter import parse_memory_to_mb, size_bytes
 from extensions.business.container_apps.container_utils import validate_exposed_ports_origin_tls_options
 from extensions.utils.per_node_config import (
   CANONICAL_PER_NODE_CONFIG_KEY,
@@ -2865,28 +2865,6 @@ class _DeeployMixin:
         raise ValueError(f"{ctx} missing required 'MOUNTING_POINT' field")
 
 
-  def _validate_stack_fixed_volume_storage_cap(self, resources, params, context=""):
-    """
-    Stack storage is selected Volume Storage. Fixed-size volumes reserve that
-    selected budget; they are not additional storage on top of it.
-    """
-    fixed_volume_storage_mb = self._aggregate_fixed_size_volumes_storage_mb(params)
-    if fixed_volume_storage_mb <= 0:
-      return
-
-    selected_storage = resources.get(DEEPLOY_RESOURCES.STORAGE) if isinstance(resources, dict) else None
-    try:
-      selected_storage_mb = self._parse_stack_storage_mb(selected_storage, context=context)
-    except ValueError:
-      raise
-
-    if fixed_volume_storage_mb > selected_storage_mb:
-      raise ValueError(
-        f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: FIXED_SIZE_VOLUMES reserve {fixed_volume_storage_mb}m "
-        f"but selected Volume Storage is {selected_storage_mb}m{' in ' + context if context else ''}."
-      )
-
-
   def _aggregate_container_resources(self, inputs):
     """
     Aggregate container resources across all CONTAINER_APP_RUNNER plugin instances.
@@ -2911,6 +2889,11 @@ class _DeeployMixin:
     is_stack_app = isinstance(job_app_type, str) and job_app_type.lower() == JOB_APP_TYPES.STACK
 
     is_native_app = isinstance(job_app_type, str) and job_app_type.lower() == JOB_APP_TYPES.NATIVE
+
+    if is_stack_app and not plugins_array and inputs.get(DEEPLOY_KEYS.APP_PARAMS):
+      # Legacy single-row input uses the same allocation parser as the normalized endpoint.
+      plugins_array = [{**inputs[DEEPLOY_KEYS.APP_PARAMS], DEEPLOY_KEYS.PLUGIN_SIGNATURE:
+                        inputs.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE) or "CONTAINER_APP_RUNNER"}]
 
     # For legacy format, use existing app_params
     if not plugins_array:
@@ -2966,9 +2949,12 @@ class _DeeployMixin:
 
         self.Pd(f"  Container resources: cpu={cpu}, memory={memory}")
         has_storage_resource = DEEPLOY_RESOURCES.STORAGE in resources
-        if is_native_app:
-          # Use the same exact binary units as Native admission and the Docker memory limit.
-          allocation = allocated_resources(plugin_instance, native=True)
+        if is_native_app or is_stack_app:
+          # Price and place the same byte quantities that redistribution compares.
+          try:
+            allocation = allocated_resources(plugin_instance, native=is_native_app)
+          except ValueError as exc:
+            raise ValueError(f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: plugin {idx}: {exc}") from exc
           cpu = allocation.cpu
           memory_mb = allocation.memory / 1024 ** 2
           storage_mb = allocation.storage / 1024 ** 2
@@ -3015,9 +3001,15 @@ class _DeeployMixin:
       total_storage_mb += storage_mb
       has_storage_resource = has_storage_resource or footprint_has_storage_resource
 
-    # Return aggregated resources in standard format
+    if is_native_app or is_stack_app:
+      # Preserve the public numeric representation when possible, including finer-than-centicore limits.
+      cpu_value = float(total_cpu)
+      if Decimal(str(cpu_value)) != total_cpu:
+        cpu_value = str(total_cpu)  # An exact signed decimal can exceed binary float precision.
+    else:
+      cpu_value = self._format_cpu_decimal(total_cpu)  # Historical Generic pricing uses centicores.
     aggregated = {
-      DEEPLOY_RESOURCES.CPU: float(total_cpu) if is_native_app else self._format_cpu_decimal(total_cpu),
+      DEEPLOY_RESOURCES.CPU: cpu_value,
       DEEPLOY_RESOURCES.MEMORY: f"{total_memory_mb.normalize():f}m" if isinstance(total_memory_mb, Decimal) else f"{total_memory_mb}m",
     }
     if has_storage_resource:
@@ -3414,20 +3406,6 @@ class _DeeployMixin:
               )
               self.P(msg)
               raise ValueError(msg)
-            if job_app_type == JOB_APP_TYPES.STACK and signature in CONTAINERIZED_APPS_SIGNATURES:
-              try:
-                storage_mb = self._parse_stack_storage_mb(resources.get(DEEPLOY_RESOURCES.STORAGE), context=f"plugin {idx}")
-              except ValueError as exc:
-                self.P(str(exc))
-                raise
-              if storage_mb < 0:
-                msg = (
-                  f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Stack container Volume Storage cannot be negative "
-                  f"for plugin {idx}."
-                )
-                self.P(msg)
-                raise ValueError(msg)
-              self._validate_stack_fixed_volume_storage_cap(resources, pi, context=f"plugin {idx}")
         else:
           app_params = inputs.get(DEEPLOY_KEYS.APP_PARAMS, {})
           self._validate_fixed_size_volumes(app_params, context="app_params")
@@ -3453,18 +3431,15 @@ class _DeeployMixin:
           self.P(msg)
           raise ValueError(msg)
         if requested_storage and expected_storage:
-          requested_storage_mb = parse_memory_to_mb(requested_storage)
-          expected_storage_mb = parse_memory_to_mb(expected_storage)
-          self.Pd(f"  Storage: requested={requested_storage_mb}MB, allowed={expected_storage_mb}MB")
-          if requested_storage_mb > expected_storage_mb:
+          # Stack aggregates and chain ceilings carry explicit units; preserve fractional MiB at the boundary.
+          storage_quantity = size_bytes if job_app_type == JOB_APP_TYPES.STACK else parse_memory_to_mb
+          if storage_quantity(requested_storage) > storage_quantity(expected_storage):
             msg = (
               f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Requested storage {requested_storage} "
               f"exceeds allowed storage {expected_storage} for job type {job_type}."
             )
             self.P(msg)
             raise ValueError(msg)
-          else:
-            self.Pd(f"  Storage validation passed ({requested_storage_mb}MB <= {expected_storage_mb}MB)")
 
         #TODO should also check gpu as soon as it is supported and sent in the request
         # Normalize numeric values before comparison
@@ -3480,42 +3455,32 @@ class _DeeployMixin:
           self.Pd(f"  Failed to parse expected CPU: {e}")
           expected_cpu_val = None
 
-        requested_memory_mb = (
-          None if requested_memory is None else parse_memory_to_mb(requested_memory)
-        )
-        expected_memory_mb = (
-          None if expected_memory is None else parse_memory_to_mb(expected_memory)
-        )
+        # Stack memory is priced at Docker byte precision. Generic keeps its legacy whole-MiB comparison.
+        memory_quantity = size_bytes if job_app_type == JOB_APP_TYPES.STACK else parse_memory_to_mb
+        requested_ram = None if requested_memory is None else memory_quantity(requested_memory)
+        expected_ram = None if expected_memory is None else memory_quantity(expected_memory)
 
         self.Pd(f"  Normalized: requested_cpu={requested_cpu_val}, expected_cpu={expected_cpu_val}")
-        self.Pd(f"  Normalized: requested_memory={requested_memory_mb}MB, expected_memory={expected_memory_mb}MB")
+        self.Pd(f"  Normalized: requested_memory={requested_ram}, expected_memory={expected_ram}")
 
         if job_app_type == JOB_APP_TYPES.STACK:
-          requested_storage_mb = (
-            None if requested_storage is None else parse_memory_to_mb(requested_storage)
-          )
-          expected_storage_mb = (
-            None if expected_storage is None else parse_memory_to_mb(expected_storage)
-          )
+          # The storage ceiling and its required presence were checked above.
           resources_match = (
             requested_cpu_val is not None and
             expected_cpu_val is not None and
-            requested_memory_mb is not None and
-            expected_memory_mb is not None and
-            requested_storage_mb is not None and
-            expected_storage_mb is not None and
+            requested_ram is not None and
+            expected_ram is not None and
             requested_cpu_val <= expected_cpu_val and
-            requested_memory_mb <= expected_memory_mb and
-            requested_storage_mb <= expected_storage_mb
+            requested_ram <= expected_ram
           )
         else:
           resources_match = (
             requested_cpu_val is not None and
             expected_cpu_val is not None and
-            requested_memory_mb is not None and
-            expected_memory_mb is not None and
+            requested_ram is not None and
+            expected_ram is not None and
             requested_cpu_val == expected_cpu_val and
-            requested_memory_mb == expected_memory_mb
+            requested_ram == expected_ram
           )
 
         self.Pd(f"  Resources match: {resources_match}")

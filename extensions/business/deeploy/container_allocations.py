@@ -47,13 +47,14 @@ def allocated_resources(instance, native):
   volumes = instance.get("FIXED_SIZE_VOLUMES", {})
   if not isinstance(volumes, dict) or any(not isinstance(vol, dict) for vol in volumes.values()):
     raise ValueError("Invalid FIXED_SIZE_VOLUMES.")
-  reserved = sum((size_bytes(vol.get("SIZE"), "m") for vol in volumes.values()), Decimal(0))
+  # The fixed-volume runner passes SIZE to fallocate, where a bare size is a byte count.
+  reserved = sum((size_bytes(vol.get("SIZE")) for vol in volumes.values()), Decimal(0))
   if native and "storage" not in resources:
     storage = reserved  # Legacy Native tiers do not have a finite storage amount.
   else:
     storage = size_bytes(resources.get("storage"), "m")
   if reserved > storage:
-    raise ValueError("FIXED_SIZE_VOLUMES exceed selected Volume Storage.")
+    raise ValueError(f"FIXED_SIZE_VOLUMES reserve {reserved / 1024 ** 2:f}m and exceed selected Volume Storage.")
   return Allocation(cpu, memory, storage)
 
 
@@ -278,9 +279,12 @@ def redistribution_requirements(previous, desired, paid):
     new_totals = tuple(map(sum, zip(*new.values()))) if new else (0, 0, 0)
     if old_totals != new_totals:
       raise ValueError("Total CPU, RAM and Volume Storage must match the saved revision on each worker.")
-    # Numeric overlay selectors and existing credential paths use the saved worker order.
-    if previous[node]["DEEPLOY_SPECS"].get("current_target_nodes") != desired[node]["DEEPLOY_SPECS"].get("current_target_nodes"):
-      raise ValueError("A container edit must retain the saved placement order.")
+    # Bind active and failover placement on every replica. Older plans omit optional fields.
+    prior_specs, next_specs = previous[node]["DEEPLOY_SPECS"], desired[node]["DEEPLOY_SPECS"]
+    placement_defaults = {"current_target_nodes": None, "nr_target_nodes": len(previous),
+                          "spare_nodes": [], "allow_replication_in_the_wild": False}
+    if any(prior_specs.get(key, default) != next_specs.get(key, default) for key, default in placement_defaults.items()):
+      raise ValueError("A container edit must retain the saved placement order, worker count and replication policy.")
     if native:
       tier = desired[node]["DEEPLOY_SPECS"].get("node_res_req") or {}
       for identity, allocation in new.items():

@@ -156,6 +156,30 @@ class DeeployStackResourceTests(unittest.TestCase):
 
     self.assertTrue(plugin.deeploy_check_payment_and_job_owner(inputs, "0xowner", is_create=True))
 
+  def test_stack_payment_and_placement_use_the_same_binary_units_as_redistribution(self):
+    plugin = make_deeploy_plugin()
+    plugin.bc = _FakeBlockchain(job_type=1)  # ENTRY provides 1 CPU, 2 GiB RAM and 8 GiB storage.
+    for ram, storage in (("512m", "1g"), (536870912, "1024MB"), ("512MB", 1024), (".5GB", "1048576KB")):
+      with self.subTest(ram=ram, storage=storage):
+        row = make_plugin_entry("CONTAINER_APP_RUNNER", instance_id="kept", IMAGE="image",
+                                CONTAINER_RESOURCES={"cpu": 0.8, "memory": ram, "storage": storage})
+        inputs = make_inputs(job_id=7, job_app_type="stack", plugins=[row])
+        plugin._validate_plugins_array(inputs.plugins)  # Exercise the HTTP admission shapes too.
+        self.assertTrue(plugin.deeploy_check_payment_and_job_owner(inputs, "0xowner", is_create=False))
+        self.assertEqual(plugin._aggregate_container_resources(inputs),
+                         {"cpu": 0.8, "memory": "512m", "storage": "1024m"})
+
+  def test_stack_paid_tier_compares_fractional_cpu_and_exact_bytes(self):
+    plugin = make_deeploy_plugin()
+    plugin.bc = _FakeBlockchain(job_type=1)  # The exact paid limits must fit and each excess must fail.
+    base = {"cpu": 1, "memory": "2048m", "storage": "8g"}
+    for field, extra in (("cpu", "1.0001"), ("memory", "2147483649b"), ("storage", "8589934593b")):
+      with self.subTest(field=field):
+        row = make_plugin_entry("WORKER_APP_RUNNER", CONTAINER_RESOURCES={**base, field: extra})
+        inputs = make_inputs(job_id=7, job_app_type="stack", plugins=[row])
+        with self.assertRaisesRegex(ValueError, DEEPLOY_ERRORS.JOB_RESOURCES3):
+          plugin.deeploy_check_payment_and_job_owner(inputs, "0xowner", is_create=False)
+
   def test_generic_duplicate_instance_id_is_rejected_before_paid_tier(self):
     plugin = make_deeploy_plugin()
     plugin.bc = _FakeBlockchain(job_type=1)  # ENTRY: 1 CPU, 2GB RAM, 8GB storage

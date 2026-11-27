@@ -44,6 +44,22 @@ class NativeResourceTests(unittest.TestCase):
     inputs.plugins.append(make_plugin_entry("IN_PROCESS"))
     self.assertTrue(self.accept(inputs))
 
+  def test_legacy_volume_definition_uses_bytes_and_optional_allocation_uses_mib(self):
+    from extensions.business.container_apps.fixed_volume import _parse_size_to_bytes
+    from extensions.business.deeploy.container_allocations import allocated_resources
+    for saved_size in ("16777216", 16777216, "16M"):
+      with self.subTest(saved_size=saved_size):
+        inputs = self.inputs({"cpu": 1, "memory": "512m"}, saved_size)
+        row = inputs.plugins[0]
+        self.assertTrue(self.accept(inputs))
+        self.assertEqual(_parse_size_to_bytes(str(saved_size)), 16 * 1024 ** 2)  # Runtime image size.
+        self.assertEqual(allocated_resources(row, native=True).storage, 16 * 1024 ** 2)
+        self.assertEqual(self.plugin._aggregate_container_resources(inputs)["storage"], "16m")
+        row["CONTAINER_RESOURCES"]["storage"] = 16  # The bare budget retains its historical MiB unit.
+        self.assertTrue(self.accept(inputs))
+        self.assertEqual(allocated_resources(row, native=True).storage, 16 * 1024 ** 2)
+        self.assertEqual(row["FIXED_SIZE_VOLUMES"]["cache"]["SIZE"], saved_size)
+
   def test_native_placement_counts_docker_units_and_fractional_limits(self):
     inputs = self.inputs({"cpu": "0.125", "memory": "0.5GB", "storage": "512KB"})
     self.assertTrue(self.accept(inputs))
