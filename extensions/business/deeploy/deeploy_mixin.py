@@ -42,7 +42,8 @@ from extensions.business.deeploy.selected_secrets import (
   selected_value_paths,
 )
 
-from extensions.utils.memory_formatter import parse_memory_to_mb
+from extensions.business.deeploy.container_allocations import allocated_resources, validate_native_limits
+from extensions.utils.memory_formatter import parse_memory_to_mb, size_bytes
 from extensions.business.container_apps.container_utils import validate_exposed_ports_origin_tls_options
 from extensions.utils.per_node_config import (
   CANONICAL_PER_NODE_CONFIG_KEY,
@@ -93,6 +94,8 @@ DEEPLOY_DAUTH_SECRET_PATH_SUFFIXES = (
   ("VCS_DATA", "TOKEN"),
   ("CR_DATA", "PASSWORD"),
   ("ENV", "R1EN_CSTORE_AUTH_SECRET"),
+  # A volume-sync set's secret: kept out of the stored pipeline even when a client sends no secret_paths for it.
+  ("ENV", "R1EN_SYNC_SECRET"),
   ("ENV", "R1EN_CSTORE_AUTH_BOOTSTRAP_ADMIN_PWD"),
   ("ENV", "CF_TUNNEL_TOKEN"),
   ("ENV", "CRDB_PASSWORD"),
@@ -917,6 +920,9 @@ class _DeeployMixin:
     )
 
     detected_job_app_type = job_app_type or self.deeploy_detect_job_app_type(plugins)
+    if detected_job_app_type in (JOB_APP_TYPES.NATIVE, JOB_APP_TYPES.STACK) and inputs.get("node_res_req"):
+      # Keep the signed worker tier for lossless edits and recovery on subsequent revisions.
+      dct_deeploy_specs["node_res_req"] = self.deepcopy(inputs.get("node_res_req"))
     if detected_job_app_type in JOB_APP_TYPES_ALL:
       dct_deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
 
@@ -2859,28 +2865,6 @@ class _DeeployMixin:
         raise ValueError(f"{ctx} missing required 'MOUNTING_POINT' field")
 
 
-  def _validate_stack_fixed_volume_storage_cap(self, resources, params, context=""):
-    """
-    Stack storage is selected Volume Storage. Fixed-size volumes reserve that
-    selected budget; they are not additional storage on top of it.
-    """
-    fixed_volume_storage_mb = self._aggregate_fixed_size_volumes_storage_mb(params)
-    if fixed_volume_storage_mb <= 0:
-      return
-
-    selected_storage = resources.get(DEEPLOY_RESOURCES.STORAGE) if isinstance(resources, dict) else None
-    try:
-      selected_storage_mb = self._parse_stack_storage_mb(selected_storage, context=context)
-    except ValueError:
-      raise
-
-    if fixed_volume_storage_mb > selected_storage_mb:
-      raise ValueError(
-        f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: FIXED_SIZE_VOLUMES reserve {fixed_volume_storage_mb}m "
-        f"but selected Volume Storage is {selected_storage_mb}m{' in ' + context if context else ''}."
-      )
-
-
   def _aggregate_container_resources(self, inputs):
     """
     Aggregate container resources across all CONTAINER_APP_RUNNER plugin instances.
@@ -2904,6 +2888,13 @@ class _DeeployMixin:
     job_app_type = inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE)
     is_stack_app = isinstance(job_app_type, str) and job_app_type.lower() == JOB_APP_TYPES.STACK
 
+    is_native_app = isinstance(job_app_type, str) and job_app_type.lower() == JOB_APP_TYPES.NATIVE
+
+    if is_stack_app and not plugins_array and inputs.get(DEEPLOY_KEYS.APP_PARAMS):
+      # Legacy single-row input uses the same allocation parser as the normalized endpoint.
+      plugins_array = [{**inputs[DEEPLOY_KEYS.APP_PARAMS], DEEPLOY_KEYS.PLUGIN_SIGNATURE:
+                        inputs.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE) or "CONTAINER_APP_RUNNER"}]
+
     # For legacy format, use existing app_params
     if not plugins_array:
       self.Pd("Using legacy format (app_params) for resource aggregation")
@@ -2921,7 +2912,7 @@ class _DeeployMixin:
         if DEEPLOY_RESOURCES.STORAGE in legacy_resources:
           has_storage_resource = True
           storage_mb = self._parse_stack_storage_mb(container_storage)
-      if not is_stack_app:
+      if not is_stack_app and not (is_native_app and has_storage_resource):
         fixed_storage_mb = self._aggregate_fixed_size_volumes_storage_mb(app_params)
         if fixed_storage_mb > 0:
           storage_mb += fixed_storage_mb
@@ -2957,15 +2948,21 @@ class _DeeployMixin:
         container_storage = resources.get(DEEPLOY_RESOURCES.STORAGE)
 
         self.Pd(f"  Container resources: cpu={cpu}, memory={memory}")
-        memory_mb = parse_memory_to_mb(memory)
-        self.Pd(f"  Parsed memory: {memory_mb}MB")
-        storage_mb = 0
-        has_storage_resource = False
-        if DEEPLOY_RESOURCES.STORAGE in resources:
-          has_storage_resource = True
-          storage_mb = self._parse_stack_storage_mb(container_storage, context=f"plugin {idx}")
-          self.Pd(f"  Container storage: {storage_mb}MB")
-        if not is_stack_app:
+        has_storage_resource = DEEPLOY_RESOURCES.STORAGE in resources
+        if is_native_app or is_stack_app:
+          # Price and place the same byte quantities that redistribution compares.
+          try:
+            allocation = allocated_resources(plugin_instance, native=is_native_app)
+          except ValueError as exc:
+            raise ValueError(f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: plugin {idx}: {exc}") from exc
+          cpu = allocation.cpu
+          memory_mb = allocation.memory / 1024 ** 2
+          storage_mb = allocation.storage / 1024 ** 2
+          has_storage_resource = has_storage_resource or storage_mb > 0
+        else:
+          memory_mb = parse_memory_to_mb(memory)
+          storage_mb = self._parse_stack_storage_mb(container_storage, context=f"plugin {idx}") if has_storage_resource else 0
+        if not is_stack_app and not is_native_app:
           fixed_storage_mb = self._aggregate_fixed_size_volumes_storage_mb(plugin_instance)
           if fixed_storage_mb > 0:
             self.Pd(f"  FIXED_SIZE_VOLUMES storage: {fixed_storage_mb}MB")
@@ -3004,13 +3001,19 @@ class _DeeployMixin:
       total_storage_mb += storage_mb
       has_storage_resource = has_storage_resource or footprint_has_storage_resource
 
-    # Return aggregated resources in standard format
+    if is_native_app or is_stack_app:
+      # Preserve the public numeric representation when possible, including finer-than-centicore limits.
+      cpu_value = float(total_cpu)
+      if Decimal(str(cpu_value)) != total_cpu:
+        cpu_value = str(total_cpu)  # An exact signed decimal can exceed binary float precision.
+    else:
+      cpu_value = self._format_cpu_decimal(total_cpu)  # Historical Generic pricing uses centicores.
     aggregated = {
-      DEEPLOY_RESOURCES.CPU: self._format_cpu_decimal(total_cpu),
-      DEEPLOY_RESOURCES.MEMORY: f"{total_memory_mb}m",
+      DEEPLOY_RESOURCES.CPU: cpu_value,
+      DEEPLOY_RESOURCES.MEMORY: f"{total_memory_mb.normalize():f}m" if isinstance(total_memory_mb, Decimal) else f"{total_memory_mb}m",
     }
     if has_storage_resource:
-      aggregated[DEEPLOY_RESOURCES.STORAGE] = f"{total_storage_mb}m"
+      aggregated[DEEPLOY_RESOURCES.STORAGE] = f"{total_storage_mb.normalize():f}m" if isinstance(total_storage_mb, Decimal) else f"{total_storage_mb}m"
     self.Pd(f"Aggregated resources: {aggregated}")
     return aggregated
 
@@ -3292,11 +3295,15 @@ class _DeeployMixin:
     self.Pd(f"  is_create: {is_create}")
     self.Pd(f"  debug: {debug}")
 
+    inputs["_verified_resource_tier"] = {}  # Clear caller data before writing the server-verified chain ceiling.
     allow_unpaid = inputs.get("allow_unpaid_job", False)
     network = self.bc.get_evm_network()
     self.Pd(f"  allow_unpaid: {allow_unpaid}, network: {network}")
 
     if allow_unpaid and network == 'devnet':
+      if inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE) == JOB_APP_TYPES.NATIVE:
+        # Local unpaid development still uses the same resource contract.
+        validate_native_limits(inputs, {}, is_create)
       self.Pd("  Bypassing payment check: unpaid job allowed on devnet")
       return True
 
@@ -3371,9 +3378,13 @@ class _DeeployMixin:
           self.Pd(f"  Failed to detect job app type: {exc}")
           job_app_type = None
 
+      if job_app_type in (JOB_APP_TYPES.NATIVE, JOB_APP_TYPES.STACK):
+        inputs["_verified_resource_tier"] = expected_resources  # Recover legacy paid tiers absent from stored plans.
       if job_app_type == JOB_APP_TYPES.NATIVE:
-        # TODO: Re-enable resource validation for native apps once specs are defined.
-        self.Pd(f"Skipping resource validation for native job {job_id}.")
+        # The paid worker limits each new CAR/WAR individually, including legacy full-tier defaults.
+        validate_native_limits(inputs, expected_resources, is_create)
+        for idx, row in enumerate(inputs.get(DEEPLOY_KEYS.PLUGINS) or []):
+          self._validate_fixed_size_volumes(row, context=f"plugin {idx}")
       else:
         self.Pd(f"  Validating resources for non-native job (type={job_app_type})...")
 
@@ -3395,20 +3406,6 @@ class _DeeployMixin:
               )
               self.P(msg)
               raise ValueError(msg)
-            if job_app_type == JOB_APP_TYPES.STACK and signature in CONTAINERIZED_APPS_SIGNATURES:
-              try:
-                storage_mb = self._parse_stack_storage_mb(resources.get(DEEPLOY_RESOURCES.STORAGE), context=f"plugin {idx}")
-              except ValueError as exc:
-                self.P(str(exc))
-                raise
-              if storage_mb < 0:
-                msg = (
-                  f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Stack container Volume Storage cannot be negative "
-                  f"for plugin {idx}."
-                )
-                self.P(msg)
-                raise ValueError(msg)
-              self._validate_stack_fixed_volume_storage_cap(resources, pi, context=f"plugin {idx}")
         else:
           app_params = inputs.get(DEEPLOY_KEYS.APP_PARAMS, {})
           self._validate_fixed_size_volumes(app_params, context="app_params")
@@ -3434,18 +3431,15 @@ class _DeeployMixin:
           self.P(msg)
           raise ValueError(msg)
         if requested_storage and expected_storage:
-          requested_storage_mb = parse_memory_to_mb(requested_storage)
-          expected_storage_mb = parse_memory_to_mb(expected_storage)
-          self.Pd(f"  Storage: requested={requested_storage_mb}MB, allowed={expected_storage_mb}MB")
-          if requested_storage_mb > expected_storage_mb:
+          # Stack aggregates and chain ceilings carry explicit units; preserve fractional MiB at the boundary.
+          storage_quantity = size_bytes if job_app_type == JOB_APP_TYPES.STACK else parse_memory_to_mb
+          if storage_quantity(requested_storage) > storage_quantity(expected_storage):
             msg = (
               f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Requested storage {requested_storage} "
               f"exceeds allowed storage {expected_storage} for job type {job_type}."
             )
             self.P(msg)
             raise ValueError(msg)
-          else:
-            self.Pd(f"  Storage validation passed ({requested_storage_mb}MB <= {expected_storage_mb}MB)")
 
         #TODO should also check gpu as soon as it is supported and sent in the request
         # Normalize numeric values before comparison
@@ -3461,42 +3455,32 @@ class _DeeployMixin:
           self.Pd(f"  Failed to parse expected CPU: {e}")
           expected_cpu_val = None
 
-        requested_memory_mb = (
-          None if requested_memory is None else parse_memory_to_mb(requested_memory)
-        )
-        expected_memory_mb = (
-          None if expected_memory is None else parse_memory_to_mb(expected_memory)
-        )
+        # Stack memory is priced at Docker byte precision. Generic keeps its legacy whole-MiB comparison.
+        memory_quantity = size_bytes if job_app_type == JOB_APP_TYPES.STACK else parse_memory_to_mb
+        requested_ram = None if requested_memory is None else memory_quantity(requested_memory)
+        expected_ram = None if expected_memory is None else memory_quantity(expected_memory)
 
         self.Pd(f"  Normalized: requested_cpu={requested_cpu_val}, expected_cpu={expected_cpu_val}")
-        self.Pd(f"  Normalized: requested_memory={requested_memory_mb}MB, expected_memory={expected_memory_mb}MB")
+        self.Pd(f"  Normalized: requested_memory={requested_ram}, expected_memory={expected_ram}")
 
         if job_app_type == JOB_APP_TYPES.STACK:
-          requested_storage_mb = (
-            None if requested_storage is None else parse_memory_to_mb(requested_storage)
-          )
-          expected_storage_mb = (
-            None if expected_storage is None else parse_memory_to_mb(expected_storage)
-          )
+          # The storage ceiling and its required presence were checked above.
           resources_match = (
             requested_cpu_val is not None and
             expected_cpu_val is not None and
-            requested_memory_mb is not None and
-            expected_memory_mb is not None and
-            requested_storage_mb is not None and
-            expected_storage_mb is not None and
+            requested_ram is not None and
+            expected_ram is not None and
             requested_cpu_val <= expected_cpu_val and
-            requested_memory_mb <= expected_memory_mb and
-            requested_storage_mb <= expected_storage_mb
+            requested_ram <= expected_ram
           )
         else:
           resources_match = (
             requested_cpu_val is not None and
             expected_cpu_val is not None and
-            requested_memory_mb is not None and
-            expected_memory_mb is not None and
+            requested_ram is not None and
+            expected_ram is not None and
             requested_cpu_val == expected_cpu_val and
-            requested_memory_mb == expected_memory_mb
+            requested_ram == expected_ram
           )
 
         self.Pd(f"  Resources match: {resources_match}")
@@ -5026,6 +5010,7 @@ class _DeeployMixin:
     prior_bundle=None,
     prior_pipeline=None,
     current_identity_aliases=None,
+    match_prior_instance=False,
   ):
     """Reconstruct the complete current bundle from exact placeholder paths."""
     prior_job_secrets = {}
@@ -5041,12 +5026,26 @@ class _DeeployMixin:
     for path in self._iter_deeploy_dauth_placeholder_paths(redacted_pipeline):
       found, value = self._get_dauth_secret_fragment_value(new_job_secrets, path)
       if not found:
-        found, value = self._get_dauth_secret_fragment_value(prior_job_secrets, path)
+        prior_path = path
+        if match_prior_instance and len(path) >= 4 and path[0] == "PLUGINS" and path[2] == "INSTANCES":
+          # Move only the positional prefix. Every secret still needs the same owning identity and local path.
+          identity = self._dauth_secret_path_identity(redacted_pipeline, path)
+          source = prior_pipeline or {}
+          matches = [(pi, ii) for pi, group in enumerate(source.get("PLUGINS", source.get("plugins", [])))
+                     for ii, instance in enumerate(group.get("INSTANCES", group.get("instances", [])))
+                     if (str(group.get("SIGNATURE", group.get("signature"))).upper(),
+                         instance.get("INSTANCE_ID", instance.get("instance_id"))) == identity]
+          if len(matches) != 1:
+            unresolved.append("/".join(str(part) for part in path))
+            continue
+          pi, ii = matches[0]
+          prior_path = ["PLUGINS", pi, "INSTANCES", ii, *path[4:]]
+        found, value = self._get_dauth_secret_fragment_value(prior_job_secrets, prior_path)
         if found and not self._same_dauth_secret_path_identity(
           path,
           redacted_pipeline,
           prior_pipeline,
-          current_identity_aliases=current_identity_aliases,
+          current_identity_aliases=current_identity_aliases, prior_path=prior_path,
         ):
           found = False
       if (
@@ -5119,9 +5118,10 @@ class _DeeployMixin:
     pipeline,
     prior_pipeline,
     current_identity_aliases=None,
+    prior_path=None,
   ):
     current_identity = self._dauth_secret_path_identity(pipeline, path)
-    prior_identity = self._dauth_secret_path_identity(prior_pipeline, path)
+    prior_identity = self._dauth_secret_path_identity(prior_pipeline, prior_path or path)
     if isinstance(current_identity_aliases, dict):
       current_identity = current_identity_aliases.get(
         current_identity,
@@ -5129,7 +5129,7 @@ class _DeeployMixin:
       )
     return (
       current_identity is not None and current_identity == prior_identity
-      and same_dynamic_structure(path, pipeline, prior_pipeline)
+      and same_dynamic_structure(path, pipeline, prior_pipeline, prior_path=prior_path)
     )
 
   def _store_deeploy_dauth_job_secrets(self, job_id, job_secrets):

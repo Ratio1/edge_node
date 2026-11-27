@@ -73,6 +73,7 @@ import threading
 import time
 import socket
 import subprocess
+from naeural_core.utils.process_credentials import child_environment, launch_with_tunnel_token, redact_command
 from enum import Enum
 from dataclasses import dataclass
 from typing import Optional
@@ -93,10 +94,12 @@ from .mixins import (
 from .env_overrides import _EnvOverridesMixin
 from .reset import _ResetMixin
 from .sync import _SyncMixin
+# The 64-hex pattern that checks a set's sync secret, and the two archive format tags the "SYNC enabled" line names.
+from .sync.constants import ARCHIVE_ENCRYPTION, ARCHIVE_ENCRYPTION_SET, HEX64_RE
 
 __VER__ = "0.7.1"
 
-from extensions.utils.memory_formatter import parse_memory_to_mb
+from extensions.utils.memory_formatter import parse_memory_to_mb, size_bytes
 from extensions.utils.per_node_config import (
   CANONICAL_PER_NODE_CONFIG_KEY,
   PER_NODE_TARGET_NODES_KEY,
@@ -115,6 +118,14 @@ _CONTAINER_LOGS_FILE = "container_logs.pkl"
 # Pre-refactor persistent-state / logs subfolder relative to the data folder.
 # Kept here only so we can migrate content once; do not use for new writes.
 _LEGACY_CONTAINER_APPS_SUBFOLDER = "container_apps"
+
+# Seconds a node runs before the one sweep of its Docker store (`_maybe_sweep_docker_store`): one hour, by which
+# the apps of the run hold their images through their containers.
+_STORE_SWEEP_DELAY = 3600
+
+# Key, in the memory all plugins of a node share, under which the app thread that sweeps the store leaves its marker.
+# State of this module would not do: the node loads the module again for every plugin instance it creates.
+_STORE_SWEEP_KEY = "__docker_store_sweep"
 
 
 class ContainerState(Enum):
@@ -318,7 +329,8 @@ _CONFIG = {
   "AUTOUPDATE_INTERVAL": 100,
 
   # Image pull retry configuration (exponential backoff with jitter)
-  "IMAGE_PULL_MAX_RETRIES": 100,      # Max pull attempts before giving up (0 = unlimited)
+  # Failed pulls after which an untracked app gives up (0 = unlimited); a tracked deployment never gives up.
+  "IMAGE_PULL_MAX_RETRIES": 100,
   "IMAGE_PULL_BACKOFF_BASE": 20,      # Base delay in seconds for exponential backoff
 
   # Restart retry configuration (exponential backoff)
@@ -610,6 +622,28 @@ class ContainerAppRunnerPlugin(
 
 
   def __reset_vars(self):
+    """
+    Reset the runtime state of the plugin to its initial values.
+
+    Called by `on_init` and by `_restart_container` before every start from scratch: it creates a new
+    Docker client, empties the container, port, volume, tunnel and log state, and resets the restart and
+    image pull counters. It ends with `_after_reset`, where a subclass resets its own state.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    RuntimeError
+      When the Docker daemon cannot be reached.
+
+    Examples
+    --------
+    >>> self.__reset_vars()
+    >>> self.container is None
+    True
+    """
     self.container = None
     self.container_id = None
     self.container_name = self._compute_container_name(
@@ -717,6 +751,10 @@ class ContainerAppRunnerPlugin(
     self._image_pull_failures = 0
     self._next_image_pull_time = 0
     self._fixed_volume_setup_pending = False
+    # The id this Docker store gives the bound image of a tracked container app, set by `_ensure_bound_image` before
+    # each launch and restart of the launch path, and kept by `_restart_container`; the inline restarts of volume
+    # sync and reset reuse it. Until one is set the container is started by the bound id (`_get_full_image_ref`).
+    self._bound_image_store_id = None
 
     # Command execution state
     self._commands_started = False
@@ -935,14 +973,17 @@ class ContainerAppRunnerPlugin(
     Record the id of the image the started container really runs.
 
     Called once on the plugin thread right after the container starts, so that publishing the node's
-    status needs no Docker call. For a runner bound to its image the id must equal the saved one. For
-    a worker the id is only information: after its base image was pulled again the id can be a new
-    one, and that must not fail the start.
+    status needs no Docker call. For a runner bound to its image the running image must be the bound
+    one (`_is_bound_image`): the saved id, or, when this Docker store gives the image another id, the
+    image listed under the saved registry reference; the saved id is kept either way. For a worker the
+    id is only information: after its base image was pulled again the id can be a new one, and that
+    must not fail the start.
 
     A runner bound to its image also gets its registry reference here when the binding has none (a
     binding made before the reference existed, or restored from such a record). It is added at the
     start and not while the plugin initializes: a failed save then fails this start, which is tried
-    again, and not the whole plugin.
+    again, and not the whole plugin. When the image has no reference in the configured repository
+    (built or loaded locally, or pulled from another repository), one red line says so at each start.
 
     Returns
     -------
@@ -973,9 +1014,17 @@ class ContainerAppRunnerPlugin(
     # newer pull of the same tag: its id is recorded below, replacing the one that was lost.
     if self._deployment_source_mode == "pinned" and getattr(self, "_launch_image", None):
       artifacts = dict(self._launch_image)
-    if self._deployment_pins_image() and artifacts.get("image_id") and artifacts["image_id"] != image_id:
-      raise RuntimeError("Running container does not match the immutable image binding")
-    artifacts["image_id"] = image_id
+    if self._deployment_pins_image() and artifacts.get("image_id"):
+      # Only a runner bound to its image must run exactly the saved one; under another image store than
+      # the one that made the binding, that image has another id and is known by its registry reference.
+      # The saved id is not rewritten: the binding the node reports and a restoration brings stays the same.
+      if not self._is_bound_image(image, artifacts):
+        # Any other image fails this start, as before: nothing but the bound image runs for this deployment.
+        raise RuntimeError("Running container does not match the immutable image binding")
+    else:
+      # A worker's base image may be a newer pull of the same tag: its id is recorded, replacing the one
+      # that was lost. A runner bound to its image records here the id of its first start, as before.
+      artifacts["image_id"] = image_id
     if self._follows_image():
       # Use the registry digest resolved for this launch: RepoDigests can include several tags' digests.
       launched = getattr(self, "_launch_image", {})
@@ -990,21 +1039,41 @@ class ContainerAppRunnerPlugin(
       if image_ref:
         # Kept with the binding from now on, and reported with it.
         artifacts["image_ref"] = image_ref
+      else:
+        self.P(
+          "The bound image {} has no registry reference in the configured repository (built or loaded locally, "
+          "or pulled from another repository). If it is lost from the local Docker store, it can be found again "
+          "only through the configured tag '{}'.".format(image_id, super()._get_full_image_ref()),
+          color='r'
+        )
     self._save_deployment_artifacts(artifacts)
 
   def _get_full_image_ref(self):
-    """
-    Return the image to look up, pull or run.
+    """Return the image reference for the current operation.
 
-    A runner bound to its image uses the saved image id once it has one, so a restart never resolves
-    the configured tag again. Every other runner, a tracked worker included, uses the configured image
-    reference: an id saved earlier exists only in the Docker store that produced it and cannot be
-    pulled.
+    A following container uses the local ID of the selected launch image.
+    A bound container uses the image ID in this Docker store when known,
+    or its saved binding. Worker base images use the configured reference.
+
+    Parameters
+    ----------
+    None
 
     Returns
     -------
     str
-      The saved `sha256:...` image id, or the configured image reference.
+      Resolved local image ID or the configured reference.
+
+    Raises
+    ------
+    ValueError
+      An explicit image binding is invalid.
+
+    Notes
+    -----
+    Fixed-volume metadata inspects the resolved launch ID because pulling
+    a digest need not update the local tag. A newer store can also list
+    the bound digest under a different local ID.
 
     Examples
     --------
@@ -1016,11 +1085,17 @@ class ContainerAppRunnerPlugin(
     if not self._deployment_pins_image():
       # Not bound to an image: the configured reference is the only thing a registry can serve.
       return super()._get_full_image_ref()
-    if self._deployment_source_mode in ("pinned", "following") and getattr(self, "_launch_image", None):
+    if self._deployment_source_mode == "following" and getattr(self, "_launch_image", None):
       # Also inspect this id when provisioning fixed volumes: pulling by digest need not update a local tag.
       return self._launch_image["image_id"]
     artifacts = self._get_pinned_deployment_artifacts()
-    return artifacts.get("image_id") or super()._get_full_image_ref()
+    if not artifacts.get("image_id"):
+      # Not bound yet: the configured reference, which the first start resolves once.
+      return super()._get_full_image_ref()
+    # The id under which the last image check that found the bound image (`_ensure_bound_image`, run before each
+    # launch and restart of the launch path; the inline restarts of volume sync and reset reuse its last value)
+    # found it in this Docker store, or the saved id until one did; both name the bound image.
+    return self._bound_image_store_id or artifacts["image_id"]
 
 
   def _load_manual_stop_state(self):
@@ -1407,10 +1482,41 @@ class ContainerAppRunnerPlugin(
 
   def _validate_sync_config(self):
     """
-    Validate the SYNC config block when ENABLED. Disables SYNC with a
-    warning rather than raising; the system volume itself is independent
-    and the rest of the plugin must keep running.
+    Validate the SYNC config block when ENABLED.
+
+    Disables SYNC with a red log line rather than raising; the system volume itself is independent and the
+    rest of the plugin must keep running. Checked in this order: ``SYNC.KEY`` is a non-empty string,
+    ``SYNC.TYPE`` is ``provider`` or ``consumer``, and the set's secret (``ENV.R1EN_SYNC_SECRET``), when the
+    job has one, is exactly 64 lowercase hex characters. A secret in any other form (a passphrase, uppercase
+    hex, an empty string, a number) disables SYNC on this job: there is no fallback to the shared key, because
+    a job that was given a secret must never publish or apply under the key every node holds.
+
+    Returns
+    -------
+    None
+      The verdict is kept in ``_sync_config_refused`` (True when a check fails), which ``_sync_enabled``
+      reads. The configuration is not changed.
+
+    Notes
+    -----
+    Runs at init and at every restart, config edits included. Each run decides again from the current
+    configuration: a refused block logs its red line once per run and keeps SYNC off (no provider or consumer
+    tick work, no ``R1_SYNC_TYPE`` or ``R1_SYNC_KEY`` for the app), and the run after a corrected
+    configuration turns SYNC back on. The verdict is not written into ``SYNC.ENABLED``: on a node
+    ``cfg_sync`` is a copy of the block, so that write would be lost. The log lines never contain the secret:
+    the refusal names the variable, and the green line names the archive format (``r1fs-set-v1`` with a
+    secret, ``r1fs-default`` without).
+
+    Examples
+    --------
+    >>> plugin.config_data["SYNC"] = {"ENABLED": True, "KEY": "k", "TYPE": "provider"}
+    >>> plugin.config_data["ENV"] = {"R1EN_SYNC_SECRET": "not-64-hex"}
+    >>> plugin._validate_sync_config()
+    >>> plugin._sync_enabled(), plugin.cfg_sync["ENABLED"]
+    (False, True)
     """
+    # Each run decides again: without this a block refused once would stay refused after it was corrected.
+    self._sync_config_refused = False
     if not self._sync_enabled():
       return
     sync = self._sync_cfg()
@@ -1421,18 +1527,33 @@ class ContainerAppRunnerPlugin(
         "[sync] SYNC.ENABLED but SYNC.KEY missing/empty; disabling SYNC.",
         color="r",
       )
-      sync["ENABLED"] = False
+      # Kept on the plugin: `sync` is a copy of the block on a node, so a write to it left SYNC on.
+      self._sync_config_refused = True
       return
     if role not in ("provider", "consumer"):
       self.P(
         f"[sync] SYNC.TYPE must be 'provider' or 'consumer' (got {role!r}); disabling SYNC.",
         color="r",
       )
-      sync["ENABLED"] = False
+      # Kept on the plugin for the same reason; before, the app still got this TYPE and the KEY in its env.
+      self._sync_config_refused = True
+      return
+    # The set's secret from the job's configured ENV; None means a set that uses the shared key.
+    secret = self.cfg_sync_secret
+    # A configured secret must be 64 lowercase hex characters, whole string (fullmatch: the pattern is unanchored).
+    if secret is not None and not (isinstance(secret, str) and HEX64_RE.fullmatch(secret)):
+      self.P(
+        "[sync] R1EN_SYNC_SECRET must be 64 lowercase hex characters; disabling SYNC.",
+        color="r",
+      )
+      # No shared-key fallback: with a malformed secret this job neither publishes nor applies. Kept on the
+      # plugin: written into the copy `sync`, the refusal was lost and the job went on publishing or applying.
+      self._sync_config_refused = True
       return
     self.P(
       f"[sync] SYNC enabled: role={role}, key={key}, "
-      f"poll={self._sync_poll_interval()}s",
+      f"poll={self._sync_poll_interval()}s, "
+      f"encryption={ARCHIVE_ENCRYPTION_SET if secret is not None else ARCHIVE_ENCRYPTION}",
       color="g",
     )
     return
@@ -1836,8 +1957,32 @@ class ContainerAppRunnerPlugin(
     return
 
 
-  def run_tunnel_command(self, command):
-    """Launch a main tunnel without a shell or credential-bearing logs."""
+  def run_tunnel_command(self, command, *, token=None):
+    """Start the main tunnel as a direct subprocess.
+
+    A managed Cloudflare connection receives its credential on stdin.
+
+    Parameters
+    ----------
+    command : str or list or tuple
+      Tunnel invocation after selecting its origin and protocol.
+    token : str or None, optional
+      Managed Cloudflare credential for the one-use pipe.
+
+    Returns
+    -------
+    subprocess.Popen or None
+      Started connector, or None for an empty or invalid command or a launch failure.
+
+    Notes
+    -----
+    The command log redacts credentials. For a managed connection the
+    process receives its token through a fresh, one-use pipe.
+
+    Examples
+    --------
+    >>> plugin.run_tunnel_command(["cloudflared", "--version"])  # doctest: +SKIP
+    """
     if not command:
       return None
 
@@ -1855,24 +2000,23 @@ class ContainerAppRunnerPlugin(
     if not command:
       return None
 
-    token = self.get_cloudflare_token()
-    safe_command = list(command)
-    if self.use_cloudflare():
-      safe_command = self._redact_tunnel_command(safe_command)
-    elif token:
-      safe_command = ["[REDACTED]" if part == str(token) else part for part in safe_command]
+    # Cover credentials in both managed and explicitly supplied tunnel commands.
+    safe_command = redact_command(command, os.environ, extra_values=(token,))
 
     try:
       self.P(f"Running tunnel command: {' '.join(safe_command)}")
+      # A managed connector receives its scoped credential only through the pipe below.
       popen_kwargs = dict(
         args=command,
+        env=child_environment(os.environ, extra_values=(token,)),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0,
       )
       if os.name != "nt":
         popen_kwargs["start_new_session"] = True
-      process = subprocess.Popen(**popen_kwargs)
+      # Do not expose the credential as an argument or subprocess environment value.
+      process = launch_with_tunnel_token(token, **popen_kwargs)
       self._remember_process_group(process)
 
       logs_reader = self.LogReader(process.stdout, size=100, daemon=None)
@@ -1890,7 +2034,28 @@ class ContainerAppRunnerPlugin(
 
 
   def run_tunnel_engine(self):
-    """Build the primary Cloudflare command as an argument vector."""
+    """Launch the main configured tunnel for the selected engine.
+
+    Cloudflare's normalized main-port credential travels on stdin.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    subprocess.Popen or None
+      Started connector process, when configured.
+
+    Notes
+    -----
+    Cloudflare requires a normalized main port and token. Other engines
+    use their inherited launcher.
+
+    Examples
+    --------
+    >>> plugin.run_tunnel_engine()  # doctest: +SKIP
+    """
     if not self.use_cloudflare():
       return super(ContainerAppRunnerPlugin, self).run_tunnel_engine()
 
@@ -1905,7 +2070,8 @@ class ContainerAppRunnerPlugin(
       tunnel_config.get("token"),
       tunnel_config.get("protocol", "http"),
     )
-    return self.run_tunnel_command(command)
+    # Ship the credential on stdin independently of the CLI arguments.
+    return self.run_tunnel_command(command, token=tunnel_config["token"])
 
   def _get_main_tunnel_config(self):
     """
@@ -2302,12 +2468,15 @@ class ContainerAppRunnerPlugin(
     """
     Build Cloudflare tunnel command for a specific port.
 
+    Use the host port mapped to the requested container port as the
+    connector's origin.
+
     Parameters
     ----------
     container_port : int
         Container port to tunnel
     token : str
-        Cloudflare tunnel token
+        Managed tunnel credential. Its presence selects the token-file form.
     protocol : str, optional
         Tunnel origin protocol (default "http")
     no_tls_verify : bool, optional
@@ -2316,38 +2485,39 @@ class ContainerAppRunnerPlugin(
     Returns
     -------
     list or None
-        Command list to execute, or None if error
+        Argument list, or None if the port has no mapping or token is absent.
+
+    Notes
+    -----
+    The credential selects the stdin token-file argument. The caller
+    supplies its value when starting the process.
+
+    Examples
+    --------
+    >>> plugin._build_tunnel_command(8080, "configured")  # doctest: +SKIP
     """
     host_port = self._get_host_port_for_container_port(container_port)
     if not host_port:
       self.P(f"No host port found for container port {container_port}", color='r')
       return None
 
-    # Return list to avoid shell injection - use list-based subprocess
+    if not token:
+      return None
+
+    # Preserve individual argument boundaries and send the credential on stdin.
     command = [
       "cloudflared",
       "tunnel",
       "--no-autoupdate",
       "run",
-      "--token",
-      str(token),
+      "--token-file",
+      "/dev/stdin",
       "--url",
       f"{protocol}://127.0.0.1:{host_port}"
     ]
     if no_tls_verify:
       command.append("--no-tls-verify")
     return command
-
-
-  def _redact_tunnel_command(self, command):
-    """Return a log-safe copy of a cloudflared command."""
-    redacted = list(command)
-    try:
-      token_index = redacted.index("--token") + 1
-      redacted[token_index] = "[REDACTED]"
-    except (ValueError, IndexError):
-      pass
-    return redacted
 
 
   def _should_start_main_tunnel(self):
@@ -2381,6 +2551,9 @@ class ContainerAppRunnerPlugin(
     """
     Start a single extra tunnel for a specific container port.
 
+    Resolve the normalized config or legacy token and start the connector
+    against the mapped origin.
+
     Parameters
     ----------
     container_port : int
@@ -2391,7 +2564,17 @@ class ContainerAppRunnerPlugin(
     Returns
     -------
     bool
-        True if tunnel started successfully, False otherwise
+        True once the process and its readers are registered. False if
+        the token or port mapping is missing, or starting the process fails.
+
+    Notes
+    -----
+    Each launch or restart passes the token through a new pipe. Diagnostic
+    commands are redacted, and launch exceptions update restart backoff.
+
+    Examples
+    --------
+    >>> plugin._start_extra_tunnel(8081, {"token": "configured"})  # doctest: +SKIP
     """
     if isinstance(tunnel_config, dict):
       token = tunnel_config.get("token")
@@ -2417,18 +2600,20 @@ class ContainerAppRunnerPlugin(
     try:
       host_port = self._get_host_port_for_container_port(container_port)
       self.P(f"Starting Cloudflare tunnel for container port {container_port} (host port {host_port})...")
-      self.Pd(f"  Command: {' '.join(self._redact_tunnel_command(command))}")
+      self.Pd(f"  Command: {' '.join(redact_command(command, os.environ, extra_values=(token,)))}")
 
-      # Use list-based subprocess to prevent shell injection
+      # Preserve argument boundaries and pass the scoped credential through stdin.
       popen_kwargs = dict(
         args=command,
+        env=child_environment(os.environ, extra_values=(token,)),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0,
       )
       if os.name != "nt":
         popen_kwargs["start_new_session"] = True
-      process = subprocess.Popen(**popen_kwargs)
+      # Each initial launch and restart receives a fresh one-use pipe.
+      process = launch_with_tunnel_token(token, **popen_kwargs)
       self._remember_process_group(process)
 
       # Create log readers for this tunnel
@@ -2449,8 +2634,8 @@ class ContainerAppRunnerPlugin(
       self.P(f"Extra tunnel for port {container_port} started (PID: {process.pid})")
       return True
 
-    except Exception as e:
-      self.P(f"Failed to start extra tunnel for port {container_port}: {e}", color='r')
+    except Exception as exc:
+      self.P(f"Failed to start extra tunnel for port {container_port}: {type(exc).__name__}", color='r')
       # Record failure for backoff tracking
       self._record_tunnel_restart_failure(container_port)
       return False
@@ -2707,6 +2892,22 @@ class ContainerAppRunnerPlugin(
     of its state (running, stopped, created). This is a guardrail for deterministic
     container naming -- it handles crash recovery, incomplete cleanup, and any state
     where self.container is None but a Docker container still exists.
+
+    Returns
+    -------
+    None
+      A failed removal is logged, not raised; the start that follows then fails on the name that is still taken.
+
+    Notes
+    -----
+    The node's Docker store is kept across node restarts, so the container a killed node left is still there at
+    the next start, with the anonymous volumes Docker created for it (one per `VOLUME` of the image that no
+    configured app volume covers). The container is removed together with those volumes: the runner never gives
+    them to a later container, and left behind they would add up, one set per node restart, until the store sweep.
+
+    Examples
+    --------
+    >>> self._ensure_no_stale_container()   # before every `containers.run`; does nothing when the name is free
     """
     try:
       stale = self.docker_client.containers.get(self.container_name)
@@ -2714,7 +2915,9 @@ class ContainerAppRunnerPlugin(
         f"Found stale container '{self.container_name}' "
         f"(id={stale.short_id}, status={stale.status}), removing..."
       )
-      stale.remove(force=True)
+      # Forced, whatever its state, and with its anonymous volumes (v): no later container gets them. Without v,
+      # every node restart left one more set of them in the kept store.
+      stale.remove(force=True, v=True)
       self.P("Stale container removed.")
     except docker.errors.NotFound:
       pass
@@ -2766,7 +2969,12 @@ class ContainerAppRunnerPlugin(
     self.P(log_str)
 
     nano_cpu_limit = int(self._cpu_limit * 1_000_000_000)
-    mem_reservation = f"{parse_memory_to_mb(self._mem_limit, 0.9)}m"
+    try:
+      # Docker treats a bare limit as bytes. Preserve that unit when deriving the soft reservation.
+      mem_reservation = int(size_bytes(self._mem_limit) * 9 / 10)
+    except ValueError:
+      # Existing noncanonical runner configs keep their former Docker SDK validation path.
+      mem_reservation = f"{parse_memory_to_mb(self._mem_limit, 0.9)}m"
 
     # Intentionally NO auto_remove=True: exited containers stay inspectable
     # in `docker ps -a` until the next start cycle, which preserves
@@ -2870,6 +3078,14 @@ class ContainerAppRunnerPlugin(
     -----
     If no container exists, logs a warning and returns.
     Clears container and container_id attributes after successful removal.
+    The container is removed with its anonymous volumes (one per `VOLUME` of the image that no configured app
+    volume covers). The next container gets new ones, so the old ones would only fill the node's Docker store,
+    which is kept across node restarts. App volumes are host folders and are not touched.
+
+    Examples
+    --------
+    >>> self.stop_container()   # a running app: stopped within 5 s, removed, `self.container` is None
+    True
     """
     if not self.container:
       self.P("No container to stop", color='r')
@@ -2889,7 +3105,9 @@ class ContainerAppRunnerPlugin(
 
     try:
       self.P(f"Removing container {self.container.short_id}...")
-      self.container.remove()
+      # With its anonymous volumes (v): a later container never gets them, and without v each restart or update of
+      # the app left one more set in the kept store until the next store sweep.
+      self.container.remove(v=True)
       self.P(f"Container {self.container.short_id} removed successfully")
     except Exception as e:
       removed_ok = False
@@ -3015,6 +3233,14 @@ class ContainerAppRunnerPlugin(
     """
     Run a shell command inside the container and stream its output.
 
+    The command (BUILD_AND_RUN_COMMANDS, or a worker's clone and build) runs in a Docker exec whose
+    output a thread streams; that thread reports "failed" when the command exits with an error or its
+    exit code cannot be read. When the exec cannot be created or started, "failed" is reported and
+    `_commands_started` is cleared, so the next lap tries again. Once an exec has started, "starting"
+    is reported before the thread begins: that takes back the start failure an earlier try of this
+    exec reported, so a tracked app leaves "failed" once it is ready (the node's lifecycle keeps a
+    start failure while the plugin still holds its error code).
+
     Parameters
     ----------
     shell_cmd : str
@@ -3023,6 +3249,11 @@ class ContainerAppRunnerPlugin(
     Returns
     -------
     None
+
+    Examples
+    --------
+    >>> self._run_container_exec("npm install && npm start")   # lap 1: exec_create fails, "failed" is reported
+    >>> self._run_container_exec("npm install && npm start")   # lap 2: the exec starts, "starting" is reported
     """
     if not self.container or not shell_cmd:
       return
@@ -3054,6 +3285,10 @@ class ContainerAppRunnerPlugin(
       )
       execution_id = execution["Id"]
       output = self.docker_client.api.exec_start(execution_id, stream=True, detach=False)
+      # The command runs: "starting" takes back a start failure that an earlier try of this exec reported, so the
+      # app leaves "failed" once it is ready. Reported before the thread starts, so it never hides that the command
+      # itself failed; before, the failure of a retried exec stayed although the app ran.
+      self.report_deployment_status("starting")
       thread = threading.Thread(
         target=self._stream_deployment_exec,
         args=(execution_id, output, self._stop_event),
@@ -3762,17 +3997,31 @@ class ContainerAppRunnerPlugin(
     This prevents multiple plugins on the same edge node from hammering the
     registry simultaneously (thundering herd).
 
+    A tracked deployment (one that belongs to a Deeploy operation: a worker pulling its base image, or
+    a container app before its first start) is never abandoned. IMAGE_PULL_MAX_RETRIES does not apply
+    to it and its pause is at most one hour, as for a container app bound to its image
+    (`_ensure_bound_image`), so after a registry outage of any length it is pulled within the hour
+    after the registry is back. An untracked app keeps the retry limit and the uncapped pause.
+
     Returns
     -------
     Image or None
-        Image object or None if pull failed or in backoff
+        Image object, or None if the pull failed, a pause is running, or an untracked app gave up
+        after IMAGE_PULL_MAX_RETRIES failures
+
+    Examples
+    --------
+    >>> img = self._pull_image_from_registry()
+    >>> img is None   # True when the pull failed or the pause after a failure is not over yet
+    False
     """
     if not self.cfg_image:
       self.P("No Docker image configured", color='r')
       return None
 
-    # Check if we've exhausted all retries
-    if self._has_exceeded_image_pull_retries():
+    # An untracked app gives up after IMAGE_PULL_MAX_RETRIES failures, as before. A tracked one does not: a
+    # registry outage longer than those attempts must not leave it down for good.
+    if not self._deployment_tracks_runtime() and self._has_exceeded_image_pull_retries():
       self.report_deployment_status("failed", error_code="IMAGE_PULL_FAILED")
       self.P(
         f"Image pull abandoned after {self._image_pull_failures} consecutive failures "
@@ -3803,7 +4052,10 @@ class ContainerAppRunnerPlugin(
 
     except Exception as e:
       self.P(f"Image pull failed: {e}", color='r')
-      self._record_image_pull_failure()
+      # The pause before the next attempt. A tracked deployment asks without end, so at most one hour apart:
+      # uncapped, the doubling puts the attempts 3-6 h apart at failure 10 and 1-2 days apart at failure 13.
+      # An untracked app keeps the uncapped pause it has always had.
+      self._record_image_pull_failure(max_backoff=3600 if self._deployment_tracks_runtime() else None)
       return None
 
 
@@ -3913,27 +4165,53 @@ class ContainerAppRunnerPlugin(
 
   def _has_image_hash_changed(self, latest_hash):
     """
-    Check if image hash has changed from current version.
+    Check if the image the registry serves is another one than the app runs.
+
+    The version the app is on (`current_image_hash`) is unknown after every start. The first check of a run takes
+    it from the image the running container was started from, then compares as every later check does.
 
     Parameters
     ----------
-    latest_hash : str
-        Latest image hash from registry
+    latest_hash : str or None
+        Latest image hash from registry; None when the pull that reads it failed
 
     Returns
     -------
     bool
-        True if hash changed and update needed, False otherwise
+        True if hash changed and update needed, False otherwise (also when `latest_hash` is None)
+
+    Raises
+    ------
+    docker.errors.APIError, requests.exceptions.RequestException
+        On the first check of a run only: reading the image of the running container (`self.container.image`) is
+        a request to the Docker daemon, which can refuse it or not answer within the client timeout. The baseline
+        then stays unset and the next check reads it again.
+
+    Notes
+    -----
+    The node's Docker store is kept across node restarts, so an app starts from the stored image without a pull,
+    and its tag may have moved while the node was down. Before, the first check took the image it had just pulled
+    as the version the app is on and never compared it with the running one: such an app kept the old image until
+    the tag moved again. Only the caller runs with a container: `_check_image_updates`, from the monitoring of a
+    running app.
+
+    Examples
+    --------
+    >>> self.current_image_hash is None            # first check; the container runs sha256:aaa...
+    True
+    >>> self._has_image_hash_changed("sha256:bbb...")
+    True
     """
     if not latest_hash:
       # Pull failed, can't determine if update needed
       return False
 
     if not self.current_image_hash:
-      # First time - establish baseline
-      self.P(f"Establishing baseline image hash: {latest_hash}")
-      self.current_image_hash = latest_hash
-      return False
+      # First check of this run: the version the app is on is the image its running container was started from, read
+      # from the store by the same rule as the pulled one (registry digest, else image id). Before, it was the image
+      # just pulled, which is right only when every start pulls.
+      self.current_image_hash = self._get_image_digest(self.container.image)
+      self.P(f"Establishing baseline image hash: {self.current_image_hash}")
 
     # Compare hashes
     return latest_hash != self.current_image_hash
@@ -4078,6 +4356,12 @@ class ContainerAppRunnerPlugin(
     """
     Restart the container from scratch.
 
+    Stops the running container (unless the caller already did), resets the runtime state with
+    `__reset_vars`, configures volumes, ports and environment again, makes the image available and
+    starts a new container; a container that waits for semaphores is started later by the launch
+    path. The restart counters, the last image check, the current image hash and the id this Docker
+    store gives the bound image are kept across the reset.
+
     Parameters
     ----------
     stop_reason : StopReason, optional
@@ -4096,6 +4380,8 @@ class ContainerAppRunnerPlugin(
 
     Examples
     --------
+    >>> self._restart_container(StopReason.CRASH)
+    True
     >>> runner._restart_container(StopReason.IMAGE_UPDATE, prepared_image=image)
     """
     if self._fixed_volume_setup_pending:
@@ -4109,6 +4395,9 @@ class ContainerAppRunnerPlugin(
     preserved_last_success = self._last_successful_start
     preserved_last_image_check = self._last_image_check
     preserved_current_hash = self.current_image_hash
+    # The id this Docker store gives the bound image: the fixed-size volume owner lookup below runs before the image
+    # check sets it again, and under another type of image store the bound id names nothing there.
+    preserved_bound_store_id = self._bound_image_store_id
 
     if not cleanup_first and stop_reason == StopReason.IMAGE_UPDATE:
       # Cleanup just recovered from a partial stop. Launch the image already downloaded for it.
@@ -4138,6 +4427,8 @@ class ContainerAppRunnerPlugin(
     self._last_successful_start = preserved_last_success
     self._last_image_check = preserved_last_image_check
     self.current_image_hash = preserved_current_hash
+    # Kept across the reset, so that lookup inspects the image the stopped container ran; before, it used the bound id.
+    self._bound_image_store_id = preserved_bound_store_id
     self._prepared_update_image = prepared_image  # Keep it across deferred semaphore waits.
     if prepared_image is not None:
       # The previous container is gone. Report the replacement only after it starts.
@@ -4330,6 +4621,46 @@ class ContainerAppRunnerPlugin(
     return bool(re.fullmatch(r"(?:[\w.\-]+(?::\d+)?/)?[\w.\-/]+@sha256:[0-9a-f]{64}", reference, re.ASCII)) \
       and reference.split("@")[0] == repository
 
+  def _is_bound_image(self, image, artifacts):
+    """
+    Whether an image of the local Docker store is the image this deployment is bound to.
+
+    It is when its id is the saved one, or when the store lists it under the saved registry reference
+    (`RepoDigests`). The id is a content hash only within one type of image store: in Docker's classic
+    store it is the hash of the image's configuration, in the containerd store the manifest digest, so
+    the same image has another id when the node's nested Docker uses another store than the one that
+    made the binding. A `repository@sha256:...` reference names one content in every store.
+
+    Parameters
+    ----------
+    image : docker.models.images.Image
+      An image of the local Docker store.
+    artifacts : dict
+      The binding: `image_id`, and `image_ref` when it is known.
+
+    Returns
+    -------
+    bool
+      True for the saved id, or for an image listed under the saved registry reference. False for any
+      other image, and for an image with another id when the binding has no registry reference.
+
+    Notes
+    -----
+    A tag is never part of this test. What a pull of the configured tag returns is accepted, in that
+    attempt, only with the saved id (`_recover_bound_image`), because a tag can move to another image.
+    An image the store lists under the saved registry reference is the bound content however it came
+    into the store, a tag pull included, so a later local lookup by that reference accepts it.
+
+    Examples
+    --------
+    >>> self._is_bound_image(image, {"image_id": "sha256:9f2c...", "image_ref": "acme/shop@sha256:4f1c..."})
+    True
+    """
+    # The saved id, or the saved exact reference among those the store lists the image under; an id-only
+    # binding (no reference) is never matched through the second test.
+    return image.id == artifacts["image_id"] or \
+      artifacts.get("image_ref") in ((image.attrs or {}).get("RepoDigests") or [])
+
   def _image_repository(self):
     return image_repository(super()._get_full_image_ref())
 
@@ -4388,10 +4719,11 @@ class ContainerAppRunnerPlugin(
     Fetch from the registry the exact image this deployment is bound to.
 
     Tried in order: the saved registry reference (`repository@sha256:...`, which can only be that
-    image), then the configured image reference. A deployment bound before the registry reference
-    was saved has only the second; its tag may have moved, so whatever comes back is accepted only
-    if its id equals the bound image id. Image ids are content hashes: an equal id is the same image.
-    Nothing with another id is ever returned.
+    image), then the configured image reference. What the saved reference gives is accepted when it is
+    the bound image by `_is_bound_image`: the saved id, or listed under that reference, whatever id this
+    image store gives it. A deployment bound before the registry reference was saved has only the
+    configured reference; its tag may have moved, so whatever it gives is accepted only if its id
+    equals the bound image id. Nothing else is ever returned.
 
     Parameters
     ----------
@@ -4401,9 +4733,9 @@ class ContainerAppRunnerPlugin(
     Returns
     -------
     tuple of (docker.models.images.Image or None, bool)
-      The image when it was found with the bound id. Otherwise None and whether the answer is final
-      for now: True when every reference was pulled and each gave another image, False when a pull
-      or the registry login failed, a "not found" answer included, and a later try may succeed.
+      The bound image when it was found. Otherwise None and whether the answer is final for now: True
+      when every reference was pulled and each gave another image, False when a pull or the registry
+      login failed, a "not found" answer included, and a later try may succeed.
 
     Notes
     -----
@@ -4439,13 +4771,14 @@ class ContainerAppRunnerPlugin(
         # Remember that this reference was not looked at, so the outcome is not reported as final.
         failed = True
         continue
-      # The id is the hash of the image's configuration in Docker's classic image store, which the
-      # node's nested Docker uses. Under the containerd image store the id is the manifest digest and
-      # would not compare: a change of store type must come with a change of this check.
-      if image.id == artifacts["image_id"]:
-        # Same content hash: this is the image the deployment was started with.
+      # A pull by the saved exact reference is the bound image when the store lists it under that reference,
+      # whatever id this store gives it (`_is_bound_image`); what the configured tag gives must have the bound
+      # id, since a tag can move.
+      if (self._is_bound_image(image, artifacts) if reference == artifacts.get("image_ref")
+          else image.id == artifacts["image_id"]):
+        # The image the deployment was started with.
         return image, False
-      self.P("'{}' is now another image ({}); it is not run in place of the bound one.".format(reference, image.id), color='r')
+      self.P("'{}' gives an image with another id ({}); it is not run in place of the bound one.".format(reference, image.id), color='r')
     # Nothing matched. Final only if every reference could be pulled and looked at.
     return None, not failed
 
@@ -4453,12 +4786,15 @@ class ContainerAppRunnerPlugin(
     """
     Make the exact image a tracked container app is bound to available, or say that it is not.
 
-    The image is looked up in the local Docker store on every call, which is cheap. When it is not
-    there (the node's own container was replaced and its Docker store is empty, or the image was
-    removed), it is fetched again from the registry and accepted only with the bound id. So an app
-    whose image was lost comes back by itself when the registry serves that image under its saved
-    reference, or still under the configured one, and never runs anything else. The attempts do not
-    end: an app whose image is not there now is asked for again every hour.
+    The image is looked up in the local Docker store on every call, which is cheap: by the bound id,
+    then, when the binding has a registry reference, by that reference (another type of image store
+    gives the same image another id). When it is not there (the node's own container was replaced and
+    its Docker store is empty, or the image was removed), it is fetched again from the registry and
+    accepted only when it is the bound image (`_recover_bound_image`). So an app whose image was lost
+    comes back by itself when the registry serves that image under its saved reference, or still under
+    the configured one, and never runs anything else. The attempts do not end: an app whose image is
+    not there now is asked for again every hour. The id under which the image was found is the one
+    the following launch starts the container by (`_get_full_image_ref`).
 
     Parameters
     ----------
@@ -4477,10 +4813,12 @@ class ContainerAppRunnerPlugin(
     as much again of random jitter (20-40 s with the default base of 20 s), doubling, at most one hour
     apart, so that a registry that was down for a day is asked again within the hour and many apps on
     one node stay under registry rate limits. The launch path calls this about every 5 s; between
-    attempts it only does the local lookup, so an image loaded onto the node by hand is used at once.
-    "failed" is reported only when every known reference was pulled and gave another image (a tag
-    that moved). A pull that raises, a "not found" answer included, is reported as "pulling_image"
-    and tried again: a failed report cannot be taken back for that attempt.
+    attempts it only does the local lookups (two local Docker calls while the bound id is not found
+    and the binding has a reference, one otherwise), so an image loaded onto the node by hand is used
+    at once. "failed" is reported only when every known reference was pulled and gave another image
+    (a tag that moved). A pull that raises, a "not found" answer included, is reported as
+    "pulling_image" and tried again: a failed report that the coordinator reads ends the rollout of
+    that attempt.
     The attempts also go on when the image disappears under a running app: the restart that finds
     it missing counts one failed restart and leaves no container, so the following laps take the
     launch path. RESTART_MAX_RETRIES ends only the restarts of a container that exists and has stopped.
@@ -4494,8 +4832,17 @@ class ContainerAppRunnerPlugin(
       # The cheap check, on every lap: the exact image in the local store.
       image = self.docker_client.images.get(artifacts["image_id"])
     except Exception:
-      # Not in this Docker store.
+      # Not in this Docker store under the bound id.
       image = None
+    if image is None and artifacts.get("image_ref"):
+      try:
+        # Under another type of image store than the one that made the binding the same image has another id;
+        # it is found by its exact registry reference, which Docker resolves only to the image listed under it.
+        # One more local call, only while the bound id is not found.
+        image = self.docker_client.images.get(artifacts["image_ref"])
+      except Exception:
+        # Not in this Docker store under that reference either.
+        image = None
     if image is None:
       if self._is_image_pull_backoff_active():
         # A registry attempt failed a moment ago: wait for the next one without asking the registry
@@ -4521,28 +4868,39 @@ class ContainerAppRunnerPlugin(
         return False
       # Found again: clear the pause so a later loss starts with short waits.
       self._record_image_pull_success()
+    # The launch that follows starts the container by the id this Docker store gives the image found here
+    # (`_get_full_image_ref`): under another type of image store the bound id names nothing.
+    self._bound_image_store_id = image.id
     # The exact bound image is in the local store.
     return True
 
   def _ensure_image_available(self):
-    """
-    Ensure the container image is available before starting container.
+    """Find or obtain the image selected for the next container launch.
 
-    This method uses a strategy pattern based on configuration:
-    - AUTOUPDATE enabled: Ensure image exists locally (update detection handled separately)
-    - IMAGE_PULL_POLICY='always': Always pull (no tracking)
-    - IMAGE_PULL_POLICY='if-not-present' or default: Pull only if missing locally
+    A following container uses a prepared replacement once, or resolves
+    and pulls the current tag by digest. A pinned container pulls the
+    requested digest on first binding and reuses a matching binding.
 
-    A catalogue deployment resolves its tag once, saves the image id
-    and from then on accepts only that image. When that image is not in the local Docker store it is
-    fetched again from the registry and accepted only with the same id (see `_ensure_bound_image`).
-    A tracked worker is not bound to its image and takes the strategies above, so a base image that
-    was lost with the Docker store is simply pulled again.
+    Parameters
+    ----------
+    None
 
     Returns
     -------
     bool
-        True if image is available, False otherwise
+        True if the selected image is available, False if it could not be prepared.
+
+    Raises
+    ------
+    ValueError
+        An explicit binding is invalid or differs from the requested digest.
+
+    Notes
+    -----
+    Other tracked container apps save the first resolved image ID and
+    subsequently recover that exact image. Worker base images and untracked
+    apps use the ordinary pull policy. For those apps, AUTOUPDATE uses a
+    local-first startup. Otherwise an explicit always policy tries to pull.
 
     Examples
     --------
@@ -4568,6 +4926,8 @@ class ContainerAppRunnerPlugin(
       artifacts = self._pull_source_image()
       if artifacts:
         self._launch_image = artifacts
+        # Replace any launch ID kept across restart with the result of the exact pull.
+        self._bound_image_store_id = artifacts["image_id"]
         self._save_deployment_artifacts(artifacts)
       return bool(artifacts)
     if self._deployment_tracks_runtime() and self._deployment_pins_image():
@@ -4740,16 +5100,124 @@ class ContainerAppRunnerPlugin(
       return self._check_image_updates(self.time(), stopped=True)
     return False
 
-  def _perform_periodic_monitoring(self):
+  def _maybe_sweep_docker_store(self):
     """
-    Perform periodic monitoring tasks.
+    Remove from the node's Docker store, once per node run, what no app of this run uses.
 
-    Executes image update checks, tunnel health checks,
-    and any subclass-defined additional checks.
+    The node image keeps the store of the node's inner Docker daemon across node restarts (`docker/daemon.json`),
+    so the app images are there at the next start. Before, the store was deleted with the node container at every
+    stop, which also removed everything left behind. This sweep takes over that part, one hour into the node run:
+    the stopped containers an earlier run left (a killed node removes none), the anonymous volumes no container
+    holds, and every image no container uses (the image a moved tag left behind, the image of an app that is no
+    longer on this node), each with all its tags. An image a container uses keeps all its tags, so an app
+    configured by any of them finds it at its next start. After it the store holds the images of the apps that
+    have a container, plus what this run adds later, as a store did before within one run. It logs one line: the
+    bytes the container and volume requests freed and the number of images removed.
 
     Returns
     -------
     None
+
+    Raises
+    ------
+    docker.errors.APIError
+      When the Docker daemon refuses a request, except the removal of an image in use, which it refuses with 409
+      and the sweep passes over.
+    requests.exceptions.RequestException
+      When the daemon does not answer a request within the client timeout (`ReadTimeout`, 60 s) or cannot be
+      reached. Either error is raised into the plugin loop, which logs it, and the sweep is not tried again in
+      this node run.
+
+    Notes
+    -----
+    `process` calls this first in every lap, in every state of the app, so a node whose apps cannot start still
+    sweeps. All apps of a node share one store, so one sweep serves them all: the first app thread that comes
+    here after the delay does it, on its own Docker client, and leaves a marker in the memory the plugins of a
+    node share.
+    An app that has no container at that moment (stopped by hand, waiting for another app or for its image) loses
+    its stored image and pulls it at its next start, as every app did at every node start before. Only containers
+    created before this node run are removed: a container of this run that has exited stays for inspection.
+    The start of the run is the current time less the node's running time; a node clock set forward by more than
+    the age of a stopped container of this run would make that container count as left by an earlier run.
+    The images are listed first, then the containers, then each unused image is removed by id and with force. An
+    image pulled after the image list is not looked at. Docker refuses with 409 the removal of an image a running
+    container uses, also of one started after the container list; the sweep keeps such an image and goes on, as
+    Docker's prune did. Force passes over stopped containers, so an image whose container was created after the
+    container list and not started yet is removed: that window runs from the container list to the removal of that
+    image, where Docker's prune, without force, checked each image when it removed it.
+    Each request waits for Docker at most the client timeout (60 s); a store too large or a host too slow for
+    that ends the sweep with the `ReadTimeout` above, with what was removed so far removed.
+
+    Examples
+    --------
+    >>> self._maybe_sweep_docker_store()   # does nothing in the first hour of the node run, and nothing after the sweep
+    """
+    if self.get_node_running_time() < _STORE_SWEEP_DELAY:
+      # Too early in the node run: apps are still starting and do not hold their images yet.
+      return
+    # A marker of this call only. `setdefault` stores the first marker of the node run and hands back the stored one,
+    # in one step, so exactly one app thread gets its own back; no lap of any app ever waits.
+    marker = object()
+    if self.plugins_shmem.setdefault(_STORE_SWEEP_KEY, marker) is not marker:
+      # The store was already swept in this node run, by this app or by another.
+      return
+    # When this node run started, in whole seconds: every container an earlier run left is older, none of this run is.
+    run_started = int(self.time() - self.get_node_running_time())
+    # Stopped containers created before this node run: what a killed node left of apps that are gone or not started
+    # yet. They are removed first, because an image or a volume a container holds is in use for Docker.
+    containers = self.docker_client.containers.prune(filters={"until": run_started})
+    # Anonymous volumes no container holds: a container is removed without them, and no later container gets them.
+    volumes = self.docker_client.volumes.prune()
+    # Every image of the store, tagged ones too, listed before the containers: an image pulled after this list is not
+    # looked at, and the slow part of the list (one inspect per image) comes before the container list, not between
+    # that list and the removals.
+    images = self.docker_client.images.list()
+    # The ids of the images the remaining containers use, running or stopped, in one request (`sparse`: no inspect
+    # per container). These images keep every tag: Docker's prune of tagged images deletes each tag of every image and
+    # refuses only the last one of an image in use, so an app configured by another tag of it lost its image.
+    used = {container.attrs["ImageID"] for container in self.docker_client.containers.list(all=True, sparse=True)}
+    # Every other image: superseded versions and removed apps.
+    unused = [image for image in images if image.id not in used]
+    # The images actually removed, for the log line: an image Docker keeps is not counted.
+    removed = 0
+    # Each of them is removed on its own.
+    for image in unused:
+      try:
+        # By id and with force, so it goes with all its tags (without force Docker refuses an image with several).
+        self.docker_client.images.remove(image.id, force=True)
+        # One image fewer in the store.
+        removed += 1
+      # Docker refuses with 409 ("conflict"), even with force, an image a running container uses (a container started
+      # on it after the container list) or one another image is built on: it is in use, so it stays and the sweep goes
+      # on with the next image, as Docker's prune of tagged images passed over it.
+      except docker.errors.APIError as error:
+        if error.status_code != 409:
+          # Any other refusal is raised into the plugin loop, as every other Docker error of the sweep.
+          raise
+    # Bytes the container and volume requests freed (a removal by id does not report bytes) and the images removed,
+    # for the one log line of the sweep.
+    freed = containers["SpaceReclaimed"] + volumes["SpaceReclaimed"]
+    self.P(
+      f"Docker store swept once for this node run: {freed} bytes freed by containers and volumes, "
+      f"{removed} unused images removed"
+    )
+    return
+
+  def _perform_periodic_monitoring(self):
+    """
+    Perform periodic monitoring tasks.
+
+    Executes image update checks, tunnel health checks, and any subclass-defined additional checks. It is called
+    only while the app's container is running; the sweep of the node's Docker store is not here for that reason
+    (`process` calls it in every lap).
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> self._perform_periodic_monitoring()   # one lap of a running app: update check, tunnels, subclass checks
     """
     current_time = self.time()
 
@@ -4894,6 +5362,7 @@ class ContainerAppRunnerPlugin(
     Main process loop for the plugin.
 
     Called every PROCESS_DELAY seconds. Performs:
+    0. Sweep the node's Docker store when that is due (once per node run, by one app)
     1. Check for paused state (manual stop)
     2. Handle initial launch if container not started
     3. Initialize and start tunnel engine if needed
@@ -4906,11 +5375,26 @@ class ContainerAppRunnerPlugin(
     -------
     None
 
+    Raises
+    ------
+    docker.errors.APIError, requests.exceptions.RequestException
+      From the store sweep, in the one lap of a node run that does it (`_maybe_sweep_docker_store`).
+
     Notes
     -----
     The process loop implements a state machine for container lifecycle
     management with automatic restart based on configured policies.
+
+    Examples
+    --------
+    >>> self.process()   # one lap: sweep when due, then start, watch or restart the app's container
     """
+    # First in every lap, whatever state the app is in: the one sweep of the node's Docker store, when it is due.
+    # The store now survives a node restart, so only this sweep frees it. From the monitoring of a running app,
+    # where the call was before, a node whose apps cannot start (store on a full disk), are stopped by hand or
+    # have no container yet never reached it and kept a full store until its host was cleaned by hand.
+    self._maybe_sweep_docker_store()
+
     # Use state machine instead of deprecated _is_manually_stopped flag
     if self.container_state == ContainerState.PAUSED:
       # Log paused message periodically instead of every process cycle

@@ -1,7 +1,9 @@
 from extensions.serving.base.base_llm_serving import BaseLlmServing as BaseServingProcess
 from transformers import AutoTokenizer, AutoModel
 import re
-import pickle
+# The documents file named by an ADD_DOC request is read as JSON, which only yields data, in place of a pickle,
+# which runs code on load.
+import json
 from pypdf import PdfReader
 from docx import Document
 
@@ -404,12 +406,47 @@ class BaseDocEmbServing(BaseServingProcess):
       return merged_documents
 
     def retrieve_documents_from_path(self, documents_path: str):
+      """
+      Read the documents of an ADD_DOC request from the file that the request's CID names.
+
+      The file comes from R1FS, so its name and its content are chosen by whoever stored it: the Jeeves API
+      stores a list of documents as a JSON file (R1FS ``add_json``, stored name "data.json"), and a caller may
+      name a file of its own. The extension picks the reader. A ".json" file is read with ``json.load`` and its
+      "DOCUMENTS" value is taken; ".txt", ".pdf" and ".docx" (or ".docs") files are extracted as text. Short
+      lines are then merged up to MAX_SEGMENT_SIZE characters. A file of any other type, a pickled ".pkl" file
+      included, is not read: the result stays None, the log line of a sample fails on it and the error is logged
+      in red, and the caller's check (a list of strings) answers a bad request.
+
+      Parameters
+      ----------
+      documents_path : str
+        Local path of the file as ``r1fs.get_file`` restored it; its name is the one stored with the file.
+
+      Returns
+      -------
+      list, object or None
+        The documents, merged by ``maybe_merge_lines`` (which keeps only non-empty strings of a list). For a
+        ".json" file, whatever its "DOCUMENTS" key holds, [] when it has none; a value that is not a list is
+        returned as it is. None for any other file type, or when reading or parsing fails (a JSON file that is
+        not an object included). When only the sample line fails (a "DOCUMENTS" value that cannot be joined,
+        such as a number), the value read before it.
+
+      Examples
+      --------
+      >>> serving.retrieve_documents_from_path('/downloads/<cid>/data.json')   # {"DOCUMENTS": ["Some text."]}
+      ['Some text.']
+      >>> serving.retrieve_documents_from_path('/downloads/<cid>/documents.pkl') is None   # not read
+      True
+      """
       path_ext = self.os_path.splitext(documents_path)[1].lower()
       documents = None
       try:
-        if path_ext == '.pkl':
-          with open(documents_path, 'rb') as f:
-            documents_data = pickle.load(f)
+        if path_ext == '.json':
+          # UTF-8, the encoding of JSON text; the Jeeves API writes it ASCII-only through json.dumps.
+          with open(documents_path, 'r', encoding='utf-8') as f:
+            # Plain data only: a JSON file cannot run code when it is loaded, as a pickle named by a request could.
+            documents_data = json.load(f)
+            # The same DOCUMENTS key the pickled file had; the caller's list-of-strings check stays the only gate.
             documents = documents_data.get(DocEmbCt.DOCUMENTS, [])
           # endwith open documents_path
         elif path_ext == '.txt':

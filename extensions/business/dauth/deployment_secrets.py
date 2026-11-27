@@ -5,16 +5,40 @@ import hashlib
 from .dauth_registry import dauth_registry_write_kwargs
 from .repair_tunnel import reconcile_restore_tunnel
 from extensions.business.deeploy.deployment_operations import (
-  check_replacement_placement, deployment_operation_phase, required_instances, ReplacementPlacementMismatch,
-  SIGNATURE_KEYS, STATELESS_REPLACEMENT,
+  BLOCKED_OPERATION_ENDED, check_replacement_placement, deployment_operation_phase, required_instances, ReplacementPlacementMismatch,
+  SIGNATURE_KEYS, STATELESS_REPLACEMENT, RESOURCE_REDISTRIBUTION,
 )
 from extensions.business.deeploy.relink_placement import relink_configs, relink_pipeline
+# Use the same key selection and signed-copy marker as the deployment coordinator.
+from extensions.business.deeploy import r1fs_documents
 
 
 REVISIONS = "DAUTH_JOB_SECRET_REVISIONS"
 CURRENT = "DAUTH_JOB_SECRETS"
 POINTERS = "DEEPLOY_DEPLOYED_JOBS"
 AUTH_FIELDS = SIGNATURE_KEYS | {"EE_ETH_SENDER", "EE_ETH_SIGN"}
+
+
+class DeploymentSecretRecordTooLarge(ValueError):
+  """
+  The chain store refused a deployment's secret record for its size.
+
+  Raised by ``_prepare_deployment_secret_revisions`` when the write of a secret-revision record, the target copy
+  or the restoration copy, ends with the chain store's outcome word ``refused_too_large``. It is a
+  ``ValueError``, so it is final like the other refusals of a request: the chain store of every oracle of this
+  release has the same size cap, and no retry can store the record.
+
+  Notes
+  -----
+  The type is its own so that the dAuth endpoint can tell this one refusal from every other failure and name
+  it to the caller by a fixed reason code (see ``reconcile_job_secrets``). It carries no text: the endpoint
+  reads the type only, and the caller's client words the refusal itself.
+
+  Examples
+  --------
+  >>> issubclass(DeploymentSecretRecordTooLarge, ValueError)
+  True
+  """
 
 
 def _revision_ref(operation, attempt):
@@ -57,8 +81,8 @@ class _DauthDeploymentSecretsMixin:
     It then reads the operation's plan from R1FS and checks that every planned
     configuration matches the operation's placement and identity and carries no
     plaintext secret. Every lifecycle custody action starts here, on the single
-    dAuth request thread, so the plan read is bounded: ``pin=False`` keeps
-    ``ipfs pin add`` out and makes the 10 s ``timeout`` the real bound.
+    dAuth request thread. The plan fetch has a 10-second timeout and skips
+    pinning.
 
     Parameters
     ----------
@@ -87,6 +111,12 @@ class _DauthDeploymentSecretsMixin:
       When the plan cannot be read from R1FS, or a newer signed snapshot of the
       same operation is already held on this node (both retryable).
 
+    Notes
+    -----
+    A completed non-delete operation can request revocation only when its
+    signed snapshot records a failed grace expiry and an abandoned deploy
+    revision pending revocation. The normal identity and plan checks apply.
+
     Examples
     --------
     >>> job_id, operation, plan = self._deployment_secret_context(body, requester)
@@ -111,7 +141,7 @@ class _DauthDeploymentSecretsMixin:
           type(operation.get("previous_revision")) is not int
           or not 0 <= operation["previous_revision"] < operation["target_revision"]))):
       raise ValueError("Invalid deployment operation identity.")
-    if operation.get("mutation") in ("same_host_repair_v1", STATELESS_REPLACEMENT):
+    if operation.get("mutation") in ("same_host_repair_v1", STATELESS_REPLACEMENT, RESOURCE_REDISTRIBUTION):
       if not isinstance(operation.get("phase"), str):
         raise ValueError("Invalid repair custody phase.")
       phase = deployment_operation_phase(operation)
@@ -128,13 +158,18 @@ class _DauthDeploymentSecretsMixin:
     }
     if operation.get("mutation") == STATELESS_REPLACEMENT:
       phases["status"].add("finalizing")  # Reconcile the exact published attempt if the original reply was lost.
+    if (operation.get("abandoned_deploy_revocation_pending") is True and operation.get("outcome") == "failed"
+        and (operation.get("error") or {}).get("code") == BLOCKED_OPERATION_ENDED):
+      # The coordinator persisted the terminal result before revoking its abandoned deployment revision.
+      phases["revoke"].add("completed")
     if action not in phases or phase not in phases[action]:
       raise ValueError("Secret action does not match the deployment phase.")
     if (operation.get("kind") == "delete") != (action == "delete" or (action == "revoke" and phase == "retiring_previous")):
       raise ValueError("Secret action does not match the deployment kind.")
     # Read the plan within the 10 s timeout and without pinning: this node does not need its own
     # pin of the plan, because the writer and the relays keep theirs.
-    plan = self.r1fs.get_json(operation["plan_cid"], timeout=10, pin=False, show_logs=False)
+    # Plans written before activation remain usable by the custodian.
+    plan = r1fs_documents.read_r1fs_document(self.r1fs, operation["plan_cid"], timeout=10, pin=False)
     if not isinstance(plan, dict):
       raise RuntimeError("Deployment plan is unavailable.")
     for attempt, key, node_key, instance_key, revision_key in (
@@ -348,7 +383,63 @@ class _DauthDeploymentSecretsMixin:
     return record
 
   def _prepare_deployment_secret_revisions(self, job_id, operation, plan, body):
-    """Reconcile target and restoration copies without changing the active CID."""
+    """
+    Reconcile target and restoration copies without changing the active CID.
+
+    Checks that the job's active pipeline is still the one the operation was built on and collects the secret
+    values the previous revision holds. It then builds one secret-revision record per attempt of the plan: the
+    restoration copy (``previous_configs``) and the target copy (``configs``). A record holds the job's secret
+    values and one pipeline configuration per target node, so it grows with the number of nodes and with the
+    size of the configurations. Both records are built and checked before either is written; each is then
+    written to the dAuth registry peers and must be confirmed.
+
+    Parameters
+    ----------
+    job_id : str
+      The normalized Deeploy job ID.
+    operation : dict
+      The authenticated operation from ``_deployment_secret_context``, in its "preparing" phase.
+    plan : dict
+      The operation's verified plan: ``configs`` and ``previous_configs``, each keyed by node.
+    body : dict
+      The verified request body. ``new_secrets`` and ``previous_new_secrets`` carry fresh secret values;
+      ``identity_aliases`` and ``node_aliases`` carry the renames of a scale-up and of a relink.
+
+    Returns
+    -------
+    None
+      The records are in the chain store, under ``DAUTH_JOB_SECRET_REVISIONS``.
+
+    Raises
+    ------
+    ValueError
+      When the active pipeline or the previous revision changed, a create would replace an active pipeline,
+      a staged revision would get other values, or the secret values cannot be completed. All are final: the
+      same request fails again.
+    DeploymentSecretRecordTooLarge
+      When the chain store refuses either record for its size: a ``ValueError`` too, and the one failure the
+      dAuth endpoint names to the caller.
+    RuntimeError
+      When the previous secret revision is not available, or a record's write failed for another reason,
+      such as no confirmation in time (retryable).
+
+    Notes
+    -----
+    The chain store refuses a record over its size cap and reports the outcome word ``refused_too_large``
+    through ``result_info``. That refusal is final, for either copy, so it gets its own error type, which
+    carries no text (so no value, key or node). ``reconcile_job_secrets`` answers every failure with one fixed
+    text and, for this type only, the reason code ``record_too_large``, from which the caller's client makes
+    its own text. The restoration copy is written first; when it is the one refused, nothing is stored. Every
+    other refusal of the store (``refused_too_deep`` and ``refused_unencodable`` among them) keeps the
+    "pending" error and gets no code.
+
+    Examples
+    --------
+    >>> self._prepare_deployment_secret_revisions("42", operation, plan, body)   # an update of job 42
+    >>> staged = self.chainstore_hgetall(hkey="DAUTH_JOB_SECRET_REVISIONS")
+    >>> sorted(key for key in staged if key.startswith("42|" + operation["operation_id"]))
+    ['42|<operation_id>:deploy', '42|<operation_id>:restore']
+    """
     prior_cid, prior_pipeline = self._load_dauth_job_pipeline_record(job_id)
     if prior_cid != operation.get("previous_pipeline_cid"):
       raise ValueError("The active pipeline changed before preparation.")
@@ -430,6 +521,7 @@ class _DauthDeploymentSecretsMixin:
           job_id, config, fragments,
           prior_bundle=prior_bundle, prior_pipeline=source,
           current_identity_aliases=aliases if attempt == "deploy" else None,
+          match_prior_instance=operation.get("mutation") == RESOURCE_REDISTRIBUTION,
         )
         bundle["job_secrets"] = self._merge_deeploy_dauth_secret_fragments(
           bundle["job_secrets"], node_bundle["job_secrets"], reject_conflicts=True,
@@ -463,8 +555,18 @@ class _DauthDeploymentSecretsMixin:
                                   value=operation["repair_parent"], **dauth_registry_write_kwargs(self)):
         raise RuntimeError("The repair's custody hold is pending.")
     for reference, record in records:
+      # The dict the chain store fills with its word for how the write ended; read when the write failed.
+      info = {}
+      # The same write as before, now with the caller's dict, so a failure can be told by its cause.
       if not self.chainstore_hset(hkey=REVISIONS, key=job_id + "|" + reference, value=record,
-                                  **dauth_registry_write_kwargs(self)):
+                                  result_info=info, **dauth_registry_write_kwargs(self)):
+        if info["outcome"] == "refused_too_large":
+          # The record is over the chain store's size cap, here and on every other oracle: no retry can store
+          # it, so it is a final error that says what to change. Before, it ended in the retryable "pending"
+          # error below, like a write that was only not confirmed yet. A type of its own (before, a plain
+          # ValueError), so that the endpoint can give the caller the reason code of this one refusal. No text:
+          # the endpoint reads the type only and the client words the refusal, so a text here had no reader.
+          raise DeploymentSecretRecordTooLarge()
         raise RuntimeError("Deployment secret preparation is pending.")
 
   def _deployment_secrets_prepared(self, job_id, operation, plan):
@@ -509,8 +611,8 @@ class _DauthDeploymentSecretsMixin:
     secret bundle; for a delete it revokes the job's previous secret revision and
     publishes an empty bundle. It then writes the bundle, writes the pointer and removes the
     previous pipeline CID from R1FS. The published-configuration read runs on the
-    single dAuth request thread, so it is bounded: ``pin=False`` keeps
-    ``ipfs pin add`` out and makes the 10 s ``timeout`` the real bound.
+    single dAuth request thread with a 10-second fetch timeout and pinning
+    disabled.
 
     Parameters
     ----------
@@ -551,6 +653,13 @@ class _DauthDeploymentSecretsMixin:
       When the published configuration or the prepared secrets are not available, or
       a chain-store write was not confirmed (all retryable).
 
+    Notes
+    -----
+    A recognized protection marker is part of the signed pointer. It
+    requires the exact published CID to authenticate with the oracle key
+    and disables passphrase fallback. Unmarked pointers still support
+    legacy reads. A missing key for protected verification is retryable.
+
     Examples
     --------
     >>> self._publish_deployment_secrets("42", operation, plan, body["pointer"])
@@ -564,6 +673,11 @@ class _DauthDeploymentSecretsMixin:
                     deleted=deleted, pipeline_cid=None if deleted else pointer.get("pipeline_cid"))
     if not deleted:
       expected["plan_cid"] = operation["plan_cid"]
+      # A protected marker is optional so already-signed publication intents stay valid.
+      mode = pointer.get(r1fs_documents.R1FS_ENCRYPTION)
+      if mode in r1fs_documents.PROTECTED_R1FS_MODES:
+        # The signed CID will be checked with the protected key before this pointer can publish.
+        expected[r1fs_documents.R1FS_ENCRYPTION] = mode
     if ({key: value for key, value in pointer.items() if key not in AUTH_FIELDS} != expected
         or pointer.get("EE_SENDER") != operation["coordinator"]
         or not self.bc.verify(pointer, return_full_info=True, log_hash_sign_fails=False).valid):
@@ -609,7 +723,11 @@ class _DauthDeploymentSecretsMixin:
       canonical = self._recursively_sort_pipeline_data(self.extract_invariable_data_from_pipeline(representative))
       # Read the published configuration within the 10 s timeout and without pinning: this node
       # does not need its own pin of it, because the writer and the relays keep theirs.
-      published = self.r1fs.get_json(pointer["pipeline_cid"], timeout=10, pin=False, show_logs=False)
+      # A protected pointer is accepted only if the copy authenticates under the oracle key.
+      published = r1fs_documents.read_r1fs_document(
+        self.r1fs, pointer["pipeline_cid"], timeout=10, pin=False,
+        protected_only=r1fs_documents.R1FS_ENCRYPTION in expected,
+      )
       if published is None:
         raise RuntimeError("Published deployment configuration is unavailable.")
       if published != canonical:
@@ -654,8 +772,8 @@ class _DauthDeploymentSecretsMixin:
     published configuration, read from R1FS, must match the plan. Then each unused
     secret revision gets a "revoked" marker and its record is overwritten with a
     revoked copy that keeps no secrets. The published-configuration read runs on the
-    single dAuth request thread, so it is bounded: ``pin=False`` keeps
-    ``ipfs pin add`` out and makes the 10 s ``timeout`` the real bound.
+    single dAuth request thread with a 10-second fetch timeout and pinning
+    disabled.
 
     Parameters
     ----------
@@ -687,6 +805,13 @@ class _DauthDeploymentSecretsMixin:
       When the publication is still pending, the published configuration cannot be
       read, or a chain-store write was not confirmed (all retryable).
 
+    Notes
+    -----
+    For completed abandonment authorized by the custody context, revoke
+    only the unused deploy revision. Preserve the previous and restoration
+    credentials. Active-attempt verification can still read either legacy
+    or protected job copies.
+
     Examples
     --------
     >>> self._revoke_deployment_secret_revisions("42", operation, plan, "deploy")
@@ -694,6 +819,8 @@ class _DauthDeploymentSecretsMixin:
     {'job_id': '42', 'revision': '<operation_id>:restore', 'revoked': True}
     """
     phase = operation["phase"]
+    # The custody context grants completed-phase access only to a signed abandonment needing revocation.
+    abandoned_deploy = phase == "completed"
     expected_active = {"finalizing": "deploy", "finalizing_recovery": "restore"}.get(phase)
     if active_attempt != expected_active or (
       phase in ("preparing", "cleaning_up_preparation") and self.time() < operation["preparation_deadline"]
@@ -713,7 +840,8 @@ class _DauthDeploymentSecretsMixin:
         raise RuntimeError("Active deployment publication is pending.")
       # Read the published configuration within the 10 s timeout and without pinning: this node
       # does not need its own pin of it, because the writer and the relays keep theirs.
-      published = self.r1fs.get_json(pointer["pipeline_cid"], timeout=10, pin=False, show_logs=False)
+      # Revocation checks can still read a job copy written before activation.
+      published = r1fs_documents.read_r1fs_document(self.r1fs, pointer["pipeline_cid"], timeout=10, pin=False)
       if published is None:
         raise RuntimeError("Published deployment configuration is unavailable.")
       if published != canonical:
@@ -727,6 +855,8 @@ class _DauthDeploymentSecretsMixin:
       references.append(operation["previous_secret_revision"])
     if operation["kind"] != "delete":
       for attempt, key in (("deploy", "configs"), ("restore", "previous_configs")):
+        if abandoned_deploy and attempt == "restore":
+          continue  # A previous runtime that partly restored may already use its restoration credentials.
         if attempt != active_attempt and plan[key]:
           references.append(_revision_ref(operation, attempt))
     repair_parent = (operation.get("repair_parent") if operation.get("mutation")

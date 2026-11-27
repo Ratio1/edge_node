@@ -1,0 +1,72 @@
+#!/bin/sh
+###
+### node_entrypoint:
+###   The entrypoint of the node images (the ENTRYPOINT of the node Dockerfiles). It starts the inner Docker
+###   daemon with the unchanged base image entrypoint, then runs the node command as process 1.
+###
+###   The daemon keeps its store (images, containers, volumes) across node restarts. When the daemon does not
+###   start twice in a row, this script removes that store and stops the container: the next start begins on an
+###   empty store, as every start did before the store was kept, and every app image is pulled once more.
+###
+###   First of all it takes a lock beside the store, which the container then holds until it ends. A second
+###   container started on the cache folder of a running node stops at that lock: it starts no daemon and removes
+###   nothing.
+###
+###   Not an operator command: the container runtime runs it, once, when the node container starts.
+###
+
+# The folder of the stores, which a first start does not find yet. The lock file goes there, beside the store and
+# not in it, so the removal below never takes it away.
+mkdir -p /edge_node/_local_cache/_bin/docker
+# Open the lock file (created empty when missing, never written) on descriptor 9 of this shell. Every process the
+# shell starts inherits that descriptor: the base entrypoint, dockerd and what dockerd starts, and the node command
+# that replaces the shell. A lock belongs to the open file, so it is held for as long as one of them runs, that is,
+# until the container ends, a kill included: nothing has to release or remove it. When the file cannot be opened
+# the shell stops here, non-zero.
+exec 9>>/edge_node/_local_cache/_bin/docker/29.lock
+# Take the lock, exclusive and without waiting. Another container that runs a node on this cache folder holds it,
+# and its daemon is using the store: stop here, non-zero, before a daemon is started and without removing anything.
+# A missing flock or a file system that refuses the lock stops the start in the same way. The lock is taken with
+# EE_DD=0 too: one node container per cache folder, whether it runs a daemon or not.
+flock -n 9 || { echo "The kept Docker store is locked by another container on this cache folder, or could not be locked: not starting." >&2; exit 1; }
+# Remove the file in which dockerd keeps the process number of the containerd it started (under its default
+# exec-root, /var/run/docker; docker/daemon.json sets no other), once, before the first try: at its start dockerd
+# takes a live process of that number for its containerd. A node container restarted in place (docker stop and
+# start, docker restart, a restart policy) keeps /var/run, which is on its own layer, and the base entrypoint removes
+# only docker*.pid there. In the container's new pid namespace processes are numbered from 1 again, in nearly the
+# same order, so the old number is often alive at the next start, as the new containerd itself ("failed to save
+# daemon pid to disk: process with PID ... is still running") or as another process ("containerd is still running",
+# then "timeout waiting for containerd to start"), and dockerd exits 1 on a healthy store. Safe after the lock: no
+# other node container uses this store, and no process of an earlier run of this container outlives its pid
+# namespace. The second try below needs no removal: the containerd of a failed first try does not outlive its
+# dockerd (stopped by it, or killed with it when the entrypoint's timeout or the kernel ends dockerd), so the file
+# holds at most a dead number, which dockerd passes over, as the processes of the second try get higher numbers.
+# Nothing else in /var/run/docker needs removing: dockerd and containerd remove each of their sockets before they
+# listen on it, and containerd cleans up, at its start, its state of tasks whose shim is gone.
+rm -f /var/run/docker/containerd/containerd.pid
+# One try to start the daemon, the same for both tries below; it ends with the base entrypoint's exit code.
+start_daemon() {
+  # The base image entrypoint launches dockerd in the background, waits until it answers (at most
+  # DOCKERD_READY_TIMEOUT, 120 s by default) and then runs the command it is given. That command is `true`, so the
+  # entrypoint returns here and dockerd stays behind as a child of process 1. With EE_DD=0 it starts no daemon and
+  # runs `true`. The daemon starts without EE_ORACLE_R1FS_SECRET, which only seed nodes are given: the node takes it
+  # into its memory and overwrites it in its own environment, but dockerd would keep it in its environment, which
+  # every process of the container can read, for as long as the container runs. The node command below still gets it.
+  env -u EE_ORACLE_R1FS_SECRET /usr/local/bin/entrypoint.sh true
+}
+# Start the daemon. When the first try fails, say so and try once more: a start that fails for a passing reason
+# then costs no store. When the second try fails too, say so and remove the kept store: a store dockerd refuses
+# would fail every later start in the same way, until someone removed it on the host. The entrypoint does not
+# report why it failed, so the store goes after ANY two failed tries (a damaged store file, a container without
+# privileges, iptables, a wrong DOCKERD_READY_TIMEOUT, a daemon that did not answer in time). A try on a store
+# dockerd refuses ends within seconds; a daemon that never answers costs two DOCKERD_READY_TIMEOUT waits. Only the
+# holder of the lock gets here, so no node container that started through this script is using the store it
+# removes. A container started on this cache folder through another entrypoint takes no lock, and its daemon is not
+# seen here. The directory is the "data-root" of docker/daemon.json; a test keeps the two equal.
+# Exit non-zero, as the base entrypoint did: the container stops, and whoever starts it again (the host's service)
+# starts on an empty store.
+start_daemon || { echo "The inner Docker daemon did not start: trying once more." >&2; start_daemon; } || { echo "The inner Docker daemon did not start a second time: removing its kept store." >&2; rm -rf /edge_node/_local_cache/_bin/docker/29; exit 1; }
+# Run the node command the way the base entrypoint ran it: it replaces this shell, so the node is process 1,
+# receives the stop signal itself and has dockerd as its child, as before. Descriptor 9 stays open in it, and with
+# it the lock.
+exec "$@"

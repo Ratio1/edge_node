@@ -214,3 +214,42 @@ are fixtures. Its synthetic keys must never be used for live systems. Fixture
 storage is a JSON file (`ALIAS_TEST_STORE`, default `/tmp/delegate-aliases.json`),
 allowing independent browser sessions to share metadata. This proves the API/UI
 boundary, not live-chain or multi-oracle replication behavior.
+
+### Native per-container limits
+
+The signed create and update endpoints accept CPU and memory in each Native
+CAR/WAR plugin's `CONTAINER_RESOURCES`. The purchased worker tier continues to
+set the price. On create each container's positive finite CPU and RAM caps
+must fit that worker. Two containers may each inherit the entire tier. Native
+in-process plugins share the worker. Docker applies CPU and memory limits.
+
+Optional `CONTAINER_RESOURCES.storage` sets a Volume Storage budget that
+includes the container's fixed-size volumes. An omitted Native budget accounts
+for the existing fixed-volume reservations. Explicit zero is valid with no
+reservations. The storage allocation does not resize existing volume files.
+
+### Editing a running Stack or Native container set
+
+Submit a complete signed `update_pipeline` request with the current
+`expected_revision` and a stable `request_id`. Keep the workers and purchased
+tier fixed. Send the stable `instance_id` and signature for every survivor,
+omit the retired rows, and leave the ID absent on a new named container.
+Resolve any dependent plugin references before removal.
+
+The coordinator compares CPU, RAM and Volume Storage on each worker with the
+saved plan for that revision. Both an increase and a decrease in any total
+are refused, including below the paid tier. A historical Native container
+with an omitted CPU or RAM key inherits its actual runner defaults of one
+core and 512 MiB. An explicitly saved full-tier cap stays intact. The saved
+resource dictionary on an identified old container can retain its omitted
+fields. An unknown baseline requires recovery before editing.
+
+Balanced membership and resource changes use whole-placement retirement.
+Every signed receipt must identify all stopped instances. During
+`waiting_for_capacity`, Edge waits for two successive direct heartbeats from every worker
+after its stop. The second sample must have sufficient free CPU, RAM and disk. The
+previous caps and persistent volumes supply no capacity credit. If the
+barrier expires, the existing revision, membership and credentials are
+restored. On a deploy failure all attempted starts must stop before restore.
+Use the original request ID on an uncertain response and poll the returned
+operation. A legacy coordinator cannot advance the versioned capacity gate.

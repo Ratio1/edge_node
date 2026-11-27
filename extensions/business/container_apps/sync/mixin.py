@@ -35,6 +35,8 @@ from .control_files import JsonControlFile, JsonControlFileUnsafeError
 from .constants import (
   SYNC_PROCESSING_FILE,
   SYNC_REQUEST_FILE,
+  # Name of the ENV variable that holds the set's secret: read from the config, removed from the container env.
+  SYNC_SECRET_ENV,
   STAGE_RUNTIME_STOP,
   SYSTEM_VOLUME_FS,
   SYSTEM_VOLUME_MOUNT,
@@ -56,6 +58,8 @@ from .manager import (
 
 class _SyncMixin:
   """
+  Volume-sync provider and consumer behaviour for a container app runner.
+
   Required attributes on the composing plugin:
     - self.P, self.time, self.cfg_*                  (BasePlugin)
     - self.get_data_folder, _get_instance_data_subfolder
@@ -67,7 +71,29 @@ class _SyncMixin:
       self.start_container()  (CAR lifecycle)
     - self.cfg_sync                                  (CAR config block)
     - self.ee_id                                     (BasePlugin identity)
+
+  Attributes
+  ----------
+  _sync_config_refused : bool
+    True while the runner's last ``_validate_sync_config`` run refused the SYNC block (no KEY, a wrong TYPE or
+    a malformed secret). Only that method writes it, and ``_sync_enabled`` reads it. False before the first
+    run.
+
+  Examples
+  --------
+  >>> class Runner(_SyncMixin):
+  ...   cfg_sync = {"ENABLED": True}
+  >>> runner = Runner()
+  >>> runner._sync_enabled()
+  True
+  >>> runner._sync_config_refused = True
+  >>> runner._sync_enabled()
+  False
   """
+
+  # The verdict of the runner's SYNC check lives on the plugin, not in the SYNC block: on a node `cfg_sync` is
+  # a copy of that block, so a refusal written into it was lost and SYNC stayed on.
+  _sync_config_refused = False
 
   # ----- system volume provisioning --------------------------------------
 
@@ -210,7 +236,7 @@ class _SyncMixin:
   # ----- env-var injection -----------------------------------------------
 
   def _inject_sync_env_vars(self):
-    """Add the ``R1_*`` env vars to the container's environment.
+    """Add the ``R1_*`` env vars to the container's environment and remove the set's secret from it.
 
     ``R1_SYSTEM_VOLUME`` / ``R1_VOLUME_SYNC_DIR`` / ``R1_SYNC_REQUEST_FILE``
     are always set so apps can write the request unconditionally; CAR just
@@ -221,9 +247,33 @@ class _SyncMixin:
     If ``_sync_unavailable`` was set during ``_configure_system_volume``
     (host tools missing), inject nothing — advertising a mount that was
     never provisioned would route the app's writes into a phantom path.
+
+    ``R1EN_SYNC_SECRET`` is removed from ``self.env`` first, whatever the SYNC state (enabled, disabled,
+    unavailable) and whether the env build took it from ``ENV`` or from ``DYNAMIC_ENV``: the set's own
+    containers must not see the secret. CAR reads it from the config (``cfg_sync_secret``), never from here.
+
+    Returns
+    -------
+    None
+      ``self.env`` is changed in place; nothing happens when it is not a dict.
+
+    Notes
+    -----
+    Call this after every env build (``_setup_env_and_ports``), as the three call sites in the runner do: a
+    build without it leaves the secret in the container's environment.
+
+    Examples
+    --------
+    >>> plugin.env = {"R1EN_SYNC_SECRET": "ab" * 32, "APP": "1"}
+    >>> plugin._inject_sync_env_vars()
+    >>> "R1EN_SYNC_SECRET" in plugin.env, plugin.env["R1_SYSTEM_VOLUME"]
+    (False, '/r1en_system')
     """
     if not isinstance(getattr(self, "env", None), dict):
       return
+    # The set's secret never reaches the container: dropped here, before the unavailable return below, so it
+    # is removed after every env build in every SYNC state.
+    self.env.pop(SYNC_SECRET_ENV, None)
     if getattr(self, "_sync_unavailable", False):
       return
     self.env["R1_SYSTEM_VOLUME"] = SYSTEM_VOLUME_MOUNT
@@ -246,7 +296,30 @@ class _SyncMixin:
     return cfg if isinstance(cfg, dict) else {}
 
   def _sync_enabled(self) -> bool:
+    """Whether SYNC is on for this job; every tick, the manager handle and the env injection ask here.
+
+    SYNC is on when the system volume is available, the runner's last ``_validate_sync_config`` run did not
+    refuse the SYNC block, and ``SYNC.ENABLED`` is truthy. A refusal wins over ``SYNC.ENABLED``: the stored
+    block is left as the owner sent it.
+
+    Returns
+    -------
+    bool
+      True when the provider or consumer tick may work and the app gets ``R1_SYNC_TYPE`` and ``R1_SYNC_KEY``.
+
+    Examples
+    --------
+    >>> plugin.cfg_sync = {"ENABLED": True, "KEY": "k", "TYPE": "consumer"}
+    >>> plugin._sync_enabled()
+    True
+    >>> plugin._sync_config_refused = True
+    >>> plugin._sync_enabled()
+    False
+    """
     if getattr(self, "_sync_unavailable", False):
+      return False
+    if self._sync_config_refused:
+      # The SYNC check refused this block: no tick work and no SYNC role or key for the app.
       return False
     return bool(self._sync_cfg().get("ENABLED"))
 
@@ -288,6 +361,31 @@ class _SyncMixin:
   @property
   def cfg_sync_key(self):
     return self._sync_cfg().get("KEY")
+
+  @property
+  def cfg_sync_secret(self):
+    """The set's secret as configured, or None for a set that uses the shared key.
+
+    Read from the job's configured ``ENV`` (``cfg_env``), never from ``self.env``: the container copy can be
+    changed by ``DYNAMIC_ENV``, and ``_inject_sync_env_vars`` removes the variable from it.
+
+    Returns
+    -------
+    object
+      The configured ``R1EN_SYNC_SECRET`` value as it is (``_validate_sync_config`` disables SYNC unless it is
+      64 lowercase hex characters), or None when the job has no ``ENV``, no such variable, or a null value.
+
+    Examples
+    --------
+    >>> plugin.cfg_env = {"R1EN_SYNC_SECRET": "ab" * 32}
+    >>> plugin.cfg_sync_secret == "ab" * 32
+    True
+    >>> plugin.cfg_env = {}
+    >>> plugin.cfg_sync_secret is None
+    True
+    """
+    # The config's value: a missing ENV (None) or a missing variable both mean a set without a secret.
+    return (self.cfg_env or {}).get(SYNC_SECRET_ENV)
 
   @property
   def cfg_sync_type(self):

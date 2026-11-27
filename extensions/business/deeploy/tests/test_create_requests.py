@@ -2,6 +2,8 @@ import unittest
 import copy
 from collections import defaultdict
 import ipaddress
+# Whether torch is installed, without importing it.
+import importlib.util
 import sys
 import types
 from unittest.mock import patch
@@ -11,8 +13,13 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.x509.oid import NameOID
 
 
-for _mod_name in ("torch", "torch.nn", "torch.nn.functional"):
-  sys.modules.setdefault(_mod_name, types.ModuleType(_mod_name))
+# The bare torch stub only where torch is not installed: it breaks every later import in the same process that
+# reads torch's attributes (scipy reads torch.Tensor). Not looked up once stubbed.
+if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
+  # Each torch module that naeural_core imports.
+  for _mod_name in ("torch", "torch.nn", "torch.nn.functional"):
+    # A bare stub of it.
+    sys.modules.setdefault(_mod_name, types.ModuleType(_mod_name))
 
 from naeural_core.main.net_mon import NetMonCt
 
@@ -689,7 +696,11 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     self.assertIn("'PER_NODE_CONFIG': '***'", serialized)
 
   def test_dauth_secret_extraction_redacts_only_mandatory_paths(self):
+    """Every mandatory secret path, a sync set's secret among them, is redacted; other values stay."""
+    # A Deeploy plugin stub that carries the extraction code under test.
     plugin = make_deeploy_plugin()
+    # One plugin instance with a value at every mandatory secret path, and values outside those paths (a
+    # branch, a registry user, a user's own ENV password, the response key).
     payload = {
       "PLUGINS": [{
         "INSTANCES": [{
@@ -705,6 +716,8 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
           "CR_DATA": {"USERNAME": "user", "PASSWORD": "registry-password"},
           "ENV": {
             "R1EN_CSTORE_AUTH_SECRET": "cstore-secret",
+            # A volume-sync set's secret, sent like any ENV value with no secret_paths entry.
+            "R1EN_SYNC_SECRET": "sync-set-secret",
             "R1EN_CSTORE_AUTH_BOOTSTRAP_ADMIN_PWD": "admin-password",
             "CF_TUNNEL_TOKEN": "node-tunnel-token",
             "CRDB_PASSWORD": "crdb-password",
@@ -720,10 +733,14 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       }],
     }
 
+    # The pipeline as it is stored, and the tree of the values taken out of it.
     redacted, secrets = plugin._extract_and_redact_deeploy_dauth_secrets(payload)
+    # The stored pipeline as text, to find a value wherever it sits.
     serialized_redacted = str(redacted)
+    # The secret tree as text, for the same reason.
     serialized_secrets = str(secrets)
 
+    # The value at each mandatory path.
     for value in (
       "cf-token",
       "ngrok-token",
@@ -732,6 +749,8 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       "github-token",
       "registry-password",
       "cstore-secret",
+      # The sync secret: gone from the pipeline that is stored, present in the secret tree.
+      "sync-set-secret",
       "admin-password",
       "node-tunnel-token",
       "crdb-password",
@@ -741,13 +760,27 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       "root-crt",
       "root-key",
     ):
+      # Gone from the stored pipeline.
       self.assertNotIn(value, serialized_redacted)
+      # Kept in the secret tree.
       self.assertIn(value, serialized_secrets)
 
+    # At its own path: the placeholder in the redacted pipeline, the value in the secret tree.
+    self.assertEqual(
+      (redacted["PLUGINS"][0]["INSTANCES"][0]["ENV"]["R1EN_SYNC_SECRET"],
+       secrets["PLUGINS"][0]["INSTANCES"][0]["ENV"]["R1EN_SYNC_SECRET"]),
+      (DEEPLOY_DAUTH_SECRET_PLACEHOLDER, "sync-set-secret"),
+    )
+
+    # The stored pipeline holds the placeholder where values were taken out.
     self.assertIn(DEEPLOY_DAUTH_SECRET_PLACEHOLDER, serialized_redacted)
+    # An ENV value outside the mandatory paths stays in the stored pipeline.
     self.assertIn("user-env-password", serialized_redacted)
+    # So does the response key.
     self.assertIn("response-key", serialized_redacted)
+    # That ENV value is not copied into the secret tree.
     self.assertNotIn("user-env-password", serialized_secrets)
+    # Nor is the response key.
     self.assertNotIn("response-key", serialized_secrets)
 
   def test_cockroachdb_secure_config_generates_node_certs_and_redacts_them(self):

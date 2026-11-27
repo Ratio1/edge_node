@@ -79,7 +79,7 @@ Catalogue services retain their runtime content binding during restoration. Gene
 local persistent state before launching a bound attempt and starts that exact ID thereafter.
 With the ID it records the registry reference of that image (`repository@sha256:...`) when the
 image came from the repository the app is configured with: if the local image is lost it is
-pulled again and accepted only when its ID equals the recorded one.
+pulled again and accepted by its recorded ID or exact registry digest.
 A worker's base image follows `IMAGE_PULL_POLICY`. A worker pin selects its Git commit.
 Node-owned observations capture the actual running image ID; worker runners additionally
 capture and verify the actual Git HEAD before publishing readiness. Retirement preserves
@@ -90,8 +90,8 @@ identifiers and performs no Docker, disk, or Git I/O on the reporter thread.
 A bound container app runs its recorded image ID. When that image is no longer in the node's
 Docker store (the node's own container was replaced, or the image was removed) it is pulled
 again: by the recorded registry reference, then by the configured reference. What comes back is
-used only if its ID equals the recorded one, so the configured tag is consulted to find that
-image and never to replace it. Until the registry serves it the app stays stopped and the pull
+used when its ID or exact registry digest identifies the saved content. A pull by the
+configured tag must match the recorded ID. Until the registry serves it the app stays stopped and the pull
 is tried again, at most an hour apart. Pinned worker restoration checks out the exact prior
 commit. Pinned apps and catalogue services disable autonomous source updates. Generic apps
 following a source restore from the current branch head or image tag. Database volume names,

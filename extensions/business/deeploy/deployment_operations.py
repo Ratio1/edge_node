@@ -5,6 +5,10 @@ There is deliberately no distributed lock, election, or automatic takeover.
 The receiving oracle resumes its own unfinished operations after restart;
 other oracles only aggregate replicated observations for polling.
 """
+# The repair schedule of a completed operation is looked up by age in a sorted tuple.
+import bisect
+# A size refusal stays the error admission raises when the save that ends its operation is not confirmed.
+import contextlib
 import copy
 import hashlib
 import json
@@ -14,15 +18,24 @@ import threading
 # The call path of an error that stops an operation is logged (function names only).
 import traceback
 import uuid
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo
 # The verified-fingerprint cache keeps insertion order, so its oldest entry can be dropped first.
 from collections import OrderedDict
 
+from naeural_core import constants as ct
+from .container_allocations import redistribution_requirements
 from naeural_core.business.deployment_lifecycle import SOURCE_FAILURES, deployment_source_mode
 from ratio1.const.base import BCct, dAuth
+# The SDK client's error for a secret record a dAuth server refused for its size: it ends a preparation at once.
+from ratio1.bc.base import DauthSecretRecordTooLarge
 from extensions.business.container_apps.container_utils import configured_image_ref, image_repository
 from extensions.utils.per_node_config import iter_overlays, normalize_config, PER_NODE_CONFIG_KEYS
 from .selected_secrets import inherit_selections
 from .relink_placement import relink_configs, relink_pipeline
+# Share the writer activation and local compatibility reader across Oracle API paths.
+from . import r1fs_documents
 
 from extensions.business.dauth.dauth_registry import get_dauth_registry_internal_peers
 # The worker signature tells the restoration gate which runtime binding an instance needs.
@@ -33,16 +46,34 @@ OPERATIONS_HKEY = "DEEPLOY_OPERATIONS"
 REPLACEMENT_REFUSALS_HKEY = "DEEPLOY_REPLACEMENT_REFUSALS"
 NODE_OPERATIONS_HKEY = "DEEPLOY_NODE_OPERATIONS"
 SECRET_REVISIONS_HKEY = "DAUTH_JOB_SECRET_REVISIONS"
+# The ages after completion, in seconds, at which the coordinator sends the final snapshot of a completed operation
+# again as peer repair once its first 600 s (re-sent every 30 s, as before) are over: ages that double from 600 s and
+# are at most 1 h apart (600, 1,200, 2,400 and 4,800 s, then every 3,600 s), the last at 84,000 s. Fixed ages after
+# each operation's own completion: the sends of operations stay spread as their completion times are, before and
+# after a restart.
+REPAIR_AGES = (600, 1200, 2400) + tuple(range(4800, 86400, 3600))
+# An operation that is not completed and whose snapshot has not changed for this many seconds is re-sent to the peers
+# as repair once per this many seconds, no longer every 30 s. An operation that waits for something that never comes
+# (a blocked one) keeps the same snapshot for as long as it waits, and every oracle received and answered that
+# snapshot about 115 times an hour.
+OPEN_REPAIR_SECONDS = 600
+# Extra phase deadlines an ordinary blocked operation may spend waiting for signed evidence.
+BLOCKED_RECOVERY_GRACE_PERIODS = 24
+BLOCKED_OPERATION_ENDED = "BLOCKED_OPERATION_ENDED"
+# Check for worker receipts that reach an ended paid create after its terminal failure.
+ENDED_CREATE_CLEANUP_CHECK_SECONDS = 60
 class DeploymentAuthenticationError(ValueError):
   """The reusable read authorization is invalid or expired."""
 
 
 STATELESS_REPLACEMENT = "stateless_replacement_v1"
+RESOURCE_REDISTRIBUTION = "resource_redistribution_v1"
 
 
 _OPERATION_PHASE_PREFIXES = {
   "same_host_repair_v1": "repair_v1_",
   STATELESS_REPLACEMENT: "stateless_v1_",
+  RESOURCE_REDISTRIBUTION: "resources_v1_",
 }
 
 
@@ -527,21 +558,51 @@ def with_observed_legacy_metadata_order(pipeline, observed):
 
 
 class _DeploymentOperationsMixin:
-  """Persist, execute, recover, and present asynchronous deployment operations."""
+  """Persist and reconcile asynchronous deployment operations.
+
+  The hosting plugin runs a coordinator worker and serves owner-scoped status
+  from verified snapshots.
+
+  Parameters
+  ----------
+  None
+
+  Returns
+  -------
+  _DeploymentOperationsMixin
+    Operation helpers for the hosting plugin.
+
+  Notes
+  -----
+  The worker's in-memory cleanup clock permits an immediate receipt check
+  after startup, then paces checks for ended paid creates every 60 seconds.
+  The signed operation, rather than the clock, preserves the outcome.
+
+  Examples
+  --------
+  >>> plugin._reconcile_coordinator_operations()  # doctest: +SKIP
+  """
+
+  # The worker owns the cadence. Restarting permits one immediate read of the local receipts.
+  _last_ended_create_cleanup_check = None
 
   def _init_deployment_operations(self):
     """Start the independent execution worker and initialize bounded caches.
 
     Creates every field the operation mixin needs before the worker thread
     starts: the admission handoff markers, the bounded plan cache (at most 32
-    plans) with its lock, the wake-up and stop events, and two in-process
+    plans) with its lock, the wake-up and stop events, and three in-process
     bookkeeping maps. `_operations_sent_at` holds the command resend times
     that used to be written into the signed operation snapshot, so a command
     retry no longer produces a new CStore write; `_operations_confirmed`
     holds the last confirmed send of each snapshot, so an unchanged snapshot
-    is no longer re-sent on every 2 s pass. `_verified_operation_records`, a FIFO cache,
+    is no longer re-sent on every 2 s pass; `_operations_repaired` holds, per
+    completed operation, how many ages of its repair schedule (`REPAIR_AGES`)
+    were already served. `_verified_operation_records`, a FIFO cache,
     holds the fingerprints of the records whose signature was already checked
-    and found valid (see `_verify_operation_record`). `_custody_retry` holds,
+    and found valid (see `_verify_operation_record`); its lock and
+    `_verified_operation_records_dropped`, the count of fingerprints dropped
+    from it since the start, sit next to it. `_custody_retry` holds,
     per operation out of the "preparing" phase with a failed dAuth custody
     call since its last pass without an error, how long the worker waits
     before calling dAuth again (see `_reconcile_coordinator_operations`).
@@ -558,12 +619,15 @@ class _DeploymentOperationsMixin:
     Notes
     -----
     Called once from the plugin's `on_init`; `on_close` sets the stop event
-    and joins the thread. The two bookkeeping maps live only in process
+    and joins the thread. The three bookkeeping maps live only in process
     memory and are not pruned: they hold one small entry per operation and
     per command target. After a restart they start empty, so the current
-    snapshot of each own operation the worker still handles (unfinished, or
-    completed less than 600 s ago) is sent once more and pending commands are
-    sent again; nodes de-duplicate commands by operation id and attempt.
+    snapshot of each own operation that is unfinished or completed less than
+    600 s ago is sent once more and pending commands are sent again; nodes
+    de-duplicate commands by operation id and attempt. An operation completed
+    600 s to 24 h ago is not sent at once: the first pass marks the current
+    age of its repair schedule as served, and its next send falls on the next
+    age of that schedule (see `_reconcile_coordinator_operations`).
     `_custody_retry` is pruned on every worker pass and also starts empty, so
     after a restart each waiting operation calls dAuth on the first pass.
 
@@ -572,13 +636,17 @@ class _DeploymentOperationsMixin:
     >>> plugin._init_deployment_operations()
     >>> plugin._deployment_operations_thread.name
     'deeploy-operations'
-    >>> plugin._operations_confirmed, plugin._operations_sent_at, plugin._custody_retry
-    ({}, {}, {})
+    >>> plugin._operations_confirmed, plugin._operations_sent_at, plugin._custody_retry, plugin._operations_repaired
+    ({}, {}, {}, {})
     """
     self._deployment_preparations = {}
     # Last confirmed send per operation id, as (sequence, signature, time): it lets _replicate_operation
     # skip an unchanged snapshot for 30 s instead of re-sending it to every oracle on each 2 s pass.
     self._operations_confirmed = {}
+    # Per completed operation id, how many ages of REPAIR_AGES were served: 0 from a pass in its first 600 s, then the
+    # ages sent or passed, the current one marked by the first pass that sees it later (as after a restart). From 600 s
+    # on, _reconcile_coordinator_operations re-sends the final snapshot when its age reaches the next one.
+    self._operations_repaired = {}
     # Last command time per "operation id|attempt|action|node": the 10 s resend throttle lives in process
     # memory, so a command retry no longer writes a new signed snapshot that every oracle re-stores.
     self._operations_sent_at = {}
@@ -586,6 +654,9 @@ class _DeploymentOperationsMixin:
     self._verified_operation_records = OrderedDict()
     # The worker thread and the plugin thread both look up and insert: one lock for the cache.
     self._verified_operation_records_lock = threading.Lock()
+    # Fingerprints dropped from the full cache since the start, changed under the lock above: every 10,000th drop
+    # makes one red line, the only sign that more valid records are alive than the cache holds.
+    self._verified_operation_records_dropped = 0
     # Operation id -> (failures in a row, time of the last one, seconds to wait) after a failed dAuth custody
     # call: the worker waits that long before it calls the same dAuth server again, instead of every 2 s.
     self._custody_retry = {}
@@ -652,6 +723,10 @@ class _DeploymentOperationsMixin:
     A lock protects lookups and insertion/eviction shared by the worker and plugin threads.
     Signature verification runs outside the lock, so concurrent misses can check the same record
     more than once; membership is checked again before insertion to avoid unnecessary eviction.
+    Evictions are counted under the same lock; every 10,000th eviction since the start makes one
+    red line, logged after the lock is released, so 10,000 evictions lie between two lines. If the
+    line repeats on every pass, more than 10,000 valid records are alive and every record is checked
+    again on every pass.
 
     Examples
     --------
@@ -677,6 +752,8 @@ class _DeploymentOperationsMixin:
       # The full check, as before: a valid signature made by the address the record names as its writer.
       valid = bool(verification.valid and record.get("EE_SENDER") == record[signer_key])
       if valid:
+        # Set under the lock below when this insertion makes the 10,000th drop since the last red line.
+        log_replaced = False
         # Insert under the cache lock, so the size check, the drop and the insert are one step.
         with self._verified_operation_records_lock:
           # Another thread may have verified and inserted this fingerprint while the lock was released.
@@ -684,8 +761,15 @@ class _DeploymentOperationsMixin:
             if len(self._verified_operation_records) >= 10000:
               # At capacity drop only the oldest insertion, so the other cached checks are kept.
               self._verified_operation_records.popitem(last=False)
+              # Count the drop with the cache, under its lock, so two threads never lose one.
+              self._verified_operation_records_dropped += 1
+              # One line per 10,000 drops: often enough to see a cache that is too small, never once per drop.
+              log_replaced = self._verified_operation_records_dropped % 10000 == 0
             # Remember only records that passed; retain the other cached verifications at capacity.
             self._verified_operation_records[fingerprint] = True
+        if log_replaced:
+          self.P("Replaced 10,000 remembered Deeploy record fingerprints. If this line repeats on every pass, more "
+                 "than 10,000 valid records are alive and every record is checked again.", color='r')
       # The outcome of the full check; a record that failed it was not remembered above.
       return valid
     except Exception:
@@ -849,33 +933,48 @@ class _DeploymentOperationsMixin:
     self._operations_confirmed[snapshot["operation_id"]] = (snapshot["sequence"], snapshot.get("EE_SIGN"), self.time())
     return operation
 
-  def _replicate_operation(self, operation):
-    """Retry the exact snapshot until confirmed; once confirmed, re-send it every 30 s as repair.
+  def _replicate_operation(self, operation, every=30):
+    """Retry the exact snapshot until confirmed; once confirmed, re-send it every `every` seconds as repair.
 
     A confirmation needs only part of the peers, and nothing else brings an oracle that missed the write
-    up to date. The re-sent snapshot is the same record: peers that hold it store nothing.
+    up to date. The re-sent snapshot is the same record: peers that already hold it do not save it again.
 
     The snapshot is identified by its `sequence` and its signature. Until
     that exact snapshot has been confirmed once, every call writes it again
     and raises while the write stays unconfirmed, so the caller does not act
-    on state the peers may lack. Once confirmed, a call within 30 s of the
-    last send returns without writing; after that the same record is sent
-    again as peer repair, and a failed repair send is not an error. Before
-    this throttle the unchanged snapshot was re-sent to every oracle peer on
-    every 2 s pass of the worker.
+    on state the peers may lack. Once confirmed, a call within `every` seconds
+    (30 by default) of the last send returns without writing; after that the
+    same record is sent again as peer repair, and a failed repair send is not
+    an error. Before this throttle the unchanged snapshot was re-sent to every
+    oracle peer on every 2 s pass of the worker.
+
+    An operation that is not completed keeps the 30 s repair only while its
+    snapshot is younger than `OPEN_REPAIR_SECONDS` (600 s, by `updated_at`).
+    Once the snapshot has not changed for that long, its repair waits 600 s
+    after the last send instead: 6 sends an hour, where a blocked operation
+    was sent about 115 times an hour to every oracle. A change of the
+    operation makes a new snapshot, which is young again.
 
     Parameters
     ----------
     operation : dict
       A signed operation snapshot exactly as stored, with `operation_id`,
-      `sequence` and `EE_SIGN`. It is written as is and never modified.
+      `sequence`, `phase`, `updated_at` and `EE_SIGN`. It is written as is
+      and never modified.
+    every : float, optional
+      Seconds a repair waits after the last send of the same snapshot.
+      Default 30; `_reconcile_coordinator_operations` passes 0 for an
+      operation completed 600 s or more ago, whose sends its repair schedule
+      times. For an operation that is not completed and whose snapshot is
+      `OPEN_REPAIR_SECONDS` old or older, the wait is `OPEN_REPAIR_SECONDS`
+      whatever is passed.
 
     Returns
     -------
     None
       After a send (confirmed, or a failed repair of an already confirmed
       snapshot) its time is recorded in `_operations_confirmed`; a call inside
-      the 30 s window returns without sending or recording anything.
+      the `every` window returns without sending or recording anything.
 
     Raises
     ------
@@ -885,9 +984,15 @@ class _DeploymentOperationsMixin:
 
     Notes
     -----
-    The 30 s timer is measured with `self.time()`; a negative age (a clock
-    step backwards) counts as expired, so the record is sent rather than
-    held back. A failed repair send also restarts the 30 s timer.
+    The timer is measured with `self.time()`; a negative age (a clock step
+    backwards) counts as expired, so the record is sent rather than held
+    back. A failed repair send also restarts the timer.
+
+    The send times are kept in process memory, so after a restart the first
+    call sends the snapshot at once, whatever its age, and the wait counts
+    from that send. With the longer wait an oracle that missed an unchanged
+    open snapshot gets it within 600 s instead of 30 s; until then it does
+    not see that operation, or sees an older snapshot of it.
 
     Examples
     --------
@@ -895,12 +1000,23 @@ class _DeploymentOperationsMixin:
     >>> plugin._replicate_operation(operation)  # within 30 s: returns without writing
     >>> plugin.now += 31
     >>> plugin._replicate_operation(operation)  # repair: the same record is sent once more
+    >>> plugin._replicate_operation(operation, every=0)  # no wait: the same record is sent once more
+    >>> plugin.now += 600
+    >>> plugin._replicate_operation(operation)  # open, unchanged for 600 s: sent, and then once per 600 s
     """
+    if operation["phase"] != "completed" and (
+      operation.get("recovery") == "blocked" or self.time() - operation["updated_at"] >= OPEN_REPAIR_SECONDS
+    ):
+      # An open operation whose snapshot has not changed for 600 s is repaired once per 600 s, not per 30 s:
+      # a blocked operation was re-sent about 115 times an hour to every oracle with nothing new in it.
+      every = OPEN_REPAIR_SECONDS
     # Read the confirmations kept in process memory since init; the signed snapshot carries no send bookkeeping.
     confirmed = self._operations_confirmed
     # Identify the snapshot by sequence and signature, and look up when it was last sent with confirmation.
     marker, last = (operation["sequence"], operation.get("EE_SIGN")), confirmed.get(operation["operation_id"])
-    if last and last[:2] == marker and 0 <= self.time() - last[2] < 30:
+    # Hold the repair back while the last send of this snapshot is less than `every` seconds old (30 s unless the
+    # caller passes 0, for an operation completed 600 s or more ago, whose repair schedule times its sends).
+    if last and last[:2] == marker and 0 <= self.time() - last[2] < every:
       return
     key = "{}|{}".format(operation["operation_id"], operation["sequence"] % 8)
     if not self.chainstore_hset(OPERATIONS_HKEY, key, operation, readonly=True,
@@ -909,7 +1025,7 @@ class _DeploymentOperationsMixin:
         # Only a snapshot that was never confirmed blocks the caller; a failed repair of an already
         # confirmed one no longer stops the node commands that follow it.
         raise RuntimeError("Deployment state replication is pending.")
-    # Record this send (or failed repair) so the next repair of the same snapshot waits another 30 s.
+    # Record this send (or failed repair) so the next repair of the same snapshot waits `every` seconds again.
     confirmed[operation["operation_id"]] = marker + (self.time(),)
 
   def _assert_no_active_deployment(self, job_id=None, app_id=None):
@@ -920,7 +1036,46 @@ class _DeploymentOperationsMixin:
       raise DeploymentConflictError("Deployment or recovery is active; wait before changing this job.")
 
   def _find_request_operation(self, request, owner, kind, repair_parent=None):
-    """Resolve already observed idempotent requests and known job conflicts."""
+    """Find an identical request or check whether another operation blocks it.
+
+    Check the verified operation records for this owner and job before
+    deciding whether a new request can proceed.
+
+    Parameters
+    ----------
+    request : dict
+      Deployment input including the job and stable request ID.
+    owner : str
+      Authenticated escrow owner.
+    kind : str
+      Kind of deployment operation being admitted.
+    repair_parent : str or None, optional
+      Active parent operation that may coexist with its own repair request.
+
+    Returns
+    -------
+    dict or None
+      The matching operation on an identical replay, or None for new input
+      that does not conflict with observed operations.
+
+    Raises
+    ------
+    ValueError
+      The request ID is missing or is outside the allowed length.
+    DeploymentConflictError
+      The request ID matches different input, unrelated work is still active,
+      or a new paid create would overlap an ended create's unconfirmed cleanup.
+
+    Notes
+    -----
+    An exact replay returns the existing record before checking conflicts
+    for new input. A completed phase can still block a new paid create until
+    its recovery state confirms cleanup.
+
+    Examples
+    --------
+    >>> plugin._find_request_operation(request, owner, "create")  # doctest: +SKIP
+    """
     request_id = request.get("request_id")
     if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
       raise ValueError("A stable request_id of 1 to 128 characters is required.")
@@ -934,6 +1089,11 @@ class _DeploymentOperationsMixin:
         if record["request_hash"] != digest:
           raise DeploymentConflictError("request_id was already used for different deployment input.")
         return record
+    # Terminal execution never permits an overlapping paid create while its earlier workers may still run.
+    if kind == "create" and any(record["kind"] == "create" and record.get("unconfirmed_nodes")
+                                and record["phase"] == "completed" and record.get("recovery") == "blocked"
+                                for record in records):
+      raise DeploymentConflictError("A previous deployment still has unconfirmed cleanup for this paid job.")
     if any(record["phase"] != "completed" and (not repair_parent or record["operation_id"] != repair_parent) for record in records):
       raise DeploymentConflictError("A deployment operation or recovery is already active for this job.")
     return None
@@ -1081,8 +1241,10 @@ class _DeploymentOperationsMixin:
     the call failed or timed out (dAuth may still have received it), when dAuth answered with an HTTP error
     or refused, and when a preparation is not finished; that error is raised again as
     `DeploymentCustodyError`, so the operations worker can wait before it calls the same dAuth server again.
-    A ValueError (invalid payload, answer, signature or signer) is raised unchanged and is tried again on the
-    next pass, as before.
+    A ValueError (invalid payload, answer, signature or signer, and the SDK's `DauthSecretRecordTooLarge` for a
+    secret record a dAuth server refused for its size) is raised unchanged: admission answers 400 for it, and the
+    worker tries its own call again on the next pass, as before. Only a "prepare", which admission sends, can be
+    refused for size.
 
     Parameters
     ----------
@@ -1105,6 +1267,9 @@ class _DeploymentOperationsMixin:
       It is a RuntimeError, so admission still answers 503 (`ADMISSION_UNAVAILABLE`) for it.
     ValueError
       When the payload or dAuth's answer is invalid, unchanged; admission still answers 400 for it.
+    DauthSecretRecordTooLarge
+      When dAuth refused a "prepare" because the chain store does not accept a secret record of the job for its
+      size (a ValueError too); admission ends the operation at once for it.
 
     Notes
     -----
@@ -1165,12 +1330,34 @@ class _DeploymentOperationsMixin:
       The job's stored copy in R1FS, with its original node names.
     reports : dict, optional
       Job reports already observed for this admission. An empty observation is valid.
+
+    Returns
+    -------
+    dict
+      Copies of the saved configurations keyed by the exact prior node set,
+      with per-instance response keys removed.
+
+    Raises
+    ------
+    ValueError
+      The saved plan is unavailable or does not cover the prior placement,
+      or legacy observations disagree with the saved configuration.
+
+    Notes
+    -----
+    A signed pointer may reference either protected or legacy plan storage.
+    For a restored revision, read the plan's previous configurations.
+
+    Examples
+    --------
+    >>> config_by_node = plugin._previous_deployment_configs(pipeline)  # doctest: +SKIP
     """
     specs = pipeline["DEEPLOY_SPECS"]
     nodes = specs.get("current_target_nodes", [])
     pointer = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(specs["job_id"]))
     if isinstance(pointer, dict) and pointer.get("plan_cid"):
-      plan = self.r1fs.get_json(pointer["plan_cid"], timeout=10, show_logs=False) or {}
+      # Older plans and protected plans are both valid restoration inputs.
+      plan = r1fs_documents.read_r1fs_document(self.r1fs, pointer["plan_cid"], timeout=10) or {}
       restored = str(specs.get("secret_revision", "")).endswith(":restore")
       configs = plan.get("previous_configs" if restored else "configs")
       if not isinstance(configs, dict) or set(configs) != set(nodes):
@@ -1213,8 +1400,15 @@ class _DeploymentOperationsMixin:
 
   def _admit_prepared_deployment(self, request, auth_result, app_id, configs,
                                  prior_pipeline, is_create, mutation=None,
-                                 restore_owner=None, identity_aliases=None, node_aliases=None, repair=None, replacement=None):
+                                 restore_owner=None, identity_aliases=None, node_aliases=None, repair=None, replacement=None,
+                                 resource_tier=None, deferred_capacity=False):
     """Save exact redacted plans and secret revisions before accepting work.
+
+    Builds the operation's redacted plan (the target configs and, for an update,
+    the previous configs to restore), stores it in R1FS, saves the operation in
+    its "preparing" phase and asks dAuth to prepare the secret revisions. The
+    operation is accepted when dAuth prepared them before the preparation
+    deadline (created + 120 s).
 
     Parameters
     ----------
@@ -1231,14 +1425,66 @@ class _DeploymentOperationsMixin:
       The job's stored copy in R1FS, for restoration planning.
     is_create : bool
       Whether this operation creates a previously absent deployment.
+    mutation : str, optional
+      The kind of update for the record ("scale_up", "owner_transfer",
+      "node_relink"); None for a create or a plain update.
+    restore_owner : str, optional
+      The owner the previous configs get for a restore (an owner transfer).
+    identity_aliases : dict, optional
+      Current plugin identity -> source identity for the instances a
+      scale-up generates, so they inherit the source's secret values.
     node_aliases : dict, optional
       Old node -> new node for a relink. ``prior_pipeline`` still names the old
       node; its previous configs and placement are renamed here.
+
+    resource_tier : dict, optional
+      Chain-confirmed ceiling for ordinary Native and Stack edits.
+    deferred_capacity : bool
+      Require a balanced resource edit before deferring a failed pre-retirement capacity check.
 
     Returns
     -------
     dict
       Signed HTTP acceptance response.
+
+    Raises
+    ------
+    DauthSecretRecordTooLarge
+      When dAuth refused a secret record of the job for its size, also when
+      the save that ends the operation is not confirmed. The operation is then
+      already failed with the error's text and in cleanup, or, with that save
+      unconfirmed, left to the worker as it is stored.
+    DeploymentConflictError
+      When the request's expected revision is not the stored one.
+    ValueError
+      When the configs or an update's previous revision are invalid (such as
+      conflicting secret values at one path, or no exact placement to
+      restore), or dAuth's answer is invalid.
+    RuntimeError
+      When the plan cannot be stored, a write is not confirmed, or a dAuth
+      custody call fails (``DeploymentCustodyError``); the operation, if
+      saved, is left to the worker.
+
+    Notes
+    -----
+    A size refusal is final: no retry can store the record. The operation is
+    then marked failed at once (``ADMISSION_PREPARATION_FAILED`` with the SDK
+    error's text) and its preparation deadline is set to now, so that dAuth
+    accepts the cleanup of anything staged at the worker's next pass and the
+    job takes a corrected request right after it. Before, the operation stayed
+    "preparing" until created + 120 s: the worker asked dAuth for its status
+    on every 2 s pass, the same request was answered 202 for it and a
+    corrected one 409. When the save that ends the operation is not confirmed,
+    the size error is still the one raised (the API answers 400), not the
+    save's RuntimeError (503 "retry with the same request_id"): the worker
+    finishes from what is stored, the cleanup, or the 120 s path when nothing
+    was stored.
+
+    Examples
+    --------
+    >>> plugin._admit_prepared_deployment(request, auth_result, "app", {"A": config},
+    ...                                   prior_pipeline=None, is_create=True)["status_code"]
+    202
     """
     validate_source_pins(configs)  # Refuse invalid revisions before staging any secrets or plans.
     owner = auth_result[DEEPLOY_KEYS.ESCROW_OWNER]
@@ -1322,11 +1568,30 @@ class _DeploymentOperationsMixin:
         old_config.setdefault("DEEPLOY_SPECS", {}).update(
           revision=previous_revision, secret_revision=previous_secret_revision,
         )
+    # Compare authenticated materialized configs for the exact signed revision on every worker.
+    budgets = (redistribution_requirements(previous_configs, configs, resource_tier)
+               if resource_tier is not None and mutation is None and not is_create else {})
+    if deferred_capacity and not budgets:
+      raise ValueError("Insufficient free resources for an ordinary update without a balanced redistribution.")
+    if budgets:
+      # Legacy name inference remains available for unrelated edits. A paid redistribution must name every survivor.
+      rows = request.get("plugins") or [request]
+      explicit = {row.get("instance_id") or row.get("INSTANCE_ID") for row in rows}
+      for node, config in configs.items():
+        previous_ids = set(required_instances(previous_configs[node]))
+        survivors = {iid for sig, iid in required_instances(config)
+                     if sig in CONTAINERIZED_APPS_SIGNATURES and (sig, iid) in previous_ids}
+        if not survivors <= explicit:
+          raise ValueError("A container redistribution must explicitly identify every surviving instance_id.")
+      mutation = RESOURCE_REDISTRIBUTION
     plan = dict(configs=configs, previous_configs=previous_configs)
+    if budgets:
+      plan["resource_requirements"] = budgets  # Immutable desired CPU, RAM and persistent disk allocations.
     if repair:
       # Keep signed historic and fresh receipts in the immutable plan under their actual signer.
       plan["repair_evidence"] = dict(stopped=repair["stopped"], inspections=repair["inspections"], seals=repair["seals"])
-    plan_cid = self.r1fs.add_json(plan, nonce=42, fn="deployment-plan.json", show_logs=False)
+    # Execution plans use the same gated writer as the canonical job copy.
+    plan_cid = r1fs_documents.write_r1fs_document(self.r1fs, plan, "deployment-plan.json")
     if not plan_cid:
       raise RuntimeError("Could not persist deployment execution plan.")
     now = self.time()
@@ -1357,6 +1622,8 @@ class _DeploymentOperationsMixin:
     # The recovery owner must exist before any plaintext revision is staged.
     # If admission stops here, the worker either confirms complete preparation
     # or revokes its staged references without touching the running revision.
+    if budgets:
+      operation["phase"] = "resources_v1_preparing"  # Older coordinators cannot bypass the capacity barrier.
     if repair:
       operation.update(phase="repair_v1_preparing", repair_parent=repair["proposal"]["parent"],
                        previous_pipeline_cid=repair["proposal"]["pipeline_cid"],
@@ -1406,6 +1673,19 @@ class _DeploymentOperationsMixin:
         self._expire_deployment_preparation(operation)
       else:
         self._save_operation(operation, "accepted", "Deployment accepted.")
+    except DauthSecretRecordTooLarge as exc:
+      # The preparation ends now: dAuth accepts the cleanup of an operation only past its preparation deadline
+      # (no "prepare" of it can still be in flight), and this one's only "prepare" was answered. Before, the
+      # deadline stayed at created + 120 s, and with it the status calls and the 409 for a corrected request.
+      operation["preparation_deadline"] = self.time()
+      # An unconfirmed save ("replication is pending") must not replace the size error: it made the API answer 503
+      # "retry with the same request_id" for a request that can never succeed. The worker then ends the operation
+      # from what is stored: the cleanup, or the 120 s path when nothing was stored.
+      with contextlib.suppress(RuntimeError):
+        # Failed at once with the SDK's text, which the job's owner reads in the operation's status too.
+        self._expire_deployment_preparation(operation, str(exc))
+      # Raised on, as before: the API answers 400 with the same text.
+      raise
     finally:
       # Keep the marker until the worker discards its old snapshots and reloads
       # durable state. This also hands interrupted admission to recovery.
@@ -1414,12 +1694,40 @@ class _DeploymentOperationsMixin:
     return self._accepted_operation_response(operation)
 
   def _load_operation_plan(self, operation):
-    """Load immutable redacted execution data without exposing it in polling."""
+    """Load the immutable, redacted plan for executing an operation.
+
+    Reuse a cached plan or download it once before returning a private copy.
+
+    Parameters
+    ----------
+    operation : dict
+      Signed operation containing the plan's CID.
+
+    Returns
+    -------
+    dict
+      Independent copy of the validated plan, including its config mapping.
+
+    Raises
+    ------
+    RuntimeError
+      The plan is unavailable or its configs field is invalid.
+
+    Notes
+    -----
+    A cache miss supports legacy and protected documents through one download.
+    The cache lock covers bookkeeping only. Status polling does not load plans.
+
+    Examples
+    --------
+    >>> configs = plugin._load_operation_plan(operation)["configs"]  # doctest: +SKIP
+    """
     cid = operation["plan_cid"]
     with self._deployment_plan_cache_lock:
       plan = self._deployment_plans.get(cid)
     if plan is None:
-      plan = self.r1fs.get_json(cid, timeout=10, show_logs=False)
+      # Recovery can use either passphrase while fetching the plan only once.
+      plan = r1fs_documents.read_r1fs_document(self.r1fs, cid, timeout=10)
       if not isinstance(plan, dict) or not isinstance(plan.get("configs"), dict):
         raise RuntimeError("Deployment plan is temporarily unavailable.")
       # Only cache bookkeeping is locked; storage reads never hold this lock.
@@ -1463,7 +1771,7 @@ class _DeploymentOperationsMixin:
         continue
       if node not in reports or reports[node]["sequence"] < sequence:
         reports[node] = report
-    if attempt == "retire" and operation.get("mutation") in ("node_relink", "same_host_repair_v1"):
+    if attempt == "retire" and operation.get("mutation") in ("node_relink", "same_host_repair_v1", RESOURCE_REDISTRIBUTION):
       # Filter after selecting the newest signature so an older stop cannot hide later contradictory evidence.
       reports = {node: report for node, report in reports.items() if report.get("status") != "stopped"
                  or report_confirms_retirement(report, operation["previous_instances"].get(node))}
@@ -1560,6 +1868,8 @@ class _DeploymentOperationsMixin:
     check_placement = action == "start" and operation.get("mutation") == "same_host_repair_v1"
     check_replacement = action == "start" and operation.get("mutation") == STATELESS_REPLACEMENT
     repair_restore = check_placement and attempt == "restore"
+    # Normal delivery remains responsive. Repeated commands for a blocked phase use the replica repair cadence.
+    interval = OPEN_REPAIR_SECONDS if operation.get("recovery") == "blocked" else 10
     for node, config in configs.items():
       report = reports.get(node, {})
       if action in ("stop", "retire") and report.get("status") == "stopped":
@@ -1572,7 +1882,8 @@ class _DeploymentOperationsMixin:
       # The map is shared by all operations, so the key starts with the operation id; the old in-snapshot
       # key needed only attempt|action|node.
       key = "{}|{}|{}|{}".format(operation["operation_id"], attempt, action, node)
-      if 0 <= self.time() - sent_at.get(key, 0) < 10:
+      # Missing send history permits the first attempt even immediately after a coordinator starts.
+      if key in sent_at and 0 <= self.time() - sent_at[key] < interval:
         continue
       if check_placement:
         # One fresh read covers this batch, including starts retried after a coordinator restart.
@@ -1637,14 +1948,94 @@ class _DeploymentOperationsMixin:
         return self._advance_deployment_operation(operation)
     return self._advance_deployment_operation(operation)
 
+  def _post_retirement_capacity(self, node, stopped_at, required):
+    """Check one direct heartbeat sampled after the signed stop receipt.
+
+    Parameters
+    ----------
+    node : str
+      Retained worker identity.
+    stopped_at : float
+      Sender-clock timestamp of its signed complete stop.
+    required : list
+      Desired CPU cores and memory/disk bytes as exact decimal strings.
+
+    Returns
+    -------
+    tuple
+      Fresh sender timestamp and whether the sample covers the desired allocation.
+
+    Examples
+    --------
+    >>> plugin._post_retirement_capacity("worker", 100.0, ["1", "100", "0"])  # doctest: +SKIP
+    (102.0, True)
+    """
+    try:
+      hb = self.netmon.network_node_last_heartbeat(node)  # Read one direct frame, never display-summary fields.
+      if hb.get(ct.PAYLOAD_DATA.EE_TZ):
+        zone = ZoneInfo(hb[ct.PAYLOAD_DATA.EE_TZ])  # A named zone preserves half-hour offsets and DST.
+      else:
+        offset = str(hb[ct.PAYLOAD_DATA.EE_TIMEZONE]).removeprefix("UTC").replace("--", "-") or "0"
+        zone = timezone(timedelta(hours=int(offset)))
+      local = datetime.strptime(hb[ct.HB.CURRENT_TIME], ct.HB.TIMESTAMP_FORMAT)
+      recent = [ts for ts in {local.replace(tzinfo=zone, fold=f).timestamp() for f in (0, 1)}
+                if 0 <= self.time() - ts <= 60]
+      if len(recent) != 1:
+        return None, False  # Only a unique, current sender-clock time can authorize a start.
+      sampled = recent[0]
+      if not sampled > stopped_at:
+        return None, False  # Delayed pre-stop packets and stale or future-dated samples cannot credit capacity.
+      cores, load, ram, disk = (Decimal(str(hb[key])) for key in
+                                (ct.HB.CPU_NR_CORES, ct.HB.CPU_USED, ct.HB.AVAILABLE_MEMORY, ct.HB.AVAILABLE_DISK))
+      if not all(value.is_finite() and value >= 0 for value in (cores, load, ram, disk)) or load > 100:
+        return None, False
+      free = (cores * (100 - load) / 100, ram * 1024 ** 3, disk * 1024 ** 3)
+      return sampled, all(observed >= Decimal(wanted) for observed, wanted in zip(free, required, strict=True))
+    except (KeyError, ValueError, TypeError, OverflowError, InvalidOperation, OSError, RuntimeError):
+      return None, False  # Unknown telemetry leaves the bounded recovery deadline running.
+
   def _advance_deployment_operation(self, operation):
-    """Run the existing state machine for the latest eligible operation."""
+    """Advance the eligible operation by one coordinator pass.
+
+    Process preparation, worker confirmation and publication or recovery
+    for the saved phase. Dispatch commands after the applicable guards pass.
+
+    Parameters
+    ----------
+    operation : dict
+      Coordinator snapshot with the current phase, deadlines and plan.
+
+    Returns
+    -------
+    None
+      Persists progress or waits for the next eligible pass.
+
+    Raises
+    ------
+    RuntimeError
+      Required plan, custody or operation replication is unavailable.
+
+    Notes
+    -----
+    Foreign and completed operations are ignored. Delete uses its own
+    retirement path. Ordinary blocked retirement, failed-rollout cleanup
+    and restoration can end after their deadline plus 24 readiness
+    timeouts. Same-host repair and stateless replacement retain their
+    applicable reservation, stop and publication barriers.
+
+    Examples
+    --------
+    >>> plugin._advance_deployment_operation(operation)  # doctest: +SKIP
+    """
     if operation["coordinator"] != self.bc.address or operation["phase"] == "completed":
       return
     if operation["kind"] == "delete":
       return self._advance_delete_operation(operation)
     repair = operation.get("mutation") == "same_host_repair_v1"
     replacing = operation.get("mutation") == STATELESS_REPLACEMENT
+    redistributing = operation.get("mutation") == RESOURCE_REDISTRIBUTION
+    # Signed repair and replacement retain their own durable handoff and publication barriers.
+    recovery_grace = self.cfg_deployment_readiness_timeout * BLOCKED_RECOVERY_GRACE_PERIODS
     if (repair or (replacing and operation.get("repair_parent"))) and not self._repair_parent_is_held(operation):
       return  # A crash between reservation writes is repaired from the parent pass.
     phase = deployment_operation_phase(operation)
@@ -1676,7 +2067,9 @@ class _DeploymentOperationsMixin:
       return self._retire_repair_workers(operation, plan)
     if phase == "retiring_previous":
       retired = self._node_operation_reports(operation, "retire")
-      if all(retired.get(node, {}).get("status") == "stopped" for node in plan["previous_configs"]):
+      # Only the workers in the previous placement can satisfy its retirement barrier.
+      missing = [node for node in plan["previous_configs"] if retired.get(node, {}).get("status") != "stopped"]
+      if not missing:
         operation["retired_runtime"] = {
           node: {item["signature"] + "|" + item["instance_id"]: copy.deepcopy(item["runtime_artifacts"])
                  for item in report.get("instances", []) if item.get("runtime_artifacts")}
@@ -1684,16 +2077,54 @@ class _DeploymentOperationsMixin:
         }
         if operation.get("error"):
           operation["restore_deadline"] = self.time() + self.cfg_deployment_readiness_timeout
+          # The restoration phase has its own readiness deadline and responsive initial sends.
+          operation["recovery"] = "in_progress"
           self._save_operation(operation, "restoring_previous", "Restoring the previous revision.")
+        elif redistributing:
+          # Each stop receipt and the matching heartbeat are timestamped by the same worker.
+          operation["capacity_after"] = {node: retired[node].get("updated_at") for node in plan["previous_configs"]}
+          operation["deadline"] = self.time() + self.cfg_deployment_readiness_timeout
+          self._save_operation(operation, "waiting_for_capacity", "Previous instances stopped; awaiting fresh worker capacity.")
         else:
           operation["deadline"] = self.time() + self.cfg_deployment_readiness_timeout
           self._save_operation(operation, "waiting_for_readiness", "Previous instances stopped; starting target nodes.")
       else:
-        if self.time() >= operation["deadline"] or any(r.get("status") == "failed" for r in retired.values()):
+        if self.time() >= operation["deadline"] + recovery_grace:
+          return self._end_blocked_operation(operation, missing)
+        if operation.get("recovery") != "blocked" and (
+          self.time() >= operation["deadline"] or any(r.get("status") == "failed" for r in retired.values())
+        ):
           operation["error"] = dict(code="PREVIOUS_STOP_UNCONFIRMED",
                                     message="Waiting for confirmed stop of the previous revision.", retryable=True)
           operation["recovery"] = "blocked"
+          # Publish the blocked state even when the next command is still throttled.
+          self._save_operation(operation)
         self._send_operation_commands(operation, plan["previous_configs"], "retire", "retire", retired)
+      return
+    if phase == "waiting_for_capacity":
+      # Admit the desired start only once every retained worker reports sufficient capacity.
+      first_samples = dict(operation.get("first_capacity_sample", {}))
+      missing = []
+      for node, required in plan["resource_requirements"].items():
+        sampled, sufficient = self._post_retirement_capacity(node, operation["capacity_after"].get(node), required)
+        if sampled is None or not sufficient or sampled <= first_samples.get(node, float("inf")):
+          missing.append(node)
+        if sampled is not None:
+          # CURRENT_TIME is written after resource collection. The next heartbeat starts a new collection.
+          first_samples.setdefault(node, sampled)
+      if first_samples != operation.get("first_capacity_sample", {}):
+        operation["first_capacity_sample"] = first_samples
+        self._save_operation(operation)  # Preserve the first observation across coordinator restart.
+      if self.time() >= operation["deadline"]:
+        operation["error"] = dict(code="POST_RETIRE_CAPACITY_UNCONFIRMED",
+                                  message="Worker capacity was insufficient or unconfirmed after retirement.",
+                                  nodes=missing, retryable=True)
+        operation["restore_deadline"] = self.time() + self.cfg_deployment_readiness_timeout
+        operation["recovery"] = "in_progress"
+        self._save_operation(operation, "restoring_previous", "Restoring the saved allocation and membership.")
+      elif not missing:
+        operation["deadline"] = self.time() + self.cfg_deployment_readiness_timeout
+        self._save_operation(operation, "waiting_for_readiness", "All retained workers confirmed sufficient free capacity.")
       return
     if phase in ("finalizing", "finalizing_recovery"):
       restoring = phase == "finalizing_recovery"
@@ -1703,14 +2134,14 @@ class _DeploymentOperationsMixin:
       for node, config in active_configs.items():
         pins = pinned_sources(config)
         # A node may go offline between the readiness barrier and publication of the revision.
-        recheck = repair or replacing or bool(pins) or any(
+        recheck = repair or replacing or redistributing or bool(pins) or any(
           deployment_source_mode(plugin["SIGNATURE"], config, instance) == "following"
           for plugin in config.get("PLUGINS", []) for instance in plugin.get("INSTANCES", [])
         )
         online = self._netmon_node_is_online_for_control(node) if recheck else True
         restore_bindings = operation.get("retired_runtime", {}).get(node, {}) if repair and restoring else None
         state = node_rollout_state(config, active_reports.get(node), online, expired, pins=pins,
-                                   allow_waiting_for_source=not (repair or replacing), restore_bindings=restore_bindings)
+                                   allow_waiting_for_source=not (repair or replacing or redistributing), restore_bindings=restore_bindings)
         if state in ("failed", "legacy_failed") or (recheck and state not in ("ready", "kept")):
           # Once the revision is published, its remaining secret/metadata writes must still finish.
           pointer = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(operation["job_id"]))
@@ -1725,7 +2156,7 @@ class _DeploymentOperationsMixin:
       expired = self.time() >= operation["deadline"]
       # Repair keeps the existing all-workers-ready barrier, including for source-following apps.
       states = {node: node_rollout_state(config, reports.get(node), self._netmon_node_is_online_for_control(node), expired,
-                                         allow_waiting_for_source=not (repair or replacing))
+                                         allow_waiting_for_source=not (repair or replacing or redistributing))
                 for node, config in configs.items()}
       failed = any(state in ("failed", "legacy_failed") for state in states.values())
       if failed or (expired and any(state in ("pending", "legacy_timeout") for state in states.values())):
@@ -1751,17 +2182,27 @@ class _DeploymentOperationsMixin:
       if replacing:
         # Dispatch intent survives a crash. Targets that never got an intent must not receive a STOP.
         configs = {node: configs[node] for node in operation["dispatched_nodes"]}
-      if all(reports.get(node, {}).get("status") == "stopped" for node in configs):
+      # Stop evidence remains mandatory for restoration, including after the grace period expires.
+      missing = [node for node in configs if reports.get(node, {}).get("status") != "stopped"]
+      if not missing:
         if operation["kind"] == "update" and operation["previous_nodes"]:
           operation["restore_deadline"] = self.time() + self.cfg_deployment_readiness_timeout
+          # Confirmed stops clear the prior blockage while restoration begins.
+          operation["recovery"] = "in_progress"
           self._save_operation(operation, "restoring_previous", "Restoring the previous revision.")
         else:
           self._release_unused_secret_revisions(operation, plan, active_attempt=None)
           operation.update(outcome="failed", recovery="completed")
           self._save_operation(operation, "completed", "Failed deployment stopped on all target nodes.")
       else:
-        if self.time() - operation["recovery_started_at"] > self.cfg_deployment_readiness_timeout:
+        # Earlier snapshots already provide the durable start of cleanup.
+        deadline = operation["recovery_started_at"] + self.cfg_deployment_readiness_timeout
+        if not (repair or replacing) and self.time() >= deadline + recovery_grace:
+          return self._end_blocked_operation(operation, missing)
+        if operation.get("recovery") != "blocked" and self.time() >= deadline:
           operation["recovery"] = "blocked"
+          # The failure remains visible while waiting for the next permitted send.
+          self._save_operation(operation)
         self._send_operation_commands(operation, configs, "deploy", "stop", reports)
       return
     if phase == "restoring_previous":
@@ -1769,16 +2210,23 @@ class _DeploymentOperationsMixin:
       previous_reports = self._node_operation_reports(operation, "restore")
       expired = self.time() >= operation["restore_deadline"]
       states = {node: node_rollout_state(config, previous_reports.get(node), self._netmon_node_is_online_for_control(node), expired,
-                                         allow_waiting_for_source=not repair,
+                                         allow_waiting_for_source=not (repair or redistributing),
                                          restore_bindings=operation.get("retired_runtime", {}).get(node, {}) if repair else None)
                 for node, config in previous_configs.items()}
       if all(state in ("ready", "kept") for state in states.values()):
         message = "Previous revision restored and waiting for source." if "kept" in states.values() else "Previous revision is ready on all required nodes."
         self._save_operation(operation, "finalizing_recovery", message)
       else:
-        if expired or any(state in ("failed", "legacy_failed") for state in states.values()):
-          operation["recovery"] = "blocked"
+        # Keep the already running restoration candidates and name the ones without positive readiness.
         unresolved = {node: previous_configs[node] for node, state in states.items() if state not in ("ready", "kept")}
+        if not (repair or replacing) and self.time() >= operation["restore_deadline"] + recovery_grace:
+          return self._end_blocked_operation(operation, unresolved)
+        if operation.get("recovery") != "blocked" and (
+          expired or any(state in ("failed", "legacy_failed") for state in states.values())
+        ):
+          operation["recovery"] = "blocked"
+          # A pending throttle must not hide newly blocked restoration from the caller.
+          self._save_operation(operation)
         self._send_operation_commands(operation, unresolved, "restore", "start", previous_reports)
       return
     if phase in ("finalizing", "finalizing_recovery"):
@@ -1810,9 +2258,12 @@ class _DeploymentOperationsMixin:
                                recovery="blocked")
               self._save_operation(operation)
             raise DeploymentCustodyError(message)
+          # A confirmed response can recover the notice from the already-published pointer.
+          publication = result
         else:
           try:
-            self._commit_operation_revision(operation, active_configs)
+            # Keep evidence of any legacy rewrite until the last signed custody request succeeds.
+            publication = self._commit_operation_revision(operation, active_configs)
           except ReplacementPublicationRefused as exc:
             self._fail_deployment_rollout(operation, "REPLACEMENT_PLACEMENT_CHANGED", str(exc))
             return
@@ -1822,13 +2273,124 @@ class _DeploymentOperationsMixin:
           operation.update(error=None, recovery=None)  # The custodian confirmed the exact publication.
           self._save_operation(operation)
       else:
-        self._commit_operation_revision(operation, active_configs)
+        # Standard updates and restores also return their verified publication evidence.
+        publication = self._commit_operation_revision(operation, active_configs)
       self._release_unused_secret_revisions(operation, plan, active_attempt="restore" if restored else "deploy")
+      if publication and publication.get("credential_rotation_required") is True:
+        # The final signed operation records the notice after all custody steps used the prior signature.
+        operation["credential_rotation_required"] = True
       applied_outcome = "waiting_for_source" if operation.get("waiting_for_source") else "succeeded"
       operation.update(outcome="failed" if restored else applied_outcome,
                        recovery="completed" if restored else None)
       self._save_operation(operation, "completed",
                            "Previous revision restored." if restored else "Deployment completed.")
+
+  def _end_blocked_operation(self, operation, missing):
+    """End a phase whose workers did not supply the required evidence.
+
+    Save the terminal result before contacting custody so a transient custody
+    outage cannot keep sending workload commands or delay the failure result.
+
+    Parameters
+    ----------
+    operation : dict
+      Coordinator-owned operation still waiting for worker reports.
+    missing : iterable of str
+      Addresses without the expected signed stop or readiness report.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+      This oracle is not the operation coordinator.
+    RuntimeError
+      Replication of the terminal snapshot is unconfirmed.
+
+    Notes
+    -----
+    The signed terminal snapshot keeps the phase and workers outstanding at
+    expiry even if a replica sees newer worker reports later. Deletion leaves
+    the published configuration and credentials available to the existing job.
+    For other operations, the pending flag lets reconciliation retry revocation
+    of the abandoned deployment revision after the terminal save. Workload
+    command dispatch ends with the saved terminal transition.
+
+    Examples
+    --------
+    >>> plugin._end_blocked_operation(operation, ["worker-b"])  # doctest: +SKIP
+    """
+    # Preserve the last work phase so readers can distinguish restore readiness from stop evidence.
+    phase = deployment_operation_phase(operation)
+    # Keep every affected worker in the signed snapshot so lagging replicas can report the same result.
+    missing = sorted(missing)
+    # This terminal event describes the unconfirmed evidence, without claiming a workload stopped.
+    evidence = "readiness" if phase == "restoring_previous" else "shutdown"
+    # Explain which confirmation the coordinator was missing in the event and the public error.
+    message = "The operation ended before confirming {} on every required worker.".format(evidence)
+    # Record failure while distinguishing the unfinished cleanup from the ended execution.
+    operation.update(outcome="failed", recovery="blocked", blocked_phase=phase, unconfirmed_nodes=missing,
+                     error=dict(code=BLOCKED_OPERATION_ENDED, message=message, retryable=False))
+    if operation["kind"] != "delete":
+      # Only an abandoned deploy revision needs revocation after the terminal save.
+      operation["abandoned_deploy_revocation_pending"] = True
+    # Persist the terminal transition and event before the reconciler can contact custody.
+    self._save_operation(operation, "completed", message)
+
+  def _confirm_ended_create_cleanup(self, operation):
+    """Confirm late cleanup for an ended paid create using signed receipts.
+
+    A positive result leaves the failure and its recorded shutdown gaps in
+    history, while allowing the user to submit a new paid-job request.
+
+    Parameters
+    ----------
+    operation : dict
+      Coordinator-owned terminal snapshot with revocation already confirmed.
+
+    Returns
+    -------
+    bool
+      True after saving confirmed cleanup, or False if the operation is
+      ineligible or still lacks an exact signed stop.
+
+    Raises
+    ------
+    RuntimeError
+      Replication of the updated snapshot is unconfirmed.
+    ValueError
+      The caller is not the operation's coordinator.
+
+    Notes
+    -----
+    Every planned worker must have a verified stop for the exact attempt.
+    An empty signed instance list fences an absent attempt. Otherwise the
+    report must confirm retirement of the full planned instance set.
+
+    Examples
+    --------
+    >>> plugin._confirm_ended_create_cleanup(operation)  # doctest: +SKIP
+    True
+    """
+    # Other terminal operation types keep their original recovery state.
+    if (operation["kind"] != "create" or operation.get("blocked_phase") != "stopping_failed_rollout"
+        or operation.get("recovery") != "blocked"):
+      return False
+    # A replica can receive old or foreign receipts. Only the newest verified report for each planned worker counts.
+    reports = self._node_operation_reports(operation, "deploy")
+    for node in operation["nodes"]:
+      report = reports.get(node, {})
+      if report.get("status") != "stopped":
+        return False
+      # An empty signed report proves the worker fenced an absent attempt. Otherwise check its full instance set.
+      if report.get("instances") != [] and not report_confirms_retirement(report, operation["instances"][node]):
+        return False
+    # Only the recovery state changes. The terminal reason, phase, and original unresolved addresses remain recorded.
+    operation["recovery"] = "completed"
+    self._save_operation(operation, message="All attempted workers later confirmed shutdown; cleanup is complete.")
+    return True
 
   def _fail_deployment_rollout(self, operation, code, message):
     """Schedule cleanup of a deployment that cannot finish.
@@ -1853,11 +2415,40 @@ class _DeploymentOperationsMixin:
                      recovery_started_at=self.time())
     self._save_operation(operation, "stopping_failed_rollout", "Cleaning up the failed rollout.")
 
-  def _expire_deployment_preparation(self, operation):
-    """Record deadline failure before waiting for plan or secret cleanup."""
+  def _expire_deployment_preparation(self, operation,
+                                     message="Deployment preparation did not complete; the running revision is unchanged."):
+    """Record deadline failure before waiting for plan or secret cleanup.
+
+    Marks the operation failed with the error ``ADMISSION_PREPARATION_FAILED`` (not retryable) and saves it in
+    the "cleaning_up_preparation" phase, in which the worker asks dAuth to revoke whatever was staged.
+
+    Parameters
+    ----------
+    operation : dict
+      The coordinator's operation snapshot, in its "preparing" phase; replaced in place by the saved snapshot.
+    message : str, optional
+      The error's text. The default says that the preparation did not complete; admission passes the SDK's text
+      of a secret record refused for its size.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    RuntimeError
+      When the replicated write of the snapshot is not confirmed (see ``_save_operation``).
+
+    Examples
+    --------
+    >>> plugin._expire_deployment_preparation(operation)
+    >>> operation["phase"], operation["error"]["code"]
+    ('cleaning_up_preparation', 'ADMISSION_PREPARATION_FAILED')
+    """
     operation.update(outcome="failed", recovery="in_progress", error=dict(
       code="ADMISSION_PREPARATION_FAILED",
-      message="Deployment preparation did not complete; the running revision is unchanged.",
+      # The caller's text: a size refusal gets the SDK's text in place of "did not complete".
+      message=message,
       retryable=False,
     ))
     self._save_operation(operation, "cleaning_up_preparation",
@@ -1881,9 +2472,37 @@ class _DeploymentOperationsMixin:
     self._save_operation(operation, "accepted", "Deployment preparation recovered.")
 
   def _commit_operation_revision(self, operation, configs):
-    """Commit canonical metadata only after readiness or restoration evidence."""
+    """Commit canonical metadata after readiness or restoration evidence.
+
+    Use one representative configuration for the canonical copy while
+    retaining the operation's exact per-worker plan.
+
+    Parameters
+    ----------
+    operation : dict
+      Signed operation entering finalization.
+    configs : dict
+      Ready or restored configuration per node.
+
+    Returns
+    -------
+    dict
+      Authenticated custody result and any confirmed legacy rewrite notice.
+
+    Notes
+    -----
+    Finalization records an affirmative rewrite notice on the completed
+    operation after releasing unused secret revisions. This call leaves
+    the notice in the returned custody result until that save is due.
+
+    Examples
+    --------
+    >>> plugin._commit_operation_revision(operation, configs)  # doctest: +SKIP
+    """
+    # All active configurations share the canonical pipeline identity.
     representative = next(iter(configs.values()))
-    self.commit_deployment_revision(operation, representative)
+    # Forward the confirmed publication data while preserving the signed operation.
+    return self.commit_deployment_revision(operation, representative)
 
   def _release_unused_secret_revisions(self, operation, plan, active_attempt):
     """Remove plaintext from unused revisions only after positive stop evidence.
@@ -1900,15 +2519,22 @@ class _DeploymentOperationsMixin:
     have finished, reads the newest verified snapshot of every operation this
     oracle coordinates from the local replica, and handles each one that no
     admission still holds: an unfinished operation is advanced, and
-    a completed one whose last update is less than 600 s old is handed to
-    `_replicate_operation`, which re-sends the final snapshot at most every
-    30 s as peer repair.
+    a completed one whose last update is less than 24 h old is handed to
+    `_replicate_operation`, which re-sends the final snapshot as peer repair:
+    at most every 30 s while the completion is less than 600 s old, as
+    before, then each time its age reaches the next age of `REPAIR_AGES`:
+    600, 1,200, 2,400 and 4,800 s after completion and every 3,600 s after
+    that.
 
     The repair of completed operations exists because a write needs only one
     confirmation, so an oracle can miss the final snapshot and nothing else
     sent it again. That oracle kept showing the operation as running and
-    refused new changes to the job. Peers that already hold the record store
-    nothing when it arrives again.
+    refused new changes to the job. Peers that already hold the record do not
+    save it again. Before, the repair stopped 600 s after completion, so an
+    oracle away longer never got the final snapshot; now it gets it at the
+    first send after it is back, within 1 h while the coordinator runs (an
+    age that passes while the coordinator is down is skipped), up to the last
+    send 84,000 s (about 23.3 h) after completion.
 
     After a failed dAuth custody call (`DeploymentCustodyError`) the operation
     is skipped for 10 s, then 20, 40 and so on, up to 300 s, counted from the
@@ -1919,8 +2545,14 @@ class _DeploymentOperationsMixin:
     recovers in the last seconds before the deadline still gets the
     deployment accepted. At the deadline it moves to cleanup, whose failed
     custody calls are paced. Any other failure, for example a chain-store
-    write that was not confirmed, is tried again on the next pass, as before.
-    A pass of the operation without an error drops its wait.
+    write that was not confirmed, is tried again on the next pass, as before,
+    except the final snapshot of an operation completed 600 s or more ago,
+    tried again at the next age of its repair schedule. A pass of the
+    operation without an error drops its wait.
+
+    Parameters
+    ----------
+    None
 
     Returns
     -------
@@ -1938,6 +2570,10 @@ class _DeploymentOperationsMixin:
     wake-up event is set. Each operation is deep-copied before it is
     advanced, so the replica's records are not mutated in place.
 
+    Ended paid creates can finish cleanup without resuming workload command
+    dispatch. The worker checks verified stop receipts every 60 seconds
+    and checks immediately after a pending custody revocation succeeds.
+
     The waits live in `_custody_retry`, which only this thread reads and
     writes. A waiting operation is skipped without any call, so the others are
     handled in the same pass. An entry is dropped when its operation has a
@@ -1945,14 +2581,36 @@ class _DeploymentOperationsMixin:
     and, at the start of every pass, when its operation is no longer read
     from the replica.
 
+    With the 2 s pass, a completed operation is re-sent 19 times in its first
+    600 s, as before, then 26 more times, at the first pass at or after each
+    age of `REPAIR_AGES` (once when a pass reaches several): 600, 1,200,
+    2,400 and 4,800 s after completion, then every 3,600 s up to 84,000 s.
+    Which ages were served is kept in process memory only
+    (`_operations_repaired`). A pass in the first 600 s marks none served, so
+    the 600 s age is sent also after a restart in that time. The first pass that
+    sees the operation later, as after a restart, marks its current age as
+    served without a send. So a restart 600 s or more after completion sends
+    nothing at once, the next send falls on the operation's own next age (the
+    sends stay spread as the completion times are), and restarts do not move
+    that age; an age that passes while the process is down is skipped. A
+    send that is not confirmed raises, one red line, while this process has
+    not seen that snapshot confirmed: a final snapshot never confirmed is
+    logged on every pass in its first 600 s, as before, then at each of its
+    ages, before a restart and after it alike, and after a restart so is a
+    confirmed one until a send of it is confirmed again.
+
     Examples
     --------
     >>> operation = plugin._save_operation(operation, "completed", "Deployment completed.")
     >>> plugin._reconcile_coordinator_operations()  # just confirmed: nothing is sent
     >>> plugin.now += 31
-    >>> plugin._reconcile_coordinator_operations()  # the same final record is sent once more
-    >>> plugin.now += 600
-    >>> plugin._reconcile_coordinator_operations()  # past the 600 s window: left alone
+    >>> plugin._reconcile_coordinator_operations()  # 31 s: the last send is over 30 s old, the same record is sent
+    >>> plugin.now += 1000
+    >>> plugin._reconcile_coordinator_operations()  # 1,031 s: past the age 600 s, sent once
+    >>> plugin.now += 100
+    >>> plugin._reconcile_coordinator_operations()  # 1,131 s: the next age is 1,200 s, nothing is sent
+    >>> plugin.now += 86400
+    >>> plugin._reconcile_coordinator_operations()  # past 24 h: left alone
 
     With dAuth down, a cleanup operation calls it again only after the wait:
 
@@ -1975,6 +2633,12 @@ class _DeploymentOperationsMixin:
       if finished.is_set():
         self._deployment_preparations.pop(operation_id)
     own = [copy.deepcopy(operation) for operation in self._operation_records(own_only=True).values()]
+    # A single clock drives passive receipt checks, independent of command and custody retries.
+    last = self._last_ended_create_cleanup_check
+    now = self.time()
+    check_ended_create_cleanup = last is None or not 0 <= now - last < ENDED_CREATE_CLEANUP_CHECK_SECONDS
+    if check_ended_create_cleanup:
+      self._last_ended_create_cleanup_check = now
     # Keep a custody wait only for an operation still read here, so one whose records are gone leaves no
     # entry behind and the map never holds more than this oracle's own operations.
     self._custody_retry = {operation["operation_id"]: self._custody_retry[operation["operation_id"]]
@@ -1989,6 +2653,8 @@ class _DeploymentOperationsMixin:
         # next one. A clock step backwards ends the wait, as for the other throttles in this file.
         continue
       try:
+        # Seconds since the operation's last snapshot; for a completed operation, since its completion.
+        age = self.time() - operation["updated_at"]
         if operation["phase"] != "completed":
           # Unfinished operations are advanced as before; completed ones are no longer skipped outright but
           # get the repair re-send below.
@@ -1996,11 +2662,37 @@ class _DeploymentOperationsMixin:
             self._advance_serialized_operation(operation)
           else:
             self._advance_deployment_operation(operation)
-        # For 600 s after completion, oracles that missed the final snapshot get it too.
-        elif self.time() - operation["updated_at"] < 600:
-          # Re-send the final snapshot as repair, throttled to once per 30 s; peers that hold it store nothing,
-          # and an oracle that missed it stops showing the operation as running and refusing job changes.
+        elif operation.get("abandoned_deploy_revocation_pending"):
+          # Retry only custody after a terminal failure. Workload commands never resume for the ended operation.
+          self._deployment_secret_request("revoke", operation, active_attempt=None)
+          operation.pop("abandoned_deploy_revocation_pending")
+          # Authenticated stop receipts can arrive before custody responds. Check them immediately after release.
+          if not self._confirm_ended_create_cleanup(operation):
+            self._save_operation(operation)
+        elif check_ended_create_cleanup and self._confirm_ended_create_cleanup(operation):
+          # The new snapshot was replicated by the save; no further repair is due on this pass.
+          continue
+        # For 600 s after completion, oracles that missed the final snapshot get it too, as before.
+        elif age < 600:
+          # No age of REPAIR_AGES is served yet, also when this is the first pass after a restart: 600 s is sent.
+          self._operations_repaired[operation["operation_id"]] = 0
+          # Re-send the final snapshot as repair, throttled to once per 30 s, and on every pass while it is not
+          # confirmed, as before; peers that already hold it do not save it again.
           self._replicate_operation(operation)
+        # Up to 24 h after completion too; before, only for 600 s, so an oracle away longer never got the final
+        # snapshot and kept showing the operation as running and refusing job changes.
+        elif age < 86400:
+          # How many ages of the repair schedule this age has reached: the point of the schedule it is at.
+          point = bisect.bisect_right(REPAIR_AGES, age)
+          # The point served last, in process memory only. The first pass that sees the operation 600 s or more after
+          # completion (as after a restart) marks the current point as served without a send: a restart sends nothing at
+          # once, and the next point stays fixed after completion whatever the restarts.
+          if point > self._operations_repaired.setdefault(operation["operation_id"], point):
+            # Served before the send, so a send that raises is not tried again before the next point either.
+            self._operations_repaired[operation["operation_id"]] = point
+            # Re-send the final snapshot as repair. With every=0 the schedule times the send, not the time since the
+            # last one: at ages that double from 600 s up to 1 h apart, 26 more sends per completed operation.
+            self._replicate_operation(operation, every=0)
         # A pass without an error ends the custody wait, so a later failed custody call waits 10 s again.
         self._custody_retry.pop(operation["operation_id"], None)
       except Exception as exc:
@@ -2010,7 +2702,8 @@ class _DeploymentOperationsMixin:
         # unconfirmed chain-store write from a dAuth custody call that failed, a plan that could not be read or a
         # command that could not be sent. Only names are logged, never the error text: it can carry request values.
         path = " > ".join(frame.name for frame in traceback.extract_tb(exc.__traceback__))[:300]
-        # Any other error (a chain-store write, a plan read, a command) is tried again on the next pass, as before.
+        # Any other error (a chain-store write, a plan read, a command) is tried again on the next pass, as before; the
+        # final snapshot of an operation completed 600 s or more ago at the next age of its repair schedule.
         retry = ""
         # A preparing operation is not paced: it asks dAuth on every pass until its preparation deadline (created
         # + 120 s), as before, so a dAuth that recovers in the last seconds still gets the deployment accepted.
@@ -2073,12 +2766,6 @@ class _DeploymentOperationsMixin:
     events, and the revision that is in effect. Any oracle can answer; only
     the coordinator advances the operation.
 
-    `observation_stale` tells the caller that the snapshot may be outdated.
-    Snapshots now change only when durable state changes and no longer on
-    every retry, so their age alone does not mean that: an unfinished
-    operation's snapshot is stale only when it is older than 30 s and its
-    coordinator is not online for control.
-
     Parameters
     ----------
     request : dict
@@ -2107,7 +2794,16 @@ class _DeploymentOperationsMixin:
       "recovery", "coordinator", "created_at", "updated_at", "error") plus
       "status", "nodes", "target_nodes", "ready_nodes",
       "observation_stale", "poll_after_ms", "events", "next_event_cursor"
-      and "revision". When nothing matches, a short answer with "status"
+      and "revision". If the saved operation records an expired blocked
+      phase, "blocked_phase" identifies that phase and "unconfirmed_nodes"
+      lists the worker addresses missing the required evidence at expiry.
+      Both fields preserve the terminal diagnosis even if later reports
+      confirm a worker stopped or finish cleanup for a failed paid create.
+      "credential_rotation_required" is present only on a completed
+      operation whose saved record explicitly sets the flag to True after
+      a confirmed protected rewrite.
+
+      When nothing matches, a short answer has "status"
       set to "synchronizing" (replicas may not have the record yet), or to
       "not_found" for a job lookup of the owner's job that has no tracked
       operation yet.
@@ -2119,6 +2815,13 @@ class _DeploymentOperationsMixin:
     ValueError
       If both selectors are given, no selector or job_id is given, or
       events_limit or after_event_cursor is out of range.
+
+    Notes
+    -----
+    An unfinished operation reports "observation_stale" only when the
+    snapshot is older than 30 seconds and its coordinator is offline for
+    control. Snapshots change with durable state, so a healthy coordinator
+    may serve the same snapshot throughout a long wait.
 
     Examples
     --------
@@ -2181,12 +2884,14 @@ class _DeploymentOperationsMixin:
               "revision": 0, "observation_stale": True, "poll_after_ms": 2000}
     operation = max(matches, key=lambda record: (record["target_revision"], record["created_at"], record["sequence"]))
     phase = deployment_operation_phase(operation)
-    restoring = phase in ("restoring_previous", "finalizing_recovery") or (
-      operation["outcome"] == "failed" and operation["kind"] == "update"
+    # An ended phase keeps the report attempt that was relevant at the timeout, even on another oracle.
+    observed_phase = operation.get("blocked_phase", phase)
+    restoring = observed_phase in ("restoring_previous", "finalizing_recovery") or (
+      "blocked_phase" not in operation and operation["outcome"] == "failed" and operation["kind"] == "update"
       and operation.get("mutation") != STATELESS_REPLACEMENT
       and (operation.get("error") or {}).get("code") != "ADMISSION_PREPARATION_FAILED"
     )
-    attempt = "retire" if operation["kind"] == "delete" or phase == "retiring_previous" else "restore" if restoring else "deploy"
+    attempt = "retire" if operation["kind"] == "delete" or observed_phase in ("retiring_previous", "waiting_for_capacity") else "restore" if restoring else "deploy"
     reports = self._node_operation_reports(operation, attempt)
     if attempt == "retire" and operation.get("mutation") == "same_host_repair_v1":
       # An already stopped worker owes no second STOP. Display the original signed receipt at its actual signer.
@@ -2244,6 +2949,12 @@ class _DeploymentOperationsMixin:
               "target_revision", "previous_revision", "phase", "outcome", "recovery",
               "coordinator", "created_at", "updated_at", "error")
     result = {key: copy.deepcopy(operation.get(key)) for key in fields}
+    if phase == "completed" and operation.get("credential_rotation_required") is True:
+      # Report the first legacy-copy migration only after its custody publication completed.
+      result["credential_rotation_required"] = True
+    if "unconfirmed_nodes" in operation:
+      # The coordinator's terminal snapshot names the exact missing workers independently of replica report lag.
+      result.update(unconfirmed_nodes=list(operation["unconfirmed_nodes"]), blocked_phase=operation["blocked_phase"])
     if operation.get("mutation") == "same_host_repair_v1":
       # The prior address remains available for audit; its successor alone occupies the paid slot.
       result["relinked_nodes"] = [{"previous": old, "current": current} for old, current in operation["repair_aliases"]]

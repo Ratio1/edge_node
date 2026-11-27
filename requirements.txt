@@ -1,10 +1,8 @@
 kmonitor
-# ratio1 3.5.71 is the first SDK version with this change's SDK parts, among them R1FS reads that pin only
-# after the get, so the caller's timeout bounds the network fetch. A lower floor would let an image build
-# without them.
-ratio1>=3.5.71
-# Core 7.7.363 adds the stateless replacement start and its durable worker fence.
-naeural_core>=7.7.363
+# The SDK provides bounded R1FS reads, compatible document decryption, and the in-memory oracle credential.
+ratio1>=3.5.74
+# The runtime supports explicit HTTP acceptance, signed worker observations, and credential-safe startup.
+naeural_core>=7.7.365
 decentra-vision
 python-telegram-bot[rate-limiter]
 protobuf

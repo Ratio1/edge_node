@@ -29,8 +29,11 @@ class Mutations(_DeploymentMutationsMixin, Admission):
     self.pipeline = copy.deepcopy(self.current["A"])
     self.plans["current-plan"] = dict(configs=self.current, previous_configs={})
     self.reports = self.current
-    self.netmon = SimpleNamespace(network_known_pipelines=lambda: {
-      node: [copy.deepcopy(config)] for node, config in self.reports.items()})
+    # Expose liveness as well as observations so polling can also report an active operation.
+    self.netmon = SimpleNamespace(
+      network_known_pipelines=lambda: {node: [copy.deepcopy(config)] for node, config in self.reports.items()},
+      network_node_is_online_for_control=lambda node: True,
+    )
     self.storage[SECRET_REVISIONS_HKEY, "7|previous:deploy"] = dict(
       job_id="7", revision="previous:deploy", pipelines=copy.deepcopy(self.current), job_secrets={"secret": "protected"},
     )
@@ -39,6 +42,8 @@ class Mutations(_DeploymentMutationsMixin, Admission):
     self._delete_pipeline_cid_from_r1fs = Mock(return_value=True)
     self.r1fs.get_json = lambda cid, **kwargs: copy.deepcopy(self.plans[cid])
     self._deployment_operations_stop = __import__("threading").Event()
+    # Match the coordinator's in-memory snapshot repair state after startup.
+    self._operations_repaired = {}
     self.captured_scale = None
 
   def time(self):
@@ -305,6 +310,29 @@ class DeploymentMutationTests(unittest.TestCase):
     self.assertEqual(retry["attempt"], first["attempt"] + 1)
     self.assertNotEqual(retry["request_id"], first["request_id"])
 
+  def test_ended_relink_does_not_retry_the_same_move(self):
+    """Keep terminal retirement failures out of automatic relink admission.
+
+    Parameters
+    ----------
+    None
+    Returns
+    -------
+    None
+    Examples
+    --------
+    >>> DeploymentMutationTests('test_ended_relink_does_not_retry_the_same_move').run()
+    """
+    # A durable failure from another coordinator can be older than the normal retry delay.
+    plugin = Mutations()
+    failed = dict(job_id=7, mutation="node_relink", kind="update", phase="completed", outcome="failed",
+                  previous_revision=4, target_revision=5, owner="owner", request_id="prior-move",
+                  nodes=["N", "B"], updated_at=plugin.now, error={"code": "BLOCKED_OPERATION_ENDED"})
+    plugin._operation_records = Mock(return_value={"relink": failed})
+    plugin.now += 3600
+    self.assertIsNone(plugin._admit_node_relink_operation(7, "A", "N"))
+    self.assertIsNone(plugin.captured_scale)
+
   def test_node_relinks_run_on_one_oracle_per_job_in_hash_order(self):
     plugin = Mutations()
     plugin.plugins_shmem = {"CHAIN_DIST_NODE_RELINKS": {7: ("A", "N")}}
@@ -410,6 +438,24 @@ class DeploymentMutationTests(unittest.TestCase):
     plugin._delete_pipeline_cid_from_r1fs.assert_called_with("canonical-cid")
 
   def test_stuck_delete_writes_no_snapshot_per_pass_and_completes_when_the_node_stops(self):
+    """Keep delete retirement stable while one worker has yet to stop.
+
+    Advance the fake clock through blocking and verify that retries reuse
+    the snapshot and obey the blocked cadence. Supply the missing signed
+    stop receipt inside the grace period and check that deletion completes.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> DeploymentMutationTests().test_stuck_delete_writes_no_snapshot_per_pass_and_completes_when_the_node_stops()
+    """
     plugin = Mutations()
     operation_id = plugin.delete()["operation_id"]
     plugin.stop_report(plugin._operation_records()[operation_id], "A")
@@ -424,14 +470,82 @@ class DeploymentMutationTests(unittest.TestCase):
     self.assertEqual(sequences[-100:], [2] * 100)
     # Repair re-sends repeat a confirmed snapshot; they never produce a new one.
     self.assertEqual(len({key for namespace, key in plugin.writes if namespace == OPERATIONS_HKEY}), 2)
-    self.assertLessEqual(sum(namespace == OPERATIONS_HKEY for namespace, _ in plugin.writes), 2 + 300 // 30 + 1)
+    # Replication of the blocked snapshot also observes the ten-minute limit.
+    self.assertLessEqual(sum(namespace == OPERATIONS_HKEY for namespace, _ in plugin.writes), 2 + 60 // 30)
     self.assertEqual((operation["recovery"], operation["error"]["code"]), ("blocked", "STOP_UNCONFIRMED"))
     retires = [command for command in plugin.commands if command["node_address"] == "B"]
-    self.assertGreaterEqual(len(retires), 29)
+    # A blocked worker receives no command more often than every ten minutes.
+    self.assertLessEqual(len(retires), 6)
     plugin.stop_report(operation, "B")
     plugin.now += 2
     plugin._advance_delete_operation(plugin._operation_records()[operation_id])
     self.assertEqual(plugin._operation_records()[operation_id]["phase"], "completed")
+
+  def test_delete_ends_at_grace_expiry_after_restart_and_names_only_unconfirmed_workers(self):
+    """Exercise durable deletion, restart, and the public progress projection.
+
+    Keep one worker unconfirmed, verify the resend boundary at 600 seconds,
+    and restart the coordinator at the grace limit. Check that the failure
+    still names the missing worker and keeps the published job intact.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> DeploymentMutationTests().test_delete_ends_at_grace_expiry_after_restart_and_names_only_unconfirmed_workers()
+    """
+    # Admit the whole job, then deliver a signed retirement receipt from only one worker.
+    before = Mutations()
+    operation_id = before.delete()["operation_id"]
+    operation = before._operation_records()[operation_id]
+    before.stop_report(operation, "A")
+    # A blocked delete can send the unresolved worker once, then wait the entire retry interval.
+    before.now = operation["deadline"]
+    before._reconcile_coordinator_operations()
+    self.assertEqual([command["node_address"] for command in before.commands], ["B"])
+    # Check one second before the ten-minute resend becomes due.
+    before.now += 599
+    before._reconcile_coordinator_operations()
+    # The unresolved worker has received only the initial command so far.
+    self.assertEqual(len(before.commands), 1)
+    # Cross the 600-second boundary, when the unresolved worker can be retried.
+    before.now += 1
+    before._reconcile_coordinator_operations()
+    # There is exactly one retry and the already confirmed worker is excluded.
+    self.assertEqual([command["node_address"] for command in before.commands], ["B", "B"])
+    # One second before grace expiry, the original operation must still hold the job.
+    before.now = operation["deadline"] + 3599
+    before._reconcile_coordinator_operations()
+    # An active operation rejects another deletion of the same job.
+    with self.assertRaisesRegex(ValueError, "already active"):
+      before._admit_delete_operation(dict(request_id="other", job_id=7, expected_revision=4), {"escrow_owner": "owner"})
+    # Restart at the boundary with only persisted state and the original incomplete receipts.
+    after = Mutations()
+    after.storage, after.plans = before.storage, before.plans
+    after.now = operation["deadline"] + 3600
+    # The status endpoint reuses an authenticated wallet read for its owner scope.
+    after.deeploy_verify_and_get_inputs = Mock(return_value=("wallet", {}))
+    after.deeploy_get_auth_result = Mock(return_value={"escrow_owner": "owner"})
+    after._reconcile_coordinator_operations()
+    result = after._deployment_status(dict(operation_id=operation_id))
+    # Completed ends execution, failed states the outcome, and blocked records unfinished cleanup.
+    self.assertEqual((result["phase"], result["outcome"], result["recovery"]), ("completed", "failed", "blocked"))
+    # The public error distinguishes grace expiry from the still-active stop wait.
+    self.assertEqual(result["error"]["code"], "BLOCKED_OPERATION_ENDED")
+    # The terminal diagnosis names the worker whose signed stop was missing.
+    self.assertEqual(result["unconfirmed_nodes"], ["B"])
+    # The expired delete sends no commands and preserves the still-needed metadata and secrets.
+    after._reconcile_coordinator_operations()
+    self.assertEqual(after.commands, [])
+    self.assertFalse(after.storage[DEEPLOY_JOBS_CSTORE_HKEY, "7"]["deleted"])
+    self.assertNotIn((SECRET_REVISIONS_HKEY, "7|previous:deploy|revoked"), after.storage)
+    after._assert_no_active_deployment(job_id=7)
 
   def test_delete_retries_metadata_cleanup_after_a_partial_write(self):
     plugin = Mutations()

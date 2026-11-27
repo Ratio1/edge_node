@@ -6,8 +6,10 @@ import uuid
 from .deeploy_const import DEEPLOY_KEYS
 from .deeploy_mixin import COCKROACHDB_CERT_ENV_KEYS, COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS
 from .deeploy_job_mixin import DEEPLOY_JOBS_CSTORE_HKEY
-from .deployment_operations import request_digest, required_instances
+from .deployment_operations import BLOCKED_OPERATION_ENDED, request_digest, required_instances
 from .relink_placement import relink_configs
+# Delete plans hold the same oracle-only configuration as update plans.
+from . import r1fs_documents
 
 # ChainDist publishes {job_id: (old_node, new_node)} here for jobs whose stored placement
 # still names a node whose license its owner relinked to another node.
@@ -18,6 +20,8 @@ NODE_RELINK_RANK_SECONDS = 900
 NODE_RELINK_RETRY_SECONDS = 300
 # After a failed move the job is left running where it is this long before retrying.
 NODE_RELINK_FAILURE_WAIT_SECONDS = 3600
+# Whole-job delete waits one additional hour for stop evidence after its ordinary phase deadline.
+DELETE_STOP_GRACE_SECONDS = 3600
 
 
 class _DeploymentMutationsMixin:
@@ -182,6 +186,10 @@ class _DeploymentMutationsMixin:
   def _admit_node_relink_operation(self, job_id, old_node, new_node):
     """Move a job from a relinked node to its owner's new node through a revision rollout.
 
+    Resolve the existing placement before preparing the update. A move with
+    the same prior revision and destination stays suppressed after grace
+    expires. A new prior revision or destination can qualify after backoff.
+
     Parameters
     ----------
     job_id : int
@@ -193,7 +201,14 @@ class _DeploymentMutationsMixin:
     Returns
     -------
     dict or None
-      Acceptance response, or None while waiting after a failed attempt.
+      Acceptance response, or None while a failed move is suppressed.
+
+    Raises
+    ------
+    ValueError
+      The saved configuration or placement cannot support the move.
+    DeploymentConflictError
+      Another operation already holds the job.
 
     Notes
     -----
@@ -203,6 +218,10 @@ class _DeploymentMutationsMixin:
     A license relink alone gives no evidence that a workload on a different
     machine stopped or that the new machine can restore it. dAuth moves the
     per-node settings only after admission; the old address is never contacted.
+
+    Examples
+    --------
+    >>> plugin._admit_node_relink_operation(job_id, old_node, new_node)  # doctest: +SKIP
     """
     pipeline = self.get_job_pipeline_from_cstore(job_id, timeout=30, pin=False,
                                                 raise_on_error=False, show_logs=False)
@@ -212,10 +231,15 @@ class _DeploymentMutationsMixin:
     nodes = specs.get("current_target_nodes", [])
     if old_node not in nodes or new_node in nodes:
       raise ValueError("The stored placement does not name only the relinked node.")
-    failed = [record["updated_at"] for record in self._operation_records().values()
+    failed = [record for record in self._operation_records(job_id=job_id).values()
               if str(record["job_id"]) == str(job_id) and record.get("mutation") == "node_relink"
               and record.get("outcome") == "failed"]
-    if failed and self.time() - max(failed) < NODE_RELINK_FAILURE_WAIT_SECONDS:
+    # A new canonical revision or destination is a different move; suppress the same exhausted move on every oracle.
+    if any((record.get("error") or {}).get("code") == BLOCKED_OPERATION_ENDED
+           and record.get("previous_revision") == specs.get("revision", 0)
+           and new_node in record.get("nodes", []) for record in failed):
+      return None
+    if failed and self.time() - max(record["updated_at"] for record in failed) < NODE_RELINK_FAILURE_WAIT_SECONDS:
       return None
     owner = pipeline.get("OWNER", "")
     # Every admitted operation advances the job's next revision, so after a failed
@@ -272,7 +296,51 @@ class _DeploymentMutationsMixin:
     return
 
   def _admit_delete_operation(self, request, auth_result):
-    """Persist a whole-job scoped retirement before dispatching any stop."""
+    """Persist whole-job retirement for the authenticated escrow owner.
+
+    Reuse an accepted operation when the owner's request ID and input
+    match. A new request checks the current escrow owner and the exact
+    persisted revision and placement before saving its execution plan.
+
+    Parameters
+    ----------
+    request : dict
+      Verified delete request with a stable request ID, job ID and expected
+      revision. If supplied, the app ID must match the job and target nodes
+      must cover its entire saved placement.
+    auth_result : dict
+      Authentication result containing the escrow owner.
+
+    Returns
+    -------
+    dict
+      Signed acceptance with status code 202 and the operation, request,
+      job, app and target revision identifiers. Poll the operation for
+      stop confirmations and the final outcome.
+
+    Raises
+    ------
+    DeploymentConflictError
+      Another operation is active for the job or the request ID was used
+      for different delete input.
+    ValueError
+      The request identifiers, current escrow owner, revision or placement
+      are invalid, inconsistent or unavailable.
+    RuntimeError
+      The plan cannot be saved, its required protection key is missing,
+      or operation replication is unconfirmed.
+
+    Notes
+    -----
+    Admission creates no new credential revision. The saved plan retains
+    the original configuration and scope so the coordinator can verify
+    every worker's retirement before clearing the published job.
+
+    Examples
+    --------
+    >>> plugin._admit_delete_operation(request, auth_result)["status"]  # doctest: +SKIP
+    'accepted'
+    """
     owner = auth_result[DEEPLOY_KEYS.ESCROW_OWNER]
     existing = self._find_request_operation(request, owner, "delete")
     if existing:
@@ -297,8 +365,10 @@ class _DeploymentMutationsMixin:
     revision = self._next_deployment_revision(request["job_id"], specs.get("revision", 0))
     plan = dict(configs={}, previous_configs=configs, canonical_record=canonical_record,
                 canonical_cid=self._get_pipeline_from_cstore(request["job_id"]))
-    cid = self.r1fs.add_json(plan, nonce=42, fn="deployment-plan.json", show_logs=False)
+    # Keep the exact retirement plan under the configured oracle document write policy.
+    cid = r1fs_documents.write_r1fs_document(self.r1fs, plan, "deployment-plan.json")
     if not cid:
+      # A later worker pass must be able to reload the plan before it can send stops.
       raise RuntimeError("Could not persist deletion execution plan.")
     now = self.time()
     operation = dict(
@@ -318,12 +388,54 @@ class _DeploymentMutationsMixin:
     return self._accepted_operation_response(operation)
 
   def _advance_delete_operation(self, operation):
-    """Revoke secrets and remove metadata only after every scoped stop is proven."""
+    """Confirm the entire job stopped before deleting its configuration.
+
+    The coordinator continues to accept signed stop evidence during the
+    additional one-hour grace period. On expiry it preserves the job's
+    published credentials and configuration and records the incomplete stop.
+
+    Parameters
+    ----------
+    operation : dict
+      Signed deletion snapshot and its retirement deadline.
+
+    Returns
+    -------
+    None
+      Persists confirmed deletion or its current wait or failure state.
+
+    Raises
+    ------
+    DeploymentCustodyError
+      The custody service has yet to confirm deletion.
+    RuntimeError
+      The execution plan is unavailable or operation replication is
+      unconfirmed.
+
+    Notes
+    -----
+    A stop failure can block the operation before the initial deadline.
+    The grace limit still runs from that deadline. If any stop remains
+    unconfirmed at expiry the signed operation ends failed. With all
+    stops confirmed, the coordinator asks custody to publish the signed
+    deletion pointer before saving success.
+
+    Examples
+    --------
+    >>> plugin._advance_delete_operation(operation)  # doctest: +SKIP
+    """
     self._replicate_operation(operation)
     plan = self._load_operation_plan(operation)
     reports = self._node_operation_reports(operation, "retire")
-    if not all(reports.get(node, {}).get("status") == "stopped" for node in plan["previous_configs"]):
-      if self.time() >= operation["deadline"] or any(report.get("status") == "failed" for report in reports.values()):
+    # Only planned workers with verified stop receipts can clear the deletion barrier.
+    missing = [node for node in plan["previous_configs"] if reports.get(node, {}).get("status") != "stopped"]
+    if missing:
+      # Stop dispatch permanently once the additional hour has elapsed and receipts are still missing.
+      if self.time() >= operation["deadline"] + DELETE_STOP_GRACE_SECONDS:
+        return self._end_blocked_operation(operation, missing)
+      if operation.get("recovery") != "blocked" and (
+        self.time() >= operation["deadline"] or any(report.get("status") == "failed" for report in reports.values())
+      ):
         operation.update(recovery="blocked", error=dict(code="STOP_UNCONFIRMED",
                          message="Deletion is waiting for confirmed shutdown on every node.", retryable=True))
         self._save_operation(operation)

@@ -3,8 +3,47 @@ import importlib.util
 import pathlib
 import unittest
 
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+from packaging.version import Version
+
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def declared_sdk_minimum(requirements):
+  """Read the unconditional SDK lower bound from a requirements file.
+
+  Parameters
+  ----------
+  requirements : str
+    File content containing PEP 508 requirements and comments.
+
+  Returns
+  -------
+  Version or None
+    The strongest declared numeric floor, or None when none is declared.
+
+  Examples
+  --------
+  >>> declared_sdk_minimum('ratio1 >= 3.5.74 # Runtime SDK').public
+  '3.5.74'
+  """
+  minimums = []
+  for line in requirements.splitlines():
+    # Ignore comments and blank lines before interpreting dependency syntax.
+    spec = line.split("#", 1)[0].strip()
+    if not spec:
+      continue
+    dependency = Requirement(spec)
+    # A dependency for only one platform cannot set the general SDK minimum.
+    if canonicalize_name(dependency.name) != "ratio1" or dependency.marker is not None:
+      continue
+    for bound in dependency.specifier:
+      # Exact numeric pins and compatible releases also impose lower bounds.
+      if bound.operator in {">=", ">", "~=", "=="}:
+        minimums.append(Version(bound.version.removesuffix(".*")))
+  return max(minimums, default=None)
 
 
 class TestCommunicationComposeTestbed(unittest.TestCase):
@@ -208,13 +247,58 @@ class TestCommunicationComposeTestbed(unittest.TestCase):
         self.assertNotIn("EE_NETMON_USE_SUMMARY_STATUS", dockerfile)
 
   def test_runtime_requirements_include_channel_qos_capable_sdk(self):
+    """Require a QoS-capable SDK in each supported package manifest.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> TestCommunicationComposeTestbed('test_runtime_requirements_include_channel_qos_capable_sdk').run()
+    """
+    # This is the first SDK with independent per-channel MQTT QoS.
+    qos_minimum = Version("3.5.41")
     for requirements_name in [
       "requirements.txt",
       ".devcontainer/requirements.txt",
     ]:
       with self.subTest(requirements_name=requirements_name):
-        requirements = (REPO_ROOT / requirements_name).read_text()
-        self.assertIn("ratio1>=3.5.41", requirements)
+        minimum = declared_sdk_minimum((REPO_ROOT / requirements_name).read_text())
+        self.assertIsNotNone(minimum, "Declare a minimum SDK version.")
+        self.assertGreaterEqual(minimum, qos_minimum)
+
+  def test_sdk_minimum_parses_versions_and_lower_bound_operators(self):
+    """Distinguish real SDK floors from comments, upper bounds and older versions.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> TestCommunicationComposeTestbed('test_sdk_minimum_parses_versions_and_lower_bound_operators').run()
+    """
+    # Parse each example as a manifest, including canonical package naming and component ordering.
+    cases = (
+      ("Ratio1 >= 3.5.100 # runtime SDK", Version("3.5.100")),
+      ("ratio1~=3.5.41", Version("3.5.41")),
+      ("ratio1==3.5.74", Version("3.5.74")),
+      ("ratio1>=3.5.9,!=3.5.10", Version("3.5.9")),
+      ("ratio1<4", None),
+      ("# ratio1>=3.5.41\nrequests>=2", None),
+    )
+    for requirements, expected in cases:
+      with self.subTest(requirements=requirements):
+        self.assertEqual(declared_sdk_minimum(requirements), expected)
 
   def test_read_only_netmon_status_dump_command_is_present(self):
     command_path = REPO_ROOT / "cmds" / "dump_netmon_status"

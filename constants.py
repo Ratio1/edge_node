@@ -61,19 +61,6 @@ ADMIN_PIPELINE = {
       "EE_MQTT", 
       "EE_MQTT_SUBTOPIC",
       "EE_MQTT_CERT",
-      
-      "EE_GITVER",
-      
-      "EE_MINIO_ENDPOINT",
-      "EE_MINIO_ACCESS_KEY",
-      "EE_MINIO_SECRET_KEY",
-      "EE_MINIO_SECURE",
-      
-      "EE_MINIO_MODEL_BUCKET",
-      "EE_MINIO_UPLOAD_BUCKET",
-      
-      "EE_NGROK_AUTH_TOKEN",
-      
     ],
     
     "AUTH_NODE_ENV_KEYS" : [

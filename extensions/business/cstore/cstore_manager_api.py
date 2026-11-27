@@ -338,8 +338,9 @@ class CstoreManagerApiPlugin(BasePlugin):
     Every data endpoint runs through here, so this is also where a request for
     a system namespace is refused: the namespace the request addresses (``hkey``
     on the hash endpoints, the raw ``key`` on the plain get and set) is checked
-    against ``SYSTEM_NAMESPACES`` before ``operation`` runs, and on the hash
-    endpoints the index of ``hkey`` (``get_hash(hkey, algorithm='sha256',
+    against ``SYSTEM_NAMESPACES`` before ``operation`` runs; on the plain get
+    and set a raw key starting with ``"dl:"`` is refused the same way; and on
+    the hash endpoints the index of ``hkey`` (``get_hash(hkey, algorithm='sha256',
     length=10)``, as ``chainstore_hset`` composes it) is compared with the
     indexes of ``SYSTEM_HASH_KEYS``. A refused request leaves one red log line
     naming the endpoint and the first 64 characters of the namespace, never
@@ -370,18 +371,32 @@ class CstoreManagerApiPlugin(BasePlugin):
       Re-raises any exception from ``operation`` after the failed call is
       recorded in the forced-summary window.
 
+    Notes
+    -----
+    The chain store keeps the tombstone of a deleted key under the raw key
+    ``"dl:" + key`` and raises ValueError for any write that names such a
+    key; ``chainstore_set`` logs that error and answers False, and
+    ``chainstore_get`` answers the record's value (None for a tombstone).
+    Refusing the prefix here gives the plain get and set the clear 403 answer
+    of a system namespace instead. The hash endpoints are not concerned: the
+    raw keys of hash records start with ``"hs:"``, whatever the hash key.
+
     Examples
     --------
     >>> plugin._run_api_call("hget", lambda: 1, key="node-1", hkey="ratio1:backend:offline_nodes_notifier:v1")
     1
     >>> plugin._run_api_call("hget", lambda: 1, key="7", hkey="DEEPLOY_DEPLOYED_JOBS")["status_code"]
     403
+    >>> plugin._run_api_call("get", lambda: None, key="dl:app:counter")["status_code"]
+    403
     """
     # The namespace the request addresses: the hash key on the hash endpoints, the raw key on plain get and set.
     namespace = key if hkey is None else hkey
     # Refuse a namespace kept by the node's own plugins before the store is touched: a name with a system prefix,
-    # or a hash key whose index, composed as chainstore_hset composes it, equals the index of a system hash key.
-    if namespace.startswith(SYSTEM_NAMESPACES) or (
+    # a raw key of plain get and set under "dl:", where the chain store keeps the tombstones of deleted keys and
+    # refuses every write, or a hash key whose index, composed as chainstore_hset composes it, equals the index of a
+    # system hash key.
+    if namespace.startswith(SYSTEM_NAMESPACES) or (hkey is None and namespace.startswith("dl:")) or (
       hkey is not None
       and self.get_hash(hkey, algorithm='sha256', length=10)
       in [self.get_hash(name, algorithm='sha256', length=10) for name in SYSTEM_HASH_KEYS]
@@ -458,7 +473,9 @@ class CstoreManagerApiPlugin(BasePlugin):
     ``key`` is a raw key. A key in a system namespace (``SYSTEM_NAMESPACES``)
     is refused, and so is a raw key in the composed form of a hash record
     (``hs:<hash of the hash key>:<field>``, as ``chainstore_hset`` builds it):
-    hash records are written only through ``hset``.
+    hash records are written only through ``hset``. A raw key starting with
+    ``"dl:"`` is refused too: the chain store keeps the tombstones of deleted
+    keys there and refuses every write that names one.
 
     Parameters
     ----------
@@ -475,11 +492,17 @@ class CstoreManagerApiPlugin(BasePlugin):
       The result of the write operation, or for a refused key the error answer
       ``{"error": str, "status_code": 403, "logged": True}``.
 
+    Notes
+    -----
+    The refusals are decided by ``_run_api_call`` before the store is called.
+
     Examples
     --------
     >>> plugin.set(key="app:counter", value=3)
     True
     >>> plugin.set(key="hs:0123456789:ZmllbGQ=", value=3)["status_code"]
+    403
+    >>> plugin.set(key="dl:app:counter", value=3)["status_code"]
     403
     """
     if chainstore_peers is None:
@@ -504,7 +527,9 @@ class CstoreManagerApiPlugin(BasePlugin):
     ``key`` is a raw key. A key in a system namespace (``SYSTEM_NAMESPACES``)
     is refused, and so is a raw key in the composed form of a hash record
     (``hs:<hash of the hash key>:<field>``, as ``chainstore_hset`` builds it):
-    hash records are read only through ``hget`` and ``hgetall``.
+    hash records are read only through ``hget`` and ``hgetall``. A raw key
+    starting with ``"dl:"`` is refused too: the chain store keeps the
+    tombstones of deleted keys there.
 
     Parameters
     ----------
@@ -518,11 +543,17 @@ class CstoreManagerApiPlugin(BasePlugin):
       refused key, the error answer ``{"error": str, "status_code": 403,
       "logged": True}``.
 
+    Notes
+    -----
+    The refusals are decided by ``_run_api_call`` before the store is called.
+
     Examples
     --------
     >>> plugin.get(key="app:counter")
     3
     >>> plugin.get(key="hs:0123456789:ZmllbGQ=")["status_code"]
+    403
+    >>> plugin.get(key="dl:app:counter")["status_code"]
     403
     """
     return self._run_api_call(

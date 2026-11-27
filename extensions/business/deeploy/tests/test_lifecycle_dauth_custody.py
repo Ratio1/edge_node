@@ -1,12 +1,97 @@
 """Lifecycle preparation and finalization through real SDK and Core wrapper APIs."""
 import copy
+# Store encrypted files by their checksum in the offline transport.
+import hashlib
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+from ratio1.bc.base import BaseBlockEngine
 from ratio1.const.base import dAuth
+from ratio1.ipfs.r1fs import R1FSEngine
+# The error type of a secret record the chain store refused for its size.
+from extensions.business.dauth.deployment_secrets import DeploymentSecretRecordTooLarge
 from extensions.business.deeploy.tests.lifecycle_custody_support import (
-  Coordinator, Custodian, State, pipeline, connect, report,
+  Coordinator, Custodian, Engine, State, pipeline, connect, report,
 )
+
+
+def ciphertext_transport(folder):
+  """Keep the SDK encryption and replace only its IPFS command boundary.
+
+  Parameters
+  ----------
+  folder : str
+    Private SDK download root for this test.
+
+  Returns
+  -------
+  tuple[R1FSEngine, dict]
+    The SDK engine and the immutable bytes captured from uploads.
+
+  Examples
+  --------
+  >>> sdk, blobs = ciphertext_transport(folder)  # doctest: +SKIP
+  """
+  # Skip daemon startup and configure only the fields used by these file operations.
+  sdk = object.__new__(R1FSEngine)
+  # Preserve each synthetic CID even when the application stops pinning it.
+  blobs = {}
+  # No external relay, storage daemon or network configuration is needed.
+  sdk._R1FSEngine__ipfs_started = True
+  sdk._R1FSEngine__downloads_dir = folder
+  sdk._R1FSEngine__downloaded_files = {}
+  sdk._R1FSEngine__uploaded_files = {}
+  sdk._R1FSEngine__relay_publication_status = {}
+  sdk._R1FSEngine__DEFAULT_SECRET = "ratio1"
+  # Record execution without side effects from the logger, relay or in-memory upload bookkeeping.
+  sdk.P = sdk.Pd = Mock()
+  sdk._R1FSEngine__set_upload_status = Mock()
+  sdk._R1FSEngine__publish_cid_to_relay = Mock()
+  sdk._R1FSEngine__relay_in_background = Mock()
+  sdk.delete_file = Mock(return_value=True)
+
+  def run(command, **kwargs):
+    """Save and restore the SDK's real ciphertext at the IPFS command boundary.
+
+    Parameters
+    ----------
+    command : list
+      Command passed by the SDK to IPFS.
+    **kwargs : dict
+      SDK command options.
+
+    Returns
+    -------
+    str
+      A synthetic CID or the expected command result.
+
+    Examples
+    --------
+    >>> run(["ipfs", "pin", "add", "FixtureCid"])
+    'ok'
+    """
+    if command[1] == "add":
+      # Capture actual SDK AES-GCM output before its temporary file is cleaned up.
+      contents = Path(command[-1]).read_bytes()
+      # Pick a valid bare CID in the SDK's input contract.
+      cid = hashlib.sha256(contents).hexdigest()
+      # Retain old ciphertext to test whether it remains decryptable after rewrite.
+      blobs[cid] = contents
+      return cid
+    if command[1] == "get":
+      # Replicate the wrapped one-file directory created by Kubo.
+      output = Path(command[-1])
+      # The SDK has removed any older downloads of this CID.
+      output.mkdir()
+      # Restore the same bytes that were uploaded.
+      (output / "ciphertext").write_bytes(blobs[command[2]])
+    return "ok"
+
+  # Record exactly how many network-bound commands a request would have executed.
+  sdk._R1FSEngine__run_command = Mock(side_effect=run)
+  return sdk, blobs
 
 
 class LifecycleDauthCustodyTests(unittest.TestCase):
@@ -61,6 +146,127 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
   def active(self):
     pointer = self.state.public['DEEPLOY_DEPLOYED_JOBS', '7']
     return self.state.blobs.get_json(pointer['pipeline_cid'])
+
+  def _admit_resource_removal(self):
+    # Two same-signature rows, with different protected credentials, occupy the initial placement.
+    previous = pipeline()
+    previous["DEEPLOY_SPECS"].update(job_app_type="stack", node_res_req={"cpu": 1, "memory": "2g"})
+    group = previous["PLUGINS"][0]
+    group["SIGNATURE"] = "CONTAINER_APP_RUNNER"
+    kept = group["INSTANCES"][0]
+    kept.update(CONTAINER_RESOURCES={"cpu": ".4", "memory": "512m", "storage": "0g"})
+    removed = copy.deepcopy(kept)
+    removed.update(INSTANCE_ID="removed", ENV={"CF_TUNNEL_TOKEN": "removed-token"})
+    group["INSTANCES"].insert(0, removed)
+    cid = self.state.blobs.add_json(previous)
+    self.state.public["DEEPLOY_DEPLOYED_JOBS", "7"] = cid
+    self.coordinator.known = {"A": [previous]}
+    desired = copy.deepcopy(previous)
+    desired["PLUGINS"][0]["INSTANCES"].pop(0)
+    survivor = desired["PLUGINS"][0]["INSTANCES"][0]
+    survivor.update(CONTAINER_RESOURCES={"cpu": ".8", "memory": "1g", "storage": "0g"},
+                    ENV={"CF_TUNNEL_TOKEN": dAuth.DAUTH_SECRET_PLACEHOLDER})
+    accepted = self.coordinator._admit_prepared_deployment(
+      request={"job_id": 7, "request_id": "split", "expected_revision": 0, "plugins": [{"instance_id": "worker"}]}, auth_result={"escrow_owner": "owner"},
+      app_id="app", configs={"A": desired}, prior_pipeline=previous, is_create=False,
+      resource_tier={"cpu": 1, "memory": "2g"}, deferred_capacity=True)
+    self.assertEqual(accepted["status_code"], 202)
+    return self.operation()
+
+  def test_redistribution_stages_by_identity_and_restores_on_capacity_timeout(self):
+    from datetime import datetime, timezone
+    from naeural_core import constants as ct
+    from extensions.business.deeploy.deployment_operations import deployment_operation_phase
+    operation = self._admit_resource_removal()
+    self.assertEqual(operation["mutation"], "resource_redistribution_v1")
+    self.coordinator._advance_deployment_operation(operation)
+    report(self.state, operation, "retire", "stopped")
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(deployment_operation_phase(operation), "waiting_for_capacity")
+    # The old packet has ample capacity. Its sender timestamp makes it unusable after a stop.
+    sampled = datetime.fromtimestamp(self.state.now - 1, timezone.utc).strftime(ct.HB.TIMESTAMP_FORMAT)
+    sample = {ct.HB.CURRENT_TIME: sampled, ct.PAYLOAD_DATA.EE_TIMEZONE: "UTC+0",
+              ct.HB.CPU_NR_CORES: 4, ct.HB.CPU_USED: 10, ct.HB.AVAILABLE_MEMORY: 16, ct.HB.AVAILABLE_DISK: 3}
+    self.coordinator.netmon.network_node_last_heartbeat = lambda node: sample
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(deployment_operation_phase(operation), "waiting_for_capacity")
+    self.assertFalse(any(command[1]["DEEPLOY_OPERATION"]["action"] == "start" for command in self.coordinator.commands))
+    self.state.now += 2
+    sample[ct.HB.CURRENT_TIME] = datetime.fromtimestamp(self.state.now, timezone.utc).strftime(ct.HB.TIMESTAMP_FORMAT)
+    self.assertEqual(self.coordinator._post_retirement_capacity("A", operation["capacity_after"]["A"],
+                                                              [".8", "1073741824", "0"]), (self.state.now, True))
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(deployment_operation_phase(operation), "waiting_for_capacity")  # First post-stop sample is the fence.
+    self.state.now += 1
+    sample[ct.HB.CURRENT_TIME] = datetime.fromtimestamp(self.state.now, timezone.utc).strftime(ct.HB.TIMESTAMP_FORMAT)
+    sample[ct.HB.AVAILABLE_MEMORY] = 0.01
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(deployment_operation_phase(operation), "waiting_for_capacity")
+    self.state.now = operation["deadline"]
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(deployment_operation_phase(operation), "restoring_previous")
+    self.assertEqual(operation["error"]["code"], "POST_RETIRE_CAPACITY_UNCONFIRMED")
+    report(self.state, operation, "restore", "ready")
+    self.coordinator._advance_deployment_operation(operation)
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(operation["recovery"], "completed")
+    self.assertEqual(len(self.active()["PLUGINS"][0]["INSTANCES"]), 2)
+
+  def test_legacy_native_update_recovers_worker_ceiling_when_both_requests_omit_it(self):
+    previous = pipeline()
+    previous["DEEPLOY_SPECS"]["job_app_type"] = "native"  # This older client never sent node_res_req.
+    group = previous["PLUGINS"][0]
+    group["SIGNATURE"] = "CONTAINER_APP_RUNNER"
+    group["INSTANCES"] = [{"INSTANCE_ID": iid, "CONTAINER_RESOURCES": {"cpu": 1, "memory": "7g"}}
+                          for iid in ("first", "second")]
+    self.state.public["DEEPLOY_DEPLOYED_JOBS", "7"] = self.state.blobs.add_json(previous)
+    self.coordinator.known = {"A": [previous]}  # The saved revision and worker report agree.
+
+    def admit_pair(first, second):
+      desired = copy.deepcopy(previous)
+      rows = desired["PLUGINS"][0]["INSTANCES"]
+      for row, memory in zip(rows, (first, second)):
+        row["CONTAINER_RESOURCES"]["memory"] = memory
+      request_rows = [{"plugin_signature": group["SIGNATURE"], "instance_id": row["INSTANCE_ID"],
+                       "CONTAINER_RESOURCES": row["CONTAINER_RESOURCES"]} for row in rows]
+      return self.coordinator._admit_prepared_deployment(
+        request={"job_id": 7, "request_id": "legacy-" + first, "expected_revision": 0, "plugins": request_rows},
+        auth_result={"escrow_owner": "owner"}, app_id="app", configs={"A": desired}, prior_pipeline=previous,
+        is_create=False, resource_tier={"cpu": 3, "memory": "14g"})
+
+    with self.assertRaisesRegex(ValueError, "worker tier"):
+      admit_pair("11g", "3g")  # Balanced total; one row exceeds the historical N-ENTRY usable limit.
+    self.assertFalse(self.coordinator._operation_records())
+    self.assertEqual(admit_pair("10g", "4g")["status_code"], 202)
+    self.assertEqual(self.operation()["mutation"], "resource_redistribution_v1")
+
+  def test_redistribution_publishes_one_survivor_after_two_fresh_worker_samples(self):
+    from datetime import datetime, timezone
+    from naeural_core import constants as ct
+    from extensions.business.deeploy.deployment_operations import deployment_operation_phase
+    operation = self._admit_resource_removal()
+    self.coordinator._advance_deployment_operation(operation)
+    report(self.state, operation, "retire", "stopped")
+    self.coordinator._advance_deployment_operation(operation)
+    def fresh(node):
+      return {ct.HB.CURRENT_TIME: datetime.fromtimestamp(self.state.now, timezone.utc).strftime(ct.HB.TIMESTAMP_FORMAT),
+              ct.PAYLOAD_DATA.EE_TZ: "UTC", ct.HB.CPU_NR_CORES: 2, ct.HB.CPU_USED: 30,
+              ct.HB.AVAILABLE_MEMORY: 1, ct.HB.AVAILABLE_DISK: 0}
+    self.coordinator.netmon.network_node_last_heartbeat = fresh
+    self.state.now += 1
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(deployment_operation_phase(operation), "waiting_for_capacity")
+    operation = self.operation()  # A coordinator restart reloads the first heartbeat fence.
+    self.state.now += 1
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(deployment_operation_phase(operation), "waiting_for_readiness")
+    self.coordinator._advance_deployment_operation(operation)
+    report(self.state, operation, "deploy", "ready")
+    self.coordinator._advance_deployment_operation(operation)
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(operation["outcome"], "succeeded")
+    self.assertEqual([i["INSTANCE_ID"] for i in self.active()["PLUGINS"][0]["INSTANCES"]], ["worker"])
+    self.assertEqual(self.token(self.state.secrets["DAUTH_JOB_SECRETS", "7"]), "fresh-token")
 
   def test_create_stages_only_on_dauth_and_publishes_after_readiness(self):
     self.assertEqual(self.admit()['status_code'], 202)
@@ -190,6 +396,129 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     restored_ref = '7|' + operation['operation_id'] + ':restore'
     self.assertNotIn('revoked', self.state.secrets['DAUTH_JOB_SECRET_REVISIONS', restored_ref])
 
+  def test_blocked_update_ends_without_restoring_and_revokes_only_the_deploy_revision(self):
+    """Verify a failed rollout across the real SDK and dAuth custody boundary.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> LifecycleDauthCustodyTests('test_blocked_update_ends_without_restoring_and_revokes_only_the_deploy_revision').run()
+    """
+    # Prepare two scoped revisions over the signed custody endpoint.
+    previous, cid = self.legacy()
+    self.admit(previous)
+    operation = self.operation()
+    self.coordinator._advance_deployment_operation(operation)
+    report(self.state, operation, 'retire', 'stopped')
+    self.coordinator._advance_deployment_operation(operation)
+    report(self.state, operation, 'deploy', 'failed')
+    self.coordinator._advance_deployment_operation(operation)
+    # No signed stop arrives after failure. The operation is still open one second before grace expires.
+    readiness = self.coordinator.cfg_deployment_readiness_timeout
+    self.state.now = operation['recovery_started_at'] + 25 * readiness - 1
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual((operation['phase'], operation['recovery']), ('stopping_failed_rollout', 'blocked'))
+    # At the deadline execution ends independently of secret-store availability.
+    self.state.now += 1
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual((operation['phase'], operation['outcome'], operation['unconfirmed_nodes']), ('completed', 'failed', ['A']))
+    key = '7|' + operation['operation_id']
+    deploy = key + ':deploy'
+    restore = key + ':restore'
+    self.state.fail_write = lambda namespace, field: 'before' if field == deploy + '|revoked' else None
+    self.coordinator._reconcile_coordinator_operations()
+    self.assertTrue(self.operation()['abandoned_deploy_revocation_pending'])
+    # The next successful custody call revokes the attempted revision and keeps the previous plan available.
+    self.state.fail_write = None
+    self.state.now += 10
+    self.coordinator._reconcile_coordinator_operations()
+    self.assertTrue(self.state.secrets['DAUTH_JOB_SECRET_REVISIONS', deploy]['revoked'])
+    self.assertNotIn('revoked', self.state.secrets['DAUTH_JOB_SECRET_REVISIONS', restore])
+    self.assertNotIn('abandoned_deploy_revocation_pending', self.operation())
+    self.assertEqual(self.state.public['DEEPLOY_DEPLOYED_JOBS', '7'], cid)
+    self.assertNotIn('restore', [cmd['DEEPLOY_OPERATION']['attempt'] for _, cmd in self.coordinator.commands])
+
+  def test_late_signed_create_stops_unlock_paid_retry_only_after_custody_release(self):
+    """Verify that late receipts can complete cleanup without resuming execution.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> LifecycleDauthCustodyTests('test_late_signed_create_stops_unlock_paid_retry_only_after_custody_release').run()
+    """
+    # Admit a paid create whose worker misses both readiness and cleanup deadlines.
+    self.admit()
+    operation = self.operation()
+    self.coordinator._advance_deployment_operation(operation)
+    self.state.now = operation['deadline']
+    self.coordinator._advance_deployment_operation(operation)
+    self.state.now += 25 * self.coordinator.cfg_deployment_readiness_timeout
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual((operation['phase'], operation['outcome'], operation['recovery']), ('completed', 'failed', 'blocked'))
+    commands = len(self.coordinator.commands)
+    # A signed stop by itself does not release the retry if custody cannot yet revoke the abandoned revision.
+    report(self.state, operation, 'deploy', 'stopped')
+    deploy = '7|' + operation['operation_id'] + ':deploy'
+    self.state.fail_write = lambda namespace, field: 'before' if field == deploy + '|revoked' else None
+    self.coordinator._reconcile_coordinator_operations()
+    self.assertEqual(self.operation()['recovery'], 'blocked')
+    request = {'job_id': 7, 'request_id': 'retry', 'expected_revision': 0}
+    with self.assertRaisesRegex(ValueError, 'unconfirmed cleanup'):
+      self.coordinator._find_request_operation(request, 'owner', 'create')
+    # A valid signature for the wrong revision cannot prove this attempt stopped.
+    receipt = self.state.public['DEEPLOY_NODE_OPERATIONS', 'A|deploy']
+    exact = copy.deepcopy(receipt)
+    receipt['revision'] += 1
+    Engine('A').sign(receipt)
+    self.state.fail_write = None
+    self.state.now += 10
+    self.coordinator._reconcile_coordinator_operations()
+    self.assertTrue(self.state.secrets['DAUTH_JOB_SECRET_REVISIONS', deploy]['revoked'])
+    self.assertEqual(self.operation()['recovery'], 'blocked')
+    # A fresh matching aggregate with an individually running instance also leaves the retry locked.
+    partial = copy.deepcopy(exact)
+    partial['instances'][0]['status'] = 'stopping'
+    Engine('A').sign(partial)
+    self.state.public['DEEPLOY_NODE_OPERATIONS', 'A|deploy'] = partial
+    self.state.now += 60
+    self.coordinator._reconcile_coordinator_operations()
+    self.assertEqual(self.operation()['recovery'], 'blocked')
+    # Matching signed evidence completes cleanup without changing the terminal outcome, or sending any command.
+    self.state.now += 60
+    report(self.state, operation, 'deploy', 'stopped')
+    self.coordinator._reconcile_coordinator_operations()
+    ended = self.operation()
+    self.assertEqual((ended['phase'], ended['outcome'], ended['recovery']), ('completed', 'failed', 'completed'))
+    self.assertEqual(ended['error']['code'], 'BLOCKED_OPERATION_ENDED')
+    self.assertEqual(ended['unconfirmed_nodes'], ['A'])
+    self.assertEqual(len(self.coordinator.commands), commands)
+    self.assertIsNone(self.coordinator._find_request_operation(request, 'owner', 'create'))
+
+    # Reuse the paid job with a fresh request and prove its new revision completes normally.
+    accepted = self.coordinator._admit_prepared_deployment(
+      request=request, auth_result={'escrow_owner': 'owner'}, app_id='app', configs={'A': pipeline('retry-token')},
+      prior_pipeline=None, is_create=True,
+    )
+    self.assertEqual(accepted['status_code'], 202)
+    retry = self.coordinator._operation_records()[accepted['operation_id']]
+    self.assertNotEqual(retry['operation_id'], operation['operation_id'])
+    self.finalize(retry)
+    self.assertEqual((retry['job_id'], retry['outcome']), (operation['job_id'], 'succeeded'))
+
   def test_first_update_without_bundle_preserves_plaintext_values(self):
     previous, cid = self.legacy('old-token', with_bundle=False)
     self.admit(previous, secret=dAuth.DAUTH_SECRET_PLACEHOLDER)
@@ -200,6 +529,87 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.finalize(operation)
     self.assertEqual(operation['outcome'], 'succeeded')
     self.assertEqual(self.token(self.state.secrets['DAUTH_JOB_SECRETS', '7']), 'old-token')
+
+  def test_first_successful_edit_publishes_protected_bytes_and_owner_notice(self):
+    """Keep historical ciphertext readable but publish an oracle-only copy on first edit.
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> LifecycleDauthCustodyTests("test_first_successful_edit_publishes_protected_bytes_and_owner_notice").run()
+    """
+    # Give the coordinator and custodian the same synthetic ciphertext transport.
+    with TemporaryDirectory() as folder:
+      # Run both writers and readers through the real SDK encryption code.
+      sdk, blobs = ciphertext_transport(folder)
+      # Replace the plaintext fixture store at both sides of custody.
+      self.state.blobs = self.coordinator.r1fs = self.dauth.r1fs = sdk
+      # The old copy and its selected credentials were stored before this switch.
+      prior, old_cid = self.legacy()
+      # A reader with only the default key can still read the old bytes.
+      self.assertEqual(sdk.get_json(old_cid, pin=False, show_logs=False), prior)
+      # Activate the new default against a synthetic locally provisioned secret.
+      secret = "synthetic-shared-oracle-passphrase-only"
+      with patch.object(BaseBlockEngine, "oracle_secret", return_value=secret), \
+           patch("extensions.business.deeploy.r1fs_documents.ORACLE_R1FS_WRITES", True):
+        # Admission publishes the new operation plan without claiming the canonical rewrite happened.
+        self.admit(prior)
+        # The status snapshot before readiness carries no credential notice.
+        operation = self.operation()
+        self.assertNotIn("credential_rotation_required", operation)
+        # The custodian will read the plan with the local key, while a default reader cannot.
+        self.assertIsNone(sdk.get_json(operation["plan_cid"], pin=False, show_logs=False))
+        # Process the signed worker confirmations and commit the protected pointer through dAuth.
+        self.finalize(operation)
+        # The successful completion is bound to the replacement ciphertext, not the old pointer.
+        current = self.state.public["DEEPLOY_DEPLOYED_JOBS", "7"]
+        # This stable signed marker supports notice recovery after an interrupted finalization.
+        self.assertEqual(current["r1fs_encryption"], "oracle_rewrote_legacy")
+        # The user is notified only after custody confirmed the rewrite.
+        self.assertIs(operation["credential_rotation_required"], True)
+        # The replacement and its plan each use a different random 96-bit nonce.
+        ids = (old_cid, operation["plan_cid"], current["pipeline_cid"])
+        # Use exact captured ciphertext headers to exclude fixed or reused nonces.
+        self.assertEqual(len({blobs[cid][:12] for cid in ids}), 3)
+        # A default reader cannot decrypt the new canonical copy.
+        self.assertIsNone(sdk.get_json(current["pipeline_cid"], pin=False, show_logs=False))
+        # A reader with the correct key can decrypt it using the unchanged public file format.
+        protected = sdk.get_json(current["pipeline_cid"], secret=secret, pin=False, show_logs=False)
+        # The protected copy contains the new deployment revision.
+        self.assertEqual(protected["DEEPLOY_SPECS"]["revision"], 1)
+        # Edit the protected revision. A new upload is required but no legacy migration remains.
+        self.coordinator._admit_prepared_deployment(
+          request={"job_id": 7, "request_id": "second-request", "expected_revision": 1},
+          auth_result={"escrow_owner": "owner"}, app_id="app", configs={"A": pipeline("new-synthetic-value")},
+          prior_pipeline=protected, is_create=False,
+        )
+        # Identify the new operation by request ID so older completion snapshots can remain visible.
+        second = next(record for record in self.coordinator._operation_records().values()
+                      if record["request_id"] == "second-request")
+        # Drive it through real custody again.
+        self.finalize(second)
+        # The next signed pointer remains protected without a repeated migration notice.
+        self.assertEqual(self.state.public["DEEPLOY_DEPLOYED_JOBS", "7"]["r1fs_encryption"], "oracle")
+        self.assertNotIn("credential_rotation_required", second)
+        # Whole-job delete uses the third protected writer, for the plan holding the previous configuration.
+        deletion = self.coordinator._admit_delete_operation(
+          {"job_id": 7, "request_id": "delete", "expected_revision": 2}, {"escrow_owner": "owner"},
+        )
+        # Read its immutable plan reference from the signed operation.
+        delete_cid = self.coordinator._operation_records()[deletion["operation_id"]]["plan_cid"]
+        # The default passphrase cannot open the delete plan either.
+        self.assertIsNone(sdk.get_json(delete_cid, pin=False, show_logs=False))
+        # The oracle can restore the exact previous placement it needs for retirement.
+        delete_plan = sdk.get_json(delete_cid, secret=secret, pin=False, show_logs=False)
+        # The signed plan keeps the prior revision intact.
+        self.assertEqual(delete_plan["previous_configs"]["A"]["DEEPLOY_SPECS"]["revision"], 2)
+        # All three writer paths used independent nonces across the captured uploads.
+        self.assertEqual(len({contents[:12] for contents in blobs.values()}), len(blobs))
+      # The old record remains readable if it was previously retained elsewhere.
+      self.assertEqual(sdk.get_json(old_cid, pin=False, show_logs=False), prior)
 
   def test_failed_first_update_without_bundle_restores_plaintext_values(self):
     previous, _ = self.legacy('old-token', with_bundle=False)
@@ -768,3 +1178,127 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.assertEqual(self.state.writes, [])
     self.assertEqual(self.state.blobs.data, {})
     self.assertEqual(self.http.call_count, 0)
+
+  def prepare_with_failed_write(self, word, attempt='deploy'):
+    """
+    Admit a deployment one of whose secret records' write fails as ``word``, on a fresh fixture.
+
+    The target copy is tried with a create; the restoration copy, which only an update has, with an update of a
+    job stored before versioned secrets (see ``legacy``).
+
+    Parameters
+    ----------
+    word : str
+      How the write of that copy ends: 'before' or 'after' (see ``Node.chainstore_hset``), or one of the
+      chain store's outcome words, such as 'refused_too_large'.
+    attempt : str, optional
+      The copy whose write fails: 'deploy' (the default), the target copy, or 'restore', the restoration copy.
+
+    Returns
+    -------
+    list of Exception
+      What the dAuth node raised while it served the preparation: one error.
+
+    Examples
+    --------
+    >>> [type(error).__name__ for error in self.prepare_with_failed_write('after')]
+    ['RuntimeError']
+    >>> [type(error).__name__ for error in self.prepare_with_failed_write('refused_too_large', 'restore')]
+    ['DeploymentSecretRecordTooLarge']
+    """
+    # A fresh coordinator, dAuth node and stores: the sub-tests of one test must not see each other's operation.
+    self.setUp()
+    # The job's stored revision for an update, which has a restoration copy; none for a create.
+    previous = self.legacy()[0] if attempt == 'restore' else None
+    # Only that copy of the secret record fails; every other write is stored and confirmed.
+    self.state.fail_write = lambda namespace, key: (
+      # The word for the write of the copy named by ``attempt``; None, a stored write, for every other.
+      word if namespace == 'DAUTH_JOB_SECRET_REVISIONS' and key.endswith(':' + attempt) else None)
+    # The dAuth node's own handler of a custody request, wrapped below.
+    serve = self.dauth.process_dauth_reconcile_secrets_request
+    # What it raised, in order.
+    raised = []
+
+    def recording(body):
+      """
+      Serve a custody request as the dAuth node does and keep the error it raises.
+
+      Parameters
+      ----------
+      body : dict
+        The signed request body.
+
+      Returns
+      -------
+      dict
+        The dAuth node's result, when it does not raise.
+
+      Examples
+      --------
+      >>> recording(body)["status"]
+      'success'
+      """
+      try:
+        # The real handler.
+        return serve(body)
+      except Exception as error:
+        # Kept for the test.
+        raised.append(error)
+        # Raised on: the fixture's HTTP side answers every refusal with one fixed text and no reason code.
+        raise
+
+    # The fixture's HTTP side looks the handler up on the node at each request.
+    self.dauth.process_dauth_reconcile_secrets_request = recording
+    # So the coordinator gets the SDK's error of a refusal without a reason, whatever the dAuth node raised;
+    # the real endpoint, which names the size refusal, is under test in test_secret_record_size_refusal.py.
+    with self.assertRaises(RuntimeError):
+      # A create (or an update) of job 7 on node A with one fresh secret value, 'fresh-token'.
+      self.admit(previous)
+    # The dAuth node's errors.
+    return raised
+
+  def test_a_secret_record_refused_for_its_size_ends_in_an_error_that_names_the_cause_and_no_value(self):
+    """When the chain store refuses a deployment's secret record for its size, the dAuth node's preparation ends in
+    an error of a type of its own (a ValueError) that carries no text, so no job id, node, key or secret value;
+    before, it ended in the same "pending" error as a write that was not confirmed."""
+    # The chain store's outcome word for a record over its size cap.
+    raised = self.prepare_with_failed_write('refused_too_large')
+    # One error of the type the dAuth endpoint names to the caller, without a text: the client words it.
+    self.assertEqual([(type(error), str(error)) for error in raised], [(DeploymentSecretRecordTooLarge, '')])
+    # Final for the request, like every ValueError of the custody code.
+    self.assertIsInstance(raised[0], ValueError)
+    # The operation the coordinator recorded.
+    operation = self.operation()
+    # The refused record is not held, and the secret value is in no public store.
+    self.assertNotIn(('DAUTH_JOB_SECRET_REVISIONS', '7|' + operation['operation_id'] + ':deploy'), self.state.secrets)
+    # Nor in the plan or the operation record.
+    self.assertNotIn('fresh-token', str(self.state.public) + str(self.state.blobs.data))
+
+  def test_a_restoration_copy_refused_for_its_size_ends_in_the_same_error(self):
+    """The copy of the job's current revision that a failed update restores, refused for its size, ends in the same
+    error type as the target copy, and nothing of the update is stored (that copy is written first); refused for
+    another reason, it keeps the "pending" error."""
+    # An update whose restoration copy the chain store refuses for its size.
+    raised = self.prepare_with_failed_write('refused_too_large', 'restore')
+    # The size refusal's own type, which the dAuth endpoint names to the caller.
+    self.assertEqual([type(error) for error in raised], [DeploymentSecretRecordTooLarge])
+    # No secret record of the update is held: the target copy was not written either.
+    self.assertEqual([key for namespace, key in self.state.secrets if namespace == 'DAUTH_JOB_SECRET_REVISIONS'], [])
+    # The same copy refused for its depth: the retryable error of before.
+    self.assertEqual([(type(error), str(error)) for error in self.prepare_with_failed_write('refused_too_deep', 'restore')],
+                     [(RuntimeError, 'Deployment secret preparation is pending.')])
+
+  def test_every_other_failed_write_of_a_secret_record_keeps_the_pending_error(self):
+    """A secret record's write that fails for any reason but its size still ends in the retryable error
+    "Deployment secret preparation is pending.": lost before or after the store took it, refused by another rule
+    of the chain store, not confirmed, or a call that raised."""
+    # 'before' and 'after' are the fixture's two failures; the others are outcome words of the chain store.
+    for word in ('before', 'after', 'unconfirmed', 'refused_by_peers', 'refused_not_member', 'refused_secret_rule',
+                 'refused_unencodable', 'refused_too_deep', 'refused_no_peers', 'error'):
+      # One sub-test each, on its own fixture.
+      with self.subTest(failure=word):
+        # What the dAuth node raised.
+        raised = self.prepare_with_failed_write(word)
+        # Today's type and text, unchanged.
+        self.assertEqual([(type(error), str(error)) for error in raised],
+                         [(RuntimeError, 'Deployment secret preparation is pending.')])

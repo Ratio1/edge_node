@@ -60,6 +60,7 @@
         "TYPE": "mqtt"
     },
     "FILE_UPLOAD": {
+        "OPTIONAL": true,
         "CONFIG_UPLOADER": {
             "ACCESS_KEY": "$EE_MINIO_ACCESS_KEY",
             "BUCKET_NAME": "$EE_MINIO_UPLOAD_BUCKET",

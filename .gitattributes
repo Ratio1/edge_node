@@ -1,2 +1,5 @@
 * text=auto
 *.py text eol=lf
+# The image entrypoint must reach an image with LF line ends in every checkout: after a CR the kernel finds no
+# interpreter for it and the node container does not start.
+cmds/node_entrypoint text eol=lf

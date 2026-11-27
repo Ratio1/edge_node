@@ -1,6 +1,7 @@
 import math
 
 from naeural_core.main.net_mon import NetMonCt
+from extensions.utils.memory_formatter import size_bytes
 
 from extensions.business.deeploy.deeploy_const import (
   DEEPLOY_ERRORS,
@@ -364,7 +365,15 @@ class _DeeployTargetNodesMixin:
         )
         memory = res.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_CONTAINER_RESOURCES.MEMORY)
         used_cpu += cpu
-        used_memory += self._parse_memory(memory)
+        # A persisted Docker limit uses bytes for bare numbers; numeric NetMon telemetry uses GiB.
+        try:
+          used_memory += size_bytes(memory)
+        except ValueError:
+          skip_node = True  # An unknown resident allocation cannot qualify this worker.
+          break
+
+      if skip_node:
+        continue
 
       self.Pd(f"Node {addr} current usage: CPU={used_cpu} cores, Memory={used_memory} bytes")
 

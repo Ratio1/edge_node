@@ -379,6 +379,22 @@ class DeeploySummaryControlLivenessTests(unittest.TestCase):
 
     self.assertEqual(nodes, ["0xai_node_alpha"])
 
+  def test_auto_placement_counts_the_docker_units_of_an_existing_neighbor(self):
+    plugin = _plugin()
+    plugin.json_dumps = lambda value, **kwargs: str(value)
+    plugin.netmon = _NetmonStub(total_cpu=8, total_mem=32, avail_disk=5,
+                                status_by_addr={"node_gamma": {"SCORE": 100}})
+    plugin._get_online_apps = lambda: {"0xai_node_gamma": {"old": {
+      "is_deeployed": True, "plugins": {CONTAINER_APP_RUNNER_SIGNATURE: [{"instance": "old-id"}]}}}}
+    inputs = make_inputs(target_nodes_count=1, job_app_type="stack", plugins=[
+      make_plugin_entry(CONTAINER_APP_RUNNER_SIGNATURE, CONTAINER_RESOURCES={"cpu": .5, "memory": "512MB", "storage": "1GB"})])
+    for memory in (536870912, "512MB"):
+      with self.subTest(memory=memory):
+        existing = {"INSTANCE_ID": "old-id", "CONTAINER_RESOURCES": {"cpu": 1, "memory": memory}}
+        pipeline = {"NAME": "old", "PLUGINS": [{"SIGNATURE": CONTAINER_APP_RUNNER_SIGNATURE, "INSTANCES": [existing]}]}
+        plugin.netmon.network_known_nodes = lambda: {"node_gamma": {"pipelines": [pipeline]}}
+        self.assertEqual(plugin._find_nodes_for_deeployment(inputs), ["0xai_node_gamma"])
+
   def test_stack_auto_selection_disk_rejects_selected_storage_over_available(self):
     plugin = _plugin()
     plugin.datetime = datetime

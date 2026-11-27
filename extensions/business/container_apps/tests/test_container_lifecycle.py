@@ -27,6 +27,8 @@ from extensions.business.container_apps.tests.support import (
   make_lifecycle_runner,
   make_mock_container,
   make_mock_docker_client,
+  # Gives a runner the core's `cfg_` getters, whose dict values are copies: a write into one is lost, as on a node.
+  read_config_like_a_node,
 )
 from extensions.business.container_apps.container_app_runner import (
   ContainerAppRunnerPlugin,
@@ -34,6 +36,10 @@ from extensions.business.container_apps.container_app_runner import (
   StopReason,
 )
 from extensions.business.container_apps.worker_app_runner import WorkerAppRunnerPlugin
+# The name of the file an app writes to ask for a publish.
+from extensions.business.container_apps.sync.constants import SYNC_REQUEST_FILE
+# The folder where the app leaves that file.
+from extensions.business.container_apps.sync.manager import volume_sync_dir
 
 
 def _patch_docker_module(client):
@@ -315,6 +321,14 @@ class TestLifecycleFirstLaunch(unittest.TestCase):
     plugin._handle_initial_launch()
     client.containers.run.assert_called_once()
 
+  def test_bare_docker_memory_limit_and_reservation_use_bytes(self):
+    plugin, client, _ = make_lifecycle_runner()
+    plugin._mem_limit = 512 * 1024 ** 2
+    plugin._handle_initial_launch()
+    kwargs = client.containers.run.call_args.kwargs
+    self.assertEqual(kwargs["mem_limit"], 512 * 1024 ** 2)
+    self.assertEqual(kwargs["mem_reservation"], (512 * 1024 ** 2) * 9 // 10)
+
   def test_state_transitions_to_running(self):
     plugin, _, _ = make_lifecycle_runner()
     plugin._handle_initial_launch()
@@ -550,20 +564,38 @@ class TestLifecycleRestart(unittest.TestCase):
     self.assertEqual(kwargs["name"], "car_test_stream_car_instance")
 
   def test_restart_revalidates_sync_config_before_start(self):
+    """A restart checks the SYNC block again before the start; one without a KEY leaves SYNC off, also on a node."""
+    # A runner whose app has crashed.
     plugin, client, _ = self._launch_and_crash()
-    plugin.cfg_sync = {"ENABLED": True, "KEY": "", "TYPE": "provider"}
+    # Its configuration read as on a node (each read of the block is a copy): SYNC enabled, but no KEY.
+    read_config_like_a_node(plugin, SYNC={"ENABLED": True, "KEY": "", "TYPE": "provider"})
+    # The system volume was provisioned.
     plugin._sync_unavailable = False
+    # The container the restart will start.
     new_container = make_mock_container()
+    # Docker hands it out at the next run.
     client.containers.run.return_value = new_container
 
+    # The restart on the mocked Docker, without the two steps that need a real system volume, recording the check.
     with _patch_docker_module(client), \
          patch.object(plugin, "_configure_system_volume"), \
          patch.object(plugin, "_recover_stale_processing"), \
          patch.object(plugin, "_validate_sync_config", wraps=plugin._validate_sync_config) as validate:
+      # The restart after the crash.
       plugin._restart_container(StopReason.CRASH)
 
+    # The check ran.
     validate.assert_called()
-    self.assertFalse(plugin.cfg_sync["ENABLED"])
+    # It refused the block with its red line, once.
+    self.assertEqual(
+      plugin.logged_messages.count("[sync] SYNC.ENABLED but SYNC.KEY missing/empty; disabling SYNC."), 1,
+    )
+    # SYNC is off on the plugin, though the stored block still says enabled (the node does not rewrite it).
+    self.assertEqual((plugin._sync_enabled(), plugin.config_data["SYNC"]["ENABLED"]), (False, True))
+    # The arguments the restarted container was started with.
+    _, kwargs = client.containers.run.call_args
+    # Its environment names no SYNC role.
+    self.assertNotIn("R1_SYNC_TYPE", kwargs["environment"])
 
 
 class TestWorkerAppRunnerLifecycle(unittest.TestCase):
@@ -767,24 +799,38 @@ class TestLifecycleStaleContainer(unittest.TestCase):
   """Test _ensure_no_stale_container()."""
 
   def test_removes_stale_running_container(self):
+    """A running container with the app's name is force-removed before a start, with its anonymous volumes."""
+    # An app with no container of its own yet.
     plugin, client, _ = make_lifecycle_runner()
+    # A container an earlier run left running under the app's name.
     stale = make_mock_container(status="running")
+    # Docker finds it by that name ...
     client.containers.get.side_effect = None
+    # ... and hands it over.
     client.containers.get.return_value = stale
 
+    # The guard that runs before every start.
     plugin._ensure_no_stale_container()
 
-    stale.remove.assert_called_once_with(force=True)
+    # Forced, because it runs; with its volumes (v), which no later container would ever get.
+    stale.remove.assert_called_once_with(force=True, v=True)
 
   def test_removes_stale_exited_container(self):
+    """A stopped container with the app's name is removed before a start, with its anonymous volumes."""
+    # An app with no container of its own yet.
     plugin, client, _ = make_lifecycle_runner()
+    # A container a killed node left, stopped, in the Docker store that is kept across node restarts.
     stale = make_mock_container(status="exited")
+    # Docker finds it by that name ...
     client.containers.get.side_effect = None
+    # ... and hands it over.
     client.containers.get.return_value = stale
 
+    # The guard that runs before every start.
     plugin._ensure_no_stale_container()
 
-    stale.remove.assert_called_once_with(force=True)
+    # With its volumes (v): without that, each node restart left one more volume per app in the kept store.
+    stale.remove.assert_called_once_with(force=True, v=True)
 
   def test_noop_when_no_stale_container(self):
     plugin, client, _ = make_lifecycle_runner()
@@ -1647,6 +1693,28 @@ class TestImagePullBackoff(unittest.TestCase):
     self.assertIsNone(result)
     client.images.pull.assert_not_called()
 
+  def test_an_untracked_app_keeps_its_uncapped_pull_pause(self):
+    """
+    An app outside Deeploy keeps the pull pacing it had: its pause is not capped at one hour.
+
+    The one-hour ceiling is for tracked deployments, which never give up; an untracked app still stops after
+    IMAGE_PULL_MAX_RETRIES (`test_max_retries_gives_up`) and keeps the doubling pause on the way there.
+    """
+    # A clock.
+    clock = {"now": 100}
+    # An untracked app.
+    plugin, client, _ = make_lifecycle_runner()
+    # It reads that clock.
+    plugin.time = lambda: clock["now"]
+    # The registry does not answer.
+    client.images.pull.side_effect = Exception("registry unreachable")
+    # Nine failures in a row so far.
+    plugin._image_pull_failures = 9
+    # The tenth fails too.
+    self.assertIsNone(plugin._pull_image_from_registry())
+    # 3-6 hours to the next attempt, as before: more than the one hour a tracked deployment waits at most.
+    self.assertGreater(plugin._next_image_pull_time - clock["now"], 3600)
+
   def test_no_max_backoff_cap(self):
     """Backoff should grow without limit (no artificial cap)."""
     plugin, _, _ = make_lifecycle_runner()
@@ -1657,6 +1725,306 @@ class TestImagePullBackoff(unittest.TestCase):
 
     expected_min = plugin.cfg_image_pull_backoff_base * (2 ** 19)  # 1,048,576 seconds
     self.assertGreaterEqual(backoff, expected_min)
+
+
+# ===========================================================================
+# The per-set sync secret in a job's configured ENV
+# ===========================================================================
+
+class TestSyncSecretConfig(unittest.TestCase):
+  """How _validate_sync_config and the env build treat ENV.R1EN_SYNC_SECRET and a refused SYNC block.
+
+  Every runner here reads ``SYNC`` and ``ENV`` through the core's ``cfg_`` getters, as on a node: each read of
+  a block is a copy, so a refusal that only wrote into such a copy would leave SYNC on and fail these tests.
+  """
+
+  # A secret in the accepted form: 64 lowercase hex characters (a fixed test value).
+  VALID = "0123456789abcdef" * 4
+
+  def setUp(self):
+    """Create the folder the runners of one test keep their data in.
+
+    Returns
+    -------
+    None
+    """
+    # Removed in tearDown.
+    self._tmp = tempfile.TemporaryDirectory()
+
+  def tearDown(self):
+    """Remove that folder.
+
+    Returns
+    -------
+    None
+    """
+    # Everything the runners wrote.
+    self._tmp.cleanup()
+
+  def _runner(self, env, role="provider"):
+    """Build a runner with SYNC enabled and the given configured ENV, recording its log lines with their color.
+
+    Parameters
+    ----------
+    env : dict
+      The job's configured ``ENV`` (``cfg_env``).
+    role : str, optional
+      ``SYNC.TYPE``: ``provider`` (default) or ``consumer``.
+
+    Returns
+    -------
+    tuple
+      ``(plugin, lines)``; ``lines`` is the list of ``(color, text)`` the plugin logs from now on. The runner
+      reads ``SYNC`` and ``ENV`` through the core's getters; a test changes them in ``plugin.config_data``.
+
+    Examples
+    --------
+    >>> plugin, lines = self._runner({"R1EN_SYNC_SECRET": self.VALID})
+    >>> plugin._validate_sync_config()
+    >>> plugin._sync_enabled()
+    True
+    """
+    # A real runner on a mocked Docker client.
+    plugin, _client, _container = make_lifecycle_runner()
+    # A fresh, enabled SYNC block and the job's configured ENV, read as on a node (`plugin.config_data` holds them).
+    read_config_like_a_node(plugin, SYNC={"ENABLED": True, "KEY": "set-key-1", "TYPE": role}, ENV=dict(env))
+    # The system volume was provisioned.
+    plugin._sync_unavailable = False
+    # A node clock past the first store refresh interval (60 s): a consumer tick that runs would refresh the store.
+    plugin.time = lambda: 1000.0
+    # The data folder the env build's local-override step reads.
+    plugin.get_data_folder = lambda: self._tmp.name
+    # Local overrides are available.
+    plugin._env_overrides_unavailable = False
+    # Their manager is created on first use.
+    plugin._env_overrides_manager = None
+    # Each logged line with its color, to tell the red refusal from the green "SYNC enabled" line.
+    lines = []
+    # The plugin's logger.
+    plugin.P = lambda msg, color=None, **_kwargs: lines.append((color, str(msg)))
+    # R1FS, which a publish or an apply would call.
+    plugin.r1fs = MagicMock()
+    # The three chain-store calls of a publish or a consumer tick.
+    plugin.chainstore_hset, plugin.chainstore_hget, plugin.chainstore_hsync = MagicMock(), MagicMock(), MagicMock()
+    # The runner and what it logs.
+    return plugin, lines
+
+  def test_invalid_sync_secret_disables_sync(self):
+    """A secret in any other form than 64 lowercase hex disables SYNC on the job, with no shared-key fallback."""
+    # Wrong forms; three start with a full valid secret, so only a whole-string check refuses them.
+    invalid = [
+      ("empty string", ""),
+      ("32 x a", "a" * 32),
+      ("63 characters", self.VALID[:63]),
+      ("65 characters", self.VALID + "0"),
+      ("valid plus a newline", self.VALID + "\n"),
+      ("valid plus a letter", self.VALID + "x"),
+      ("uppercase", self.VALID.upper()),
+      ("int", 1234567890123456),
+    ]
+    # Both roles.
+    for role in ("provider", "consumer"):
+      # Every wrong form.
+      for label, secret in invalid:
+        # A failure names the role and the form.
+        with self.subTest(role=role, secret=label):
+          # A job whose ENV holds the malformed secret.
+          plugin, lines = self._runner({"R1EN_SYNC_SECRET": secret, "APP_VAR": "1"}, role=role)
+          # The check that runs at init and at every restart.
+          plugin._validate_sync_config()
+          # The red line names the variable.
+          self.assertIn(
+            ("r", "[sync] R1EN_SYNC_SECRET must be 64 lowercase hex characters; disabling SYNC."), lines,
+          )
+          # The lines that report SYNC as enabled.
+          enabled_lines = [text for _color, text in lines if "SYNC enabled" in text]
+          # SYNC is off by the plugin's own answer (a node does not rewrite the block), and no such line exists.
+          self.assertEqual((plugin._sync_enabled(), enabled_lines), (False, []))
+          if secret != "":
+            # No line repeats the value, not even its first 8 characters.
+            self.assertEqual([text for _color, text in lines if str(secret)[:8] in text], [])
+          # The real env build.
+          plugin._setup_env_and_ports()
+          # The injection that follows every build.
+          plugin._inject_sync_env_vars()
+          # Which of the set's three variables and the app's own one the app's environment holds.
+          held = [name for name in ("R1_SYNC_KEY", "R1_SYNC_TYPE", "R1EN_SYNC_SECRET", "APP_VAR") if name in plugin.env]
+          # No set KEY and no role for the app, no secret; the app's own variable is kept with its value.
+          self.assertEqual((held, plugin.env["APP_VAR"]), (["APP_VAR"], "1"))
+          # No manager for this job.
+          self.assertIsNone(plugin._ensure_sync_manager())
+          # A provider tick.
+          plugin._sync_provider_tick(1000.0)
+          # A consumer tick.
+          plugin._sync_consumer_tick(1000.0)
+          # What a publish, a fetch, a store write, a store read and a store refresh would have called.
+          mocks = [plugin.r1fs.add_file, plugin.r1fs.get_file, plugin.chainstore_hset, plugin.chainstore_hget,
+                   plugin.chainstore_hsync]
+          # Nothing was published or fetched under any key, and the store was not written, read or refreshed.
+          self.assertEqual([mock.call_count for mock in mocks], [0, 0, 0, 0, 0])
+
+  def test_valid_sync_secret_keeps_sync_enabled(self):
+    """A 64-lowercase-hex secret keeps SYNC enabled; the green line names the archive format, not the value."""
+    # A job whose ENV holds a well-formed secret.
+    plugin, lines = self._runner({"R1EN_SYNC_SECRET": self.VALID, "APP_VAR": "1"})
+    # The check that runs at init and at every restart.
+    plugin._validate_sync_config()
+    # The green "SYNC enabled" lines.
+    greens = [text for color, text in lines if color == "g" and "SYNC enabled" in text]
+    # SYNC stays on, with one such line.
+    self.assertEqual((plugin._sync_enabled(), len(greens)), (True, 1))
+    # It names the set format.
+    self.assertIn("encryption=r1fs-set-v1", greens[0])
+    # No line holds the secret, not even its first 8 characters.
+    self.assertEqual([text for _color, text in lines if self.VALID[:8] in text], [])
+    # The real env build copies the configured variable into the container env.
+    plugin._setup_env_and_ports()
+    # It is there before the injection.
+    self.assertEqual(plugin.env["R1EN_SYNC_SECRET"], self.VALID)
+    # The injection that follows every build.
+    plugin._inject_sync_env_vars()
+    # The KEY is exported, the secret's variable is gone, the app's own variable is kept.
+    self.assertEqual(
+      (plugin.env["R1_SYNC_KEY"], "R1EN_SYNC_SECRET" in plugin.env, plugin.env["APP_VAR"]),
+      ("set-key-1", False, "1"),
+    )
+    # No other variable holds the secret's value.
+    self.assertNotIn(self.VALID, [str(value) for value in plugin.env.values()])
+    # The node still reads it from the config.
+    self.assertEqual(plugin.cfg_sync_secret, self.VALID)
+    # A job without the variable, or with a JSON null.
+    for env in ({"APP_VAR": "1"}, {"R1EN_SYNC_SECRET": None}):
+      # A failure names the ENV.
+      with self.subTest(cfg_env=env):
+        # A job of a set that uses the shared key.
+        plugin, lines = self._runner(env)
+        # The same check.
+        plugin._validate_sync_config()
+        # The green "SYNC enabled" lines.
+        greens = [text for color, text in lines if color == "g" and "SYNC enabled" in text]
+        # SYNC stays on, with one such line.
+        self.assertEqual((plugin._sync_enabled(), len(greens)), (True, 1))
+        # It names the shared-key format.
+        self.assertIn("encryption=r1fs-default", greens[0])
+
+  def test_refused_sync_config_stays_off_on_a_node(self):
+    """Each refusal (no KEY, wrong TYPE, malformed secret) leaves SYNC off on a node: no tick work, no SYNC env."""
+    # The three refusals: the change to a valid SYNC block, the job's ENV, and the red line that names the reason.
+    refusals = [
+      ("no KEY", {"KEY": ""}, {}, "[sync] SYNC.ENABLED but SYNC.KEY missing/empty; disabling SYNC."),
+      ("wrong TYPE", {"TYPE": "mirror"}, {},
+       "[sync] SYNC.TYPE must be 'provider' or 'consumer' (got 'mirror'); disabling SYNC."),
+      ("malformed secret", {}, {"R1EN_SYNC_SECRET": "not-64-hex"},
+       "[sync] R1EN_SYNC_SECRET must be 64 lowercase hex characters; disabling SYNC."),
+    ]
+    # Both roles (the wrong TYPE replaces the role, so that refusal runs twice with the same block).
+    for role in ("provider", "consumer"):
+      # Every refusal.
+      for label, sync_change, env, red_line in refusals:
+        # A failure names the role and the refusal; each case keeps its data in a folder of its own.
+        with self.subTest(role=role, refusal=label), tempfile.TemporaryDirectory() as data_folder:
+          # A job with an enabled SYNC block and its own variable, read as on a node.
+          plugin, lines = self._runner({"APP_VAR": "1", **env}, role=role)
+          # This case's data folder, so a request another case left cannot be seen here.
+          plugin.get_data_folder = lambda: data_folder
+          # The refused field, written into the node's configuration of the plugin.
+          plugin.config_data["SYNC"].update(sync_change)
+          # The folder the app writes its publish request to.
+          request_dir = volume_sync_dir(plugin)
+          # It exists, as after the system volume was provisioned.
+          request_dir.mkdir(parents=True)
+          # A publish request the app left there.
+          (request_dir / SYNC_REQUEST_FILE).write_text('{"archive_paths": ["/app/data"]}')
+          # The check that runs at init and at every restart.
+          plugin._validate_sync_config()
+          # Its red line, once, is the only red line, and no line reports SYNC as enabled.
+          self.assertEqual(
+            ([text for color, text in lines if color == "r"], [text for _c, text in lines if "SYNC enabled" in text]),
+            ([red_line], []),
+          )
+          # SYNC is off on the plugin; the stored block still says enabled, the node does not rewrite it.
+          self.assertEqual((plugin._sync_enabled(), plugin.config_data["SYNC"]["ENABLED"]), (False, True))
+          # The real env build.
+          plugin._setup_env_and_ports()
+          # The injection that follows every build.
+          plugin._inject_sync_env_vars()
+          # The app gets no SYNC key, role or secret; it keeps the system volume and its own variable.
+          self.assertEqual(
+            ("R1_SYNC_KEY" in plugin.env, "R1_SYNC_TYPE" in plugin.env, "R1EN_SYNC_SECRET" in plugin.env,
+             plugin.env["R1_SYSTEM_VOLUME"], plugin.env["APP_VAR"]),
+            (False, False, False, "/r1en_system", "1"),
+          )
+          # No manager for this job.
+          self.assertIsNone(plugin._ensure_sync_manager())
+          # A provider tick.
+          plugin._sync_provider_tick(1000.0)
+          # A consumer tick.
+          plugin._sync_consumer_tick(1000.0)
+          # Nothing was published or fetched, and the store was not written, read or refreshed.
+          self.assertEqual(
+            (plugin.r1fs.add_file.call_count, plugin.r1fs.get_file.call_count, plugin.chainstore_hset.call_count,
+             plugin.chainstore_hget.call_count, plugin.chainstore_hsync.call_count),
+            (0, 0, 0, 0, 0),
+          )
+          # The app's request was not claimed or answered: it is still the only file in the folder.
+          self.assertEqual([path.name for path in request_dir.iterdir()], [SYNC_REQUEST_FILE])
+          # The ticks logged nothing: the refusal's line is still the only line of the SYNC feature.
+          self.assertEqual([text for _color, text in lines if "[sync]" in text], [red_line])
+
+  def test_corrected_sync_config_turns_sync_back_on(self):
+    """A refused block is refused again at every check, and the check after the owner's correction turns SYNC on."""
+    # The red line of a malformed secret.
+    red_line = "[sync] R1EN_SYNC_SECRET must be 64 lowercase hex characters; disabling SYNC."
+    # A job whose ENV holds a malformed secret, read as on a node.
+    plugin, lines = self._runner({"R1EN_SYNC_SECRET": "not-64-hex"}, role="consumer")
+    # The check at init.
+    plugin._validate_sync_config()
+    # The check of a restart with the same configuration.
+    plugin._validate_sync_config()
+    # SYNC is off after both, with one red line per check and no "SYNC enabled" line.
+    self.assertEqual(
+      (plugin._sync_enabled(), lines.count(("r", red_line)), [text for _c, text in lines if "SYNC enabled" in text]),
+      (False, 2, []),
+    )
+    # The owner corrects the secret: the node replaces the plugin's configuration with the edited one.
+    plugin.config_data = {"SYNC": dict(plugin.config_data["SYNC"]), "ENV": {"R1EN_SYNC_SECRET": self.VALID}}
+    # The check of the restart that follows a configuration edit.
+    plugin._validate_sync_config()
+    # The green "SYNC enabled" lines.
+    greens = [text for color, text in lines if color == "g" and "SYNC enabled" in text]
+    # SYNC is on, with one green line and no further red line.
+    self.assertEqual((plugin._sync_enabled(), len(greens), lines.count(("r", red_line))), (True, 1, 2))
+    # The real env build.
+    plugin._setup_env_and_ports()
+    # The injection that follows every build.
+    plugin._inject_sync_env_vars()
+    # The app now gets the set's KEY and its role, and still not the secret.
+    self.assertEqual(
+      (plugin.env["R1_SYNC_KEY"], plugin.env["R1_SYNC_TYPE"], "R1EN_SYNC_SECRET" in plugin.env),
+      ("set-key-1", "consumer", False),
+    )
+
+  def test_refusal_holds_when_a_restart_fails_before_the_check(self):
+    """A restart that fails after its state reset and before the SYNC check leaves a refused block refused."""
+    # A job whose ENV holds a malformed secret, read as on a node.
+    plugin, _lines = self._runner({"R1EN_SYNC_SECRET": "not-64-hex"}, role="consumer")
+    # The check at init refuses the block.
+    plugin._validate_sync_config()
+    # SYNC is off.
+    self.assertFalse(plugin._sync_enabled())
+    # A restart on the mocked Docker whose registry login fails: the state reset has run, the SYNC check has not.
+    with _patch_docker_module(plugin.docker_client), \
+         patch.object(plugin, "_login_to_registry", side_effect=RuntimeError("registry login failed")):
+      # The failure reaches the caller.
+      with self.assertRaises(RuntimeError):
+        # The restart, with nothing to clean up first.
+        plugin._restart_container(StopReason.CRASH, cleanup_first=False)
+    # The reset did not turn SYNC back on.
+    self.assertFalse(plugin._sync_enabled())
+    # A consumer tick of the loop that keeps running after the failed restart.
+    plugin._sync_consumer_tick(1000.0)
+    # It did not refresh or read the store.
+    self.assertEqual((plugin.chainstore_hsync.call_count, plugin.chainstore_hget.call_count), (0, 0))
 
 
 if __name__ == "__main__":

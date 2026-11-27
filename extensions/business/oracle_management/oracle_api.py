@@ -35,6 +35,9 @@ TODO LEDGER :
 
 """
 
+from threading import Event, Thread
+from time import monotonic
+
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 from ratio1.const.base import dAuth
 
@@ -65,7 +68,11 @@ NODE_KEY_ROTATIONS_SYNC_TIMEOUT = 5
 _CONFIG = {
   **BasePlugin.CONFIG,
 
-  'PORT': None,
+  # A fixed port instead of a drawn one. With the generator seeded the same way on every node, this
+  # app drew 30835 everywhere; the value is kept, so whatever reaches the app on that local port (a
+  # tunnel ingress set to it) still does once the draws differ per node. A fixed port that is taken
+  # is retried every 5 s; it is not drawn again.
+  'PORT': 30835,
   # 'ASSETS': 'plugins/business/fastapi/epoch_manager',
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -90,6 +97,8 @@ class OracleApiPlugin(BasePlugin):
     # claim signed without the floor cannot be redone.
     self.__revoked_nodes = {}
     self.__last_node_key_rotations_sync = 0
+    self.__rotation_stop = Event()  # Cancels the remaining peers when this plugin is closed.
+    self.__rotation_thread = None  # Only the plugin loop schedules sync rounds.
     if self.evm_network == dAuth.EvmNetData.MAINNET:
       self.__revoked_nodes = parse_revoked_node_addresses(
         self.bc, self.os_environ.get(DAUTH_REVOKED_NODES_ENV_KEY)
@@ -138,29 +147,92 @@ class OracleApiPlugin(BasePlugin):
 
   def __maybe_sync_node_key_rotations(self):
     """Merge the `NODE_KEY_ROTATIONS` hash from every dAuth server (mainnet only)."""
-    if not self.__revoked_nodes:
+    if not self.__revoked_nodes or self.__rotation_stop.is_set():
       return
     now = self.time()
     if now - self.__last_node_key_rotations_sync < NODE_KEY_ROTATIONS_SYNC_INTERVAL:
       return
+    if self.__rotation_thread is not None and self.__rotation_thread.is_alive():
+      return  # A slow round keeps sole ownership even after the nominal interval.
     self.__last_node_key_rotations_sync = now
-    try:
-      peers = get_dauth_registry_internal_peers(self)
-    except Exception as exc:
-      self.P(f"Could not list dAuth servers to sync node key rotations: {exc}", color='y')
+    if not callable(getattr(self, 'chainstore_hsync_from_peer', None)):
+      # A rolling downgrade restores the legacy plugin-thread execution and its thread-bound timers.
+      self.__sync_node_key_rotations(self.__rotation_stop)
       return
-    for peer in peers:
-      if peer == self.bc.address:
-        continue
-      try:
-        self.chainstore_hsync(
-          hkey=NODE_KEY_ROTATIONS_CSTORE_HKEY, extra_peers=[peer],
-          include_default_peers=False, include_configured_peers=False,
-          timeout=NODE_KEY_ROTATIONS_SYNC_TIMEOUT,
-        )
-      except Exception as exc:
-        self.P(f"Could not sync node key rotations from {peer}: {exc}", color='y')
-    return
+    self.__rotation_thread = Thread(target=self.__sync_node_key_rotations, args=(self.__rotation_stop,), name="oracle-key-rotations", daemon=True)
+    self.__rotation_thread.start()  # Discovery, network waits and persistence run outside endpoint dispatch.
+
+  def __sync_node_key_rotations(self, stop):
+    """Catch up each reachable dAuth replica within one refresh interval.
+
+    Stop between peers on shutdown and preserve independent, additive peer merges.
+
+    Parameters
+    ----------
+    stop : threading.Event
+      This round's lifecycle event. A later initialization has a different event.
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    The plugin loop schedules this worker when its refresh interval elapses.
+    """
+    started = monotonic()
+    merged = failures = 0
+    try:
+      peers = get_dauth_registry_internal_peers(self)  # Discovery can itself wait on chain and identity resolution.
+      for peer in peers:
+        remaining = NODE_KEY_ROTATIONS_SYNC_INTERVAL - (monotonic() - started)
+        if stop.is_set() or remaining <= 0:
+          break  # No new work after shutdown or the round deadline.
+        if peer == self.bc.address:
+          continue
+        try:
+          timeout = min(NODE_KEY_ROTATIONS_SYNC_TIMEOUT, remaining)
+          sync_peer = getattr(self, 'chainstore_hsync_from_peer', None)
+          if callable(sync_peer):
+            result = sync_peer(NODE_KEY_ROTATIONS_CSTORE_HKEY, peer, timeout)
+          else:
+            # Only reached on the main plugin thread with an older Core.
+            result = self.chainstore_hsync(
+              hkey=NODE_KEY_ROTATIONS_CSTORE_HKEY, extra_peers=[peer],
+              include_default_peers=False, include_configured_peers=False, timeout=timeout,
+            )
+          merged += result['merged_fields']  # Each peer may contribute unique rotation records.
+        except Exception as exc:
+          failures += 1
+          self.P(f"Could not sync node key rotations from {peer}: {exc}", color='y')
+    except Exception as exc:
+      failures += 1
+      self.P(f"Could not list dAuth servers to sync node key rotations: {exc}", color='y')
+    finally:
+      self.P(f"Node key rotation sync finished in {monotonic()-started:.2f}s: {merged} fields merged, {failures} failures.")
+
+  def on_close(self):
+    """Stop scheduling rotation work before the web plugin closes.
+
+    A peer already in flight has its bounded network wait. Registry discovery
+    observes the stop before scheduling a peer even if its transport finishes late.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    Called by the plugin lifecycle on shutdown.
+    """
+    self.__rotation_stop.set()
+    if self.__rotation_thread is not None:
+      self.__rotation_thread.join(timeout=NODE_KEY_ROTATIONS_SYNC_TIMEOUT + 1)
+    super().on_close()
 
 
   def __sign(self, data):
@@ -331,7 +403,89 @@ class OracleApiPlugin(BasePlugin):
       for epoch, val in zip(epochs, selected)
     ]
 
-  def __get_node_epochs(self, node_addr: str, start_epoch: int = 1, end_epoch: int = None, include_bc_info: bool = False):
+  def __check_served_epoch(self, node_eth_address, epoch, served, stored):
+    """
+    Check a single-epoch availability about to be served against the stored one.
+
+    `node_epoch` and `node_last_epoch` read the served value through `__get_node_epochs`, which
+    applies the revoked-key floor, and read the stored value again without it. The two must be
+    equal, with one exception the floor itself makes: a revoked node key is served
+    `REVOKED_FLOOR_VALUE` in the floor epochs. Without that exception such a request failed the
+    check whenever the stored value was lower, and was answered with an error.
+
+    Parameters
+    ----------
+    node_eth_address : str
+      The ETH address of the node, as `__get_node_epochs` returned it.
+    epoch : int
+      The epoch that was read.
+    served : int
+      The availability the endpoint is about to answer.
+    stored : int
+      The availability the epoch manager holds for that epoch.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    AssertionError
+      When the two values differ and the floor does not explain it; the text names the epoch
+      and both values.
+
+    Notes
+    -----
+    The floor's eligibility rule (availability in `REVOKED_FLOOR_ELIGIBLE_EPOCHS`) is not
+    checked again: it needs the node's whole history, which only `__get_node_epochs` reads. A
+    revoked key that is not eligible is served its stored value, so the equality covers it; the
+    check is weaker than the floor rule only for such a key served exactly the floor value.
+
+    Examples
+    --------
+    >>> self.__check_served_epoch("0xREVOKED", 530, 255, 0)   # the floor: passes
+    >>> self.__check_served_epoch("0xOTHER", 530, 255, 0)
+    Traceback (most recent call last):
+    AssertionError: Epoch 530: served 255, stored 0.
+    """
+    # The one difference the floor makes: the floor value, in a floor epoch, for a revoked key.
+    floored = (
+      served == REVOKED_FLOOR_VALUE and REVOKED_FLOOR_FIRST_EPOCH <= epoch <= REVOKED_FLOOR_LAST_EPOCH
+      and node_eth_address.lower() in self.__revoked_nodes
+    )
+    # Any other difference is still an error, and the text now says which values differ.
+    assert served == stored or floored, f"Epoch {epoch}: served {served}, stored {stored}."
+    return
+
+  def __read_stats(self, node_addrs=None, online_only=False):
+    """Read published metadata with compatibility for a rolling Core downgrade.
+
+    An older Core can still answer the existing endpoint contract, using its
+    synchronous statistics scan until its cache-only interface becomes available.
+
+    Parameters
+    ----------
+    node_addrs : iterable of str, optional
+      Internal addresses needed by one rewards request.
+    online_only : bool, optional
+      Select the existing paginated online view.
+
+    Returns
+    -------
+    dict
+      Metadata from a single statistics generation.
+
+    Examples
+    --------
+    A sixteen-license request takes one view before calculating any row.
+    """
+    manager = self.netmon.epoch_manager
+    read_cached = getattr(manager, 'get_cached_stats', None)
+    if read_cached is not None:
+      return read_cached(node_addrs=node_addrs, online_only=online_only)
+    return manager.get_stats(online_only=online_only)  # Older Core retains its original refresh behavior.
+
+  def __get_node_epochs(self, node_addr: str, start_epoch: int = 1, end_epoch: int = None, include_bc_info: bool = False, stats=None):
     """
     Get the epochs availabilities for a given node.
 
@@ -348,6 +502,9 @@ class OracleApiPlugin(BasePlugin):
 
     include_bc_info : bool
         If True, the blockchain license info will be included in the response.
+    stats : dict, optional
+        Metadata generation captured for this batch. Availability and signatures
+        are calculated from authoritative epoch state for each request.
 
     Returns
     -------
@@ -413,9 +570,9 @@ class OracleApiPlugin(BasePlugin):
       )
       if epochs_vals is None:
         error_msg = f"No epochs found for node {node_addr} in the range {start_epoch}-{end_epoch}"
-        stats, resources = {}, {}
       else:
-        stats = self.netmon.epoch_manager.get_stats()
+        if stats is None:  # A single-node request reads only its own metadata.
+          stats = self.__read_stats(node_addrs=[node_addr])
         resources = stats.get(node_addr, {}).get("resources", {})
         tags = stats.get(node_addr, {}).get("tags", [])
       # end if epochs_vals is None
@@ -510,7 +667,7 @@ class OracleApiPlugin(BasePlugin):
     #     "eth_address" : self.bc.node_address_to_eth_address(x),
     #   } for x in nodes 
     # }    
-    nodes = self.netmon.epoch_manager.get_stats(display=False, online_only=False)
+    nodes = self.__read_stats()
     response = self.__get_response({
       'nodes': nodes,
     })
@@ -613,7 +770,7 @@ class OracleApiPlugin(BasePlugin):
     #   if self.netmon.network_node_simple_status(addr=x) == self.const.DEVICE_STATUS_ONLINE
     # }
     start = self.time()
-    all_nodes = self.netmon.epoch_manager.get_stats(display=False, online_only=True)
+    all_nodes = self.__read_stats(online_only=True)
     elapsed = self.time() - start
     error = all_nodes.pop("error", None)
     nodes = all_nodes # temp variable
@@ -775,7 +932,11 @@ class OracleApiPlugin(BasePlugin):
     include_bc_info: bool = False,
   ):
     """
-    Returns the list of epochs availabilities for a list of given nodes each with start-end epochs.
+    Return signed epoch availabilities for the requested nodes and ranges.
+
+    Resource and tag metadata comes from the last completed NetMon generation.
+    Before the first refresh these fields are empty. Epoch history, validity and
+    the signature for each claim are evaluated when the request is served.
 
     Parameters
     ----------
@@ -816,6 +977,7 @@ class OracleApiPlugin(BasePlugin):
     
     all_nodes = {}
     request_start = self.time()
+    resolved = {}  # Validate the entire batch before signing or reading its metadata.
     for eth_node_addr, epochs in dct_eth_nodes_request.items():
       if not isinstance(epochs, list) or len(epochs) != 2:
         raise ValueError(f"Invalid epochs for node {eth_node_addr}. Please provide a list with [start_epoch, end_epoch].")
@@ -826,11 +988,16 @@ class OracleApiPlugin(BasePlugin):
       if epochs[0] > epochs[1]:
         raise ValueError(f"Start epoch {epochs[0]} is greater than end epoch {epochs[1]} for node {eth_node_addr}.")
       
-      node_addr_internal = self.__eth_to_internal(eth_node_addr)
+      resolved[eth_node_addr] = self.__eth_to_internal(eth_node_addr)
+    # A batch uses a single finished generation even if NetMon publishes during signing.
+    stats = self.__read_stats(node_addrs=resolved.values())
+    for eth_node_addr, node_addr_internal in resolved.items():
+      epochs = dct_eth_nodes_request[eth_node_addr]
       node_data = self.__get_node_epochs(
         node_addr_internal, 
         start_epoch=epochs[0], 
         end_epoch=epochs[1],
+        stats=stats,
         include_bc_info=include_bc_info
       )
       all_nodes[eth_node_addr] = node_data
@@ -948,6 +1115,23 @@ class OracleApiPlugin(BasePlugin):
 
         - epoch_prc: float
             The availability score of the node in the epoch as a percentage (between 0 and 1).
+
+        For a revoked node key that the floor covers, `epoch_val` in a floor epoch is
+        `REVOKED_FLOOR_VALUE`, the value the range endpoints serve and sign.
+
+    Raises
+    ------
+    ValueError
+        When neither `eth_node_addr` nor `node_addr` is given.
+    AssertionError
+        When the value to serve differs from the stored one and the revoked-key floor does
+        not explain it (see `__check_served_epoch`).
+
+    Examples
+    --------
+    >>> # a revoked key the floor covers, stored value 0 in epoch 530
+    >>> self.node_epoch(epoch=530, node_addr="0xai_node")["epoch_val"]
+    255
     """
     if eth_node_addr is not None:
       node_addr = self.__eth_to_internal(eth_node_addr)
@@ -958,7 +1142,8 @@ class OracleApiPlugin(BasePlugin):
     if isinstance(data.get('epochs_vals'), list) and len(data['epochs_vals']) > 0:
       epoch_val = data['epochs_vals'][0]
       epoch_val_direct = self.netmon.epoch_manager.get_node_epoch(node_addr, epoch)
-      assert epoch_val == epoch_val_direct
+      # The self-check accepts the revoked-key floor: a floored value no longer fails the request.
+      self.__check_served_epoch(data['node_eth_address'], epoch, epoch_val, epoch_val_direct)
       response = self.__get_response({
         'epoch_id': epoch,
         'epoch_val': epoch_val,
@@ -1006,6 +1191,22 @@ class OracleApiPlugin(BasePlugin):
         - last_epoch_prc: float
             The availability score of the node in the last epoch as a percentage (between 0 and 1).
 
+        For a revoked node key that the floor covers, `last_epoch_val` is `REVOKED_FLOOR_VALUE`
+        while the last synced epoch is a floor epoch, the value the range endpoints serve and sign.
+
+    Raises
+    ------
+    ValueError
+        When neither `eth_node_addr` nor `node_addr` is given.
+    AssertionError
+        When the value to serve differs from the stored one and the revoked-key floor does
+        not explain it (see `__check_served_epoch`).
+
+    Examples
+    --------
+    >>> # a revoked key the floor covers, stored value 0, last synced epoch 538
+    >>> self.node_last_epoch(node_addr="0xai_node")["last_epoch_val"]
+    255
     """
     if eth_node_addr is not None:
       node_addr = self.__eth_to_internal(eth_node_addr)
@@ -1017,7 +1218,8 @@ class OracleApiPlugin(BasePlugin):
     if isinstance(data.get('epochs_vals'), list) and len(data['epochs_vals']) > 0:
       epoch_val = data['epochs_vals'][0]
       epoch_val_direct = self.netmon.epoch_manager.get_node_epoch(node_addr, epoch)
-      assert epoch_val == epoch_val_direct
+      # The self-check accepts the revoked-key floor: a floored value no longer fails the request.
+      self.__check_served_epoch(data['node_eth_address'], epoch, epoch_val, epoch_val_direct)
       response = self.__get_response({
         'last_epoch_id': epoch,
         'last_epoch_val': epoch_val,

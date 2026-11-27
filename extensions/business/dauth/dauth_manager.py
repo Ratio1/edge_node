@@ -22,6 +22,9 @@ WHITELIST (oracles)
 """
 # The call path of a failed secret reconciliation is logged (function names only).
 import traceback
+# The registry read is timed on the monotonic clock, the one the SDK times its memory of a failed read on: on the
+# wall clock, a forward step during a failed read lengthened the retry's wait by three times the step.
+from time import monotonic
 
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
@@ -35,9 +38,19 @@ from extensions.business.dauth.dauth_registry import (
   dauth_registry_write_kwargs,
   load_dauth_registry_snapshot,
 )
+# The type of a refusal that is dAuth's verdict on the requester; get_secrets logs it in yellow.
+# The label says which sender and job a refused request names. Imported on a line of its own,
+# apart from the block above.
+from extensions.business.dauth.dauth_mixin import DauthRefused, dauth_request_label
 from extensions.business.dauth.dauth_revoked_nodes import _DauthRevokedNodesMixin
 
-from extensions.business.dauth.deployment_secrets import _DauthDeploymentSecretsMixin
+# The custody mixin, and the one failure of a reconciliation whose cause the caller is told.
+from extensions.business.dauth.deployment_secrets import _DauthDeploymentSecretsMixin, DeploymentSecretRecordTooLarge
+# The name of the reason field of a refusal and its one code, shared with the client that reads them.
+from ratio1.const.base import dAuth
+# How many times a failed registry read's time the SDK answers that read's error without a read; its public name,
+# which the SDK keeps for this caller (a private name could be renamed there and fail this plugin at import).
+from ratio1.bc.evm import ORACLE_REGISTRY_FAILURE_FACTOR
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 from extensions.business.deeploy.deeploy_job_mixin import _DeeployJobMixin
 
@@ -46,7 +59,11 @@ __VER__ = '0.3.5'
 _CONFIG = {
   **BasePlugin.CONFIG,
 
-  'PORT': None,
+  # A fixed port instead of a drawn one. With the generator seeded the same way on every node, this
+  # app drew 31731 everywhere; the value is kept, so whatever reaches the app on that local port (a
+  # tunnel ingress set to it) still does once the draws differ per node. A fixed port that is taken
+  # is retried every 5 s; it is not drawn again.
+  'PORT': 31731,
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   'REQUEST_TIMEOUT': 600,
@@ -220,10 +237,56 @@ class DauthManagerPlugin(
     return self._refresh_dauth_registry(force=True)
 
   def _refresh_dauth_registry(self, force=False):
+    """
+    Read the dAuth registry when a refresh is due and enable or disable this node's dAuth server by it.
+
+    A refresh is due every ``DAUTH_REGISTRY_REFRESH_INTERVAL`` seconds after a refresh that read the registry,
+    and after a failed read once ``DAUTH_REGISTRY_REFRESH_RETRY_INTERVAL`` seconds have passed or, if later, once
+    three times the failed read's time has passed (the SDK's ``ORACLE_REGISTRY_FAILURE_FACTOR``), both counted
+    from the end of the read. The read's time is taken on the monotonic clock, as the SDK takes it, so a step
+    of the wall clock during the read does not change it. The server is enabled when this node's address is in
+    the registry and the registry's peers resolve; a failed read disables it.
+
+    Parameters
+    ----------
+    force : bool, optional
+      True reads the registry whatever the time since the last refresh (the start-up check). Default False.
+
+    Returns
+    -------
+    bool
+      Whether this node's dAuth server is enabled after the call.
+
+    Notes
+    -----
+    The SDK answers every read of a registry within three times a failed read's time after that failure with
+    the error of that read, without a read. A retry inside that time failed without a read and paused the
+    server for another retry interval: a read that hung 20.2 s, retried 60 s after its start (40 s after it
+    failed), kept a dAuth server paused up to 99 s after its RPC endpoint answered again. Counted from the end
+    of the read and no sooner than the SDK reads again, the retry finds the endpoint as it is: such a server
+    resumes about 60 s after the failure, the SDK's memory being the floor (120 s for a read of 40 s). A
+    refresh that gets the remembered failure of another thread's read takes no time: it is tried again one
+    retry interval later, and again while that memory lasts.
+
+    The read's time was first the difference of two wall clock readings. A forward step of S seconds during a
+    failed read (an NTP step after boot) then paused the server for three times the read plus S: 1800 s for a
+    600 s step after a read of 0.13 s, whose memory in the SDK had ended within a second. On the monotonic
+    clock the wait is what it is without the step: the retry interval, 60 s, for that read.
+
+    Examples
+    --------
+    >>> plugin._refresh_dauth_registry(force=True)   # this node is registered and its peers resolve
+    True
+    """
     now = self.time()
+    # The read's start on the monotonic clock: its time decides the retry's wait after a failure, and a wall clock
+    # step during the read must not count as read time.
+    read_started = monotonic()
     last_refresh = getattr(self, "_last_dauth_registry_refresh", None)
     refresh_interval = (
-      self.cfg_dauth_registry_refresh_retry_interval
+      # After a failed read, the retry interval or, if longer, as long as the SDK answers that read's error from
+      # its memory: a retry inside it fails without a read. Before, only the retry interval, from the read's start.
+      max(self.cfg_dauth_registry_refresh_retry_interval, ORACLE_REGISTRY_FAILURE_FACTOR * self._dauth_registry_read_seconds)
       if getattr(self, "_dauth_registry_refresh_failed", False)
       else self.cfg_dauth_registry_refresh_interval
     )
@@ -235,7 +298,6 @@ class DauthManagerPlugin(
       return self._is_dauth_server_enabled()
     # endif
 
-    self._last_dauth_registry_refresh = now
     previous_enabled = getattr(self, "_dauth_server_enabled", None)
     previous_eth_oracles = getattr(self, "_dauth_registry_eth_oracles", None)
 
@@ -250,6 +312,12 @@ class DauthManagerPlugin(
       error = str(e)
     # end try
 
+    # The next refresh is timed from the end of this read, no longer from its start: a read that hangs 20 s ends
+    # a third of the way into a retry interval counted from its start.
+    self._last_dauth_registry_refresh = self.time()
+    # How long the read took, for the retry after a failed one, on the monotonic clock as the SDK counts it. On the
+    # wall clock, a 600 s forward step during a failed read paused the server 1800 s instead of 60 s.
+    self._dauth_registry_read_seconds = monotonic() - read_started
     message = None if enabled else error or "current node is not registered as a dAuth oracle"
     self._dauth_registry_eth_oracles = eth_oracles if enabled else None
     self._dauth_registry_internal_peers = peers if enabled else None
@@ -371,12 +439,33 @@ class DauthManagerPlugin(
     return
 
   def process(self):
+    """
+    The end of each plugin lap: sync the job-secret namespaces when due and write pending unlicensed tries.
+
+    On a registered dAuth oracle each lap syncs the two job-secret namespaces from the dAuth registry peers
+    once per ``DAUTH_JOB_SECRETS_HSYNC_INTERVAL`` and writes at most one pending record of a revoked node that
+    asked without a license. On any other node nothing is done.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    The periodic log of every node's request trace is switched off here (the ``if False`` below). dAuth
+    tracks no endpoint, so it has no trace to write either.
+
+    Examples
+    --------
+    >>> plugin.process()   # called by the plugin loop after the lap's queued requests
+    """
     self._maybe_hsync_dauth_job_secrets()
     if self._is_dauth_server_enabled():
       self._maybe_publish_dauth_revoked_unlicensed_tries()
     # TODO: this will be re-enabled in the future.
     if False:
-      self._maybe_log_and_save_tracked_requests()
+      # The mixin's periodic log under its new name (it no longer writes the trace); still switched off.
+      self._maybe_log_tracked_requests()
     return
 
   def _maybe_hsync_dauth_job_secrets(self):
@@ -582,21 +671,36 @@ class DauthManagerPlugin(
     dict
       The signed response with the request's `nonce`, the server fields this node adds (alias, version,
       time, epoch, uptime) and either the reconciliation result or `error`. When reconciliation fails, the
-      caller is told only that it failed, never why.
+      caller is told only that it failed, never why, with one exception: when the chain store refused the
+      job's secret record for its size, the response also carries `reason` with the code `record_too_large`.
 
     Notes
     -----
-    A failure is logged in red with the type of the error and the functions it passed through, outermost
-    first and cut to 300 characters, so the failing step (for example the read of the operation's plan) can
-    be told from the log. The error text is not logged: new secret values can be present in the request or
-    in a dependency's error.
+    A failure is logged in red with the sender and the job the request names (see `dauth_request_label`),
+    the type of the error, the functions it passed through, outermost first and cut to 300 characters, and
+    the line of the innermost function, where it was raised. The failing check can so be told from the log:
+    one function holds several checks that raise the same type. The error text is not logged: new secret
+    values can be present in the request or in a dependency's error.
+
+    The reason code is a constant from a closed set of one (`DAUTH_REASON_RECORD_TOO_LARGE`), given for the
+    error type `DeploymentSecretRecordTooLarge` and for nothing else. No text of an error and no value, key or
+    size is answered; from the code the caller's client tells the job's owner that the new revision, or the
+    current one kept for a rollback, has too many nodes or too large configurations (either copy can be the
+    one refused). The type is raised in one place, at the write of a secret-revision record
+    during a "prepare", which a request reaches only after every earlier check passed: this node is a
+    registered dAuth oracle, the body is signed
+    by a key that is not revoked, its nonce is fresh, the sender is a protocol oracle, the operation is signed
+    by that same sender as its coordinator, its plan matches it and holds no plaintext secret, and the job's
+    active revision is the one the operation was built on. A caller that fails any of them gets the answer
+    of every other failure. A dAuth server of an earlier release never sends `reason`, and a client of an
+    earlier release does not read it: the `error` text is the same as before.
 
     Examples
     --------
     >>> body = {"nonce": "n1", "EE_SENDER": "0xai_...", "action": "prepare"}  # unsigned: refused
     >>> response = plugin.reconcile_job_secrets(body)  # on a registered dAuth oracle
-    >>> response["nonce"], response["error"]
-    ('n1', 'dAuth secret reconciliation failed')
+    >>> response["nonce"], response["error"], "reason" in response
+    ('n1', 'dAuth secret reconciliation failed', False)
     """
     nonce = body.get("nonce") if isinstance(body, dict) else None
     if not self._is_dauth_server_enabled():
@@ -610,10 +714,21 @@ class DauthManagerPlugin(
         # the reconciliation failed, and a plan that could not be read looked like any other failure. The
         # path, outermost first, is cut to 300 characters to bound the log line: on a very deep path the
         # innermost names (where the error was raised) are the ones cut.
-        path = " > ".join(frame.name for frame in traceback.extract_tb(exc.__traceback__))[:300]
-        self.P("dAuth secret reconciliation failed for request from {}: {} in {}.".format(
-          self.get_request_client_ip(), type(exc).__name__, path), color='r')
+        frames = traceback.extract_tb(exc.__traceback__)
+        # The same path as before, built from the frames kept above.
+        path = " > ".join(frame.name for frame in frames)[:300]
+        # The line also names who asked for which job and the line that raised, by the innermost
+        # function's name and line number: a location in the code, never the error text. Before,
+        # several checks of one function could not be told apart and the requester was not named.
+        self.P("dAuth secret reconciliation failed for request from {} ({}): {} in {} (line {} of {}).".format(
+          self.get_request_client_ip(), dauth_request_label(body), type(exc).__name__, path,
+          frames[-1].lineno, frames[-1].name), color='r')
         data = {'error': 'dAuth secret reconciliation failed'}
+        if isinstance(exc, DeploymentSecretRecordTooLarge):
+          # The one cause the caller is told, as a fixed code and by the error's type alone: the chain store
+          # refused the job's secret record for its size, so the job's owner can be told what to change.
+          # Before, this answer was the same as for a write that was only not confirmed yet.
+          data[dAuth.DAUTH_REASON] = dAuth.DAUTH_REASON_RECORD_TOO_LARGE
     return self.__get_response({'nonce': nonce, **data})
 
   @BasePlugin.endpoint(method="post")
@@ -625,6 +740,32 @@ class DauthManagerPlugin(
     The signed request must include a hex-millisecond timestamp nonce no older
     than 120 seconds and the required secret revision. The signed response
     echoes both and the encrypted bundle is bound to the revision.
+
+    Parameters
+    ----------
+    body : dict
+      The signed request: the sender fields, `nonce`, `job_id` and, for a versioned job,
+      `revision`.
+
+    Returns
+    -------
+    dict
+      The signed response with the request's `nonce` and either the encrypted bundle or
+      `error` with `retryable` (False for a ``ValueError``, which is final for the requester).
+
+    Notes
+    -----
+    A failed request writes one line with the source address, the sender and the job the
+    request names (see `dauth_request_label`) and the error text. The line is
+    yellow when the error is a ``DauthRefused``, dAuth's verdict on the requester (a revoked
+    key or revision, a node outside the job's placement or the revision's plan), and red for
+    everything else. Red lines are also copied to the error log.
+
+    Examples
+    --------
+    >>> response = plugin.get_secrets(body)   # signed by a node that does not run the job
+    >>> response["error"], response["retryable"]
+    ('Sender is not running the existing job.', False)
     """
     request_nonce = body.get("nonce") if isinstance(body, dict) else None
     if not self._is_dauth_server_enabled():
@@ -637,8 +778,8 @@ class DauthManagerPlugin(
     try:
       data = self.process_dauth_get_secret_request(body)
     except Exception as e:
-      self.P("Error processing get_secrets request from {}: {}".format(
-        self.get_request_client_ip(), e), color='r'
+      self.P("Error processing get_secrets request from {} ({}): {}".format(
+        self.get_request_client_ip(), dauth_request_label(body), e), color='y' if isinstance(e, DauthRefused) else 'r'
       )
       data = {
         'error': str(e),

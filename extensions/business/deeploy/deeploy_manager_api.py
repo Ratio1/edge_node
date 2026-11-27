@@ -20,6 +20,7 @@ from .repair_relay import _RepairRelayMixin
 from .deeploy_mixin import _DeeployMixin
 from .delegate_aliases import _DelegateAliasesMixin  # Optional metadata stays separate from deployment behavior.
 from .selected_secrets import compile_request_selections
+from .container_allocations import prepare_native_omissions, restore_native_omissions
 from .deeploy_chainstore_response_mixin import _DeeployChainstoreResponseMixin
 from .deeploy_target_nodes_mixin import _DeeployTargetNodesMixin
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
@@ -41,7 +42,11 @@ __VER__ = '0.6.0'
 _CONFIG = {
   **BasePlugin.CONFIG,
 
-  'PORT': None,
+  # A fixed port instead of a drawn one. With the generator seeded the same way on every node, this
+  # app drew 31653 everywhere; the value is kept, so whatever reaches the app on that local port (a
+  # tunnel ingress set to it) still does once the draws differ per node. A fixed port that is taken
+  # is retried every 5 s; it is not drawn again.
+  'PORT': 31653,
   'NETWORK_ROUTE_BY_HANDLER': True,  # Queue only Deeploy peer payloads from the shared admin listener.
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
@@ -63,8 +68,9 @@ _CONFIG = {
   # stored and saved again by every oracle.
   'REQUESTS_TRACKED_ENDPOINTS': ['create_pipeline', 'update_pipeline', 'scale_up_job_workers', 'delete_pipeline', 'send_instance_command', 'send_app_command', 'reconcile_csp_escrow_jobs', 'save_preferred_nodes'],
   # At most one write of the record every 30 s (two a minute), however often the endpoints above are called.
-  # A change after a quiet period is written by the next process() call that runs past WARMUP_DELAY; process()
-  # runs at the end of the plugin lap, after the queued requests.
+  # A change after a quiet period is written at the request monitor's next turn (within about 0.25 s), also
+  # while an endpoint holds the plugin thread and during WARMUP_DELAY; the write does not wait for the other
+  # oracles. Before, process() wrote it at the end of the plugin lap, past WARMUP_DELAY, and waited for them.
   'REQUESTS_SAVE_INTERVAL': 30,
   'REQUESTS_LOG_INTERVAL' : 5 * 60,
   'REQUESTS_MAX_RECORDS' : 2,
@@ -110,6 +116,31 @@ class DeeployManagerApiPlugin(
     return {"DEEPLOY_MANAGER_API"}
 
   def on_init(self):
+    """
+    Start the Deeploy API: the request trace's state, the web app, the balance check and the operations worker.
+
+    The trace state is created first. The base ``on_init`` starts the web app's request monitor thread, which
+    calls ``on_request`` and ``on_request_monitor_tick`` from its first turn on; both use the trace state. The
+    rest runs as before: the ETH balance check (the tunnel engine is stopped when the balance is too low), the
+    managed-update bookkeeping and the deployment operations worker.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Until this method returns, the request monitor already admits requests and writes the trace, while the
+    fields created after the base ``on_init`` do not exist yet.
+
+    Examples
+    --------
+    >>> plugin.on_init()   # called once by the plugin runtime, after the configuration was loaded
+    """
+    # The trace state before the base on_init: that call starts the request monitor thread, which records
+    # requests and writes the trace at once. Before, the state was created after it and after the web3
+    # balance check below, so a request that arrived in between raised AttributeError in on_request.
+    self._init_request_tracking()
     super(DeeployManagerApiPlugin, self).on_init()
     my_address = self.bc.address
     my_eth_address = self.bc.eth_address
@@ -126,7 +157,6 @@ class DeeployManagerApiPlugin(
         color='r', boxed=True
       )
       self.maybe_stop_tunnel_engine()
-    self._init_request_tracking()
     self._pending_managed_update_actions = {}
     self._applied_managed_update_actions = {}
     self._managed_update_action_lock = threading.Lock()
@@ -263,6 +293,33 @@ class DeeployManagerApiPlugin(
 
   def on_response(self, method, response):
     self._track_response(method, response)
+    return
+
+  def on_request_monitor_tick(self):
+    """
+    Write the request trace from the request monitor thread.
+
+    The web-app base calls this hook at each turn of its request monitor: about every 0.25 s while no request
+    comes and right after each request was queued or refused. The trace (which tracked requests this oracle
+    received, and whether it answered them) is written here when it changed, at most once per
+    ``REQUESTS_SAVE_INTERVAL``, with a chain-store write that does not wait for the other oracles.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    The monitor thread is not held by an endpoint. A request whose endpoint hangs holds the plugin thread, and
+    with it ``process()``, where the trace was written before: the other oracles then never learned that this
+    oracle held the request. The monitor admits no request while this runs, so the work here stays short.
+
+    Examples
+    --------
+    >>> plugin.on_request_monitor_tick()   # nothing changed since the last write: nothing is written
+    """
+    # The trace's write, moved here from process(): this thread still turns while an endpoint hangs.
+    self._maybe_publish_tracked_requests()
     return
 
 
@@ -875,7 +932,10 @@ class DeeployManagerApiPlugin(
 
       # Validate plugins array structure and required fields for each plugin
       plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+      omissions = {}
       if plugins_array:
+        if not is_create and not repair_update and not replacing and job_app_type == JOB_APP_TYPES.NATIVE:
+          omissions = prepare_native_omissions(plugins_array)  # Work on normalized input, never the signed request.
         self._validate_plugins_array(plugins_array)
       else:
         # This shouldn't happen after normalization, but handle as fallback
@@ -917,6 +977,7 @@ class DeeployManagerApiPlugin(
       prepared_create_deploy_plan = None
       prepared_pipeline_configs = None
       update_context_from_persisted_pipeline = False
+      deferred_capacity = False
       if is_create:
         canonical = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(job_id))
         reusing_deleted_job = isinstance(canonical, dict) and canonical.get("deleted") is True
@@ -1141,7 +1202,15 @@ class DeeployManagerApiPlugin(
           deployment_targets,
         )
 
-        validated_nodes = self._check_nodes_availability(inputs)
+        try:
+          validated_nodes = self._check_nodes_availability(inputs)
+        except ValueError as exc:
+          # Only resource pressure on the retained placement is eligible for a post-stop check.
+          if (replacing or repair_update or job_app_type not in (JOB_APP_TYPES.STACK, JOB_APP_TYPES.NATIVE)
+              or set(current_nodes) != set(deployment_targets) or DEEPLOY_ERRORS.NODERES1 not in str(exc)):
+            raise
+          deferred_capacity = True
+          validated_nodes = self._check_nodes_availability(inputs, skip_resource_check=True)
         if set(validated_nodes) != set(deployment_targets):
           msg = (
             f"{DEEPLOY_ERRORS.NODES2}: Failed to validate requested target nodes. "
@@ -1199,6 +1268,8 @@ class DeeployManagerApiPlugin(
         owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
         prepared_deploy_plan=prepared_create_deploy_plan,
       )
+      if omissions:
+        restore_native_omissions(prepared_pipeline_configs, omissions)
       prior_pipeline = None if is_create or replacing else self.get_job_pipeline_from_cstore(
         job_id, timeout=30, pin=False, raise_on_error=False, show_logs=False,
       )
@@ -1217,6 +1288,9 @@ class DeeployManagerApiPlugin(
         request=request, auth_result=auth_result, app_id=app_id,
         configs=prepared_pipeline_configs, prior_pipeline=prior_pipeline,
         is_create=is_create, **({"repair": repair, "mutation": SAME_HOST_REPAIR} if repair_update else {}),
+        **({"deferred_capacity": True} if deferred_capacity else {}),
+        **({"resource_tier": inputs.get("_verified_resource_tier", {})}
+           if not is_create and not repair_update and job_app_type in (JOB_APP_TYPES.STACK, JOB_APP_TYPES.NATIVE) else {}),
       )
     except StaleReplacementReviewError:
       try:
@@ -1247,7 +1321,7 @@ class DeeployManagerApiPlugin(
     })
     return response
 
-  @BasePlugin.endpoint(method="post")
+  @BasePlugin.endpoint(method="post", forward_accepted_status=True)
   # /create_pipeline
   def create_pipeline(
     self,
@@ -1273,6 +1347,9 @@ class DeeployManagerApiPlugin(
 
       job_id : int
           The job ID from blockchain
+
+      request_id : str
+          Stable request identifier included in the signature.
 
       target_nodes : list[str] or target_nodes_count : int
           Either specific nodes or count of nodes to deploy on
@@ -1345,15 +1422,15 @@ class DeeployManagerApiPlugin(
     Returns
     -------
     dict
-        Response containing:
-        - status : str
-        - app_id : str
-        - status_details : dict
-        - request : dict
-        - auth : dict
+        Signed HTTP 202 acceptance with operation, request, job, app and
+        target revision identifiers. Invalid requests, conflicts and
+        uncertain acceptance use HTTP 400, 409 and 503 respectively.
 
     Notes
     -----
+    Poll get_deployment_status for execution and recovery. For uncertain
+    acceptance, retry with the same request ID and input.
+
     - Multi-plugin pipelines are automatically classified as JOB_APP_TYPE.NATIVE
     - Single CONTAINER_APP_RUNNER is classified as GENERIC or SERVICE
     - Resource requirements are aggregated across all container plugins
@@ -1361,15 +1438,14 @@ class DeeployManagerApiPlugin(
     - Example: [{"plugin_signature": "PLUGIN_A", ...}, {"plugin_signature": "PLUGIN_A", ...}] creates 2 instances
     - For multi-plugin templates, see DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN in deeploy_const.py
 
-    TODO: (Vitalii)
-      - Add support to get the ngrok url if NO edge/endpoint is provided but ngrok is STILL used
-    Requires a signed stable request_id. Returns HTTP 202 after durable
-    acceptance; get_deployment_status reports execution and recovery.
+    Examples
+    --------
+    >>> operation_id = oracle.create_pipeline(signed_request)["operation_id"]  # doctest: +SKIP
     """
     self.Pd(f"Called Deeploy create_pipeline endpoint")
     return self._process_pipeline_request(request, is_create=True)
 
-  @BasePlugin.endpoint(method="post")
+  @BasePlugin.endpoint(method="post", forward_accepted_status=True)
   # /update_pipeline
   def update_pipeline(
     self,
@@ -1433,7 +1509,7 @@ class DeeployManagerApiPlugin(
             - instance_id : str (required when updating an existing plugin instance)
               - Required on every submitted service plugin and never inferred by the backend
             - **instance-specific parameters** (payload merged into the instance configuration)
-              - Omit instance_id to attach a brand new plugin instance; supported for native apps only
+              - Omit instance_id to attach a brand new plugin instance; supported for ordinary running Native and Stack container membership edits
             - Omit a live plugin from this array to remove it from the replacement deployment
 
       **Legacy format:**
@@ -1447,7 +1523,9 @@ class DeeployManagerApiPlugin(
     Returns
     -------
     dict
-        Response containing update status and details
+        Signed HTTP 202 acceptance with operation, request, job, app and
+        target revision identifiers. Invalid requests, conflicts and
+        uncertain acceptance use HTTP 400, 409 and 503 respectively.
 
     Notes
     -----
@@ -1459,6 +1537,9 @@ class DeeployManagerApiPlugin(
     - New plugin instances can be introduced by omitting `instance_id` (native job type only)
     - See create_pipeline endpoint for detailed parameter documentation and examples
 
+    Examples
+    --------
+    >>> operation_id = oracle.update_pipeline(signed_request)["operation_id"]  # doctest: +SKIP
     """
     self.P(
       "Received an update_pipeline request with body: {}".format(
@@ -1517,9 +1598,13 @@ class DeeployManagerApiPlugin(
     except Exception:
       return self._get_response(dict(status="blocked", reason="The current job, license or worker evidence is unavailable."))
 
-  @BasePlugin.endpoint(method="post")
+  @BasePlugin.endpoint(method="post", forward_accepted_status=True)
   def repair_update_pipeline(self, request: dict):
-    """Accept a CSP-signed legacy correction and update on its original coordinator.
+    """Accept a signed deployment repair using its reviewed coordinator.
+
+    Use the reviewed proposal to admit a same-host repair or
+    replace a stateless workload through the coordinator named in that
+    proposal.
 
     Parameters
     ----------
@@ -1529,7 +1614,13 @@ class DeeployManagerApiPlugin(
     Returns
     -------
     dict
-      Existing deployment acceptance or structured admission error.
+      Signed HTTP 202 acceptance with an operation ID, or a structured
+      admission error. A stale replacement review returns HTTP 409.
+
+    Notes
+    -----
+    Acceptance is separate from worker readiness and recovery. Poll
+    get_deployment_status for the accepted operation's outcome.
 
     Examples
     --------
@@ -1568,13 +1659,33 @@ class DeeployManagerApiPlugin(
     return self._get_response(dict(status_code=code, status="error",
                                   error=dict(code=name, message=message, retryable=retryable)))
 
-  @BasePlugin.endpoint(method="post")
+  @BasePlugin.endpoint(method="post", forward_accepted_status=True)
   def scale_up_job_workers(self, request: dict = DEEPLOY_SCALE_UP_JOB_WORKERS_REQUEST):
-    """Accept a full revision rollout to a larger placement with automatic rollback.
+    """Accept a full revision rollout to a larger job placement.
 
-    The signed request requires job_id, request_id, expected_revision, and the
-    existing node-selection/resource fields. Poll get_deployment_status for the
-    accepted operation; HTTP202 does not assert readiness.
+    Validate the paid placement change and keep the prior configuration
+    available for restoration if the rollout fails.
+
+    Parameters
+    ----------
+    request : dict
+      Signed request with job_id, request_id, expected_revision and the
+      existing node-selection and resource fields for the additional nodes.
+
+    Returns
+    -------
+    dict
+      Signed HTTP 202 acceptance with an operation ID. Invalid requests,
+      conflicts and uncertain acceptance use HTTP 400, 409 and 503 respectively.
+
+    Notes
+    -----
+    Poll get_deployment_status for rollout and recovery. Retry uncertain
+    acceptance with the same request ID and input.
+
+    Examples
+    --------
+    >>> operation_id = oracle.scale_up_job_workers(signed_request)["operation_id"]  # doctest: +SKIP
     """
     try:
       self.__ensure_eth_balance()
@@ -1591,13 +1702,39 @@ class DeeployManagerApiPlugin(
     except Exception as exc:
       return self._deployment_admission_error(exc)
 
-  @BasePlugin.endpoint(method="post")
+  @BasePlugin.endpoint(method="post", forward_accepted_status=True)
   def delete_pipeline(self, request: dict = DEEPLOY_DELETE_REQUEST):
-    """Accept whole-job deletion; retain credentials until all nodes prove stop.
+    """Accept an authenticated request to stop and delete one complete job.
 
-    The signed request requires job_id, request_id and expected_revision.
-    Partial placement deletion is unsupported. Completion is reported through
-    the same deployment polling endpoint, independently of the HTTP connection.
+    The coordinator runs retirement independently of the HTTP request.
+    It removes published configuration and credentials only after every
+    worker in the saved placement confirms shutdown.
+
+    Parameters
+    ----------
+    request : dict
+      Signed request with job_id, request_id and expected_revision. An
+      optional app_id must match the job. If supplied, target_nodes must
+      contain the full saved placement.
+
+    Returns
+    -------
+    dict
+      A signed accepted result with HTTP 202 and an operation ID to poll
+      through get_deployment_status. The HTTP error path returns 400 for
+      invalid input, 409 for conflicting work or request ID reuse, and 503
+      if acceptance is uncertain. For a 503, retry with the same request ID
+      and input.
+
+    Notes
+    -----
+    The accepted response describes admission. Terminal success or failure
+    is available through the status lookup.
+
+    Examples
+    --------
+    >>> plugin.delete_pipeline(signed_delete_request)["status"]  # doctest: +SKIP
+    'accepted'
     """
     try:
       _, inputs = self.deeploy_verify_and_get_inputs(request, request_type="delete pipeline")
@@ -1901,6 +2038,26 @@ class DeeployManagerApiPlugin(
     return (self.time() - self.__warmup_start_time) > self.cfg_warmup_delay
 
   def process(self):
+    """
+    The end of each plugin lap: admit the jobs of relinked nodes and log every oracle's request trace.
+
+    Nothing runs before ``WARMUP_DELAY`` seconds have passed since ``on_init``. After that each lap moves the
+    jobs of relinked nodes (an error there is logged in red and the lap goes on) and, every
+    ``REQUESTS_LOG_INTERVAL`` seconds, logs the request traces of all oracles from the local replica.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    The trace itself is not written here any more: ``on_request_monitor_tick`` writes it, also before
+    ``WARMUP_DELAY`` has passed.
+
+    Examples
+    --------
+    >>> plugin.process()   # called by the plugin loop after the lap's queued requests
+    """
     self._process_job_repair_relay()  # Process peer replies before ordinary warmup-gated maintenance.
     if not self.is_deeploy_warmed_up():
       return
@@ -1910,5 +2067,7 @@ class DeeployManagerApiPlugin(
     except Exception as e:
       self.P(f"Error moving jobs from relinked nodes: {e}", color='r')
 
-    self._maybe_log_and_save_tracked_requests()
+    # Only the periodic log of every oracle's trace is left on the plugin thread: the trace is written from
+    # on_request_monitor_tick, where an endpoint that hangs cannot hold it back.
+    self._maybe_log_tracked_requests()
     return
