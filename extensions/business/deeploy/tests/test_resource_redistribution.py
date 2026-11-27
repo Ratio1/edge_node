@@ -93,3 +93,16 @@ class RedistributionTests(unittest.TestCase):
     values = {"PLUGINS":[{"INSTANCES":[{}, {"DYNAMIC_ENV":{"K":[{"value":"previous"}]}}]}]}
     with self.assertRaisesRegex(ValueError, "Unresolved"):
       plugin._build_complete_dauth_job_secret_bundle(7, new, {}, {"job_secrets": values}, old, match_prior_instance=True)
+
+  def test_missing_legacy_worker_tier_is_reconstructed_from_paid_allocation(self):
+    old = config([("one", 1, "1g", "0g")], native=True)
+    old["DEEPLOY_SPECS"].pop("node_res_req")
+    new = config([("one", ".5", "512m", "0g"), ("two", ".5", "512m", "0g")], native=True)
+    self.assertTrue(redistribution_requirements({"A": old}, {"A": new}, {"cpu": 3, "memory": "14g"}))
+    noop = copy.deepcopy(old)
+    noop["DEEPLOY_SPECS"]["node_res_req"] = {"cpu": 30, "memory": "10g"}
+    with self.assertRaisesRegex(ValueError, "tier"):
+      redistribution_requirements({"A": old}, {"A": noop}, {"cpu": 3, "memory": "14g"})
+    new["DEEPLOY_SPECS"]["node_res_req"]["cpu"] = 30
+    with self.assertRaisesRegex(ValueError, "tier"):
+      redistribution_requirements({"A": old}, {"A": new}, {"cpu": 3, "memory": "14g"})
