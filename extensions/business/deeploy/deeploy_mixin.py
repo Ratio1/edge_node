@@ -3386,8 +3386,9 @@ class _DeeployMixin:
           self.Pd(f"  Failed to detect job app type: {exc}")
           job_app_type = None
 
+      if job_app_type in (JOB_APP_TYPES.NATIVE, JOB_APP_TYPES.STACK):
+        inputs["_verified_resource_tier"] = expected_resources  # Recover legacy paid tiers absent from stored plans.
       if job_app_type == JOB_APP_TYPES.NATIVE:
-        inputs["_verified_resource_tier"] = expected_resources
         # The paid worker limits each new CAR/WAR individually, including legacy full-tier defaults.
         validate_native_limits(inputs, expected_resources, is_create)
         for idx, row in enumerate(inputs.get(DEEPLOY_KEYS.PLUGINS) or []):

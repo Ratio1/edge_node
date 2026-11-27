@@ -162,6 +162,45 @@ def instance_allocations(config, native, saved=False):
   return allocations
 
 
+def _normalized_worker_tier(tier):
+  """Normalize an existing worker request without losing other tier dimensions.
+
+  Parameters
+  ----------
+  tier : dict
+    Signed worker requirements or the immutable purchased tier.
+
+  Returns
+  -------
+  dict
+    Numeric dimensions in common units, plus unchanged nonnumeric fields.
+
+  Examples
+  --------
+  >>> _normalized_worker_tier({"memory": "1g"}) == _normalized_worker_tier({"memory": "1024m"})
+  True
+  """
+  normalized = dict(tier)
+  if "cpu" in tier:
+    try:
+      normalized["cpu"] = Decimal(str(tier["cpu"]))
+    except InvalidOperation as exc:
+      raise ValueError("Invalid worker CPU tier.") from exc
+  if "memory" in tier:
+    normalized["memory"] = size_bytes(tier["memory"])
+  if "storage" in tier:
+    normalized["storage"] = size_bytes(tier["storage"], "m")
+  return normalized
+
+
+# Historical Native dashboard requests contain the worker's usable CPU and RAM.
+# GPU variants of the same worker share this table. The chain table lists its capacity before headroom.
+_NATIVE_WORKER_HEADROOM = {
+  (3, "14g"): (3, "10g"), (8, "22g"): (7, "20g"), (12, "30g"): (11, "30g"),
+  (16, "60g"): (15, "60g"), (22, "124g"): (22, "120g"),
+}
+
+
 def redistribution_requirements(previous, desired, paid):
   """Bind an ordinary container edit to its saved per-worker allocation.
 
@@ -210,6 +249,21 @@ def redistribution_requirements(previous, desired, paid):
           if any(field not in resources and (prior is None or field in prior) for field in ("cpu", "memory")):
             raise ValueError("Resource limits may only remain absent on the same saved legacy container.")
     new = instance_allocations(config, native, saved=native)
+    if set(previous) == set(desired):
+      # Keep a same-placement metadata-only save from rewriting the baseline for a later redistribution.
+      saved_tier = before["DEEPLOY_SPECS"].get("node_res_req")
+      tier = config["DEEPLOY_SPECS"].get("node_res_req") or {}
+      if saved_tier is None and tier:
+        # Legacy plans omitted the worker request. Reconstruct only the known purchased worker tier.
+        saved_tier = paid
+        if native and "storage" not in paid:
+          known = _NATIVE_WORKER_HEADROOM.get((paid.get("cpu"), paid.get("memory")))
+          if known:
+            saved_tier = {"cpu": known[0], "memory": known[1]}
+        if not saved_tier:
+          raise ValueError("The saved worker tier cannot be recovered for this resource edit.")
+      if saved_tier is not None and _normalized_worker_tier(tier) != _normalized_worker_tier(saved_tier):
+        raise ValueError("The saved worker tier must stay fixed during redistribution.")
     allocations[node] = (old, new)
     changed |= old != new
   if not changed:
@@ -227,11 +281,8 @@ def redistribution_requirements(previous, desired, paid):
     # Numeric overlay selectors and existing credential paths use the saved worker order.
     if previous[node]["DEEPLOY_SPECS"].get("current_target_nodes") != desired[node]["DEEPLOY_SPECS"].get("current_target_nodes"):
       raise ValueError("A container edit must retain the saved placement order.")
-    saved_tier = previous[node]["DEEPLOY_SPECS"].get("node_res_req")
-    tier = desired[node]["DEEPLOY_SPECS"].get("node_res_req") or {}
-    if saved_tier is not None and tier != saved_tier:
-      raise ValueError("The saved worker tier must stay fixed during redistribution.")
     if native:
+      tier = desired[node]["DEEPLOY_SPECS"].get("node_res_req") or {}
       for identity, allocation in new.items():
         prior = old.get(identity)
         # Preserve unchanged legacy caps independently in each dimension.
