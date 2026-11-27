@@ -80,7 +80,7 @@ def validate_native_limits(inputs, paid, is_create):
   --------
   >>> validate_native_limits({"plugins": []}, {"cpu": 3, "memory": "14g"}, True)
   """
-  node_request = inputs.get("node_res_req") or {}
+  node_request = _native_worker_request(paid, inputs.get("node_res_req"))
   for row in inputs.get("plugins", []):
     if str(row.get("plugin_signature", "")).upper() not in CONTAINERIZED_APPS_SIGNATURES:
       continue  # In-process plugins share the worker and have no Docker controls.
@@ -202,6 +202,38 @@ _NATIVE_WORKER_HEADROOM = {
 }
 
 
+def _native_worker_request(paid, requested=None):
+  """Resolve the usable limits of a Native worker.
+
+  Older clients can omit individual limits or the entire worker request.
+  Recover their defaults from the verified purchased tier without writing
+  synthetic fields into the signed configuration.
+
+  Parameters
+  ----------
+  paid, requested : dict
+    Purchased resources and optional signed worker requirements.
+
+  Returns
+  -------
+  dict
+    Effective resources to use alongside the chain ceiling at admission.
+
+  Examples
+  --------
+  >>> _native_worker_request({"cpu": 3, "memory": "14g"})
+  {'cpu': 3, 'memory': '10g'}
+  """
+  if requested is not None and not isinstance(requested, dict):
+    raise ValueError("Invalid Native worker tier: node_res_req must be a dictionary.")
+  defaults = paid
+  if "storage" not in paid:  # Native worker SKUs have no finite purchased storage.
+    usable = _NATIVE_WORKER_HEADROOM.get((paid.get("cpu"), paid.get("memory")))
+    if usable:
+      defaults = {"cpu": usable[0], "memory": usable[1]}
+  return {**defaults, **(requested or {})}  # A persisted partial request still binds its explicit fields.
+
+
 def redistribution_requirements(previous, desired, paid):
   """Bind an ordinary container edit to its saved per-worker allocation.
 
@@ -256,11 +288,7 @@ def redistribution_requirements(previous, desired, paid):
       tier = config["DEEPLOY_SPECS"].get("node_res_req") or {}
       if saved_tier is None and tier:
         # Legacy plans omitted the worker request. Reconstruct only the known purchased worker tier.
-        saved_tier = paid
-        if native and "storage" not in paid:
-          known = _NATIVE_WORKER_HEADROOM.get((paid.get("cpu"), paid.get("memory")))
-          if known:
-            saved_tier = {"cpu": known[0], "memory": known[1]}
+        saved_tier = _native_worker_request(paid) if native else paid
         if not saved_tier:
           raise ValueError("The saved worker tier cannot be recovered for this resource edit.")
       if saved_tier is not None and _normalized_worker_tier(tier) != _normalized_worker_tier(saved_tier):
@@ -286,7 +314,7 @@ def redistribution_requirements(previous, desired, paid):
     if any(prior_specs.get(key, default) != next_specs.get(key, default) for key, default in placement_defaults.items()):
       raise ValueError("A container edit must retain the saved placement order, worker count and replication policy.")
     if native:
-      tier = desired[node]["DEEPLOY_SPECS"].get("node_res_req") or {}
+      tier = _native_worker_request(paid, desired[node]["DEEPLOY_SPECS"].get("node_res_req"))
       for identity, allocation in new.items():
         prior = old.get(identity)
         # Preserve unchanged legacy caps independently in each dimension.

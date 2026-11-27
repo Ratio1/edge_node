@@ -38,6 +38,20 @@ class NativeResourceTests(unittest.TestCase):
       with self.subTest(key=key, value=value), self.assertRaises(ValueError):
         self.accept(self.inputs({"cpu": 3, "memory": "10g", key: value}))
 
+  def test_legacy_create_recovers_the_paid_worker_request_when_absent(self):
+    inputs = self.inputs({"cpu": 3, "memory": "10g"})
+    del inputs["node_res_req"]
+    self.assertTrue(self.accept(inputs))  # N-ENTRY has 10 GiB available to one container.
+    inputs.plugins[0]["CONTAINER_RESOURCES"]["memory"] = "11g"
+    with self.assertRaisesRegex(ValueError, "worker tier"):
+      self.accept(inputs)
+    inputs["node_res_req"] = {"cpu": 3}  # Omitting just RAM inherits the same ceiling.
+    with self.assertRaisesRegex(ValueError, "worker tier"):
+      self.accept(inputs)
+    inputs["node_res_req"] = "invalid"
+    with self.assertRaisesRegex(ValueError, "must be a dictionary"):
+      self.accept(inputs)
+
   def test_existing_full_tier_per_container_is_supported(self):
     inputs = self.inputs({"cpu": 3, "memory": "10g", "storage": "0g"})
     inputs.plugins.append(make_plugin_entry("WORKER_APP_RUNNER", CONTAINER_RESOURCES={"cpu": 3, "memory": "10g"}))

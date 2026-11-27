@@ -212,6 +212,34 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.assertEqual(operation["recovery"], "completed")
     self.assertEqual(len(self.active()["PLUGINS"][0]["INSTANCES"]), 2)
 
+  def test_legacy_native_update_recovers_worker_ceiling_when_both_requests_omit_it(self):
+    previous = pipeline()
+    previous["DEEPLOY_SPECS"]["job_app_type"] = "native"  # This older client never sent node_res_req.
+    group = previous["PLUGINS"][0]
+    group["SIGNATURE"] = "CONTAINER_APP_RUNNER"
+    group["INSTANCES"] = [{"INSTANCE_ID": iid, "CONTAINER_RESOURCES": {"cpu": 1, "memory": "7g"}}
+                          for iid in ("first", "second")]
+    self.state.public["DEEPLOY_DEPLOYED_JOBS", "7"] = self.state.blobs.add_json(previous)
+    self.coordinator.known = {"A": [previous]}  # The saved revision and worker report agree.
+
+    def admit_pair(first, second):
+      desired = copy.deepcopy(previous)
+      rows = desired["PLUGINS"][0]["INSTANCES"]
+      for row, memory in zip(rows, (first, second)):
+        row["CONTAINER_RESOURCES"]["memory"] = memory
+      request_rows = [{"plugin_signature": group["SIGNATURE"], "instance_id": row["INSTANCE_ID"],
+                       "CONTAINER_RESOURCES": row["CONTAINER_RESOURCES"]} for row in rows]
+      return self.coordinator._admit_prepared_deployment(
+        request={"job_id": 7, "request_id": "legacy-" + first, "expected_revision": 0, "plugins": request_rows},
+        auth_result={"escrow_owner": "owner"}, app_id="app", configs={"A": desired}, prior_pipeline=previous,
+        is_create=False, resource_tier={"cpu": 3, "memory": "14g"})
+
+    with self.assertRaisesRegex(ValueError, "worker tier"):
+      admit_pair("11g", "3g")  # Balanced total; one row exceeds the historical N-ENTRY usable limit.
+    self.assertFalse(self.coordinator._operation_records())
+    self.assertEqual(admit_pair("10g", "4g")["status_code"], 202)
+    self.assertEqual(self.operation()["mutation"], "resource_redistribution_v1")
+
   def test_redistribution_publishes_one_survivor_after_two_fresh_worker_samples(self):
     from datetime import datetime, timezone
     from naeural_core import constants as ct
