@@ -214,3 +214,16 @@ are fixtures. Its synthetic keys must never be used for live systems. Fixture
 storage is a JSON file (`ALIAS_TEST_STORE`, default `/tmp/delegate-aliases.json`),
 allowing independent browser sessions to share metadata. This proves the API/UI
 boundary, not live-chain or multi-oracle replication behavior.
+
+### Native per-container limits
+
+The signed create and update endpoints accept CPU and memory in each Native
+CAR/WAR plugin's `CONTAINER_RESOURCES`. The purchased worker tier continues to
+set the price. On create each container's positive finite CPU and RAM caps
+must fit that worker. Two containers may each inherit the entire tier. Native
+in-process plugins share the worker. Docker applies CPU and memory limits.
+
+Optional `CONTAINER_RESOURCES.storage` sets a Volume Storage budget that
+includes the container's fixed-size volumes. An omitted Native budget accounts
+for the existing fixed-volume reservations. Explicit zero is valid with no
+reservations. The storage allocation does not resize existing volume files.

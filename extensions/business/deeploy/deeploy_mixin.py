@@ -42,6 +42,7 @@ from extensions.business.deeploy.selected_secrets import (
   selected_value_paths,
 )
 
+from extensions.business.deeploy.container_allocations import validate_native_limits
 from extensions.utils.memory_formatter import parse_memory_to_mb
 from extensions.business.container_apps.container_utils import validate_exposed_ports_origin_tls_options
 from extensions.utils.per_node_config import (
@@ -919,6 +920,9 @@ class _DeeployMixin:
     )
 
     detected_job_app_type = job_app_type or self.deeploy_detect_job_app_type(plugins)
+    if detected_job_app_type in (JOB_APP_TYPES.NATIVE, JOB_APP_TYPES.STACK) and inputs.get("node_res_req"):
+      # Keep the signed worker tier for lossless edits and recovery on subsequent revisions.
+      dct_deeploy_specs["node_res_req"] = self.deepcopy(inputs.get("node_res_req"))
     if detected_job_app_type in JOB_APP_TYPES_ALL:
       dct_deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
 
@@ -2906,6 +2910,8 @@ class _DeeployMixin:
     job_app_type = inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE)
     is_stack_app = isinstance(job_app_type, str) and job_app_type.lower() == JOB_APP_TYPES.STACK
 
+    is_native_app = isinstance(job_app_type, str) and job_app_type.lower() == JOB_APP_TYPES.NATIVE
+
     # For legacy format, use existing app_params
     if not plugins_array:
       self.Pd("Using legacy format (app_params) for resource aggregation")
@@ -2923,7 +2929,7 @@ class _DeeployMixin:
         if DEEPLOY_RESOURCES.STORAGE in legacy_resources:
           has_storage_resource = True
           storage_mb = self._parse_stack_storage_mb(container_storage)
-      if not is_stack_app:
+      if not is_stack_app and not (is_native_app and has_storage_resource):
         fixed_storage_mb = self._aggregate_fixed_size_volumes_storage_mb(app_params)
         if fixed_storage_mb > 0:
           storage_mb += fixed_storage_mb
@@ -2967,7 +2973,7 @@ class _DeeployMixin:
           has_storage_resource = True
           storage_mb = self._parse_stack_storage_mb(container_storage, context=f"plugin {idx}")
           self.Pd(f"  Container storage: {storage_mb}MB")
-        if not is_stack_app:
+        if not is_stack_app and not (is_native_app and has_storage_resource):
           fixed_storage_mb = self._aggregate_fixed_size_volumes_storage_mb(plugin_instance)
           if fixed_storage_mb > 0:
             self.Pd(f"  FIXED_SIZE_VOLUMES storage: {fixed_storage_mb}MB")
@@ -3299,6 +3305,9 @@ class _DeeployMixin:
     self.Pd(f"  allow_unpaid: {allow_unpaid}, network: {network}")
 
     if allow_unpaid and network == 'devnet':
+      if inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE) == JOB_APP_TYPES.NATIVE:
+        # Local unpaid development still uses the same resource contract.
+        validate_native_limits(inputs, {}, is_create)
       self.Pd("  Bypassing payment check: unpaid job allowed on devnet")
       return True
 
@@ -3374,8 +3383,10 @@ class _DeeployMixin:
           job_app_type = None
 
       if job_app_type == JOB_APP_TYPES.NATIVE:
-        # TODO: Re-enable resource validation for native apps once specs are defined.
-        self.Pd(f"Skipping resource validation for native job {job_id}.")
+        # The paid worker limits each new CAR/WAR individually, including legacy full-tier defaults.
+        validate_native_limits(inputs, expected_resources, is_create)
+        for idx, row in enumerate(inputs.get(DEEPLOY_KEYS.PLUGINS) or []):
+          self._validate_fixed_size_volumes(row, context=f"plugin {idx}")
       else:
         self.Pd(f"  Validating resources for non-native job (type={job_app_type})...")
 
